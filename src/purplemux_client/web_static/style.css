@@ -74,6 +74,29 @@ button:disabled { cursor: default; opacity: 0.45; }
 .status.success { background: #163f2b; color: #75e2a8; }
 .status.failed, .status.stopped { background: #4b252b; color: #ff9ca8; }
 
+.progress-panel { margin-top: 14px; }
+.progress-panel h2 { margin: 0 0 10px; }
+.empty-progress { margin: 0; color: #737d91; font-size: 13px; }
+.progress-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.progress-item {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  gap: 6px;
+  align-items: start;
+}
+.progress-marker { color: #ffd66b; line-height: 1.4; text-align: center; }
+.progress-item.completed .progress-marker { color: #75e2a8; }
+.progress-item.failed .progress-marker { color: #ff9ca8; }
+.progress-label { font-size: 14px; line-height: 1.4; }
+.progress-note, .progress-reference { color: #9ba3b5; font-size: 12px; }
+.progress-item.failed .progress-note { color: #ffb3bc; }
+
 .outputs {
   display: grid;
   grid-template-columns: 1fr 1fr;

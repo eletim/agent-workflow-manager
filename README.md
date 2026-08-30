@@ -70,6 +70,26 @@ idle/running/success/failed/stopped state. Run and Stop operate on one script at
 a time. Stop and server shutdown clean up the script's POSIX process group,
 including child processes.
 
+Workflow scripts can explicitly report lightweight progress without changing
+their execution logic. Calls made outside the Runner are no-ops. Events from
+the latest execution remain visible after its process exits and are cleared by
+the next Run.
+
+```python
+from purplemux_client import emit_step
+
+emit_step("implementation", "started", workspace="ws-example", tab="tab-1")
+# Run the workflow's ordinary Python logic.
+emit_step("implementation", "completed")
+emit_step("review", "started", iteration=1, message="Checking the result")
+emit_step("review", "failed", iteration=1, error="Tests failed")
+```
+
+`emit_step` accepts only `started`, `completed`, and `failed`. In addition to
+the step name and status, it accepts optional `iteration`, `attempt`, `message`,
+`error`, `workspace`, and `tab` values. Progress is observational only: the
+Runner does not infer workflow transitions or control the script from events.
+
 ```bash
 make web
 ```

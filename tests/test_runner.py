@@ -11,7 +11,12 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from purplemux_client.runner import AlreadyRunningError, PythonRunner, RunnerSnapshot
+from purplemux_client.runner import (
+    AlreadyRunningError,
+    ProgressEvent,
+    PythonRunner,
+    RunnerSnapshot,
+)
 from purplemux_client.web import RunnerHTTPServer
 
 
@@ -59,6 +64,97 @@ def test_stderr(runner: PythonRunner) -> None:
 
     assert result.state == "success"
     assert result.stderr == "BAD\n"
+
+
+def test_progress_events_preserve_emit_order_and_optional_fields(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        "from purplemux_client import emit_step\n"
+        'emit_step("implementation", "started", message="working", '
+        'workspace="ws-1", tab="tab-1")\n'
+        'emit_step("implementation", "completed")\n'
+        'emit_step("review", "started", iteration=2, attempt=1)\n'
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert result.progress == (
+        ProgressEvent(
+            "implementation",
+            "started",
+            message="working",
+            workspace="ws-1",
+            tab="tab-1",
+        ),
+        ProgressEvent("implementation", "completed"),
+        ProgressEvent("review", "started", iteration=2, attempt=1),
+    )
+
+
+def test_failed_progress_is_retained_with_failed_process(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        "from purplemux_client import emit_step\n"
+        'emit_step("review", "failed", iteration=1, error="tests failed")\n'
+        "raise SystemExit(4)\n"
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "failed"
+    assert result.exit_code == 4
+    assert result.progress == (
+        ProgressEvent("review", "failed", iteration=1, error="tests failed"),
+    )
+
+
+def test_started_progress_is_visible_while_runner_is_running(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        "from purplemux_client import emit_step\n"
+        "import time\n"
+        'emit_step("implementation", "started")\n'
+        "time.sleep(60)\n"
+    )
+
+    result = wait_for(runner, lambda snapshot: bool(snapshot.progress))
+
+    assert result.state == "running"
+    assert result.progress == (ProgressEvent("implementation", "started"),)
+
+
+def test_progress_does_not_change_stdout_or_stderr(runner: PythonRunner) -> None:
+    runner.start(
+        "from purplemux_client import emit_step\n"
+        "import sys\n"
+        'emit_step("step", "started")\n'
+        'print("OUT")\n'
+        'print("ERR", file=sys.stderr)\n'
+        'emit_step("step", "completed")\n'
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.stdout == "OUT\n"
+    assert result.stderr == "ERR\n"
+    assert [event.status for event in result.progress] == ["started", "completed"]
+
+
+def test_next_run_clears_previous_progress(runner: PythonRunner) -> None:
+    runner.start(
+        'from purplemux_client import emit_step; emit_step("first", "completed")'
+    )
+    assert wait_until_finished(runner).progress
+
+    runner.start('print("next")')
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert result.progress == ()
 
 
 def test_nonzero_exit(runner: PythonRunner) -> None:
@@ -311,7 +407,52 @@ def test_runner_http_lifecycle(
         "stderr": "",
         "exitCode": 0,
         "runId": 1,
+        "progress": [],
     }
+
+
+def test_http_status_includes_progress_events(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": (
+                    "from purplemux_client import emit_step\n"
+                    'emit_step("review", "completed", iteration=2)'
+                )
+            }
+        ),
+        token=token,
+    )
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status, result = request(address, "GET", "/api/status")
+        if result["state"] != "running":
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("HTTP run did not finish")
+
+    assert status == 200
+    assert result["state"] == "success"
+    assert result["progress"] == [
+        {
+            "name": "review",
+            "status": "completed",
+            "iteration": 2,
+            "attempt": None,
+            "message": None,
+            "error": None,
+            "workspace": None,
+            "tab": None,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
