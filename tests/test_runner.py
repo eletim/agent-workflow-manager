@@ -398,6 +398,16 @@ def request(
     return response.status, payload
 
 
+def request_text(server_address: tuple[str, int], path: str) -> tuple[int, str, str]:
+    connection = http.client.HTTPConnection(*server_address, timeout=3)
+    connection.request("GET", path)
+    response = connection.getresponse()
+    content = response.read().decode()
+    content_type = response.getheader("Content-Type", "")
+    connection.close()
+    return response.status, content_type, content
+
+
 @pytest.mark.parametrize(
     ("body", "error"),
     [
@@ -448,6 +458,38 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "progress": [],
     }
+
+
+def test_workflow_guide_is_served_by_runner(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+
+    status, content_type, guide = request_text(address, "/python-workflow-guide.md")
+
+    assert status == 200
+    assert content_type == "text/markdown; charset=utf-8"
+    assert guide.startswith("# Python Workflow Guide")
+    assert "MutationOutcomeUnknown" in guide
+    assert 'emit_step("implementation", "started"' in guide
+
+
+def test_runner_ui_has_workflow_guide_display_copy_and_raw_links(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+
+    index_status, _, index = request_text(address, "/")
+    script_status, _, script = request_text(address, "/app.js")
+
+    assert index_status == 200
+    assert script_status == 200
+    assert 'id="guide-open">Workflow Guide' in index
+    assert 'href="/python-workflow-guide.md"' in index
+    assert 'id="guide-content"' in index
+    assert 'id="guide-copy"' in index
+    assert 'fetch("/python-workflow-guide.md")' in script
+    assert "navigator.clipboard.writeText" in script
 
 
 def test_http_status_includes_progress_events(
