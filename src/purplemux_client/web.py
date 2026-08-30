@@ -15,6 +15,7 @@ STATIC_DIR = Path(__file__).with_name("web_static")
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/output-copy.js": ("output-copy.js", "text/javascript; charset=utf-8"),
     "/python-workflow-guide.md": (
         "python-workflow-guide.md",
         "text/markdown; charset=utf-8",

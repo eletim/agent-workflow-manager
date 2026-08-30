@@ -4,6 +4,7 @@ const stopButton = document.querySelector("#stop");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
 const stderr = document.querySelector("#stderr");
+const outputCopy = document.querySelector("#output-copy");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
@@ -16,6 +17,7 @@ const guideContent = document.querySelector("#guide-content");
 let timer = null;
 let requestToken = null;
 let guideText = null;
+let outputCopyResetTimer = null;
 
 function render(result) {
   const running = result.state === "running";
@@ -110,6 +112,26 @@ guideCopy.addEventListener("click", async () => {
   } catch (error) {
     guideContent.textContent = `${guideText || ""}\n\nCopy failed: ${error}`;
   }
+});
+
+outputCopy.addEventListener("click", async () => {
+  if (outputCopyResetTimer !== null) {
+    window.clearTimeout(outputCopyResetTimer);
+  }
+  try {
+    await runnerOutputClipboard.write(
+      navigator.clipboard,
+      stdout.textContent,
+      stderr.textContent,
+    );
+    outputCopy.textContent = "Copied";
+  } catch (error) {
+    outputCopy.textContent = "Copy failed";
+  }
+  outputCopyResetTimer = window.setTimeout(() => {
+    outputCopy.textContent = "Copy output";
+    outputCopyResetTimer = null;
+  }, 1200);
 });
 
 async function request(path, options = {}) {
