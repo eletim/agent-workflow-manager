@@ -38,14 +38,19 @@ emit_step("workspace create", "completed")</textarea>
         <ol id="progress" class="progress-list"></ol>
       </section>
 
-      <section class="outputs" aria-live="polite">
-        <div class="panel output-panel">
-          <h2>stdout</h2>
-          <pre id="stdout"></pre>
+      <section class="output-section" aria-live="polite">
+        <div class="output-actions">
+          <button id="output-copy">Copy output</button>
         </div>
-        <div class="panel output-panel stderr-panel">
-          <h2>stderr</h2>
-          <pre id="stderr"></pre>
+        <div class="outputs">
+          <div class="panel output-panel">
+            <h2>stdout</h2>
+            <pre id="stdout"></pre>
+          </div>
+          <div class="panel output-panel stderr-panel">
+            <h2>stderr</h2>
+            <pre id="stderr"></pre>
+          </div>
         </div>
       </section>
     </main>
@@ -61,6 +66,7 @@ emit_step("workspace create", "completed")</textarea>
       </div>
       <pre id="guide-content">Loading…</pre>
     </dialog>
+    <script src="/output-copy.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

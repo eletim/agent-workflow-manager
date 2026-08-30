@@ -103,8 +103,15 @@ a { color: #bcaaff; }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
-  margin-top: 14px;
 }
+
+.output-section { margin-top: 14px; }
+.output-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+.output-actions button { padding: 5px 10px; font-size: 12px; }
 
 .output-panel h2 { margin: 0 0 10px; }
 pre {

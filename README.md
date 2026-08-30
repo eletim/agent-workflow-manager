@@ -114,7 +114,8 @@ per-server request-token checks.
 
 ## Development
 
-Python 3.10 or later and `uv` are required.
+Python 3.10 or later, `uv`, and Node.js 18 or later are required. Node.js is
+used only for the browser JavaScript unit tests.
 
 ```bash
 make format

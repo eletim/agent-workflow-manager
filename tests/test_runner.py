@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -490,6 +491,37 @@ def test_runner_ui_has_workflow_guide_display_copy_and_raw_links(
     assert 'id="guide-copy"' in index
     assert 'fetch("/python-workflow-guide.md")' in script
     assert "navigator.clipboard.writeText" in script
+
+
+def test_runner_ui_has_output_copy_control_and_failure_feedback(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+
+    index_status, _, index = request_text(address, "/")
+    helper_status, _, helper = request_text(address, "/output-copy.js")
+    script_status, _, script = request_text(address, "/app.js")
+
+    assert index_status == 200
+    assert helper_status == 200
+    assert script_status == 200
+    assert 'id="run"' in index
+    assert 'id="stop"' in index
+    assert 'id="progress"' in index
+    assert 'id="stdout"' in index
+    assert 'id="stderr"' in index
+    assert 'id="guide-open"' in index
+    assert 'id="output-copy">Copy output' in index
+    assert 'src="/output-copy.js"' in index
+    assert "formatOutput" in helper
+    assert 'outputCopy.textContent = "Copied"' in script
+    assert 'outputCopy.textContent = "Copy failed"' in script
+
+
+def test_output_copy_browser_logic() -> None:
+    test_file = Path(__file__).with_name("test_output_copy.js")
+
+    subprocess.run(["node", "--test", str(test_file)], check=True)
 
 
 def test_http_status_includes_progress_events(
