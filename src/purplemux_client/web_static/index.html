@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local Python Runner</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">Trusted local development tool</p>
+          <h1>Python Runner</h1>
+        </div>
+        <span id="status" class="status idle">idle</span>
+      </header>
+
+      <section class="panel editor-panel">
+        <label for="code">Python</label>
+        <textarea id="code" spellcheck="false">from purplemux_client import PurpleMuxCLIClient
+
+print(PurpleMuxCLIClient.__name__)</textarea>
+        <div class="controls">
+          <button id="run" class="primary">Run</button>
+          <button id="stop" disabled>Stop</button>
+          <span id="exit-code">Exit code: —</span>
+        </div>
+      </section>
+
+      <section class="outputs" aria-live="polite">
+        <div class="panel output-panel">
+          <h2>stdout</h2>
+          <pre id="stdout"></pre>
+        </div>
+        <div class="panel output-panel stderr-panel">
+          <h2>stderr</h2>
+          <pre id="stderr"></pre>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
