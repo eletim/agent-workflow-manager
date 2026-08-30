@@ -8,6 +8,7 @@ from typing import Literal
 StepStatus = Literal["started", "completed", "failed"]
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
+MAX_PROGRESS_EVENT_BYTES = 4096
 _write_lock = threading.Lock()
 
 
@@ -64,6 +65,8 @@ def emit_step(
     encoded = (
         json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode()
+    if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
+        return
     with _write_lock:
         view = memoryview(encoded)
         while view:

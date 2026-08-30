@@ -14,9 +14,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import IO, Literal, cast
 
-from purplemux_client.progress import PROGRESS_FD_ENV, StepStatus
+from purplemux_client.progress import (
+    MAX_PROGRESS_EVENT_BYTES,
+    PROGRESS_FD_ENV,
+    StepStatus,
+)
 
 RunnerState = Literal["idle", "running", "success", "failed", "stopped"]
+DEFAULT_MAX_PROGRESS_EVENTS = 200
 
 
 @dataclass(frozen=True)
@@ -56,12 +61,18 @@ class PythonRunner:
     """Run one trusted local Python program at a time."""
 
     def __init__(
-        self, *, stop_timeout: float = 3.0, max_output_chars: int = 1_000_000
+        self,
+        *,
+        stop_timeout: float = 3.0,
+        max_output_chars: int = 1_000_000,
+        max_progress_events: int = DEFAULT_MAX_PROGRESS_EVENTS,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
         if max_output_chars < 1:
             raise ValueError("max_output_chars must be positive")
+        if max_progress_events < 1:
+            raise ValueError("max_progress_events must be positive")
         self._stop_timeout = stop_timeout
         self._max_output_chars = max_output_chars
         self._lock = threading.Lock()
@@ -80,7 +91,7 @@ class PythonRunner:
         self._run_id: int | None = None
         self._next_run_id = 1
         self._stop_requested = False
-        self._progress: list[ProgressEvent] = []
+        self._progress: deque[ProgressEvent] = deque(maxlen=max_progress_events)
 
     def start(self, code: str) -> int:
         with self._lock:
@@ -248,9 +259,15 @@ class PythonRunner:
 
     def _read_progress(self, fd: int) -> None:
         try:
-            with os.fdopen(fd, encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    event = self._parse_progress_event(line)
+            with os.fdopen(fd, "rb") as stream:
+                while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
+                    if len(line) > MAX_PROGRESS_EVENT_BYTES or not line.endswith(b"\n"):
+                        while line and not line.endswith(b"\n"):
+                            line = stream.readline(MAX_PROGRESS_EVENT_BYTES + 1)
+                        continue
+                    event = self._parse_progress_event(
+                        line.decode("utf-8", errors="replace")
+                    )
                     if event is not None:
                         with self._lock:
                             self._progress.append(event)

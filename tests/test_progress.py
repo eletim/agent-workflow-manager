@@ -6,7 +6,7 @@ import os
 import pytest
 
 from purplemux_client import emit_step
-from purplemux_client.progress import PROGRESS_FD_ENV
+from purplemux_client.progress import MAX_PROGRESS_EVENT_BYTES, PROGRESS_FD_ENV
 
 
 def test_emit_step_writes_one_json_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -45,6 +45,18 @@ def test_emit_step_is_noop_outside_runner(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv(PROGRESS_FD_ENV, raising=False)
 
     emit_step("ordinary script", "completed")
+
+
+def test_emit_step_drops_oversized_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_step("step", "failed", error="x" * MAX_PROGRESS_EVENT_BYTES)
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, "rb") as stream:
+        assert stream.read() == b""
 
 
 @pytest.mark.parametrize("status", ["pending", "retrying", "done"])

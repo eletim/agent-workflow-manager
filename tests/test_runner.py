@@ -157,6 +157,45 @@ def test_next_run_clears_previous_progress(runner: PythonRunner) -> None:
     assert result.progress == ()
 
 
+def test_progress_retains_only_configured_event_limit() -> None:
+    runner = PythonRunner(max_progress_events=3)
+    try:
+        runner.start(
+            "from purplemux_client import emit_step\n"
+            "for iteration in range(1, 6):\n"
+            '    emit_step("review", "completed", iteration=iteration)\n'
+        )
+        result = wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert [event.iteration for event in result.progress] == [3, 4, 5]
+
+
+def test_runner_discards_oversized_progress_line_and_reads_next_event(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        "import os\n"
+        "from purplemux_client import emit_step\n"
+        "from purplemux_client.progress import PROGRESS_FD_ENV\n"
+        "fd = int(os.environ[PROGRESS_FD_ENV])\n"
+        'os.write(fd, b"x" * 5000 + b"\\n")\n'
+        'emit_step("next", "completed")\n'
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert result.progress == (ProgressEvent("next", "completed"),)
+
+
+@pytest.mark.parametrize("max_progress_events", [0, -1])
+def test_progress_event_limit_must_be_positive(max_progress_events: int) -> None:
+    with pytest.raises(ValueError, match="max_progress_events must be positive"):
+        PythonRunner(max_progress_events=max_progress_events)
+
+
 def test_nonzero_exit(runner: PythonRunner) -> None:
     runner.start("raise SystemExit(3)")
 

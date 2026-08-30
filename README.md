@@ -89,6 +89,9 @@ emit_step("review", "failed", iteration=1, error="Tests failed")
 the step name and status, it accepts optional `iteration`, `attempt`, `message`,
 `error`, `workspace`, and `tab` values. Progress is observational only: the
 Runner does not infer workflow transitions or control the script from events.
+To keep observation bounded, the Runner retains the latest 200 events and each
+encoded event is limited to 4 KiB. Older events and oversized events are
+discarded without affecting workflow execution.
 
 ```bash
 make web
