@@ -1,0 +1,101 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #10131a;
+  color: #e8eaf0;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; }
+
+main {
+  width: min(1100px, calc(100% - 40px));
+  margin: 32px auto;
+}
+
+header, .controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+header { justify-content: space-between; }
+h1 { margin: 2px 0 18px; font-size: 28px; }
+h2, label { font-size: 14px; font-weight: 650; }
+.eyebrow { margin: 0; color: #9ba3b5; font-size: 12px; }
+
+.panel {
+  border: 1px solid #303746;
+  border-radius: 10px;
+  background: #171b24;
+  padding: 16px;
+}
+
+textarea, pre {
+  width: 100%;
+  color: #e8eaf0;
+  background: #0c0f15;
+  border: 1px solid #303746;
+  border-radius: 7px;
+  font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+textarea {
+  display: block;
+  min-height: 390px;
+  margin: 10px 0 14px;
+  padding: 14px;
+  resize: vertical;
+  tab-size: 4;
+}
+
+button {
+  padding: 8px 18px;
+  color: #e8eaf0;
+  background: #262c39;
+  border: 1px solid #3b4456;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button.primary { background: #6846d7; border-color: #8061e8; }
+button:disabled { cursor: default; opacity: 0.45; }
+#exit-code { margin-left: auto; color: #aab0bf; font-size: 13px; }
+
+.status {
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: #303746;
+  font: 12px ui-monospace, monospace;
+}
+
+.status.running { background: #513d12; color: #ffd66b; }
+.status.success { background: #163f2b; color: #75e2a8; }
+.status.failed, .status.stopped { background: #4b252b; color: #ff9ca8; }
+
+.outputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.output-panel h2 { margin: 0 0 10px; }
+pre {
+  min-height: 170px;
+  max-height: 330px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.stderr-panel pre { color: #ffb3bc; }
+
+@media (max-width: 760px) {
+  main { width: min(100% - 24px, 1100px); margin: 18px auto; }
+  .outputs { grid-template-columns: 1fr; }
+  textarea { min-height: 330px; }
+}
