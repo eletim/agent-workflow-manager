@@ -13,7 +13,10 @@
           <p class="eyebrow">Trusted local development tool</p>
           <h1>Python Runner</h1>
         </div>
-        <span id="status" class="status idle">idle</span>
+        <div class="header-actions">
+          <button id="guide-open">Workflow Guide</button>
+          <span id="status" class="status idle">idle</span>
+        </div>
       </header>
 
       <section class="panel editor-panel">
@@ -46,6 +49,18 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </section>
     </main>
+
+    <dialog id="guide-dialog" aria-labelledby="guide-title">
+      <div class="guide-toolbar">
+        <h2 id="guide-title">Workflow Guide</h2>
+        <div class="guide-actions">
+          <a href="/python-workflow-guide.md" target="_blank" rel="noopener">Raw</a>
+          <button id="guide-copy" disabled>Copy</button>
+          <button id="guide-close">Close</button>
+        </div>
+      </div>
+      <pre id="guide-content">Loading…</pre>
+    </dialog>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -103,6 +103,10 @@ Then open <http://127.0.0.1:8765>. To choose another local port:
 make web ARGS="--host 127.0.0.1 --port 9000"
 ```
 
+The Runner's **Workflow Guide** button displays and copies the packaged
+[`python-workflow-guide.md`](src/purplemux_client/web_static/python-workflow-guide.md),
+which is the plain Markdown contract for AI-generated workflow scripts.
+
 The UI has local trusted execution semantics: it is not a sandbox, provides no
 multi-user isolation, and must not be exposed to the public internet. It binds
 to `127.0.0.1` by default and protects mutations with Host, browser Origin, and

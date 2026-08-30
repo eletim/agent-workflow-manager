@@ -7,9 +7,15 @@ const stderr = document.querySelector("#stderr");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
+const guideDialog = document.querySelector("#guide-dialog");
+const guideOpen = document.querySelector("#guide-open");
+const guideClose = document.querySelector("#guide-close");
+const guideCopy = document.querySelector("#guide-copy");
+const guideContent = document.querySelector("#guide-content");
 
 let timer = null;
 let requestToken = null;
+let guideText = null;
 
 function render(result) {
   const running = result.state === "running";
@@ -74,6 +80,37 @@ function renderProgress(events) {
     progress.append(item);
   }
 }
+
+async function loadGuide() {
+  if (guideText !== null) return guideText;
+  const response = await fetch("/python-workflow-guide.md");
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  guideText = await response.text();
+  guideContent.textContent = guideText;
+  guideCopy.disabled = false;
+  return guideText;
+}
+
+guideOpen.addEventListener("click", async () => {
+  guideDialog.showModal();
+  try {
+    await loadGuide();
+  } catch (error) {
+    guideContent.textContent = `Could not load Workflow Guide: ${error}`;
+  }
+});
+
+guideClose.addEventListener("click", () => guideDialog.close());
+
+guideCopy.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(await loadGuide());
+    guideCopy.textContent = "Copied";
+    window.setTimeout(() => { guideCopy.textContent = "Copy"; }, 1200);
+  } catch (error) {
+    guideContent.textContent = `${guideText || ""}\n\nCopy failed: ${error}`;
+  }
+});
 
 async function request(path, options = {}) {
   if (options.method === "POST") {
