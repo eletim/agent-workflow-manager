@@ -1,8 +1,8 @@
 # Agent Workflow Manager
 
-Agent Workflow Manager is a lightweight runner/manager for AI-generated plain
-Python/Bash workflows. It executes, observes, and stops scripts; it does not
-define a workflow language or reproduce the state machine of another runtime.
+Agent Workflow Manager contains a thin PurpleMux CLI adapter and a trusted
+local UI for running arbitrary Python. It does not define a workflow language
+or reproduce the state machine of another runtime.
 
 This standalone project was initially migrated from
 `apps/purplemux-client` in an older LangGraph fork. LangGraph itself is not a
@@ -10,16 +10,13 @@ runtime dependency and none of its workflow framework is included here.
 
 ## Principles
 
-- A plain Python or Bash script is the Source of Truth.
+- Python code executed by the local runner remains plain Python.
 - There is no workflow DSL.
 - There are no graph semantics.
 - There is no duplicated workflow state machine.
 - External systems are used through public CLI or API contracts.
 - PurpleMux is an agent runtime.
-- This project executes, observes, and stops scripts.
-- Notification support may be added later; it is not implemented today.
-- Successful runtimes may be cleaned up.
-- Failed runtimes should remain inspectable where appropriate.
+- The local runner executes, observes, and stops Python processes.
 
 ## PurpleMux adapter
 

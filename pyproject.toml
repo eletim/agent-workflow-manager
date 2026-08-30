@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "purplemux-client"
 version = "0.1.0"
-description = "Lightweight runner and manager for AI-generated Python and Bash workflows."
+description = "PurpleMux CLI adapter and trusted local Python runner UI."
 authors = []
 requires-python = ">=3.10"
 readme = "README.md"
