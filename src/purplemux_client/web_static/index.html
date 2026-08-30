@@ -18,14 +18,21 @@
 
       <section class="panel editor-panel">
         <label for="code">Python</label>
-        <textarea id="code" spellcheck="false">from purplemux_client import PurpleMuxCLIClient
+        <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
-print(PurpleMuxCLIClient.__name__)</textarea>
+emit_step("workspace create", "started")
+emit_step("workspace create", "completed")</textarea>
         <div class="controls">
           <button id="run" class="primary">Run</button>
           <button id="stop" disabled>Stop</button>
           <span id="exit-code">Exit code: —</span>
         </div>
+      </section>
+
+      <section class="panel progress-panel" aria-live="polite">
+        <h2>Progress</h2>
+        <p id="progress-empty" class="empty-progress">No progress events.</p>
+        <ol id="progress" class="progress-list"></ol>
       </section>
 
       <section class="outputs" aria-live="polite">
