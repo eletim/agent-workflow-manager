@@ -76,29 +76,51 @@ The normal setup and startup path is:
 bash start.sh
 ```
 
-Run it from the repository root. The script verifies `uv` and `purplemux`,
-syncs locked Python dependencies, and starts the trusted local UI on
-`127.0.0.1:8765`. If the public `notify` CLI is missing, it downloads the
-installer and CLI source from
+Run it from the repository root. On the first run, the script copies the
+committed, secret-free `sample_config.sh` to the gitignored `config.sh`, walks
+through the short network setup, and saves the selected runtime settings.
+Later starts load that file without repeating setup questions. The script then
+validates the configuration, syncs locked Python dependencies, verifies `uv`
+and `purplemux`, and starts the UI at the configured URL.
+
+`config.sh` owns Agent Workflow Manager startup settings:
+
+```bash
+AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"
+AGENT_WORKFLOW_MANAGER_PORT="8765"
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="auto"
+NOTIFY_CONFIG="$HOME/.config/notify/config"
+```
+
+Edit `config.sh` to change a later startup. Do not put `NOTIFY_TOKEN` in it.
+The file named by `NOTIFY_CONFIG` is owned by the public `notify` CLI and is
+the sole persistent location for its server, topic, and credentials.
+
+If the public `notify` CLI is missing, `start.sh` downloads the installer and
+CLI source from
 [`eletim/notify-server`](https://github.com/eletim/notify-server) into a
 temporary directory and runs that repository's supported `install-cli.sh`.
 No notify-server implementation is copied into this project.
 
 ### Trusted-network browser access
 
-The default remains local-only at `http://127.0.0.1:8765`. To use the UI from
-another device, bind directly to one explicitly selected trusted interface
-IPv4 address, such as this machine's Tailscale IPv4 address:
+The default remains local-only at `http://127.0.0.1:8765`. During first-run
+setup, `start.sh` optionally runs `tailscale ip -4` as a convenience. If it
+finds one usable address, it offers to save that address in `config.sh`; if
+Tailscale is absent or unavailable, setup safely offers localhost instead.
+Tailscale is never required.
+
+To use another trusted LAN or interface address, decline the localhost prompt
+and enter its explicit IPv4 address, or later edit this value in `config.sh`:
 
 ```bash
-AGENT_WORKFLOW_MANAGER_HOST=100.x.y.z bash start.sh
+AGENT_WORKFLOW_MANAGER_HOST="192.168.50.20"
 ```
 
-No Tailscale CLI is needed when the address is supplied. The same mechanism
-can use a trusted LAN/interface IPv4 address. `start.sh` prints the exact
-browser URL and rejects hostnames, invalid addresses, and the wildcard
-`0.0.0.0`; it never invokes Tailscale Serve or Funnel and introduces no reverse
-proxy.
+`start.sh` prints the exact browser URL and rejects hostnames, invalid
+addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
+Funnel and introduces no reverse proxy. After configuration, normal startup is
+always simply `bash start.sh`.
 
 ```text
 browser on another trusted device
@@ -117,25 +139,24 @@ trust. Never use a public IP/interface, `0.0.0.0`, port forwarding, a public
 reverse proxy, Tailscale Funnel, or any other public-internet exposure.
 
 On an interactive terminal, a missing token can be entered without echo and
-is saved outside Git in `~/.config/notify/config`. Leaving it blank disables
-notifications without blocking Runner startup. To disable notification setup
-explicitly, or for unattended startup without notifications:
+is saved outside Git in the file selected by `NOTIFY_CONFIG` (by default
+`~/.config/notify/config`). Leaving it blank disables notifications without
+blocking Runner startup. To skip notification setup, set this in `config.sh`:
 
 ```bash
-AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=disabled bash start.sh
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="disabled"
 ```
 
 `NOTIFY_SERVER` and `NOTIFY_TOPIC` default to `https://eletim.jp` and `agents`.
-Supply `NOTIFY_TOKEN` through the external config or environment; never place
-it in the repository. Set `AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=1` to opt in
-to stopped-run notifications (success and failure are enabled after notify
-configuration succeeds).
+Supply `NOTIFY_TOKEN` through the notify CLI config or environment; never
+place it in `config.sh` or the repository. Set
+`AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=1` to opt in to stopped-run
+notifications (success and failure are enabled after notify configuration
+succeeds).
 
-Then open <http://127.0.0.1:8765>. To choose another local port:
-
-```bash
-make web ARGS="--host 127.0.0.1 --port 9000"
-```
+Open the URL printed under `Agent Workflow Manager:`. To choose another local
+port, edit `AGENT_WORKFLOW_MANAGER_PORT` in `config.sh` and run `bash start.sh`
+again.
 
 The UI has trusted execution semantics: it is not a sandbox, provides no
 multi-user isolation, and must not be exposed to the public internet. It binds

@@ -42,10 +42,21 @@ CLI contract and does not replace its runtime or access tmux directly.
 ## Browser access and network trust
 
 The safe default bind is `127.0.0.1`. Remote browser access is enabled only by
-setting `AGENT_WORKFLOW_MANAGER_HOST` to one explicit IPv4 address assigned to
-a trusted interface, typically the machine's Tailscale IPv4 or a trusted LAN
-address. Wildcard binding to `0.0.0.0` is rejected. This integration does not
-use Tailscale Serve, Tailscale Funnel, or any reverse proxy.
+setting `AGENT_WORKFLOW_MANAGER_HOST` in `config.sh` to one explicit IPv4
+address assigned to a trusted interface, typically the machine's Tailscale
+IPv4 or a trusted LAN address. Wildcard binding to `0.0.0.0` is rejected. This
+integration does not use Tailscale Serve, Tailscale Funnel, or any reverse
+proxy.
+
+`bash start.sh` is the normal startup command. If the gitignored `config.sh`
+does not exist, startup copies the committed, secret-free `sample_config.sh`,
+runs interactive setup, persists the selected values with owner-only file
+permissions, and continues startup. If it already exists, startup loads and
+validates it without repeating first-run questions. First-run setup may call
+`tailscale ip -4` to suggest one address, but this is optional detection only:
+failure or absence defaults safely to a localhost offer, and a user can enter
+another explicit trusted interface IPv4 manually. Startup never depends on
+the Tailscale CLI.
 
 The Runner derives the allowed HTTP Host and browser Origin from the actual
 configured bind address and port. GET requests require that Host. Browser POST
@@ -72,10 +83,11 @@ not drive workflow control flow and do not participate in orchestration.
 | `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
 | `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
 
-`AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal notifications.
+At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal notifications.
 `AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=1` additionally enables stopped
-notifications. `start.sh` sets the first value after setup; the second remains
-an explicit operator choice.
+notifications. In `config.sh`, the first setting is expressed as `auto`,
+`enabled`, or `disabled`; `start.sh` resolves it to the runtime boolean after
+notify setup. The second remains an explicit operator choice.
 
 Each enabled terminal notification has one attempt, an outer bounded timeout,
 and no retry loop. The CLI runs in its own process group, which is terminated
@@ -99,8 +111,13 @@ notify-server authentication behavior.
 
 ## Credentials and configuration
 
+Agent Workflow Manager runtime/startup configuration lives in the gitignored
+`config.sh`, initially generated from committed `sample_config.sh`. Its
+required values are the explicit host, port, notification mode, and
+`NOTIFY_CONFIG` path. It contains no notification credentials.
+
 Notify configuration lives outside Git at `~/.config/notify/config` by default
-(or the path selected by `NOTIFY_CONFIG`/`XDG_CONFIG_HOME`):
+(or the path selected by `NOTIFY_CONFIG`):
 
 ```text
 NOTIFY_SERVER=https://eletim.jp
@@ -109,6 +126,6 @@ NOTIFY_TOKEN=tk_...
 ```
 
 The server and topic shown above are defaults. The token is a secret and must
-never be hardcoded, committed, passed as a command argument, or printed.
-Credential storage and notification delivery belong to the notify CLI and
-Notify Server respectively.
+never be hardcoded, copied into `config.sh`, committed, passed as a command
+argument, or printed. Credential storage and notification delivery belong to
+the notify CLI and Notify Server respectively.
