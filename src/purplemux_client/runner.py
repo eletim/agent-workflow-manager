@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import logging
 import os
 import signal
 import subprocess
@@ -11,9 +12,18 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Literal, Protocol
+
+from purplemux_client.notifier import NotificationResult, TerminalState
 
 RunnerState = Literal["idle", "running", "success", "failed", "stopped"]
+logger = logging.getLogger(__name__)
+
+
+class TerminalNotifier(Protocol):
+    def notify_terminal(
+        self, *, run_id: int, state: TerminalState, exit_code: int | None
+    ) -> NotificationResult: ...
 
 
 class AlreadyRunningError(RuntimeError):
@@ -39,7 +49,11 @@ class PythonRunner:
     """Run one trusted local Python program at a time."""
 
     def __init__(
-        self, *, stop_timeout: float = 3.0, max_output_chars: int = 1_000_000
+        self,
+        *,
+        stop_timeout: float = 3.0,
+        max_output_chars: int = 1_000_000,
+        notifier: TerminalNotifier | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -63,6 +77,7 @@ class PythonRunner:
         self._run_id: int | None = None
         self._next_run_id = 1
         self._stop_requested = False
+        self._notifier = notifier
 
     def start(self, code: str) -> int:
         with self._lock:
@@ -232,9 +247,47 @@ class PythonRunner:
                 if exit_code == 0
                 else "failed"
             )
+            run_id = self._run_id
+            terminal_state = self._state
             self._process = None
             self._process_group_id = None
             self._script_path = None
+
+        self._notify_terminal(run_id=run_id, state=terminal_state, exit_code=exit_code)
+
+    def _notify_terminal(
+        self, *, run_id: int | None, state: RunnerState, exit_code: int
+    ) -> None:
+        notifier = self._notifier
+        if (
+            notifier is None
+            or run_id is None
+            or state
+            not in (
+                "success",
+                "failed",
+                "stopped",
+            )
+        ):
+            return
+        try:
+            result = notifier.notify_terminal(
+                run_id=run_id, state=state, exit_code=exit_code
+            )
+        except Exception:
+            logger.warning(
+                "Terminal notification failed for run %d (%s): notifier error",
+                run_id,
+                state,
+            )
+            return
+        if result.attempted and not result.delivered:
+            logger.warning(
+                "Terminal notification failed for run %d (%s): %s",
+                run_id,
+                state,
+                result.diagnostic,
+            )
 
     def _terminate_process_group(self, process_group_id: int) -> None:
         with self._group_cleanup_lock:

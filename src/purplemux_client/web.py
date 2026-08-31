@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from purplemux_client.notifier import NotifyCLI
 from purplemux_client.runner import AlreadyRunningError, PythonRunner
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -29,7 +30,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
-        self.runner = runner or PythonRunner()
+        self.runner = runner or PythonRunner(notifier=NotifyCLI.from_environment())
         self.request_token = secrets.token_urlsafe(32)
         bound_host, bound_port = cast(tuple[str, int], self.server_address)
         self.allowed_hosts = {

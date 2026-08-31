@@ -70,9 +70,33 @@ idle/running/success/failed/stopped state. Run and Stop operate on one script at
 a time. Stop and server shutdown clean up the script's POSIX process group,
 including child processes.
 
+The normal setup and startup path is:
+
 ```bash
-make web
+bash start.sh
 ```
+
+Run it from the repository root. The script verifies `uv` and `purplemux`,
+syncs locked Python dependencies, and starts the trusted local UI on
+`127.0.0.1:8765`. If the public `notify` CLI is missing, it clones
+[`eletim/notify-server`](https://github.com/eletim/notify-server) into a
+temporary directory and runs that repository's supported `install-cli.sh`.
+No notify-server implementation is copied into this project.
+
+On an interactive terminal, a missing token can be entered without echo and
+is saved outside Git in `~/.config/notify/config`. Leaving it blank disables
+notifications without blocking Runner startup. To disable notification setup
+explicitly, or for unattended startup without notifications:
+
+```bash
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=disabled bash start.sh
+```
+
+`NOTIFY_SERVER` and `NOTIFY_TOPIC` default to `https://eletim.jp` and `agents`.
+Supply `NOTIFY_TOKEN` through the external config or environment; never place
+it in the repository. Set `AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=1` to opt in
+to stopped-run notifications (success and failure are enabled after notify
+configuration succeeds).
 
 Then open <http://127.0.0.1:8765>. To choose another local port:
 
@@ -84,6 +108,11 @@ The UI has local trusted execution semantics: it is not a sandbox, provides no
 multi-user isolation, and must not be exposed to the public internet. It binds
 to `127.0.0.1` by default and protects mutations with Host, browser Origin, and
 per-server request-token checks.
+
+Terminal notifications are a best-effort observation side effect through
+`notify send`. The Python process alone determines success, failure, or stopped
+state; notify failures cannot change it. The complete ownership and message
+contract is in [the workflow/runtime specification](docs/workflow-runtime-spec.md).
 
 ## Development
 
