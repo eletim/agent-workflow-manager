@@ -78,7 +78,8 @@ bash start.sh
 
 Run it from the repository root. The script verifies `uv` and `purplemux`,
 syncs locked Python dependencies, and starts the trusted local UI on
-`127.0.0.1:8765`. If the public `notify` CLI is missing, it clones
+`127.0.0.1:8765`. If the public `notify` CLI is missing, it downloads the
+installer and CLI source from
 [`eletim/notify-server`](https://github.com/eletim/notify-server) into a
 temporary directory and runs that repository's supported `install-cli.sh`.
 No notify-server implementation is copied into this project.

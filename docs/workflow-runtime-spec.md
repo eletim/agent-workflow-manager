@@ -53,11 +53,13 @@ notifications. `start.sh` sets the first value after setup; the second remains
 an explicit operator choice.
 
 Each enabled terminal notification has one attempt, an outer bounded timeout,
-and no retry loop. Missing or disabled `notify`, timeout, process launch error,
-or nonzero CLI exit is recorded as a generic diagnostic. Notification stderr
-is not copied into Runner output or logs because an external command could
-include credentials there. Notification failure never mutates Runner state,
-the Python exit code, or the workflow result.
+and no retry loop. The CLI runs in its own process group, which is terminated
+and reaped as a unit if that outer timeout expires. Missing or disabled
+`notify`, timeout, process launch error, or nonzero CLI exit is recorded as a
+generic diagnostic. Notification stderr is not copied into Runner output or
+logs because an external command could include credentials there. Notification
+failure never mutates Runner state, the Python exit code, or the workflow
+result.
 
 The `notify` CLI is the integration boundary. It owns notify-server/ntfy HTTP,
 authentication, delivery configuration, and its internal request timeout.

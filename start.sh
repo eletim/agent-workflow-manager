@@ -32,13 +32,17 @@ uv sync --locked
 if [[ $notification_mode != 0 && $notification_mode != disabled && $notification_mode != false ]]; then
     require_command curl
     if ! command -v notify >/dev/null 2>&1; then
-        require_command git
         install_root=$(mktemp -d)
         cleanup_install() { rm -rf -- "$install_root"; }
         trap cleanup_install EXIT
         printf 'Installing the public notify CLI...\n'
-        git clone --depth 1 --quiet \
-            https://github.com/eletim/notify-server "$install_root/notify-server"
+        mkdir -p "$install_root/notify-server/bin"
+        curl --fail --silent --show-error --location \
+            --output "$install_root/notify-server/install-cli.sh" \
+            https://raw.githubusercontent.com/eletim/notify-server/main/install-cli.sh
+        curl --fail --silent --show-error --location \
+            --output "$install_root/notify-server/bin/notify" \
+            https://raw.githubusercontent.com/eletim/notify-server/main/bin/notify
         bash "$install_root/notify-server/install-cli.sh"
         trap - EXIT
         cleanup_install

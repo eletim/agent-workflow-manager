@@ -3,11 +3,35 @@ from __future__ import annotations
 import logging
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
 from purplemux_client.notifier import NotificationResult, NotifyCLI
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
+
+
+class FinishedProcess:
+    def __init__(self, return_code: int = 0) -> None:
+        self.pid = 12345
+        self.return_code = return_code
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.return_code
+
+
+def _record_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[list[str]],
+    *,
+    return_code: int = 0,
+) -> None:
+    def start(command: list[str], **kwargs: object) -> FinishedProcess:
+        calls.append(command)
+        assert kwargs["start_new_session"] is True
+        return FinishedProcess(return_code)
+
+    monkeypatch.setattr(subprocess, "Popen", start)
 
 
 def _wait_until_finished(runner: PythonRunner) -> RunnerSnapshot:
@@ -61,13 +85,7 @@ def test_stopped_notification_is_disabled_by_default(
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: (
-            calls.append(command) or subprocess.CompletedProcess(command, 0)
-        ),
-    )
+    _record_process_start(monkeypatch, calls)
     notifier = NotifyCLI(enabled=True)
 
     result = notifier.notify_terminal(run_id=4, state="stopped", exit_code=-15)
@@ -79,13 +97,7 @@ def test_stopped_notification_is_disabled_by_default(
 def test_stopped_notification_can_be_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: (
-            calls.append(command) or subprocess.CompletedProcess(command, 0)
-        ),
-    )
+    _record_process_start(monkeypatch, calls)
     notifier = NotifyCLI(enabled=True, notify_stopped=True)
 
     result = notifier.notify_terminal(run_id=4, state="stopped", exit_code=-15)
@@ -136,19 +148,19 @@ def test_disabled_notify_is_safe() -> None:
 
 
 def test_notify_failure_diagnostic_does_not_surface_secret(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     secret = "tk_super_secret_value"
     monkeypatch.setenv("NOTIFY_TOKEN", secret)
-    monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 2, stdout="", stderr=f"bad token: {secret}"
-        ),
+    executable = tmp_path / "notify"
+    executable.write_text(
+        f"#!/usr/bin/env bash\nprintf 'bad token: {secret}\\n' >&2\nexit 2\n",
+        encoding="utf-8",
     )
-    runner = PythonRunner(notifier=NotifyCLI(enabled=True))
+    executable.chmod(0o755)
+    runner = PythonRunner(notifier=NotifyCLI(enabled=True, executable=str(executable)))
 
     with caplog.at_level(logging.WARNING):
         try:
@@ -170,13 +182,7 @@ def test_notify_command_contains_required_success_message(
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: (
-            calls.append(command) or subprocess.CompletedProcess(command, 0)
-        ),
-    )
+    _record_process_start(monkeypatch, calls)
 
     NotifyCLI(enabled=True).notify_terminal(run_id=12, state="success", exit_code=0)
 
@@ -197,15 +203,43 @@ def test_notify_command_contains_required_failure_message(
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: (
-            calls.append(command) or subprocess.CompletedProcess(command, 0)
-        ),
-    )
+    _record_process_start(monkeypatch, calls)
 
     NotifyCLI(enabled=True).notify_terminal(run_id=13, state="failed", exit_code=9)
 
     assert "Workflow failed" in calls[0]
     assert "Run 13 finished with state: failed and exit code 9" in calls[0]
+
+
+def test_notify_timeout_kills_child_process_group(tmp_path: Path) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    executable = tmp_path / "notify"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 60 &\n"
+        f"printf '%s' \"$!\" >{child_pid_file!s}\n"
+        "wait\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = NotifyCLI(
+        enabled=True, executable=str(executable), timeout=0.2
+    ).notify_terminal(run_id=1, state="success", exit_code=0)
+
+    assert result == NotificationResult(True, False, "notify command timed out")
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and _process_is_live(child_pid):
+        time.sleep(0.02)
+    assert not _process_is_live(child_pid)
+
+
+def _process_is_live(pid: int) -> bool:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-o", "stat=", "-p", str(pid)], text=True
+        ).strip()
+    except subprocess.CalledProcessError:
+        return False
+    return bool(output) and not output.startswith("Z")

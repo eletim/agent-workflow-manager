@@ -97,24 +97,35 @@ def test_start_installs_missing_notify_with_supported_installer(
     tmp_path: Path,
 ) -> None:
     environment, call_log = _start_environment(tmp_path)
-    _executable(tmp_path / "bin" / "curl", "exit 0\n")
     _executable(
-        tmp_path / "bin" / "git",
+        tmp_path / "bin" / "curl",
         """
-printf 'git %s\n' "$*" >>"$START_CALL_LOG"
-destination=${@: -1}
-mkdir -p "$destination"
-cat >"$destination/install-cli.sh" <<'INSTALLER'
+printf 'curl %s\n' "$*" >>"$START_CALL_LOG"
+output=
+url=
+while (($#)); do
+    if [[ $1 == --output ]]; then
+        output=$2
+        shift 2
+    else
+        url=$1
+        shift
+    fi
+done
+if [[ $url == */install-cli.sh ]]; then
+cat >"$output" <<'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 mkdir -p "$HOME/.local/bin"
-cat >"$HOME/.local/bin/notify" <<'NOTIFY'
+install -m 0755 bin/notify "$HOME/.local/bin/notify"
+INSTALLER
+else
+cat >"$output" <<'NOTIFY'
 #!/usr/bin/env bash
 exit 0
 NOTIFY
-chmod +x "$HOME/.local/bin/notify"
-INSTALLER
-chmod +x "$destination/install-cli.sh"
+fi
 """,
     )
 
@@ -130,9 +141,11 @@ chmod +x "$destination/install-cli.sh"
 
     assert completed.returncode == 0
     calls = call_log.read_text(encoding="utf-8")
-    assert (
-        "git clone --depth 1 --quiet https://github.com/eletim/notify-server" in calls
-    )
+    assert "curl --fail --silent --show-error --location --output" in calls
+    assert "notify-server/main/install-cli.sh" in calls
+    assert "notify-server/main/bin/notify" in calls
+    assert "git " not in calls
+    assert "tar " not in calls
     assert (Path(environment["HOME"]) / ".local/bin/notify").is_file()
 
 

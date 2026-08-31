@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 from typing import Literal
@@ -57,20 +58,26 @@ class NotifyCLI:
 
         title, message = _terminal_message(run_id, state, exit_code)
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [executable, "send", "--title", title, "--message", message],
-                check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=self.timeout,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            return NotificationResult(True, False, "notify command timed out")
         except OSError:
             return NotificationResult(True, False, "notify command could not start")
-        if completed.returncode != 0:
+        try:
+            return_code = process.wait(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            return NotificationResult(True, False, "notify command timed out")
+        if return_code != 0:
             return NotificationResult(
-                True, False, f"notify exited with status {completed.returncode}"
+                True, False, f"notify exited with status {return_code}"
             )
         return NotificationResult(True, True, "notification sent")
 
