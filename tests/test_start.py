@@ -18,6 +18,7 @@ def _write_runtime_config(
     path: Path,
     *,
     host: str = "127.0.0.1",
+    host_aliases: str = "",
     port: str = "8765",
     notifications: str = "auto",
     notify_success: str = "true",
@@ -29,6 +30,7 @@ def _write_runtime_config(
         "\n".join(
             (
                 f"AGENT_WORKFLOW_MANAGER_HOST={shlex.quote(host)}",
+                f"AGENT_WORKFLOW_MANAGER_HOST_ALIASES={shlex.quote(host_aliases)}",
                 f"AGENT_WORKFLOW_MANAGER_PORT={shlex.quote(port)}",
                 f"AGENT_WORKFLOW_MANAGER_NOTIFICATIONS={shlex.quote(notifications)}",
                 f"AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS={shlex.quote(notify_success)}",
@@ -192,6 +194,7 @@ def test_missing_config_generates_persistent_runtime_config(tmp_path: Path) -> N
     assert config_file.stat().st_mode & 0o777 == 0o600
     config = config_file.read_text(encoding="utf-8")
     assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''" in config
     assert "AGENT_WORKFLOW_MANAGER_PORT=8765" in config
     assert "AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=auto" in config
     assert "AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=true" in config
@@ -238,6 +241,103 @@ def test_first_run_declines_detected_tailscale_ipv4(tmp_path: Path) -> None:
     assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config_file.read_text(
         encoding="utf-8"
     )
+
+
+def test_first_run_detects_and_accepts_magicdns_hostname(tmp_path: Path) -> None:
+    environment, call_log, config_file = _start_environment(
+        tmp_path, create_config=False
+    )
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+printf 'tailscale %s\n' "$*" >>"$START_CALL_LOG"
+if [[ $* == "ip -4" ]]; then
+    printf '100.70.80.90\n'
+elif [[ $* == "status --json" ]]; then
+    printf '%s\n' '{"Self":{"DNSName":"E-Ryzen.tail6bc726.ts.net."}}'
+else
+    exit 1
+fi
+""",
+    )
+    completed = _run_start(environment, input_text="\n\n")
+
+    assert completed.returncode == 0
+    config = config_file.read_text(encoding="utf-8")
+    assert "AGENT_WORKFLOW_MANAGER_HOST=100.70.80.90" in config
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in config
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" in completed.stdout
+    assert "tailscale status --json" in call_log.read_text(encoding="utf-8")
+
+
+def test_first_run_can_decline_detected_magicdns_hostname(tmp_path: Path) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+if [[ $* == "ip -4" ]]; then
+    printf '100.70.80.90\n'
+else
+    printf '%s\n' '{"Self":{"DNSName":"e-ryzen.tail6bc726.ts.net."}}'
+fi
+""",
+    )
+    completed = _run_start(environment, input_text="\nn\n")
+
+    assert completed.returncode == 0
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''" in config_file.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_existing_config_supports_manual_hostname_alias_without_tailscale(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="192.168.50.20",
+        host_aliases="runner.lan",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "http://192.168.50.20:8765" in completed.stdout
+    assert "http://runner.lan:8765" in completed.stdout
+    calls = call_log.read_text(encoding="utf-8")
+    assert "--host-aliases runner.lan" in calls
+    assert "tailscale" not in calls
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "*.ts.net",
+        "https://runner.ts.net",
+        "runner.ts.net/path",
+        "user@runner.ts.net",
+        "runner.ts.net?query",
+        "runner.ts.net\nforged",
+        "-runner.ts.net",
+        "runner..ts.net",
+        "100.70.80.90",
+    ],
+)
+def test_start_rejects_invalid_hostname_alias(tmp_path: Path, alias: str) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host_aliases=alias,
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    completed = _run_start(environment)
+
+    assert completed.returncode == 2
+    calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+    assert "uv run python -m purplemux_client.web" not in calls
 
 
 def test_first_run_without_tailscale_defaults_to_localhost(tmp_path: Path) -> None:

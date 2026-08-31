@@ -3,6 +3,8 @@
 # Notification credentials belong in NOTIFY_CONFIG, never in this file.
 
 AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"
+# Comma-separated exact DNS hostnames accepted by browser Host/Origin checks.
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES=""
 AGENT_WORKFLOW_MANAGER_PORT="8765"
 AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="auto"
 AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS="true"
