@@ -11,7 +11,12 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from purplemux_client.runner import AlreadyRunningError, PythonRunner, RunnerSnapshot
+from purplemux_client.runner import (
+    AlreadyRunningError,
+    PythonRunner,
+    RunnerClosedError,
+    RunnerSnapshot,
+)
 from purplemux_client.web import RunnerHTTPServer
 
 
@@ -156,6 +161,53 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
 
     assert result.stdout == "after stop\n"
     assert result.state == "success"
+
+
+def test_start_after_close_is_rejected() -> None:
+    runner = PythonRunner()
+    runner.close()
+
+    with pytest.raises(RunnerClosedError, match="Runner is closed"):
+        runner.start('print("must not start")')
+
+
+def test_close_cannot_miss_concurrent_start_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    popen_entered = threading.Event()
+    allow_popen = threading.Event()
+
+    def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        popen_entered.set()
+        assert allow_popen.wait(timeout=3)
+        return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", blocking_popen)
+    runner = PythonRunner(stop_timeout=0.5)
+    start_errors: list[BaseException] = []
+
+    def start_run() -> None:
+        try:
+            runner.start("import time; time.sleep(60)")
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    start_thread = threading.Thread(target=start_run)
+    start_thread.start()
+    assert popen_entered.wait(timeout=3)
+    close_thread = threading.Thread(target=runner.close)
+    close_thread.start()
+    allow_popen.set()
+    start_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not start_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert start_errors == []
+    assert runner.snapshot().state == "stopped"
+    with pytest.raises(RunnerClosedError):
+        runner.start("")
 
 
 def test_close_stops_process_group() -> None:

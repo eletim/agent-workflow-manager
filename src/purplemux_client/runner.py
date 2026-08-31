@@ -32,6 +32,10 @@ class AlreadyRunningError(RuntimeError):
     """Raised when a run is requested while another process is active."""
 
 
+class RunnerClosedError(AlreadyRunningError):
+    """Raised when a run is requested after Runner shutdown begins."""
+
+
 @dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
@@ -81,9 +85,12 @@ class PythonRunner:
         self._stop_requested = False
         self._notifier = notifier
         self._wait_threads: set[threading.Thread] = set()
+        self._closed = False
 
     def start(self, code: str) -> int:
         with self._lock:
+            if self._closed:
+                raise RunnerClosedError("the Python Runner is closed")
             if self._process is not None:
                 raise AlreadyRunningError("a Python process is already running")
 
@@ -124,28 +131,27 @@ class PythonRunner:
             self._run_id = run_id
             self._stop_requested = False
 
-        stdout_thread = threading.Thread(
-            target=self._read_stream,
-            args=(process.stdout, "stdout"),
-            name=f"python-runner-stdout-{run_id}",
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=self._read_stream,
-            args=(process.stderr, "stderr"),
-            name=f"python-runner-stderr-{run_id}",
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-        wait_thread = threading.Thread(
-            target=self._wait_for_process,
-            args=(process, script_path, stdout_thread, stderr_thread),
-            name=f"python-runner-wait-{run_id}",
-            daemon=True,
-        )
-        with self._lock:
+            stdout_thread = threading.Thread(
+                target=self._read_stream,
+                args=(process.stdout, "stdout"),
+                name=f"python-runner-stdout-{run_id}",
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=self._read_stream,
+                args=(process.stderr, "stderr"),
+                name=f"python-runner-stderr-{run_id}",
+                daemon=True,
+            )
+            wait_thread = threading.Thread(
+                target=self._wait_for_process,
+                args=(process, script_path, stdout_thread, stderr_thread),
+                name=f"python-runner-wait-{run_id}",
+                daemon=True,
+            )
             self._wait_threads.add(wait_thread)
+            stdout_thread.start()
+            stderr_thread.start()
             wait_thread.start()
         return run_id
 
@@ -171,14 +177,18 @@ class PythonRunner:
         return True
 
     def close(self) -> None:
-        self.stop()
         with self._lock:
+            self._closed = True
             process = self._process
+            process_group_id = self._process_group_id
+            if process is not None and process_group_id is not None:
+                self._stop_requested = True
+        if process_group_id is not None:
+            self._terminate_process_group(process_group_id)
         if process is not None:
             try:
                 process.wait(timeout=self._stop_timeout + 1)
             except subprocess.TimeoutExpired:
-                process_group_id = self._process_group_id
                 if process_group_id is not None:
                     self._kill_process_group(process_group_id)
                 process.wait()
