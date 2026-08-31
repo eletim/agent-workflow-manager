@@ -23,11 +23,6 @@ def emit_step(
     workspace: str | None = None,
     tab: str | None = None,
 ) -> None:
-    """Emit one progress event when running inside the local Python Runner.
-
-    Calls made outside the Runner are no-ops, so workflow scripts remain plain
-    Python and can still be run directly.
-    """
     if not isinstance(name, str) or not name.strip():
         raise ValueError("step name must be a non-empty string")
     if status not in ("started", "completed", "failed"):

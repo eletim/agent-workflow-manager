@@ -70,88 +70,185 @@ idle/running/success/failed/stopped state. Run and Stop operate on one script at
 a time. Stop and server shutdown clean up the script's POSIX process group,
 including child processes.
 
-Workflow scripts can explicitly report lightweight progress without changing
-their execution logic. Calls made outside the Runner are no-ops. Events from
-the latest execution remain visible after its process exits and are cleared by
-the next Run.
-
-```python
-from purplemux_client import emit_step
-
-emit_step("implementation", "started", workspace="ws-example", tab="tab-1")
-# Run the workflow's ordinary Python logic.
-emit_step("implementation", "completed")
-emit_step("review", "started", iteration=1, message="Checking the result")
-emit_step("review", "failed", iteration=1, error="Tests failed")
-```
-
-`emit_step` accepts only `started`, `completed`, and `failed`. In addition to
-the step name and status, it accepts optional `iteration`, `attempt`, `message`,
-`error`, `workspace`, and `tab` values. Progress is observational only: the
-Runner does not infer workflow transitions or control the script from events.
-To keep observation bounded, the Runner retains the latest 200 events and each
-encoded event is limited to 4 KiB. Older events and oversized events are
-discarded without affecting workflow execution.
-
-The recommended entry point resolves the bind configuration, prepares the
-workflow `PATH`, checks runtime dependencies, and launches the Runner:
+The normal setup and startup path is:
 
 ```bash
-./start.sh
+bash start.sh
 ```
 
-On the first run, enter the bind host and port at the prompts. Press Enter to
-accept the local-only defaults (`127.0.0.1:8765`). The answers are saved in the
-git-ignored `config.sh`; later runs only need `./start.sh`. If a required value
-is empty, only that value is prompted for again. See `sample_config.sh` for the
-minimal configuration shape.
+Run it from the repository root. On the first run, the script copies the
+committed, secret-free `sample_config.sh` to the gitignored `config.sh`, walks
+through the short network setup, and saves the selected runtime settings.
+Later starts load that file without repeating setup questions. The script then
+validates the configuration, syncs locked Python dependencies, verifies `uv`
+and `purplemux`, and starts the UI at the configured URL.
 
-To allow access from another device on the same VPN, set the host to the
-machine's specific VPN interface IP, for example:
+`config.sh` owns Agent Workflow Manager startup settings:
 
 ```bash
-AGENT_WORKFLOW_MANAGER_HOST="100.x.x.x"
+AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES=""
 AGENT_WORKFLOW_MANAGER_PORT="8765"
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="auto"
+AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS="true"
+AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE="true"
+AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED="false"
+NOTIFY_CONFIG="$HOME/.config/notify/config"
 ```
 
-Then use `http://100.x.x.x:8765` from the other VPN device. VPN setup is outside
-this project, and the Runner must not be exposed to the public internet. A
-specific VPN IP is preferred over a wildcard bind; the existing request-token,
-Host, Origin, JSON, and content-length protections remain active.
+Edit `config.sh` to change a later startup. Do not put `NOTIFY_TOKEN` in it.
+The file named by `NOTIFY_CONFIG` is owned by the public `notify` CLI and is
+the sole persistent location for its server, topic, and credentials.
 
-`start.sh` requires `purplemux`, `gh`, and `uv`. It preserves the existing
-`PATH`, adds `$HOME/.local/bin`, and optionally prepends
-`AGENT_WORKFLOW_MANAGER_PATH` from `config.sh`, so Runner workflow children see
-the same commands. If a dependency is missing, the script stops before starting
-the Runner and prints a detailed setup, PATH, and verification guide. It never
-installs dependencies, clones PurpleMux, creates command wrappers, or edits a
-shell profile.
+If the public `notify` CLI is missing, `start.sh` downloads the installer and
+CLI source from
+[`eletim/notify-server`](https://github.com/eletim/notify-server) into a
+temporary directory and runs that repository's supported `install-cli.sh`.
+No notify-server implementation is copied into this project.
 
-For direct development startup, you can still run:
+### Trusted-network browser access
+
+The default remains local-only at `http://127.0.0.1:8765`. During first-run
+setup, `start.sh` optionally runs `tailscale ip -4` as a convenience. If it
+finds one usable address, it offers to save that address in `config.sh`; if
+Tailscale is absent or unavailable, setup safely offers localhost instead.
+Tailscale is never required. Accepting a detected address selects it;
+declining that detected address selects localhost, as prompted.
+
+When no Tailscale address can be detected, declining the localhost prompt lets
+you enter another trusted LAN or interface IPv4 address. You can also later
+edit this value in `config.sh`:
 
 ```bash
-make web
+AGENT_WORKFLOW_MANAGER_HOST="192.168.50.20"
 ```
 
-Then open <http://127.0.0.1:8765>. To choose another local port:
+`start.sh` prints the exact browser URL and rejects hostnames as bind values,
+invalid addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
+Funnel and introduces no reverse proxy. After configuration, normal startup is
+always simply `bash start.sh`.
+
+The bind address and browser hostname trust are separate settings. The Runner
+still binds one explicit IPv4 from `AGENT_WORKFLOW_MANAGER_HOST`. Optional
+comma-separated `AGENT_WORKFLOW_MANAGER_HOST_ALIASES` values only extend the
+exact HTTP Host and Origin allowlist; they never affect the socket bind:
 
 ```bash
-make web ARGS="--host 127.0.0.1 --port 9000"
+AGENT_WORKFLOW_MANAGER_HOST="100.x.y.z"
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES="e-ryzen.tail6bc726.ts.net"
 ```
 
-The Runner's **Workflow Guide** button displays and copies the packaged
-[`python-workflow-guide.md`](src/purplemux_client/web_static/python-workflow-guide.md),
-which is the plain Markdown contract for AI-generated workflow scripts.
+When first-run setup detects and you accept a Tailscale IPv4, it also tries to
+detect the local MagicDNS name and offers to persist it as an alias. Both
+Tailscale checks are bounded optional conveniences: startup continues if either fails,
+and an exact LAN or MagicDNS hostname can be entered directly in `config.sh`
+without the Tailscale CLI. Aliases are normalized to lowercase DNS names and
+must not contain a scheme, port, path, query, user information, wildcard,
+whitespace, or control character. A trailing DNS root dot is removed. No
+`*.ts.net` or other suffix is implicitly trusted.
 
-The UI has local trusted execution semantics: it is not a sandbox, provides no
+Existing installations are migrated without manual editing. When
+`bash start.sh` loads an existing `config.sh` with a non-loopback IPv4 bind and no
+hostname aliases, it performs the same bounded MagicDNS detection and offers
+to allow that exact hostname. Accepting atomically appends one effective
+`AGENT_WORKFLOW_MANAGER_HOST_ALIASES` assignment; all existing configuration
+text remains intact. Runtime config writers share a sidecar lock and the
+migration refuses a stale replacement rather than losing a concurrent update.
+Declining or failed detection leaves the file unchanged and startup continues.
+An already configured alias or explicit environment override skips detection
+and the migration prompt.
+
+For compatibility and one-off launches, explicit environment values override
+the corresponding saved values for that process without rewriting
+`config.sh`; for example,
+`AGENT_WORKFLOW_MANAGER_HOST=100.x.y.z bash start.sh`. Persistent changes
+belong in `config.sh`.
+
+```text
+browser on another trusted device
+  -> http://<explicit trusted IPv4 or configured hostname>:8765
+  -> DNS / MagicDNS (for a hostname)
+  -> <explicit bound IPv4>:8765
+  -> Agent Workflow Manager Runner UI
+```
+
+The configured address, exact aliases, and port are the only accepted remote
+HTTP Host and browser Origin combinations. `start.sh` prints the direct IP URL
+and every configured alias URL. Unknown Hosts and Origins remain rejected, and
+every mutation still requires the per-server request token. Network access is
+an outer trust boundary, not a replacement for these checks.
+
+This UI executes arbitrary trusted Python and is not a sandbox or multi-user
+service. Bind only to an interface whose network and connected devices you
+trust. Never use a public IP/interface, `0.0.0.0`, port forwarding, a public
+reverse proxy, Tailscale Funnel, or any other public-internet exposure.
+
+### Notification settings
+
+Open **Settings → Notifications** in the Runner UI for day-to-day notification
+configuration. The compact panel can enable notifications, select success,
+failure, and stopped terminal states, edit the notify server and topic, report
+credentials as only `Configured` or `Missing`, replace the token through a
+write-only password field, and send a real test notification.
+
+Policy is split deliberately between two files:
+
+- Gitignored repository `config.sh` owns whether notifications are enabled and
+  the success/failure/stopped policy.
+- The external file selected by `NOTIFY_CONFIG` owns `NOTIFY_SERVER`,
+  `NOTIFY_TOPIC`, and `NOTIFY_TOKEN` for the public `notify` CLI.
+
+Saving the notification policy updates the active notifier immediately and
+persists it atomically; no workflow or Runner restart is required. Server,
+topic, and an optional replacement token are atomically written to the notify
+CLI config with owner-only permissions. The existing token is never returned,
+displayed, logged, or copied into `config.sh`.
+
+Explicit `NOTIFY_SERVER`, `NOTIFY_TOPIC`, or `NOTIFY_TOKEN` values inherited by
+the Runner process keep the public notify CLI's normal precedence and are
+reflected in the displayed effective settings. After a UI save, the validated
+saved server/topic and any replacement token take precedence immediately for
+this Runner process as well as being persisted to the notify CLI config.
+
+The test button invokes only `notify send --title "Agent Workflow Manager"
+--message "Test notification"`. It uses a bounded timeout and no retries, and
+returns only a sanitized actionable result. It never reads or changes the
+Python Runner state. Both settings mutation and test-send use the same exact
+Host, matching Origin, and per-server request-token checks as Run and Stop.
+
+On an interactive terminal, a missing token can be entered without echo and
+is saved outside Git in the file selected by `NOTIFY_CONFIG` (by default
+`~/.config/notify/config`). Leaving it blank disables notifications without
+blocking Runner startup. To skip notification setup, set this in `config.sh`:
+
+```bash
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="disabled"
+```
+
+`NOTIFY_SERVER` and `NOTIFY_TOPIC` default to `https://eletim.jp` and `agents`.
+Supply `NOTIFY_TOKEN` through the notify CLI config or environment; never
+place it in `config.sh` or the repository. Success and failure notifications
+default on, while stopped notifications default off; the Settings panel or
+the corresponding `config.sh` values control each policy.
+
+Open the URL printed under `Agent Workflow Manager:`. To choose another local
+port, edit `AGENT_WORKFLOW_MANAGER_PORT` in `config.sh` and run `bash start.sh`
+again.
+
+The UI has trusted execution semantics: it is not a sandbox, provides no
 multi-user isolation, and must not be exposed to the public internet. It binds
-to `127.0.0.1` by default and protects mutations with Host, browser Origin, and
-per-server request-token checks.
+to `127.0.0.1` by default and only permits an explicitly selected IPv4 address
+for remote use. Host, browser Origin, and per-server request-token checks stay
+enabled in both modes.
+
+Terminal notifications are a best-effort observation side effect through
+`notify send`. The Python process alone determines success, failure, or stopped
+state; notify failures cannot change it. The complete ownership and message
+contract is in [the workflow/runtime specification](docs/workflow-runtime-spec.md).
 
 ## Development
 
-Python 3.10 or later, `uv`, and Node.js 18 or later are required. Node.js is
-used only for the browser JavaScript unit tests.
+Python 3.10 or later and `uv` are required.
 
 ```bash
 make format

@@ -6,20 +6,15 @@
 }
 
 * { box-sizing: border-box; }
-
 body { margin: 0; }
+main { width: min(1100px, calc(100% - 40px)); margin: 32px auto; }
 
-main {
-  width: min(1100px, calc(100% - 40px));
-  margin: 32px auto;
-}
-
-header, .controls, .header-actions, .guide-toolbar, .guide-actions {
+header, .controls, .header-actions, .guide-toolbar, .guide-actions,
+.settings-heading, .settings-actions {
   display: flex;
   align-items: center;
   gap: 12px;
 }
-
 header { justify-content: space-between; }
 .header-actions { align-self: flex-start; }
 h1 { margin: 2px 0 18px; font-size: 28px; }
@@ -33,7 +28,7 @@ h2, label { font-size: 14px; font-weight: 650; }
   padding: 16px;
 }
 
-textarea, pre {
+textarea, pre, input[type="text"], input[type="url"], input[type="password"] {
   width: 100%;
   color: #e8eaf0;
   background: #0c0f15;
@@ -41,7 +36,11 @@ textarea, pre {
   border-radius: 7px;
   font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
-
+input[type="text"], input[type="url"], input[type="password"] {
+  min-width: 0;
+  padding: 8px 10px;
+  font-family: inherit;
+}
 textarea {
   display: block;
   min-height: 390px;
@@ -50,7 +49,6 @@ textarea {
   resize: vertical;
   tab-size: 4;
 }
-
 button {
   padding: 8px 18px;
   color: #e8eaf0;
@@ -59,7 +57,6 @@ button {
   border-radius: 6px;
   cursor: pointer;
 }
-
 button.primary { background: #6846d7; border-color: #8061e8; }
 button:disabled { cursor: default; opacity: 0.45; }
 a { color: #bcaaff; }
@@ -71,7 +68,6 @@ a { color: #bcaaff; }
   background: #303746;
   font: 12px ui-monospace, monospace;
 }
-
 .status.running { background: #513d12; color: #ffd66b; }
 .status.success { background: #163f2b; color: #75e2a8; }
 .status.failed, .status.stopped { background: #4b252b; color: #ff9ca8; }
@@ -99,20 +95,14 @@ a { color: #bcaaff; }
 .progress-note, .progress-reference { color: #9ba3b5; font-size: 12px; }
 .progress-item.failed .progress-note { color: #ffb3bc; }
 
+.output-section { margin-top: 14px; }
+.output-actions { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.output-actions button { padding: 5px 10px; font-size: 12px; }
 .outputs {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
 }
-
-.output-section { margin-top: 14px; }
-.output-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-bottom: 8px;
-}
-.output-actions button { padding: 5px 10px; font-size: 12px; }
-
 .output-panel h2 { margin: 0 0 10px; }
 pre {
   min-height: 170px;
@@ -123,7 +113,6 @@ pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-
 .stderr-panel pre { color: #ffb3bc; }
 
 dialog {
@@ -150,8 +139,44 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   border-radius: 0;
 }
 
+.settings-panel { margin-top: 14px; }
+.settings-panel summary { cursor: pointer; font-weight: 650; }
+.settings-panel[open] summary { margin-bottom: 18px; }
+.settings-heading { justify-content: space-between; }
+.settings-heading h2 { margin: 0 0 4px; }
+.settings-heading p { margin: 0; color: #9ba3b5; font-size: 13px; }
+.credential {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.credential.configured { background: #163f2b; color: #75e2a8; }
+.credential.missing { background: #4b252b; color: #ff9ca8; }
+.toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(4, max-content);
+  gap: 12px 24px;
+  margin: 18px 0;
+}
+.toggle-grid label { font-weight: 500; }
+.field-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(180px, 1fr);
+  align-items: center;
+  gap: 10px 14px;
+}
+.settings-actions { margin-top: 16px; }
+#settings-message { color: #aab0bf; font-size: 13px; }
+#settings-message.error { color: #ff9ca8; }
+#settings-message.success-message { color: #75e2a8; }
+
 @media (max-width: 760px) {
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
   .outputs { grid-template-columns: 1fr; }
   textarea { min-height: 330px; }
+  .settings-heading { align-items: flex-start; }
+  .toggle-grid { grid-template-columns: 1fr 1fr; }
+  .field-grid { grid-template-columns: 1fr; }
+  .settings-actions { align-items: stretch; flex-direction: column; }
 }

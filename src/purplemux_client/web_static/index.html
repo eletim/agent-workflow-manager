@@ -53,6 +53,38 @@ emit_step("workspace create", "completed")</textarea>
           </div>
         </div>
       </section>
+
+      <details class="panel settings-panel">
+        <summary>Settings</summary>
+        <form id="notification-settings">
+          <div class="settings-heading">
+            <div>
+              <h2>Notifications</h2>
+              <p>Terminal-state policy and notify CLI delivery settings.</p>
+            </div>
+            <span id="credential-status" class="credential missing">Credentials: Missing</span>
+          </div>
+          <div class="toggle-grid">
+            <label><input id="notifications-enabled" type="checkbox"> Enabled</label>
+            <label><input id="notify-success" type="checkbox"> On success</label>
+            <label><input id="notify-failure" type="checkbox"> On failure</label>
+            <label><input id="notify-stopped" type="checkbox"> On stopped</label>
+          </div>
+          <div class="field-grid">
+            <label for="notify-server">Server</label>
+            <input id="notify-server" type="url" required autocomplete="url">
+            <label for="notify-topic">Topic</label>
+            <input id="notify-topic" type="text" required maxlength="64" pattern="[A-Za-z0-9_-]+">
+            <label for="replacement-token">Replace token</label>
+            <input id="replacement-token" type="password" autocomplete="new-password" placeholder="Leave blank to keep existing token">
+          </div>
+          <div class="settings-actions">
+            <button id="save-settings" type="submit" class="primary">Save settings</button>
+            <button id="test-notification" type="button">Send test notification</button>
+            <span id="settings-message" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </details>
     </main>
 
     <dialog id="guide-dialog" aria-labelledby="guide-title">
@@ -66,6 +98,7 @@ emit_step("workspace create", "completed")</textarea>
       </div>
       <pre id="guide-content">Loading…</pre>
     </dialog>
+
     <script src="/output-copy.js"></script>
     <script src="/app.js"></script>
   </body>

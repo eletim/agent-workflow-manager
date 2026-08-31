@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
+import os
+import re
 import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +12,12 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from purplemux_client.notification_settings import (
+    NotificationSettings,
+    SettingsError,
+    SettingsValidationError,
+)
+from purplemux_client.notifier import NotifyCLI
 from purplemux_client.runner import AlreadyRunningError, PythonRunner
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -22,6 +31,83 @@ STATIC_FILES = {
     ),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _parse_ipv4_number(value: str) -> int | None:
+    base = 10
+    digits = value
+    if value.lower().startswith("0x"):
+        base = 16
+        digits = value[2:]
+    elif len(value) > 1 and value.startswith("0"):
+        base = 8
+        digits = value[1:]
+    if not digits and base == 16:
+        return 0
+    if not digits:
+        return None
+    valid_digits = {
+        8: re.compile(r"[0-7]+"),
+        10: re.compile(r"[0-9]+"),
+        16: re.compile(r"[0-9a-fA-F]+"),
+    }
+    if valid_digits[base].fullmatch(digits) is None:
+        return None
+    return int(digits, base)
+
+
+def _looks_like_browser_ipv4(value: str) -> bool:
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 4:
+        return False
+    numbers = [_parse_ipv4_number(part) for part in parts]
+    if any(number is None for number in numbers):
+        return False
+    parsed_numbers = cast(list[int], numbers)
+    if any(number > 255 for number in parsed_numbers[:-1]):
+        return False
+    return parsed_numbers[-1] < 256 ** (5 - len(parsed_numbers))
+
+
+def normalize_host_alias(value: str) -> str:
+    """Validate and canonicalize one exact DNS hostname alias."""
+    if not value or value != value.strip():
+        raise ValueError("hostname alias must not be empty or contain whitespace")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("hostname alias must not contain control characters")
+    if "*" in value:
+        raise ValueError("wildcard hostname aliases are not allowed")
+    if value.endswith("."):
+        value = value[:-1]
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "hostname alias must contain only ASCII DNS characters"
+        ) from exc
+    normalized = value.lower()
+    if not normalized or len(normalized) > 253:
+        raise ValueError("hostname alias must be between 1 and 253 characters")
+    if _looks_like_browser_ipv4(normalized):
+        raise ValueError("hostname alias must be a DNS hostname, not an IP address")
+    if any(HOST_LABEL.fullmatch(label) is None for label in normalized.split(".")):
+        raise ValueError("hostname alias contains an invalid DNS label")
+    return normalized
+
+
+def _parse_host_aliases(value: str) -> tuple[str, ...]:
+    if value == "":
+        return ()
+    aliases: list[str] = []
+    try:
+        for alias in value.split(","):
+            normalized = normalize_host_alias(alias)
+            if normalized not in aliases:
+                aliases.append(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return tuple(aliases)
 
 
 class RunnerHTTPServer(ThreadingHTTPServer):
@@ -31,10 +117,31 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         runner: PythonRunner | None = None,
+        notification_settings: NotificationSettings | None = None,
+        host_aliases: tuple[str, ...] = (),
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
-        self.runner = runner or PythonRunner()
+        notifier = (
+            NotifyCLI.from_environment()
+            if runner is None or notification_settings is None
+            else None
+        )
+        self.runner = runner or PythonRunner(notifier=notifier)
+        self.notification_settings = notification_settings or NotificationSettings(
+            runtime_config=Path(
+                os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")
+            ),
+            notify_config=Path(
+                os.environ.get(
+                    "NOTIFY_CONFIG", str(Path.home() / ".config/notify/config")
+                )
+            ),
+            notifier=cast(NotifyCLI, notifier),
+        )
+        self._settings_notifier = (
+            notifier if runner is not None and notification_settings is None else None
+        )
         self.request_token = secrets.token_urlsafe(32)
         bound_host, bound_port = cast(tuple[str, int], self.server_address)
         self.allowed_hosts = {
@@ -43,12 +150,68 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         }
         if bound_host == "127.0.0.1":
             self.allowed_hosts.add(f"localhost:{bound_port}")
+        self.host_aliases = frozenset(
+            normalize_host_alias(alias) for alias in host_aliases
+        )
+        self.allowed_hosts.update(
+            f"{alias}:{bound_port}" for alias in self.host_aliases
+        )
 
     def is_allowed_host(self, host: str | None) -> bool:
-        return host in self.allowed_hosts
+        return self._canonical_authority(host) is not None
+
+    def is_allowed_origin(self, origin: str | None, host: str | None) -> bool:
+        if origin is None:
+            return True
+        if any(ord(character) < 32 or ord(character) == 127 for character in origin):
+            return False
+        if "?" in origin or "#" in origin:
+            return False
+        try:
+            parsed = urlparse(origin)
+        except ValueError:
+            return False
+        if (
+            parsed.scheme != "http"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or parsed.hostname is None
+        ):
+            return False
+        try:
+            origin_port = parsed.port
+        except ValueError:
+            return False
+        if origin_port is None:
+            return False
+        return self._canonical_authority(host) == self._canonical_authority(
+            f"{parsed.hostname}:{origin_port}"
+        )
+
+    def _canonical_authority(self, authority: str | None) -> str | None:
+        if authority in self.allowed_hosts:
+            return authority
+        if authority is None or authority.count(":") != 1:
+            return None
+        hostname, port = authority.rsplit(":", 1)
+        if port != str(self.server_address[1]):
+            return None
+        try:
+            normalized = normalize_host_alias(hostname)
+        except ValueError:
+            return None
+        if normalized not in self.host_aliases:
+            return None
+        return f"{normalized}:{port}"
 
     def server_close(self) -> None:
         self.runner.close()
+        if self._settings_notifier is not None:
+            self._settings_notifier.close()
         super().server_close()
 
 
@@ -65,6 +228,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             return
         if path in {"/api/status", "/api/output"}:
             self._send_json(HTTPStatus.OK, self.server.runner.snapshot().as_json())
+            return
+        if path == "/api/settings/notifications":
+            try:
+                settings = self.server.notification_settings.read()
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings.as_json())
             return
         static_file = STATIC_FILES.get(path)
         if static_file is None:
@@ -86,7 +257,12 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if not self._is_trusted_request(require_json=path == "/api/run"):
+        json_paths = {
+            "/api/run",
+            "/api/settings/notifications",
+            "/api/settings/notifications/test",
+        }
+        if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
             return
         if path == "/api/run":
@@ -119,6 +295,40 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/settings/notifications":
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                settings = self.server.notification_settings.update(payload)
+            except SettingsValidationError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings.as_json())
+            return
+        if path == "/api/settings/notifications/test":
+            payload = self._read_json()
+            if payload is None:
+                return
+            if payload:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "test notification request must be empty"},
+                )
+                return
+            try:
+                result = self.server.notification_settings.send_test()
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            if result.delivered:
+                self._send_json(HTTPStatus.OK, result.as_json())
+            else:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": result.message})
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def _is_trusted_request(self, *, require_json: bool) -> bool:
@@ -130,10 +340,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             return False
         if self.headers.get("X-Python-Runner-Token") != self.server.request_token:
             return False
-        origin = self.headers.get("Origin")
-        if origin is None:
-            return True
-        return origin == f"http://{host}"
+        return self.server.is_allowed_origin(self.headers.get("Origin"), host)
 
     def _read_json(self) -> dict[str, Any] | None:
         try:
@@ -165,18 +372,60 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         return
 
 
+def _parse_bind_host(value: str) -> str:
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "host must be an explicit IPv4 interface address"
+        ) from exc
+    if address.is_unspecified:
+        raise argparse.ArgumentTypeError("host must not be the wildcard 0.0.0.0")
+    return str(address)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local trusted Python runner UI")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser = argparse.ArgumentParser(description="Trusted Python runner UI")
+    parser.add_argument("--host", default="127.0.0.1", type=_parse_bind_host)
     parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument(
+        "--host-aliases",
+        default=(),
+        type=_parse_host_aliases,
+        help="comma-separated exact trusted browser hostnames",
+    )
+    parser.add_argument(
+        "--runtime-config",
+        default=Path(os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")),
+        type=Path,
+    )
+    parser.add_argument(
+        "--notify-config",
+        default=Path(
+            os.environ.get("NOTIFY_CONFIG", str(Path.home() / ".config/notify/config"))
+        ),
+        type=Path,
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    server = RunnerHTTPServer((args.host, args.port))
+    notifier = NotifyCLI.from_environment()
+    notifier.config_path = str(args.notify_config)
+    notification_settings = NotificationSettings(
+        runtime_config=args.runtime_config,
+        notify_config=args.notify_config,
+        notifier=notifier,
+    )
+    server = RunnerHTTPServer(
+        (args.host, args.port),
+        runner=PythonRunner(notifier=notifier),
+        notification_settings=notification_settings,
+        host_aliases=args.host_aliases,
+    )
     print(f"Python Runner UI: http://{args.host}:{args.port}")
-    print("Trusted local use only: this server executes arbitrary Python code.")
+    print("Trusted-network use only: this server executes arbitrary Python code.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -4,3 +4,4 @@ __pycache__/
 .uv-cache/
 .venv/
 config.sh
+.config.sh.lock

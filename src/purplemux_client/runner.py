@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -12,8 +13,9 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import IO, Literal, cast
+from typing import IO, Literal, Protocol, cast
 
+from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
@@ -22,6 +24,15 @@ from purplemux_client.progress import (
 
 RunnerState = Literal["idle", "running", "success", "failed", "stopped"]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
+logger = logging.getLogger(__name__)
+
+
+class TerminalNotifier(Protocol):
+    def notify_terminal(
+        self, *, run_id: int, state: TerminalState, exit_code: int | None
+    ) -> NotificationResult: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,10 @@ class ProgressEvent:
 
 class AlreadyRunningError(RuntimeError):
     """Raised when a run is requested while another process is active."""
+
+
+class RunnerClosedError(AlreadyRunningError):
+    """Raised when a run is requested after Runner shutdown begins."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +81,7 @@ class PythonRunner:
         stop_timeout: float = 3.0,
         max_output_chars: int = 1_000_000,
         max_progress_events: int = DEFAULT_MAX_PROGRESS_EVENTS,
+        notifier: TerminalNotifier | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -91,10 +107,15 @@ class PythonRunner:
         self._run_id: int | None = None
         self._next_run_id = 1
         self._stop_requested = False
+        self._notifier = notifier
+        self._wait_threads: set[threading.Thread] = set()
+        self._closed = False
         self._progress: deque[ProgressEvent] = deque(maxlen=max_progress_events)
 
     def start(self, code: str) -> int:
         with self._lock:
+            if self._closed:
+                raise RunnerClosedError("the Python Runner is closed")
             if self._process is not None:
                 raise AlreadyRunningError("a Python process is already running")
 
@@ -145,39 +166,41 @@ class PythonRunner:
             self._stop_requested = False
             self._progress.clear()
 
-        stdout_thread = threading.Thread(
-            target=self._read_stream,
-            args=(process.stdout, "stdout"),
-            name=f"python-runner-stdout-{run_id}",
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=self._read_stream,
-            args=(process.stderr, "stderr"),
-            name=f"python-runner-stderr-{run_id}",
-            daemon=True,
-        )
-        progress_thread = threading.Thread(
-            target=self._read_progress,
-            args=(progress_read_fd,),
-            name=f"python-runner-progress-{run_id}",
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-        progress_thread.start()
-        threading.Thread(
-            target=self._wait_for_process,
-            args=(
-                process,
-                script_path,
-                stdout_thread,
-                stderr_thread,
-                progress_thread,
-            ),
-            name=f"python-runner-wait-{run_id}",
-            daemon=True,
-        ).start()
+            stdout_thread = threading.Thread(
+                target=self._read_stream,
+                args=(process.stdout, "stdout"),
+                name=f"python-runner-stdout-{run_id}",
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=self._read_stream,
+                args=(process.stderr, "stderr"),
+                name=f"python-runner-stderr-{run_id}",
+                daemon=True,
+            )
+            progress_thread = threading.Thread(
+                target=self._read_progress,
+                args=(progress_read_fd,),
+                name=f"python-runner-progress-{run_id}",
+                daemon=True,
+            )
+            wait_thread = threading.Thread(
+                target=self._wait_for_process,
+                args=(
+                    process,
+                    script_path,
+                    stdout_thread,
+                    stderr_thread,
+                    progress_thread,
+                ),
+                name=f"python-runner-wait-{run_id}",
+                daemon=True,
+            )
+            self._wait_threads.add(wait_thread)
+            stdout_thread.start()
+            stderr_thread.start()
+            progress_thread.start()
+            wait_thread.start()
         return run_id
 
     def snapshot(self) -> RunnerSnapshot:
@@ -203,17 +226,39 @@ class PythonRunner:
         return True
 
     def close(self) -> None:
-        self.stop()
         with self._lock:
+            self._closed = True
             process = self._process
+            process_group_id = self._process_group_id
+            if process is not None and process_group_id is not None:
+                self._stop_requested = True
+        if process_group_id is not None:
+            self._terminate_process_group(process_group_id)
         if process is not None:
             try:
                 process.wait(timeout=self._stop_timeout + 1)
             except subprocess.TimeoutExpired:
-                process_group_id = self._process_group_id
                 if process_group_id is not None:
                     self._kill_process_group(process_group_id)
                 process.wait()
+        notifier = self._notifier
+        if notifier is not None:
+            try:
+                notifier.close()
+            except Exception:
+                logger.warning("Failed to close terminal notifier")
+        current_thread = threading.current_thread()
+        while True:
+            with self._lock:
+                wait_threads = tuple(
+                    thread
+                    for thread in self._wait_threads
+                    if thread is not current_thread
+                )
+            if not wait_threads:
+                break
+            for thread in wait_threads:
+                thread.join()
 
     def _read_stream(
         self, stream: IO[bytes] | None, destination: Literal["stdout", "stderr"]
@@ -324,26 +369,70 @@ class PythonRunner:
         stderr_thread: threading.Thread,
         progress_thread: threading.Thread,
     ) -> None:
-        exit_code = process.wait()
-        self._terminate_process_group(process.pid)
-        stdout_thread.join()
-        stderr_thread.join()
-        progress_thread.join()
-        script_path.unlink(missing_ok=True)
-        with self._lock:
-            if self._process is not process:
-                return
-            self._exit_code = exit_code
-            self._state = (
-                "stopped"
-                if self._stop_requested
-                else "success"
-                if exit_code == 0
-                else "failed"
+        try:
+            exit_code = process.wait()
+            self._terminate_process_group(process.pid)
+            stdout_thread.join()
+            stderr_thread.join()
+            progress_thread.join()
+            script_path.unlink(missing_ok=True)
+            with self._lock:
+                if self._process is not process:
+                    return
+                self._exit_code = exit_code
+                self._state = (
+                    "stopped"
+                    if self._stop_requested
+                    else "success"
+                    if exit_code == 0
+                    else "failed"
+                )
+                run_id = self._run_id
+                terminal_state = self._state
+                self._process = None
+                self._process_group_id = None
+                self._script_path = None
+
+            self._notify_terminal(
+                run_id=run_id, state=terminal_state, exit_code=exit_code
             )
-            self._process = None
-            self._process_group_id = None
-            self._script_path = None
+        finally:
+            with self._lock:
+                self._wait_threads.discard(threading.current_thread())
+
+    def _notify_terminal(
+        self, *, run_id: int | None, state: RunnerState, exit_code: int
+    ) -> None:
+        notifier = self._notifier
+        if (
+            notifier is None
+            or run_id is None
+            or state
+            not in (
+                "success",
+                "failed",
+                "stopped",
+            )
+        ):
+            return
+        try:
+            result = notifier.notify_terminal(
+                run_id=run_id, state=state, exit_code=exit_code
+            )
+        except Exception:
+            logger.warning(
+                "Terminal notification failed for run %d (%s): notifier error",
+                run_id,
+                state,
+            )
+            return
+        if result.attempted and not result.delivered:
+            logger.warning(
+                "Terminal notification failed for run %d (%s): %s",
+                run_id,
+                state,
+                result.diagnostic,
+            )
 
     def _terminate_process_group(self, process_group_id: int) -> None:
         with self._group_cleanup_lock:

@@ -9,7 +9,7 @@ from purplemux_client.client import (
     WorkerInterrupted,
     WorkerNeedsInput,
 )
-from purplemux_client.progress import StepStatus, emit_step
+from purplemux_client.progress import emit_step
 
 __all__ = [
     "CreateSessionRequest",
@@ -17,7 +17,6 @@ __all__ = [
     "PurpleMuxCLIClient",
     "ResultNotReady",
     "SessionReadyTimeout",
-    "StepStatus",
     "TerminalSessionError",
     "WorkerFailure",
     "WorkerInterrupted",

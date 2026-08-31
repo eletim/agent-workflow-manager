@@ -12,13 +12,15 @@ from pathlib import Path
 
 import pytest
 
+from purplemux_client.notification_settings import NotificationSettings
+from purplemux_client.notifier import NotificationResult
 from purplemux_client.runner import (
     AlreadyRunningError,
-    ProgressEvent,
     PythonRunner,
+    RunnerClosedError,
     RunnerSnapshot,
 )
-from purplemux_client.web import RunnerHTTPServer
+from purplemux_client.web import RunnerHTTPServer, build_parser
 
 
 @pytest.fixture
@@ -65,136 +67,6 @@ def test_stderr(runner: PythonRunner) -> None:
 
     assert result.state == "success"
     assert result.stderr == "BAD\n"
-
-
-def test_progress_events_preserve_emit_order_and_optional_fields(
-    runner: PythonRunner,
-) -> None:
-    runner.start(
-        "from purplemux_client import emit_step\n"
-        'emit_step("implementation", "started", message="working", '
-        'workspace="ws-1", tab="tab-1")\n'
-        'emit_step("implementation", "completed")\n'
-        'emit_step("review", "started", iteration=2, attempt=1)\n'
-    )
-
-    result = wait_until_finished(runner)
-
-    assert result.state == "success"
-    assert result.progress == (
-        ProgressEvent(
-            "implementation",
-            "started",
-            message="working",
-            workspace="ws-1",
-            tab="tab-1",
-        ),
-        ProgressEvent("implementation", "completed"),
-        ProgressEvent("review", "started", iteration=2, attempt=1),
-    )
-
-
-def test_failed_progress_is_retained_with_failed_process(
-    runner: PythonRunner,
-) -> None:
-    runner.start(
-        "from purplemux_client import emit_step\n"
-        'emit_step("review", "failed", iteration=1, error="tests failed")\n'
-        "raise SystemExit(4)\n"
-    )
-
-    result = wait_until_finished(runner)
-
-    assert result.state == "failed"
-    assert result.exit_code == 4
-    assert result.progress == (
-        ProgressEvent("review", "failed", iteration=1, error="tests failed"),
-    )
-
-
-def test_started_progress_is_visible_while_runner_is_running(
-    runner: PythonRunner,
-) -> None:
-    runner.start(
-        "from purplemux_client import emit_step\n"
-        "import time\n"
-        'emit_step("implementation", "started")\n'
-        "time.sleep(60)\n"
-    )
-
-    result = wait_for(runner, lambda snapshot: bool(snapshot.progress))
-
-    assert result.state == "running"
-    assert result.progress == (ProgressEvent("implementation", "started"),)
-
-
-def test_progress_does_not_change_stdout_or_stderr(runner: PythonRunner) -> None:
-    runner.start(
-        "from purplemux_client import emit_step\n"
-        "import sys\n"
-        'emit_step("step", "started")\n'
-        'print("OUT")\n'
-        'print("ERR", file=sys.stderr)\n'
-        'emit_step("step", "completed")\n'
-    )
-
-    result = wait_until_finished(runner)
-
-    assert result.stdout == "OUT\n"
-    assert result.stderr == "ERR\n"
-    assert [event.status for event in result.progress] == ["started", "completed"]
-
-
-def test_next_run_clears_previous_progress(runner: PythonRunner) -> None:
-    runner.start(
-        'from purplemux_client import emit_step; emit_step("first", "completed")'
-    )
-    assert wait_until_finished(runner).progress
-
-    runner.start('print("next")')
-    result = wait_until_finished(runner)
-
-    assert result.state == "success"
-    assert result.progress == ()
-
-
-def test_progress_retains_only_configured_event_limit() -> None:
-    runner = PythonRunner(max_progress_events=3)
-    try:
-        runner.start(
-            "from purplemux_client import emit_step\n"
-            "for iteration in range(1, 6):\n"
-            '    emit_step("review", "completed", iteration=iteration)\n'
-        )
-        result = wait_until_finished(runner)
-    finally:
-        runner.close()
-
-    assert [event.iteration for event in result.progress] == [3, 4, 5]
-
-
-def test_runner_discards_oversized_progress_line_and_reads_next_event(
-    runner: PythonRunner,
-) -> None:
-    runner.start(
-        "import os\n"
-        "from purplemux_client import emit_step\n"
-        "from purplemux_client.progress import PROGRESS_FD_ENV\n"
-        "fd = int(os.environ[PROGRESS_FD_ENV])\n"
-        'os.write(fd, b"x" * 5000 + b"\\n")\n'
-        'emit_step("next", "completed")\n'
-    )
-
-    result = wait_until_finished(runner)
-
-    assert result.state == "success"
-    assert result.progress == (ProgressEvent("next", "completed"),)
-
-
-@pytest.mark.parametrize("max_progress_events", [0, -1])
-def test_progress_event_limit_must_be_positive(max_progress_events: int) -> None:
-    with pytest.raises(ValueError, match="max_progress_events must be positive"):
-        PythonRunner(max_progress_events=max_progress_events)
 
 
 def test_nonzero_exit(runner: PythonRunner) -> None:
@@ -294,6 +166,53 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
     assert result.state == "success"
 
 
+def test_start_after_close_is_rejected() -> None:
+    runner = PythonRunner()
+    runner.close()
+
+    with pytest.raises(RunnerClosedError, match="Runner is closed"):
+        runner.start('print("must not start")')
+
+
+def test_close_cannot_miss_concurrent_start_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    popen_entered = threading.Event()
+    allow_popen = threading.Event()
+
+    def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        popen_entered.set()
+        assert allow_popen.wait(timeout=3)
+        return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", blocking_popen)
+    runner = PythonRunner(stop_timeout=0.5)
+    start_errors: list[BaseException] = []
+
+    def start_run() -> None:
+        try:
+            runner.start("import time; time.sleep(60)")
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    start_thread = threading.Thread(target=start_run)
+    start_thread.start()
+    assert popen_entered.wait(timeout=3)
+    close_thread = threading.Thread(target=runner.close)
+    close_thread.start()
+    allow_popen.set()
+    start_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not start_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert start_errors == []
+    assert runner.snapshot().state == "stopped"
+    with pytest.raises(RunnerClosedError):
+        runner.start("")
+
+
 def test_close_stops_process_group() -> None:
     runner = PythonRunner(stop_timeout=0.5)
     runner.start(
@@ -377,6 +296,84 @@ def web_server() -> Iterator[tuple[tuple[str, int], str]]:
     thread.join()
 
 
+class SettingsAPINotifier:
+    def __init__(self) -> None:
+        self.current_policy = (True, True, True, False)
+        self.test_result = NotificationResult(True, True, "notification sent")
+        self.test_calls = 0
+        self.transport_calls: list[tuple[str, str, str | None]] = []
+
+    def policy(self) -> tuple[bool, bool, bool, bool]:
+        return self.current_policy
+
+    def configure_policy(
+        self,
+        *,
+        enabled: bool,
+        notify_success: bool,
+        notify_failure: bool,
+        notify_stopped: bool,
+    ) -> None:
+        self.current_policy = (
+            enabled,
+            notify_success,
+            notify_failure,
+            notify_stopped,
+        )
+
+    def send_test(self) -> NotificationResult:
+        self.test_calls += 1
+        return self.test_result
+
+    def configure_transport(
+        self, *, server: str, topic: str, replacement_token: str | None
+    ) -> None:
+        self.transport_calls.append((server, topic, replacement_token))
+
+
+@pytest.fixture
+def settings_web_server(
+    tmp_path: Path,
+) -> Iterator[
+    tuple[tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner]
+]:
+    runtime_config = tmp_path / "config.sh"
+    notify_config = tmp_path / "notify/config"
+    runtime_config.write_text(
+        'AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"\n', encoding="utf-8"
+    )
+    notify_config.parent.mkdir()
+    notify_config.write_text(
+        "NOTIFY_SERVER=https://notify.example\n"
+        "NOTIFY_TOPIC=agents\n"
+        "NOTIFY_TOKEN=tk_api_secret\n",
+        encoding="utf-8",
+    )
+    notifier = SettingsAPINotifier()
+    settings = NotificationSettings(
+        runtime_config=runtime_config,
+        notify_config=notify_config,
+        notifier=notifier,
+        environment={},
+    )
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    yield (
+        (str(host), int(port)),
+        server.request_token,
+        runtime_config,
+        notify_config,
+        notifier,
+        runner,
+    )
+    server.shutdown()
+    server.server_close()
+    thread.join()
+
+
 def request(
     server_address: tuple[str, int],
     method: str,
@@ -385,6 +382,7 @@ def request(
     *,
     token: str | None = None,
     origin: str | None = None,
+    host: str | None = None,
 ) -> tuple[int, dict[str, object]]:
     connection = http.client.HTTPConnection(*server_address, timeout=3)
     headers = {"Content-Type": "application/json"} if body is not None else {}
@@ -392,21 +390,13 @@ def request(
         headers["X-Python-Runner-Token"] = token
     if origin is not None:
         headers["Origin"] = origin
+    if host is not None:
+        headers["Host"] = host
     connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     payload = json.loads(response.read())
     connection.close()
     return response.status, payload
-
-
-def request_text(server_address: tuple[str, int], path: str) -> tuple[int, str, str]:
-    connection = http.client.HTTPConnection(*server_address, timeout=3)
-    connection.request("GET", path)
-    response = connection.getresponse()
-    content = response.read().decode()
-    content_type = response.getheader("Content-Type", "")
-    connection.close()
-    return response.status, content_type, content
 
 
 @pytest.mark.parametrize(
@@ -457,120 +447,339 @@ def test_runner_http_lifecycle(
         "stderr": "",
         "exitCode": 0,
         "runId": 1,
-        "progress": [],
     }
 
 
-def test_workflow_guide_is_served_by_runner(
-    web_server: tuple[tuple[str, int], str],
+def test_notification_settings_api_read_never_returns_token(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
 ) -> None:
-    address, _ = web_server
+    address, _, _, _, _, _ = settings_web_server
 
-    status, content_type, guide = request_text(address, "/python-workflow-guide.md")
+    status, payload = request(address, "GET", "/api/settings/notifications")
 
     assert status == 200
-    assert content_type == "text/markdown; charset=utf-8"
-    assert guide.startswith("# Python Workflow Guide")
-    assert "MutationOutcomeUnknown" in guide
-    assert 'emit_step("implementation", "started"' in guide
+    assert payload["credentialStatus"] == "configured"
+    assert payload["server"] == "https://notify.example"
+    assert "tk_api_secret" not in json.dumps(payload)
+    assert "token" not in json.dumps(payload).lower()
 
 
-def test_runner_ui_has_workflow_guide_display_copy_and_raw_links(
-    web_server: tuple[tuple[str, int], str],
+def test_notification_settings_api_honors_environment_only_credential(
+    tmp_path: Path,
 ) -> None:
-    address, _ = web_server
+    runtime_config = tmp_path / "config.sh"
+    notify_config = tmp_path / "notify/config"
+    runtime_config.write_text("AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=enabled\n")
+    notify_config.parent.mkdir()
+    notify_config.write_text(
+        "NOTIFY_SERVER=https://file.example\nNOTIFY_TOPIC=file-topic\n",
+        encoding="utf-8",
+    )
+    notifier = SettingsAPINotifier()
+    settings = NotificationSettings(
+        runtime_config=runtime_config,
+        notify_config=notify_config,
+        notifier=notifier,
+        environment={
+            "NOTIFY_SERVER": "https://environment.example",
+            "NOTIFY_TOPIC": "environment-topic",
+            "NOTIFY_TOKEN": "tk_environment_api_secret",
+        },
+    )
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    address = (str(host), int(port))
+    trusted_host = f"{host}:{port}"
+    try:
+        status, read_payload = request(address, "GET", "/api/settings/notifications")
+        test_status, test_payload = request(
+            address,
+            "POST",
+            "/api/settings/notifications/test",
+            "{}",
+            token=server.request_token,
+            origin=f"http://{trusted_host}",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
-    index_status, _, index = request_text(address, "/")
-    script_status, _, script = request_text(address, "/app.js")
+    assert status == 200
+    assert read_payload["credentialStatus"] == "configured"
+    assert read_payload["server"] == "https://environment.example"
+    assert "tk_environment_api_secret" not in json.dumps(read_payload)
+    assert test_status == 200
+    assert test_payload["delivered"] is True
+    assert notifier.transport_calls == [
+        (
+            "https://environment.example",
+            "environment-topic",
+            "tk_environment_api_secret",
+        )
+    ]
 
-    assert index_status == 200
-    assert script_status == 200
-    assert 'id="guide-open">Workflow Guide' in index
-    assert 'href="/python-workflow-guide.md"' in index
-    assert 'id="guide-content"' in index
-    assert 'id="guide-copy"' in index
-    assert 'fetch("/python-workflow-guide.md")' in script
-    assert "navigator.clipboard.writeText" in script
 
-
-def test_runner_ui_has_output_copy_control_and_failure_feedback(
-    web_server: tuple[tuple[str, int], str],
+def test_notification_settings_api_write_applies_immediately(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
 ) -> None:
-    address, _ = web_server
+    address, token, runtime_config, notify_config, notifier, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    secret = "tk_replaced_api_secret"
 
-    index_status, _, index = request_text(address, "/")
-    helper_status, _, helper = request_text(address, "/output-copy.js")
-    script_status, _, script = request_text(address, "/app.js")
-
-    assert index_status == 200
-    assert helper_status == 200
-    assert script_status == 200
-    assert 'id="run"' in index
-    assert 'id="stop"' in index
-    assert 'id="progress"' in index
-    assert 'id="stdout"' in index
-    assert 'id="stderr"' in index
-    assert 'id="guide-open"' in index
-    assert 'id="output-copy">Copy output' in index
-    assert 'src="/output-copy.js"' in index
-    assert "formatOutput" in helper
-    assert 'outputCopy.textContent = "Copied"' in script
-    assert 'outputCopy.textContent = "Copy failed"' in script
-
-
-def test_output_copy_browser_logic() -> None:
-    test_file = Path(__file__).with_name("test_output_copy.js")
-
-    subprocess.run(["node", "--test", str(test_file)], check=True)
-
-
-def test_http_status_includes_progress_events(
-    web_server: tuple[tuple[str, int], str],
-) -> None:
-    address, token = web_server
-    request(
+    status, payload = request(
         address,
         "POST",
-        "/api/run",
+        "/api/settings/notifications",
         json.dumps(
             {
-                "code": (
-                    "from purplemux_client import emit_step\n"
-                    'emit_step("review", "completed", iteration=2)'
-                )
+                "enabled": False,
+                "onSuccess": False,
+                "onFailure": True,
+                "onStopped": True,
+                "server": "https://new-notify.example",
+                "topic": "runner_team",
+                "replacementToken": secret,
             }
         ),
         token=token,
+        origin=f"http://{host}",
     )
 
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        status, result = request(address, "GET", "/api/status")
-        if result["state"] != "running":
-            break
-        time.sleep(0.02)
-    else:
-        raise AssertionError("HTTP run did not finish")
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["credentialStatus"] == "configured"
+    assert payload["restartRequired"] is False
+    assert secret not in json.dumps(payload)
+    assert notifier.current_policy == (False, False, True, True)
+    assert secret not in runtime_config.read_text(encoding="utf-8")
+    assert secret in notify_config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "invalid_server",
+    [
+        "https://[",
+        "https://notify.example\r\nNOTIFY_TOKEN=injected",
+        "https://x\t",
+        "https://notify.example\u0085NOTIFY_TOKEN=injected",
+        "https://notify.example\u2028NOTIFY_TOKEN=injected",
+        "https://notify.example\u2029NOTIFY_TOKEN=injected",
+    ],
+)
+def test_notification_settings_api_rejects_malformed_server_without_writes(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+    invalid_server: str,
+) -> None:
+    address, token, runtime_config, notify_config, _, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    original_runtime = runtime_config.read_bytes()
+    original_notify = notify_config.read_bytes()
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications",
+        json.dumps(
+            {
+                "enabled": True,
+                "onSuccess": True,
+                "onFailure": True,
+                "onStopped": False,
+                "server": invalid_server,
+                "topic": "agents",
+            }
+        ),
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 400
+    assert payload == {"error": "Notify server must be a valid HTTP(S) URL."}
+    assert runtime_config.read_bytes() == original_runtime
+    assert notify_config.read_bytes() == original_notify
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_notification_settings_api_rejects_unicode_separator_token_without_writes(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+    separator: str,
+) -> None:
+    address, token, runtime_config, notify_config, _, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    original_runtime = runtime_config.read_bytes()
+    original_notify = notify_config.read_bytes()
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications",
+        json.dumps(
+            {
+                "enabled": True,
+                "onSuccess": True,
+                "onFailure": True,
+                "onStopped": False,
+                "server": "https://notify.example",
+                "topic": "agents",
+                "replacementToken": f"tk_before{separator}NOTIFY_TOKEN=injected",
+            }
+        ),
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 400
+    assert payload == {"error": "Replacement token is invalid."}
+    assert runtime_config.read_bytes() == original_runtime
+    assert notify_config.read_bytes() == original_notify
+
+
+def test_notification_test_api_success_does_not_change_runner_state(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+) -> None:
+    address, token, _, _, notifier, runner = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    before = runner.snapshot()
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications/test",
+        "{}",
+        token=token,
+        origin=f"http://{host}",
+    )
 
     assert status == 200
-    assert result["state"] == "success"
-    assert result["progress"] == [
-        {
-            "name": "review",
-            "status": "completed",
-            "iteration": 2,
-            "attempt": None,
-            "message": None,
-            "error": None,
-            "workspace": None,
-            "tab": None,
-        }
-    ]
+    assert payload == {"delivered": True, "message": "Test notification sent."}
+    assert notifier.test_calls == 1
+    assert runner.snapshot() == before
+
+
+def test_notification_test_api_cli_failure_is_sanitized(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+) -> None:
+    address, token, _, _, notifier, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    notifier.test_result = NotificationResult(
+        True, False, "notify stderr contained tk_api_secret"
+    )
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications/test",
+        "{}",
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 502
+    assert payload == {
+        "error": "Notify failed; check the server, topic, token, and network."
+    }
+    assert "tk_api_secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("token_kind", "origin_kind", "host_kind"),
+    [
+        ("missing", "trusted", "trusted"),
+        ("wrong", "trusted", "trusted"),
+        ("valid", "untrusted", "trusted"),
+        ("valid", "trusted", "untrusted"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/settings/notifications/test", "{}"),
+        (
+            "/api/settings/notifications",
+            json.dumps(
+                {
+                    "enabled": True,
+                    "onSuccess": True,
+                    "onFailure": True,
+                    "onStopped": False,
+                    "server": "https://notify.example",
+                    "topic": "agents",
+                }
+            ),
+        ),
+    ],
+)
+def test_notification_settings_mutation_rejects_untrusted_request(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+    token_kind: str,
+    origin_kind: str,
+    host_kind: str,
+    path: str,
+    body: str,
+) -> None:
+    address, actual_token, runtime_config, notify_config, notifier, _ = (
+        settings_web_server
+    )
+    original_runtime = runtime_config.read_bytes()
+    original_notify = notify_config.read_bytes()
+    trusted_host = f"{address[0]}:{address[1]}"
+    supplied_token = (
+        actual_token
+        if token_kind == "valid"
+        else "wrong"
+        if token_kind == "wrong"
+        else None
+    )
+    origin = (
+        f"http://{trusted_host}"
+        if origin_kind == "trusted"
+        else "https://attacker.example"
+    )
+    host = trusted_host if host_kind == "trusted" else "attacker.example"
+
+    status, payload = request(
+        address,
+        "POST",
+        path,
+        body,
+        token=supplied_token,
+        origin=origin,
+        host=host,
+    )
+
+    assert status == 403
+    assert payload == {"error": "untrusted request"}
+    assert notifier.test_calls == 0
+    assert runtime_config.read_bytes() == original_runtime
+    assert notify_config.read_bytes() == original_notify
 
 
 @pytest.mark.parametrize(
     ("token", "origin"),
-    [(None, None), ("wrong", None), ("valid", "https://attacker.example")],
+    [
+        (None, None),
+        ("wrong", None),
+        ("valid", "https://attacker.example"),
+        ("valid", "http://["),
+    ],
 )
 def test_run_rejects_untrusted_request(
     web_server: tuple[tuple[str, int], str], token: str | None, origin: str | None
@@ -603,23 +812,218 @@ def test_token_rejects_untrusted_host(
     assert payload == {"error": "untrusted host"}
 
 
+@pytest.mark.parametrize("delimiter", ["?", "#", "?#"])
+def test_run_rejects_matching_origin_with_empty_delimiter(
+    web_server: tuple[tuple[str, int], str], delimiter: str
+) -> None:
+    address, token = web_server
+    host, port = address
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": ""}),
+        token=token,
+        origin=f"http://{host}:{port}{delimiter}",
+    )
+
+    assert status == 403
+    assert payload == {"error": "untrusted request"}
+
+
+def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.2", 0), runner)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    address = (str(host), int(port))
+    trusted_host = f"127.0.0.2:{port}"
+    trusted_origin = f"http://{trusted_host}"
+    try:
+        connection = http.client.HTTPConnection(*address, timeout=3)
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        page = response.read()
+        connection.close()
+        assert response.status == 200
+        assert b"Python Runner" in page
+
+        status, token_payload = request(address, "GET", "/api/token")
+        assert status == 200
+        token = str(token_payload["token"])
+        status, _ = request(address, "GET", "/api/status")
+        assert status == 200
+
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            origin=trusted_origin,
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            token=token,
+            origin="http://127.0.0.3:8765",
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            token=token,
+            origin=trusted_origin,
+            host="127.0.0.3:8765",
+        )
+        assert status == 403
+
+        status, started = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": "import time; time.sleep(60)"}),
+            token=token,
+            origin=trusted_origin,
+        )
+        assert status == 202
+        assert started["state"] == "running"
+        status, stopped = request(
+            address,
+            "POST",
+            "/api/stop",
+            token=token,
+            origin=trusted_origin,
+        )
+        assert status == 202
+        assert stopped["stopped"] is True
+        assert wait_until_finished(runner).state == "stopped"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "localhost", "not-an-ip"])
+def test_web_cli_rejects_non_explicit_ipv4_bind(host: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--host", host])
+
+
+def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
+    args = build_parser().parse_args(["--host", "100.64.10.20"])
+
+    assert args.host == "100.64.10.20"
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [
+        "*.ts.net",
+        "https://runner.ts.net",
+        "runner.ts.net/path",
+        "runner.ts.net?query",
+        "user@runner.ts.net",
+        "runner.ts.net\rforged",
+        "runner..ts.net",
+        "127.0.0.1",
+        "127.1",
+        "2130706433",
+        "0x7f000001",
+        "0x",
+        "0X",
+        "0x.1",
+        "0x000000001",
+        "0000000000000001",
+    ],
+)
+def test_web_cli_rejects_invalid_hostname_aliases(aliases: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--host-aliases", aliases])
+
+
+def test_configured_hostname_alias_accepts_get_and_protected_post() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        host_aliases=("E-Ryzen.tail6bc726.ts.net.",),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    bound_host, bound_port = server.server_address
+    address = (str(bound_host), int(bound_port))
+    alias_host = f"e-ryzen.tail6bc726.ts.net:{bound_port}"
+    try:
+        status, _ = request(address, "GET", "/api/status", host=alias_host)
+        assert status == 200
+
+        status, token_payload = request(address, "GET", "/api/token", host=alias_host)
+        assert status == 200
+        token = str(token_payload["token"])
+
+        status, result = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": 'print("ALIAS_OK")'}),
+            token=token,
+            host=alias_host,
+            origin=f"http://{alias_host}",
+        )
+        assert status == 202
+        assert result["state"] == "running"
+        assert wait_until_finished(runner).state == "success"
+
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            host=alias_host,
+            origin=f"http://{alias_host}",
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            token=token,
+            host=alias_host,
+            origin=f"http://unknown.tail6bc726.ts.net:{bound_port}",
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "GET",
+            "/api/status",
+            host=f"unknown.tail6bc726.ts.net:{bound_port}",
+        )
+        assert status == 403
+
+        status, _ = request(address, "GET", "/api/status")
+        assert status == 200
+        status, _ = request(
+            address, "GET", "/api/status", host=f"localhost:{bound_port}"
+        )
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_server_allows_explicitly_requested_hostname() -> None:
     server = RunnerHTTPServer(("localhost", 0))
     try:
         _, port = server.server_address
         assert server.is_allowed_host(f"localhost:{port}")
-    finally:
-        server.server_close()
-
-
-def test_server_allows_specific_bind_ip_host_and_rejects_other_hosts() -> None:
-    server = RunnerHTTPServer(("127.0.0.2", 0))
-    try:
-        bound_host, port = server.server_address
-        assert bound_host == "127.0.0.2"
-        assert server.is_allowed_host(f"127.0.0.2:{port}")
-        assert not server.is_allowed_host(f"127.0.0.3:{port}")
-        assert not server.is_allowed_host(f"attacker.example:{port}")
     finally:
         server.server_close()
 

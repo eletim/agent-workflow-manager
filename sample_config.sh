@@ -1,7 +1,13 @@
-# Bind to 127.0.0.1 for local-only access, or to a specific VPN interface IP
-# (for example, 100.x.x.x) for access from other devices on that VPN.
-AGENT_WORKFLOW_MANAGER_HOST=""
-AGENT_WORKFLOW_MANAGER_PORT=""
+# Agent Workflow Manager runtime/startup configuration.
+# Copying is normally handled automatically by: bash start.sh
+# Notification credentials belong in NOTIFY_CONFIG, never in this file.
 
-# Optional: prepend additional CLI directories to the inherited PATH.
-AGENT_WORKFLOW_MANAGER_PATH=""
+AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"
+# Comma-separated exact DNS hostnames accepted by browser Host/Origin checks.
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES=""
+AGENT_WORKFLOW_MANAGER_PORT="8765"
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="auto"
+AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS="true"
+AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE="true"
+AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED="false"
+NOTIFY_CONFIG="$HOME/.config/notify/config"

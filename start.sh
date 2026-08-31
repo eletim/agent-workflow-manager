@@ -1,180 +1,563 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 case ${BASH_SOURCE[0]} in
     */*) script_dir=${BASH_SOURCE[0]%/*} ;;
     *) script_dir=. ;;
 esac
-REPO_ROOT=$(cd -P -- "$script_dir" && pwd)
-CONFIG_FILE="$REPO_ROOT/config.sh"
+repo_root=$(cd -P -- "$script_dir" && pwd)
 
-# Keep the caller's PATH and add the conventional user-local CLI directory.
+if [[ $PWD != "$repo_root" ]]; then
+    printf 'ERROR: run start.sh from the repository root: %s\n' "$repo_root" >&2
+    exit 1
+fi
+
 export PATH="$HOME/.local/bin:$PATH"
+config_file=${AGENT_WORKFLOW_MANAGER_CONFIG_FILE:-$repo_root/config.sh}
+sample_config_file="$repo_root/sample_config.sh"
+host_override_set=${AGENT_WORKFLOW_MANAGER_HOST+x}
+host_override=${AGENT_WORKFLOW_MANAGER_HOST-}
+host_aliases_override_set=${AGENT_WORKFLOW_MANAGER_HOST_ALIASES+x}
+host_aliases_override=${AGENT_WORKFLOW_MANAGER_HOST_ALIASES-}
+port_override_set=${AGENT_WORKFLOW_MANAGER_PORT+x}
+port_override=${AGENT_WORKFLOW_MANAGER_PORT-}
+notifications_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFICATIONS+x}
+notifications_override=${AGENT_WORKFLOW_MANAGER_NOTIFICATIONS-}
+notify_success_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS+x}
+notify_success_override=${AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS-}
+notify_failure_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE+x}
+notify_failure_override=${AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE-}
+notify_stopped_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED+x}
+notify_stopped_override=${AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED-}
+notify_config_override_set=${NOTIFY_CONFIG+x}
+notify_config_override=${NOTIFY_CONFIG-}
+runtime_config_temp=""
 
-AGENT_WORKFLOW_MANAGER_HOST=""
-AGENT_WORKFLOW_MANAGER_PORT=""
-AGENT_WORKFLOW_MANAGER_PATH=""
-
-if [[ -f $CONFIG_FILE ]]; then
-    if ! source "$CONFIG_FILE"; then
-        printf 'ERROR: failed to load %s.\n' "$CONFIG_FILE" >&2
-        printf 'Fix the shell syntax in config.sh, then retry: ./start.sh\n' >&2
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'ERROR: required command not found: %s\n' "$1" >&2
         exit 1
     fi
-fi
-
-config_changed=false
-
-prompt_if_empty() {
-    local variable_name=$1
-    local prompt=$2
-    local default_value=$3
-    local current_value=${!variable_name}
-    local entered_value
-
-    if [[ -n $current_value ]]; then
-        return
-    fi
-    printf '%s [%s]: ' "$prompt" "$default_value" >&2
-    if ! IFS= read -r entered_value; then
-        printf '\nERROR: configuration input ended before %s was set.\n' "$variable_name" >&2
-        exit 1
-    fi
-    printf -v "$variable_name" '%s' "${entered_value:-$default_value}"
-    config_changed=true
 }
 
-prompt_if_empty AGENT_WORKFLOW_MANAGER_HOST "Bind host" "127.0.0.1"
-prompt_if_empty AGENT_WORKFLOW_MANAGER_PORT "Port" "8765"
+validate_ipv4() {
+    local value=$1
+    local octets
+    local octet
 
-if [[ ! $AGENT_WORKFLOW_MANAGER_PORT =~ ^[0-9]{1,5}$ ]] ||
-    ((10#$AGENT_WORKFLOW_MANAGER_PORT < 1 || 10#$AGENT_WORKFLOW_MANAGER_PORT > 65535)); then
-    printf 'ERROR: AGENT_WORKFLOW_MANAGER_PORT must be an integer from 1 to 65535 (got %q).\n' \
-        "$AGENT_WORKFLOW_MANAGER_PORT" >&2
-    exit 1
-fi
+    if [[ ! $value =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    IFS=. read -r -a octets <<<"$value"
+    for octet in "${octets[@]}"; do
+        if [[ $octet != 0 && $octet == 0* ]] || ((10#$octet > 255)); then
+            return 1
+        fi
+    done
+}
 
-if [[ $config_changed == true || ! -f $CONFIG_FILE ]]; then
+validate_port() {
+    local value=$1
+    [[ $value =~ ^[0-9]{1,5}$ ]] &&
+        ((10#$value >= 1 && 10#$value <= 65535))
+}
+
+looks_like_browser_ipv4() {
+    local value=$1
+    local part
+    local digits
+    local number
+    local last_limit
+    local -a parts
+    local -a numbers
+
+    IFS=. read -r -a parts <<<"$value"
+    (( ${#parts[@]} >= 1 && ${#parts[@]} <= 4 )) || return 1
+    for part in "${parts[@]}"; do
+        if [[ $part == 0x || $part == 0X ]]; then
+            number=0
+        elif [[ $part =~ ^0[xX]([0-9a-fA-F]+)$ ]]; then
+            digits=${BASH_REMATCH[1]}
+            while [[ ${#digits} -gt 1 && $digits == 0* ]]; do
+                digits=${digits#0}
+            done
+            (( ${#digits} <= 8 )) || return 1
+            number=$((16#$digits))
+        elif [[ ${#part} -gt 1 && $part == 0* ]]; then
+            [[ $part =~ ^0([0-7]+)$ ]] || return 1
+            digits=${BASH_REMATCH[1]}
+            while [[ ${#digits} -gt 1 && $digits == 0* ]]; do
+                digits=${digits#0}
+            done
+            (( ${#digits} <= 11 )) || return 1
+            number=$((8#$digits))
+        elif [[ $part =~ ^[0-9]+$ ]]; then
+            (( ${#part} <= 10 )) || return 1
+            number=$((10#$part))
+        else
+            return 1
+        fi
+        numbers+=("$number")
+    done
+    for number in "${numbers[@]:0:${#numbers[@]}-1}"; do
+        (( number <= 255 )) || return 1
+    done
+    last_limit=$((1 << (8 * (5 - ${#numbers[@]}))))
+    (( numbers[${#numbers[@]}-1] < last_limit ))
+}
+
+normalize_hostname_alias() {
+    local value=$1
+    local label
+    local label_pattern='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    local -a labels
+
+    [[ -n $value && $value != *'*'* ]] || return 1
+    [[ $value != *[[:space:]]* ]] || return 1
+    value=${value%.}
+    value=${value,,}
+    (( ${#value} >= 1 && ${#value} <= 253 )) || return 1
+    looks_like_browser_ipv4 "$value" && return 1
+    IFS=. read -r -a labels <<<"$value"
+    for label in "${labels[@]}"; do
+        [[ $label =~ $label_pattern ]] || return 1
+    done
+    printf '%s' "$value"
+}
+
+normalize_hostname_aliases() {
+    local value=$1
+    local alias
+    local normalized
+    local result=""
+    local -a aliases
+
+    [[ -n $value ]] || return 0
+    [[ $value != *[[:space:][:cntrl:]]* ]] || return 1
+    [[ $value != ,* && $value != *, && $value != *,,* ]] || return 1
+    IFS=, read -r -a aliases <<<"$value"
+    for alias in "${aliases[@]}"; do
+        normalized=$(normalize_hostname_alias "$alias") || return 1
+        if [[ ,$result, != *,$normalized,* ]]; then
+            result=${result:+$result,}$normalized
+        fi
+    done
+    printf '%s' "$result"
+}
+
+validate_boolean() {
+    case ${1,,} in
+        1 | true | yes | on | 0 | false | no | off) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+prompt_yes_by_default() {
+    local prompt=$1
+    local answer
+
+    printf '%s [Y/n] ' "$prompt" >&2
+    if ! IFS= read -r answer; then
+        return 2
+    fi
+    [[ -z $answer || $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
+}
+
+detect_tailscale_ipv4() {
+    local output
+    local candidate
+    local detected=""
+    local count=0
+
+    command -v tailscale >/dev/null 2>&1 || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    output=$(timeout --signal=TERM --kill-after=1 2 tailscale ip -4 2>/dev/null) || return 1
+    while IFS= read -r candidate; do
+        if validate_ipv4 "$candidate" && [[ $candidate != 0.0.0.0 ]]; then
+            detected=$candidate
+            ((count += 1))
+        fi
+    done <<<"$output"
+    [[ $count == 1 ]] || return 1
+    printf '%s' "$detected"
+}
+
+detect_tailscale_hostname() {
+    local status_json
+    local detected
+
+    command -v tailscale >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    status_json=$(timeout --signal=TERM --kill-after=1 2 tailscale status --json \
+        2>/dev/null) || return 1
+    detected=$(printf '%s' "$status_json" | python3 -c \
+        'import json, sys; print(json.load(sys.stdin).get("Self", {}).get("DNSName", ""))' \
+        2>/dev/null) || return 1
+    normalize_hostname_alias "$detected"
+}
+
+write_runtime_config() {
+    runtime_config_temp=$(mktemp "${config_file}.tmp.XXXXXX")
     {
-        printf '# Generated by ./start.sh. Edit these values, then rerun ./start.sh.\n'
+        printf '# Generated by bash start.sh. Edit values here, then rerun bash start.sh.\n'
+        printf '# Notification credentials belong only in NOTIFY_CONFIG, never in this file.\n'
         printf 'AGENT_WORKFLOW_MANAGER_HOST=%q\n' "$AGENT_WORKFLOW_MANAGER_HOST"
+        printf 'AGENT_WORKFLOW_MANAGER_HOST_ALIASES=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_HOST_ALIASES"
         printf 'AGENT_WORKFLOW_MANAGER_PORT=%q\n' "$AGENT_WORKFLOW_MANAGER_PORT"
-        printf 'AGENT_WORKFLOW_MANAGER_PATH=%q\n' "$AGENT_WORKFLOW_MANAGER_PATH"
-    } >"$CONFIG_FILE"
-    printf 'Saved configuration to %s\n' "$CONFIG_FILE"
-fi
-
-if [[ -n $AGENT_WORKFLOW_MANAGER_PATH ]]; then
-    export PATH="$AGENT_WORKFLOW_MANAGER_PATH:$PATH"
-fi
-
-missing_dependency=false
-
-has_path_executable() {
-    local executable_path
-
-    executable_path=$(builtin type -P "$1" 2>/dev/null) || return 1
-    [[ -f $executable_path && -x $executable_path ]]
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFICATIONS"
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS"
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE"
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED"
+        printf 'NOTIFY_CONFIG=%q\n' "$NOTIFY_CONFIG"
+    } >"$runtime_config_temp"
+    chmod 600 "$runtime_config_temp"
+    mv -- "$runtime_config_temp" "$config_file"
+    runtime_config_temp=""
 }
 
-if ! has_path_executable purplemux; then
-    missing_dependency=true
-    cat >&2 <<'EOF'
+persist_runtime_host_alias() {
+    local hostname=$1
 
-ERROR: purplemux command was not found.
+    runtime_config_temp=$(mktemp "${config_file}.tmp.XXXXXX")
+    if ! python3 - "$config_file" "$runtime_config_temp" "$hostname" <<'PY'
+import fcntl
+import os
+import shlex
+import sys
+from pathlib import Path
 
-agent-workflow-manager workflows use the PurpleMux CLI to create workspaces
-and communicate with Codex, Claude, and Shell tabs.
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+hostname = sys.argv[3]
+lock_path = source.with_name(f".{source.name}.lock")
+lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+os.fchmod(lock_descriptor, 0o600)
+with os.fdopen(lock_descriptor, "r+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    original = source.read_bytes()
+    separator = b"" if not original or original.endswith((b"\n", b"\r")) else b"\n"
+    assignment = (
+        f"AGENT_WORKFLOW_MANAGER_HOST_ALIASES={shlex.quote(hostname)}\n".encode()
+    )
+    with destination.open("wb") as handle:
+        handle.write(original + separator + assignment)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(destination, 0o600)
+    if source.read_bytes() != original:
+        raise RuntimeError("runtime configuration changed during migration")
+    os.replace(destination, source)
+    directory = os.open(source.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+PY
+    then
+        rm -f -- "$runtime_config_temp"
+        runtime_config_temp=""
+        return 1
+    fi
+    runtime_config_temp=""
+}
 
-First verify whether you already have a PurpleMux checkout. From the PurpleMux
-repository root, run:
+migrate_existing_magicdns_alias() {
+    local detected_hostname
+    local normalized_aliases
 
-  node bin/cli.js --help
+    validate_ipv4 "${AGENT_WORKFLOW_MANAGER_HOST-}" || return 0
+    [[ $AGENT_WORKFLOW_MANAGER_HOST != 0.0.0.0 ]] || return 0
+    [[ $AGENT_WORKFLOW_MANAGER_HOST != 127.* ]] || return 0
+    normalized_aliases=$(normalize_hostname_aliases \
+        "${AGENT_WORKFLOW_MANAGER_HOST_ALIASES-}") || return 0
+    [[ -z $normalized_aliases ]] || return 0
+    detected_hostname=$(detect_tailscale_hostname) || return 0
 
-If that works, expose the CLI on PATH. For example, create your own wrapper:
+    printf 'MagicDNS hostname %s was detected.\n' "$detected_hostname" >&2
+    if prompt_yes_by_default \
+        'Allow browser access using this hostname?'; then
+        if persist_runtime_host_alias "$detected_hostname"; then
+            AGENT_WORKFLOW_MANAGER_HOST_ALIASES=$detected_hostname
+            printf 'Saved trusted hostname to %s\n' "$config_file"
+        else
+            printf '%s\n' \
+                'WARNING: could not update runtime configuration; continuing without the hostname.' >&2
+        fi
+    fi
+}
 
-  mkdir -p ~/.local/bin
-  cat > ~/.local/bin/purplemux <<'WRAPPER'
-  #!/usr/bin/env bash
-  exec node "/absolute/path/to/purplemux/bin/cli.js" "$@"
-  WRAPPER
-  chmod +x ~/.local/bin/purplemux
+run_first_time_setup() {
+    local detected_ip
+    local answer_status
+    local entered_ip
+    local detected_hostname
 
-Then ensure the directory is on PATH (start.sh also adds this directory):
+    if detected_ip=$(detect_tailscale_ipv4); then
+        printf 'Tailscale IPv4 %s was detected.\n' "$detected_ip" >&2
+        if prompt_yes_by_default \
+            'Use it so the Runner UI can be accessed from other tailnet devices?'; then
+            AGENT_WORKFLOW_MANAGER_HOST=$detected_ip
+            if detected_hostname=$(detect_tailscale_hostname); then
+                printf 'MagicDNS hostname %s was detected.\n' "$detected_hostname" >&2
+                if prompt_yes_by_default \
+                    'Trust it as an additional browser hostname?'; then
+                    AGENT_WORKFLOW_MANAGER_HOST_ALIASES=$detected_hostname
+                fi
+            fi
+        else
+            AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1
+        fi
+    else
+        printf 'Tailscale IPv4 could not be detected.\n' >&2
+        if prompt_yes_by_default 'Start in local-only mode on 127.0.0.1?'; then
+            AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1
+        else
+            answer_status=$?
+            if [[ $answer_status == 2 ]]; then
+                AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1
+            else
+                while true; do
+                    printf 'Explicit trusted interface IPv4 address: ' >&2
+                    if ! IFS= read -r entered_ip; then
+                        printf '\nERROR: setup input ended before an IPv4 address was entered.\n' >&2
+                        exit 2
+                    fi
+                    if validate_ipv4 "$entered_ip" && [[ $entered_ip != 0.0.0.0 ]]; then
+                        AGENT_WORKFLOW_MANAGER_HOST=$entered_ip
+                        break
+                    fi
+                    printf 'Invalid IPv4 address; enter one interface address, not 0.0.0.0.\n' >&2
+                done
+            fi
+        fi
+    fi
 
-  export PATH="$HOME/.local/bin:$PATH"
+    write_runtime_config
+    printf 'Saved runtime configuration to %s\n' "$config_file"
+}
 
-Verify the completed setup:
+AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES=""
+AGENT_WORKFLOW_MANAGER_PORT=8765
+AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=auto
+AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=true
+AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=true
+AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=false
+NOTIFY_CONFIG="$HOME/.config/notify/config"
 
-  command -v purplemux
-  purplemux --help
+first_run=false
+existing_config=true
+if [[ ! -f $config_file ]]; then
+    cp -- "$sample_config_file" "$config_file"
+    chmod 600 "$config_file"
+    first_run=true
+    existing_config=false
 
-If PurpleMux is not installed, install or clone it separately, complete its
-normal dependency/setup procedure, and verify `node bin/cli.js --help` before
-exposing the CLI on PATH. start.sh does not clone, install, or create wrappers.
-EOF
+    cleanup_incomplete_setup() {
+        if [[ -n $runtime_config_temp ]]; then
+            rm -f -- "$runtime_config_temp"
+        fi
+        if [[ $first_run == true ]]; then
+            rm -f -- "$config_file"
+        fi
+    }
+    trap cleanup_incomplete_setup EXIT
 fi
 
-if ! has_path_executable gh; then
-    missing_dependency=true
-    cat >&2 <<'EOF'
-
-ERROR: GitHub CLI (gh) was not found.
-
-Workflows use GitHub CLI for pull-request and issue operations. Install `gh`
-separately using GitHub's official instructions or your OS package manager;
-start.sh does not install it or modify your shell profile.
-
-After installation, authenticate if needed and verify both discovery and
-authentication:
-
-  command -v gh
-  gh --version
-  gh auth status
-EOF
+# shellcheck disable=SC1090
+if ! source "$config_file"; then
+    printf 'ERROR: failed to load runtime configuration: %s\n' "$config_file" >&2
+    exit 2
 fi
 
-if ! has_path_executable uv; then
-    missing_dependency=true
-    cat >&2 <<'EOF'
-
-ERROR: uv was not found.
-
-uv is required to create the project Python environment and launch the Runner
-with its locked dependencies. Install uv separately using the official uv
-installation instructions or an appropriate package manager. start.sh never
-installs Python tools or packages automatically.
-
-Ensure uv's installation directory is on PATH, then verify:
-
-  command -v uv
-  uv --version
-EOF
+if [[ $first_run == true ]]; then
+    run_first_time_setup
+    first_run=false
+    trap - EXIT
 fi
 
-if [[ $missing_dependency == true ]]; then
-    cat >&2 <<'EOF'
-
-Review your PATH with:
-
-  printf '%s\n' "$PATH"
-
-After fixing every dependency above, verify each command and retry:
-
-  command -v purplemux
-  command -v gh
-  command -v uv
-  ./start.sh
-EOF
-    exit 1
+if [[ $existing_config == true && ! $host_override_set && \
+    ! $host_aliases_override_set ]]; then
+    migrate_existing_magicdns_alias
 fi
 
-printf 'Starting Agent Workflow Manager\n'
-printf 'Bind: %s:%s\n' "$AGENT_WORKFLOW_MANAGER_HOST" "$AGENT_WORKFLOW_MANAGER_PORT"
-printf 'URL:  http://%s:%s\n' "$AGENT_WORKFLOW_MANAGER_HOST" "$AGENT_WORKFLOW_MANAGER_PORT"
+if [[ $host_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_HOST=$host_override
+fi
+if [[ $host_aliases_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_HOST_ALIASES=$host_aliases_override
+fi
+if [[ $port_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_PORT=$port_override
+fi
+if [[ $notifications_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=$notifications_override
+fi
+if [[ $notify_success_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=$notify_success_override
+fi
+if [[ $notify_failure_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=$notify_failure_override
+fi
+if [[ $notify_stopped_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=$notify_stopped_override
+fi
+if [[ $notify_config_override_set ]]; then
+    NOTIFY_CONFIG=$notify_config_override
+fi
 
-cd "$REPO_ROOT"
+if ! validate_ipv4 "${AGENT_WORKFLOW_MANAGER_HOST-}"; then
+    printf 'ERROR: AGENT_WORKFLOW_MANAGER_HOST must be an explicit IPv4 address.\n' >&2
+    exit 2
+fi
+if [[ $AGENT_WORKFLOW_MANAGER_HOST == 0.0.0.0 ]]; then
+    printf '%s\n' \
+        'ERROR: refusing wildcard bind 0.0.0.0; choose one trusted interface IPv4 address.' >&2
+    exit 2
+fi
+if ! normalized_host_aliases=$(normalize_hostname_aliases \
+    "${AGENT_WORKFLOW_MANAGER_HOST_ALIASES-}"); then
+    printf '%s\n' \
+        'ERROR: AGENT_WORKFLOW_MANAGER_HOST_ALIASES must contain only comma-separated exact DNS hostnames.' >&2
+    exit 2
+fi
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES=$normalized_host_aliases
+if ! validate_port "${AGENT_WORKFLOW_MANAGER_PORT-}"; then
+    printf 'ERROR: AGENT_WORKFLOW_MANAGER_PORT must be an integer from 1 to 65535.\n' >&2
+    exit 2
+fi
+case ${AGENT_WORKFLOW_MANAGER_NOTIFICATIONS-} in
+    auto | enabled | disabled) ;;
+    *)
+        printf '%s\n' \
+            'ERROR: AGENT_WORKFLOW_MANAGER_NOTIFICATIONS must be auto, enabled, or disabled.' >&2
+        exit 2
+        ;;
+esac
+for policy_variable in \
+    AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS \
+    AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE \
+    AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED; do
+    if ! validate_boolean "${!policy_variable-}"; then
+        printf 'ERROR: %s must be a boolean value.\n' "$policy_variable" >&2
+        exit 2
+    fi
+done
+if [[ -z ${NOTIFY_CONFIG-} ]]; then
+    printf 'ERROR: NOTIFY_CONFIG must not be empty.\n' >&2
+    exit 2
+fi
+export NOTIFY_CONFIG
+export AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS
+export AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE
+export AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED
+export AGENT_WORKFLOW_MANAGER_CONFIG_FILE="$config_file"
+
+require_command uv
+printf 'Syncing Python dependencies...\n'
+uv sync --locked
+require_command purplemux
+
+notification_mode=$AGENT_WORKFLOW_MANAGER_NOTIFICATIONS
+if [[ $notification_mode != disabled ]]; then
+    if ! command -v notify >/dev/null 2>&1; then
+        require_command curl
+        install_root=$(mktemp -d)
+        cleanup_install() { rm -rf -- "$install_root"; }
+        trap cleanup_install EXIT
+        printf 'Installing the public notify CLI...\n'
+        mkdir -p "$install_root/notify-server/bin"
+        curl --fail --silent --show-error --location \
+            --output "$install_root/notify-server/install-cli.sh" \
+            https://raw.githubusercontent.com/eletim/notify-server/main/install-cli.sh
+        curl --fail --silent --show-error --location \
+            --output "$install_root/notify-server/bin/notify" \
+            https://raw.githubusercontent.com/eletim/notify-server/main/bin/notify
+        bash "$install_root/notify-server/install-cli.sh"
+        trap - EXIT
+        cleanup_install
+    fi
+
+    notify_config_dir=${NOTIFY_CONFIG%/*}
+    if [[ $notify_config_dir == "$NOTIFY_CONFIG" ]]; then
+        notify_config_dir=.
+    fi
+    mkdir -p -- "$notify_config_dir"
+    if [[ ! -f $NOTIFY_CONFIG ]]; then
+        {
+            printf 'NOTIFY_SERVER=https://eletim.jp\n'
+            printf 'NOTIFY_TOPIC=agents\n'
+            printf '# NOTIFY_TOKEN=tk_...\n'
+        } >"$NOTIFY_CONFIG"
+        chmod 600 "$NOTIFY_CONFIG"
+        printf 'Created notify configuration: %s\n' "$NOTIFY_CONFIG"
+    fi
+
+    token_configured=false
+    if [[ -n ${NOTIFY_TOKEN:-} ]]; then
+        token_configured=true
+    elif (
+        set +u
+        # shellcheck disable=SC1090
+        source "$NOTIFY_CONFIG" >/dev/null 2>&1
+        [[ -n ${NOTIFY_TOKEN:-} ]]
+    ); then
+        token_configured=true
+    fi
+
+    if [[ $token_configured == false && -t 0 ]]; then
+        printf 'Notify token (leave blank to disable notifications): ' >&2
+        IFS= read -r -s notify_token
+        printf '\n' >&2
+        if [[ -n $notify_token ]]; then
+            printf 'NOTIFY_TOKEN=%q\n' "$notify_token" >>"$NOTIFY_CONFIG"
+            chmod 600 "$NOTIFY_CONFIG"
+            unset notify_token
+            token_configured=true
+            printf 'Notify token saved to %s\n' "$NOTIFY_CONFIG"
+        fi
+    fi
+
+    if [[ $token_configured == true ]]; then
+        export AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1
+        printf 'Terminal notifications enabled.\n'
+    elif [[ $notification_mode == enabled ]]; then
+        export AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=0
+        printf 'Terminal notifications requested but no token is configured; continuing disabled.\n'
+    else
+        export AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=0
+        printf 'Terminal notifications disabled; Runner startup will continue.\n'
+    fi
+else
+    export AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=0
+    printf 'Terminal notifications disabled by runtime configuration.\n'
+fi
+
+if [[ $AGENT_WORKFLOW_MANAGER_HOST != 127.0.0.1 ]]; then
+    printf '%s\n' \
+        'WARNING: this UI executes arbitrary trusted Python; never expose this address publicly.'
+fi
+printf '\nAgent Workflow Manager:\n'
+printf '  http://%s:%s\n' "$AGENT_WORKFLOW_MANAGER_HOST" "$AGENT_WORKFLOW_MANAGER_PORT"
+if [[ -n $AGENT_WORKFLOW_MANAGER_HOST_ALIASES ]]; then
+    IFS=, read -r -a browser_host_aliases <<<"$AGENT_WORKFLOW_MANAGER_HOST_ALIASES"
+    for browser_host_alias in "${browser_host_aliases[@]}"; do
+        printf '  http://%s:%s\n' "$browser_host_alias" "$AGENT_WORKFLOW_MANAGER_PORT"
+    done
+fi
+printf 'Notifications: %s\n' \
+    "$([[ $AGENT_WORKFLOW_MANAGER_NOTIFICATIONS == 1 ]] && printf enabled || printf disabled)"
+printf 'Notify config: %s\n' "$NOTIFY_CONFIG"
+
 exec uv run python -m purplemux_client.web \
     --host "$AGENT_WORKFLOW_MANAGER_HOST" \
-    --port "$AGENT_WORKFLOW_MANAGER_PORT"
+    --port "$AGENT_WORKFLOW_MANAGER_PORT" \
+    --host-aliases "$AGENT_WORKFLOW_MANAGER_HOST_ALIASES" \
+    --runtime-config "$config_file" \
+    --notify-config "$NOTIFY_CONFIG"
