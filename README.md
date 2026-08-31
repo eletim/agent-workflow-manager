@@ -123,8 +123,8 @@ edit this value in `config.sh`:
 AGENT_WORKFLOW_MANAGER_HOST="192.168.50.20"
 ```
 
-`start.sh` prints the exact browser URL and rejects hostnames, invalid
-addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
+`start.sh` prints the exact browser URL and rejects hostnames as bind values,
+invalid addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
 Funnel and introduces no reverse proxy. After configuration, normal startup is
 always simply `bash start.sh`.
 
@@ -140,7 +140,7 @@ AGENT_WORKFLOW_MANAGER_HOST_ALIASES="e-ryzen.tail6bc726.ts.net"
 
 When first-run setup detects and you accept a Tailscale IPv4, it also tries to
 detect the local MagicDNS name and offers to persist it as an alias. Both
-Tailscale checks are optional conveniences: startup continues if either fails,
+Tailscale checks are bounded optional conveniences: startup continues if either fails,
 and an exact LAN or MagicDNS hostname can be entered directly in `config.sh`
 without the Tailscale CLI. Aliases are normalized to lowercase DNS names and
 must not contain a scheme, port, path, query, user information, wildcard,

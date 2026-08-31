@@ -29,6 +29,40 @@ STATIC_FILES = {
 HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
+def _parse_ipv4_number(value: str) -> int | None:
+    base = 10
+    digits = value
+    if value.lower().startswith("0x"):
+        base = 16
+        digits = value[2:]
+    elif len(value) > 1 and value.startswith("0"):
+        base = 8
+        digits = value[1:]
+    if not digits:
+        return None
+    valid_digits = {
+        8: re.compile(r"[0-7]+"),
+        10: re.compile(r"[0-9]+"),
+        16: re.compile(r"[0-9a-fA-F]+"),
+    }
+    if valid_digits[base].fullmatch(digits) is None:
+        return None
+    return int(digits, base)
+
+
+def _looks_like_browser_ipv4(value: str) -> bool:
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 4:
+        return False
+    numbers = [_parse_ipv4_number(part) for part in parts]
+    if any(number is None for number in numbers):
+        return False
+    parsed_numbers = cast(list[int], numbers)
+    if any(number > 255 for number in parsed_numbers[:-1]):
+        return False
+    return parsed_numbers[-1] < 256 ** (5 - len(parsed_numbers))
+
+
 def normalize_host_alias(value: str) -> str:
     """Validate and canonicalize one exact DNS hostname alias."""
     if not value or value != value.strip():
@@ -48,11 +82,7 @@ def normalize_host_alias(value: str) -> str:
     normalized = value.lower()
     if not normalized or len(normalized) > 253:
         raise ValueError("hostname alias must be between 1 and 253 characters")
-    try:
-        ipaddress.ip_address(normalized)
-    except ValueError:
-        pass
-    else:
+    if _looks_like_browser_ipv4(normalized):
         raise ValueError("hostname alias must be a DNS hostname, not an IP address")
     if any(HOST_LABEL.fullmatch(label) is None for label in normalized.split(".")):
         raise ValueError("hostname alias contains an invalid DNS label")
@@ -128,7 +158,10 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             return True
         if any(ord(character) < 32 or ord(character) == 127 for character in origin):
             return False
-        parsed = urlparse(origin)
+        try:
+            parsed = urlparse(origin)
+        except ValueError:
+            return False
         if (
             parsed.scheme != "http"
             or parsed.username is not None

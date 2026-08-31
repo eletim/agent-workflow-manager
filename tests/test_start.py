@@ -323,6 +323,9 @@ def test_existing_config_supports_manual_hostname_alias_without_tailscale(
         "-runner.ts.net",
         "runner..ts.net",
         "100.70.80.90",
+        "127.1",
+        "2130706433",
+        "0x7f000001",
     ],
 )
 def test_start_rejects_invalid_hostname_alias(tmp_path: Path, alias: str) -> None:
@@ -349,6 +352,62 @@ def test_first_run_without_tailscale_defaults_to_localhost(tmp_path: Path) -> No
     assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config_file.read_text(
         encoding="utf-8"
     )
+
+
+def test_hanging_tailscale_discovery_is_bounded_and_falls_back(
+    tmp_path: Path,
+) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    _executable(tmp_path / "bin" / "tailscale", "sleep 30\n")
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        input="\n",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=6,
+    )
+
+    assert completed.returncode == 0
+    assert "Tailscale IPv4 could not be detected." in completed.stderr
+    assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config_file.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_hanging_magicdns_discovery_is_bounded_and_keeps_detected_ip(
+    tmp_path: Path,
+) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+if [[ $* == "ip -4" ]]; then
+    printf '100.70.80.90\n'
+else
+    sleep 30
+fi
+""",
+    )
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        input="\n",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=6,
+    )
+
+    assert completed.returncode == 0
+    config = config_file.read_text(encoding="utf-8")
+    assert "AGENT_WORKFLOW_MANAGER_HOST=100.70.80.90" in config
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''" in config
 
 
 def test_first_run_allows_manual_explicit_ipv4(tmp_path: Path) -> None:

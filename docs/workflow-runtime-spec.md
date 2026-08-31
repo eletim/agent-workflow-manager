@@ -77,7 +77,7 @@ Funnel configuration.
 
 After a detected Tailscale IPv4 is accepted, first-run setup may query
 Tailscale status for the machine's MagicDNS FQDN and offer to save it. This is
-optional convenience detection only; failure is nonfatal, and aliases may be
+bounded optional convenience detection only; failure is nonfatal, and aliases may be
 configured manually without Tailscale. Each alias is validated as one exact
 ASCII DNS hostname, normalized to lowercase with an optional trailing root dot
 removed, and matched only on the configured port. Schemes, ports, paths,

@@ -62,6 +62,42 @@ validate_port() {
         ((10#$value >= 1 && 10#$value <= 65535))
 }
 
+looks_like_browser_ipv4() {
+    local value=$1
+    local part
+    local digits
+    local number
+    local last_limit
+    local -a parts
+    local -a numbers
+
+    IFS=. read -r -a parts <<<"$value"
+    (( ${#parts[@]} >= 1 && ${#parts[@]} <= 4 )) || return 1
+    for part in "${parts[@]}"; do
+        if [[ $part =~ ^0[xX]([0-9a-fA-F]+)$ ]]; then
+            digits=${BASH_REMATCH[1]}
+            (( ${#digits} <= 8 )) || return 1
+            number=$((16#$digits))
+        elif [[ ${#part} -gt 1 && $part == 0* ]]; then
+            [[ $part =~ ^0([0-7]+)$ ]] || return 1
+            digits=${BASH_REMATCH[1]}
+            (( ${#digits} <= 11 )) || return 1
+            number=$((8#$digits))
+        elif [[ $part =~ ^[0-9]+$ ]]; then
+            (( ${#part} <= 10 )) || return 1
+            number=$((10#$part))
+        else
+            return 1
+        fi
+        numbers+=("$number")
+    done
+    for number in "${numbers[@]:0:${#numbers[@]}-1}"; do
+        (( number <= 255 )) || return 1
+    done
+    last_limit=$((1 << (8 * (5 - ${#numbers[@]}))))
+    (( numbers[${#numbers[@]}-1] < last_limit ))
+}
+
 normalize_hostname_alias() {
     local value=$1
     local label
@@ -73,7 +109,7 @@ normalize_hostname_alias() {
     value=${value%.}
     value=${value,,}
     (( ${#value} >= 1 && ${#value} <= 253 )) || return 1
-    validate_ipv4 "$value" && return 1
+    looks_like_browser_ipv4 "$value" && return 1
     IFS=. read -r -a labels <<<"$value"
     for label in "${labels[@]}"; do
         [[ $label =~ $label_pattern ]] || return 1
@@ -126,7 +162,8 @@ detect_tailscale_ipv4() {
     local count=0
 
     command -v tailscale >/dev/null 2>&1 || return 1
-    output=$(tailscale ip -4 2>/dev/null) || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    output=$(timeout --signal=TERM --kill-after=1 2 tailscale ip -4 2>/dev/null) || return 1
     while IFS= read -r candidate; do
         if validate_ipv4 "$candidate" && [[ $candidate != 0.0.0.0 ]]; then
             detected=$candidate
@@ -143,7 +180,9 @@ detect_tailscale_hostname() {
 
     command -v tailscale >/dev/null 2>&1 || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    status_json=$(tailscale status --json 2>/dev/null) || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    status_json=$(timeout --signal=TERM --kill-after=1 2 tailscale status --json \
+        2>/dev/null) || return 1
     detected=$(printf '%s' "$status_json" | python3 -c \
         'import json, sys; print(json.load(sys.stdin).get("Self", {}).get("DNSName", ""))' \
         2>/dev/null) || return 1

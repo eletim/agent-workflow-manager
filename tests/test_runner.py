@@ -774,7 +774,12 @@ def test_notification_settings_mutation_rejects_untrusted_request(
 
 @pytest.mark.parametrize(
     ("token", "origin"),
-    [(None, None), ("wrong", None), ("valid", "https://attacker.example")],
+    [
+        (None, None),
+        ("wrong", None),
+        ("valid", "https://attacker.example"),
+        ("valid", "http://["),
+    ],
 )
 def test_run_rejects_untrusted_request(
     web_server: tuple[tuple[str, int], str], token: str | None, origin: str | None
@@ -908,6 +913,9 @@ def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
         "runner.ts.net\rforged",
         "runner..ts.net",
         "127.0.0.1",
+        "127.1",
+        "2130706433",
+        "0x7f000001",
     ],
 )
 def test_web_cli_rejects_invalid_hostname_aliases(aliases: str) -> None:
