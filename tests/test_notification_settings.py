@@ -271,7 +271,14 @@ def test_settings_accepts_loopback_http_notify_server(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "server",
-    ["https://[", "https://notify.example\rINJECTED=value", "https://notify.example\t"],
+    [
+        "https://[",
+        "https://notify.example\rINJECTED=value",
+        "https://notify.example\t",
+        "https://notify.example\u0085INJECTED=value",
+        "https://notify.example\u2028INJECTED=value",
+        "https://notify.example\u2029INJECTED=value",
+    ],
 )
 def test_malformed_or_control_character_server_is_safely_rejected(
     tmp_path: Path, server: str
@@ -280,6 +287,25 @@ def test_malformed_or_control_character_server_is_safely_rejected(
 
     with pytest.raises(SettingsValidationError, match="valid HTTP"):
         settings.update({"server": server, "topic": "agents"})
+
+    assert not runtime_config.exists()
+    assert not notify_config.exists()
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_unicode_separator_in_replacement_token_is_safely_rejected(
+    tmp_path: Path, separator: str
+) -> None:
+    settings, runtime_config, notify_config, _ = _settings(tmp_path)
+
+    with pytest.raises(SettingsValidationError, match="Replacement token is invalid"):
+        settings.update(
+            {
+                "server": "https://notify.example",
+                "topic": "agents",
+                "replacementToken": f"tk_before{separator}NOTIFY_TOKEN=injected",
+            }
+        )
 
     assert not runtime_config.exists()
     assert not notify_config.exists()

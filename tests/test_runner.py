@@ -565,7 +565,14 @@ def test_notification_settings_api_write_applies_immediately(
 
 @pytest.mark.parametrize(
     "invalid_server",
-    ["https://[", "https://notify.example\r\nNOTIFY_TOKEN=injected", "https://x\t"],
+    [
+        "https://[",
+        "https://notify.example\r\nNOTIFY_TOKEN=injected",
+        "https://x\t",
+        "https://notify.example\u0085NOTIFY_TOKEN=injected",
+        "https://notify.example\u2028NOTIFY_TOKEN=injected",
+        "https://notify.example\u2029NOTIFY_TOKEN=injected",
+    ],
 )
 def test_notification_settings_api_rejects_malformed_server_without_writes(
     settings_web_server: tuple[
@@ -598,6 +605,43 @@ def test_notification_settings_api_rejects_malformed_server_without_writes(
 
     assert status == 400
     assert payload == {"error": "Notify server must be a valid HTTP(S) URL."}
+    assert runtime_config.read_bytes() == original_runtime
+    assert notify_config.read_bytes() == original_notify
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_notification_settings_api_rejects_unicode_separator_token_without_writes(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+    separator: str,
+) -> None:
+    address, token, runtime_config, notify_config, _, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    original_runtime = runtime_config.read_bytes()
+    original_notify = notify_config.read_bytes()
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications",
+        json.dumps(
+            {
+                "enabled": True,
+                "onSuccess": True,
+                "onFailure": True,
+                "onStopped": False,
+                "server": "https://notify.example",
+                "topic": "agents",
+                "replacementToken": f"tk_before{separator}NOTIFY_TOKEN=injected",
+            }
+        ),
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 400
+    assert payload == {"error": "Replacement token is invalid."}
     assert runtime_config.read_bytes() == original_runtime
     assert notify_config.read_bytes() == original_notify
 

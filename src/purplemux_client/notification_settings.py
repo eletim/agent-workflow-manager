@@ -6,6 +6,7 @@ import re
 import shlex
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -254,7 +255,7 @@ class NotificationSettings:
             not isinstance(value, str)
             or value != value.strip()
             or len(value) > 2048
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or _has_unsafe_characters(value)
         ):
             raise SettingsValidationError("Notify server must be a valid HTTP(S) URL.")
         try:
@@ -301,7 +302,7 @@ class NotificationSettings:
             not isinstance(value, str)
             or not value
             or len(value) > 4096
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or _has_unsafe_characters(value)
         ):
             raise SettingsValidationError("Replacement token is invalid.")
         return value
@@ -392,3 +393,11 @@ class NotificationSettings:
                 temporary_path.unlink(missing_ok=True)
         except OSError as exc:
             raise SettingsError("Notification settings could not be saved.") from exc
+
+
+def _has_unsafe_characters(value: str) -> bool:
+    return any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        for character in value
+    )
