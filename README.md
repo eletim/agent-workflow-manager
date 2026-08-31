@@ -170,6 +170,12 @@ topic, and an optional replacement token are atomically written to the notify
 CLI config with owner-only permissions. The existing token is never returned,
 displayed, logged, or copied into `config.sh`.
 
+Explicit `NOTIFY_SERVER`, `NOTIFY_TOPIC`, or `NOTIFY_TOKEN` values inherited by
+the Runner process keep the public notify CLI's normal precedence and are
+reflected in the displayed effective settings. After a UI save, the validated
+saved server/topic and any replacement token take precedence immediately for
+this Runner process as well as being persisted to the notify CLI config.
+
 The test button invokes only `notify send --title "Agent Workflow Manager"
 --message "Test notification"`. It uses a bounded timeout and no retries, and
 returns only a sanitized actionable result. It never reads or changes the

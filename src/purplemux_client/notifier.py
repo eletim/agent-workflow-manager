@@ -41,6 +41,7 @@ class NotifyCLI:
         self.timeout = timeout
         self.executable = executable
         self.config_path = config_path
+        self._transport_overrides: dict[str, str] = {}
         self._lock = threading.Lock()
         self._processes: set[subprocess.Popen[bytes]] = set()
         self._closed = False
@@ -84,6 +85,15 @@ class NotifyCLI:
             self.notify_failure = notify_failure
             self.notify_stopped = notify_stopped
 
+    def configure_transport(
+        self, *, server: str, topic: str, replacement_token: str | None
+    ) -> None:
+        with self._lock:
+            self._transport_overrides["NOTIFY_SERVER"] = server
+            self._transport_overrides["NOTIFY_TOPIC"] = topic
+            if replacement_token is not None:
+                self._transport_overrides["NOTIFY_TOKEN"] = replacement_token
+
     def notify_terminal(
         self, *, run_id: int, state: TerminalState, exit_code: int | None
     ) -> NotificationResult:
@@ -108,13 +118,15 @@ class NotifyCLI:
         if executable is None:
             return NotificationResult(True, False, "notify command unavailable")
 
-        environment = None
-        if self.config_path is not None:
-            environment = os.environ.copy()
-            environment["NOTIFY_CONFIG"] = self.config_path
         with self._lock:
             if self._closed:
                 return NotificationResult(False, False, "notifier closed")
+            environment = None
+            if self.config_path is not None or self._transport_overrides:
+                environment = os.environ.copy()
+                if self.config_path is not None:
+                    environment["NOTIFY_CONFIG"] = self.config_path
+                environment.update(self._transport_overrides)
             try:
                 process = subprocess.Popen(
                     [executable, "send", "--title", title, "--message", message],

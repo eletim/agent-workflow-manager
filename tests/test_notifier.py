@@ -253,8 +253,17 @@ def test_test_notification_uses_public_cli_and_config_path(
 
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
     monkeypatch.setattr(subprocess, "Popen", start)
+    monkeypatch.setenv("NOTIFY_SERVER", "https://old.example")
+    monkeypatch.setenv("NOTIFY_TOPIC", "old-topic")
+    monkeypatch.setenv("NOTIFY_TOKEN", "tk_old_secret")
 
-    result = NotifyCLI(config_path="/tmp/external-notify-config").send_test()
+    notifier = NotifyCLI(config_path="/tmp/external-notify-config")
+    notifier.configure_transport(
+        server="https://new.example",
+        topic="new-topic",
+        replacement_token="tk_new_secret",
+    )
+    result = notifier.send_test()
 
     assert result.delivered is True
     command, options = calls[0]
@@ -269,6 +278,10 @@ def test_test_notification_uses_public_cli_and_config_path(
     environment = options["env"]
     assert isinstance(environment, dict)
     assert environment["NOTIFY_CONFIG"] == "/tmp/external-notify-config"
+    assert environment["NOTIFY_SERVER"] == "https://new.example"
+    assert environment["NOTIFY_TOPIC"] == "new-topic"
+    assert environment["NOTIFY_TOKEN"] == "tk_new_secret"
+    assert "tk_new_secret" not in command
     assert options["stdout"] is subprocess.DEVNULL
     assert options["stderr"] is subprocess.DEVNULL
 

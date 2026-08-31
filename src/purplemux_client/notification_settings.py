@@ -6,6 +6,7 @@ import re
 import shlex
 import tempfile
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -42,6 +43,10 @@ class MutableNotifier(Protocol):
     ) -> None: ...
 
     def send_test(self) -> NotificationResult: ...
+
+    def configure_transport(
+        self, *, server: str, topic: str, replacement_token: str | None
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -95,10 +100,17 @@ class NotificationSettings:
         runtime_config: Path,
         notify_config: Path,
         notifier: MutableNotifier,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self._runtime_config = runtime_config
         self._notify_config = notify_config
         self._notifier = notifier
+        source_environment = os.environ if environment is None else environment
+        self._environment_overrides = {
+            key: source_environment[key]
+            for key in self._NOTIFY_KEYS
+            if key in source_environment
+        }
         self._lock = threading.Lock()
 
     def read(self) -> NotificationSettingsSnapshot:
@@ -106,6 +118,7 @@ class NotificationSettings:
             notify_values = self._read_assignments(
                 self._notify_config, allowed=self._NOTIFY_KEYS
             )
+            notify_values.update(self._environment_overrides)
             enabled, on_success, on_failure, on_stopped = self._notifier.policy()
             return NotificationSettingsSnapshot(
                 enabled=enabled,
@@ -173,9 +186,19 @@ class NotificationSettings:
                 notify_failure=on_failure,
                 notify_stopped=on_stopped,
             )
+            self._environment_overrides["NOTIFY_SERVER"] = server
+            self._environment_overrides["NOTIFY_TOPIC"] = topic
+            if replacement_token is not None:
+                self._environment_overrides["NOTIFY_TOKEN"] = replacement_token
+            self._notifier.configure_transport(
+                server=server,
+                topic=topic,
+                replacement_token=replacement_token,
+            )
             notify_values = self._read_assignments(
                 self._notify_config, allowed=self._NOTIFY_KEYS
             )
+            notify_values.update(self._environment_overrides)
 
         return NotificationSettingsSnapshot(
             enabled=enabled,
@@ -189,22 +212,31 @@ class NotificationSettings:
 
     def send_test(self) -> TestNotificationResult:
         with self._lock:
-            if not self._notify_config.is_file():
-                return TestNotificationResult(
-                    False, "Notify configuration is missing; save settings first."
-                )
+            config_exists = self._notify_config.is_file()
             values = self._read_assignments(
                 self._notify_config, allowed=self._NOTIFY_KEYS
             )
+            values.update(self._environment_overrides)
+            if not config_exists and not values.get("NOTIFY_TOKEN"):
+                return TestNotificationResult(
+                    False, "Notify configuration is missing; save settings first."
+                )
             try:
-                self._server(values.get("NOTIFY_SERVER", ""))
-                self._topic(values.get("NOTIFY_TOPIC", ""))
+                server = self._server(
+                    values.get("NOTIFY_SERVER", DEFAULT_NOTIFY_SERVER)
+                )
+                topic = self._topic(values.get("NOTIFY_TOPIC", DEFAULT_NOTIFY_TOPIC))
             except SettingsValidationError as exc:
                 return TestNotificationResult(False, str(exc))
             if not values.get("NOTIFY_TOKEN"):
                 return TestNotificationResult(
                     False, "Notify credential is missing; replace the token and save."
                 )
+            self._notifier.configure_transport(
+                server=server,
+                topic=topic,
+                replacement_token=self._environment_overrides.get("NOTIFY_TOKEN"),
+            )
 
         result = self._notifier.send_test()
         return self._sanitize_test_result(result)
@@ -218,16 +250,21 @@ class NotificationSettings:
 
     @staticmethod
     def _server(value: object) -> str:
-        if not isinstance(value, str) or value != value.strip() or len(value) > 2048:
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or len(value) > 2048
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
             raise SettingsValidationError("Notify server must be a valid HTTP(S) URL.")
-        parsed = urlparse(value)
         try:
+            parsed = urlparse(value)
             port = parsed.port
+            hostname = parsed.hostname
         except ValueError as exc:
             raise SettingsValidationError(
                 "Notify server must be a valid HTTP(S) URL."
             ) from exc
-        hostname = parsed.hostname
         loopback = hostname == "localhost"
         if hostname is not None and not loopback:
             try:

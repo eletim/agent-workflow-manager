@@ -301,6 +301,7 @@ class SettingsAPINotifier:
         self.current_policy = (True, True, True, False)
         self.test_result = NotificationResult(True, True, "notification sent")
         self.test_calls = 0
+        self.transport_calls: list[tuple[str, str, str | None]] = []
 
     def policy(self) -> tuple[bool, bool, bool, bool]:
         return self.current_policy
@@ -323,6 +324,11 @@ class SettingsAPINotifier:
     def send_test(self) -> NotificationResult:
         self.test_calls += 1
         return self.test_result
+
+    def configure_transport(
+        self, *, server: str, topic: str, replacement_token: str | None
+    ) -> None:
+        self.transport_calls.append((server, topic, replacement_token))
 
 
 @pytest.fixture
@@ -348,6 +354,7 @@ def settings_web_server(
         runtime_config=runtime_config,
         notify_config=notify_config,
         notifier=notifier,
+        environment={},
     )
     runner = PythonRunner(stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
@@ -459,6 +466,65 @@ def test_notification_settings_api_read_never_returns_token(
     assert "token" not in json.dumps(payload).lower()
 
 
+def test_notification_settings_api_honors_environment_only_credential(
+    tmp_path: Path,
+) -> None:
+    runtime_config = tmp_path / "config.sh"
+    notify_config = tmp_path / "notify/config"
+    runtime_config.write_text("AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=enabled\n")
+    notify_config.parent.mkdir()
+    notify_config.write_text(
+        "NOTIFY_SERVER=https://file.example\nNOTIFY_TOPIC=file-topic\n",
+        encoding="utf-8",
+    )
+    notifier = SettingsAPINotifier()
+    settings = NotificationSettings(
+        runtime_config=runtime_config,
+        notify_config=notify_config,
+        notifier=notifier,
+        environment={
+            "NOTIFY_SERVER": "https://environment.example",
+            "NOTIFY_TOPIC": "environment-topic",
+            "NOTIFY_TOKEN": "tk_environment_api_secret",
+        },
+    )
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    address = (str(host), int(port))
+    trusted_host = f"{host}:{port}"
+    try:
+        status, read_payload = request(address, "GET", "/api/settings/notifications")
+        test_status, test_payload = request(
+            address,
+            "POST",
+            "/api/settings/notifications/test",
+            "{}",
+            token=server.request_token,
+            origin=f"http://{trusted_host}",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert status == 200
+    assert read_payload["credentialStatus"] == "configured"
+    assert read_payload["server"] == "https://environment.example"
+    assert "tk_environment_api_secret" not in json.dumps(read_payload)
+    assert test_status == 200
+    assert test_payload["delivered"] is True
+    assert notifier.transport_calls == [
+        (
+            "https://environment.example",
+            "environment-topic",
+            "tk_environment_api_secret",
+        )
+    ]
+
+
 def test_notification_settings_api_write_applies_immediately(
     settings_web_server: tuple[
         tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
@@ -495,6 +561,45 @@ def test_notification_settings_api_write_applies_immediately(
     assert notifier.current_policy == (False, False, True, True)
     assert secret not in runtime_config.read_text(encoding="utf-8")
     assert secret in notify_config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "invalid_server",
+    ["https://[", "https://notify.example\r\nNOTIFY_TOKEN=injected", "https://x\t"],
+)
+def test_notification_settings_api_rejects_malformed_server_without_writes(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+    invalid_server: str,
+) -> None:
+    address, token, runtime_config, notify_config, _, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    original_runtime = runtime_config.read_bytes()
+    original_notify = notify_config.read_bytes()
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications",
+        json.dumps(
+            {
+                "enabled": True,
+                "onSuccess": True,
+                "onFailure": True,
+                "onStopped": False,
+                "server": invalid_server,
+                "topic": "agents",
+            }
+        ),
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 400
+    assert payload == {"error": "Notify server must be a valid HTTP(S) URL."}
+    assert runtime_config.read_bytes() == original_runtime
+    assert notify_config.read_bytes() == original_notify
 
 
 def test_notification_test_api_success_does_not_change_runner_state(

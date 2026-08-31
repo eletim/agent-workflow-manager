@@ -24,6 +24,7 @@ class FakeNotifier:
             True, True, "notification sent"
         )
         self.configure_calls: list[tuple[bool, bool, bool, bool]] = []
+        self.transport_calls: list[tuple[str, str, str | None]] = []
         self.test_calls = 0
 
     def policy(self) -> tuple[bool, bool, bool, bool]:
@@ -49,9 +50,17 @@ class FakeNotifier:
         self.test_calls += 1
         return self.test_result
 
+    def configure_transport(
+        self, *, server: str, topic: str, replacement_token: str | None
+    ) -> None:
+        self.transport_calls.append((server, topic, replacement_token))
+
 
 def _settings(
-    tmp_path: Path, notifier: FakeNotifier | None = None
+    tmp_path: Path,
+    notifier: FakeNotifier | None = None,
+    *,
+    environment: dict[str, str] | None = None,
 ) -> tuple[NotificationSettings, Path, Path, FakeNotifier]:
     runtime_config = tmp_path / "config.sh"
     notify_config = tmp_path / "notify/config"
@@ -60,6 +69,7 @@ def _settings(
         runtime_config=runtime_config,
         notify_config=notify_config,
         notifier=fake_notifier,
+        environment={} if environment is None else environment,
     )
     return settings, runtime_config, notify_config, fake_notifier
 
@@ -147,6 +157,9 @@ def test_settings_write_updates_only_owned_values_and_applies_policy(
     assert "NOTIFY_TOPIC=new_topic" in notify_content
     assert "NOTIFY_TOKEN=tk_new_secret" in notify_content
     assert notifier.configure_calls == [(False, False, True, True)]
+    assert notifier.transport_calls == [
+        ("https://notify.example", "new_topic", "tk_new_secret")
+    ]
     assert runtime_config.stat().st_mode & 0o777 == 0o600
     assert notify_config.stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.rglob(".config.sh.*")) == []
@@ -171,6 +184,47 @@ def test_server_topic_update_preserves_existing_token(tmp_path: Path) -> None:
     assert "NOTIFY_TOKEN=tk_keep_secret" in notify_content
     assert payload["credentialStatus"] == "configured"
     assert "tk_keep_secret" not in json.dumps(payload)
+
+
+def test_environment_transport_overrides_are_reported_and_used(tmp_path: Path) -> None:
+    notifier = FakeNotifier()
+    settings, _, notify_config, _ = _settings(
+        tmp_path,
+        notifier,
+        environment={
+            "NOTIFY_SERVER": "https://environment.example",
+            "NOTIFY_TOPIC": "environment_topic",
+            "NOTIFY_TOKEN": "tk_environment_secret",
+        },
+    )
+    notify_config.parent.mkdir()
+    notify_config.write_text(
+        "NOTIFY_SERVER=https://file.example\nNOTIFY_TOPIC=file_topic\n",
+        encoding="utf-8",
+    )
+
+    payload = settings.read().as_json()
+    result = settings.send_test()
+    updated = settings.update(
+        {
+            "server": "https://saved.example",
+            "topic": "saved_topic",
+            "replacementToken": "tk_saved_secret",
+        }
+    ).as_json()
+
+    assert payload["server"] == "https://environment.example"
+    assert payload["topic"] == "environment_topic"
+    assert payload["credentialStatus"] == "configured"
+    assert "tk_environment_secret" not in json.dumps(payload)
+    assert result.delivered is True
+    assert updated["server"] == "https://saved.example"
+    assert updated["topic"] == "saved_topic"
+    assert "tk_saved_secret" not in json.dumps(updated)
+    assert notifier.transport_calls == [
+        ("https://environment.example", "environment_topic", "tk_environment_secret"),
+        ("https://saved.example", "saved_topic", "tk_saved_secret"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -213,6 +267,22 @@ def test_settings_accepts_loopback_http_notify_server(tmp_path: Path) -> None:
     ).as_json()
 
     assert payload["server"] == "http://127.0.0.1:8080"
+
+
+@pytest.mark.parametrize(
+    "server",
+    ["https://[", "https://notify.example\rINJECTED=value", "https://notify.example\t"],
+)
+def test_malformed_or_control_character_server_is_safely_rejected(
+    tmp_path: Path, server: str
+) -> None:
+    settings, runtime_config, notify_config, _ = _settings(tmp_path)
+
+    with pytest.raises(SettingsValidationError, match="valid HTTP"):
+        settings.update({"server": server, "topic": "agents"})
+
+    assert not runtime_config.exists()
+    assert not notify_config.exists()
 
 
 def test_test_notification_requires_config_and_credential(tmp_path: Path) -> None:

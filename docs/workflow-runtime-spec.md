@@ -136,6 +136,11 @@ The settings read response contains server, topic, policy booleans, and only a
 `configured`/`missing` credential status. It never contains the existing token,
 its prefix, or its length. A replacement token is accepted only as a validated
 write-only value and is persisted solely to the external notify config.
+Inherited `NOTIFY_SERVER`, `NOTIFY_TOPIC`, and `NOTIFY_TOKEN` environment
+overrides retain the public CLI's precedence and are included when calculating
+effective values and credential status. A UI save updates the external config
+and the active notifier's private child-process overrides together, so saved
+values take effect immediately even when the Runner inherited older values.
 
 Settings mutations and test-send requests require the configured exact Host,
 matching browser Origin when present, and current per-server request token—the
