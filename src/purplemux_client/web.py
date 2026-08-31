@@ -38,6 +38,8 @@ def _parse_ipv4_number(value: str) -> int | None:
     elif len(value) > 1 and value.startswith("0"):
         base = 8
         digits = value[1:]
+    if not digits and base == 16:
+        return 0
     if not digits:
         return None
     valid_digits = {
@@ -157,6 +159,8 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         if origin is None:
             return True
         if any(ord(character) < 32 or ord(character) == 127 for character in origin):
+            return False
+        if "?" in origin or "#" in origin:
             return False
         try:
             parsed = urlparse(origin)

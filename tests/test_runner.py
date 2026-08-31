@@ -812,6 +812,25 @@ def test_token_rejects_untrusted_host(
     assert payload == {"error": "untrusted host"}
 
 
+@pytest.mark.parametrize("delimiter", ["?", "#", "?#"])
+def test_run_rejects_matching_origin_with_empty_delimiter(
+    web_server: tuple[tuple[str, int], str], delimiter: str
+) -> None:
+    address, token = web_server
+    host, port = address
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": ""}),
+        token=token,
+        origin=f"http://{host}:{port}{delimiter}",
+    )
+
+    assert status == 403
+    assert payload == {"error": "untrusted request"}
+
+
 def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> None:
     runner = PythonRunner(stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.2", 0), runner)
@@ -916,6 +935,11 @@ def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
         "127.1",
         "2130706433",
         "0x7f000001",
+        "0x",
+        "0X",
+        "0x.1",
+        "0x000000001",
+        "0000000000000001",
     ],
 )
 def test_web_cli_rejects_invalid_hostname_aliases(aliases: str) -> None:

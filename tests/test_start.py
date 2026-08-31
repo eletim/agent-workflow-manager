@@ -326,6 +326,11 @@ def test_existing_config_supports_manual_hostname_alias_without_tailscale(
         "127.1",
         "2130706433",
         "0x7f000001",
+        "0x",
+        "0X",
+        "0x.1",
+        "0x000000001",
+        "0000000000000001",
     ],
 )
 def test_start_rejects_invalid_hostname_alias(tmp_path: Path, alias: str) -> None:

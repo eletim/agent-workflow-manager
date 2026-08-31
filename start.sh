@@ -74,13 +74,21 @@ looks_like_browser_ipv4() {
     IFS=. read -r -a parts <<<"$value"
     (( ${#parts[@]} >= 1 && ${#parts[@]} <= 4 )) || return 1
     for part in "${parts[@]}"; do
-        if [[ $part =~ ^0[xX]([0-9a-fA-F]+)$ ]]; then
+        if [[ $part == 0x || $part == 0X ]]; then
+            number=0
+        elif [[ $part =~ ^0[xX]([0-9a-fA-F]+)$ ]]; then
             digits=${BASH_REMATCH[1]}
+            while [[ ${#digits} -gt 1 && $digits == 0* ]]; do
+                digits=${digits#0}
+            done
             (( ${#digits} <= 8 )) || return 1
             number=$((16#$digits))
         elif [[ ${#part} -gt 1 && $part == 0* ]]; then
             [[ $part =~ ^0([0-7]+)$ ]] || return 1
             digits=${BASH_REMATCH[1]}
+            while [[ ${#digits} -gt 1 && $digits == 0* ]]; do
+                digits=${digits#0}
+            done
             (( ${#digits} <= 11 )) || return 1
             number=$((8#$digits))
         elif [[ $part =~ ^[0-9]+$ ]]; then
