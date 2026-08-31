@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,11 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from purplemux_client.notification_settings import (
+    NotificationSettings,
+    SettingsError,
+    SettingsValidationError,
+)
 from purplemux_client.notifier import NotifyCLI
 from purplemux_client.runner import AlreadyRunningError, PythonRunner
 
@@ -28,10 +34,30 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         runner: PythonRunner | None = None,
+        notification_settings: NotificationSettings | None = None,
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
-        self.runner = runner or PythonRunner(notifier=NotifyCLI.from_environment())
+        notifier = (
+            NotifyCLI.from_environment()
+            if runner is None or notification_settings is None
+            else None
+        )
+        self.runner = runner or PythonRunner(notifier=notifier)
+        self.notification_settings = notification_settings or NotificationSettings(
+            runtime_config=Path(
+                os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")
+            ),
+            notify_config=Path(
+                os.environ.get(
+                    "NOTIFY_CONFIG", str(Path.home() / ".config/notify/config")
+                )
+            ),
+            notifier=cast(NotifyCLI, notifier),
+        )
+        self._settings_notifier = (
+            notifier if runner is not None and notification_settings is None else None
+        )
         self.request_token = secrets.token_urlsafe(32)
         bound_host, bound_port = cast(tuple[str, int], self.server_address)
         self.allowed_hosts = {
@@ -46,6 +72,8 @@ class RunnerHTTPServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self.runner.close()
+        if self._settings_notifier is not None:
+            self._settings_notifier.close()
         super().server_close()
 
 
@@ -62,6 +90,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             return
         if path in {"/api/status", "/api/output"}:
             self._send_json(HTTPStatus.OK, self.server.runner.snapshot().as_json())
+            return
+        if path == "/api/settings/notifications":
+            try:
+                settings = self.server.notification_settings.read()
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings.as_json())
             return
         static_file = STATIC_FILES.get(path)
         if static_file is None:
@@ -83,7 +119,12 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if not self._is_trusted_request(require_json=path == "/api/run"):
+        json_paths = {
+            "/api/run",
+            "/api/settings/notifications",
+            "/api/settings/notifications/test",
+        }
+        if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
             return
         if path == "/api/run":
@@ -115,6 +156,40 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     **self.server.runner.snapshot().as_json(),
                 },
             )
+            return
+        if path == "/api/settings/notifications":
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                settings = self.server.notification_settings.update(payload)
+            except SettingsValidationError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings.as_json())
+            return
+        if path == "/api/settings/notifications/test":
+            payload = self._read_json()
+            if payload is None:
+                return
+            if payload:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "test notification request must be empty"},
+                )
+                return
+            try:
+                result = self.server.notification_settings.send_test()
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            if result.delivered:
+                self._send_json(HTTPStatus.OK, result.as_json())
+            else:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": result.message})
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -178,12 +253,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trusted Python runner UI")
     parser.add_argument("--host", default="127.0.0.1", type=_parse_bind_host)
     parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument(
+        "--runtime-config",
+        default=Path(os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")),
+        type=Path,
+    )
+    parser.add_argument(
+        "--notify-config",
+        default=Path(
+            os.environ.get("NOTIFY_CONFIG", str(Path.home() / ".config/notify/config"))
+        ),
+        type=Path,
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    server = RunnerHTTPServer((args.host, args.port))
+    notifier = NotifyCLI.from_environment()
+    notifier.config_path = str(args.notify_config)
+    notification_settings = NotificationSettings(
+        runtime_config=args.runtime_config,
+        notify_config=args.notify_config,
+        notifier=notifier,
+    )
+    server = RunnerHTTPServer(
+        (args.host, args.port),
+        runner=PythonRunner(notifier=notifier),
+        notification_settings=notification_settings,
+    )
     print(f"Python Runner UI: http://{args.host}:{args.port}")
     print("Trusted-network use only: this server executes arbitrary Python code.")
     try:

@@ -25,16 +25,22 @@ class NotifyCLI:
         self,
         *,
         enabled: bool = True,
+        notify_success: bool = True,
+        notify_failure: bool = True,
         notify_stopped: bool = False,
         timeout: float = 20.0,
         executable: str = "notify",
+        config_path: str | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("notification timeout must be positive")
         self.enabled = enabled
+        self.notify_success = notify_success
+        self.notify_failure = notify_failure
         self.notify_stopped = notify_stopped
         self.timeout = timeout
         self.executable = executable
+        self.config_path = config_path
         self._lock = threading.Lock()
         self._processes: set[subprocess.Popen[bytes]] = set()
         self._closed = False
@@ -43,24 +49,69 @@ class NotifyCLI:
     def from_environment(cls) -> NotifyCLI:
         return cls(
             enabled=_environment_flag("AGENT_WORKFLOW_MANAGER_NOTIFICATIONS", False),
+            notify_success=_environment_flag(
+                "AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS", True
+            ),
+            notify_failure=_environment_flag(
+                "AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE", True
+            ),
             notify_stopped=_environment_flag(
                 "AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED", False
             ),
+            config_path=os.environ.get("NOTIFY_CONFIG"),
         )
+
+    def policy(self) -> tuple[bool, bool, bool, bool]:
+        with self._lock:
+            return (
+                self.enabled,
+                self.notify_success,
+                self.notify_failure,
+                self.notify_stopped,
+            )
+
+    def configure_policy(
+        self,
+        *,
+        enabled: bool,
+        notify_success: bool,
+        notify_failure: bool,
+        notify_stopped: bool,
+    ) -> None:
+        with self._lock:
+            self.enabled = enabled
+            self.notify_success = notify_success
+            self.notify_failure = notify_failure
+            self.notify_stopped = notify_stopped
 
     def notify_terminal(
         self, *, run_id: int, state: TerminalState, exit_code: int | None
     ) -> NotificationResult:
-        if not self.enabled:
+        enabled, notify_success, notify_failure, notify_stopped = self.policy()
+        if not enabled:
             return NotificationResult(False, False, "notifications disabled")
-        if state == "stopped" and not self.notify_stopped:
+        if state == "success" and not notify_success:
+            return NotificationResult(False, False, "success notifications disabled")
+        if state == "failed" and not notify_failure:
+            return NotificationResult(False, False, "failure notifications disabled")
+        if state == "stopped" and not notify_stopped:
             return NotificationResult(False, False, "stopped notifications disabled")
 
+        title, message = _terminal_message(run_id, state, exit_code)
+        return self._send(title=title, message=message)
+
+    def send_test(self) -> NotificationResult:
+        return self._send(title="Agent Workflow Manager", message="Test notification")
+
+    def _send(self, *, title: str, message: str) -> NotificationResult:
         executable = shutil.which(self.executable)
         if executable is None:
             return NotificationResult(True, False, "notify command unavailable")
 
-        title, message = _terminal_message(run_id, state, exit_code)
+        environment = None
+        if self.config_path is not None:
+            environment = os.environ.copy()
+            environment["NOTIFY_CONFIG"] = self.config_path
         with self._lock:
             if self._closed:
                 return NotificationResult(False, False, "notifier closed")
@@ -70,6 +121,7 @@ class NotifyCLI:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=environment,
                 )
             except OSError:
                 return NotificationResult(True, False, "notify command could not start")

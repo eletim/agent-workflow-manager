@@ -11,6 +11,10 @@ Runner
   -> execute / stop / observe
   -> terminal notification side effect
 
+Agent Workflow Manager UI
+  -> protected notification settings/test APIs
+  -> public notify CLI
+
 notify CLI
   -> notify-server / ntfy
 
@@ -86,11 +90,13 @@ not drive workflow control flow and do not participate in orchestration.
 | `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
 | `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
 
-At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal notifications.
-`AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=1` additionally enables stopped
-notifications. In `config.sh`, the first setting is expressed as `auto`,
-`enabled`, or `disabled`; `start.sh` resolves it to the runtime boolean after
-notify setup. The second remains an explicit operator choice.
+At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
+notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,
+`AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE`, and
+`AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED` select terminal states independently;
+success and failure default on, and stopped defaults off. In `config.sh`, the
+first setting is expressed as `auto`, `enabled`, or `disabled`; `start.sh`
+resolves it to the runtime boolean after notify setup.
 
 Each enabled terminal notification has one attempt, an outer bounded timeout,
 and no retry loop. The CLI runs in its own process group, which is terminated
@@ -112,12 +118,42 @@ authentication, delivery configuration, and its internal request timeout.
 Agent Workflow Manager must not construct raw ntfy HTTP requests or duplicate
 notify-server authentication behavior.
 
+## Notification settings and test API
+
+The UI exposes one compact Notifications settings area rather than a generic
+settings framework. Its backend is limited to the configured repository
+`config.sh` and external notify CLI config path; the browser cannot select a
+file path or perform arbitrary file edits. Values are validated before being
+written, files are replaced atomically where practical, and the secret-bearing
+notify config is mode `0600`.
+
+Notification policy changes are applied immediately to the same notifier used
+for future terminal-state observations and persisted to `config.sh`. They do
+not alter a running or completed workflow state. Host and port are not exposed
+in this UI, so no setting requires unsafe network rebinding or a restart.
+
+The settings read response contains server, topic, policy booleans, and only a
+`configured`/`missing` credential status. It never contains the existing token,
+its prefix, or its length. A replacement token is accepted only as a validated
+write-only value and is persisted solely to the external notify config.
+
+Settings mutations and test-send requests require the configured exact Host,
+matching browser Origin when present, and current per-server request token—the
+same trusted-request boundary as Run and Stop. Test delivery calls public
+`notify send` once with title `Agent Workflow Manager` and message
+`Test notification`, under the same bounded process timeout and process-group
+cleanup as terminal delivery. CLI absence, invalid/missing config or token,
+timeout, and nonzero exit produce sanitized actionable messages; CLI output is
+discarded and never returned. A test notification never reads or mutates
+PythonRunner state.
+
 ## Credentials and configuration
 
 Agent Workflow Manager runtime/startup configuration lives in the gitignored
 `config.sh`, initially generated from committed `sample_config.sh`. Its
-required values are the explicit host, port, notification mode, and
-`NOTIFY_CONFIG` path. It contains no notification credentials.
+required values are the explicit host, port, notification enabled mode,
+success/failure/stopped policy, and `NOTIFY_CONFIG` path. It contains no
+notification credentials.
 
 Notify configuration lives outside Git at `~/.config/notify/config` by default
 (or the path selected by `NOTIFY_CONFIG`):

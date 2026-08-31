@@ -32,13 +32,19 @@ h2, label { font-size: 14px; font-weight: 650; }
   padding: 16px;
 }
 
-textarea, pre {
+textarea, pre, input[type="text"], input[type="url"], input[type="password"] {
   width: 100%;
   color: #e8eaf0;
   background: #0c0f15;
   border: 1px solid #303746;
   border-radius: 7px;
   font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+input[type="text"], input[type="url"], input[type="password"] {
+  min-width: 0;
+  padding: 8px 10px;
+  font-family: inherit;
 }
 
 textarea {
@@ -94,8 +100,49 @@ pre {
 
 .stderr-panel pre { color: #ffb3bc; }
 
+.settings-panel { margin-top: 14px; }
+.settings-panel summary { cursor: pointer; font-weight: 650; }
+.settings-panel[open] summary { margin-bottom: 18px; }
+.settings-heading, .settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.settings-heading { justify-content: space-between; }
+.settings-heading h2 { margin: 0 0 4px; }
+.settings-heading p { margin: 0; color: #9ba3b5; font-size: 13px; }
+.credential {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.credential.configured { background: #163f2b; color: #75e2a8; }
+.credential.missing { background: #4b252b; color: #ff9ca8; }
+.toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(4, max-content);
+  gap: 12px 24px;
+  margin: 18px 0;
+}
+.toggle-grid label { font-weight: 500; }
+.field-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(180px, 1fr);
+  align-items: center;
+  gap: 10px 14px;
+}
+.settings-actions { margin-top: 16px; }
+#settings-message { color: #aab0bf; font-size: 13px; }
+#settings-message.error { color: #ff9ca8; }
+#settings-message.success-message { color: #75e2a8; }
+
 @media (max-width: 760px) {
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
   .outputs { grid-template-columns: 1fr; }
   textarea { min-height: 330px; }
+  .settings-heading { align-items: flex-start; }
+  .toggle-grid { grid-template-columns: 1fr 1fr; }
+  .field-grid { grid-template-columns: 1fr; }
+  .settings-actions { align-items: stretch; flex-direction: column; }
 }

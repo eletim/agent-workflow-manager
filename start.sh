@@ -21,6 +21,12 @@ port_override_set=${AGENT_WORKFLOW_MANAGER_PORT+x}
 port_override=${AGENT_WORKFLOW_MANAGER_PORT-}
 notifications_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFICATIONS+x}
 notifications_override=${AGENT_WORKFLOW_MANAGER_NOTIFICATIONS-}
+notify_success_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS+x}
+notify_success_override=${AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS-}
+notify_failure_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE+x}
+notify_failure_override=${AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE-}
+notify_stopped_override_set=${AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED+x}
+notify_stopped_override=${AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED-}
 notify_config_override_set=${NOTIFY_CONFIG+x}
 notify_config_override=${NOTIFY_CONFIG-}
 runtime_config_temp=""
@@ -52,6 +58,13 @@ validate_port() {
     local value=$1
     [[ $value =~ ^[0-9]{1,5}$ ]] &&
         ((10#$value >= 1 && 10#$value <= 65535))
+}
+
+validate_boolean() {
+    case ${1,,} in
+        1 | true | yes | on | 0 | false | no | off) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 prompt_yes_by_default() {
@@ -92,6 +105,12 @@ write_runtime_config() {
         printf 'AGENT_WORKFLOW_MANAGER_PORT=%q\n' "$AGENT_WORKFLOW_MANAGER_PORT"
         printf 'AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=%q\n' \
             "$AGENT_WORKFLOW_MANAGER_NOTIFICATIONS"
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS"
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE"
+        printf 'AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=%q\n' \
+            "$AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED"
         printf 'NOTIFY_CONFIG=%q\n' "$NOTIFY_CONFIG"
     } >"$runtime_config_temp"
     chmod 600 "$runtime_config_temp"
@@ -144,6 +163,9 @@ run_first_time_setup() {
 AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1
 AGENT_WORKFLOW_MANAGER_PORT=8765
 AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=auto
+AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=true
+AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=true
+AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=false
 NOTIFY_CONFIG="$HOME/.config/notify/config"
 
 first_run=false
@@ -184,6 +206,15 @@ fi
 if [[ $notifications_override_set ]]; then
     AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=$notifications_override
 fi
+if [[ $notify_success_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=$notify_success_override
+fi
+if [[ $notify_failure_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=$notify_failure_override
+fi
+if [[ $notify_stopped_override_set ]]; then
+    AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=$notify_stopped_override
+fi
 if [[ $notify_config_override_set ]]; then
     NOTIFY_CONFIG=$notify_config_override
 fi
@@ -209,11 +240,24 @@ case ${AGENT_WORKFLOW_MANAGER_NOTIFICATIONS-} in
         exit 2
         ;;
 esac
+for policy_variable in \
+    AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS \
+    AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE \
+    AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED; do
+    if ! validate_boolean "${!policy_variable-}"; then
+        printf 'ERROR: %s must be a boolean value.\n' "$policy_variable" >&2
+        exit 2
+    fi
+done
 if [[ -z ${NOTIFY_CONFIG-} ]]; then
     printf 'ERROR: NOTIFY_CONFIG must not be empty.\n' >&2
     exit 2
 fi
 export NOTIFY_CONFIG
+export AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS
+export AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE
+export AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED
+export AGENT_WORKFLOW_MANAGER_CONFIG_FILE="$config_file"
 
 require_command uv
 printf 'Syncing Python dependencies...\n'
@@ -307,4 +351,6 @@ printf 'Notify config: %s\n' "$NOTIFY_CONFIG"
 
 exec uv run python -m purplemux_client.web \
     --host "$AGENT_WORKFLOW_MANAGER_HOST" \
-    --port "$AGENT_WORKFLOW_MANAGER_PORT"
+    --port "$AGENT_WORKFLOW_MANAGER_PORT" \
+    --runtime-config "$config_file" \
+    --notify-config "$NOTIFY_CONFIG"

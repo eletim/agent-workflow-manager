@@ -8,9 +8,12 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
+from purplemux_client.notification_settings import NotificationSettings
+from purplemux_client.notifier import NotificationResult
 from purplemux_client.runner import (
     AlreadyRunningError,
     PythonRunner,
@@ -293,6 +296,77 @@ def web_server() -> Iterator[tuple[tuple[str, int], str]]:
     thread.join()
 
 
+class SettingsAPINotifier:
+    def __init__(self) -> None:
+        self.current_policy = (True, True, True, False)
+        self.test_result = NotificationResult(True, True, "notification sent")
+        self.test_calls = 0
+
+    def policy(self) -> tuple[bool, bool, bool, bool]:
+        return self.current_policy
+
+    def configure_policy(
+        self,
+        *,
+        enabled: bool,
+        notify_success: bool,
+        notify_failure: bool,
+        notify_stopped: bool,
+    ) -> None:
+        self.current_policy = (
+            enabled,
+            notify_success,
+            notify_failure,
+            notify_stopped,
+        )
+
+    def send_test(self) -> NotificationResult:
+        self.test_calls += 1
+        return self.test_result
+
+
+@pytest.fixture
+def settings_web_server(
+    tmp_path: Path,
+) -> Iterator[
+    tuple[tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner]
+]:
+    runtime_config = tmp_path / "config.sh"
+    notify_config = tmp_path / "notify/config"
+    runtime_config.write_text(
+        'AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"\n', encoding="utf-8"
+    )
+    notify_config.parent.mkdir()
+    notify_config.write_text(
+        "NOTIFY_SERVER=https://notify.example\n"
+        "NOTIFY_TOPIC=agents\n"
+        "NOTIFY_TOKEN=tk_api_secret\n",
+        encoding="utf-8",
+    )
+    notifier = SettingsAPINotifier()
+    settings = NotificationSettings(
+        runtime_config=runtime_config,
+        notify_config=notify_config,
+        notifier=notifier,
+    )
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    yield (
+        (str(host), int(port)),
+        server.request_token,
+        runtime_config,
+        notify_config,
+        notifier,
+        runner,
+    )
+    server.shutdown()
+    server.server_close()
+    thread.join()
+
+
 def request(
     server_address: tuple[str, int],
     method: str,
@@ -367,6 +441,186 @@ def test_runner_http_lifecycle(
         "exitCode": 0,
         "runId": 1,
     }
+
+
+def test_notification_settings_api_read_never_returns_token(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+) -> None:
+    address, _, _, _, _, _ = settings_web_server
+
+    status, payload = request(address, "GET", "/api/settings/notifications")
+
+    assert status == 200
+    assert payload["credentialStatus"] == "configured"
+    assert payload["server"] == "https://notify.example"
+    assert "tk_api_secret" not in json.dumps(payload)
+    assert "token" not in json.dumps(payload).lower()
+
+
+def test_notification_settings_api_write_applies_immediately(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+) -> None:
+    address, token, runtime_config, notify_config, notifier, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    secret = "tk_replaced_api_secret"
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications",
+        json.dumps(
+            {
+                "enabled": False,
+                "onSuccess": False,
+                "onFailure": True,
+                "onStopped": True,
+                "server": "https://new-notify.example",
+                "topic": "runner_team",
+                "replacementToken": secret,
+            }
+        ),
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["credentialStatus"] == "configured"
+    assert payload["restartRequired"] is False
+    assert secret not in json.dumps(payload)
+    assert notifier.current_policy == (False, False, True, True)
+    assert secret not in runtime_config.read_text(encoding="utf-8")
+    assert secret in notify_config.read_text(encoding="utf-8")
+
+
+def test_notification_test_api_success_does_not_change_runner_state(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+) -> None:
+    address, token, _, _, notifier, runner = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    before = runner.snapshot()
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications/test",
+        "{}",
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 200
+    assert payload == {"delivered": True, "message": "Test notification sent."}
+    assert notifier.test_calls == 1
+    assert runner.snapshot() == before
+
+
+def test_notification_test_api_cli_failure_is_sanitized(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+) -> None:
+    address, token, _, _, notifier, _ = settings_web_server
+    host = f"{address[0]}:{address[1]}"
+    notifier.test_result = NotificationResult(
+        True, False, "notify stderr contained tk_api_secret"
+    )
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/settings/notifications/test",
+        "{}",
+        token=token,
+        origin=f"http://{host}",
+    )
+
+    assert status == 502
+    assert payload == {
+        "error": "Notify failed; check the server, topic, token, and network."
+    }
+    assert "tk_api_secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("token_kind", "origin_kind", "host_kind"),
+    [
+        ("missing", "trusted", "trusted"),
+        ("wrong", "trusted", "trusted"),
+        ("valid", "untrusted", "trusted"),
+        ("valid", "trusted", "untrusted"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/settings/notifications/test", "{}"),
+        (
+            "/api/settings/notifications",
+            json.dumps(
+                {
+                    "enabled": True,
+                    "onSuccess": True,
+                    "onFailure": True,
+                    "onStopped": False,
+                    "server": "https://notify.example",
+                    "topic": "agents",
+                }
+            ),
+        ),
+    ],
+)
+def test_notification_settings_mutation_rejects_untrusted_request(
+    settings_web_server: tuple[
+        tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner
+    ],
+    token_kind: str,
+    origin_kind: str,
+    host_kind: str,
+    path: str,
+    body: str,
+) -> None:
+    address, actual_token, runtime_config, notify_config, notifier, _ = (
+        settings_web_server
+    )
+    original_runtime = runtime_config.read_bytes()
+    original_notify = notify_config.read_bytes()
+    trusted_host = f"{address[0]}:{address[1]}"
+    supplied_token = (
+        actual_token
+        if token_kind == "valid"
+        else "wrong"
+        if token_kind == "wrong"
+        else None
+    )
+    origin = (
+        f"http://{trusted_host}"
+        if origin_kind == "trusted"
+        else "https://attacker.example"
+    )
+    host = trusted_host if host_kind == "trusted" else "attacker.example"
+
+    status, payload = request(
+        address,
+        "POST",
+        path,
+        body,
+        token=supplied_token,
+        origin=origin,
+        host=host,
+    )
+
+    assert status == 403
+    assert payload == {"error": "untrusted request"}
+    assert notifier.test_calls == 0
+    assert runtime_config.read_bytes() == original_runtime
+    assert notify_config.read_bytes() == original_notify
 
 
 @pytest.mark.parametrize(
