@@ -56,7 +56,10 @@ validates it without repeating first-run questions. First-run setup may call
 `tailscale ip -4` to suggest one address, but this is optional detection only:
 failure or absence defaults safely to a localhost offer, and a user can enter
 another explicit trusted interface IPv4 manually. Startup never depends on
-the Tailscale CLI.
+the Tailscale CLI. Declining an address that was successfully detected selects
+localhost; manual entry is offered when detection fails and the localhost
+offer is declined. Explicit environment values may override saved values for
+one process without rewriting `config.sh`.
 
 The Runner derives the allowed HTTP Host and browser Origin from the actual
 configured bind address and port. GET requests require that Host. Browser POST

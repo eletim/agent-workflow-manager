@@ -108,10 +108,12 @@ The default remains local-only at `http://127.0.0.1:8765`. During first-run
 setup, `start.sh` optionally runs `tailscale ip -4` as a convenience. If it
 finds one usable address, it offers to save that address in `config.sh`; if
 Tailscale is absent or unavailable, setup safely offers localhost instead.
-Tailscale is never required.
+Tailscale is never required. Accepting a detected address selects it;
+declining that detected address selects localhost, as prompted.
 
-To use another trusted LAN or interface address, decline the localhost prompt
-and enter its explicit IPv4 address, or later edit this value in `config.sh`:
+When no Tailscale address can be detected, declining the localhost prompt lets
+you enter another trusted LAN or interface IPv4 address. You can also later
+edit this value in `config.sh`:
 
 ```bash
 AGENT_WORKFLOW_MANAGER_HOST="192.168.50.20"
@@ -121,6 +123,12 @@ AGENT_WORKFLOW_MANAGER_HOST="192.168.50.20"
 addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
 Funnel and introduces no reverse proxy. After configuration, normal startup is
 always simply `bash start.sh`.
+
+For compatibility and one-off launches, explicit environment values override
+the corresponding saved values for that process without rewriting
+`config.sh`; for example,
+`AGENT_WORKFLOW_MANAGER_HOST=100.x.y.z bash start.sh`. Persistent changes
+belong in `config.sh`.
 
 ```text
 browser on another trusted device

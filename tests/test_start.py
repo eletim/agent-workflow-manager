@@ -115,6 +115,28 @@ def test_existing_config_skips_first_run_setup(tmp_path: Path) -> None:
     assert "tailscale " not in call_log.read_text(encoding="utf-8")
 
 
+def test_explicit_environment_values_override_existing_config(tmp_path: Path) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    environment.update(
+        {
+            "AGENT_WORKFLOW_MANAGER_HOST": "100.70.80.91",
+            "AGENT_WORKFLOW_MANAGER_PORT": "9000",
+            "AGENT_WORKFLOW_MANAGER_NOTIFICATIONS": "disabled",
+            "NOTIFY_CONFIG": str(tmp_path / "external-notify/config"),
+        }
+    )
+    original_config = config_file.read_text(encoding="utf-8")
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "http://100.70.80.91:9000" in completed.stdout
+    assert f"Notify config: {environment['NOTIFY_CONFIG']}" in completed.stdout
+    assert call_log.read_text(encoding="utf-8").splitlines()[-1] == (
+        "uv run python -m purplemux_client.web --host 100.70.80.91 --port 9000"
+    )
+    assert config_file.read_text(encoding="utf-8") == original_config
+
+
 def test_missing_config_generates_persistent_runtime_config(tmp_path: Path) -> None:
     environment, _, config_file = _start_environment(tmp_path, create_config=False)
     completed = _run_start(environment, input_text="\n")
@@ -128,6 +150,15 @@ def test_missing_config_generates_persistent_runtime_config(tmp_path: Path) -> N
     assert "AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=auto" in config
     assert f"NOTIFY_CONFIG={environment['HOME']}/.config/notify/config" in config
     assert "Saved runtime configuration" in completed.stdout
+
+
+def test_incomplete_first_run_is_retried_next_start(tmp_path: Path) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    completed = _run_start(environment, input_text="n\n")
+
+    assert completed.returncode != 0
+    assert "setup input ended" in completed.stderr
+    assert not config_file.exists()
 
 
 def test_first_run_accepts_detected_tailscale_ipv4(tmp_path: Path) -> None:
@@ -202,6 +233,24 @@ def test_start_uses_external_token_without_printing_or_persisting_it(
     runtime_config = config_file.read_text(encoding="utf-8")
     assert secret not in runtime_config
     assert "NOTIFY_TOKEN" not in runtime_config
+
+
+def test_installed_notify_does_not_invoke_curl(tmp_path: Path) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        notifications="auto",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    environment["NOTIFY_TOKEN"] = "tk_external"
+    _executable(
+        tmp_path / "bin" / "curl",
+        "printf 'curl invoked\\n' >>\"$START_CALL_LOG\"\nexit 99\n",
+    )
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "curl invoked" not in call_log.read_text(encoding="utf-8")
 
 
 def test_start_without_notify_configuration_still_launches(tmp_path: Path) -> None:
