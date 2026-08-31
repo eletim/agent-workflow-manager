@@ -19,7 +19,9 @@ notify CLI
   -> notify-server / ntfy
 
 browser on another trusted device
-  -> http://<explicit trusted IPv4>:8765
+  -> http://<trusted hostname>:8765
+  -> DNS / MagicDNS
+  -> <explicit bound IPv4>:8765
   -> Agent Workflow Manager Runner UI
 ```
 
@@ -65,12 +67,44 @@ localhost; manual entry is offered when detection fails and the localhost
 offer is declined. Explicit environment values may override saved values for
 one process without rewriting `config.sh`.
 
-The Runner derives the allowed HTTP Host and browser Origin from the actual
-configured bind address and port. GET requests require that Host. Browser POST
-run/stop requests require the configured Host, its matching exact `http://`
-Origin, and the current per-server request token. Missing browser Origin keeps
-the existing trusted non-browser client behavior, but unknown or unconfigured
-Host/Origin values remain forbidden.
+`AGENT_WORKFLOW_MANAGER_HOST` is exclusively the socket bind IPv4.
+`AGENT_WORKFLOW_MANAGER_HOST_ALIASES` is an optional comma-separated set of
+exact DNS names that extends browser Host and Origin trust without changing
+the bind. A browser may therefore resolve a configured MagicDNS or LAN
+hostname to the bound IPv4 while the Runner continues listening only on that
+IPv4. The alias list does not use a reverse proxy and does not cause Serve or
+Funnel configuration.
+
+After a detected Tailscale IPv4 is accepted, first-run setup may query
+Tailscale status for the machine's MagicDNS FQDN and offer to save it. This is
+bounded optional convenience detection only; failure is nonfatal, and aliases may be
+configured manually without Tailscale. Each alias is validated as one exact
+ASCII DNS hostname, normalized to lowercase with an optional trailing root dot
+removed, and matched only on the configured port. Schemes, ports, paths,
+queries, user information, whitespace, control characters, IP addresses, and
+wildcards are rejected. In particular, no `*.ts.net` suffix or all-MagicDNS
+trust is supported.
+
+Startup also provides a one-time convenience path for an existing runtime
+configuration that predates hostname aliases. If its saved bind is an explicit
+non-loopback IPv4 and its alias value is empty or absent, startup may detect a
+valid local MagicDNS FQDN and ask whether to allow it. Acceptance atomically
+appends one effective alias assignment with mode `0600`; it does not alter any
+existing bind, notification policy, notify config path, comment, inline shell
+statement, or unrelated value. Runtime config writers serialize through a
+sidecar lock, and migration checks for an unexpected stale source before
+replacement. Decline and detection failure leave the file unchanged and do
+not block startup. A configured alias or explicit host/alias environment
+override suppresses this migration entirely.
+
+The Runner derives allowed HTTP Hosts and browser Origins from the actual bind
+address, exact configured hostname aliases, and port. GET requests require one
+of those Hosts. Browser POST requests require an allowed Host, its matching
+exact normalized `http://` Origin, and the current per-server request token.
+Missing browser Origin keeps the existing trusted non-browser client behavior,
+but unknown or unconfigured Host/Origin values remain forbidden. Direct IP
+access continues to work; localhost is additionally trusted only for a
+`127.0.0.1` bind.
 
 Direct network access is only an outer trust boundary and does not replace
 application validation. The Runner executes arbitrary trusted Python, is not a
@@ -156,7 +190,8 @@ PythonRunner state.
 
 Agent Workflow Manager runtime/startup configuration lives in the gitignored
 `config.sh`, initially generated from committed `sample_config.sh`. Its
-required values are the explicit host, port, notification enabled mode,
+required values are the explicit bind host, trusted hostname aliases, port,
+notification enabled mode,
 success/failure/stopped policy, and `NOTIFY_CONFIG` path. It contains no
 notification credentials.
 

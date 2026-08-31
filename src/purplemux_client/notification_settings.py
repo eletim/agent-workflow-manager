@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import os
 import re
@@ -360,37 +361,42 @@ class NotificationSettings:
         if not updates.keys() <= allowed:
             raise SettingsError("Notification settings update was rejected.")
         try:
-            existing = path.read_text(encoding="utf-8") if path.exists() else ""
-            lines = existing.splitlines()
-            written: set[str] = set()
-            rendered: list[str] = []
-            for line in lines:
-                match = _ASSIGNMENT.match(line)
-                key = match.group("key") if match is not None else None
-                if key in updates:
-                    rendered.append(f"{key}={shlex.quote(updates[key])}")
-                    written.add(key)
-                else:
-                    rendered.append(line)
-            for key, value in updates.items():
-                if key not in written:
-                    rendered.append(f"{key}={shlex.quote(value)}")
-            content = "\n".join(rendered) + "\n"
-
             path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", dir=path.parent
-            )
-            temporary_path = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
-                    temporary.write(content)
-                    temporary.flush()
-                    os.fsync(temporary.fileno())
-                temporary_path.chmod(mode)
-                os.replace(temporary_path, path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+            lock_path = path.with_name(f".{path.name}.lock")
+            lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.fchmod(lock_descriptor, 0o600)
+            with os.fdopen(lock_descriptor, "r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                existing = path.read_text(encoding="utf-8") if path.exists() else ""
+                lines = existing.splitlines()
+                written: set[str] = set()
+                rendered: list[str] = []
+                for line in lines:
+                    match = _ASSIGNMENT.match(line)
+                    key = match.group("key") if match is not None else None
+                    if key in updates:
+                        rendered.append(f"{key}={shlex.quote(updates[key])}")
+                        written.add(key)
+                    else:
+                        rendered.append(line)
+                for key, value in updates.items():
+                    if key not in written:
+                        rendered.append(f"{key}={shlex.quote(value)}")
+                content = "\n".join(rendered) + "\n"
+
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.", dir=path.parent
+                )
+                temporary_path = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                        temporary.write(content)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                    temporary_path.chmod(mode)
+                    os.replace(temporary_path, path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
         except OSError as exc:
             raise SettingsError("Notification settings could not be saved.") from exc
 

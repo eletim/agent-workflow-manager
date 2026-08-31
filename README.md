@@ -87,6 +87,7 @@ and `purplemux`, and starts the UI at the configured URL.
 
 ```bash
 AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES=""
 AGENT_WORKFLOW_MANAGER_PORT="8765"
 AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="auto"
 AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS="true"
@@ -122,10 +123,40 @@ edit this value in `config.sh`:
 AGENT_WORKFLOW_MANAGER_HOST="192.168.50.20"
 ```
 
-`start.sh` prints the exact browser URL and rejects hostnames, invalid
-addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
+`start.sh` prints the exact browser URL and rejects hostnames as bind values,
+invalid addresses, and the wildcard `0.0.0.0`; it never invokes Tailscale Serve or
 Funnel and introduces no reverse proxy. After configuration, normal startup is
 always simply `bash start.sh`.
+
+The bind address and browser hostname trust are separate settings. The Runner
+still binds one explicit IPv4 from `AGENT_WORKFLOW_MANAGER_HOST`. Optional
+comma-separated `AGENT_WORKFLOW_MANAGER_HOST_ALIASES` values only extend the
+exact HTTP Host and Origin allowlist; they never affect the socket bind:
+
+```bash
+AGENT_WORKFLOW_MANAGER_HOST="100.x.y.z"
+AGENT_WORKFLOW_MANAGER_HOST_ALIASES="e-ryzen.tail6bc726.ts.net"
+```
+
+When first-run setup detects and you accept a Tailscale IPv4, it also tries to
+detect the local MagicDNS name and offers to persist it as an alias. Both
+Tailscale checks are bounded optional conveniences: startup continues if either fails,
+and an exact LAN or MagicDNS hostname can be entered directly in `config.sh`
+without the Tailscale CLI. Aliases are normalized to lowercase DNS names and
+must not contain a scheme, port, path, query, user information, wildcard,
+whitespace, or control character. A trailing DNS root dot is removed. No
+`*.ts.net` or other suffix is implicitly trusted.
+
+Existing installations are migrated without manual editing. When
+`bash start.sh` loads an existing `config.sh` with a non-loopback IPv4 bind and no
+hostname aliases, it performs the same bounded MagicDNS detection and offers
+to allow that exact hostname. Accepting atomically appends one effective
+`AGENT_WORKFLOW_MANAGER_HOST_ALIASES` assignment; all existing configuration
+text remains intact. Runtime config writers share a sidecar lock and the
+migration refuses a stale replacement rather than losing a concurrent update.
+Declining or failed detection leaves the file unchanged and startup continues.
+An already configured alias or explicit environment override skips detection
+and the migration prompt.
 
 For compatibility and one-off launches, explicit environment values override
 the corresponding saved values for that process without rewriting
@@ -135,14 +166,17 @@ belong in `config.sh`.
 
 ```text
 browser on another trusted device
-  -> http://<explicit trusted IPv4>:8765
+  -> http://<explicit trusted IPv4 or configured hostname>:8765
+  -> DNS / MagicDNS (for a hostname)
+  -> <explicit bound IPv4>:8765
   -> Agent Workflow Manager Runner UI
 ```
 
-The configured address and port are the only accepted remote HTTP Host and
-browser Origin. Unknown Hosts and Origins remain rejected, and every mutation
-still requires the per-server request token. Network access is an outer trust
-boundary, not a replacement for these checks.
+The configured address, exact aliases, and port are the only accepted remote
+HTTP Host and browser Origin combinations. `start.sh` prints the direct IP URL
+and every configured alias URL. Unknown Hosts and Origins remain rejected, and
+every mutation still requires the per-server request token. Network access is
+an outer trust boundary, not a replacement for these checks.
 
 This UI executes arbitrary trusted Python and is not a sandbox or multi-user
 service. Bind only to an interface whose network and connected devices you

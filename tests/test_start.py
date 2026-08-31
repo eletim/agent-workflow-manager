@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -18,6 +20,7 @@ def _write_runtime_config(
     path: Path,
     *,
     host: str = "127.0.0.1",
+    host_aliases: str = "",
     port: str = "8765",
     notifications: str = "auto",
     notify_success: str = "true",
@@ -29,6 +32,7 @@ def _write_runtime_config(
         "\n".join(
             (
                 f"AGENT_WORKFLOW_MANAGER_HOST={shlex.quote(host)}",
+                f"AGENT_WORKFLOW_MANAGER_HOST_ALIASES={shlex.quote(host_aliases)}",
                 f"AGENT_WORKFLOW_MANAGER_PORT={shlex.quote(port)}",
                 f"AGENT_WORKFLOW_MANAGER_NOTIFICATIONS={shlex.quote(notifications)}",
                 f"AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS={shlex.quote(notify_success)}",
@@ -192,6 +196,7 @@ def test_missing_config_generates_persistent_runtime_config(tmp_path: Path) -> N
     assert config_file.stat().st_mode & 0o777 == 0o600
     config = config_file.read_text(encoding="utf-8")
     assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''" in config
     assert "AGENT_WORKFLOW_MANAGER_PORT=8765" in config
     assert "AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=auto" in config
     assert "AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=true" in config
@@ -240,6 +245,314 @@ def test_first_run_declines_detected_tailscale_ipv4(tmp_path: Path) -> None:
     )
 
 
+def test_first_run_detects_and_accepts_magicdns_hostname(tmp_path: Path) -> None:
+    environment, call_log, config_file = _start_environment(
+        tmp_path, create_config=False
+    )
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+printf 'tailscale %s\n' "$*" >>"$START_CALL_LOG"
+if [[ $* == "ip -4" ]]; then
+    printf '100.70.80.90\n'
+elif [[ $* == "status --json" ]]; then
+    printf '%s\n' '{"Self":{"DNSName":"E-Ryzen.tail6bc726.ts.net."}}'
+else
+    exit 1
+fi
+""",
+    )
+    completed = _run_start(environment, input_text="\n\n")
+
+    assert completed.returncode == 0
+    config = config_file.read_text(encoding="utf-8")
+    assert "AGENT_WORKFLOW_MANAGER_HOST=100.70.80.90" in config
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in config
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" in completed.stdout
+    assert "tailscale status --json" in call_log.read_text(encoding="utf-8")
+
+
+def test_first_run_can_decline_detected_magicdns_hostname(tmp_path: Path) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+if [[ $* == "ip -4" ]]; then
+    printf '100.70.80.90\n'
+else
+    printf '%s\n' '{"Self":{"DNSName":"e-ryzen.tail6bc726.ts.net."}}'
+fi
+""",
+    )
+    completed = _run_start(environment, input_text="\nn\n")
+
+    assert completed.returncode == 0
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''" in config_file.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_existing_config_supports_manual_hostname_alias_without_tailscale(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="192.168.50.20",
+        host_aliases="runner.lan",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "http://192.168.50.20:8765" in completed.stdout
+    assert "http://runner.lan:8765" in completed.stdout
+    calls = call_log.read_text(encoding="utf-8")
+    assert "--host-aliases runner.lan" in calls
+    assert "tailscale" not in calls
+
+
+def test_existing_config_accepts_detected_magicdns_alias_and_preserves_values(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_failure="false",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    config = config_file.read_text(encoding="utf-8")
+    config = config.replace(
+        "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''\n",
+        "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''; "
+        "UNRELATED_INLINE_VALUE='keep inline' # keep this comment\n",
+    )
+    config_file.write_text(
+        "# Existing installation settings\n"
+        + config
+        + "UNRELATED_RUNTIME_VALUE='preserve me'\n",
+        encoding="utf-8",
+    )
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+printf 'tailscale %s\n' "$*" >>"$START_CALL_LOG"
+printf '%s\n' '{"Self":{"DNSName":"E-Ryzen.tail6bc726.ts.net."}}'
+""",
+    )
+
+    completed = _run_start(environment, input_text="\n")
+
+    assert completed.returncode == 0
+    assert (
+        "MagicDNS hostname e-ryzen.tail6bc726.ts.net was detected." in completed.stderr
+    )
+    assert "Allow browser access using this hostname? [Y/n]" in completed.stderr
+    updated = config_file.read_text(encoding="utf-8")
+    assert "AGENT_WORKFLOW_MANAGER_HOST=100.70.80.90" in updated
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in updated
+    assert "AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=false" in updated
+    assert "UNRELATED_RUNTIME_VALUE='preserve me'" in updated
+    assert (
+        "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''; "
+        "UNRELATED_INLINE_VALUE='keep inline' # keep this comment" in updated
+    )
+    assert "# Existing installation settings" in updated
+    assert config_file.stat().st_mode & 0o777 == 0o600
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" in completed.stdout
+    calls = call_log.read_text(encoding="utf-8")
+    assert "tailscale status --json" in calls
+    assert "tailscale ip -4" not in calls
+
+
+def test_existing_config_can_decline_detected_magicdns_alias(tmp_path: Path) -> None:
+    environment, _, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'%s\n\' \'{"Self":{"DNSName":"e-ryzen.tail6bc726.ts.net."}}\'\n',
+    )
+
+    completed = _run_start(environment, input_text="n\n")
+
+    assert completed.returncode == 0
+    assert "Allow browser access using this hostname? [Y/n]" in completed.stderr
+    assert config_file.read_bytes() == original
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" not in completed.stdout
+
+
+def test_existing_configured_alias_skips_magicdns_migration(tmp_path: Path) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        host_aliases="runner.example.test",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'tailscale %s\n\' "$*" >>"$START_CALL_LOG"\nexit 99\n',
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "Allow browser access" not in completed.stderr
+    assert config_file.read_bytes() == original
+    assert "tailscale" not in call_log.read_text(encoding="utf-8")
+
+
+def test_existing_config_magicdns_detection_failure_is_nonfatal(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'tailscale %s\n\' "$*" >>"$START_CALL_LOG"\nexit 1\n',
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "Allow browser access" not in completed.stderr
+    assert "http://100.70.80.90:8765" in completed.stdout
+    assert config_file.read_bytes() == original
+    assert "tailscale status --json" in call_log.read_text(encoding="utf-8")
+
+
+def test_existing_config_environment_alias_override_skips_migration(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    environment["AGENT_WORKFLOW_MANAGER_HOST_ALIASES"] = "override.example.test"
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'tailscale %s\n\' "$*" >>"$START_CALL_LOG"\nexit 99\n',
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "Allow browser access" not in completed.stderr
+    assert "http://override.example.test:8765" in completed.stdout
+    assert config_file.read_bytes() == original
+    assert "tailscale" not in call_log.read_text(encoding="utf-8")
+
+
+def test_existing_config_migration_preserves_concurrent_locked_update(
+    tmp_path: Path,
+) -> None:
+    environment, _, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'%s\n\' \'{"Self":{"DNSName":"e-ryzen.tail6bc726.ts.net."}}\'\n',
+    )
+    lock_path = config_file.with_name(f".{config_file.name}.lock")
+    lock_path.touch(mode=0o600)
+
+    with lock_path.open("r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        process = subprocess.Popen(
+            ["bash", "start.sh"],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write("\n")
+        process.stdin.flush()
+
+        concurrent_content = (
+            config_file.read_text(encoding="utf-8")
+            + "CONCURRENT_SETTINGS_VALUE='preserved'\n"
+        )
+        concurrent_temp = config_file.with_suffix(".concurrent")
+        concurrent_temp.write_text(concurrent_content, encoding="utf-8")
+        concurrent_temp.chmod(0o600)
+        os.replace(concurrent_temp, config_file)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+    stdout, stderr = process.communicate(timeout=6)
+
+    assert process.returncode == 0
+    updated = config_file.read_text(encoding="utf-8")
+    assert "CONCURRENT_SETTINGS_VALUE='preserved'" in updated
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in updated
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" in stdout
+    assert "Allow browser access using this hostname? [Y/n]" in stderr
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "*.ts.net",
+        "https://runner.ts.net",
+        "runner.ts.net/path",
+        "user@runner.ts.net",
+        "runner.ts.net?query",
+        "runner.ts.net\nforged",
+        "-runner.ts.net",
+        "runner..ts.net",
+        "100.70.80.90",
+        "127.1",
+        "2130706433",
+        "0x7f000001",
+        "0x",
+        "0X",
+        "0x.1",
+        "0x000000001",
+        "0000000000000001",
+    ],
+)
+def test_start_rejects_invalid_hostname_alias(tmp_path: Path, alias: str) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host_aliases=alias,
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    completed = _run_start(environment)
+
+    assert completed.returncode == 2
+    calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+    assert "uv run python -m purplemux_client.web" not in calls
+
+
 def test_first_run_without_tailscale_defaults_to_localhost(tmp_path: Path) -> None:
     environment, _, config_file = _start_environment(tmp_path, create_config=False)
     completed = _run_start(environment, input_text="\n")
@@ -249,6 +562,62 @@ def test_first_run_without_tailscale_defaults_to_localhost(tmp_path: Path) -> No
     assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config_file.read_text(
         encoding="utf-8"
     )
+
+
+def test_hanging_tailscale_discovery_is_bounded_and_falls_back(
+    tmp_path: Path,
+) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    _executable(tmp_path / "bin" / "tailscale", "sleep 30\n")
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        input="\n",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=6,
+    )
+
+    assert completed.returncode == 0
+    assert "Tailscale IPv4 could not be detected." in completed.stderr
+    assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config_file.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_hanging_magicdns_discovery_is_bounded_and_keeps_detected_ip(
+    tmp_path: Path,
+) -> None:
+    environment, _, config_file = _start_environment(tmp_path, create_config=False)
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+if [[ $* == "ip -4" ]]; then
+    printf '100.70.80.90\n'
+else
+    sleep 30
+fi
+""",
+    )
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        input="\n",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=6,
+    )
+
+    assert completed.returncode == 0
+    config = config_file.read_text(encoding="utf-8")
+    assert "AGENT_WORKFLOW_MANAGER_HOST=100.70.80.90" in config
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''" in config
 
 
 def test_first_run_allows_manual_explicit_ipv4(tmp_path: Path) -> None:

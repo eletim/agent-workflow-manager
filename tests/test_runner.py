@@ -774,7 +774,12 @@ def test_notification_settings_mutation_rejects_untrusted_request(
 
 @pytest.mark.parametrize(
     ("token", "origin"),
-    [(None, None), ("wrong", None), ("valid", "https://attacker.example")],
+    [
+        (None, None),
+        ("wrong", None),
+        ("valid", "https://attacker.example"),
+        ("valid", "http://["),
+    ],
 )
 def test_run_rejects_untrusted_request(
     web_server: tuple[tuple[str, int], str], token: str | None, origin: str | None
@@ -805,6 +810,25 @@ def test_token_rejects_untrusted_host(
 
     assert response.status == 403
     assert payload == {"error": "untrusted host"}
+
+
+@pytest.mark.parametrize("delimiter", ["?", "#", "?#"])
+def test_run_rejects_matching_origin_with_empty_delimiter(
+    web_server: tuple[tuple[str, int], str], delimiter: str
+) -> None:
+    address, token = web_server
+    host, port = address
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": ""}),
+        token=token,
+        origin=f"http://{host}:{port}{delimiter}",
+    )
+
+    assert status == 403
+    assert payload == {"error": "untrusted request"}
 
 
 def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> None:
@@ -895,6 +919,104 @@ def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
     args = build_parser().parse_args(["--host", "100.64.10.20"])
 
     assert args.host == "100.64.10.20"
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [
+        "*.ts.net",
+        "https://runner.ts.net",
+        "runner.ts.net/path",
+        "runner.ts.net?query",
+        "user@runner.ts.net",
+        "runner.ts.net\rforged",
+        "runner..ts.net",
+        "127.0.0.1",
+        "127.1",
+        "2130706433",
+        "0x7f000001",
+        "0x",
+        "0X",
+        "0x.1",
+        "0x000000001",
+        "0000000000000001",
+    ],
+)
+def test_web_cli_rejects_invalid_hostname_aliases(aliases: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--host-aliases", aliases])
+
+
+def test_configured_hostname_alias_accepts_get_and_protected_post() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        host_aliases=("E-Ryzen.tail6bc726.ts.net.",),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    bound_host, bound_port = server.server_address
+    address = (str(bound_host), int(bound_port))
+    alias_host = f"e-ryzen.tail6bc726.ts.net:{bound_port}"
+    try:
+        status, _ = request(address, "GET", "/api/status", host=alias_host)
+        assert status == 200
+
+        status, token_payload = request(address, "GET", "/api/token", host=alias_host)
+        assert status == 200
+        token = str(token_payload["token"])
+
+        status, result = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": 'print("ALIAS_OK")'}),
+            token=token,
+            host=alias_host,
+            origin=f"http://{alias_host}",
+        )
+        assert status == 202
+        assert result["state"] == "running"
+        assert wait_until_finished(runner).state == "success"
+
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            host=alias_host,
+            origin=f"http://{alias_host}",
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            token=token,
+            host=alias_host,
+            origin=f"http://unknown.tail6bc726.ts.net:{bound_port}",
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "GET",
+            "/api/status",
+            host=f"unknown.tail6bc726.ts.net:{bound_port}",
+        )
+        assert status == 403
+
+        status, _ = request(address, "GET", "/api/status")
+        assert status == 200
+        status, _ = request(
+            address, "GET", "/api/status", host=f"localhost:{bound_port}"
+        )
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_server_allows_explicitly_requested_hostname() -> None:
