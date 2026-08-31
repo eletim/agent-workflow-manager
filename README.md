@@ -93,6 +93,42 @@ To keep observation bounded, the Runner retains the latest 200 events and each
 encoded event is limited to 4 KiB. Older events and oversized events are
 discarded without affecting workflow execution.
 
+The recommended entry point resolves the bind configuration, prepares the
+workflow `PATH`, checks runtime dependencies, and launches the Runner:
+
+```bash
+./start.sh
+```
+
+On the first run, enter the bind host and port at the prompts. Press Enter to
+accept the local-only defaults (`127.0.0.1:8765`). The answers are saved in the
+git-ignored `config.sh`; later runs only need `./start.sh`. If a required value
+is empty, only that value is prompted for again. See `sample_config.sh` for the
+minimal configuration shape.
+
+To allow access from another device on the same VPN, set the host to the
+machine's specific VPN interface IP, for example:
+
+```bash
+AGENT_WORKFLOW_MANAGER_HOST="100.x.x.x"
+AGENT_WORKFLOW_MANAGER_PORT="8765"
+```
+
+Then use `http://100.x.x.x:8765` from the other VPN device. VPN setup is outside
+this project, and the Runner must not be exposed to the public internet. A
+specific VPN IP is preferred over a wildcard bind; the existing request-token,
+Host, Origin, JSON, and content-length protections remain active.
+
+`start.sh` requires `purplemux`, `gh`, and `uv`. It preserves the existing
+`PATH`, adds `$HOME/.local/bin`, and optionally prepends
+`AGENT_WORKFLOW_MANAGER_PATH` from `config.sh`, so Runner workflow children see
+the same commands. If a dependency is missing, the script stops before starting
+the Runner and prints a detailed setup, PATH, and verification guide. It never
+installs dependencies, clones PurpleMux, creates command wrappers, or edits a
+shell profile.
+
+For direct development startup, you can still run:
+
 ```bash
 make web
 ```

@@ -612,6 +612,18 @@ def test_server_allows_explicitly_requested_hostname() -> None:
         server.server_close()
 
 
+def test_server_allows_specific_bind_ip_host_and_rejects_other_hosts() -> None:
+    server = RunnerHTTPServer(("127.0.0.2", 0))
+    try:
+        bound_host, port = server.server_address
+        assert bound_host == "127.0.0.2"
+        assert server.is_allowed_host(f"127.0.0.2:{port}")
+        assert not server.is_allowed_host(f"127.0.0.3:{port}")
+        assert not server.is_allowed_host(f"attacker.example:{port}")
+    finally:
+        server.server_close()
+
+
 def test_web_server_close_stops_running_process() -> None:
     runner = PythonRunner(stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner)
