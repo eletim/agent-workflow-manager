@@ -150,10 +150,13 @@ whitespace, or control character. A trailing DNS root dot is removed. No
 Existing installations are migrated without manual editing. When
 `bash start.sh` loads an existing `config.sh` with a non-loopback IPv4 bind and no
 hostname aliases, it performs the same bounded MagicDNS detection and offers
-to allow that exact hostname. Accepting atomically replaces or appends only
-`AGENT_WORKFLOW_MANAGER_HOST_ALIASES`; all other configuration remains intact.
+to allow that exact hostname. Accepting atomically appends one effective
+`AGENT_WORKFLOW_MANAGER_HOST_ALIASES` assignment; all existing configuration
+text remains intact. Runtime config writers share a sidecar lock and the
+migration refuses a stale replacement rather than losing a concurrent update.
 Declining or failed detection leaves the file unchanged and startup continues.
-An already configured alias skips detection and the migration prompt.
+An already configured alias or explicit environment override skips detection
+and the migration prompt.
 
 For compatibility and one-off launches, explicit environment values override
 the corresponding saved values for that process without rewriting

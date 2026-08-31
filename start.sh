@@ -226,8 +226,8 @@ persist_runtime_host_alias() {
 
     runtime_config_temp=$(mktemp "${config_file}.tmp.XXXXXX")
     if ! python3 - "$config_file" "$runtime_config_temp" "$hostname" <<'PY'
+import fcntl
 import os
-import re
 import shlex
 import sys
 from pathlib import Path
@@ -235,31 +235,31 @@ from pathlib import Path
 source = Path(sys.argv[1])
 destination = Path(sys.argv[2])
 hostname = sys.argv[3]
-lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
-assignment = re.compile(
-    r"^\s*(?:export\s+)?AGENT_WORKFLOW_MANAGER_HOST_ALIASES="
-)
-matching_lines = [index for index, line in enumerate(lines) if assignment.match(line)]
-replacement = f"AGENT_WORKFLOW_MANAGER_HOST_ALIASES={shlex.quote(hostname)}\n"
-if matching_lines:
-    lines[matching_lines[-1]] = replacement
-else:
-    if lines and not lines[-1].endswith(("\n", "\r")):
-        lines[-1] += "\n"
-    lines.append(replacement)
-
-with destination.open("w", encoding="utf-8", newline="") as handle:
-    handle.writelines(lines)
-    handle.flush()
-    os.fsync(handle.fileno())
+lock_path = source.with_name(f".{source.name}.lock")
+lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+os.fchmod(lock_descriptor, 0o600)
+with os.fdopen(lock_descriptor, "r+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    original = source.read_bytes()
+    separator = b"" if not original or original.endswith((b"\n", b"\r")) else b"\n"
+    assignment = (
+        f"AGENT_WORKFLOW_MANAGER_HOST_ALIASES={shlex.quote(hostname)}\n".encode()
+    )
+    with destination.open("wb") as handle:
+        handle.write(original + separator + assignment)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(destination, 0o600)
+    if source.read_bytes() != original:
+        raise RuntimeError("runtime configuration changed during migration")
+    os.replace(destination, source)
+    directory = os.open(source.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 PY
     then
-        rm -f -- "$runtime_config_temp"
-        runtime_config_temp=""
-        return 1
-    fi
-    if ! chmod 600 "$runtime_config_temp" || \
-        ! mv -- "$runtime_config_temp" "$config_file"; then
         rm -f -- "$runtime_config_temp"
         runtime_config_temp=""
         return 1
@@ -382,7 +382,8 @@ if [[ $first_run == true ]]; then
     trap - EXIT
 fi
 
-if [[ $existing_config == true ]]; then
+if [[ $existing_config == true && ! $host_override_set && \
+    ! $host_aliases_override_set ]]; then
     migrate_existing_magicdns_alias
 fi
 

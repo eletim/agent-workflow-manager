@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -323,7 +325,11 @@ def test_existing_config_accepts_detected_magicdns_alias_and_preserves_values(
         notify_config=Path(environment["HOME"]) / ".config/notify/config",
     )
     config = config_file.read_text(encoding="utf-8")
-    config = config.replace("AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''\n", "")
+    config = config.replace(
+        "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''\n",
+        "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''; "
+        "UNRELATED_INLINE_VALUE='keep inline' # keep this comment\n",
+    )
     config_file.write_text(
         "# Existing installation settings\n"
         + config
@@ -350,6 +356,10 @@ printf '%s\n' '{"Self":{"DNSName":"E-Ryzen.tail6bc726.ts.net."}}'
     assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in updated
     assert "AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=false" in updated
     assert "UNRELATED_RUNTIME_VALUE='preserve me'" in updated
+    assert (
+        "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''; "
+        "UNRELATED_INLINE_VALUE='keep inline' # keep this comment" in updated
+    )
     assert "# Existing installation settings" in updated
     assert config_file.stat().st_mode & 0o777 == 0o600
     assert "http://e-ryzen.tail6bc726.ts.net:8765" in completed.stdout
@@ -426,6 +436,84 @@ def test_existing_config_magicdns_detection_failure_is_nonfatal(
     assert "http://100.70.80.90:8765" in completed.stdout
     assert config_file.read_bytes() == original
     assert "tailscale status --json" in call_log.read_text(encoding="utf-8")
+
+
+def test_existing_config_environment_alias_override_skips_migration(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    environment["AGENT_WORKFLOW_MANAGER_HOST_ALIASES"] = "override.example.test"
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'tailscale %s\n\' "$*" >>"$START_CALL_LOG"\nexit 99\n',
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "Allow browser access" not in completed.stderr
+    assert "http://override.example.test:8765" in completed.stdout
+    assert config_file.read_bytes() == original
+    assert "tailscale" not in call_log.read_text(encoding="utf-8")
+
+
+def test_existing_config_migration_preserves_concurrent_locked_update(
+    tmp_path: Path,
+) -> None:
+    environment, _, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'%s\n\' \'{"Self":{"DNSName":"e-ryzen.tail6bc726.ts.net."}}\'\n',
+    )
+    lock_path = config_file.with_name(f".{config_file.name}.lock")
+    lock_path.touch(mode=0o600)
+
+    with lock_path.open("r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        process = subprocess.Popen(
+            ["bash", "start.sh"],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write("\n")
+        process.stdin.flush()
+
+        concurrent_content = (
+            config_file.read_text(encoding="utf-8")
+            + "CONCURRENT_SETTINGS_VALUE='preserved'\n"
+        )
+        concurrent_temp = config_file.with_suffix(".concurrent")
+        concurrent_temp.write_text(concurrent_content, encoding="utf-8")
+        concurrent_temp.chmod(0o600)
+        os.replace(concurrent_temp, config_file)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+    stdout, stderr = process.communicate(timeout=6)
+
+    assert process.returncode == 0
+    updated = config_file.read_text(encoding="utf-8")
+    assert "CONCURRENT_SETTINGS_VALUE='preserved'" in updated
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in updated
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" in stdout
+    assert "Allow browser access using this hostname? [Y/n]" in stderr
 
 
 @pytest.mark.parametrize(

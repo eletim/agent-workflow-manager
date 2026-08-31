@@ -162,8 +162,12 @@ def test_settings_write_updates_only_owned_values_and_applies_policy(
     ]
     assert runtime_config.stat().st_mode & 0o777 == 0o600
     assert notify_config.stat().st_mode & 0o777 == 0o600
-    assert list(tmp_path.rglob(".config.sh.*")) == []
-    assert list(tmp_path.rglob(".config.*")) == []
+    runtime_lock = runtime_config.with_name(f".{runtime_config.name}.lock")
+    notify_lock = notify_config.with_name(f".{notify_config.name}.lock")
+    assert list(runtime_config.parent.glob(".config.sh.*")) == [runtime_lock]
+    assert list(notify_config.parent.glob(".config.*")) == [notify_lock]
+    assert runtime_lock.stat().st_mode & 0o777 == 0o600
+    assert notify_lock.stat().st_mode & 0o777 == 0o600
 
 
 def test_server_topic_update_preserves_existing_token(tmp_path: Path) -> None:

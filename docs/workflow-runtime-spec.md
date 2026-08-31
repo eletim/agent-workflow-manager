@@ -89,10 +89,13 @@ Startup also provides a one-time convenience path for an existing runtime
 configuration that predates hostname aliases. If its saved bind is an explicit
 non-loopback IPv4 and its alias value is empty or absent, startup may detect a
 valid local MagicDNS FQDN and ask whether to allow it. Acceptance atomically
-updates only the alias assignment with mode `0600`; it does not recreate the
-file or alter the bind, notification policy, notify config path, comments, or
-unrelated values. Decline and detection failure leave the file unchanged and
-do not block startup. A configured alias suppresses this migration entirely.
+appends one effective alias assignment with mode `0600`; it does not alter any
+existing bind, notification policy, notify config path, comment, inline shell
+statement, or unrelated value. Runtime config writers serialize through a
+sidecar lock, and migration checks for an unexpected stale source before
+replacement. Decline and detection failure leave the file unchanged and do
+not block startup. A configured alias or explicit host/alias environment
+override suppresses this migration entirely.
 
 The Runner derives allowed HTTP Hosts and browser Origins from the actual bind
 address, exact configured hostname aliases, and port. GET requests require one
