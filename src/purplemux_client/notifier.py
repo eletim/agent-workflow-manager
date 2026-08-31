@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Literal
 
@@ -34,6 +35,9 @@ class NotifyCLI:
         self.notify_stopped = notify_stopped
         self.timeout = timeout
         self.executable = executable
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen[bytes]] = set()
+        self._closed = False
 
     @classmethod
     def from_environment(cls) -> NotifyCLI:
@@ -57,29 +61,51 @@ class NotifyCLI:
             return NotificationResult(True, False, "notify command unavailable")
 
         title, message = _terminal_message(run_id, state, exit_code)
-        try:
-            process = subprocess.Popen(
-                [executable, "send", "--title", title, "--message", message],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError:
-            return NotificationResult(True, False, "notify command could not start")
-        try:
-            return_code = process.wait(timeout=self.timeout)
-        except subprocess.TimeoutExpired:
+        with self._lock:
+            if self._closed:
+                return NotificationResult(False, False, "notifier closed")
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-            return NotificationResult(True, False, "notify command timed out")
+                process = subprocess.Popen(
+                    [executable, "send", "--title", title, "--message", message],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                return NotificationResult(True, False, "notify command could not start")
+            self._processes.add(process)
+        try:
+            try:
+                return_code = process.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                self._kill_process_group(process)
+                process.wait()
+                return NotificationResult(True, False, "notify command timed out")
+        finally:
+            with self._lock:
+                self._processes.discard(process)
         if return_code != 0:
             return NotificationResult(
                 True, False, f"notify exited with status {return_code}"
             )
         return NotificationResult(True, True, "notification sent")
+
+    def close(self) -> None:
+        """Stop and reap notification process groups still active at shutdown."""
+        with self._lock:
+            self._closed = True
+            processes = tuple(self._processes)
+        for process in processes:
+            self._kill_process_group(process)
+        for process in processes:
+            process.wait()
+
+    @staticmethod
+    def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def _terminal_message(

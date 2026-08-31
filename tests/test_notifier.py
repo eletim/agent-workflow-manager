@@ -55,6 +55,9 @@ class RecordingNotifier:
         self.calls.append((run_id, state, exit_code))
         return self.result
 
+    def close(self) -> None:
+        return
+
 
 @pytest.mark.parametrize(
     ("code", "expected_state", "expected_exit_code"),
@@ -232,6 +235,34 @@ def test_notify_timeout_kills_child_process_group(tmp_path: Path) -> None:
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline and _process_is_live(child_pid):
         time.sleep(0.02)
+    assert not _process_is_live(child_pid)
+
+
+def test_runner_close_reaps_blocking_notification_tree(tmp_path: Path) -> None:
+    child_pid_file = tmp_path / "close-child.pid"
+    executable = tmp_path / "notify"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 60 &\n"
+        f"printf '%s' \"$!\" >{child_pid_file!s}\n"
+        "wait\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    runner = PythonRunner(
+        notifier=NotifyCLI(enabled=True, executable=str(executable), timeout=10)
+    )
+    runner.start("")
+    _wait_until_finished(runner)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not child_pid_file.exists():
+        time.sleep(0.01)
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+
+    started_close = time.monotonic()
+    runner.close()
+
+    assert time.monotonic() - started_close < 2
     assert not _process_is_live(child_pid)
 
 

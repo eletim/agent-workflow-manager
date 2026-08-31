@@ -25,6 +25,8 @@ class TerminalNotifier(Protocol):
         self, *, run_id: int, state: TerminalState, exit_code: int | None
     ) -> NotificationResult: ...
 
+    def close(self) -> None: ...
+
 
 class AlreadyRunningError(RuntimeError):
     """Raised when a run is requested while another process is active."""
@@ -78,6 +80,7 @@ class PythonRunner:
         self._next_run_id = 1
         self._stop_requested = False
         self._notifier = notifier
+        self._wait_threads: set[threading.Thread] = set()
 
     def start(self, code: str) -> int:
         with self._lock:
@@ -135,12 +138,15 @@ class PythonRunner:
         )
         stdout_thread.start()
         stderr_thread.start()
-        threading.Thread(
+        wait_thread = threading.Thread(
             target=self._wait_for_process,
             args=(process, script_path, stdout_thread, stderr_thread),
             name=f"python-runner-wait-{run_id}",
             daemon=True,
-        ).start()
+        )
+        with self._lock:
+            self._wait_threads.add(wait_thread)
+            wait_thread.start()
         return run_id
 
     def snapshot(self) -> RunnerSnapshot:
@@ -176,6 +182,24 @@ class PythonRunner:
                 if process_group_id is not None:
                     self._kill_process_group(process_group_id)
                 process.wait()
+        notifier = self._notifier
+        if notifier is not None:
+            try:
+                notifier.close()
+            except Exception:
+                logger.warning("Failed to close terminal notifier")
+        current_thread = threading.current_thread()
+        while True:
+            with self._lock:
+                wait_threads = tuple(
+                    thread
+                    for thread in self._wait_threads
+                    if thread is not current_thread
+                )
+            if not wait_threads:
+                break
+            for thread in wait_threads:
+                thread.join()
 
     def _read_stream(
         self, stream: IO[bytes] | None, destination: Literal["stdout", "stderr"]
@@ -231,29 +255,35 @@ class PythonRunner:
         stdout_thread: threading.Thread,
         stderr_thread: threading.Thread,
     ) -> None:
-        exit_code = process.wait()
-        self._terminate_process_group(process.pid)
-        stdout_thread.join()
-        stderr_thread.join()
-        script_path.unlink(missing_ok=True)
-        with self._lock:
-            if self._process is not process:
-                return
-            self._exit_code = exit_code
-            self._state = (
-                "stopped"
-                if self._stop_requested
-                else "success"
-                if exit_code == 0
-                else "failed"
-            )
-            run_id = self._run_id
-            terminal_state = self._state
-            self._process = None
-            self._process_group_id = None
-            self._script_path = None
+        try:
+            exit_code = process.wait()
+            self._terminate_process_group(process.pid)
+            stdout_thread.join()
+            stderr_thread.join()
+            script_path.unlink(missing_ok=True)
+            with self._lock:
+                if self._process is not process:
+                    return
+                self._exit_code = exit_code
+                self._state = (
+                    "stopped"
+                    if self._stop_requested
+                    else "success"
+                    if exit_code == 0
+                    else "failed"
+                )
+                run_id = self._run_id
+                terminal_state = self._state
+                self._process = None
+                self._process_group_id = None
+                self._script_path = None
 
-        self._notify_terminal(run_id=run_id, state=terminal_state, exit_code=exit_code)
+            self._notify_terminal(
+                run_id=run_id, state=terminal_state, exit_code=exit_code
+            )
+        finally:
+            with self._lock:
+                self._wait_threads.discard(threading.current_thread())
 
     def _notify_terminal(
         self, *, run_id: int | None, state: RunnerState, exit_code: int

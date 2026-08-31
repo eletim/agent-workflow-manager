@@ -61,6 +61,11 @@ logs because an external command could include credentials there. Notification
 failure never mutates Runner state, the Python exit code, or the workflow
 result.
 
+Runner shutdown owns pending notification cleanup: it closes the notifier and
+joins terminal waiter threads. Any active notify CLI process group is
+terminated and reaped before shutdown completes, so notification descendants
+cannot outlive the trusted local Runner.
+
 The `notify` CLI is the integration boundary. It owns notify-server/ntfy HTTP,
 authentication, delivery configuration, and its internal request timeout.
 Agent Workflow Manager must not construct raw ntfy HTTP requests or duplicate
