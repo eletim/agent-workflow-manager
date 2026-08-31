@@ -48,7 +48,7 @@ prompt_if_empty() {
 prompt_if_empty AGENT_WORKFLOW_MANAGER_HOST "Bind host" "127.0.0.1"
 prompt_if_empty AGENT_WORKFLOW_MANAGER_PORT "Port" "8765"
 
-if [[ ! $AGENT_WORKFLOW_MANAGER_PORT =~ ^[0-9]+$ ]] ||
+if [[ ! $AGENT_WORKFLOW_MANAGER_PORT =~ ^[0-9]{1,5}$ ]] ||
     ((10#$AGENT_WORKFLOW_MANAGER_PORT < 1 || 10#$AGENT_WORKFLOW_MANAGER_PORT > 65535)); then
     printf 'ERROR: AGENT_WORKFLOW_MANAGER_PORT must be an integer from 1 to 65535 (got %q).\n' \
         "$AGENT_WORKFLOW_MANAGER_PORT" >&2
@@ -71,7 +71,14 @@ fi
 
 missing_dependency=false
 
-if ! command -v purplemux >/dev/null 2>&1; then
+has_path_executable() {
+    local executable_path
+
+    executable_path=$(builtin type -P "$1" 2>/dev/null) || return 1
+    [[ -f $executable_path && -x $executable_path ]]
+}
+
+if ! has_path_executable purplemux; then
     missing_dependency=true
     cat >&2 <<'EOF'
 
@@ -109,7 +116,7 @@ exposing the CLI on PATH. start.sh does not clone, install, or create wrappers.
 EOF
 fi
 
-if ! command -v gh >/dev/null 2>&1; then
+if ! has_path_executable gh; then
     missing_dependency=true
     cat >&2 <<'EOF'
 
@@ -128,7 +135,7 @@ authentication:
 EOF
 fi
 
-if ! command -v uv >/dev/null 2>&1; then
+if ! has_path_executable uv; then
     missing_dependency=true
     cat >&2 <<'EOF'
 

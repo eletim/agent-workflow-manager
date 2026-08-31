@@ -41,6 +41,7 @@ def run_start(
     home_commands: tuple[str, ...] = ("purplemux", "gh", "uv"),
     extra_path: Path | None = None,
     extra_env: dict[str, str] | None = None,
+    exported_functions: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     home = tmp_path / "home"
     local_bin = home / ".local" / "bin"
@@ -60,8 +61,20 @@ def run_start(
         env["TEST_EXTRA_PATH"] = str(extra_path)
     if extra_env is not None:
         env.update(extra_env)
+    command = ["/bin/bash", str(repo / "start.sh")]
+    if exported_functions:
+        definitions = "; ".join(
+            f"{name}() {{ :; }}; export -f {name}" for name in exported_functions
+        )
+        command = [
+            "/bin/bash",
+            "-c",
+            f'{definitions}; exec /bin/bash "$1"',
+            "start-test",
+            str(repo / "start.sh"),
+        ]
     return subprocess.run(
-        ["/bin/bash", str(repo / "start.sh")],
+        command,
         input=input_text,
         text=True,
         capture_output=True,
@@ -137,7 +150,18 @@ def test_complete_config_starts_noninteractively_and_passes_runner_args(
     ]
 
 
-@pytest.mark.parametrize("port", ["0", "65536", "abc", "12.5", "-1"])
+@pytest.mark.parametrize(
+    "port",
+    [
+        "0",
+        "65536",
+        "abc",
+        "12.5",
+        "-1",
+        "18446744073709551617",
+        "18446744073709560381",
+    ],
+)
 def test_invalid_port_stops_before_runner(
     start_repo: Path, tmp_path: Path, port: str
 ) -> None:
@@ -218,6 +242,42 @@ def test_missing_dependency_has_detailed_guide_and_does_not_start_runner(
     assert not (tmp_path / "args-report").exists()
     if "purplemux" not in commands:
         assert not (tmp_path / "home" / ".local" / "bin" / "purplemux").exists()
+
+
+@pytest.mark.parametrize(
+    ("dependency", "commands", "expected_error"),
+    [
+        (
+            "purplemux",
+            ("gh", "uv"),
+            "ERROR: purplemux command was not found.",
+        ),
+        (
+            "gh",
+            ("purplemux", "uv"),
+            "ERROR: GitHub CLI (gh) was not found.",
+        ),
+    ],
+)
+def test_exported_shell_function_does_not_satisfy_dependency_preflight(
+    start_repo: Path,
+    tmp_path: Path,
+    dependency: str,
+    commands: tuple[str, ...],
+    expected_error: str,
+) -> None:
+    config(start_repo, "127.0.0.1", "8765")
+
+    result = run_start(
+        start_repo,
+        tmp_path,
+        home_commands=commands,
+        exported_functions=(dependency,),
+    )
+
+    assert result.returncode != 0
+    assert expected_error in result.stderr
+    assert not (tmp_path / "args-report").exists()
 
 
 def test_shell_quoting_round_trips_config_values(
