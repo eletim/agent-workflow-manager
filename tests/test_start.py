@@ -20,6 +20,9 @@ def _write_runtime_config(
     host: str = "127.0.0.1",
     port: str = "8765",
     notifications: str = "auto",
+    notify_success: str = "true",
+    notify_failure: str = "true",
+    notify_stopped: str = "false",
     notify_config: Path,
 ) -> None:
     path.write_text(
@@ -28,6 +31,9 @@ def _write_runtime_config(
                 f"AGENT_WORKFLOW_MANAGER_HOST={shlex.quote(host)}",
                 f"AGENT_WORKFLOW_MANAGER_PORT={shlex.quote(port)}",
                 f"AGENT_WORKFLOW_MANAGER_NOTIFICATIONS={shlex.quote(notifications)}",
+                f"AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS={shlex.quote(notify_success)}",
+                f"AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE={shlex.quote(notify_failure)}",
+                f"AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED={shlex.quote(notify_stopped)}",
                 f"NOTIFY_CONFIG={shlex.quote(str(notify_config))}",
                 "",
             )
@@ -95,10 +101,19 @@ def test_start_syncs_and_launches_runner_with_notify_disabled(
     completed = _run_start(environment)
 
     assert completed.returncode == 0
-    assert call_log.read_text(encoding="utf-8").splitlines() == [
-        "uv sync --locked",
-        "uv run python -m purplemux_client.web --host 127.0.0.1 --port 8765",
-    ]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls[0] == "uv sync --locked"
+    assert calls[1].startswith(
+        "uv run python -m purplemux_client.web --host 127.0.0.1 --port 8765"
+    )
+    assert (
+        f"--runtime-config {environment['AGENT_WORKFLOW_MANAGER_CONFIG_FILE']}"
+        in calls[1]
+    )
+    assert (
+        f"--notify-config {Path(environment['HOME']) / '.config/notify/config'}"
+        in calls[1]
+    )
     assert "notifications disabled" in completed.stdout.lower()
 
 
@@ -113,6 +128,33 @@ def test_existing_config_skips_first_run_setup(tmp_path: Path) -> None:
     assert completed.returncode == 0
     assert "Tailscale IPv4" not in completed.stderr
     assert "tailscale " not in call_log.read_text(encoding="utf-8")
+
+
+def test_start_exports_saved_terminal_notification_policy(tmp_path: Path) -> None:
+    environment, _, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        notifications="disabled",
+        notify_success="false",
+        notify_failure="false",
+        notify_stopped="true",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    _executable(
+        tmp_path / "bin" / "uv",
+        """
+if [[ $1 == run ]]; then
+    [[ $AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS == false ]]
+    [[ $AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE == false ]]
+    [[ $AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED == true ]]
+fi
+printf 'uv %s\n' "$*" >>"$START_CALL_LOG"
+""",
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
 
 
 def test_explicit_environment_values_override_existing_config(tmp_path: Path) -> None:
@@ -131,8 +173,12 @@ def test_explicit_environment_values_override_existing_config(tmp_path: Path) ->
     assert completed.returncode == 0
     assert "http://100.70.80.91:9000" in completed.stdout
     assert f"Notify config: {environment['NOTIFY_CONFIG']}" in completed.stdout
-    assert call_log.read_text(encoding="utf-8").splitlines()[-1] == (
-        "uv run python -m purplemux_client.web --host 100.70.80.91 --port 9000"
+    assert (
+        call_log.read_text(encoding="utf-8")
+        .splitlines()[-1]
+        .startswith(
+            "uv run python -m purplemux_client.web --host 100.70.80.91 --port 9000"
+        )
     )
     assert config_file.read_text(encoding="utf-8") == original_config
 
@@ -148,6 +194,9 @@ def test_missing_config_generates_persistent_runtime_config(tmp_path: Path) -> N
     assert "AGENT_WORKFLOW_MANAGER_HOST=127.0.0.1" in config
     assert "AGENT_WORKFLOW_MANAGER_PORT=8765" in config
     assert "AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=auto" in config
+    assert "AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS=true" in config
+    assert "AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=true" in config
+    assert "AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=false" in config
     assert f"NOTIFY_CONFIG={environment['HOME']}/.config/notify/config" in config
     assert "Saved runtime configuration" in completed.stdout
 
@@ -350,8 +399,12 @@ def test_start_uses_explicit_remote_interface_and_prints_url(tmp_path: Path) -> 
     assert completed.returncode == 0
     assert "never expose this address publicly" in completed.stdout
     assert "http://100.64.10.20:8765" in completed.stdout
-    assert call_log.read_text(encoding="utf-8").splitlines()[-1] == (
-        "uv run python -m purplemux_client.web --host 100.64.10.20 --port 8765"
+    assert (
+        call_log.read_text(encoding="utf-8")
+        .splitlines()[-1]
+        .startswith(
+            "uv run python -m purplemux_client.web --host 100.64.10.20 --port 8765"
+        )
     )
     assert "tailscale" not in call_log.read_text(encoding="utf-8").lower()
 

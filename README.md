@@ -89,6 +89,9 @@ and `purplemux`, and starts the UI at the configured URL.
 AGENT_WORKFLOW_MANAGER_HOST="127.0.0.1"
 AGENT_WORKFLOW_MANAGER_PORT="8765"
 AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="auto"
+AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS="true"
+AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE="true"
+AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED="false"
 NOTIFY_CONFIG="$HOME/.config/notify/config"
 ```
 
@@ -146,6 +149,39 @@ service. Bind only to an interface whose network and connected devices you
 trust. Never use a public IP/interface, `0.0.0.0`, port forwarding, a public
 reverse proxy, Tailscale Funnel, or any other public-internet exposure.
 
+### Notification settings
+
+Open **Settings → Notifications** in the Runner UI for day-to-day notification
+configuration. The compact panel can enable notifications, select success,
+failure, and stopped terminal states, edit the notify server and topic, report
+credentials as only `Configured` or `Missing`, replace the token through a
+write-only password field, and send a real test notification.
+
+Policy is split deliberately between two files:
+
+- Gitignored repository `config.sh` owns whether notifications are enabled and
+  the success/failure/stopped policy.
+- The external file selected by `NOTIFY_CONFIG` owns `NOTIFY_SERVER`,
+  `NOTIFY_TOPIC`, and `NOTIFY_TOKEN` for the public `notify` CLI.
+
+Saving the notification policy updates the active notifier immediately and
+persists it atomically; no workflow or Runner restart is required. Server,
+topic, and an optional replacement token are atomically written to the notify
+CLI config with owner-only permissions. The existing token is never returned,
+displayed, logged, or copied into `config.sh`.
+
+Explicit `NOTIFY_SERVER`, `NOTIFY_TOPIC`, or `NOTIFY_TOKEN` values inherited by
+the Runner process keep the public notify CLI's normal precedence and are
+reflected in the displayed effective settings. After a UI save, the validated
+saved server/topic and any replacement token take precedence immediately for
+this Runner process as well as being persisted to the notify CLI config.
+
+The test button invokes only `notify send --title "Agent Workflow Manager"
+--message "Test notification"`. It uses a bounded timeout and no retries, and
+returns only a sanitized actionable result. It never reads or changes the
+Python Runner state. Both settings mutation and test-send use the same exact
+Host, matching Origin, and per-server request-token checks as Run and Stop.
+
 On an interactive terminal, a missing token can be entered without echo and
 is saved outside Git in the file selected by `NOTIFY_CONFIG` (by default
 `~/.config/notify/config`). Leaving it blank disables notifications without
@@ -157,10 +193,9 @@ AGENT_WORKFLOW_MANAGER_NOTIFICATIONS="disabled"
 
 `NOTIFY_SERVER` and `NOTIFY_TOPIC` default to `https://eletim.jp` and `agents`.
 Supply `NOTIFY_TOKEN` through the notify CLI config or environment; never
-place it in `config.sh` or the repository. Set
-`AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=1` to opt in to stopped-run
-notifications (success and failure are enabled after notify configuration
-succeeds).
+place it in `config.sh` or the repository. Success and failure notifications
+default on, while stopped notifications default off; the Settings panel or
+the corresponding `config.sh` values control each policy.
 
 Open the URL printed under `Agent Workflow Manager:`. To choose another local
 port, edit `AGENT_WORKFLOW_MANAGER_PORT` in `config.sh` and run `bash start.sh`

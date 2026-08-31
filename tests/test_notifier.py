@@ -111,6 +111,34 @@ def test_stopped_notification_can_be_enabled(monkeypatch: pytest.MonkeyPatch) ->
     assert "Workflow stopped" in calls[0]
 
 
+@pytest.mark.parametrize(
+    ("state", "options", "diagnostic"),
+    [
+        ("success", {"notify_success": False}, "success notifications disabled"),
+        ("failed", {"notify_failure": False}, "failure notifications disabled"),
+        ("stopped", {"notify_stopped": False}, "stopped notifications disabled"),
+    ],
+)
+def test_terminal_policy_can_disable_each_state(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    options: dict[str, bool],
+    diagnostic: str,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
+    _record_process_start(monkeypatch, calls)
+
+    result = NotifyCLI(enabled=True, **options).notify_terminal(  # type: ignore[arg-type]
+        run_id=4,
+        state=state,
+        exit_code=0,  # type: ignore[arg-type]
+    )
+
+    assert result == NotificationResult(False, False, diagnostic)
+    assert calls == []
+
+
 def test_notify_command_failure_does_not_change_runner_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -212,6 +240,62 @@ def test_notify_command_contains_required_failure_message(
 
     assert "Workflow failed" in calls[0]
     assert "Run 13 finished with state: failed and exit code 9" in calls[0]
+
+
+def test_test_notification_uses_public_cli_and_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def start(command: list[str], **kwargs: object) -> FinishedProcess:
+        calls.append((command, kwargs))
+        return FinishedProcess()
+
+    monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
+    monkeypatch.setattr(subprocess, "Popen", start)
+    monkeypatch.setenv("NOTIFY_SERVER", "https://old.example")
+    monkeypatch.setenv("NOTIFY_TOPIC", "old-topic")
+    monkeypatch.setenv("NOTIFY_TOKEN", "tk_old_secret")
+
+    notifier = NotifyCLI(config_path="/tmp/external-notify-config")
+    notifier.configure_transport(
+        server="https://new.example",
+        topic="new-topic",
+        replacement_token="tk_new_secret",
+    )
+    result = notifier.send_test()
+
+    assert result.delivered is True
+    command, options = calls[0]
+    assert command == [
+        "/usr/bin/notify",
+        "send",
+        "--title",
+        "Agent Workflow Manager",
+        "--message",
+        "Test notification",
+    ]
+    environment = options["env"]
+    assert isinstance(environment, dict)
+    assert environment["NOTIFY_CONFIG"] == "/tmp/external-notify-config"
+    assert environment["NOTIFY_SERVER"] == "https://new.example"
+    assert environment["NOTIFY_TOPIC"] == "new-topic"
+    assert environment["NOTIFY_TOKEN"] == "tk_new_secret"
+    assert "tk_new_secret" not in command
+    assert options["stdout"] is subprocess.DEVNULL
+    assert options["stderr"] is subprocess.DEVNULL
+
+
+def test_test_notification_timeout_is_bounded(tmp_path: Path) -> None:
+    executable = tmp_path / "notify"
+    executable.write_text("#!/usr/bin/env bash\nsleep 60\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    started = time.monotonic()
+    result = NotifyCLI(executable=str(executable), timeout=0.1).send_test()
+
+    assert time.monotonic() - started < 2
+    assert result == NotificationResult(True, False, "notify command timed out")
 
 
 def test_notify_timeout_kills_child_process_group(tmp_path: Path) -> None:
