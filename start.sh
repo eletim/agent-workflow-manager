@@ -23,6 +23,44 @@ require_command() {
     fi
 }
 
+validate_ipv4() {
+    local value=$1
+    local octets
+    local octet
+
+    if [[ ! $value =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    IFS=. read -r -a octets <<<"$value"
+    for octet in "${octets[@]}"; do
+        if [[ $octet != 0 && $octet == 0* ]] || ((10#$octet > 255)); then
+            return 1
+        fi
+    done
+}
+
+validate_port() {
+    local value=$1
+    [[ $value =~ ^[0-9]{1,5}$ ]] &&
+        ((10#$value >= 1 && 10#$value <= 65535))
+}
+
+host=${AGENT_WORKFLOW_MANAGER_HOST:-127.0.0.1}
+port=${AGENT_WORKFLOW_MANAGER_PORT:-8765}
+if ! validate_ipv4 "$host"; then
+    printf 'ERROR: AGENT_WORKFLOW_MANAGER_HOST must be an explicit IPv4 address.\n' >&2
+    exit 2
+fi
+if [[ $host == 0.0.0.0 ]]; then
+    printf '%s\n' \
+        'ERROR: refusing wildcard bind 0.0.0.0; choose one trusted interface IPv4 address.' >&2
+    exit 2
+fi
+if ! validate_port "$port"; then
+    printf 'ERROR: AGENT_WORKFLOW_MANAGER_PORT must be an integer from 1 to 65535.\n' >&2
+    exit 2
+fi
+
 require_command uv
 require_command purplemux
 
@@ -100,7 +138,10 @@ else
     printf 'Terminal notifications disabled by configuration.\n'
 fi
 
-host=${AGENT_WORKFLOW_MANAGER_HOST:-127.0.0.1}
-port=${AGENT_WORKFLOW_MANAGER_PORT:-8765}
+if [[ $host != 127.0.0.1 ]]; then
+    printf 'Trusted-network bind enabled for explicit interface %s.\n' "$host"
+    printf '%s\n' \
+        'WARNING: this UI executes arbitrary trusted Python; never expose this address publicly.'
+fi
 printf 'Starting Agent Workflow Manager at http://%s:%s\n' "$host" "$port"
 exec uv run python -m purplemux_client.web --host "$host" --port "$port"

@@ -13,6 +13,10 @@ Runner
 
 notify CLI
   -> notify-server / ntfy
+
+browser on another trusted device
+  -> http://<explicit trusted IPv4>:8765
+  -> Agent Workflow Manager Runner UI
 ```
 
 The plain Python workflow is the sole source of truth for workflow control
@@ -34,6 +38,27 @@ The Runner does not operate tmux.
 
 PurpleMux owns the agent runtime. `purplemux_client` uses PurpleMux's public
 CLI contract and does not replace its runtime or access tmux directly.
+
+## Browser access and network trust
+
+The safe default bind is `127.0.0.1`. Remote browser access is enabled only by
+setting `AGENT_WORKFLOW_MANAGER_HOST` to one explicit IPv4 address assigned to
+a trusted interface, typically the machine's Tailscale IPv4 or a trusted LAN
+address. Wildcard binding to `0.0.0.0` is rejected. This integration does not
+use Tailscale Serve, Tailscale Funnel, or any reverse proxy.
+
+The Runner derives the allowed HTTP Host and browser Origin from the actual
+configured bind address and port. GET requests require that Host. Browser POST
+run/stop requests require the configured Host, its matching exact `http://`
+Origin, and the current per-server request token. Missing browser Origin keeps
+the existing trusted non-browser client behavior, but unknown or unconfigured
+Host/Origin values remain forbidden.
+
+Direct network access is only an outer trust boundary and does not replace
+application validation. The Runner executes arbitrary trusted Python, is not a
+sandbox, and provides no multi-user isolation. It must only bind to a trusted
+private interface and must never be exposed through a public interface,
+wildcard address, port forwarding, Funnel, or a public proxy.
 
 ## Terminal notification contract
 

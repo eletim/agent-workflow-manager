@@ -84,6 +84,38 @@ installer and CLI source from
 temporary directory and runs that repository's supported `install-cli.sh`.
 No notify-server implementation is copied into this project.
 
+### Trusted-network browser access
+
+The default remains local-only at `http://127.0.0.1:8765`. To use the UI from
+another device, bind directly to one explicitly selected trusted interface
+IPv4 address, such as this machine's Tailscale IPv4 address:
+
+```bash
+AGENT_WORKFLOW_MANAGER_HOST=100.x.y.z bash start.sh
+```
+
+No Tailscale CLI is needed when the address is supplied. The same mechanism
+can use a trusted LAN/interface IPv4 address. `start.sh` prints the exact
+browser URL and rejects hostnames, invalid addresses, and the wildcard
+`0.0.0.0`; it never invokes Tailscale Serve or Funnel and introduces no reverse
+proxy.
+
+```text
+browser on another trusted device
+  -> http://<explicit trusted IPv4>:8765
+  -> Agent Workflow Manager Runner UI
+```
+
+The configured address and port are the only accepted remote HTTP Host and
+browser Origin. Unknown Hosts and Origins remain rejected, and every mutation
+still requires the per-server request token. Network access is an outer trust
+boundary, not a replacement for these checks.
+
+This UI executes arbitrary trusted Python and is not a sandbox or multi-user
+service. Bind only to an interface whose network and connected devices you
+trust. Never use a public IP/interface, `0.0.0.0`, port forwarding, a public
+reverse proxy, Tailscale Funnel, or any other public-internet exposure.
+
 On an interactive terminal, a missing token can be entered without echo and
 is saved outside Git in `~/.config/notify/config`. Leaving it blank disables
 notifications without blocking Runner startup. To disable notification setup
@@ -105,10 +137,11 @@ Then open <http://127.0.0.1:8765>. To choose another local port:
 make web ARGS="--host 127.0.0.1 --port 9000"
 ```
 
-The UI has local trusted execution semantics: it is not a sandbox, provides no
+The UI has trusted execution semantics: it is not a sandbox, provides no
 multi-user isolation, and must not be exposed to the public internet. It binds
-to `127.0.0.1` by default and protects mutations with Host, browser Origin, and
-per-server request-token checks.
+to `127.0.0.1` by default and only permits an explicitly selected IPv4 address
+for remote use. Host, browser Origin, and per-server request-token checks stay
+enabled in both modes.
 
 Terminal notifications are a best-effort observation side effect through
 `notify send`. The Python process alone determines success, failure, or stopped

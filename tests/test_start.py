@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).parents[1]
 
 
@@ -164,3 +166,46 @@ def test_start_requires_repository_root(tmp_path: Path) -> None:
     assert completed.returncode != 0
     assert "run start.sh from the repository root" in completed.stderr
     assert not call_log.exists()
+
+
+def test_start_uses_explicit_remote_interface_and_prints_url(tmp_path: Path) -> None:
+    environment, call_log = _start_environment(tmp_path)
+    environment["AGENT_WORKFLOW_MANAGER_NOTIFICATIONS"] = "disabled"
+    environment["AGENT_WORKFLOW_MANAGER_HOST"] = "100.64.10.20"
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "Trusted-network bind enabled" in completed.stdout
+    assert "http://100.64.10.20:8765" in completed.stdout
+    assert call_log.read_text(encoding="utf-8").splitlines()[-1] == (
+        "uv run python -m purplemux_client.web --host 100.64.10.20 --port 8765"
+    )
+    assert "tailscale" not in call_log.read_text(encoding="utf-8").lower()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "localhost", "999.1.1.1"])
+def test_start_rejects_non_explicit_or_wildcard_host(tmp_path: Path, host: str) -> None:
+    environment, call_log = _start_environment(tmp_path)
+    environment["AGENT_WORKFLOW_MANAGER_NOTIFICATIONS"] = "disabled"
+    environment["AGENT_WORKFLOW_MANAGER_HOST"] = host
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+    assert "uv run python -m purplemux_client.web" not in calls
