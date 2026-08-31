@@ -11,8 +11,13 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from purplemux_client.runner import AlreadyRunningError, PythonRunner, RunnerSnapshot
-from purplemux_client.web import RunnerHTTPServer
+from purplemux_client.runner import (
+    AlreadyRunningError,
+    PythonRunner,
+    RunnerClosedError,
+    RunnerSnapshot,
+)
+from purplemux_client.web import RunnerHTTPServer, build_parser
 
 
 @pytest.fixture
@@ -158,6 +163,53 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
     assert result.state == "success"
 
 
+def test_start_after_close_is_rejected() -> None:
+    runner = PythonRunner()
+    runner.close()
+
+    with pytest.raises(RunnerClosedError, match="Runner is closed"):
+        runner.start('print("must not start")')
+
+
+def test_close_cannot_miss_concurrent_start_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    popen_entered = threading.Event()
+    allow_popen = threading.Event()
+
+    def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        popen_entered.set()
+        assert allow_popen.wait(timeout=3)
+        return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", blocking_popen)
+    runner = PythonRunner(stop_timeout=0.5)
+    start_errors: list[BaseException] = []
+
+    def start_run() -> None:
+        try:
+            runner.start("import time; time.sleep(60)")
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    start_thread = threading.Thread(target=start_run)
+    start_thread.start()
+    assert popen_entered.wait(timeout=3)
+    close_thread = threading.Thread(target=runner.close)
+    close_thread.start()
+    allow_popen.set()
+    start_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not start_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert start_errors == []
+    assert runner.snapshot().state == "stopped"
+    with pytest.raises(RunnerClosedError):
+        runner.start("")
+
+
 def test_close_stops_process_group() -> None:
     runner = PythonRunner(stop_timeout=0.5)
     runner.start(
@@ -249,6 +301,7 @@ def request(
     *,
     token: str | None = None,
     origin: str | None = None,
+    host: str | None = None,
 ) -> tuple[int, dict[str, object]]:
     connection = http.client.HTTPConnection(*server_address, timeout=3)
     headers = {"Content-Type": "application/json"} if body is not None else {}
@@ -256,6 +309,8 @@ def request(
         headers["X-Python-Runner-Token"] = token
     if origin is not None:
         headers["Origin"] = origin
+    if host is not None:
+        headers["Host"] = host
     connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     payload = json.loads(response.read())
@@ -347,6 +402,96 @@ def test_token_rejects_untrusted_host(
 
     assert response.status == 403
     assert payload == {"error": "untrusted host"}
+
+
+def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.2", 0), runner)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    address = (str(host), int(port))
+    trusted_host = f"127.0.0.2:{port}"
+    trusted_origin = f"http://{trusted_host}"
+    try:
+        connection = http.client.HTTPConnection(*address, timeout=3)
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        page = response.read()
+        connection.close()
+        assert response.status == 200
+        assert b"Python Runner" in page
+
+        status, token_payload = request(address, "GET", "/api/token")
+        assert status == 200
+        token = str(token_payload["token"])
+        status, _ = request(address, "GET", "/api/status")
+        assert status == 200
+
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            origin=trusted_origin,
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            token=token,
+            origin="http://127.0.0.3:8765",
+        )
+        assert status == 403
+        status, _ = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": ""}),
+            token=token,
+            origin=trusted_origin,
+            host="127.0.0.3:8765",
+        )
+        assert status == 403
+
+        status, started = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": "import time; time.sleep(60)"}),
+            token=token,
+            origin=trusted_origin,
+        )
+        assert status == 202
+        assert started["state"] == "running"
+        status, stopped = request(
+            address,
+            "POST",
+            "/api/stop",
+            token=token,
+            origin=trusted_origin,
+        )
+        assert status == 202
+        assert stopped["stopped"] is True
+        assert wait_until_finished(runner).state == "stopped"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "localhost", "not-an-ip"])
+def test_web_cli_rejects_non_explicit_ipv4_bind(host: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--host", host])
+
+
+def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
+    args = build_parser().parse_args(["--host", "100.64.10.20"])
+
+    assert args.host == "100.64.10.20"
 
 
 def test_server_allows_explicitly_requested_hostname() -> None:

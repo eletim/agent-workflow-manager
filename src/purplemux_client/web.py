@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import secrets
 from http import HTTPStatus
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from purplemux_client.notifier import NotifyCLI
 from purplemux_client.runner import AlreadyRunningError, PythonRunner
 
 STATIC_DIR = Path(__file__).with_name("web_static")
@@ -29,7 +31,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
-        self.runner = runner or PythonRunner()
+        self.runner = runner or PythonRunner(notifier=NotifyCLI.from_environment())
         self.request_token = secrets.token_urlsafe(32)
         bound_host, bound_port = cast(tuple[str, int], self.server_address)
         self.allowed_hosts = {
@@ -160,9 +162,21 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         return
 
 
+def _parse_bind_host(value: str) -> str:
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "host must be an explicit IPv4 interface address"
+        ) from exc
+    if address.is_unspecified:
+        raise argparse.ArgumentTypeError("host must not be the wildcard 0.0.0.0")
+    return str(address)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local trusted Python runner UI")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser = argparse.ArgumentParser(description="Trusted Python runner UI")
+    parser.add_argument("--host", default="127.0.0.1", type=_parse_bind_host)
     parser.add_argument("--port", default=8765, type=int)
     return parser
 
@@ -171,7 +185,7 @@ def main() -> None:
     args = build_parser().parse_args()
     server = RunnerHTTPServer((args.host, args.port))
     print(f"Python Runner UI: http://{args.host}:{args.port}")
-    print("Trusted local use only: this server executes arbitrary Python code.")
+    print("Trusted-network use only: this server executes arbitrary Python code.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
