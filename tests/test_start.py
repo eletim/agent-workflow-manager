@@ -311,6 +311,123 @@ def test_existing_config_supports_manual_hostname_alias_without_tailscale(
     assert "tailscale" not in calls
 
 
+def test_existing_config_accepts_detected_magicdns_alias_and_preserves_values(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_failure="false",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    config = config_file.read_text(encoding="utf-8")
+    config = config.replace("AGENT_WORKFLOW_MANAGER_HOST_ALIASES=''\n", "")
+    config_file.write_text(
+        "# Existing installation settings\n"
+        + config
+        + "UNRELATED_RUNTIME_VALUE='preserve me'\n",
+        encoding="utf-8",
+    )
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        """
+printf 'tailscale %s\n' "$*" >>"$START_CALL_LOG"
+printf '%s\n' '{"Self":{"DNSName":"E-Ryzen.tail6bc726.ts.net."}}'
+""",
+    )
+
+    completed = _run_start(environment, input_text="\n")
+
+    assert completed.returncode == 0
+    assert (
+        "MagicDNS hostname e-ryzen.tail6bc726.ts.net was detected." in completed.stderr
+    )
+    assert "Allow browser access using this hostname? [Y/n]" in completed.stderr
+    updated = config_file.read_text(encoding="utf-8")
+    assert "AGENT_WORKFLOW_MANAGER_HOST=100.70.80.90" in updated
+    assert "AGENT_WORKFLOW_MANAGER_HOST_ALIASES=e-ryzen.tail6bc726.ts.net" in updated
+    assert "AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE=false" in updated
+    assert "UNRELATED_RUNTIME_VALUE='preserve me'" in updated
+    assert "# Existing installation settings" in updated
+    assert config_file.stat().st_mode & 0o777 == 0o600
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" in completed.stdout
+    calls = call_log.read_text(encoding="utf-8")
+    assert "tailscale status --json" in calls
+    assert "tailscale ip -4" not in calls
+
+
+def test_existing_config_can_decline_detected_magicdns_alias(tmp_path: Path) -> None:
+    environment, _, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'%s\n\' \'{"Self":{"DNSName":"e-ryzen.tail6bc726.ts.net."}}\'\n',
+    )
+
+    completed = _run_start(environment, input_text="n\n")
+
+    assert completed.returncode == 0
+    assert "Allow browser access using this hostname? [Y/n]" in completed.stderr
+    assert config_file.read_bytes() == original
+    assert "http://e-ryzen.tail6bc726.ts.net:8765" not in completed.stdout
+
+
+def test_existing_configured_alias_skips_magicdns_migration(tmp_path: Path) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        host_aliases="runner.example.test",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'tailscale %s\n\' "$*" >>"$START_CALL_LOG"\nexit 99\n',
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "Allow browser access" not in completed.stderr
+    assert config_file.read_bytes() == original
+    assert "tailscale" not in call_log.read_text(encoding="utf-8")
+
+
+def test_existing_config_magicdns_detection_failure_is_nonfatal(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, config_file = _start_environment(tmp_path)
+    _write_runtime_config(
+        config_file,
+        host="100.70.80.90",
+        notifications="disabled",
+        notify_config=Path(environment["HOME"]) / ".config/notify/config",
+    )
+    original = config_file.read_bytes()
+    _executable(
+        tmp_path / "bin" / "tailscale",
+        'printf \'tailscale %s\n\' "$*" >>"$START_CALL_LOG"\nexit 1\n',
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    assert "Allow browser access" not in completed.stderr
+    assert "http://100.70.80.90:8765" in completed.stdout
+    assert config_file.read_bytes() == original
+    assert "tailscale status --json" in call_log.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     "alias",
     [

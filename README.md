@@ -147,6 +147,14 @@ must not contain a scheme, port, path, query, user information, wildcard,
 whitespace, or control character. A trailing DNS root dot is removed. No
 `*.ts.net` or other suffix is implicitly trusted.
 
+Existing installations are migrated without manual editing. When
+`bash start.sh` loads an existing `config.sh` with a non-loopback IPv4 bind and no
+hostname aliases, it performs the same bounded MagicDNS detection and offers
+to allow that exact hostname. Accepting atomically replaces or appends only
+`AGENT_WORKFLOW_MANAGER_HOST_ALIASES`; all other configuration remains intact.
+Declining or failed detection leaves the file unchanged and startup continues.
+An already configured alias skips detection and the migration prompt.
+
 For compatibility and one-off launches, explicit environment values override
 the corresponding saved values for that process without rewriting
 `config.sh`; for example,

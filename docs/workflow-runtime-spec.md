@@ -85,6 +85,15 @@ queries, user information, whitespace, control characters, IP addresses, and
 wildcards are rejected. In particular, no `*.ts.net` suffix or all-MagicDNS
 trust is supported.
 
+Startup also provides a one-time convenience path for an existing runtime
+configuration that predates hostname aliases. If its saved bind is an explicit
+non-loopback IPv4 and its alias value is empty or absent, startup may detect a
+valid local MagicDNS FQDN and ask whether to allow it. Acceptance atomically
+updates only the alias assignment with mode `0600`; it does not recreate the
+file or alter the bind, notification policy, notify config path, comments, or
+unrelated values. Decline and detection failure leave the file unchanged and
+do not block startup. A configured alias suppresses this migration entirely.
+
 The Runner derives allowed HTTP Hosts and browser Origins from the actual bind
 address, exact configured hostname aliases, and port. GET requests require one
 of those Hosts. Browser POST requests require an allowed Host, its matching

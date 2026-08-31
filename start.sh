@@ -221,6 +221,77 @@ write_runtime_config() {
     runtime_config_temp=""
 }
 
+persist_runtime_host_alias() {
+    local hostname=$1
+
+    runtime_config_temp=$(mktemp "${config_file}.tmp.XXXXXX")
+    if ! python3 - "$config_file" "$runtime_config_temp" "$hostname" <<'PY'
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+hostname = sys.argv[3]
+lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
+assignment = re.compile(
+    r"^\s*(?:export\s+)?AGENT_WORKFLOW_MANAGER_HOST_ALIASES="
+)
+matching_lines = [index for index, line in enumerate(lines) if assignment.match(line)]
+replacement = f"AGENT_WORKFLOW_MANAGER_HOST_ALIASES={shlex.quote(hostname)}\n"
+if matching_lines:
+    lines[matching_lines[-1]] = replacement
+else:
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += "\n"
+    lines.append(replacement)
+
+with destination.open("w", encoding="utf-8", newline="") as handle:
+    handle.writelines(lines)
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+    then
+        rm -f -- "$runtime_config_temp"
+        runtime_config_temp=""
+        return 1
+    fi
+    if ! chmod 600 "$runtime_config_temp" || \
+        ! mv -- "$runtime_config_temp" "$config_file"; then
+        rm -f -- "$runtime_config_temp"
+        runtime_config_temp=""
+        return 1
+    fi
+    runtime_config_temp=""
+}
+
+migrate_existing_magicdns_alias() {
+    local detected_hostname
+    local normalized_aliases
+
+    validate_ipv4 "${AGENT_WORKFLOW_MANAGER_HOST-}" || return 0
+    [[ $AGENT_WORKFLOW_MANAGER_HOST != 0.0.0.0 ]] || return 0
+    [[ $AGENT_WORKFLOW_MANAGER_HOST != 127.* ]] || return 0
+    normalized_aliases=$(normalize_hostname_aliases \
+        "${AGENT_WORKFLOW_MANAGER_HOST_ALIASES-}") || return 0
+    [[ -z $normalized_aliases ]] || return 0
+    detected_hostname=$(detect_tailscale_hostname) || return 0
+
+    printf 'MagicDNS hostname %s was detected.\n' "$detected_hostname" >&2
+    if prompt_yes_by_default \
+        'Allow browser access using this hostname?'; then
+        if persist_runtime_host_alias "$detected_hostname"; then
+            AGENT_WORKFLOW_MANAGER_HOST_ALIASES=$detected_hostname
+            printf 'Saved trusted hostname to %s\n' "$config_file"
+        else
+            printf '%s\n' \
+                'WARNING: could not update runtime configuration; continuing without the hostname.' >&2
+        fi
+    fi
+}
+
 run_first_time_setup() {
     local detected_ip
     local answer_status
@@ -281,10 +352,12 @@ AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED=false
 NOTIFY_CONFIG="$HOME/.config/notify/config"
 
 first_run=false
+existing_config=true
 if [[ ! -f $config_file ]]; then
     cp -- "$sample_config_file" "$config_file"
     chmod 600 "$config_file"
     first_run=true
+    existing_config=false
 
     cleanup_incomplete_setup() {
         if [[ -n $runtime_config_temp ]]; then
@@ -307,6 +380,10 @@ if [[ $first_run == true ]]; then
     run_first_time_setup
     first_run=false
     trap - EXIT
+fi
+
+if [[ $existing_config == true ]]; then
+    migrate_existing_magicdns_alias
 fi
 
 if [[ $host_override_set ]]; then
