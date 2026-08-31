@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import shlex
@@ -220,15 +221,33 @@ class NotificationSettings:
         if not isinstance(value, str) or value != value.strip() or len(value) > 2048:
             raise SettingsValidationError("Notify server must be a valid HTTP(S) URL.")
         parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise SettingsValidationError(
+                "Notify server must be a valid HTTP(S) URL."
+            ) from exc
+        hostname = parsed.hostname
+        loopback = hostname == "localhost"
+        if hostname is not None and not loopback:
+            try:
+                loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
         if (
             parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
+            or not hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
         ):
             raise SettingsValidationError("Notify server must be a valid HTTP(S) URL.")
+        if parsed.scheme == "http" and not loopback:
+            raise SettingsValidationError(
+                "Notify server must use HTTPS (HTTP is allowed only for loopback)."
+            )
         return value
 
     @staticmethod

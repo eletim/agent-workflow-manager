@@ -179,6 +179,7 @@ def test_server_topic_update_preserves_existing_token(tmp_path: Path) -> None:
         ("enabled", "yes", "enabled must be true or false"),
         ("server", "ftp://notify.example", r"valid HTTP\(S\) URL"),
         ("server", "https://token@notify.example", r"valid HTTP\(S\) URL"),
+        ("server", "http://192.168.1.2", "must use HTTPS"),
         ("topic", "not a topic", "1-64 letters"),
         ("replacementToken", "", "Replacement token is invalid"),
     ],
@@ -202,6 +203,16 @@ def test_settings_write_validates_all_inputs_before_writing(
 
     assert not runtime_config.exists()
     assert not notify_config.exists()
+
+
+def test_settings_accepts_loopback_http_notify_server(tmp_path: Path) -> None:
+    settings, _, _, _ = _settings(tmp_path)
+
+    payload = settings.update(
+        {"server": "http://127.0.0.1:8080", "topic": "agents"}
+    ).as_json()
+
+    assert payload["server"] == "http://127.0.0.1:8080"
 
 
 def test_test_notification_requires_config_and_credential(tmp_path: Path) -> None:
