@@ -23,6 +23,7 @@ from purplemux_client.runner import (
     InvalidExecutionContextError,
     PythonRunner,
     RunNotFoundError,
+    RunNotResumableError,
     WorkflowValidationError,
 )
 
@@ -376,6 +377,32 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.ACCEPTED if stopped else HTTPStatus.CONFLICT,
                 {"stopped": stopped, **snapshot.as_json()},
             )
+            return
+        resume_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/resume", path)
+        if resume_match is not None:
+            run_id = int(resume_match.group(1))
+            try:
+                self.server.runner.resume(run_id)
+                snapshot = self.server.runner.snapshot(run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except RunNotResumableError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except InvalidExecutionContextError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except WorkflowValidationError as exc:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "workflow validation failed before resume",
+                        "validation": [issue.as_json() for issue in exc.result.issues],
+                    },
+                )
+                return
+            self._send_json(HTTPStatus.ACCEPTED, snapshot.as_json())
             return
         if path == "/api/settings/notifications":
             payload = self._read_json()

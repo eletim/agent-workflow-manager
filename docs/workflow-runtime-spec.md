@@ -36,11 +36,43 @@ terminal state is determined solely by the Python process:
 
 - exit code zero becomes `success`;
 - a nonzero exit becomes `failed`;
+- the reserved suspension exit with a matching `suspend_run()` event becomes
+  `suspended`;
 - a process terminated after a Runner stop request becomes `stopped`.
 
 Progress events are observational. They do not decide terminal state and must
 never drive workflow sequencing, branching, retries, cleanup, or completion.
 The Runner does not operate tmux.
+
+## Manual recovery and resume contract
+
+Resume is an explicit user action on the same in-memory run; it is never an
+automatic retry. A workflow proves that replay can be avoided by calling
+`save_checkpoint(name, data)` only after a set of side effects is complete.
+The data is a small string map (normally PurpleMux workspace/tab IDs and other
+non-secret correlation values). The Runner retains only the latest checkpoint,
+the original output, and each terminal attempt in run history. It keeps the
+same code, working directory, arguments, run ID, and PurpleMux resources.
+Publishing a checkpoint is also the workflow author's assertion that restarting
+from it remains safe until a newer checkpoint replaces it; otherwise the
+workflow must not publish one.
+
+On resume, the Runner re-runs preflight and starts the same plain Python script
+with that checkpoint available through `resume_checkpoint()`. The script is the
+sole owner of branching: it must recognize the checkpoint, validate manually
+repaired external state, reuse retained resource IDs, and skip every completed
+non-idempotent side effect. Publishing a checkpoint does not cause the Runner
+to infer or execute a next step. If a failed/suspended run has no checkpoint,
+the resume API rejects it instead of starting the script blindly. Checkpoint
+data must not contain credentials because it is returned by the run API/UI.
+
+`suspend_run(reason)` lets a workflow distinguish a human-needs-input boundary
+from a hard failure after it has saved a safe checkpoint. The process exits and
+the run becomes `suspended`; PurpleMux sessions remain open. After the operator
+answers or repairs the external state, the same explicit Resume action applies.
+Repeated fail/suspend → repair → resume cycles use the newest checkpoint. This
+small contract is process-memory scoped: restarting the Runner loses its run
+registry and requires a new run with workflow-specific recovery inputs.
 
 PurpleMux owns agent and managed-terminal runtime. `purplemux_client` uses
 PurpleMux's public CLI contract and does not replace its runtime or access tmux
@@ -130,6 +162,7 @@ not drive workflow control flow and do not participate in orchestration.
 | --- | --- | --- |
 | `success` | `Workflow completed` | Includes the run ID and `success` state. |
 | `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
+| `suspended` | `Workflow needs attention` | Says that the run is suspended for manual input or recovery. |
 | `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
 
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
@@ -139,6 +172,9 @@ notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,
 success and failure default on, and stopped defaults off. In `config.sh`, the
 first setting is expressed as `auto`, `enabled`, or `disabled`; `start.sh`
 resolves it to the runtime boolean after notify setup.
+Suspension is an operator-attention condition rather than a hard failure and is
+therefore sent whenever notifications are globally enabled; it does not use the
+failure policy or failure wording.
 
 Each enabled terminal notification has one attempt, an outer bounded timeout,
 and no retry loop. The CLI runs in its own process group, which is terminated

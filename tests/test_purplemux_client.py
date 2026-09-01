@@ -14,6 +14,7 @@ from purplemux_client import (
     ResultNotReady,
     SessionReadyTimeout,
     ShellCommandRequest,
+    TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
@@ -821,8 +822,10 @@ def test_wait_raises_for_needs_input() -> None:
     cli = client(runner)
 
     cli.send_input("tab-1", "work")
-    with pytest.raises(WorkerNeedsInput, match="needs input"):
+    with pytest.raises(WorkerNeedsInput, match="needs input") as raised:
         cli.wait_for_turn_completion("tab-1", 1)
+    assert isinstance(raised.value, TerminalSessionError)
+    assert not isinstance(raised.value, WorkerFailure)
 
 
 def test_wait_raises_when_agent_becomes_inactive() -> None:

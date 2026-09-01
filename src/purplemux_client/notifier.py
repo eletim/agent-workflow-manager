@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from typing import Literal
 
-TerminalState = Literal["success", "failed", "stopped"]
+TerminalState = Literal["success", "failed", "suspended", "stopped"]
 
 
 @dataclass(frozen=True)
@@ -182,6 +182,11 @@ def _terminal_message(
         return (
             "Workflow failed",
             f"Run {run_id} finished with state: failed{exit_detail}",
+        )
+    if state == "suspended":
+        return (
+            "Workflow needs attention",
+            f"Run {run_id} is suspended and waiting for manual input or recovery",
         )
     return "Workflow stopped", f"Run {run_id} finished with state: stopped"
 

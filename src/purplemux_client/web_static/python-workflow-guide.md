@@ -78,6 +78,7 @@ from purplemux_client import (
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
     ResultNotReady,
+    ResumeCheckpoint,
     ShellCommandRequest,
     ShellResult,
     SessionReadyTimeout,
@@ -86,6 +87,9 @@ from purplemux_client import (
     WorkerInterrupted,
     WorkerNeedsInput,
     emit_step,
+    resume_checkpoint,
+    save_checkpoint,
+    suspend_run,
 )
 ```
 
@@ -188,7 +192,9 @@ Relevant errors all derive from `TerminalSessionError`:
 - `SessionReadyTimeout`: the session did not become ready in time.
 - `WorkerFailure`: CLI failure, invalid state/result, turn timeout, or another
   worker failure.
-- `WorkerNeedsInput`: the agent needs additional input.
+- `WorkerNeedsInput`: the agent needs additional input. Unlike hard worker
+  failure, this derives directly from `TerminalSessionError` so a workflow can
+  suspend for a human response explicitly.
 - `WorkerInterrupted`: the current turn was interrupted.
 - `ResultNotReady`: no fresh structured result is ready.
 - `MutationOutcomeUnknown`: a mutation timed out and may have happened remotely.
@@ -320,6 +326,61 @@ Do not retry a timed-out close blindly. There is currently no workspace deletion
 method in `purplemux_client`; do not invent one. A workflow may use
 `capture_screen` after failure for diagnostics, without parsing it as a result.
 
+## Explicit checkpoints and manual recovery
+
+The Runner resumes only a failed or suspended run that published a safe
+checkpoint. Checkpoints are execution metadata, not progress and not a workflow
+graph. Save one only after preceding side effects have completed:
+
+```python
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    workspace_id = create_workspace()
+    client = PurpleMuxCLIClient(workspace_id)
+    implementer = client.create_session(...)
+    save_checkpoint(
+        "sessions ready",
+        {"workspace": workspace_id, "implementer": implementer},
+    )
+else:
+    if checkpoint.name != "sessions ready":
+        raise WorkerFailure(f"unsupported checkpoint: {checkpoint.name}")
+    workspace_id = checkpoint.data["workspace"]
+    implementer = checkpoint.data["implementer"]
+    client = PurpleMuxCLIClient(workspace_id)
+    # Validate the retained tab/repository/manual repair before continuing.
+```
+
+The workflow must branch before any completed non-idempotent action, reuse
+checkpoint IDs, and validate assumptions that manual repair could change.
+It may leave a checkpoint active only when every operation from that point to
+the next checkpoint is safe/idempotent to re-enter after an arbitrary failure.
+Checkpoint values are exposed in the UI/API, so store only short non-secret
+strings. A checkpoint event over 4 KiB is rejected. On each Resume click the
+Runner re-runs preflight and the same saved script, cwd, and arguments under the
+same run ID; output and terminal attempt history are appended. It never edits
+or restores repository files, so manual changes are preserved unless the
+workflow itself overwrites them.
+
+For an agent question, save a safe checkpoint and convert the typed condition
+to a suspended run while leaving the PurpleMux tab open:
+
+```python
+try:
+    client.wait_for_turn_completion(implementer, TURN_TIMEOUT)
+except WorkerNeedsInput as exc:
+    save_checkpoint(
+        "implementer needs input",
+        {"workspace": workspace_id, "implementer": implementer},
+    )
+    suspend_run(str(exc))
+```
+
+If safe continuation cannot be represented this way, do not publish a
+checkpoint. The UI will explain that the run cannot be resumed, and the user
+must start a new workflow-specific recovery path. Resume state lasts only for
+the current Runner process; this is deliberately not a persistence framework.
+
 ## Progress instrumentation
 
 Progress is optional observation, not control flow:
@@ -395,7 +456,8 @@ Do not:
 - let the UI decide the next step;
 - ask an implementer to self-review when an independent review is required;
 - run observable/parallel Bash work as an invisible local subprocess;
-- invent checkpoint/resume, graph semantics, or missing APIs.
+- invent additional checkpoint/graph semantics or missing APIs beyond the
+  explicit `save_checkpoint()` / `resume_checkpoint()` contract.
 
 ## Complete example: implement, review, fix, and ready a PR
 

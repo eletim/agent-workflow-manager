@@ -83,6 +83,28 @@ def test_terminal_result_attempts_exactly_one_notification(
     assert notifier.calls == [(run_id, expected_state, expected_exit_code)]
 
 
+def test_suspended_result_attempts_exactly_one_attention_notification() -> None:
+    notifier = RecordingNotifier()
+    runner = PythonRunner(notifier=notifier)
+    code = """\
+from purplemux_client import save_checkpoint, suspend_run
+save_checkpoint("waiting", {"tab": "tab-1"})
+suspend_run("answer tab-1")
+"""
+    try:
+        run_id = runner.start(code)
+        result = _wait_until_finished(runner)
+        for _ in range(100):
+            if notifier.calls:
+                break
+            time.sleep(0.01)
+    finally:
+        runner.close()
+
+    assert result.state == "suspended"
+    assert notifier.calls == [(run_id, "suspended", 75)]
+
+
 def test_stopped_notification_is_disabled_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -240,6 +262,30 @@ def test_notify_command_contains_required_failure_message(
 
     assert "Workflow failed" in calls[0]
     assert "Run 13 finished with state: failed and exit code 9" in calls[0]
+
+
+def test_suspended_notification_is_attention_not_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
+    _record_process_start(monkeypatch, calls)
+
+    result = NotifyCLI(enabled=True, notify_failure=False).notify_terminal(
+        run_id=14, state="suspended", exit_code=75
+    )
+
+    assert result.delivered is True
+    assert calls == [
+        [
+            "/usr/bin/notify",
+            "send",
+            "--title",
+            "Workflow needs attention",
+            "--message",
+            "Run 14 is suspended and waiting for manual input or recovery",
+        ]
+    ]
 
 
 def test_test_notification_uses_public_cli_and_config_path(
