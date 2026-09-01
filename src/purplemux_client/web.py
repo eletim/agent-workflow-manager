@@ -209,9 +209,12 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         return f"{normalized}:{port}"
 
     def server_close(self) -> None:
-        self.runner.close()
-        if self._settings_notifier is not None:
-            self._settings_notifier.close()
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.close()
+        settings_notifier = getattr(self, "_settings_notifier", None)
+        if settings_notifier is not None:
+            settings_notifier.close()
         super().server_close()
 
 

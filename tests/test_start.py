@@ -60,9 +60,38 @@ def _start_environment(
     config_file = tmp_path / "config.sh"
     _executable(
         fake_bin / "uv",
-        'printf \'uv %s\\n\' "$*" >>"$START_CALL_LOG"\n',
+        """
+printf 'uv %s\\n' "$*" >>"$START_CALL_LOG"
+if [[ ${1-} == run && ${2-} == --no-sync && ${3-} == python ]]; then
+    shift 3
+    exec /usr/bin/python3 "$@"
+fi
+""",
     )
-    _executable(fake_bin / "purplemux", "exit 0\n")
+    _executable(
+        fake_bin / "purplemux",
+        """
+if [[ ${1-} == --help ]]; then
+    cat <<'HELP'
+purplemux CLI
+workspaces
+workspace create --cwd PATH [--name NAME]
+tab create -w WS [-n NAME] [-t TYPE]
+tab send -w WS TAB_ID CONTENT...
+tab interrupt -w WS TAB_ID
+tab status -w WS TAB_ID
+tab result -w WS TAB_ID
+tab capture -w WS TAB_ID
+tab close -w WS TAB_ID
+HELP
+elif [[ ${1-} == workspaces ]]; then
+    runtime_output=${PURPLEMUX_WORKSPACES_OUTPUT-'{"workspaces":[]}'}
+    printf '%s\n' "$runtime_output"
+else
+    exit 2
+fi
+""",
+    )
     _executable(fake_bin / "tailscale", "exit 1\n")
     if with_notify:
         _executable(fake_bin / "notify", "exit 0\n")
@@ -107,18 +136,154 @@ def test_start_syncs_and_launches_runner_with_notify_disabled(
     assert completed.returncode == 0
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert calls[0] == "uv sync --locked"
-    assert calls[1].startswith(
+    assert calls[1].startswith("uv run --no-sync python -c import json, sys;")
+    assert calls[2].startswith(
         "uv run python -m purplemux_client.web --host 127.0.0.1 --port 8765"
     )
     assert (
         f"--runtime-config {environment['AGENT_WORKFLOW_MANAGER_CONFIG_FILE']}"
-        in calls[1]
+        in calls[2]
     )
     assert (
         f"--notify-config {Path(environment['HOME']) / '.config/notify/config'}"
-        in calls[1]
+        in calls[2]
     )
     assert "notifications disabled" in completed.stdout.lower()
+
+
+def test_start_reports_custom_install_remediation_when_purplemux_is_missing(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    (tmp_path / "bin" / "purplemux").unlink()
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "required custom purplemux CLI not found" in completed.stderr
+    assert "eletim/purplemux" in completed.stderr
+    assert "cli-token" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_start_rejects_incompatible_upstream_purplemux_cli(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    _executable(
+        tmp_path / "bin" / "purplemux",
+        "printf '%s\n' 'Usage: purplemux [options] <files...>'\n",
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "does not provide the required custom CLI contract" in completed.stderr
+    assert "upstream npm purplemux CLI" in completed.stderr
+    assert "eletim/purplemux" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_start_rejects_purplemux_cli_without_tab_type_option(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    purplemux = tmp_path / "bin" / "purplemux"
+    original = purplemux.read_text(encoding="utf-8")
+    purplemux.write_text(
+        original.replace(
+            "tab create -w WS [-n NAME] [-t TYPE]",
+            "tab create -w WS [-n NAME]",
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "does not provide the required custom CLI contract" in completed.stderr
+    assert "tab create -w WS [-n NAME] [-t TYPE]" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_start_rejects_unreachable_purplemux_runtime(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    purplemux = tmp_path / "bin" / "purplemux"
+    original = purplemux.read_text(encoding="utf-8")
+    purplemux.write_text(
+        original.replace(
+            "if [[ ${1-} == --help ]]; then",
+            "if [[ ${1-} == workspaces ]]; then\n    exit 7\n"
+            "elif [[ ${1-} == --help ]]; then",
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "could not reach its runtime within 5 seconds" in completed.stderr
+    assert "cli-token" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime_output",
+    (
+        'not-json "workspaces":',
+        '{"workspaces":null}',
+        "[]",
+    ),
+)
+def test_start_rejects_invalid_purplemux_runtime_response(
+    tmp_path: Path,
+    runtime_output: str,
+) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    environment["PURPLEMUX_WORKSPACES_OUTPUT"] = runtime_output
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "returned an unexpected response" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_hanging_purplemux_runtime_check_is_bounded(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    purplemux = tmp_path / "bin" / "purplemux"
+    original = purplemux.read_text(encoding="utf-8")
+    purplemux.write_text(
+        original.replace(
+            "if [[ ${1-} == --help ]]; then",
+            "if [[ ${1-} == workspaces ]]; then\n    sleep 30\n"
+            "elif [[ ${1-} == --help ]]; then",
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+    assert completed.returncode != 0
+    assert "could not reach its runtime within 5 seconds" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_existing_config_skips_first_run_setup(tmp_path: Path) -> None:

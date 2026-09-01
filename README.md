@@ -81,7 +81,10 @@ committed, secret-free `sample_config.sh` to the gitignored `config.sh`, walks
 through the short network setup, and saves the selected runtime settings.
 Later starts load that file without repeating setup questions. The script then
 validates the configuration, syncs locked Python dependencies, verifies `uv`
-and `purplemux`, and starts the UI at the configured URL.
+and the custom `eletim/purplemux` command contract, confirms the PurpleMux
+runtime responds to a bounded read-only workspace query, and starts the UI at
+the configured URL. An incompatible upstream npm CLI or an unreachable runtime
+fails startup with installation and connection guidance before the UI launches.
 
 `config.sh` owns Agent Workflow Manager startup settings:
 

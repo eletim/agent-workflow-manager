@@ -40,6 +40,70 @@ require_command() {
     fi
 }
 
+purplemux_remediation() {
+    printf '%s\n' \
+        'Install the custom eletim/purplemux CLI and ensure its runtime is running.' \
+        'Then verify ~/.purplemux/{port,cli-token} point to that runtime.' >&2
+}
+
+validate_purplemux() {
+    local help_output
+    local runtime_output
+    local required_contract
+
+    if ! command -v purplemux >/dev/null 2>&1; then
+        printf '%s\n' \
+            'ERROR: required custom purplemux CLI not found on PATH.' >&2
+        purplemux_remediation
+        exit 1
+    fi
+    require_command timeout
+
+    if ! help_output=$(timeout --signal=TERM --kill-after=1 5 \
+        purplemux --help 2>&1); then
+        printf '%s\n' \
+            'ERROR: the purplemux CLI could not report its command contract within 5 seconds.' >&2
+        purplemux_remediation
+        exit 1
+    fi
+
+    for required_contract in \
+        'workspaces' \
+        'workspace create --cwd PATH' \
+        'tab create -w WS [-n NAME] [-t TYPE]' \
+        'tab send -w WS TAB_ID' \
+        'tab interrupt -w WS TAB_ID' \
+        'tab status -w WS TAB_ID' \
+        'tab result -w WS TAB_ID' \
+        'tab capture -w WS TAB_ID' \
+        'tab close -w WS TAB_ID'; do
+        if [[ $help_output != *"$required_contract"* ]]; then
+            printf '%s\n' \
+                "ERROR: purplemux does not provide the required custom CLI contract: $required_contract" >&2
+            printf '%s\n' \
+                'An upstream npm purplemux CLI or an incompatible custom CLI may be first on PATH.' >&2
+            purplemux_remediation
+            exit 1
+        fi
+    done
+
+    if ! runtime_output=$(timeout --signal=TERM --kill-after=1 5 \
+        purplemux workspaces 2>&1); then
+        printf '%s\n' \
+            'ERROR: the custom purplemux CLI could not reach its runtime within 5 seconds.' >&2
+        purplemux_remediation
+        exit 1
+    fi
+    if ! printf '%s' "$runtime_output" | uv run --no-sync python -c \
+        'import json, sys; data = json.load(sys.stdin); sys.exit(not (isinstance(data, dict) and isinstance(data.get("workspaces"), list)))' \
+        2>/dev/null; then
+        printf '%s\n' \
+            'ERROR: purplemux workspaces returned an unexpected response instead of the custom runtime contract.' >&2
+        purplemux_remediation
+        exit 1
+    fi
+}
+
 validate_ipv4() {
     local value=$1
     local octets
@@ -462,7 +526,7 @@ export AGENT_WORKFLOW_MANAGER_CONFIG_FILE="$config_file"
 require_command uv
 printf 'Syncing Python dependencies...\n'
 uv sync --locked
-require_command purplemux
+validate_purplemux
 
 notification_mode=$AGENT_WORKFLOW_MANAGER_NOTIFICATIONS
 if [[ $notification_mode != disabled ]]; then
