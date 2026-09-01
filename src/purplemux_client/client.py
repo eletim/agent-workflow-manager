@@ -23,7 +23,7 @@ class WorkerFailure(TerminalSessionError):
     """Raised when a PurpleMux-backed worker or CLI operation fails."""
 
 
-class WorkerNeedsInput(WorkerFailure):
+class WorkerNeedsInput(TerminalSessionError):
     """Raised when a worker cannot complete without additional input."""
 
 

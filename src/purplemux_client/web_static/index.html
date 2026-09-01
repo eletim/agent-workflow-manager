@@ -47,9 +47,16 @@ emit_step("workspace create", "completed")</textarea>
         <div class="controls">
           <button id="validate">Validate</button>
           <button id="run" class="primary">Run</button>
+          <button id="resume" disabled>Continue after fix</button>
           <button id="stop" disabled>Stop</button>
           <span id="exit-code">Exit code: —</span>
         </div>
+      </section>
+
+      <section id="recovery-panel" class="panel recovery-panel" aria-live="polite" hidden>
+        <h2>Recovery</h2>
+        <p id="recovery-summary"></p>
+        <ol id="attempt-history" class="attempt-history"></ol>
       </section>
 
       <section id="validation-panel" class="panel validation-panel" aria-live="polite" hidden>

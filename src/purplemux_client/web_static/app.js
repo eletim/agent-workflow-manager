@@ -5,6 +5,7 @@ const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
 const runButton = document.querySelector("#run");
+const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
 const stopButton = document.querySelector("#stop");
 const statusBadge = document.querySelector("#status");
@@ -14,6 +15,9 @@ const outputCopy = document.querySelector("#output-copy");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
+const recoveryPanel = document.querySelector("#recovery-panel");
+const recoverySummary = document.querySelector("#recovery-summary");
+const attemptHistory = document.querySelector("#attempt-history");
 const validationPanel = document.querySelector("#validation-panel");
 const validation = document.querySelector("#validation");
 const guideDialog = document.querySelector("#guide-dialog");
@@ -50,8 +54,10 @@ function render(result) {
   runButton.disabled = false;
   validateButton.disabled = false;
   stopButton.disabled = activeRunId === null || !running;
+  resumeButton.disabled = activeRunId === null || !result.resumable;
   renderProgress(result.progress || []);
   renderValidation(result.validation || []);
+  renderRecovery(result);
   const renderedArgs = (result.args || []).map((argument) => JSON.stringify(argument)).join(" ");
   const label = result.runId == null ? "Configured run" : `Run #${result.runId}`;
   activeContext.textContent = `${label}: ${result.cwd}${renderedArgs ? ` ${renderedArgs}` : ""}`;
@@ -59,6 +65,28 @@ function render(result) {
   if (running) {
     stdout.scrollTop = stdout.scrollHeight;
     stderr.scrollTop = stderr.scrollHeight;
+  }
+}
+
+function renderRecovery(result) {
+  const attempts = result.attempts || [];
+  recoveryPanel.hidden = !["failed", "suspended"].includes(result.state)
+    && result.checkpoint == null && attempts.length < 2;
+  if (result.checkpoint) {
+    recoverySummary.textContent = `Safe checkpoint: ${result.checkpoint.name}. Manual fixes are preserved; the Python workflow decides how continuation validates and uses this checkpoint.`;
+  } else if (result.state === "failed") {
+    recoverySummary.textContent = "No safe checkpoint was published. This run cannot be resumed without risking replay of completed side effects.";
+  } else {
+    recoverySummary.textContent = result.suspensionReason || "";
+  }
+  if (result.suspensionReason) {
+    recoverySummary.textContent += ` Suspended: ${result.suspensionReason}`;
+  }
+  attemptHistory.replaceChildren();
+  for (const attempt of attempts) {
+    const item = document.createElement("li");
+    item.textContent = `Attempt ${attempt.number}: ${attempt.state} (exit ${attempt.exitCode})${attempt.resumedFrom ? `, resumed from ${attempt.resumedFrom}` : ""}`;
+    attemptHistory.append(item);
   }
 }
 
@@ -300,6 +328,18 @@ stopButton.addEventListener("click", async () => {
     await refresh();
   } catch (error) {
     stderr.textContent = String(error);
+  }
+});
+
+resumeButton.addEventListener("click", async () => {
+  if (activeRunId === null) return;
+  resumeButton.disabled = true;
+  try {
+    render(await request(`/api/runs/${activeRunId}/resume`, {method: "POST"}));
+    await refresh();
+  } catch (error) {
+    stderr.textContent = String(error);
+    await refresh();
   }
 });
 

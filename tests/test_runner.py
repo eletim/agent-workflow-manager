@@ -19,6 +19,7 @@ from purplemux_client.runner import (
     PythonRunner,
     RunnerClosedError,
     RunnerSnapshot,
+    RunNotResumableError,
 )
 from purplemux_client.web import RunnerHTTPServer, build_parser
 
@@ -344,6 +345,115 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
     assert result.state == "success"
 
 
+def test_resume_reuses_same_run_from_explicit_checkpoint_without_replaying_side_effect(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    code = """\
+from pathlib import Path
+from purplemux_client import resume_checkpoint, save_checkpoint
+
+side_effect = Path("side-effect.txt")
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    side_effect.write_text("created once")
+    save_checkpoint("resource created", {"resource": str(side_effect.resolve())})
+else:
+    assert checkpoint.name == "resource created"
+    assert Path(checkpoint.data["resource"]).read_text() == "manually repaired"
+if not Path("repair.complete").exists():
+    raise RuntimeError("manual repair required")
+print("continued safely")
+"""
+    run_id = runner.start(code, cwd=tmp_path)
+    first = wait_until_finished(runner)
+    assert first.state == "failed"
+    assert first.checkpoint is not None
+    assert first.checkpoint.name == "resource created"
+    assert first.attempts[0].state == "failed"
+
+    (tmp_path / "side-effect.txt").write_text("manually repaired", encoding="utf-8")
+    (tmp_path / "repair.complete").touch()
+    runner.resume(run_id)
+    resumed = wait_until_finished(runner)
+
+    assert resumed.run_id == run_id
+    assert resumed.state == "success"
+    assert (tmp_path / "side-effect.txt").read_text() == "manually repaired"
+    assert "[resume attempt 2 from checkpoint 'resource created']" in resumed.stdout
+    assert resumed.stdout.endswith("continued safely\n")
+    assert [(attempt.state, attempt.resumed_from) for attempt in resumed.attempts] == [
+        ("failed", None),
+        ("success", "resource created"),
+    ]
+
+
+def test_resume_rejects_failure_without_safe_checkpoint(runner: PythonRunner) -> None:
+    run_id = runner.start("raise RuntimeError('unsafe to replay')")
+    wait_until_finished(runner)
+
+    with pytest.raises(RunNotResumableError, match="no safe checkpoint"):
+        runner.resume(run_id)
+
+
+def test_suspended_run_is_distinct_and_resumable(runner: PythonRunner) -> None:
+    code = """\
+from purplemux_client import resume_checkpoint, save_checkpoint, suspend_run
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    save_checkpoint("agent waiting", {"tab": "tab-1"})
+    suspend_run("reply in tab-1 before continuing")
+print("continued after input")
+"""
+    run_id = runner.start(code)
+    suspended = wait_until_finished(runner)
+
+    assert suspended.state == "suspended"
+    assert suspended.suspension_reason == "reply in tab-1 before continuing"
+    runner.resume(run_id)
+    resumed = wait_until_finished(runner)
+    assert resumed.state == "success"
+    assert [attempt.state for attempt in resumed.attempts] == ["suspended", "success"]
+
+
+def test_repeated_manual_recovery_uses_latest_safe_checkpoint(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    code = """\
+from pathlib import Path
+from purplemux_client import resume_checkpoint, save_checkpoint
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    save_checkpoint("phase one", {"workspace": "ws-1"})
+    raise RuntimeError("first repair")
+if checkpoint.name == "phase one":
+    assert Path("first-fixed").exists()
+    save_checkpoint("phase two", {"workspace": checkpoint.data["workspace"], "tab": "tab-2"})
+    raise RuntimeError("second repair")
+assert checkpoint.name == "phase two"
+assert Path("second-fixed").exists()
+print(checkpoint.data["workspace"], checkpoint.data["tab"])
+"""
+    run_id = runner.start(code, cwd=tmp_path)
+    wait_until_finished(runner)
+    (tmp_path / "first-fixed").touch()
+    runner.resume(run_id)
+    second = wait_until_finished(runner)
+    assert second.state == "failed"
+    assert second.checkpoint is not None
+    assert second.checkpoint.name == "phase two"
+
+    (tmp_path / "second-fixed").touch()
+    runner.resume(run_id)
+    final = wait_until_finished(runner)
+    assert final.state == "success"
+    assert final.stdout.endswith("ws-1 tab-2\n")
+    assert [attempt.resumed_from for attempt in final.attempts] == [
+        None,
+        "phase one",
+        "phase two",
+    ]
+
+
 def test_start_after_close_is_rejected() -> None:
     runner = PythonRunner()
     runner.close()
@@ -663,6 +773,17 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "cwd": str(Path.cwd()),
         "args": [],
+        "checkpoint": None,
+        "attempts": [
+            {
+                "number": 1,
+                "state": "success",
+                "exitCode": 0,
+                "resumedFrom": None,
+            }
+        ],
+        "suspensionReason": None,
+        "resumable": False,
     }
 
 
@@ -736,6 +857,70 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "GET", "/api/runs/999")[0] == 404
     assert request(address, "POST", "/api/runs/999/stop")[0] == 403
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
+
+
+def test_run_api_resumes_same_run_and_rejects_unsafe_replay(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    code = """\
+from pathlib import Path
+from purplemux_client import resume_checkpoint, save_checkpoint
+if resume_checkpoint() is None:
+    save_checkpoint("before repair", {"workspace": "ws-1", "tab": "tab-1"})
+if not Path("fixed").exists():
+    raise RuntimeError("fix required")
+print("resumed")
+"""
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": code, "cwd": str(tmp_path)}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, failed = request(address, "GET", f"/api/runs/{run_id}")
+        if failed["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert failed["state"] == "failed"
+    assert failed["resumable"] is True
+    assert failed["checkpoint"] == {
+        "name": "before repair",
+        "data": {"workspace": "ws-1", "tab": "tab-1"},
+    }
+
+    (tmp_path / "fixed").touch()
+    status, resumed = request(
+        address, "POST", f"/api/runs/{run_id}/resume", token=token
+    )
+    assert status == 202
+    assert resumed["runId"] == run_id
+
+    unsafe_status, unsafe = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "raise RuntimeError('no checkpoint')"}),
+        token=token,
+    )
+    assert unsafe_status == 202
+    unsafe_id = int(unsafe["runId"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, unsafe = request(address, "GET", f"/api/runs/{unsafe_id}")
+        if unsafe["state"] != "running":
+            break
+        time.sleep(0.02)
+    status, refusal = request(
+        address, "POST", f"/api/runs/{unsafe_id}/resume", token=token
+    )
+    assert status == 409
+    assert "no safe checkpoint" in str(refusal["error"])
 
 
 def test_run_api_passes_run_scoped_execution_context(
