@@ -115,7 +115,9 @@ a { color: #bcaaff; }
 .recovery-panel p { margin: 0; color: #d7c68f; font-size: 13px; }
 .attempt-history { margin-bottom: 0; color: #aab0bf; font-size: 13px; }
 
-.validation-panel { border-color: #7d4148; }
+.validation-panel.invalid { border-color: #7d4148; }
+.validation-panel.valid { border-color: #296644; }
+.validation-success { margin: 0; color: #75e2a8; font-size: 13px; }
 .validation-list { margin-bottom: 0; color: #ffb3bc; }
 
 .progress-panel { margin-top: 14px; }
