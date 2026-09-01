@@ -174,6 +174,128 @@ def test_approved_head_change_is_rejected_after_resume(
         SAMPLE_MODULE.require_approved_head("b" * 40, resumed, "Issue PR")
 
 
+def test_issue_approved_resume_with_new_head_runs_a_new_bounded_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase="issue_approved",
+        issue_number=1,
+        implementer="tab-1",
+        reviewer="tab-2",
+        reviews_used=1,
+        approved_sha="a" * 40,
+    )
+    new_sha = "b" * 40
+    reviews: list[int | None] = []
+    monkeypatch.setattr(SAMPLE_MODULE, "merged_issue_pr", lambda *_args: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "prepare_issue_branch", lambda *_args: None)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "require_issue_head",
+        lambda *_args: (new_sha, {"headRefOid": new_sha}),
+    )
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "run_turn",
+        lambda *_args, iteration=None, **_kwargs: (
+            reviews.append(iteration) or "APPROVED"
+        ),
+    )
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "merge_issue_pr",
+        lambda _issue, _config, state: {
+            "url": "https://github.com/OWNER/REPOSITORY/pull/1",
+            "headRefOid": state.approved_sha,
+        },
+    )
+    monkeypatch.setattr(SAMPLE_MODULE, "close_tabs", lambda *_args: None)
+
+    SAMPLE_MODULE.process_issue(config.issues[0], config, object(), recovery)
+
+    assert reviews == [1]
+    assert recovery.phase == "workspace_ready"
+
+
+def test_integration_approved_resume_with_new_head_rereviews_and_rechecks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase="integration_checks_done",
+        implementer="tab-1",
+        reviewer="tab-2",
+        reviews_used=1,
+        approved_sha="a" * 40,
+    )
+    new_sha = "b" * 40
+    pr = {
+        "number": 10,
+        "url": "https://github.com/OWNER/REPOSITORY/pull/10",
+        "state": "OPEN",
+        "isDraft": True,
+        "headRefName": config.integration_branch,
+        "headRefOid": new_sha,
+        "baseRefName": config.main_branch,
+    }
+    reviews: list[int | None] = []
+    checks: list[str] = []
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "switch_to_integration", lambda _config: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "integration_prs", lambda *_args: [pr])
+    monkeypatch.setattr(SAMPLE_MODULE, "ensure_draft_integration_pr", lambda *_args: pr)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "require_integration_head",
+        lambda *_args: (new_sha, pr),
+    )
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "run_turn",
+        lambda *_args, iteration=None, **_kwargs: (
+            reviews.append(iteration) or "APPROVED"
+        ),
+    )
+
+    def run_checks(_client: object, _config: object, state: object, name: str) -> None:
+        checks.append(name)
+        state.phase = "integration_checks_done"
+
+    def mutate(args: list[str], _config: object) -> str:
+        if args[:3] == ["gh", "pr", "ready"]:
+            pr["isDraft"] = False
+        return ""
+
+    monkeypatch.setattr(SAMPLE_MODULE, "run_checks_in_purplemux", run_checks)
+    monkeypatch.setattr(SAMPLE_MODULE, "mutate", mutate)
+    monkeypatch.setattr(SAMPLE_MODULE, "close_tabs", lambda *_args: None)
+
+    ready = SAMPLE_MODULE.integration_review(config, object(), recovery)
+
+    assert reviews == [1]
+    assert checks == ["final whole-version checks"]
+    assert ready["isDraft"] is False
+    assert recovery.phase == "integration_ready"
+
+
 def test_dirty_integration_resume_on_wrong_branch_stops_before_switch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,6 +363,8 @@ def test_ready_integration_pr_with_changed_head_is_returned_to_draft(
     assert mutations == [
         ["gh", "pr", "ready", "10", "--undo", "--repo", "OWNER/REPOSITORY"]
     ]
+    assert recovery.phase == "integration_fix_done"
+    assert recovery.approved_sha is None
 
 
 @pytest.mark.parametrize(
@@ -275,7 +399,7 @@ def test_existing_issue_branch_must_contain_latest_integration_tip(
 
     def reject_ancestry(ancestor: str, descendant: str, _config: object) -> None:
         assert ancestor == "origin/dev/v1.2.3"
-        assert descendant == existing_ref
+        assert descendant == "HEAD"
         raise purplemux_client.WorkerFailure("not based on latest integration")
 
     monkeypatch.setattr(SAMPLE_MODULE, "require_ancestor", reject_ancestry)
@@ -283,6 +407,53 @@ def test_existing_issue_branch_must_contain_latest_integration_tip(
     with pytest.raises(purplemux_client.WorkerFailure, match="not based"):
         SAMPLE_MODULE.prepare_issue_branch(config.issues[0], config)
     assert other_ref != existing_ref
+
+
+@pytest.mark.parametrize(
+    "local_behind", [True, False], ids=("local-behind", "remote-behind")
+)
+def test_existing_issue_branch_reconciles_before_ancestry_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local_behind: bool
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    local_sha = "a" * 40
+    remote_sha = "b" * 40
+    merge_base = local_sha if local_behind else remote_sha
+    events: list[tuple[str, ...]] = []
+    monkeypatch.setattr(SAMPLE_MODULE, "switch_to_integration", lambda _config: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "branch_exists", lambda *_args: True)
+
+    def mutate(args: list[str], _config: object) -> str:
+        events.append(tuple(args))
+        return ""
+
+    def read_text(args: list[str], _config: object) -> str:
+        if args[:3] == ["git", "merge-base", "HEAD"]:
+            return merge_base
+        if args[-1] == "HEAD":
+            return local_sha
+        return remote_sha
+
+    def require_ancestor(ancestor: str, descendant: str, _config: object) -> None:
+        events.append(("ancestry", ancestor, descendant))
+
+    monkeypatch.setattr(SAMPLE_MODULE, "mutate", mutate)
+    monkeypatch.setattr(SAMPLE_MODULE, "read_text", read_text)
+    monkeypatch.setattr(SAMPLE_MODULE, "require_ancestor", require_ancestor)
+
+    SAMPLE_MODULE.prepare_issue_branch(config.issues[0], config)
+
+    ancestry_event = ("ancestry", "origin/dev/v1.2.3", "HEAD")
+    assert events[-1] == ancestry_event
+    merge_command = ("git", "merge", "--ff-only", "refs/remotes/origin/feature/issue-1")
+    assert (merge_command in events) is local_behind
 
 
 def test_git_ancestry_rejects_stale_or_unrelated_branch(

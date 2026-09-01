@@ -485,10 +485,6 @@ def prepare_issue_branch(issue: Issue, config: Config) -> None:
     remote_ref = f"refs/remotes/origin/{issue.branch}"
     integration_ref = f"origin/{config.integration_branch}"
     if branch_exists(local_ref, config):
-        require_ancestor(integration_ref, local_ref, config)
-    if branch_exists(remote_ref, config):
-        require_ancestor(integration_ref, remote_ref, config)
-    if branch_exists(local_ref, config):
         mutate(["git", "switch", issue.branch], config)
         if branch_exists(remote_ref, config):
             # Fast-forward only. Local commits are preserved for an implementer to
@@ -513,6 +509,9 @@ def prepare_issue_branch(issue: Issue, config: Config) -> None:
             ],
             config,
         )
+    # Check the reconciled checkout. A local branch may safely fast-forward to a
+    # valid remote, and a remote may safely lag valid local commits.
+    require_ancestor(integration_ref, "HEAD", config)
 
 
 def require_branch_pushed(branch: str, config: Config) -> str:
@@ -629,6 +628,22 @@ def require_approved_head(actual_sha: str, recovery: Recovery, stage: str) -> No
             f"{stage} head changed after approval: approved "
             f"{recovery.approved_sha}, current {actual_sha}; run a new review"
         )
+
+
+def reopen_review_if_approval_drifted(
+    actual_sha: str,
+    recovery: Recovery,
+    reviewable_phase: str,
+    config: Config,
+) -> bool:
+    if recovery.approved_sha == actual_sha:
+        return False
+    recovery.approved_sha = None
+    # The reviewed subject changed, so start a new bounded loop for the new head.
+    recovery.reviews_used = 0
+    recovery.phase = reviewable_phase
+    recovery.checkpoint(config)
+    return True
 
 
 def merge_issue_pr(issue: Issue, config: Config, recovery: Recovery) -> dict[str, Any]:
@@ -803,6 +818,11 @@ def process_issue(
         recovery.checkpoint(config)
 
     approved = recovery.phase == "issue_approved"
+    if approved:
+        current_sha, _ = require_issue_head(issue, config)
+        approved = not reopen_review_if_approval_drifted(
+            current_sha, recovery, "issue_fix_done", config
+        )
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
         reviewed_sha, _ = require_issue_head(issue, config)
@@ -919,6 +939,9 @@ def restore_draft_if_ready_head_is_unapproved(
             ["gh", "pr", "ready", str(pr["number"]), "--undo", "--repo", config.slug],
             config,
         )
+    reopen_review_if_approval_drifted(
+        str(pr.get("headRefOid")), recovery, "integration_fix_done", config
+    )
     raise WorkerFailure(
         "integration PR head changed after approval; Draft status was restored and "
         "a new whole-version review is required"
@@ -1104,6 +1127,11 @@ when no blocking actionable findings remain. Otherwise return exactly
 CHANGES_REQUESTED, followed by concrete findings."""
 
     approved = recovery.phase in {"integration_approved", "integration_checks_done"}
+    if approved:
+        current_sha, _ = require_integration_head(int(pr["number"]), config)
+        approved = not reopen_review_if_approval_drifted(
+            current_sha, recovery, "integration_fix_done", config
+        )
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
         reviewed_sha, _ = require_integration_head(int(pr["number"]), config)
