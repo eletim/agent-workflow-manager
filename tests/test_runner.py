@@ -262,6 +262,53 @@ def test_stopping_one_run_does_not_affect_another(runner: PythonRunner) -> None:
     assert runner.stop(second_id) is True
 
 
+def test_concurrent_targeted_stops_have_independent_grace_periods() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    stubborn_code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    try:
+        run_ids = [runner.start(stubborn_code) for _ in range(2)]
+        for run_id in run_ids:
+            wait_for(
+                runner,
+                lambda snapshot: snapshot.stdout == "READY\n",
+                run_id=run_id,
+            )
+
+        stop_results: list[bool] = []
+        stop_threads = [
+            threading.Thread(
+                target=lambda target=run_id: stop_results.append(runner.stop(target))
+            )
+            for run_id in run_ids
+        ]
+        started = time.monotonic()
+        for thread in stop_threads:
+            thread.start()
+        for thread in stop_threads:
+            thread.join(timeout=2)
+        elapsed = time.monotonic() - started
+
+        assert all(not thread.is_alive() for thread in stop_threads)
+        assert stop_results == [True, True]
+        assert elapsed < 0.85
+        for run_id in run_ids:
+            assert (
+                wait_for(
+                    runner,
+                    lambda snapshot: snapshot.state != "running",
+                    run_id=run_id,
+                ).state
+                == "stopped"
+            )
+    finally:
+        runner.close()
+
+
 def test_validation_does_not_overwrite_an_active_run(runner: PythonRunner) -> None:
     run_id = runner.start("import time; time.sleep(60)")
 
@@ -363,6 +410,34 @@ def test_close_stops_process_group() -> None:
     while time.monotonic() < deadline and _process_is_live(child_pid):
         time.sleep(0.05)
     assert not _process_is_live(child_pid)
+
+
+def test_close_cleans_up_stubborn_runs_with_one_bounded_grace_period() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    stubborn_code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    run_ids = [runner.start(stubborn_code) for _ in range(3)]
+    for run_id in run_ids:
+        wait_for(
+            runner,
+            lambda snapshot: snapshot.stdout == "READY\n",
+            run_id=run_id,
+        )
+
+    started = time.monotonic()
+    runner.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.85
+    assert [runner.snapshot(run_id).state for run_id in run_ids] == [
+        "stopped",
+        "stopped",
+        "stopped",
+    ]
 
 
 def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:

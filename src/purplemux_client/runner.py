@@ -127,6 +127,7 @@ class _RunRecord:
     exit_code: int | None = None
     stop_requested: bool = False
     progress: deque[ProgressEvent] = field(default_factory=deque)
+    cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class PythonRunner:
@@ -152,7 +153,6 @@ class PythonRunner:
         self._max_progress_events = max_progress_events
         self._lock = threading.Lock()
         self._validation_lock = threading.Lock()
-        self._group_cleanup_lock = threading.Lock()
         self._runs: dict[int, _RunRecord] = {}
         self._next_run_id = 1
         self._notifier = notifier
@@ -406,9 +406,8 @@ class PythonRunner:
             if run.state != "running":
                 return False
             run.stop_requested = True
-            process_group_id = run.process_group_id
 
-        self._terminate_process_group(process_group_id)
+        self._terminate_process_group(run)
         return True
 
     def close(self) -> None:
@@ -420,8 +419,19 @@ class PythonRunner:
             for run in active_runs:
                 run.stop_requested = True
         self._validator.close()
-        for run in active_runs:
-            self._terminate_process_group(run.process_group_id)
+        cleanup_threads = tuple(
+            threading.Thread(
+                target=self._terminate_process_group,
+                args=(run,),
+                name=f"python-runner-cleanup-{run.run_id}",
+                daemon=True,
+            )
+            for run in active_runs
+        )
+        for thread in cleanup_threads:
+            thread.start()
+        for thread in cleanup_threads:
+            thread.join()
         for run in active_runs:
             try:
                 run.process.wait(timeout=self._stop_timeout + 1)
@@ -565,7 +575,7 @@ class PythonRunner:
     ) -> None:
         try:
             exit_code = process.wait()
-            self._terminate_process_group(process.pid)
+            self._terminate_process_group(run)
             stdout_thread.join()
             stderr_thread.join()
             progress_thread.join()
@@ -624,8 +634,9 @@ class PythonRunner:
                 result.diagnostic,
             )
 
-    def _terminate_process_group(self, process_group_id: int) -> None:
-        with self._group_cleanup_lock:
+    def _terminate_process_group(self, run: _RunRecord) -> None:
+        process_group_id = run.process_group_id
+        with run.cleanup_lock:
             if not self._process_group_exists(process_group_id):
                 return
             try:
