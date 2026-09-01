@@ -153,6 +153,9 @@ function renderRun(result) {
 }
 
 async function enterDraftMode() {
+  // Already drafting: the fields are already the live draft, so restoring
+  // `draft` here would silently discard whatever the user is mid-typing.
+  if (activeRunId === null) return;
   // Only the draft/editable fields and the run-scoped controls change here;
   // the output/progress/recovery panels are left showing whatever was last
   // viewed (harmless reference) until a run is selected or started again.
@@ -379,6 +382,10 @@ async function refresh() {
     const {runs} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
     if (activeRunId === null && !explicitNewRun && runs.length > 0) {
+      // A run just appeared (e.g. discovered via SSE) while the fields held
+      // in-progress draft edits nobody submitted yet; retain them before
+      // auto-selecting, exactly as an explicit run-list click would.
+      captureDraftIfEditing();
       activeRunId = runs[runs.length - 1].runId;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;

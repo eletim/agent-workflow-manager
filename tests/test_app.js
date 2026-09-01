@@ -1080,3 +1080,55 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
 });
+
+test("New run is a no-op while already drafting and never discards in-progress edits", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  elements["working-directory"].value = "/tmp/still-typing";
+  elements["run-arguments"].value = "still-typing-arg";
+  elements.code.value = "print('still typing')";
+
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["working-directory"].value, "/tmp/still-typing");
+  assert.equal(elements["run-arguments"].value, "still-typing-arg");
+  assert.equal(elements.code.value, "print('still typing')");
+});
+
+test("a run auto-selected via SSE while drafting captures in-progress edits first", async () => {
+  const runs = [];
+  const details = {};
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  // No runs exist yet, so the fields hold an untouched draft nobody submitted.
+  elements["working-directory"].value = "/tmp/in-progress-draft";
+  elements["run-arguments"].value = "in-progress-arg";
+  elements.code.value = "print('in progress')";
+
+  // Another session starts a run concurrently; this client only learns about
+  // it through the next SSE-triggered refresh, not through any explicit
+  // action of its own.
+  runs.push({runId: 9, state: "running", cwd: "/work/run-9"});
+  details[9] = snapshot({
+    runId: 9, state: "running", stdout: "elsewhere",
+    cwd: "/work/run-9", args: ["x"], code: "print('elsewhere')",
+  });
+  eventSource.emit("runner-change");
+  await waitFor(() => selectedRun(elements) !== undefined);
+
+  assert.equal(elements["working-directory"].value, "/work/run-9");
+
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["working-directory"].value, "/tmp/in-progress-draft");
+  assert.equal(elements["run-arguments"].value, "in-progress-arg");
+  assert.equal(elements.code.value, "print('in progress')");
+});
