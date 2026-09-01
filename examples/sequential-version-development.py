@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -90,6 +91,7 @@ class Recovery:
     implementer: str | None = None
     reviewer: str | None = None
     reviews_used: int = 0
+    approved_sha: str | None = None
 
     def checkpoint(self, config: Config) -> None:
         data = {
@@ -104,6 +106,8 @@ class Recovery:
             data["implementer"] = self.implementer
         if self.reviewer is not None:
             data["reviewer"] = self.reviewer
+        if self.approved_sha is not None:
+            data["approved_sha"] = self.approved_sha
         save_checkpoint(self.phase, data)
 
 
@@ -211,6 +215,49 @@ def worktree_is_dirty(config: Config) -> bool:
     return bool(read_text(["git", "status", "--porcelain"], config))
 
 
+def github_origin_slug(origin: str) -> str:
+    path: str
+    if origin.startswith("git@github.com:"):
+        path = origin.removeprefix("git@github.com:")
+    else:
+        try:
+            parsed = urlsplit(origin)
+            if parsed.scheme == "https":
+                valid = (
+                    parsed.hostname == "github.com"
+                    and parsed.username is None
+                    and parsed.password is None
+                    and parsed.port is None
+                )
+            elif parsed.scheme == "ssh":
+                valid = (
+                    parsed.hostname == "github.com"
+                    and parsed.username == "git"
+                    and parsed.password is None
+                    and parsed.port is None
+                )
+            else:
+                valid = False
+        except ValueError as exc:
+            raise WorkerFailure(f"invalid origin URL: {origin!r}") from exc
+        if not valid or parsed.query or parsed.fragment:
+            raise WorkerFailure(f"unsupported or non-GitHub origin URL: {origin!r}")
+        path = parsed.path.removeprefix("/")
+    path = path.removesuffix(".git")
+    parts = path.split("/")
+    if (
+        len(parts) != 2
+        or any(not part for part in parts)
+        or any(
+            not part.isascii()
+            or not all(character.isalnum() or character in "-_." for character in part)
+            for part in parts
+        )
+    ):
+        raise WorkerFailure(f"origin has an invalid GitHub repository path: {origin!r}")
+    return "/".join(parts)
+
+
 def validate_repository(config: Config, checkpoint: ResumeCheckpoint | None) -> None:
     if not config.repo.is_dir():
         raise WorkerFailure(f"repository directory does not exist: {config.repo}")
@@ -227,8 +274,7 @@ def validate_repository(config: Config, checkpoint: ResumeCheckpoint | None) -> 
             "worktree must be clean unless resuming an active Issue/integration stage"
         )
     origin = read_text(["git", "remote", "get-url", "origin"], config)
-    normalized = origin.removesuffix(".git").replace("git@github.com:", "github.com/")
-    if not normalized.endswith(f"github.com/{config.slug}"):
+    if github_origin_slug(origin).lower() != config.slug.lower():
         raise WorkerFailure(
             f"origin {origin!r} does not match configured repository {config.slug!r}"
         )
@@ -308,6 +354,7 @@ def load_recovery(config: Config, checkpoint: ResumeCheckpoint | None) -> Recove
             implementer=data.get("implementer"),
             reviewer=data.get("reviewer"),
             reviews_used=reviews_used,
+            approved_sha=data.get("approved_sha"),
         )
     except (KeyError, ValueError) as exc:
         raise WorkerFailure("checkpoint is incomplete or malformed") from exc
@@ -328,6 +375,47 @@ def branch_exists(ref: str, config: Config) -> bool:
     if completed.returncode not in (0, 1):
         raise WorkerFailure(f"could not inspect Git ref {ref}")
     return completed.returncode == 0
+
+
+def require_ancestor(ancestor: str, descendant: str, config: Config) -> None:
+    try:
+        completed = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=config.repo,
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkerFailure("Git ancestry check timed out") from exc
+    except OSError as exc:
+        raise WorkerFailure(f"could not inspect Git ancestry: {exc}") from exc
+    if completed.returncode == 1:
+        raise WorkerFailure(
+            f"{descendant} is not based on the latest {ancestor}; reconcile the "
+            "branch explicitly without resetting or force-pushing"
+        )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "no stderr"
+        raise WorkerFailure(f"could not inspect Git ancestry: {detail}")
+
+
+def preserve_dirty_resume_branch(
+    expected_branch: str, stage: str, config: Config
+) -> bool:
+    if not worktree_is_dirty(config):
+        return False
+    current_branch = read_text(["git", "branch", "--show-current"], config)
+    if current_branch != expected_branch:
+        raise WorkerFailure(
+            f"resumed {stage} work is on {current_branch!r}, expected "
+            f"{expected_branch!r}; reconcile it without resetting"
+        )
+    # Preserve the partial tree exactly. Refresh remote state, but do not switch or
+    # merge because either operation could move edits onto a different commit.
+    mutate(["git", "fetch", "origin"], config)
+    return True
 
 
 def switch_to_integration(config: Config) -> None:
@@ -395,6 +483,11 @@ def prepare_issue_branch(issue: Issue, config: Config) -> None:
     mutate(["git", "fetch", "origin"], config)
     local_ref = f"refs/heads/{issue.branch}"
     remote_ref = f"refs/remotes/origin/{issue.branch}"
+    integration_ref = f"origin/{config.integration_branch}"
+    if branch_exists(local_ref, config):
+        require_ancestor(integration_ref, local_ref, config)
+    if branch_exists(remote_ref, config):
+        require_ancestor(integration_ref, remote_ref, config)
     if branch_exists(local_ref, config):
         mutate(["git", "switch", issue.branch], config)
         if branch_exists(remote_ref, config):
@@ -422,7 +515,7 @@ def prepare_issue_branch(issue: Issue, config: Config) -> None:
         )
 
 
-def require_branch_pushed(branch: str, config: Config) -> None:
+def require_branch_pushed(branch: str, config: Config) -> str:
     if worktree_is_dirty(config):
         raise WorkerFailure(f"{branch} has uncommitted work after an agent turn")
     current = read_text(["git", "branch", "--show-current"], config)
@@ -435,6 +528,7 @@ def require_branch_pushed(branch: str, config: Config) -> None:
     remote_sha = read_text(["git", "rev-parse", f"origin/{branch}"], config)
     if local_sha != remote_sha:
         raise WorkerFailure(f"{branch} is not fully pushed to origin")
+    return local_sha
 
 
 def issue_url(issue: Issue, config: Config) -> str:
@@ -516,14 +610,38 @@ def require_open_issue_pr(issue: Issue, config: Config) -> dict[str, Any]:
     return pr
 
 
-def merge_issue_pr(issue: Issue, config: Config) -> dict[str, Any]:
+def require_issue_head(issue: Issue, config: Config) -> tuple[str, dict[str, Any]]:
+    branch_sha = require_branch_pushed(issue.branch, config)
+    pr = require_open_issue_pr(issue, config)
+    if pr["headRefOid"] != branch_sha:
+        raise WorkerFailure(
+            f"Issue #{issue.number} local/origin head {branch_sha} does not match "
+            f"PR head {pr['headRefOid']}"
+        )
+    return branch_sha, pr
+
+
+def require_approved_head(actual_sha: str, recovery: Recovery, stage: str) -> None:
+    if recovery.approved_sha is None:
+        raise WorkerFailure(f"{stage} checkpoint has no approved commit SHA")
+    if actual_sha != recovery.approved_sha:
+        raise WorkerFailure(
+            f"{stage} head changed after approval: approved "
+            f"{recovery.approved_sha}, current {actual_sha}; run a new review"
+        )
+
+
+def merge_issue_pr(issue: Issue, config: Config, recovery: Recovery) -> dict[str, Any]:
     already_merged = merged_issue_pr(issue, config)
     if already_merged is not None:
+        require_approved_head(str(already_merged["headRefOid"]), recovery, "Issue PR")
         return already_merged
-    pr = require_open_issue_pr(issue, config)
+    approved_sha, pr = require_issue_head(issue, config)
+    require_approved_head(approved_sha, recovery, "Issue PR")
     if pr.get("isDraft"):
         mutate(["gh", "pr", "ready", str(pr["number"]), "--repo", config.slug], config)
-        pr = require_open_issue_pr(issue, config)
+        current_sha, pr = require_issue_head(issue, config)
+        require_approved_head(current_sha, recovery, "Issue PR")
     mutate(
         [
             "gh",
@@ -543,6 +661,7 @@ def merge_issue_pr(issue: Issue, config: Config) -> dict[str, Any]:
         raise MutationOutcomeUnknown(
             f"PR #{pr['number']} merge returned but merged state is not visible"
         )
+    require_approved_head(str(merged["headRefOid"]), recovery, "merged Issue PR")
     return merged
 
 
@@ -607,6 +726,9 @@ def process_issue(
         if recovery.issue_number == issue.number and recovery.phase.startswith(
             "issue_"
         ):
+            require_approved_head(
+                str(merged_before_start["headRefOid"]), recovery, "merged Issue PR"
+            )
             retained = [
                 tab
                 for tab in (recovery.implementer, recovery.reviewer)
@@ -618,6 +740,7 @@ def process_issue(
             recovery.implementer = None
             recovery.reviewer = None
             recovery.reviews_used = 0
+            recovery.approved_sha = None
             recovery.checkpoint(config)
         print(
             f"Skipping already-merged Issue #{issue.number} PR: "
@@ -628,16 +751,11 @@ def process_issue(
     resumed_here = recovery.issue_number == issue.number and recovery.phase.startswith(
         "issue_"
     )
-    if resumed_here and worktree_is_dirty(config):
-        current_branch = read_text(["git", "branch", "--show-current"], config)
-        if current_branch != issue.branch:
-            raise WorkerFailure(
-                f"resumed partial work is on {current_branch!r}, expected "
-                f"{issue.branch!r}; reconcile it without resetting"
-            )
-        # Preserve the partial tree exactly. Read-only remote state is refreshed,
-        # but no switch/merge can carry edits onto a different branch.
-        mutate(["git", "fetch", "origin"], config)
+    preserved_dirty_issue = resumed_here and preserve_dirty_resume_branch(
+        issue.branch, "Issue", config
+    )
+    if preserved_dirty_issue:
+        require_ancestor(f"origin/{config.integration_branch}", "HEAD", config)
     else:
         prepare_issue_branch(issue, config)
     if not resumed_here:
@@ -646,6 +764,7 @@ def process_issue(
         recovery.implementer = None
         recovery.reviewer = None
         recovery.reviews_used = 0
+        recovery.approved_sha = None
         recovery.checkpoint(config)
         recovery.implementer = create_agent(client, config)
         recovery.phase = "issue_implementer_ready"
@@ -680,21 +799,30 @@ def process_issue(
         require_branch_pushed(issue.branch, config)
         require_open_issue_pr(issue, config)
         recovery.phase = "issue_implementation_done"
+        recovery.approved_sha = None
         recovery.checkpoint(config)
 
     approved = recovery.phase == "issue_approved"
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
+        reviewed_sha, _ = require_issue_head(issue, config)
         result = run_turn(
             client,
             recovery.reviewer,
             f"Issue #{issue.number} review",
-            review_prompt,
+            f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
             iteration=review_number,
         )
+        current_sha, _ = require_issue_head(issue, config)
+        if current_sha != reviewed_sha:
+            raise WorkerFailure(
+                f"Issue #{issue.number} head changed during review; discard this "
+                "verdict and run a new review"
+            )
         if decision(result) == "APPROVED":
             recovery.reviews_used = review_number
             recovery.phase = "issue_approved"
+            recovery.approved_sha = reviewed_sha
             recovery.checkpoint(config)
             approved = True
             break
@@ -717,11 +845,14 @@ REVIEW RESULT:
         require_open_issue_pr(issue, config)
         recovery.reviews_used = review_number
         recovery.phase = "issue_fix_done"
+        recovery.approved_sha = None
         recovery.checkpoint(config)
 
     if not approved:
         raise WorkerFailure(f"Issue #{issue.number} ended without approval")
-    merged = merge_issue_pr(issue, config)
+    approved_sha, _ = require_issue_head(issue, config)
+    require_approved_head(approved_sha, recovery, "Issue PR")
+    merged = merge_issue_pr(issue, config, recovery)
     recovery.phase = "issue_merged"
     recovery.checkpoint(config)
     close_tabs(client, [recovery.implementer, recovery.reviewer])
@@ -731,6 +862,7 @@ REVIEW RESULT:
     recovery.implementer = None
     recovery.reviewer = None
     recovery.reviews_used = 0
+    recovery.approved_sha = None
     recovery.checkpoint(config)
 
 
@@ -748,13 +880,49 @@ def integration_prs(config: Config, state: str = "all") -> list[dict[str, Any]]:
             "--limit",
             "20",
             "--json",
-            "number,url,state,isDraft,headRefName,baseRefName",
+            "number,url,state,isDraft,headRefName,headRefOid,baseRefName",
         ],
         config,
     )
     if not isinstance(data, list):
         raise WorkerFailure("gh integration PR list returned an unexpected value")
     return data
+
+
+def require_integration_head(
+    pr_number: int, config: Config
+) -> tuple[str, dict[str, Any]]:
+    branch_sha = require_branch_pushed(config.integration_branch, config)
+    open_prs = [pr for pr in integration_prs(config) if pr.get("state") == "OPEN"]
+    if len(open_prs) != 1 or open_prs[0].get("number") != pr_number:
+        raise WorkerFailure("integration PR identity changed unexpectedly")
+    pr = open_prs[0]
+    if pr.get("headRefName") != config.integration_branch:
+        raise WorkerFailure("integration PR head branch changed unexpectedly")
+    if pr.get("baseRefName") != config.main_branch:
+        raise WorkerFailure("integration PR base changed unexpectedly")
+    if pr.get("headRefOid") != branch_sha:
+        raise WorkerFailure(
+            f"integration local/origin head {branch_sha} does not match "
+            f"PR head {pr.get('headRefOid')}"
+        )
+    return branch_sha, pr
+
+
+def restore_draft_if_ready_head_is_unapproved(
+    pr: dict[str, Any], recovery: Recovery, config: Config
+) -> None:
+    if pr.get("headRefOid") == recovery.approved_sha:
+        return
+    if not pr.get("isDraft"):
+        mutate(
+            ["gh", "pr", "ready", str(pr["number"]), "--undo", "--repo", config.slug],
+            config,
+        )
+    raise WorkerFailure(
+        "integration PR head changed after approval; Draft status was restored and "
+        "a new whole-version review is required"
+    )
 
 
 def ensure_draft_integration_pr(config: Config) -> dict[str, Any]:
@@ -844,7 +1012,14 @@ def integration_review(
     client: PurpleMuxCLIClient,
     recovery: Recovery,
 ) -> dict[str, Any]:
-    switch_to_integration(config)
+    resumed_here = recovery.phase.startswith("integration_")
+    preserved_dirty_integration = resumed_here and preserve_dirty_resume_branch(
+        config.integration_branch, "integration", config
+    )
+    if preserved_dirty_integration:
+        require_ancestor(f"origin/{config.integration_branch}", "HEAD", config)
+    else:
+        switch_to_integration(config)
     open_before_start = [
         item for item in integration_prs(config) if item.get("state") == "OPEN"
     ]
@@ -858,26 +1033,37 @@ def integration_review(
                 "integration PR became Ready before whole-version approval; restore "
                 "Draft status manually before resuming"
             )
+        restore_draft_if_ready_head_is_unapproved(
+            open_before_start[0], recovery, config
+        )
+        current_sha, current_pr = require_integration_head(
+            int(open_before_start[0]["number"]), config
+        )
+        require_approved_head(current_sha, recovery, "integration PR")
         if recovery.phase == "integration_approved":
             # Re-running checks is safe if Ready succeeded but its response was lost.
             run_checks_in_purplemux(
                 client, config, recovery, "final whole-version checks"
             )
+            checked_sha, current_pr = require_integration_head(
+                int(open_before_start[0]["number"]), config
+            )
+            require_approved_head(checked_sha, recovery, "integration PR")
             recovery.phase = "integration_ready"
             recovery.checkpoint(config)
         retained = [
             tab for tab in (recovery.implementer, recovery.reviewer) if tab is not None
         ]
         close_tabs(client, retained)
-        return open_before_start[0]
+        return current_pr
     pr = ensure_draft_integration_pr(config)
-    resumed_here = recovery.phase.startswith("integration_")
     if not resumed_here:
         recovery.phase = "integration_fixer_create_pending"
         recovery.issue_number = None
         recovery.implementer = None
         recovery.reviewer = None
         recovery.reviews_used = 0
+        recovery.approved_sha = None
         recovery.checkpoint(config)
         recovery.implementer = create_agent(client, config)
         recovery.phase = "integration_fixer_ready"
@@ -920,16 +1106,24 @@ CHANGES_REQUESTED, followed by concrete findings."""
     approved = recovery.phase in {"integration_approved", "integration_checks_done"}
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
+        reviewed_sha, _ = require_integration_head(int(pr["number"]), config)
         result = run_turn(
             client,
             recovery.reviewer,
             "whole-version integration review",
-            review_prompt,
+            f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
             iteration=review_number,
         )
+        current_sha, _ = require_integration_head(int(pr["number"]), config)
+        if current_sha != reviewed_sha:
+            raise WorkerFailure(
+                "integration head changed during review; discard this verdict and "
+                "run a new review"
+            )
         if decision(result) == "APPROVED":
             recovery.reviews_used = review_number
             recovery.phase = "integration_approved"
+            recovery.approved_sha = reviewed_sha
             recovery.checkpoint(config)
             approved = True
             break
@@ -955,21 +1149,30 @@ INTEGRATION REVIEW RESULT:
         require_branch_pushed(config.integration_branch, config)
         recovery.reviews_used = review_number
         recovery.phase = "integration_fix_done"
+        recovery.approved_sha = None
         recovery.checkpoint(config)
 
     if not approved:
         raise WorkerFailure("whole-version integration review ended without approval")
+    approved_sha, _ = require_integration_head(int(pr["number"]), config)
+    require_approved_head(approved_sha, recovery, "integration PR")
     if recovery.phase != "integration_checks_done":
         run_checks_in_purplemux(client, config, recovery, "final whole-version checks")
-    current = [item for item in integration_prs(config) if item.get("state") == "OPEN"]
-    if len(current) != 1 or current[0].get("number") != pr.get("number"):
-        raise WorkerFailure("integration PR identity changed before Ready transition")
-    if current[0].get("baseRefName") != config.main_branch:
-        raise WorkerFailure("integration PR base changed unexpectedly")
-    if current[0].get("isDraft"):
+    checked_sha, current_pr = require_integration_head(int(pr["number"]), config)
+    require_approved_head(checked_sha, recovery, "integration PR")
+    if current_pr.get("isDraft"):
         mutate(["gh", "pr", "ready", str(pr["number"]), "--repo", config.slug], config)
-    ready = [item for item in integration_prs(config) if item.get("state") == "OPEN"]
-    if len(ready) != 1 or ready[0].get("isDraft"):
+    ready_candidates = [
+        item for item in integration_prs(config) if item.get("state") == "OPEN"
+    ]
+    if len(ready_candidates) != 1 or ready_candidates[0].get("number") != pr.get(
+        "number"
+    ):
+        raise MutationOutcomeUnknown("integration PR Ready transition is unconfirmed")
+    restore_draft_if_ready_head_is_unapproved(ready_candidates[0], recovery, config)
+    ready_sha, ready_pr = require_integration_head(int(pr["number"]), config)
+    require_approved_head(ready_sha, recovery, "integration PR")
+    if ready_pr.get("isDraft"):
         raise MutationOutcomeUnknown("integration PR Ready transition is unconfirmed")
 
     # Deliberate terminal state: Ready for human review. There is no command or
@@ -977,7 +1180,7 @@ INTEGRATION REVIEW RESULT:
     recovery.phase = "integration_ready"
     recovery.checkpoint(config)
     close_tabs(client, [recovery.implementer, recovery.reviewer])
-    return ready[0]
+    return ready_pr
 
 
 def diagnose(client: PurpleMuxCLIClient, recovery: Recovery) -> None:
