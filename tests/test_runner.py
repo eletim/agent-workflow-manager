@@ -1277,6 +1277,24 @@ def test_runner_page_exposes_execution_context_inputs(
     assert 'id="run-list"' in page
 
 
+def test_runner_page_exposes_agent_workflow_manager_favicon(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    documents = {}
+    for path in ["/", "/favicon.svg"]:
+        connection = http.client.HTTPConnection(*address, timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        documents[path] = (response.getheader("Content-Type"), response.read().decode())
+        connection.close()
+        assert response.status == 200
+
+    assert '<link id="favicon" rel="icon" href="/favicon.svg"' in documents["/"][1]
+    assert documents["/favicon.svg"][0] == "image/svg+xml"
+    assert documents["/favicon.svg"][1].startswith("<svg ")
+
+
 def test_runner_page_exposes_copy_actions_and_shared_helper(
     web_server: tuple[tuple[str, int], str],
 ) -> None:
