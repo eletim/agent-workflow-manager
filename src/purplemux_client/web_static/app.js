@@ -1,5 +1,6 @@
 const code = document.querySelector("#code");
 const runButton = document.querySelector("#run");
+const validateButton = document.querySelector("#validate");
 const stopButton = document.querySelector("#stop");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
@@ -8,6 +9,8 @@ const outputCopy = document.querySelector("#output-copy");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
+const validationPanel = document.querySelector("#validation-panel");
+const validation = document.querySelector("#validation");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -39,8 +42,10 @@ function render(result) {
   stderr.textContent = result.stderr;
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   runButton.disabled = running;
+  validateButton.disabled = running;
   stopButton.disabled = !running;
   renderProgress(result.progress || []);
+  renderValidation(result.validation || []);
 
   if (running) {
     stdout.scrollTop = stdout.scrollHeight;
@@ -49,6 +54,19 @@ function render(result) {
   } else if (timer !== null) {
     window.clearInterval(timer);
     timer = null;
+  }
+}
+
+function renderValidation(issues) {
+  validation.replaceChildren();
+  validationPanel.hidden = issues.length === 0;
+  for (const issue of issues) {
+    const item = document.createElement("li");
+    const location = issue.line == null
+      ? ""
+      : `Line ${issue.line}${issue.column == null ? "" : `:${issue.column}`}: `;
+    item.textContent = `${location}${issue.message}`;
+    validation.append(item);
   }
 }
 
@@ -155,7 +173,11 @@ async function request(path, options = {}) {
   }
   const response = await fetch(path, options);
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(result.error || `HTTP ${response.status}`);
+    error.result = result;
+    throw error;
+  }
   return result;
 }
 
@@ -205,7 +227,21 @@ runButton.addEventListener("click", async () => {
       body: JSON.stringify({code: code.value}),
     }));
   } catch (error) {
+    if (error.result) render(error.result);
     stderr.textContent = String(error);
+  }
+});
+
+validateButton.addEventListener("click", async () => {
+  try {
+    render(await request("/api/validate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({code: code.value}),
+    }));
+  } catch (error) {
+    if (error.result) render(error.result);
+    else stderr.textContent = String(error);
   }
 });
 

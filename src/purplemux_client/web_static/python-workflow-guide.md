@@ -27,6 +27,28 @@ PurpleMux UI = runtime inspection and manual intervention
 - The current Python adapter creates Codex and Claude sessions only. Do not
   generate Shell/Bash sessions through `PurpleMuxCLIClient` as if supported.
 
+## Preflight requirements
+
+Run performs static validation before starting the workflow. Syntax, imports,
+literal `os.environ["NAME"]` requirements, and public `purplemux_client` imports
+are checked without importing or executing the script. Declare requirements
+known before expensive agent work with an optional literal module-level value:
+
+```python
+WORKFLOW_PREFLIGHT = {
+    "commands": ["git", "gh", "uv"],
+    "imports": ["project_package"],
+    "environment": ["GH_TOKEN"],
+    "paths": ["pyproject.toml", "/absolute/input/data.json"],
+}
+```
+
+All keys are optional lists of non-empty strings. Paths relative to the Runner
+process directory are supported. Keep these checks deterministic and
+side-effect-free; do not use metadata as a workflow DSL. Preflight is
+best-effort and cannot prove that dynamic code or later external operations will
+succeed.
+
 ## Installed Python API
 
 Import the public names from `purplemux_client`:

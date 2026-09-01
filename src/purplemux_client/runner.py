@@ -16,13 +16,20 @@ from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.notifier import NotificationResult, TerminalState
+from purplemux_client.preflight import (
+    ValidationIssue,
+    ValidationResult,
+    WorkflowValidator,
+)
 from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
     StepStatus,
 )
 
-RunnerState = Literal["idle", "running", "success", "failed", "stopped"]
+RunnerState = Literal[
+    "idle", "running", "success", "failed", "stopped", "validation_failed"
+]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,14 @@ class RunnerClosedError(AlreadyRunningError):
     """Raised when a run is requested after Runner shutdown begins."""
 
 
+class WorkflowValidationError(RuntimeError):
+    """Raised when workflow preflight fails before a process is started."""
+
+    def __init__(self, result: ValidationResult) -> None:
+        super().__init__("workflow validation failed")
+        self.result = result
+
+
 @dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
@@ -63,12 +78,14 @@ class RunnerSnapshot:
     exit_code: int | None
     run_id: int | None
     progress: tuple[ProgressEvent, ...]
+    validation: tuple[ValidationIssue, ...]
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
         payload["progress"] = [asdict(event) for event in self.progress]
+        payload["validation"] = [issue.as_json() for issue in self.validation]
         return payload
 
 
@@ -82,6 +99,7 @@ class PythonRunner:
         max_output_chars: int = 1_000_000,
         max_progress_events: int = DEFAULT_MAX_PROGRESS_EVENTS,
         notifier: TerminalNotifier | None = None,
+        validator: WorkflowValidator | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -111,13 +129,43 @@ class PythonRunner:
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
         self._progress: deque[ProgressEvent] = deque(maxlen=max_progress_events)
+        self._validation: tuple[ValidationIssue, ...] = ()
+        self._validator = validator or WorkflowValidator()
+
+    def validate(self, code: str) -> ValidationResult:
+        with self._lock:
+            self._ensure_available()
+            result = self._validator.validate(code)
+            self._validation = result.issues
+            self._state = "idle" if result.valid else "validation_failed"
+            self._stdout.clear()
+            self._stderr.clear()
+            self._stdout_chars = 0
+            self._stderr_chars = 0
+            self._stdout_truncated = False
+            self._stderr_truncated = False
+            self._exit_code = None
+            self._run_id = None
+            self._progress.clear()
+            return result
 
     def start(self, code: str) -> int:
         with self._lock:
-            if self._closed:
-                raise RunnerClosedError("the Python Runner is closed")
-            if self._process is not None:
-                raise AlreadyRunningError("a Python process is already running")
+            self._ensure_available()
+            validation = self._validator.validate(code)
+            self._validation = validation.issues
+            if not validation.valid:
+                self._state = "validation_failed"
+                self._stdout.clear()
+                self._stderr.clear()
+                self._stdout_chars = 0
+                self._stderr_chars = 0
+                self._stdout_truncated = False
+                self._stderr_truncated = False
+                self._exit_code = None
+                self._run_id = None
+                self._progress.clear()
+                raise WorkflowValidationError(validation)
 
             script = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -165,6 +213,7 @@ class PythonRunner:
             self._run_id = run_id
             self._stop_requested = False
             self._progress.clear()
+            self._validation = ()
 
             stdout_thread = threading.Thread(
                 target=self._read_stream,
@@ -212,7 +261,14 @@ class PythonRunner:
                 exit_code=self._exit_code,
                 run_id=self._run_id,
                 progress=tuple(self._progress),
+                validation=self._validation,
             )
+
+    def _ensure_available(self) -> None:
+        if self._closed:
+            raise RunnerClosedError("the Python Runner is closed")
+        if self._process is not None:
+            raise AlreadyRunningError("a Python process is already running")
 
     def stop(self) -> bool:
         with self._lock:
