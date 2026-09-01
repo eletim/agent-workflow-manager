@@ -19,6 +19,7 @@ const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
 const validationPanel = document.querySelector("#validation-panel");
+const validationSuccess = document.querySelector("#validation-success");
 const validation = document.querySelector("#validation");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
@@ -126,7 +127,11 @@ function updatePolling(runs) {
 
 function renderValidation(issues) {
   validation.replaceChildren();
-  validationPanel.hidden = issues.length === 0;
+  const valid = issues.length === 0;
+  validationPanel.hidden = false;
+  validationPanel.className = `panel validation-panel ${valid ? "valid" : "invalid"}`;
+  validationSuccess.hidden = !valid;
+  validation.hidden = valid;
   for (const issue of issues) {
     const item = document.createElement("li");
     const location = issue.line == null
@@ -491,7 +496,7 @@ async function initialize() {
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
   if (!workingDirectory.value) workingDirectory.value = initialStatus.cwd;
-  if (initialStatus.runId == null) {
+  if (initialStatus.state === "validation_failed") {
     renderValidation(initialStatus.validation || []);
   }
   renderRun(initialStatus);

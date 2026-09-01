@@ -121,7 +121,7 @@ async function loadApp({
     "runs-empty", "run", "resume", "validate", "stop", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
-    "validation", "guide-dialog", "guide-open", "guide-close", "guide-copy",
+    "validation-success", "validation", "guide-dialog", "guide-open", "guide-close", "guide-copy",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
@@ -129,6 +129,9 @@ async function loadApp({
     "save-settings", "test-notification",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
+  elements["validation-panel"].hidden = true;
+  elements["validation-success"].hidden = true;
+  elements["validation-success"].textContent = "✓ Valid";
   const calls = [];
   const document = {
     body: new Element(),
@@ -203,6 +206,51 @@ function selectedRun(elements) {
   );
 }
 
+test("successful validation is explicit when no run exists", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["validation-panel"].hidden, true);
+
+  await elements.validate.dispatch("click");
+
+  assert.equal(elements["validation-panel"].hidden, false);
+  assert.equal(elements["validation-success"].hidden, false);
+  assert.equal(elements["validation-success"].textContent, "✓ Valid");
+  assert.equal(elements.validation.hidden, true);
+  assert.equal(elements.validation.children.length, 0);
+});
+
+test("validation issues replace success feedback", async () => {
+  let validationCalls = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/validate") return undefined;
+      validationCalls += 1;
+      if (validationCalls === 1) return response({validation: []});
+      return response({
+        error: "workflow validation failed",
+        validation: [{line: 3, column: null, message: "fix this import"}],
+      }, 422);
+    },
+  });
+
+  await elements.validate.dispatch("click");
+  assert.equal(elements["validation-success"].hidden, false);
+
+  await elements.validate.dispatch("click");
+
+  assert.equal(elements["validation-success"].hidden, true);
+  assert.equal(elements.validation.hidden, false);
+  assert.equal(elements.validation.children[0].textContent, "Line 3: fix this import");
+});
+
 test("validation preserves a selected failed resumable run through refresh", async () => {
   const failed = snapshot({
     runId: 2,
@@ -264,13 +312,7 @@ test("validation preserves another selected running run through refresh", async 
       1: running,
       2: snapshot({runId: 2, state: "failed", stdout: "newer failed"}),
     },
-    validation: {
-      status: 422,
-      body: {
-        error: "workflow validation failed",
-        validation: [{line: null, column: null, message: "preview path missing"}],
-      },
-    },
+    validation: {status: 200, body: {validation: []}},
   });
 
   const runOne = elements["run-list"].children.find(
@@ -286,14 +328,16 @@ test("validation preserves another selected running run through refresh", async 
   assert.equal(elements.stdout.textContent, "live output");
   assert.equal(elements.stop.disabled, false);
   assert.equal(elements.resume.disabled, true);
-  assert.equal(elements.validation.children[0].textContent, "preview path missing");
+  assert.equal(elements["validation-success"].hidden, false);
+  assert.equal(elements["validation-success"].textContent, "✓ Valid");
 
   await selectedRun(elements).dispatch("click");
 
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements.stdout.textContent, "live output");
   assert.equal(elements.stop.disabled, false);
-  assert.equal(elements.validation.children[0].textContent, "preview path missing");
+  assert.equal(elements["validation-success"].hidden, false);
+  assert.equal(elements["validation-success"].textContent, "✓ Valid");
 });
 
 test("slow run response cannot replace a newly selected run", async () => {
@@ -392,17 +436,15 @@ test("slow validation response cannot replace a newer validation result", async 
       if (url !== "/api/validate") return undefined;
       validationCalls += 1;
       if (validationCalls === 1) return delayedValidation.promise;
-      return response({
-        error: "workflow validation failed",
-        validation: [{line: 8, column: null, message: "newer result"}],
-      }, 422);
+      return response({validation: []});
     },
   });
 
   const slowValidation = elements.validate.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
   await elements.validate.dispatch("click");
-  assert.equal(elements.validation.children[0].textContent, "Line 8: newer result");
+  assert.equal(elements["validation-success"].hidden, false);
+  assert.equal(elements["validation-success"].textContent, "✓ Valid");
 
   delayedValidation.resolve(response({
     error: "workflow validation failed",
@@ -410,8 +452,9 @@ test("slow validation response cannot replace a newer validation result", async 
   }, 422));
   await slowValidation;
 
-  assert.equal(elements.validation.children.length, 1);
-  assert.equal(elements.validation.children[0].textContent, "Line 8: newer result");
+  assert.equal(elements["validation-success"].hidden, false);
+  assert.equal(elements["validation-success"].textContent, "✓ Valid");
+  assert.equal(elements.validation.children.length, 0);
 });
 
 test("manual output copy preserves the payload attempted before a run switch", async () => {
