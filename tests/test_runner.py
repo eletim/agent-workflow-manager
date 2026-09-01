@@ -607,6 +607,46 @@ def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> N
             os.kill(child_pid, signal.SIGKILL)
 
 
+def test_stop_rejects_exited_main_with_detached_child_output() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    child_pid: int | None = None
+    try:
+        run_id = runner.start(
+            "import subprocess, sys\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "print(child.pid, flush=True)\n"
+        )
+        result = wait_for(
+            runner,
+            lambda snapshot: (
+                bool(snapshot.stdout.strip())
+                and runner._runs[run_id].process.poll() == 0
+            ),
+            run_id=run_id,
+        )
+        child_pid = int(result.stdout.strip())
+        assert result.state == "running"
+
+        started = time.monotonic()
+        assert runner.stop(run_id) is False
+        runner.close()
+        elapsed = time.monotonic() - started
+        result = runner.snapshot(run_id)
+
+        assert elapsed < 1.5
+        assert result.state == "success"
+        assert result.exit_code == 0
+        assert result.attempts[-1].state == "success"
+        assert _process_is_live(child_pid)
+    finally:
+        runner.close()
+        if child_pid is not None and _process_is_live(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
 def _process_is_live(pid: int) -> bool:
     try:
         output = subprocess.check_output(

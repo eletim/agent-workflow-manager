@@ -554,7 +554,7 @@ class PythonRunner:
                 run = self._runs[next(reversed(self._runs))]
             else:
                 run = self._get_run(run_id)
-            if run.state != "running":
+            if run.state != "running" or run.process.poll() is not None:
                 return False
             run.stop_requested = True
 
@@ -565,7 +565,9 @@ class PythonRunner:
         with self._lock:
             self._closed = True
             active_runs = tuple(
-                run for run in self._runs.values() if run.state == "running"
+                run
+                for run in self._runs.values()
+                if run.state == "running" and run.process.poll() is None
             )
             for run in active_runs:
                 run.stop_requested = True
