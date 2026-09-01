@@ -1202,8 +1202,9 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
     assert "writeText" in helper
     assert 'execCommand("copy")' in helper
     assert "runnerOutputClipboard.writeText" in script
-    assert 'guideCopy.textContent = "Copy failed"' in script
-    assert 'outputCopy.textContent = "Copy failed"' in script
+    assert 'guideCopy.textContent = "Copy manually"' in script
+    assert 'outputCopy.textContent = "Copy manually"' in script
+    assert 'id="manual-copy-dialog"' in index
 
 
 def test_copy_browser_logic() -> None:

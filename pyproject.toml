@@ -15,6 +15,7 @@ dependencies = []
 [dependency-groups]
 test = [
     "pytest",
+    "selenium",
 ]
 lint = [
     "ruff",

@@ -49,6 +49,14 @@ class Element {
     this.attributes[name] = value;
   }
 
+  focus() {}
+
+  select() {}
+
+  setSelectionRange(start, end) {
+    this.selection = [start, end];
+  }
+
   async dispatch(type) {
     const event = {preventDefault() {}};
     for (const listener of this.listeners.get(type) || []) {
@@ -101,14 +109,21 @@ function deferred() {
   return {promise, resolve};
 }
 
-async function loadApp({runs, details, validation, fetchOverride = null}) {
+async function loadApp({
+  runs,
+  details,
+  validation,
+  fetchOverride = null,
+  clipboardOverride = null,
+}) {
   const ids = [
     "code", "working-directory", "run-arguments", "active-context", "run-list",
     "runs-empty", "run", "resume", "validate", "stop", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
     "validation", "guide-dialog", "guide-open", "guide-close", "guide-copy",
-    "guide-content", "notification-settings", "notifications-enabled",
+    "guide-content", "manual-copy-dialog", "manual-copy-content",
+    "manual-copy-close", "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
     "notify-topic", "replacement-token", "credential-status", "settings-message",
     "save-settings", "test-notification",
@@ -156,7 +171,13 @@ async function loadApp({runs, details, validation, fetchOverride = null}) {
     document,
     fetch,
     navigator: {clipboard: {async writeText() {}}},
-    runnerOutputClipboard: {async write() {}, async writeText() {}},
+    runnerOutputClipboard: clipboardOverride || {
+      formatOutput(stdout, stderr) {
+        return `stdout:\n${stdout}\n\nstderr:\n${stderr}`;
+      },
+      async write() {},
+      async writeText() {},
+    },
     setTimeout,
     clearTimeout,
     window: {
@@ -391,4 +412,51 @@ test("slow validation response cannot replace a newer validation result", async 
 
   assert.equal(elements.validation.children.length, 1);
   assert.equal(elements.validation.children[0].textContent, "Line 8: newer result");
+});
+
+test("manual output copy preserves the payload attempted before a run switch", async () => {
+  const delayedCopy = deferred();
+  const attempted = [];
+  const clipboard = {
+    formatOutput(stdout, stderr) {
+      return `stdout:\n${stdout}\n\nstderr:\n${stderr}`;
+    },
+    async writeText(text) {
+      attempted.push(text);
+      await delayedCopy.promise;
+      throw new Error("copy denied");
+    },
+  };
+  const runOne = snapshot({runId: 1, state: "success", stdout: "run one"});
+  const runTwo = snapshot({runId: 2, state: "failed", stdout: "run two"});
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1"},
+      {runId: 2, state: "failed", cwd: "/work/run-2"},
+    ],
+    details: {1: runOne, 2: runTwo},
+    validation: {status: 200, body: {validation: []}},
+    clipboardOverride: clipboard,
+  });
+
+  const copy = elements["output-copy"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  const attemptedRunTwo = "stdout:\nrun two\n\nstderr:\nstderr-2";
+  assert.deepEqual(attempted, [attemptedRunTwo]);
+
+  const runOneButton = elements["run-list"].children.find(
+    (element) => element.textContent.startsWith("#1"),
+  );
+  await runOneButton.dispatch("click");
+  assert.equal(elements.stdout.textContent, "run one");
+
+  delayedCopy.resolve();
+  await copy;
+
+  assert.equal(elements["output-copy"].textContent, "Copy manually");
+  assert.equal(elements["manual-copy-content"].value, attemptedRunTwo);
+  assert.deepEqual(
+    elements["manual-copy-content"].selection,
+    [0, attemptedRunTwo.length],
+  );
 });
