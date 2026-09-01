@@ -156,11 +156,22 @@ class PurpleMuxCLIClient:
             if state in _READY_STATES:
                 return
             if self._monotonic() >= deadline:
+                diagnostic = self._startup_diagnostic(session_id)
                 raise SessionReadyTimeout(
                     f"session {session_id} was not ready within {timeout_seconds}s "
-                    f"(last cliState={state})"
+                    f"(last cliState={state}){diagnostic}"
                 )
             self._sleep(self.poll_interval_seconds)
+
+    def _startup_diagnostic(self, session_id: str) -> str:
+        """Capture pane text for timeout diagnosis without treating it as state."""
+        try:
+            content = self.capture_screen(session_id).strip()
+        except WorkerFailure as exc:
+            return f"; PurpleMux capture failed: {exc}"
+        if not content:
+            return "; PurpleMux pane capture was empty"
+        return f"; PurpleMux pane capture (diagnostic only):\n{content}"
 
     def send_input(self, session_id: str, text: str) -> None:
         """Submit one prompt after recording a correlation baseline."""

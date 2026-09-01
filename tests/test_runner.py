@@ -445,6 +445,7 @@ def test_runner_http_lifecycle(
         "state": "success",
         "stdout": "HTTP_OK\n",
         "stderr": "",
+        "progress": [],
         "exitCode": 0,
         "runId": 1,
     }
@@ -1036,3 +1037,13 @@ def test_web_server_close_stops_running_process() -> None:
     server.server_close()
 
     assert wait_until_finished(runner).state == "stopped"
+
+
+def test_web_server_bind_failure_preserves_address_in_use_error() -> None:
+    first = RunnerHTTPServer(("127.0.0.1", 0))
+    address = first.server_address
+    try:
+        with pytest.raises(OSError, match="Address already in use"):
+            RunnerHTTPServer(address)
+    finally:
+        first.server_close()

@@ -160,9 +160,34 @@ def test_wait_until_ready_accepts_ready_for_review() -> None:
 
 
 def test_ready_timeout_reports_last_state() -> None:
-    runner = FakeRunner([completed({"cliState": "inactive", "alive": True})])
+    runner = FakeRunner(
+        [
+            completed({"cliState": "inactive", "alive": True}),
+            completed({"content": "Trust this folder?"}),
+        ]
+    )
 
-    with pytest.raises(SessionReadyTimeout, match="last cliState=inactive"):
+    with pytest.raises(
+        SessionReadyTimeout,
+        match=r"(?s)last cliState=inactive.*Trust this folder\?",
+    ):
+        client(runner).wait_until_ready("tab-1", 0)
+
+    assert runner.calls[-1][2] == "capture"
+
+
+def test_ready_timeout_reports_capture_failure_without_masking_timeout() -> None:
+    runner = FakeRunner(
+        [
+            completed({"cliState": "inactive", "alive": True}),
+            completed({}, returncode=2, stderr="capture unavailable"),
+        ]
+    )
+
+    with pytest.raises(
+        SessionReadyTimeout,
+        match="PurpleMux capture failed.*capture unavailable",
+    ):
         client(runner).wait_until_ready("tab-1", 0)
 
 
