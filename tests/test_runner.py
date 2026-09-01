@@ -471,6 +471,25 @@ def test_validation_api_and_run_preflight_report_distinct_state(
     assert rejected["runId"] is None
 
 
+@pytest.mark.parametrize("path", ["/api/validate", "/api/run"])
+def test_workflow_api_reports_unresolvable_preflight_path(
+    web_server: tuple[tuple[str, int], str], path: str
+) -> None:
+    address, token = web_server
+    status, result = request(
+        address,
+        "POST",
+        path,
+        json.dumps({"code": "WORKFLOW_PREFLIGHT = {'paths': ['~unknown-user/input']}"}),
+        token=token,
+    )
+
+    assert status == 422
+    assert result["state"] == "validation_failed"
+    assert result["validation"][0]["kind"] == "path"
+    assert "could not check required path" in result["validation"][0]["message"]
+
+
 def test_notification_settings_api_read_never_returns_token(
     settings_web_server: tuple[
         tuple[str, int], str, Path, Path, SettingsAPINotifier, PythonRunner

@@ -71,9 +71,11 @@ side-effect-free, best-effort static checks, and Run performs the same preflight
 before creating a process. Stop and server shutdown clean up the script's POSIX
 process group, including child processes.
 
-Preflight always checks syntax, imports, required `os.environ["NAME"]` access,
-and names imported from the public `purplemux_client` API. Workflows can declare
-requirements that are known before agent work with a literal module-level value:
+Preflight always checks syntax. It also checks direct module-level imports,
+direct module-level `os.environ["NAME"]` access, and names imported directly from
+the public `purplemux_client` API. Guarded, conditional, and deferred uses are
+not assumed to be mandatory. Workflows can declare requirements that are known
+before agent work with a literal module-level value:
 
 ```python
 WORKFLOW_PREFLIGHT = {
@@ -88,8 +90,10 @@ All four keys are optional lists of non-empty strings. Commands are located on
 the Runner's `PATH`, imports use the Runner interpreter, environment names must
 be present, and relative paths resolve from the Runner process directory. The
 declaration is parsed as data; neither it nor any other workflow code is
-executed during validation. Preflight is deliberately best-effort: dynamic
-Python behavior and external state can still fail after execution starts.
+executed during validation. Read-only discovery is bounded; a stalled lookup is
+reported as a validation timeout without blocking Runner status or shutdown.
+Preflight is deliberately best-effort: dynamic Python behavior and external
+state can still fail after execution starts.
 
 The normal setup and startup path is:
 

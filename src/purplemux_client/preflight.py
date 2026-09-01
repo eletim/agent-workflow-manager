@@ -3,8 +3,11 @@ from __future__ import annotations
 import ast
 import importlib.machinery
 import os
+import queue
 import shutil
 import sys
+import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -13,6 +16,7 @@ from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
 
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
 PREFLIGHT_KEYS = frozenset({"commands", "imports", "environment", "paths"})
+DEFAULT_CHECK_TIMEOUT = 2.0
 
 
 @dataclass(frozen=True)
@@ -50,12 +54,18 @@ class WorkflowValidator:
         environment: Mapping[str, str] | None = None,
         cwd: Path | None = None,
         module_search_path: Sequence[str] | None = None,
+        check_timeout: float = DEFAULT_CHECK_TIMEOUT,
     ) -> None:
+        if check_timeout <= 0:
+            raise ValueError("check_timeout must be positive")
         self._environment = os.environ if environment is None else environment
         self._cwd = Path.cwd() if cwd is None else cwd
         self._module_search_path = (
-            tuple(sys.path) if module_search_path is None else tuple(module_search_path)
+            self._workflow_module_search_path()
+            if module_search_path is None
+            else tuple(module_search_path)
         )
+        self._check_timeout = check_timeout
 
     def validate(self, code: str) -> ValidationResult:
         try:
@@ -73,17 +83,56 @@ class WorkflowValidator:
                 )
             )
 
+        results: queue.Queue[tuple[ValidationIssue, ...] | Exception] = queue.Queue(
+            maxsize=1
+        )
+
+        def check() -> None:
+            try:
+                results.put(self._validate_read_checks(tree))
+            except Exception as exc:
+                results.put(exc)
+
+        worker = threading.Thread(
+            target=check,
+            name="workflow-preflight-checks",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(self._check_timeout)
+        if worker.is_alive():
+            return ValidationResult(
+                (
+                    ValidationIssue(
+                        "timeout",
+                        f"workflow validation checks exceeded {self._check_timeout:g}s",
+                    ),
+                )
+            )
+        checked = results.get_nowait()
+        if isinstance(checked, Exception):
+            return ValidationResult(
+                (
+                    ValidationIssue(
+                        "validation",
+                        f"workflow validation check failed: {type(checked).__name__}: {checked}",
+                    ),
+                )
+            )
+        return ValidationResult(checked)
+
+    def _validate_read_checks(self, tree: ast.Module) -> tuple[ValidationIssue, ...]:
         issues: list[ValidationIssue] = []
         self._validate_imports(tree, issues)
         self._validate_required_environment(tree, issues)
         self._validate_metadata(tree, issues)
-        return ValidationResult(tuple(issues))
+        return tuple(issues)
 
     def _validate_imports(
         self, tree: ast.Module, issues: list[ValidationIssue]
     ) -> None:
         seen_modules: set[str] = set()
-        for node in ast.walk(tree):
+        for node in tree.body:
             names: list[str] = []
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
@@ -101,15 +150,26 @@ class WorkflowValidator:
                                 )
                             )
             for name in names:
-                root = name.partition(".")[0]
-                if root in seen_modules:
+                if name in seen_modules:
                     continue
-                seen_modules.add(root)
-                if not self._module_exists(root):
+                seen_modules.add(name)
+                try:
+                    exists = self._module_exists(name)
+                except Exception as exc:
                     issues.append(
                         ValidationIssue(
                             "import",
-                            f"Python dependency {root!r} is not available to the Runner interpreter",
+                            f"could not check Python dependency {name!r}: {type(exc).__name__}: {exc}",
+                            getattr(node, "lineno", None),
+                            self._column(node),
+                        )
+                    )
+                    continue
+                if not exists:
+                    issues.append(
+                        ValidationIssue(
+                            "import",
+                            f"Python dependency {name!r} is not available to the workflow process",
                             getattr(node, "lineno", None),
                             self._column(node),
                         )
@@ -118,24 +178,28 @@ class WorkflowValidator:
     def _validate_required_environment(
         self, tree: ast.Module, issues: list[ValidationIssue]
     ) -> None:
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Subscript) or not self._is_os_environ(
-                node.value
-            ):
+        for statement in tree.body:
+            expression = self._direct_expression(statement)
+            if expression is None:
                 continue
-            if isinstance(node.slice, ast.Constant) and isinstance(
-                node.slice.value, str
-            ):
-                name = node.slice.value
-                if name not in self._environment:
-                    issues.append(
-                        ValidationIssue(
-                            "environment",
-                            f"required environment variable {name!r} is not set",
-                            node.lineno,
-                            node.col_offset + 1,
+            for node in self._immediate_nodes(expression):
+                if not isinstance(node, ast.Subscript) or not self._is_os_environ(
+                    node.value
+                ):
+                    continue
+                if isinstance(node.slice, ast.Constant) and isinstance(
+                    node.slice.value, str
+                ):
+                    name = node.slice.value
+                    if name not in self._environment:
+                        issues.append(
+                            ValidationIssue(
+                                "environment",
+                                f"required environment variable {name!r} is not set",
+                                node.lineno,
+                                node.col_offset + 1,
+                            )
                         )
-                    )
 
     @staticmethod
     def _is_os_environ(node: ast.expr) -> bool:
@@ -145,6 +209,51 @@ class WorkflowValidator:
             and isinstance(node.value, ast.Name)
             and node.value.id == "os"
         )
+
+    @staticmethod
+    def _direct_expression(statement: ast.stmt) -> ast.expr | None:
+        if isinstance(statement, ast.Expr):
+            return statement.value
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            return statement.value
+        if isinstance(statement, (ast.If, ast.While)):
+            return statement.test
+        if isinstance(statement, (ast.For, ast.AsyncFor)):
+            return statement.iter
+        return None
+
+    @staticmethod
+    def _immediate_nodes(expression: ast.expr) -> tuple[ast.AST, ...]:
+        nodes: list[ast.AST] = []
+
+        class ImmediateVisitor(ast.NodeVisitor):
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+            def visit_IfExp(self, node: ast.IfExp) -> None:
+                self.visit(node.test)
+
+            def visit_BoolOp(self, node: ast.BoolOp) -> None:
+                self.visit(node.values[0])
+
+            def visit_ListComp(self, node: ast.ListComp) -> None:
+                return
+
+            def visit_SetComp(self, node: ast.SetComp) -> None:
+                return
+
+            def visit_DictComp(self, node: ast.DictComp) -> None:
+                return
+
+            def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+                return
+
+            def generic_visit(self, node: ast.AST) -> None:
+                nodes.append(node)
+                super().generic_visit(node)
+
+        ImmediateVisitor().visit(expression)
+        return tuple(nodes)
 
     def _validate_metadata(
         self, tree: ast.Module, issues: list[ValidationIssue]
@@ -199,21 +308,27 @@ class WorkflowValidator:
         issues: list[ValidationIssue],
     ) -> None:
         message: str | None = None
-        if (
-            kind == "commands"
-            and shutil.which(value, path=self._environment.get("PATH")) is None
-        ):
-            message = f"required command {value!r} was not found on PATH"
-        elif kind == "imports" and not self._module_exists(value.partition(".")[0]):
-            message = f"required Python dependency {value!r} is not available"
-        elif kind == "environment" and value not in self._environment:
-            message = f"required environment variable {value!r} is not set"
-        elif kind == "paths":
-            path = Path(value).expanduser()
-            if not path.is_absolute():
-                path = self._cwd / path
-            if not path.exists():
-                message = f"required path {value!r} does not exist"
+        try:
+            if (
+                kind == "commands"
+                and shutil.which(value, path=self._environment.get("PATH")) is None
+            ):
+                message = f"required command {value!r} was not found on PATH"
+            elif kind == "imports" and not self._module_exists(value):
+                message = f"required Python dependency {value!r} is not available"
+            elif kind == "environment" and value not in self._environment:
+                message = f"required environment variable {value!r} is not set"
+            elif kind == "paths":
+                path = Path(value).expanduser()
+                if not path.is_absolute():
+                    path = self._cwd / path
+                if not path.exists():
+                    message = f"required path {value!r} does not exist"
+        except Exception as exc:
+            message = (
+                f"could not check required {kind.rstrip('s')} {value!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
         if message:
             issues.append(
                 ValidationIssue(
@@ -222,17 +337,31 @@ class WorkflowValidator:
             )
 
     def _module_exists(self, name: str) -> bool:
-        if name in sys.builtin_module_names or name in sys.stdlib_module_names:
-            return True
-        try:
-            return (
-                importlib.machinery.PathFinder.find_spec(
-                    name, list(self._module_search_path)
-                )
-                is not None
-            )
-        except (ImportError, AttributeError, ValueError):
+        parts = name.split(".")
+        if any(not part for part in parts):
             return False
+        root = parts[0]
+        if root in sys.builtin_module_names:
+            return len(parts) == 1
+        spec = importlib.machinery.PathFinder.find_spec(
+            root, list(self._module_search_path)
+        )
+        if spec is None:
+            return len(parts) == 1 and root in sys.stdlib_module_names
+        qualified = root
+        for part in parts[1:]:
+            locations = spec.submodule_search_locations
+            if locations is None:
+                return False
+            qualified = f"{qualified}.{part}"
+            spec = importlib.machinery.PathFinder.find_spec(qualified, list(locations))
+            if spec is None:
+                return False
+        return True
+
+    @staticmethod
+    def _workflow_module_search_path() -> tuple[str, ...]:
+        return (tempfile.gettempdir(), *sys.path[1:])
 
     @staticmethod
     def _column(node: ast.AST) -> int | None:

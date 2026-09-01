@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
 
 from purplemux_client.preflight import WorkflowValidator
-from purplemux_client.runner import PythonRunner, WorkflowValidationError
+from purplemux_client.runner import (
+    PythonRunner,
+    RunnerClosedError,
+    WorkflowValidationError,
+)
 
 
 def validator(tmp_path: Path, **environment: str) -> WorkflowValidator:
@@ -55,6 +60,56 @@ def test_missing_import_and_configuration_are_actionable(tmp_path: Path) -> None
     ]
     assert "dependency_that_does_not_exist" in result.issues[0].message
     assert "REQUIRED_TOKEN" in result.issues[1].message
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import json.nonexistent",
+        "WORKFLOW_PREFLIGHT = {'imports': ['json.nonexistent']}",
+    ],
+)
+def test_nested_missing_module_is_rejected(tmp_path: Path, code: str) -> None:
+    result = WorkflowValidator(cwd=tmp_path).validate(code)
+
+    assert not result.valid
+    assert result.issues[0].kind == "import"
+    assert "json.nonexistent" in result.issues[0].message
+
+
+def test_nested_existing_module_is_accepted(tmp_path: Path) -> None:
+    result = WorkflowValidator(cwd=tmp_path).validate("import json.decoder")
+
+    assert result.valid
+
+
+def test_manager_cwd_only_module_is_not_visible_to_workflow_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "manager_only.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(tmp_path)
+
+    result = WorkflowValidator(cwd=tmp_path).validate("import manager_only")
+
+    assert not result.valid
+    assert result.issues[0].kind == "import"
+    assert "manager_only" in result.issues[0].message
+
+
+def test_guarded_import_and_environment_access_are_not_mandatory(
+    tmp_path: Path,
+) -> None:
+    result = validator(tmp_path).validate(
+        "import os\n"
+        "try:\n"
+        "    import optional_dependency_that_is_missing\n"
+        "except ImportError:\n"
+        "    optional_dependency_that_is_missing = None\n"
+        "if 'OPTIONAL_TOKEN' in os.environ:\n"
+        "    token = os.environ['OPTIONAL_TOKEN']\n"
+    )
+
+    assert result.valid
 
 
 def test_declared_requirements_report_missing_command_import_and_path(
@@ -125,3 +180,60 @@ def test_runner_does_not_start_process_when_validation_fails(tmp_path: Path) -> 
         assert runner.snapshot().state == "idle"
     finally:
         runner.close()
+
+
+def test_stalled_lookup_returns_timeout_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_lookup = threading.Event()
+    validator = WorkflowValidator(cwd=tmp_path, check_timeout=0.05)
+
+    def stalled_lookup(_name: str) -> bool:
+        release_lookup.wait(timeout=1)
+        return True
+
+    monkeypatch.setattr(validator, "_module_exists", stalled_lookup)
+
+    result = validator.validate("import json")
+    release_lookup.set()
+
+    assert not result.valid
+    assert result.issues[0].kind == "timeout"
+    assert "exceeded 0.05s" in result.issues[0].message
+
+
+def test_stalled_checks_do_not_block_runner_observation_or_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checks_started = threading.Event()
+    release_checks = threading.Event()
+    validator = WorkflowValidator(cwd=tmp_path, check_timeout=0.1)
+
+    def stalled_lookup(_name: str) -> bool:
+        checks_started.set()
+        release_checks.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr(validator, "_module_exists", stalled_lookup)
+    runner = PythonRunner(validator=validator)
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            runner.start("import json")
+        except BaseException as exc:
+            errors.append(exc)
+
+    start_thread = threading.Thread(target=start)
+    start_thread.start()
+    assert checks_started.wait(timeout=1)
+
+    assert runner.snapshot().state == "idle"
+    assert runner.stop() is False
+    runner.close()
+    start_thread.join(timeout=1)
+    release_checks.set()
+
+    assert not start_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RunnerClosedError)

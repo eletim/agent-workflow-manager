@@ -110,6 +110,7 @@ class PythonRunner:
         self._stop_timeout = stop_timeout
         self._max_output_chars = max_output_chars
         self._lock = threading.Lock()
+        self._validation_lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._process_group_id: int | None = None
         self._group_cleanup_lock = threading.Lock()
@@ -133,124 +134,125 @@ class PythonRunner:
         self._validator = validator or WorkflowValidator()
 
     def validate(self, code: str) -> ValidationResult:
-        with self._lock:
-            self._ensure_available()
+        with self._validation_lock:
+            with self._lock:
+                self._ensure_available()
             result = self._validator.validate(code)
-            self._validation = result.issues
-            self._state = "idle" if result.valid else "validation_failed"
-            self._stdout.clear()
-            self._stderr.clear()
-            self._stdout_chars = 0
-            self._stderr_chars = 0
-            self._stdout_truncated = False
-            self._stderr_truncated = False
-            self._exit_code = None
-            self._run_id = None
-            self._progress.clear()
-            return result
+            with self._lock:
+                self._ensure_available()
+                self._apply_validation(result)
+                return result
 
     def start(self, code: str) -> int:
-        with self._lock:
-            self._ensure_available()
+        with self._validation_lock:
+            with self._lock:
+                self._ensure_available()
             validation = self._validator.validate(code)
-            self._validation = validation.issues
-            if not validation.valid:
-                self._state = "validation_failed"
-                self._stdout.clear()
-                self._stderr.clear()
-                self._stdout_chars = 0
-                self._stderr_chars = 0
-                self._stdout_truncated = False
-                self._stderr_truncated = False
-                self._exit_code = None
-                self._run_id = None
-                self._progress.clear()
-                raise WorkflowValidationError(validation)
+            with self._lock:
+                self._ensure_available()
+                if not validation.valid:
+                    self._apply_validation(validation)
+                    raise WorkflowValidationError(validation)
+                return self._start_validated(code)
 
-            script = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", encoding="utf-8", delete=False
+    def _start_validated(self, code: str) -> int:
+        script = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", encoding="utf-8", delete=False
+        )
+        try:
+            script.write(code)
+        finally:
+            script.close()
+        script_path = Path(script.name)
+
+        progress_read_fd, progress_write_fd = os.pipe()
+        child_env = os.environ.copy()
+        child_env[PROGRESS_FD_ENV] = str(progress_write_fd)
+
+        try:
+            process = subprocess.Popen(
+                [sys.executable, str(script_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                pass_fds=(progress_write_fd,),
+                shell=False,
+                start_new_session=True,
             )
-            try:
-                script.write(code)
-            finally:
-                script.close()
-            script_path = Path(script.name)
-
-            progress_read_fd, progress_write_fd = os.pipe()
-            child_env = os.environ.copy()
-            child_env[PROGRESS_FD_ENV] = str(progress_write_fd)
-
-            try:
-                process = subprocess.Popen(
-                    [sys.executable, str(script_path)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=child_env,
-                    pass_fds=(progress_write_fd,),
-                    shell=False,
-                    start_new_session=True,
-                )
-            except BaseException:
-                os.close(progress_read_fd)
-                os.close(progress_write_fd)
-                script_path.unlink(missing_ok=True)
-                raise
+        except BaseException:
+            os.close(progress_read_fd)
             os.close(progress_write_fd)
+            script_path.unlink(missing_ok=True)
+            raise
+        os.close(progress_write_fd)
 
-            run_id = self._next_run_id
-            self._next_run_id += 1
-            self._process = process
-            self._process_group_id = process.pid
-            self._script_path = script_path
-            self._state = "running"
-            self._stdout.clear()
-            self._stderr.clear()
-            self._stdout_chars = 0
-            self._stderr_chars = 0
-            self._stdout_truncated = False
-            self._stderr_truncated = False
-            self._exit_code = None
-            self._run_id = run_id
-            self._stop_requested = False
-            self._progress.clear()
-            self._validation = ()
+        run_id = self._next_run_id
+        self._next_run_id += 1
+        self._process = process
+        self._process_group_id = process.pid
+        self._script_path = script_path
+        self._state = "running"
+        self._stdout.clear()
+        self._stderr.clear()
+        self._stdout_chars = 0
+        self._stderr_chars = 0
+        self._stdout_truncated = False
+        self._stderr_truncated = False
+        self._exit_code = None
+        self._run_id = run_id
+        self._stop_requested = False
+        self._progress.clear()
+        self._validation = ()
 
-            stdout_thread = threading.Thread(
-                target=self._read_stream,
-                args=(process.stdout, "stdout"),
-                name=f"python-runner-stdout-{run_id}",
-                daemon=True,
-            )
-            stderr_thread = threading.Thread(
-                target=self._read_stream,
-                args=(process.stderr, "stderr"),
-                name=f"python-runner-stderr-{run_id}",
-                daemon=True,
-            )
-            progress_thread = threading.Thread(
-                target=self._read_progress,
-                args=(progress_read_fd,),
-                name=f"python-runner-progress-{run_id}",
-                daemon=True,
-            )
-            wait_thread = threading.Thread(
-                target=self._wait_for_process,
-                args=(
-                    process,
-                    script_path,
-                    stdout_thread,
-                    stderr_thread,
-                    progress_thread,
-                ),
-                name=f"python-runner-wait-{run_id}",
-                daemon=True,
-            )
-            self._wait_threads.add(wait_thread)
-            stdout_thread.start()
-            stderr_thread.start()
-            progress_thread.start()
-            wait_thread.start()
+        stdout_thread = threading.Thread(
+            target=self._read_stream,
+            args=(process.stdout, "stdout"),
+            name=f"python-runner-stdout-{run_id}",
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=self._read_stream,
+            args=(process.stderr, "stderr"),
+            name=f"python-runner-stderr-{run_id}",
+            daemon=True,
+        )
+        progress_thread = threading.Thread(
+            target=self._read_progress,
+            args=(progress_read_fd,),
+            name=f"python-runner-progress-{run_id}",
+            daemon=True,
+        )
+        wait_thread = threading.Thread(
+            target=self._wait_for_process,
+            args=(
+                process,
+                script_path,
+                stdout_thread,
+                stderr_thread,
+                progress_thread,
+            ),
+            name=f"python-runner-wait-{run_id}",
+            daemon=True,
+        )
+        self._wait_threads.add(wait_thread)
+        stdout_thread.start()
+        stderr_thread.start()
+        progress_thread.start()
+        wait_thread.start()
         return run_id
+
+    def _apply_validation(self, result: ValidationResult) -> None:
+        self._validation = result.issues
+        self._state = "idle" if result.valid else "validation_failed"
+        self._stdout.clear()
+        self._stderr.clear()
+        self._stdout_chars = 0
+        self._stderr_chars = 0
+        self._stdout_truncated = False
+        self._stderr_truncated = False
+        self._exit_code = None
+        self._run_id = None
+        self._progress.clear()
 
     def snapshot(self) -> RunnerSnapshot:
         with self._lock:
