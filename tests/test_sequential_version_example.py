@@ -572,3 +572,162 @@ def test_git_ancestry_rejects_stale_or_unrelated_branch(
         SAMPLE_MODULE.require_ancestor(
             "origin/dev/v1.2.3", "refs/heads/feature/issue-1", config
         )
+
+
+@pytest.mark.parametrize("failure_point", ["send", "wait"])
+def test_issue_turn_timeout_resume_does_not_resend_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase="issue_sessions_ready",
+        issue_number=1,
+        implementer="tab-1",
+        reviewer="tab-2",
+    )
+    checkpoints: list[str] = []
+
+    class TimeoutClient:
+        workspace_id = "ws-1"
+
+        def __init__(self) -> None:
+            self.send_attempts = 0
+
+        def wait_until_ready(self, _tab: str, _timeout: int) -> None:
+            return None
+
+        def send_input(self, _tab: str, _prompt: str) -> None:
+            assert recovery.phase == "issue_implementation_turn_pending"
+            assert checkpoints == ["issue_implementation_turn_pending"]
+            self.send_attempts += 1
+            if failure_point == "send":
+                raise purplemux_client.MutationOutcomeUnknown("send timed out")
+
+        def wait_for_turn_completion(self, _tab: str, _timeout: int) -> None:
+            raise purplemux_client.WorkerFailure("turn timed out")
+
+    client = TimeoutClient()
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "save_checkpoint",
+        lambda name, _data: checkpoints.append(name),
+    )
+    monkeypatch.setattr(SAMPLE_MODULE, "merged_issue_pr", lambda *_args: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "prepare_issue_branch", lambda *_args: None)
+
+    expected_error = (
+        purplemux_client.MutationOutcomeUnknown
+        if failure_point == "send"
+        else purplemux_client.WorkerFailure
+    )
+    with pytest.raises(expected_error):
+        SAMPLE_MODULE.process_issue(config.issues[0], config, client, recovery)
+
+    assert checkpoints == ["issue_implementation_turn_pending"]
+    assert recovery.phase == "issue_implementation_turn_pending"
+    assert client.send_attempts == 1
+
+    with pytest.raises(
+        purplemux_client.MutationOutcomeUnknown, match="do not resend the prompt"
+    ):
+        SAMPLE_MODULE.process_issue(config.issues[0], config, client, recovery)
+
+    assert client.send_attempts == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["issue_review_turn_pending", "issue_fix_turn_pending"],
+)
+def test_issue_pending_review_or_fix_resume_stops_before_resend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase=phase,
+        issue_number=1,
+        implementer="tab-1",
+        reviewer="tab-2",
+    )
+    monkeypatch.setattr(SAMPLE_MODULE, "merged_issue_pr", lambda *_args: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "prepare_issue_branch", lambda *_args: None)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "run_turn",
+        lambda *_args, **_kwargs: pytest.fail("pending turn was resent"),
+    )
+
+    with pytest.raises(
+        purplemux_client.MutationOutcomeUnknown, match="do not resend the prompt"
+    ):
+        SAMPLE_MODULE.process_issue(config.issues[0], config, object(), recovery)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["integration_review_turn_pending", "integration_fix_turn_pending"],
+)
+def test_integration_pending_turn_resume_stops_before_resend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase=phase,
+        implementer="tab-1",
+        reviewer="tab-2",
+    )
+    pr = {
+        "number": 10,
+        "url": "https://github.com/OWNER/REPOSITORY/pull/10",
+        "state": "OPEN",
+        "isDraft": True,
+        "headRefName": config.integration_branch,
+        "headRefOid": "a" * 40,
+        "baseRefName": config.main_branch,
+    }
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "switch_to_integration", lambda _config: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "integration_prs", lambda *_args: [pr])
+    monkeypatch.setattr(SAMPLE_MODULE, "ensure_draft_integration_pr", lambda *_args: pr)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "run_turn",
+        lambda *_args, **_kwargs: pytest.fail("pending turn was resent"),
+    )
+
+    with pytest.raises(
+        purplemux_client.MutationOutcomeUnknown, match="do not resend the prompt"
+    ):
+        SAMPLE_MODULE.integration_review(config, object(), recovery)

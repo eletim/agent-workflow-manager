@@ -545,6 +545,9 @@ def run_turn(
     tab: str,
     name: str,
     prompt: str,
+    recovery: Recovery,
+    config: Config,
+    pending_phase: str,
     *,
     iteration: int | None = None,
 ) -> str:
@@ -557,6 +560,11 @@ def run_turn(
     )
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
+        # The client keeps fresh-result correlation in memory. Persist the pending
+        # turn immediately before the mutation so a timeout/restart cannot resend
+        # a prompt whose outcome is unknown.
+        recovery.phase = pending_phase
+        recovery.checkpoint(config)
         client.send_input(tab, prompt)
         client.wait_for_turn_completion(tab, TURN_TIMEOUT)
         result = client.read_result(tab)
@@ -578,6 +586,16 @@ def run_turn(
         tab=tab,
     )
     return result
+
+
+def reject_pending_agent_turn(recovery: Recovery, stage: str) -> None:
+    if not recovery.phase.endswith("_turn_pending"):
+        return
+    raise MutationOutcomeUnknown(
+        f"a prior {stage} agent turn may have been sent; inspect the checkpointed "
+        "tab and structured result, then start a workflow-specific recovery after "
+        "reconciling its outcome; do not resend the prompt"
+    )
 
 
 def decision(result: str) -> str:
@@ -730,6 +748,8 @@ def process_issue(
     client: PurpleMuxCLIClient,
     recovery: Recovery,
 ) -> None:
+    if recovery.issue_number == issue.number:
+        reject_pending_agent_turn(recovery, f"Issue #{issue.number}")
     merged_before_start = merged_issue_pr(issue, config)
     if merged_before_start is not None:
         if worktree_is_dirty(config):
@@ -809,6 +829,9 @@ def process_issue(
             recovery.implementer,
             f"Issue #{issue.number} implementation",
             implementation_prompt,
+            recovery,
+            config,
+            "issue_implementation_turn_pending",
         )
         require_branch_pushed(issue.branch, config)
         require_open_issue_pr(issue, config)
@@ -830,6 +853,9 @@ def process_issue(
             recovery.reviewer,
             f"Issue #{issue.number} review",
             f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
+            recovery,
+            config,
+            "issue_review_turn_pending",
             iteration=review_number,
         )
         current_sha, _ = require_issue_head(issue, config)
@@ -858,6 +884,9 @@ run all normal checks and git diff --check, then commit and push.
 
 REVIEW RESULT:
 {result}""",
+            recovery,
+            config,
+            "issue_fix_turn_pending",
             iteration=review_number,
         )
         require_branch_pushed(issue.branch, config)
@@ -1034,6 +1063,7 @@ def integration_review(
     client: PurpleMuxCLIClient,
     recovery: Recovery,
 ) -> dict[str, Any]:
+    reject_pending_agent_turn(recovery, "integration")
     resumed_here = recovery.phase.startswith("integration_")
     preserved_dirty_integration = resumed_here and preserve_dirty_resume_branch(
         config.integration_branch, "integration", config
@@ -1139,6 +1169,9 @@ CHANGES_REQUESTED, followed by concrete findings."""
             recovery.reviewer,
             "whole-version integration review",
             f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
+            recovery,
+            config,
+            "integration_review_turn_pending",
             iteration=review_number,
         )
         current_sha, _ = require_integration_head(int(pr["number"]), config)
@@ -1171,6 +1204,9 @@ and git diff --check, commit, and push to {config.integration_branch}.
 
 INTEGRATION REVIEW RESULT:
 {result}""",
+            recovery,
+            config,
+            "integration_fix_turn_pending",
             iteration=review_number,
         )
         require_branch_pushed(config.integration_branch, config)
