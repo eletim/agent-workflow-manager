@@ -52,6 +52,8 @@ let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
+let eventRefreshActive = false;
+let eventRefreshPending = false;
 
 function renderRun(result) {
   const running = result.state === "running";
@@ -306,13 +308,29 @@ async function refresh() {
 function connectEvents() {
   eventSource = new window.EventSource("/api/events");
   eventSource.addEventListener("runner-change", () => {
-    void refresh();
+    void scheduleEventRefresh();
   });
   eventSource.addEventListener("open", () => {
     // EventSource reconnects automatically. Reconcile because notifications may
     // have been missed while the connection was unavailable.
-    void refresh();
+    void scheduleEventRefresh();
   });
+}
+
+async function scheduleEventRefresh() {
+  if (eventRefreshActive) {
+    eventRefreshPending = true;
+    return;
+  }
+  eventRefreshActive = true;
+  try {
+    do {
+      eventRefreshPending = false;
+      await refresh();
+    } while (eventRefreshPending);
+  } finally {
+    eventRefreshActive = false;
+  }
 }
 
 function renderSettings(settings) {

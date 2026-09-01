@@ -273,6 +273,67 @@ test("SSE changes refresh state, output, and progress without polling", async ()
   assert.equal(elements.stop.disabled, true);
 });
 
+test("SSE bursts coalesce to one active and one pending refresh", async () => {
+  const delayedDetail = deferred();
+  let delayNextDetail = false;
+  let detailWasDelayed = false;
+  const runs = [{runId: 1, state: "running", cwd: "/work/run-1"}];
+  const details = {1: snapshot({runId: 1, state: "running", stdout: "initial"})};
+  const {calls, elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayNextDetail && !detailWasDelayed && url === "/api/runs/1") {
+        detailWasDelayed = true;
+        return delayedDetail.promise;
+      }
+      return undefined;
+    },
+  });
+  const callsBeforeBurst = calls.length;
+  delayNextDetail = true;
+
+  eventSource.emit("runner-change");
+  await waitFor(() => detailWasDelayed);
+  for (let event = 0; event < 100; event += 1) {
+    eventSource.emit("runner-change");
+  }
+
+  assert.equal(
+    calls.slice(callsBeforeBurst).filter(([url]) => url === "/api/runs").length,
+    1,
+  );
+  assert.equal(
+    calls.slice(callsBeforeBurst).filter(([url]) => url === "/api/runs/1").length,
+    1,
+  );
+
+  runs[0] = {...runs[0], state: "success"};
+  details[1] = {
+    ...details[1],
+    state: "success",
+    stdout: "latest authoritative output",
+    exitCode: 0,
+  };
+  delayedDetail.resolve(response(snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "stale in-flight output",
+  })));
+  await waitFor(() => elements.stdout.textContent === "latest authoritative output");
+
+  assert.equal(
+    calls.slice(callsBeforeBurst).filter(([url]) => url === "/api/runs").length,
+    2,
+  );
+  assert.equal(
+    calls.slice(callsBeforeBurst).filter(([url]) => url === "/api/runs/1").length,
+    2,
+  );
+  assert.equal(elements.status.textContent, "success");
+});
+
 test("SSE refresh preserves the selected run while multiple runs change", async () => {
   const runs = [
     {runId: 1, state: "running", cwd: "/work/run-1"},
