@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from purplemux_client.preflight import WorkflowValidator
+from purplemux_client.preflight import ValidationResult, WorkflowValidator
 from purplemux_client.runner import (
     PythonRunner,
     RunnerClosedError,
@@ -228,7 +228,7 @@ def test_repeated_timeouts_reap_validation_workers(
 
     results = [validator.validate("import json") for _ in range(3)]
     pids = wait_for_pids(pid_log, 3)
-    validator.cancel()
+    validator.close()
 
     assert all(not result.valid for result in results)
     assert all(result.issues[0].kind == "timeout" for result in results)
@@ -269,4 +269,46 @@ def test_stalled_checks_do_not_block_runner_observation_or_close(
     assert len(errors) == 1
     assert isinstance(errors[0], RunnerClosedError)
     assert not process_is_live(worker_pid)
+    assert validator._workers == set()
+
+
+def test_close_prevents_helper_registration_that_has_not_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_log = tmp_path / "worker-pid"
+    validation_entered = threading.Event()
+    allow_registration = threading.Event()
+    validator = WorkflowValidator(cwd=tmp_path, check_timeout=10)
+    original_run_worker = validator._run_worker
+
+    def delayed_run_worker(code: str) -> ValidationResult:
+        validation_entered.set()
+        assert allow_registration.wait(timeout=2)
+        return original_run_worker(code)
+
+    monkeypatch.setattr(validator, "_run_worker", delayed_run_worker)
+    monkeypatch.setattr(
+        validator, "_worker_command", lambda: stalling_worker_command(pid_log)
+    )
+    runner = PythonRunner(validator=validator)
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            runner.start("import json")
+        except BaseException as exc:
+            errors.append(exc)
+
+    start_thread = threading.Thread(target=start)
+    start_thread.start()
+    assert validation_entered.wait(timeout=1)
+
+    runner.close()
+    allow_registration.set()
+    start_thread.join(timeout=1)
+
+    assert not start_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RunnerClosedError)
+    assert not pid_log.exists()
     assert validator._workers == set()

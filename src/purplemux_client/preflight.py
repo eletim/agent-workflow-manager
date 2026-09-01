@@ -70,6 +70,7 @@ class WorkflowValidator:
         self._check_timeout = check_timeout
         self._worker_lock = threading.Lock()
         self._workers: set[subprocess.Popen[str]] = set()
+        self._closed = False
 
     def validate(self, code: str) -> ValidationResult:
         try:
@@ -89,9 +90,10 @@ class WorkflowValidator:
 
         return self._run_worker(code)
 
-    def cancel(self) -> None:
-        """Kill and reap any active read-only validation helper."""
+    def close(self) -> None:
+        """Permanently prevent new helpers, then kill and reap active ones."""
         with self._worker_lock:
+            self._closed = True
             workers = tuple(self._workers)
         for worker in workers:
             if worker.poll() is None:
@@ -112,6 +114,15 @@ class WorkflowValidator:
         )
         try:
             with self._worker_lock:
+                if self._closed:
+                    return ValidationResult(
+                        (
+                            ValidationIssue(
+                                "validation",
+                                "workflow validator is closed",
+                            ),
+                        )
+                    )
                 worker = subprocess.Popen(
                     self._worker_command(),
                     stdin=subprocess.PIPE,

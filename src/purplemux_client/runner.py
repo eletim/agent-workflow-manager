@@ -290,7 +290,7 @@ class PythonRunner:
             process_group_id = self._process_group_id
             if process is not None and process_group_id is not None:
                 self._stop_requested = True
-        self._validator.cancel()
+        self._validator.close()
         if process_group_id is not None:
             self._terminate_process_group(process_group_id)
         if process is not None:
