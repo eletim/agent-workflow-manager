@@ -109,6 +109,14 @@ function deferred() {
   return {promise, resolve};
 }
 
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail("condition was not met");
+}
+
 async function loadApp({
   runs,
   details,
@@ -133,6 +141,7 @@ async function loadApp({
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
   const calls = [];
+  const eventSources = [];
   const document = {
     body: new Element(),
     createElement() { return new Element(); },
@@ -168,7 +177,23 @@ async function loadApp({
     if (match) return response(details[Number(match[1])]);
     throw new Error(`unexpected request: ${url}`);
   };
-  let intervalId = 0;
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+      eventSources.push(this);
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+
+    emit(type) {
+      for (const listener of this.listeners.get(type) || []) listener({type});
+    }
+  }
   const context = {
     console,
     document,
@@ -184,9 +209,9 @@ async function loadApp({
     setTimeout,
     clearTimeout,
     window: {
-      clearInterval() {},
       clearTimeout,
-      setInterval() { intervalId += 1; return intervalId; },
+      EventSource: FakeEventSource,
+      setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
     },
   };
@@ -197,7 +222,9 @@ async function loadApp({
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.ok(calls.some(([url]) => url === "/api/settings/notifications"));
-  return {calls, elements};
+  assert.equal(eventSources.length, 1);
+  assert.equal(eventSources[0].url, "/api/events");
+  return {calls, elements, eventSource: eventSources[0]};
 }
 
 function selectedRun(elements) {
@@ -205,6 +232,94 @@ function selectedRun(elements) {
     (element) => element.className.includes("selected"),
   );
 }
+
+test("initial state loads through read APIs before any SSE event", async () => {
+  const running = snapshot({runId: 1, state: "running", stdout: "already running"});
+  const {calls, elements} = await loadApp({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+    details: {1: running},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements.stdout.textContent, "already running");
+  assert.ok(calls.some(([url]) => url === "/api/status"));
+  assert.ok(calls.some(([url]) => url === "/api/runs/1"));
+});
+
+test("SSE changes refresh state, output, and progress without polling", async () => {
+  const runs = [{runId: 1, state: "running", cwd: "/work/run-1"}];
+  const details = {1: snapshot({runId: 1, state: "running", stdout: "starting"})};
+  const {calls, elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+  const callsBeforeEvent = calls.length;
+
+  runs[0] = {...runs[0], state: "success"};
+  details[1] = {
+    ...details[1],
+    state: "success",
+    stdout: "starting\nfinished\n",
+    exitCode: 0,
+    progress: [{name: "deploy", status: "completed"}],
+  };
+  eventSource.emit("runner-change");
+  await waitFor(() => elements.status.textContent === "success");
+
+  assert.equal(elements.stdout.textContent, "starting\nfinished\n");
+  assert.equal(elements.progress.children[0].children[1].children[0].textContent, "deploy");
+  assert.ok(calls.slice(callsBeforeEvent).some(([url]) => url === "/api/runs"));
+  assert.equal(elements.stop.disabled, true);
+});
+
+test("SSE refresh preserves the selected run while multiple runs change", async () => {
+  const runs = [
+    {runId: 1, state: "running", cwd: "/work/run-1"},
+    {runId: 2, state: "running", cwd: "/work/run-2"},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "running", stdout: "one"}),
+    2: snapshot({runId: 2, state: "running", stdout: "two"}),
+  };
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+  const runOne = elements["run-list"].children.find(
+    (element) => element.textContent.startsWith("#1"),
+  );
+  await runOne.dispatch("click");
+
+  runs[1] = {...runs[1], state: "success"};
+  details[2] = {...details[2], state: "success", stdout: "two done", exitCode: 0};
+  details[1] = {...details[1], stdout: "one still selected"};
+  eventSource.emit("runner-change");
+  await waitFor(() => elements.stdout.textContent === "one still selected");
+
+  assert.match(selectedRun(elements).textContent, /^#1/);
+  const runTwo = elements["run-list"].children.find(
+    (element) => element.textContent.startsWith("#2"),
+  );
+  assert.equal(runTwo.dataset.state, "success");
+});
+
+test("EventSource reconnect reconciles authoritative state", async () => {
+  const runs = [{runId: 1, state: "running", cwd: "/work/run-1"}];
+  const details = {1: snapshot({runId: 1, state: "running", stdout: "before gap"})};
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  details[1] = {...details[1], stdout: "after reconnect"};
+  eventSource.emit("open");
+  await waitFor(() => elements.stdout.textContent === "after reconnect");
+
+  assert.equal(elements.status.textContent, "running");
+});
 
 test("successful validation is explicit when no run exists", async () => {
   const {elements} = await loadApp({
@@ -340,12 +455,12 @@ test("validation preserves another selected running run through refresh", async 
   assert.equal(elements["validation-success"].textContent, "✓ Valid");
 });
 
-test("slow run response cannot replace a newly selected run", async () => {
+test("slow SSE refresh cannot replace a newly selected run", async () => {
   const delayedRun = deferred();
   let delayRunTwo = false;
   const runOne = snapshot({runId: 1, state: "running", stdout: "run one output"});
   const runTwo = snapshot({runId: 2, state: "failed", stdout: "run two output"});
-  const {calls, elements} = await loadApp({
+  const {calls, elements, eventSource} = await loadApp({
     runs: [
       {runId: 1, state: "running", cwd: "/work/run-1"},
       {runId: 2, state: "failed", cwd: "/work/run-2"},
@@ -359,7 +474,7 @@ test("slow run response cannot replace a newly selected run", async () => {
   });
 
   delayRunTwo = true;
-  const slowRefresh = selectedRun(elements).dispatch("click");
+  eventSource.emit("runner-change");
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(calls.filter(([url]) => url === "/api/runs/2").length >= 2);
 
@@ -372,7 +487,7 @@ test("slow run response cannot replace a newly selected run", async () => {
   assert.equal(elements.stop.disabled, false);
 
   delayedRun.resolve(response(runTwo));
-  await slowRefresh;
+  await new Promise((resolve) => setImmediate(resolve));
 
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements.status.textContent, "running");

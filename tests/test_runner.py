@@ -203,6 +203,56 @@ def test_streams_flushed_output_without_newline(runner: PythonRunner) -> None:
     assert result.state == "running"
 
 
+def test_change_revision_tracks_authoritative_observable_state(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    code = """\
+import time
+from pathlib import Path
+from purplemux_client import emit_step, save_checkpoint
+
+def wait_for(name):
+    while not Path(name).exists():
+        time.sleep(0.01)
+
+wait_for("output")
+print("visible", flush=True)
+wait_for("progress")
+emit_step("observed", "completed")
+wait_for("checkpoint")
+save_checkpoint("safe", {"workspace": "ws-1"})
+wait_for("finish")
+"""
+    run_id = runner.start(code, cwd=tmp_path)
+    revision = runner.change_revision()
+
+    (tmp_path / "output").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    revision = changed
+    assert runner.snapshot(run_id).stdout == "visible\n"
+
+    (tmp_path / "progress").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    revision = changed
+    assert runner.snapshot(run_id).progress[-1].name == "observed"
+
+    (tmp_path / "checkpoint").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    revision = changed
+    checkpoint = runner.snapshot(run_id).checkpoint
+    assert checkpoint is not None
+    assert checkpoint.name == "safe"
+    assert checkpoint.data == {"workspace": "ws-1"}
+
+    (tmp_path / "finish").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    assert runner.snapshot(run_id).state == "success"
+
+
 def test_output_is_bounded_and_reports_truncation() -> None:
     runner = PythonRunner(max_output_chars=20)
     try:
@@ -910,6 +960,52 @@ def test_runner_http_lifecycle(
         "suspensionReason": None,
         "resumable": False,
     }
+
+
+def test_events_endpoint_streams_runner_change_notifications(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    events = http.client.HTTPConnection(*address, timeout=3)
+    events.request("GET", "/api/events")
+    response = events.getresponse()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/event-stream; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-cache"
+    assert response.readline() == b"retry: 1000\n"
+    assert response.readline() == b"\n"
+
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "import time; time.sleep(60)"}),
+        token=token,
+    )
+    assert status == 202
+    assert started["state"] == "running"
+    assert response.readline() == b"event: runner-change\n"
+    revision_line = response.readline()
+    assert revision_line.startswith(b"data: ")
+    assert int(revision_line.removeprefix(b"data: ")) > 0
+    assert response.readline() == b"\n"
+
+    events.close()
+
+
+def test_events_endpoint_rejects_untrusted_host(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/api/events", headers={"Host": "attacker.example"})
+    response = connection.getresponse()
+    payload = json.loads(response.read())
+    connection.close()
+
+    assert response.status == 403
+    assert payload == {"error": "untrusted host"}
 
 
 def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
