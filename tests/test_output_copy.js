@@ -25,13 +25,24 @@ function recordingClipboard(error = null) {
   };
 }
 
-function fallbackDocument({result = true, error = null} = {}) {
+function fallbackDocument({result = true, error = null, modal = false} = {}) {
+  const selection = {
+    added: [],
+    rangeCount: 1,
+    removed: false,
+    addRange(range) { this.added.push(range); },
+    getRangeAt() { return {cloneRange() { return "saved-range"; }}; },
+    removeAllRanges() { this.removed = true; },
+  };
   const document = {
     appended: [],
     commands: [],
+    activeElement: null,
+    getSelection() { return selection; },
     body: {
       appendChild(element) {
         document.appended.push(element);
+        element.parent = this;
       },
       removeChild(element) {
         element.removed = true;
@@ -42,10 +53,15 @@ function fallbackDocument({result = true, error = null} = {}) {
       return {
         attributes: {},
         removed: false,
+        focused: false,
         selected: false,
         selection: null,
         style: {},
         value: "",
+        focus() {
+          this.focused = true;
+          document.activeElement = this;
+        },
         setAttribute(name, value) {
           this.attributes[name] = value;
         },
@@ -63,6 +79,27 @@ function fallbackDocument({result = true, error = null} = {}) {
       return result;
     },
   };
+  const dialog = {
+    appended: [],
+    appendChild(element) {
+      this.appended.push(element);
+      document.appended.push(element);
+      element.parent = this;
+    },
+    removeChild(element) { element.removed = true; },
+  };
+  const previousFocus = {
+    restored: false,
+    closest() { return modal ? dialog : null; },
+    focus() {
+      this.restored = true;
+      document.activeElement = this;
+    },
+  };
+  document.activeElement = previousFocus;
+  document.dialog = dialog;
+  document.previousFocus = previousFocus;
+  document.selection = selection;
   return document;
 }
 
@@ -143,10 +180,25 @@ test("falls back when the Clipboard API is unavailable", async () => {
   const textarea = document.appended[0];
   assert.equal(textarea.value, "guide <text>\n");
   assert.equal(textarea.attributes.readonly, "");
+  assert.equal(textarea.attributes["aria-hidden"], "true");
+  assert.equal(textarea.focused, true);
   assert.equal(textarea.selected, true);
   assert.deepEqual(textarea.selection, [0, 13]);
   assert.deepEqual(document.commands, ["copy"]);
   assert.equal(textarea.removed, true);
+  assert.equal(document.previousFocus.restored, true);
+  assert.equal(document.selection.removed, true);
+  assert.deepEqual(document.selection.added, ["saved-range"]);
+});
+
+test("keeps the fallback selection inside an open modal dialog", async () => {
+  const document = fallbackDocument({modal: true});
+
+  await writeText("workflow guide", undefined, document);
+
+  assert.equal(document.dialog.appended.length, 1);
+  assert.equal(document.dialog.appended[0].value, "workflow guide");
+  assert.deepEqual(document.commands, ["copy"]);
 });
 
 test("falls back when Clipboard API permission is denied", async () => {

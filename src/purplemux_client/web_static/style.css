@@ -185,6 +185,13 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   border-radius: 0;
 }
 
+#manual-copy-dialog { height: auto; max-height: calc(100% - 32px); }
+.manual-copy-content { padding: 18px; }
+.manual-copy-content h2 { margin: 0 0 8px; }
+.manual-copy-content p { color: #aab0bf; font-size: 13px; }
+#manual-copy-content { min-height: 220px; }
+.manual-copy-actions { display: flex; justify-content: flex-end; }
+
 .settings-panel { margin-top: 14px; }
 .settings-panel summary { cursor: pointer; font-weight: 650; }
 .settings-panel[open] summary { margin-bottom: 18px; }

@@ -108,7 +108,8 @@ async function loadApp({runs, details, validation, fetchOverride = null}) {
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
     "validation", "guide-dialog", "guide-open", "guide-close", "guide-copy",
-    "guide-content", "notification-settings", "notifications-enabled",
+    "guide-content", "manual-copy-dialog", "manual-copy-content",
+    "manual-copy-close", "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
     "notify-topic", "replacement-token", "credential-status", "settings-message",
     "save-settings", "test-notification",
@@ -156,7 +157,13 @@ async function loadApp({runs, details, validation, fetchOverride = null}) {
     document,
     fetch,
     navigator: {clipboard: {async writeText() {}}},
-    runnerOutputClipboard: {async write() {}, async writeText() {}},
+    runnerOutputClipboard: {
+      formatOutput(stdout, stderr) {
+        return `stdout:\n${stdout}\n\nstderr:\n${stderr}`;
+      },
+      async write() {},
+      async writeText() {},
+    },
     setTimeout,
     clearTimeout,
     window: {

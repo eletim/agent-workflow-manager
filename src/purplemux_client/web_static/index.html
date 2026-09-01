@@ -131,6 +131,17 @@ emit_step("workspace create", "completed")</textarea>
       <pre id="guide-content">Loading…</pre>
     </dialog>
 
+    <dialog id="manual-copy-dialog" aria-labelledby="manual-copy-title">
+      <div class="manual-copy-content">
+        <h2 id="manual-copy-title">Copy manually</h2>
+        <p>Your browser did not allow programmatic clipboard access. The intended text is selected below; copy it with your browser or keyboard.</p>
+        <textarea id="manual-copy-content" readonly aria-label="Text to copy manually"></textarea>
+        <div class="manual-copy-actions">
+          <button id="manual-copy-close" type="button">Close</button>
+        </div>
+      </div>
+    </dialog>
+
     <script src="/output-copy.js"></script>
     <script src="/app.js"></script>
   </body>

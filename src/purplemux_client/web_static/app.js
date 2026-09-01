@@ -25,6 +25,9 @@ const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
 const guideCopy = document.querySelector("#guide-copy");
 const guideContent = document.querySelector("#guide-content");
+const manualCopyDialog = document.querySelector("#manual-copy-dialog");
+const manualCopyContent = document.querySelector("#manual-copy-content");
+const manualCopyClose = document.querySelector("#manual-copy-close");
 const settingsForm = document.querySelector("#notification-settings");
 const notificationsEnabled = document.querySelector("#notifications-enabled");
 const notifySuccess = document.querySelector("#notify-success");
@@ -187,6 +190,16 @@ async function loadGuide() {
   return guideText;
 }
 
+function showManualCopy(text) {
+  manualCopyContent.value = text;
+  manualCopyDialog.showModal();
+  manualCopyContent.focus();
+  manualCopyContent.select();
+  manualCopyContent.setSelectionRange(0, text.length);
+}
+
+manualCopyClose.addEventListener("click", () => manualCopyDialog.close());
+
 guideOpen.addEventListener("click", async () => {
   guideDialog.showModal();
   try {
@@ -203,14 +216,16 @@ guideCopy.addEventListener("click", async () => {
     window.clearTimeout(guideCopyResetTimer);
   }
   try {
+    const text = await loadGuide();
     await runnerOutputClipboard.writeText(
-      await loadGuide(),
+      text,
       navigator.clipboard,
       document,
     );
     guideCopy.textContent = "Copied";
   } catch (error) {
-    guideCopy.textContent = "Copy failed";
+    guideCopy.textContent = "Copy manually";
+    showManualCopy(guideText || guideContent.textContent);
   }
   guideCopyResetTimer = window.setTimeout(() => {
     guideCopy.textContent = "Copy";
@@ -231,7 +246,11 @@ outputCopy.addEventListener("click", async () => {
     );
     outputCopy.textContent = "Copied";
   } catch (error) {
-    outputCopy.textContent = "Copy failed";
+    outputCopy.textContent = "Copy manually";
+    showManualCopy(runnerOutputClipboard.formatOutput(
+      stdout.textContent,
+      stderr.textContent,
+    ));
   }
   outputCopyResetTimer = window.setTimeout(() => {
     outputCopy.textContent = "Copy output";

@@ -152,6 +152,29 @@ sandbox, and provides no multi-user isolation. It must only bind to a trusted
 private interface and must never be exposed through a public interface,
 wildcard address, port forwarding, Funnel, or a public proxy.
 
+## First-class HTTP browser contract
+
+The normal Runner deployment is an ordinary `http://` origin on localhost, a
+trusted LAN, or a private VPN. It is not an HTTPS-only application with a
+best-effort HTTP fallback. Validation, execution control, recovery, settings,
+progress, output, and normal read/observation APIs must not depend solely on a
+secure-context browser API. Same-origin SSE/EventSource transport and
+favicon/status indicators remain presentation and observation mechanisms over
+the same HTTP origin; neither may become a workflow state source or introduce
+an HTTPS prerequisite.
+
+Clipboard writes prefer `navigator.clipboard.writeText` when it is available.
+On an insecure origin the UI creates and explicitly selects a controlled
+textarea inside the active modal (when present), invokes the browser copy
+command, removes the temporary element, and restores the prior focus and
+selection. Success is reported only after that operation returns success. If
+both browser paths fail, the exact guide or selected-run output is shown in a
+focused, selected manual-copy field instead of reporting false success.
+
+HTTP support does not relax the exact Host, matching Origin, or request-token
+checks. It is scoped to trusted local/LAN/VPN use and is not a claim that the
+Runner is safe for public-Internet exposure.
+
 ## Terminal notification contract
 
 After a Python process reaches one terminal state, the Runner may invoke the
@@ -195,6 +218,11 @@ The `notify` CLI is the integration boundary. It owns notify-server/ntfy HTTP,
 authentication, delivery configuration, and its internal request timeout.
 Agent Workflow Manager must not construct raw ntfy HTTP requests or duplicate
 notify-server authentication behavior.
+
+Browser notification permission, service workers, and Web Push are outside
+the Agent Workflow Manager core contract. Any such delivery belongs behind the
+external notification boundary. Core execution and observation must remain
+available over local/VPN HTTP regardless of secure-context-only Push APIs.
 
 ## Notification settings and test API
 
