@@ -42,8 +42,8 @@ const settingsMessage = document.querySelector("#settings-message");
 const saveSettingsButton = document.querySelector("#save-settings");
 const testNotificationButton = document.querySelector("#test-notification");
 
-let timer = null;
 let requestToken = null;
+let eventSource = null;
 let guideText = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
@@ -52,6 +52,8 @@ let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
+let eventRefreshActive = false;
+let eventRefreshPending = false;
 
 function renderRun(result) {
   const running = result.state === "running";
@@ -113,15 +115,6 @@ function renderRunList(runs) {
       await refresh();
     });
     runList.append(button);
-  }
-}
-
-function updatePolling(runs) {
-  if (runs.some((run) => run.state === "running") && timer === null) {
-    timer = window.setInterval(refresh, 500);
-  } else if (!runs.some((run) => run.state === "running") && timer !== null) {
-    window.clearInterval(timer);
-    timer = null;
   }
 }
 
@@ -303,13 +296,40 @@ async function refresh() {
     ) return;
     if (result) renderRun(result);
     renderRunList(runs);
-    updatePolling(runs);
     renderedRefreshGeneration = requestGeneration;
   } catch (error) {
     if (
       selectionGeneration === activeRunGeneration
       && requestGeneration > renderedRefreshGeneration
     ) stderr.textContent = String(error);
+  }
+}
+
+function connectEvents() {
+  eventSource = new window.EventSource("/api/events");
+  eventSource.addEventListener("runner-change", () => {
+    void scheduleEventRefresh();
+  });
+  eventSource.addEventListener("open", () => {
+    // EventSource reconnects automatically. Reconcile because notifications may
+    // have been missed while the connection was unavailable.
+    void scheduleEventRefresh();
+  });
+}
+
+async function scheduleEventRefresh() {
+  if (eventRefreshActive) {
+    eventRefreshPending = true;
+    return;
+  }
+  eventRefreshActive = true;
+  try {
+    do {
+      eventRefreshPending = false;
+      await refresh();
+    } while (eventRefreshPending);
+  } finally {
+    eventRefreshActive = false;
   }
 }
 
@@ -501,6 +521,7 @@ async function initialize() {
   }
   renderRun(initialStatus);
   await refresh();
+  connectEvents();
   try {
     renderSettings(await request("/api/settings/notifications"));
   } catch (error) {

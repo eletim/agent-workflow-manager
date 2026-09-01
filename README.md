@@ -150,7 +150,9 @@ Stop action without changing another run. `GET /api/runs` lists compact summarie
 `POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
 from its latest safe checkpoint. The original `/api/status`,
 `/api/output`, and `/api/stop` routes remain available and address the most
-recently created run.
+recently created run. `GET /api/events` streams revision-only SSE change
+notifications; initial load, notifications, and reconnects all reconcile through
+the authoritative read APIs rather than treating the stream as workflow state.
 
 Each Run or Validate request owns its execution context. The UI exposes an
 explicit working directory and zero or more arguments (one argument per line),
