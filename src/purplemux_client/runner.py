@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
@@ -70,6 +71,10 @@ class WorkflowValidationError(RuntimeError):
         self.result = result
 
 
+class InvalidExecutionContextError(ValueError):
+    """Raised when a requested run execution context cannot be used."""
+
+
 @dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
@@ -79,6 +84,8 @@ class RunnerSnapshot:
     run_id: int | None
     progress: tuple[ProgressEvent, ...]
     validation: tuple[ValidationIssue, ...]
+    cwd: str
+    args: tuple[str, ...]
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -131,31 +138,58 @@ class PythonRunner:
         self._closed = False
         self._progress: deque[ProgressEvent] = deque(maxlen=max_progress_events)
         self._validation: tuple[ValidationIssue, ...] = ()
+        self._cwd = str(Path.cwd())
+        self._args: tuple[str, ...] = ()
         self._validator = validator or WorkflowValidator()
 
-    def validate(self, code: str) -> ValidationResult:
+    def validate(
+        self,
+        code: str,
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+        args: Sequence[str] = (),
+    ) -> ValidationResult:
+        run_cwd, run_args, child_env = self._execution_context(cwd, args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_available()
-            result = self._validator.validate(code)
+            result = self._validator.validate(code, cwd=run_cwd, environment=child_env)
             with self._lock:
                 self._ensure_available()
-                self._apply_validation(result)
+                self._apply_validation(result, run_cwd, run_args)
                 return result
 
-    def start(self, code: str) -> int:
+    def start(
+        self,
+        code: str,
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+        args: Sequence[str] = (),
+    ) -> int:
+        run_cwd, run_args, child_env = self._execution_context(cwd, args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_available()
-            validation = self._validator.validate(code)
+            validation = self._validator.validate(
+                code, cwd=run_cwd, environment=child_env
+            )
             with self._lock:
                 self._ensure_available()
                 if not validation.valid:
-                    self._apply_validation(validation)
+                    self._apply_validation(validation, run_cwd, run_args)
                     raise WorkflowValidationError(validation)
-                return self._start_validated(code)
+                return self._start_validated(
+                    code, run_cwd=run_cwd, run_args=run_args, child_env=child_env
+                )
 
-    def _start_validated(self, code: str) -> int:
+    def _start_validated(
+        self,
+        code: str,
+        *,
+        run_cwd: Path,
+        run_args: tuple[str, ...],
+        child_env: Mapping[str, str],
+    ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
         )
@@ -166,15 +200,16 @@ class PythonRunner:
         script_path = Path(script.name)
 
         progress_read_fd, progress_write_fd = os.pipe()
-        child_env = os.environ.copy()
+        child_env = dict(child_env)
         child_env[PROGRESS_FD_ENV] = str(progress_write_fd)
 
         try:
             process = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                [sys.executable, str(script_path), *run_args],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=child_env,
+                cwd=run_cwd,
                 pass_fds=(progress_write_fd,),
                 shell=False,
                 start_new_session=True,
@@ -203,6 +238,8 @@ class PythonRunner:
         self._stop_requested = False
         self._progress.clear()
         self._validation = ()
+        self._cwd = str(run_cwd)
+        self._args = run_args
 
         stdout_thread = threading.Thread(
             target=self._read_stream,
@@ -241,7 +278,9 @@ class PythonRunner:
         wait_thread.start()
         return run_id
 
-    def _apply_validation(self, result: ValidationResult) -> None:
+    def _apply_validation(
+        self, result: ValidationResult, run_cwd: Path, run_args: tuple[str, ...]
+    ) -> None:
         self._validation = result.issues
         self._state = "idle" if result.valid else "validation_failed"
         self._stdout.clear()
@@ -253,6 +292,8 @@ class PythonRunner:
         self._exit_code = None
         self._run_id = None
         self._progress.clear()
+        self._cwd = str(run_cwd)
+        self._args = run_args
 
     def snapshot(self) -> RunnerSnapshot:
         with self._lock:
@@ -264,7 +305,49 @@ class PythonRunner:
                 run_id=self._run_id,
                 progress=tuple(self._progress),
                 validation=self._validation,
+                cwd=self._cwd,
+                args=self._args,
             )
+
+    @staticmethod
+    def _execution_context(
+        cwd: str | os.PathLike[str] | None, args: Sequence[str]
+    ) -> tuple[Path, tuple[str, ...], dict[str, str]]:
+        explicit_cwd = cwd is not None
+        try:
+            run_cwd = Path.cwd() if cwd is None else Path(cwd).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InvalidExecutionContextError(
+                f"working directory could not be resolved: {exc}"
+            ) from exc
+        if not run_cwd.is_dir():
+            raise InvalidExecutionContextError(
+                f"working directory is not a directory: {run_cwd}"
+            )
+        if isinstance(args, (str, bytes)):
+            raise InvalidExecutionContextError("args must be a sequence of strings")
+        run_args = tuple(args)
+        if any(not isinstance(argument, str) for argument in run_args):
+            raise InvalidExecutionContextError("args must contain only strings")
+        if any("\0" in argument for argument in run_args):
+            raise InvalidExecutionContextError("args must not contain null bytes")
+
+        child_env = os.environ.copy()
+        if explicit_cwd:
+            virtual_env = child_env.pop("VIRTUAL_ENV", None)
+            virtual_envs = {virtual_env} if virtual_env else set()
+            if sys.prefix != sys.base_prefix:
+                virtual_envs.add(sys.prefix)
+            virtual_env_bins = {
+                os.path.normpath(os.path.join(environment, "bin"))
+                for environment in virtual_envs
+            }
+            child_env["PATH"] = os.pathsep.join(
+                entry
+                for entry in child_env.get("PATH", "").split(os.pathsep)
+                if os.path.normpath(entry) not in virtual_env_bins
+            )
+        return run_cwd, run_args, child_env
 
     def _ensure_available(self) -> None:
         if self._closed:

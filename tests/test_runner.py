@@ -16,6 +16,7 @@ from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.runner import (
     AlreadyRunningError,
+    InvalidExecutionContextError,
     PythonRunner,
     RunnerClosedError,
     RunnerSnapshot,
@@ -104,6 +105,79 @@ def test_empty_code(runner: PythonRunner) -> None:
 
     assert result.state == "success"
     assert result.exit_code == 0
+
+
+def test_run_uses_and_records_explicit_cwd_and_args(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    runner.start(
+        "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
+        cwd=tmp_path,
+        args=("--repo", "path with spaces"),
+    )
+
+    result = wait_until_finished(runner)
+
+    assert json.loads(result.stdout) == [
+        str(tmp_path),
+        ["--repo", "path with spaces"],
+    ]
+    assert result.cwd == str(tmp_path)
+    assert result.args == ("--repo", "path with spaces")
+
+
+def test_explicit_cwd_removes_runner_virtualenv_from_child_environment(
+    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager_venv = tmp_path / "manager-venv"
+    target_bin = tmp_path / "target-bin"
+    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(manager_venv / "bin"), str(target_bin)))
+    )
+
+    runner.start(
+        "import json, os; print(json.dumps([os.environ.get('VIRTUAL_ENV'), "
+        "os.environ.get('PATH')]))",
+        cwd=tmp_path,
+    )
+    result = wait_until_finished(runner)
+
+    assert json.loads(result.stdout) == [None, str(target_bin)]
+
+
+def test_implicit_cwd_preserves_existing_environment(
+    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager_venv = tmp_path / "manager-venv"
+    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
+
+    runner.start("import os; print(os.environ.get('VIRTUAL_ENV'))")
+    result = wait_until_finished(runner)
+
+    assert result.stdout == f"{manager_venv}\n"
+
+
+def test_execution_context_rejects_non_directory(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing"
+
+    with pytest.raises(InvalidExecutionContextError, match="not a directory"):
+        runner.start("", cwd=missing)
+
+
+def test_preflight_resolves_relative_paths_from_explicit_cwd(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    (tmp_path / "input.txt").write_text("input", encoding="utf-8")
+
+    result = runner.validate(
+        "WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}", cwd=tmp_path
+    )
+
+    assert result.valid
+    assert runner.snapshot().cwd == str(tmp_path)
 
 
 def test_stop_long_running_process(runner: PythonRunner) -> None:
@@ -295,6 +369,7 @@ def test_popen_uses_current_interpreter_without_shell(
     assert command[0] == sys.executable
     assert options["shell"] is False
     assert options["start_new_session"] is True
+    assert options["cwd"] == Path.cwd()
 
 
 @pytest.fixture
@@ -462,7 +537,102 @@ def test_runner_http_lifecycle(
         "validation": [],
         "exitCode": 0,
         "runId": 1,
+        "cwd": str(Path.cwd()),
+        "args": [],
     }
+
+
+def test_run_api_passes_run_scoped_execution_context(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
+                "cwd": str(tmp_path),
+                "args": ["--repo", "target repo"],
+            }
+        ),
+        token=token,
+    )
+
+    assert status == 202
+    assert started["cwd"] == str(tmp_path)
+    assert started["args"] == ["--repo", "target repo"]
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, result = request(address, "GET", "/api/status")
+        if result["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert json.loads(str(result["stdout"])) == [
+        str(tmp_path),
+        ["--repo", "target repo"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("context", "error"),
+    [
+        ({"cwd": 42}, "cwd must be a string or null"),
+        ({"args": "--repo target"}, "args must be an array of strings"),
+        ({"args": ["--repo", 42]}, "args must be an array of strings"),
+    ],
+)
+def test_run_api_rejects_invalid_execution_context_shape(
+    web_server: tuple[tuple[str, int], str],
+    context: dict[str, object],
+    error: str,
+) -> None:
+    address, token = web_server
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "", **context}),
+        token=token,
+    )
+
+    assert status == 400
+    assert payload == {"error": error}
+
+
+def test_run_api_rejects_missing_working_directory(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "", "cwd": str(tmp_path / "missing")}),
+        token=token,
+    )
+
+    assert status == 400
+    assert "working directory is not a directory" in str(payload["error"])
+
+
+def test_runner_page_exposes_execution_context_inputs(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/")
+    response = connection.getresponse()
+    page = response.read().decode()
+    connection.close()
+
+    assert response.status == 200
+    assert 'id="working-directory"' in page
+    assert 'id="run-arguments"' in page
 
 
 def test_validation_api_and_run_preflight_report_distinct_state(

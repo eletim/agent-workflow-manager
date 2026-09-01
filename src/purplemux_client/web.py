@@ -20,6 +20,7 @@ from purplemux_client.notification_settings import (
 from purplemux_client.notifier import NotifyCLI
 from purplemux_client.runner import (
     AlreadyRunningError,
+    InvalidExecutionContextError,
     PythonRunner,
     WorkflowValidationError,
 )
@@ -283,9 +284,27 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, {"error": "code must be a string"}
                 )
                 return
+            cwd = payload.get("cwd")
+            if cwd == "":
+                cwd = None
+            if cwd is not None and not isinstance(cwd, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "cwd must be a string or null"},
+                )
+                return
+            args = payload.get("args", [])
+            if not isinstance(args, list) or any(
+                not isinstance(argument, str) for argument in args
+            ):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "args must be an array of strings"},
+                )
+                return
             try:
                 if path == "/api/validate":
-                    result = self.server.runner.validate(code)
+                    result = self.server.runner.validate(code, cwd=cwd, args=args)
                     self._send_json(
                         HTTPStatus.OK
                         if result.valid
@@ -293,7 +312,10 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         self.server.runner.snapshot().as_json(),
                     )
                     return
-                run_id = self.server.runner.start(code)
+                run_id = self.server.runner.start(code, cwd=cwd, args=args)
+            except InvalidExecutionContextError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             except WorkflowValidationError:
                 self._send_json(
                     HTTPStatus.UNPROCESSABLE_ENTITY,

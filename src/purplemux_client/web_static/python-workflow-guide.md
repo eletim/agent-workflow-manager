@@ -27,6 +27,20 @@ PurpleMux UI = runtime inspection and manual intervention
 - The current Python adapter creates Codex and Claude sessions only. Do not
   generate Shell/Bash sessions through `PurpleMuxCLIClient` as if supported.
 
+## Run execution context
+
+Choose the target repository in the Runner's **Working directory** field. Put
+each workflow argument on its own line in **Arguments**; spaces within a line
+belong to that single argument. The resolved directory and argument list are
+shown with the run and apply to both preflight and execution. They are not
+global workflow configuration.
+
+Selecting a working directory prevents the workflow child from inheriting
+Agent Workflow Manager's `VIRTUAL_ENV` and matching virtualenv `bin` path. It
+does not activate the target repository's environment. Commands that require a
+project environment should make it explicit, such as `uv run --project
+/absolute/repo python -m package.module` or an absolute interpreter path.
+
 ## Preflight requirements
 
 Run performs static validation before starting the workflow. Syntax, direct
@@ -45,8 +59,8 @@ WORKFLOW_PREFLIGHT = {
 }
 ```
 
-All keys are optional lists of non-empty strings. Paths relative to the Runner
-process directory are supported. Keep these checks deterministic and
+All keys are optional lists of non-empty strings. Relative paths resolve from
+the selected run working directory. Keep these checks deterministic and
 side-effect-free; do not use metadata as a workflow DSL. Read-only discovery is
 bounded and reports a validation timeout if a lookup stalls. Preflight is
 best-effort and cannot prove that dynamic code or later external operations will

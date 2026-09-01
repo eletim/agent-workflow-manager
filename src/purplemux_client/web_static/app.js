@@ -1,4 +1,7 @@
 const code = document.querySelector("#code");
+const workingDirectory = document.querySelector("#working-directory");
+const runArguments = document.querySelector("#run-arguments");
+const activeContext = document.querySelector("#active-context");
 const runButton = document.querySelector("#run");
 const validateButton = document.querySelector("#validate");
 const stopButton = document.querySelector("#stop");
@@ -46,6 +49,8 @@ function render(result) {
   stopButton.disabled = !running;
   renderProgress(result.progress || []);
   renderValidation(result.validation || []);
+  const renderedArgs = (result.args || []).map((argument) => JSON.stringify(argument)).join(" ");
+  activeContext.textContent = `Configured run: ${result.cwd}${renderedArgs ? ` ${renderedArgs}` : ""}`;
 
   if (running) {
     stdout.scrollTop = stdout.scrollHeight;
@@ -219,12 +224,19 @@ function settingsPayload() {
   return payload;
 }
 
+function executionContextPayload() {
+  return {
+    cwd: workingDirectory.value.trim() || null,
+    args: runArguments.value === "" ? [] : runArguments.value.split("\n"),
+  };
+}
+
 runButton.addEventListener("click", async () => {
   try {
     render(await request("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value}),
+      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     }));
   } catch (error) {
     if (error.result) render(error.result);
@@ -237,7 +249,7 @@ validateButton.addEventListener("click", async () => {
     render(await request("/api/validate", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value}),
+      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     }));
   } catch (error) {
     if (error.result) render(error.result);
@@ -295,7 +307,9 @@ testNotificationButton.addEventListener("click", async () => {
 async function initialize() {
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
-  await refresh();
+  const initialStatus = await request("/api/status");
+  if (!workingDirectory.value) workingDirectory.value = initialStatus.cwd;
+  render(initialStatus);
   try {
     renderSettings(await request("/api/settings/notifications"));
   } catch (error) {
