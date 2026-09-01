@@ -71,9 +71,17 @@ side-effect-free, best-effort static checks, and Run performs the same preflight
 before creating a process. Stop and server shutdown clean up the script's POSIX
 process group, including child processes.
 
+Runs are independent and may execute concurrently. The UI lists every run and
+lets the operator select its state, output, progress, execution context, and
+Stop action without changing another run. `GET /api/runs` lists compact summaries,
+`GET /api/runs/{runId}` reads one snapshot, and
+`POST /api/runs/{runId}/stop` stops only that run. The original `/api/status`,
+`/api/output`, and `/api/stop` routes remain available and address the most
+recently created run.
+
 Each Run or Validate request owns its execution context. The UI exposes an
 explicit working directory and zero or more arguments (one argument per line),
-and the status response keeps the resolved `cwd` and `args` visible with that
+and every run snapshot keeps the resolved `cwd` and `args` visible with that
 run. The HTTP form is `{"code": "...", "cwd": "/absolute/repo", "args":
 ["--repo", "/absolute/repo"]}`. Omitting `cwd` preserves the original behavior
 of using the Runner process directory; an explicit relative path is resolved

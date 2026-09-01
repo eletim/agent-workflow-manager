@@ -2,6 +2,8 @@ const code = document.querySelector("#code");
 const workingDirectory = document.querySelector("#working-directory");
 const runArguments = document.querySelector("#run-arguments");
 const activeContext = document.querySelector("#active-context");
+const runList = document.querySelector("#run-list");
+const runsEmpty = document.querySelector("#runs-empty");
 const runButton = document.querySelector("#run");
 const validateButton = document.querySelector("#validate");
 const stopButton = document.querySelector("#stop");
@@ -36,6 +38,7 @@ let timer = null;
 let requestToken = null;
 let guideText = null;
 let outputCopyResetTimer = null;
+let activeRunId = null;
 
 function render(result) {
   const running = result.state === "running";
@@ -44,19 +47,42 @@ function render(result) {
   stdout.textContent = result.stdout;
   stderr.textContent = result.stderr;
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
-  runButton.disabled = running;
-  validateButton.disabled = running;
-  stopButton.disabled = !running;
+  runButton.disabled = false;
+  validateButton.disabled = false;
+  stopButton.disabled = activeRunId === null || !running;
   renderProgress(result.progress || []);
   renderValidation(result.validation || []);
   const renderedArgs = (result.args || []).map((argument) => JSON.stringify(argument)).join(" ");
-  activeContext.textContent = `Configured run: ${result.cwd}${renderedArgs ? ` ${renderedArgs}` : ""}`;
+  const label = result.runId == null ? "Configured run" : `Run #${result.runId}`;
+  activeContext.textContent = `${label}: ${result.cwd}${renderedArgs ? ` ${renderedArgs}` : ""}`;
 
   if (running) {
     stdout.scrollTop = stdout.scrollHeight;
     stderr.scrollTop = stderr.scrollHeight;
-    if (timer === null) timer = window.setInterval(refresh, 500);
-  } else if (timer !== null) {
+  }
+}
+
+function renderRunList(runs) {
+  runList.replaceChildren();
+  runsEmpty.hidden = runs.length > 0;
+  for (const run of [...runs].reverse()) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
+    button.dataset.state = run.state;
+    button.textContent = `#${run.runId}  ${run.state}  ${run.cwd}`;
+    button.addEventListener("click", async () => {
+      activeRunId = run.runId;
+      await refresh();
+    });
+    runList.append(button);
+  }
+}
+
+function updatePolling(runs) {
+  if (runs.some((run) => run.state === "running") && timer === null) {
+    timer = window.setInterval(refresh, 500);
+  } else if (!runs.some((run) => run.state === "running") && timer !== null) {
     window.clearInterval(timer);
     timer = null;
   }
@@ -188,7 +214,14 @@ async function request(path, options = {}) {
 
 async function refresh() {
   try {
-    render(await request("/api/status"));
+    const {runs} = await request("/api/runs");
+    if (activeRunId === null && runs.length > 0) {
+      activeRunId = runs[runs.length - 1].runId;
+    }
+    const selected = runs.find((run) => run.runId === activeRunId);
+    if (selected) render(await request(`/api/runs/${activeRunId}`));
+    renderRunList(runs);
+    updatePolling(runs);
   } catch (error) {
     stderr.textContent = String(error);
   }
@@ -233,11 +266,14 @@ function executionContextPayload() {
 
 runButton.addEventListener("click", async () => {
   try {
-    render(await request("/api/run", {
+    const result = await request("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
-    }));
+    });
+    activeRunId = result.runId;
+    render(result);
+    await refresh();
   } catch (error) {
     if (error.result) render(error.result);
     stderr.textContent = String(error);
@@ -258,8 +294,9 @@ validateButton.addEventListener("click", async () => {
 });
 
 stopButton.addEventListener("click", async () => {
+  if (activeRunId === null) return;
   try {
-    render(await request("/api/stop", {method: "POST"}));
+    render(await request(`/api/runs/${activeRunId}/stop`, {method: "POST"}));
     await refresh();
   } catch (error) {
     stderr.textContent = String(error);
@@ -310,6 +347,7 @@ async function initialize() {
   const initialStatus = await request("/api/status");
   if (!workingDirectory.value) workingDirectory.value = initialStatus.cwd;
   render(initialStatus);
+  await refresh();
   try {
     renderSettings(await request("/api/settings/notifications"));
   } catch (error) {

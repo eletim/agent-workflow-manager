@@ -15,7 +15,6 @@ import pytest
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.runner import (
-    AlreadyRunningError,
     InvalidExecutionContextError,
     PythonRunner,
     RunnerClosedError,
@@ -36,14 +35,17 @@ def wait_for(
     predicate: Callable[[RunnerSnapshot], bool],
     *,
     timeout: float = 5,
+    run_id: int | None = None,
 ) -> RunnerSnapshot:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        snapshot = runner.snapshot()
+        snapshot = runner.snapshot(run_id)
         if predicate(snapshot):
             return snapshot
         time.sleep(0.02)
-    raise AssertionError(f"runner did not reach expected state: {runner.snapshot()}")
+    raise AssertionError(
+        f"runner did not reach expected state: {runner.snapshot(run_id)}"
+    )
 
 
 def wait_until_finished(runner: PythonRunner) -> RunnerSnapshot:
@@ -217,11 +219,105 @@ def test_runner_rejects_non_posix_platform(monkeypatch: pytest.MonkeyPatch) -> N
         PythonRunner()
 
 
-def test_second_run_is_rejected_while_running(runner: PythonRunner) -> None:
-    runner.start("import time; time.sleep(60)")
+def test_runs_execute_concurrently_with_independent_output(
+    runner: PythonRunner,
+) -> None:
+    first_id = runner.start(
+        'import time; print("first-start", flush=True); time.sleep(60)'
+    )
+    first_running = wait_for(
+        runner,
+        lambda snapshot: snapshot.stdout == "first-start\n",
+        run_id=first_id,
+    )
 
-    with pytest.raises(AlreadyRunningError, match="already running"):
-        runner.start('print("second")')
+    second_id = runner.start('print("second")')
+    second = wait_for(
+        runner,
+        lambda snapshot: snapshot.state != "running",
+        run_id=second_id,
+    )
+
+    assert first_running.state == "running"
+    assert runner.snapshot(first_id).state == "running"
+    assert runner.snapshot(first_id).stdout == "first-start\n"
+    assert second.state == "success"
+    assert second.stdout == "second\n"
+    assert runner.stop(first_id) is True
+
+
+def test_stopping_one_run_does_not_affect_another(runner: PythonRunner) -> None:
+    first_id = runner.start("import time; time.sleep(60)")
+    second_id = runner.start("import time; time.sleep(60)")
+
+    assert runner.stop(first_id) is True
+    first = wait_for(
+        runner,
+        lambda snapshot: snapshot.state != "running",
+        run_id=first_id,
+    )
+
+    assert first.state == "stopped"
+    assert runner.snapshot(second_id).state == "running"
+    assert runner.stop(second_id) is True
+
+
+def test_concurrent_targeted_stops_have_independent_grace_periods() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    stubborn_code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    try:
+        run_ids = [runner.start(stubborn_code) for _ in range(2)]
+        for run_id in run_ids:
+            wait_for(
+                runner,
+                lambda snapshot: snapshot.stdout == "READY\n",
+                run_id=run_id,
+            )
+
+        stop_results: list[bool] = []
+        stop_threads = [
+            threading.Thread(
+                target=lambda target=run_id: stop_results.append(runner.stop(target))
+            )
+            for run_id in run_ids
+        ]
+        started = time.monotonic()
+        for thread in stop_threads:
+            thread.start()
+        for thread in stop_threads:
+            thread.join(timeout=2)
+        elapsed = time.monotonic() - started
+
+        assert all(not thread.is_alive() for thread in stop_threads)
+        assert stop_results == [True, True]
+        assert elapsed < 0.85
+        for run_id in run_ids:
+            assert (
+                wait_for(
+                    runner,
+                    lambda snapshot: snapshot.state != "running",
+                    run_id=run_id,
+                ).state
+                == "stopped"
+            )
+    finally:
+        runner.close()
+
+
+def test_validation_does_not_overwrite_an_active_run(runner: PythonRunner) -> None:
+    run_id = runner.start("import time; time.sleep(60)")
+
+    validation = runner.validate("def broken(")
+
+    assert not validation.valid
+    assert runner.snapshot(run_id).state == "running"
+    assert [snapshot.run_id for snapshot in runner.snapshots()] == [run_id]
+    assert runner.stop(run_id) is True
 
 
 def test_can_run_again_after_finish(runner: PythonRunner) -> None:
@@ -314,6 +410,34 @@ def test_close_stops_process_group() -> None:
     while time.monotonic() < deadline and _process_is_live(child_pid):
         time.sleep(0.05)
     assert not _process_is_live(child_pid)
+
+
+def test_close_cleans_up_stubborn_runs_with_one_bounded_grace_period() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    stubborn_code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    run_ids = [runner.start(stubborn_code) for _ in range(3)]
+    for run_id in run_ids:
+        wait_for(
+            runner,
+            lambda snapshot: snapshot.stdout == "READY\n",
+            run_id=run_id,
+        )
+
+    started = time.monotonic()
+    runner.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.85
+    assert [runner.snapshot(run_id).state for run_id in run_ids] == [
+        "stopped",
+        "stopped",
+        "stopped",
+    ]
 
 
 def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:
@@ -542,6 +666,78 @@ def test_runner_http_lifecycle(
     }
 
 
+def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+
+    status, first = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": "import time; print('first', flush=True); time.sleep(60)",
+                "cwd": str(first_cwd),
+                "args": ["--first"],
+            }
+        ),
+        token=token,
+    )
+    assert status == 202
+    status, second = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": "import time; print('second', flush=True); time.sleep(60)",
+                "cwd": str(second_cwd),
+                "args": ["--second"],
+            }
+        ),
+        token=token,
+    )
+    assert status == 202
+    first_id = int(first["runId"])
+    second_id = int(second["runId"])
+
+    status, listed = request(address, "GET", "/api/runs")
+    assert status == 200
+    assert [(run["runId"], run["cwd"], run["args"]) for run in listed["runs"]] == [
+        (first_id, str(first_cwd), ["--first"]),
+        (second_id, str(second_cwd), ["--second"]),
+    ]
+
+    status, stopped = request(
+        address, "POST", f"/api/runs/{first_id}/stop", token=token
+    )
+    assert status == 202
+    assert stopped["stopped"] is True
+    assert stopped["runId"] == first_id
+
+    status, still_running = request(address, "GET", f"/api/runs/{second_id}")
+    assert status == 200
+    assert still_running["state"] == "running"
+
+    status, _ = request(address, "POST", f"/api/runs/{second_id}/stop", token=token)
+    assert status == 202
+
+
+def test_run_api_returns_not_found_for_unknown_run(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+
+    assert request(address, "GET", "/api/runs/999")[0] == 404
+    assert request(address, "POST", "/api/runs/999/stop")[0] == 403
+    assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
+
+
 def test_run_api_passes_run_scoped_execution_context(
     web_server: tuple[tuple[str, int], str], tmp_path: Path
 ) -> None:
@@ -633,6 +829,7 @@ def test_runner_page_exposes_execution_context_inputs(
     assert response.status == 200
     assert 'id="working-directory"' in page
     assert 'id="run-arguments"' in page
+    assert 'id="run-list"' in page
 
 
 def test_validation_api_and_run_preflight_report_distinct_state(

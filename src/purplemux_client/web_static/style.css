@@ -27,6 +27,23 @@ h2, label { font-size: 14px; font-weight: 650; }
   background: #171b24;
   padding: 16px;
 }
+.runs-panel { margin-bottom: 14px; }
+.runs-heading { display: flex; align-items: center; gap: 12px; }
+.runs-heading h2 { margin: 0; }
+#runs-empty { color: #737d91; font-size: 13px; }
+.run-list { display: grid; gap: 7px; margin-top: 10px; }
+.run-item {
+  width: 100%;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.run-item.selected { border-color: #9b83ef; background: #34295a; }
+.run-item[data-state="running"] { color: #ffd66b; }
+.run-item[data-state="success"] { color: #75e2a8; }
+.run-item[data-state="failed"], .run-item[data-state="stopped"] { color: #ff9ca8; }
 
 textarea, pre, input[type="text"], input[type="url"], input[type="password"] {
   width: 100%;

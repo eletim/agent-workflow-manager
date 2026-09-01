@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
@@ -75,6 +75,10 @@ class InvalidExecutionContextError(ValueError):
     """Raised when a requested run execution context cannot be used."""
 
 
+class RunNotFoundError(LookupError):
+    """Raised when a requested run identifier does not exist."""
+
+
 @dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
@@ -95,9 +99,39 @@ class RunnerSnapshot:
         payload["validation"] = [issue.as_json() for issue in self.validation]
         return payload
 
+    def as_summary_json(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "exitCode": self.exit_code,
+            "runId": self.run_id,
+            "cwd": self.cwd,
+            "args": list(self.args),
+        }
+
+
+@dataclass
+class _RunRecord:
+    run_id: int
+    cwd: str
+    args: tuple[str, ...]
+    process: subprocess.Popen[bytes]
+    process_group_id: int
+    script_path: Path
+    state: RunnerState = "running"
+    stdout: deque[str] = field(default_factory=deque)
+    stderr: deque[str] = field(default_factory=deque)
+    stdout_chars: int = 0
+    stderr_chars: int = 0
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    exit_code: int | None = None
+    stop_requested: bool = False
+    progress: deque[ProgressEvent] = field(default_factory=deque)
+    cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
 
 class PythonRunner:
-    """Run one trusted local Python program at a time."""
+    """Run and observe trusted local Python programs independently."""
 
     def __init__(
         self,
@@ -116,30 +150,25 @@ class PythonRunner:
             raise ValueError("max_progress_events must be positive")
         self._stop_timeout = stop_timeout
         self._max_output_chars = max_output_chars
+        self._max_progress_events = max_progress_events
         self._lock = threading.Lock()
         self._validation_lock = threading.Lock()
-        self._process: subprocess.Popen[bytes] | None = None
-        self._process_group_id: int | None = None
-        self._group_cleanup_lock = threading.Lock()
-        self._script_path: Path | None = None
-        self._state: RunnerState = "idle"
-        self._stdout: deque[str] = deque()
-        self._stderr: deque[str] = deque()
-        self._stdout_chars = 0
-        self._stderr_chars = 0
-        self._stdout_truncated = False
-        self._stderr_truncated = False
-        self._exit_code: int | None = None
-        self._run_id: int | None = None
+        self._runs: dict[int, _RunRecord] = {}
         self._next_run_id = 1
-        self._stop_requested = False
         self._notifier = notifier
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
-        self._progress: deque[ProgressEvent] = deque(maxlen=max_progress_events)
-        self._validation: tuple[ValidationIssue, ...] = ()
-        self._cwd = str(Path.cwd())
-        self._args: tuple[str, ...] = ()
+        self._preview = RunnerSnapshot(
+            state="idle",
+            stdout="",
+            stderr="",
+            exit_code=None,
+            run_id=None,
+            progress=(),
+            validation=(),
+            cwd=str(Path.cwd()),
+            args=(),
+        )
         self._validator = validator or WorkflowValidator()
 
     def validate(
@@ -152,12 +181,12 @@ class PythonRunner:
         run_cwd, run_args, child_env = self._execution_context(cwd, args)
         with self._validation_lock:
             with self._lock:
-                self._ensure_available()
+                self._ensure_open()
             result = self._validator.validate(code, cwd=run_cwd, environment=child_env)
             with self._lock:
-                self._ensure_available()
+                self._ensure_open()
                 self._apply_validation(result, run_cwd, run_args)
-                return result
+            return result
 
     def start(
         self,
@@ -169,12 +198,12 @@ class PythonRunner:
         run_cwd, run_args, child_env = self._execution_context(cwd, args)
         with self._validation_lock:
             with self._lock:
-                self._ensure_available()
+                self._ensure_open()
             validation = self._validator.validate(
                 code, cwd=run_cwd, environment=child_env
             )
             with self._lock:
-                self._ensure_available()
+                self._ensure_open()
                 if not validation.valid:
                     self._apply_validation(validation, run_cwd, run_args)
                     raise WorkflowValidationError(validation)
@@ -223,45 +252,39 @@ class PythonRunner:
 
         run_id = self._next_run_id
         self._next_run_id += 1
-        self._process = process
-        self._process_group_id = process.pid
-        self._script_path = script_path
-        self._state = "running"
-        self._stdout.clear()
-        self._stderr.clear()
-        self._stdout_chars = 0
-        self._stderr_chars = 0
-        self._stdout_truncated = False
-        self._stderr_truncated = False
-        self._exit_code = None
-        self._run_id = run_id
-        self._stop_requested = False
-        self._progress.clear()
-        self._validation = ()
-        self._cwd = str(run_cwd)
-        self._args = run_args
+        run = _RunRecord(
+            run_id=run_id,
+            cwd=str(run_cwd),
+            args=run_args,
+            process=process,
+            process_group_id=process.pid,
+            script_path=script_path,
+            progress=deque(maxlen=self._max_progress_events),
+        )
+        self._runs[run_id] = run
 
         stdout_thread = threading.Thread(
             target=self._read_stream,
-            args=(process.stdout, "stdout"),
+            args=(run, process.stdout, "stdout"),
             name=f"python-runner-stdout-{run_id}",
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=self._read_stream,
-            args=(process.stderr, "stderr"),
+            args=(run, process.stderr, "stderr"),
             name=f"python-runner-stderr-{run_id}",
             daemon=True,
         )
         progress_thread = threading.Thread(
             target=self._read_progress,
-            args=(progress_read_fd,),
+            args=(run, progress_read_fd),
             name=f"python-runner-progress-{run_id}",
             daemon=True,
         )
         wait_thread = threading.Thread(
             target=self._wait_for_process,
             args=(
+                run,
                 process,
                 script_path,
                 stdout_thread,
@@ -281,33 +304,52 @@ class PythonRunner:
     def _apply_validation(
         self, result: ValidationResult, run_cwd: Path, run_args: tuple[str, ...]
     ) -> None:
-        self._validation = result.issues
-        self._state = "idle" if result.valid else "validation_failed"
-        self._stdout.clear()
-        self._stderr.clear()
-        self._stdout_chars = 0
-        self._stderr_chars = 0
-        self._stdout_truncated = False
-        self._stderr_truncated = False
-        self._exit_code = None
-        self._run_id = None
-        self._progress.clear()
-        self._cwd = str(run_cwd)
-        self._args = run_args
+        self._preview = RunnerSnapshot(
+            state="idle" if result.valid else "validation_failed",
+            stdout="",
+            stderr="",
+            exit_code=None,
+            run_id=None,
+            progress=(),
+            validation=result.issues,
+            cwd=str(run_cwd),
+            args=run_args,
+        )
 
-    def snapshot(self) -> RunnerSnapshot:
+    def snapshot(self, run_id: int | None = None) -> RunnerSnapshot:
         with self._lock:
-            return RunnerSnapshot(
-                state=self._state,
-                stdout=self._render_output(self._stdout, self._stdout_truncated),
-                stderr=self._render_output(self._stderr, self._stderr_truncated),
-                exit_code=self._exit_code,
-                run_id=self._run_id,
-                progress=tuple(self._progress),
-                validation=self._validation,
-                cwd=self._cwd,
-                args=self._args,
-            )
+            if run_id is None:
+                if not self._runs:
+                    return self._preview
+                run_id = next(reversed(self._runs))
+            return self._snapshot_run(self._get_run(run_id))
+
+    def snapshots(self) -> tuple[RunnerSnapshot, ...]:
+        with self._lock:
+            return tuple(self._snapshot_run(run) for run in self._runs.values())
+
+    def validation_snapshot(self) -> RunnerSnapshot:
+        with self._lock:
+            return self._preview
+
+    def _snapshot_run(self, run: _RunRecord) -> RunnerSnapshot:
+        return RunnerSnapshot(
+            state=run.state,
+            stdout=self._render_output(run.stdout, run.stdout_truncated),
+            stderr=self._render_output(run.stderr, run.stderr_truncated),
+            exit_code=run.exit_code,
+            run_id=run.run_id,
+            progress=tuple(run.progress),
+            validation=(),
+            cwd=run.cwd,
+            args=run.args,
+        )
+
+    def _get_run(self, run_id: int) -> _RunRecord:
+        try:
+            return self._runs[run_id]
+        except KeyError as exc:
+            raise RunNotFoundError(f"run {run_id} was not found") from exc
 
     @staticmethod
     def _execution_context(
@@ -349,40 +391,53 @@ class PythonRunner:
             )
         return run_cwd, run_args, child_env
 
-    def _ensure_available(self) -> None:
+    def _ensure_open(self) -> None:
         if self._closed:
             raise RunnerClosedError("the Python Runner is closed")
-        if self._process is not None:
-            raise AlreadyRunningError("a Python process is already running")
 
-    def stop(self) -> bool:
+    def stop(self, run_id: int | None = None) -> bool:
         with self._lock:
-            process = self._process
-            process_group_id = self._process_group_id
-            if process is None or process_group_id is None:
+            if run_id is None:
+                if not self._runs:
+                    return False
+                run = self._runs[next(reversed(self._runs))]
+            else:
+                run = self._get_run(run_id)
+            if run.state != "running":
                 return False
-            self._stop_requested = True
+            run.stop_requested = True
 
-        self._terminate_process_group(process_group_id)
+        self._terminate_process_group(run)
         return True
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            process = self._process
-            process_group_id = self._process_group_id
-            if process is not None and process_group_id is not None:
-                self._stop_requested = True
+            active_runs = tuple(
+                run for run in self._runs.values() if run.state == "running"
+            )
+            for run in active_runs:
+                run.stop_requested = True
         self._validator.close()
-        if process_group_id is not None:
-            self._terminate_process_group(process_group_id)
-        if process is not None:
+        cleanup_threads = tuple(
+            threading.Thread(
+                target=self._terminate_process_group,
+                args=(run,),
+                name=f"python-runner-cleanup-{run.run_id}",
+                daemon=True,
+            )
+            for run in active_runs
+        )
+        for thread in cleanup_threads:
+            thread.start()
+        for thread in cleanup_threads:
+            thread.join()
+        for run in active_runs:
             try:
-                process.wait(timeout=self._stop_timeout + 1)
+                run.process.wait(timeout=self._stop_timeout + 1)
             except subprocess.TimeoutExpired:
-                if process_group_id is not None:
-                    self._kill_process_group(process_group_id)
-                process.wait()
+                self._kill_process_group(run.process_group_id)
+                run.process.wait()
         notifier = self._notifier
         if notifier is not None:
             try:
@@ -403,7 +458,10 @@ class PythonRunner:
                 thread.join()
 
     def _read_stream(
-        self, stream: IO[bytes] | None, destination: Literal["stdout", "stderr"]
+        self,
+        run: _RunRecord,
+        stream: IO[bytes] | None,
+        destination: Literal["stdout", "stderr"],
     ) -> None:
         if stream is None:
             return
@@ -411,26 +469,29 @@ class PythonRunner:
         try:
             while chunk := os.read(stream.fileno(), 4096):
                 text = decoder.decode(chunk)
-                self._append_output(destination, text)
+                self._append_output(run, destination, text)
             final_text = decoder.decode(b"", final=True)
             if final_text:
-                self._append_output(destination, final_text)
+                self._append_output(run, destination, final_text)
         finally:
             stream.close()
 
     def _append_output(
-        self, destination: Literal["stdout", "stderr"], text: str
+        self,
+        run: _RunRecord,
+        destination: Literal["stdout", "stderr"],
+        text: str,
     ) -> None:
         with self._lock:
-            chunks = self._stdout if destination == "stdout" else self._stderr
+            chunks = run.stdout if destination == "stdout" else run.stderr
             size_attribute = (
-                "_stdout_chars" if destination == "stdout" else "_stderr_chars"
+                "stdout_chars" if destination == "stdout" else "stderr_chars"
             )
             truncated_attribute = (
-                "_stdout_truncated" if destination == "stdout" else "_stderr_truncated"
+                "stdout_truncated" if destination == "stdout" else "stderr_truncated"
             )
             chunks.append(text)
-            size = getattr(self, size_attribute) + len(text)
+            size = getattr(run, size_attribute) + len(text)
             was_truncated = size > self._max_output_chars
             while size > self._max_output_chars:
                 overflow = size - self._max_output_chars
@@ -440,11 +501,11 @@ class PythonRunner:
                 else:
                     chunks[0] = first[overflow:]
                     size -= overflow
-            setattr(self, size_attribute, size)
+            setattr(run, size_attribute, size)
             if was_truncated:
-                setattr(self, truncated_attribute, True)
+                setattr(run, truncated_attribute, True)
 
-    def _read_progress(self, fd: int) -> None:
+    def _read_progress(self, run: _RunRecord, fd: int) -> None:
         try:
             with os.fdopen(fd, "rb") as stream:
                 while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
@@ -457,7 +518,7 @@ class PythonRunner:
                     )
                     if event is not None:
                         with self._lock:
-                            self._progress.append(event)
+                            run.progress.append(event)
         except OSError:
             return
 
@@ -505,6 +566,7 @@ class PythonRunner:
 
     def _wait_for_process(
         self,
+        run: _RunRecord,
         process: subprocess.Popen[bytes],
         script_path: Path,
         stdout_thread: threading.Thread,
@@ -513,30 +575,26 @@ class PythonRunner:
     ) -> None:
         try:
             exit_code = process.wait()
-            self._terminate_process_group(process.pid)
+            self._terminate_process_group(run)
             stdout_thread.join()
             stderr_thread.join()
             progress_thread.join()
             script_path.unlink(missing_ok=True)
             with self._lock:
-                if self._process is not process:
+                if run.process is not process:
                     return
-                self._exit_code = exit_code
-                self._state = (
+                run.exit_code = exit_code
+                run.state = (
                     "stopped"
-                    if self._stop_requested
+                    if run.stop_requested
                     else "success"
                     if exit_code == 0
                     else "failed"
                 )
-                run_id = self._run_id
-                terminal_state = self._state
-                self._process = None
-                self._process_group_id = None
-                self._script_path = None
+                terminal_state = run.state
 
             self._notify_terminal(
-                run_id=run_id, state=terminal_state, exit_code=exit_code
+                run_id=run.run_id, state=terminal_state, exit_code=exit_code
             )
         finally:
             with self._lock:
@@ -576,8 +634,9 @@ class PythonRunner:
                 result.diagnostic,
             )
 
-    def _terminate_process_group(self, process_group_id: int) -> None:
-        with self._group_cleanup_lock:
+    def _terminate_process_group(self, run: _RunRecord) -> None:
+        process_group_id = run.process_group_id
+        with run.cleanup_lock:
             if not self._process_group_exists(process_group_id):
                 return
             try:
