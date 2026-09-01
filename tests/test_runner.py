@@ -69,6 +69,15 @@ def test_stderr(runner: PythonRunner) -> None:
     assert result.stderr == "BAD\n"
 
 
+def test_standard_library_alias_import_passes_and_runs(runner: PythonRunner) -> None:
+    runner.start("import os.path; print(os.path.basename('/tmp/example'))")
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert result.stdout == "example\n"
+
+
 def test_nonzero_exit(runner: PythonRunner) -> None:
     runner.start("raise SystemExit(3)")
 
@@ -181,8 +190,9 @@ def test_close_cannot_miss_concurrent_start_registration(
     allow_popen = threading.Event()
 
     def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-        popen_entered.set()
-        assert allow_popen.wait(timeout=3)
+        if kwargs.get("start_new_session") is True:
+            popen_entered.set()
+            assert allow_popen.wait(timeout=3)
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
 
     monkeypatch.setattr(subprocess, "Popen", blocking_popen)
@@ -276,7 +286,11 @@ def test_popen_uses_current_interpreter_without_shell(
     runner.start("")
     wait_until_finished(runner)
 
-    command, options = calls[0]
+    command, options = next(
+        (command, options)
+        for command, options in calls
+        if options.get("start_new_session") is True
+    )
     assert isinstance(command, list)
     assert command[0] == sys.executable
     assert options["shell"] is False

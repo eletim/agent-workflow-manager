@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import ast
 import importlib.machinery
+import json
 import os
-import queue
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
 PREFLIGHT_KEYS = frozenset({"commands", "imports", "environment", "paths"})
 DEFAULT_CHECK_TIMEOUT = 2.0
+STDLIB_MODULE_ALIASES = frozenset({"os.path"})
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,8 @@ class WorkflowValidator:
             else tuple(module_search_path)
         )
         self._check_timeout = check_timeout
+        self._worker_lock = threading.Lock()
+        self._workers: set[subprocess.Popen[str]] = set()
 
     def validate(self, code: str) -> ValidationResult:
         try:
@@ -83,43 +87,95 @@ class WorkflowValidator:
                 )
             )
 
-        results: queue.Queue[tuple[ValidationIssue, ...] | Exception] = queue.Queue(
-            maxsize=1
-        )
+        return self._run_worker(code)
 
-        def check() -> None:
-            try:
-                results.put(self._validate_read_checks(tree))
-            except Exception as exc:
-                results.put(exc)
+    def cancel(self) -> None:
+        """Kill and reap any active read-only validation helper."""
+        with self._worker_lock:
+            workers = tuple(self._workers)
+        for worker in workers:
+            if worker.poll() is None:
+                worker.kill()
+        for worker in workers:
+            worker.wait()
+        with self._worker_lock:
+            self._workers.difference_update(workers)
 
-        worker = threading.Thread(
-            target=check,
-            name="workflow-preflight-checks",
-            daemon=True,
+    def _run_worker(self, code: str) -> ValidationResult:
+        payload = json.dumps(
+            {
+                "code": code,
+                "environment": dict(self._environment),
+                "cwd": str(self._cwd),
+                "moduleSearchPath": self._module_search_path,
+            }
         )
-        worker.start()
-        worker.join(self._check_timeout)
-        if worker.is_alive():
-            return ValidationResult(
-                (
-                    ValidationIssue(
-                        "timeout",
-                        f"workflow validation checks exceeded {self._check_timeout:g}s",
-                    ),
+        try:
+            with self._worker_lock:
+                worker = subprocess.Popen(
+                    self._worker_command(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    shell=False,
                 )
-            )
-        checked = results.get_nowait()
-        if isinstance(checked, Exception):
+                self._workers.add(worker)
+        except Exception as exc:
             return ValidationResult(
                 (
                     ValidationIssue(
                         "validation",
-                        f"workflow validation check failed: {type(checked).__name__}: {checked}",
+                        f"could not start workflow validation checks: {type(exc).__name__}: {exc}",
                     ),
                 )
             )
-        return ValidationResult(checked)
+        try:
+            try:
+                stdout, stderr = worker.communicate(
+                    payload, timeout=self._check_timeout
+                )
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.communicate()
+                return ValidationResult(
+                    (
+                        ValidationIssue(
+                            "timeout",
+                            f"workflow validation checks exceeded {self._check_timeout:g}s",
+                        ),
+                    )
+                )
+        finally:
+            with self._worker_lock:
+                self._workers.discard(worker)
+        if worker.returncode != 0:
+            detail = stderr.strip() or f"helper exited with status {worker.returncode}"
+            return ValidationResult(
+                (
+                    ValidationIssue(
+                        "validation",
+                        f"workflow validation check failed: {detail}",
+                    ),
+                )
+            )
+        try:
+            values = json.loads(stdout)
+            issues = tuple(ValidationIssue(**value) for value in values)
+        except (json.JSONDecodeError, TypeError) as exc:
+            return ValidationResult(
+                (
+                    ValidationIssue(
+                        "validation",
+                        f"workflow validation returned an invalid response: {type(exc).__name__}: {exc}",
+                    ),
+                )
+            )
+        return ValidationResult(issues)
+
+    @staticmethod
+    def _worker_command() -> list[str]:
+        return [sys.executable, "-m", "purplemux_client.preflight", "--check-worker"]
 
     def _validate_read_checks(self, tree: ast.Module) -> tuple[ValidationIssue, ...]:
         issues: list[ValidationIssue] = []
@@ -337,6 +393,8 @@ class WorkflowValidator:
             )
 
     def _module_exists(self, name: str) -> bool:
+        if name in STDLIB_MODULE_ALIASES:
+            return True
         parts = name.split(".")
         if any(not part for part in parts):
             return False
@@ -389,3 +447,19 @@ class WorkflowValidator:
                 node.col_offset + 1,
             )
         )
+
+
+def _run_check_worker() -> None:
+    payload = json.load(sys.stdin)
+    validator = WorkflowValidator(
+        environment=payload["environment"],
+        cwd=Path(payload["cwd"]),
+        module_search_path=payload["moduleSearchPath"],
+    )
+    tree = ast.parse(payload["code"], filename="<workflow>")
+    issues = validator._validate_read_checks(tree)
+    json.dump([issue.as_json() for issue in issues], sys.stdout)
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--check-worker"]:
+    _run_check_worker()
