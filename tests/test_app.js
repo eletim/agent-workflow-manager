@@ -45,6 +45,10 @@ class Element {
     this.children = children;
   }
 
+  prepend(...children) {
+    this.children.unshift(...children);
+  }
+
   setAttribute(name, value) {
     this.attributes[name] = value;
   }
@@ -232,6 +236,113 @@ function selectedRun(elements) {
     (element) => element.className.includes("selected"),
   );
 }
+
+function runItem(elements, runId) {
+  return elements["run-list"].children.find(
+    (element) => element.dataset.runId === String(runId),
+  );
+}
+
+function markerState(elements, runId) {
+  const item = runItem(elements, runId);
+  assert.equal(item.children[0].className, "run-state-marker");
+  assert.equal(item.children[0].attributes["aria-hidden"], "true");
+  return item.dataset.state;
+}
+
+test("run rows render independent decorative indicators from textual states", async () => {
+  const runs = [
+    {runId: 1, state: "running", cwd: "/work/run-1"},
+    {runId: 2, state: "success", cwd: "/work/run-2"},
+    {runId: 3, state: "failed", cwd: "/work/run-3"},
+    {runId: 4, state: "stopped", cwd: "/work/run-4"},
+    {runId: 5, state: "suspended", cwd: "/work/run-5"},
+  ];
+  const details = Object.fromEntries(runs.map((run) => [
+    run.runId,
+    snapshot({runId: run.runId, state: run.state, stdout: run.state}),
+  ]));
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  for (const run of runs) {
+    assert.equal(markerState(elements, run.runId), run.state);
+    assert.match(runItem(elements, run.runId).textContent, new RegExp(`  ${run.state}  `));
+  }
+});
+
+test("state changes and selection update independently", async () => {
+  const runs = [
+    {runId: 1, state: "running", cwd: "/work/run-1"},
+    {runId: 2, state: "success", cwd: "/work/run-2"},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "running", stdout: "active"}),
+    2: snapshot({runId: 2, state: "success", stdout: "done"}),
+  };
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  assert.ok(runItem(elements, 1).className.includes("selected"));
+
+  for (const state of ["success", "failed", "stopped", "suspended"]) {
+    runs[0] = {...runs[0], state};
+    details[1] = {...details[1], state};
+    eventSource.emit("runner-change");
+    await waitFor(() => markerState(elements, 1) === state);
+
+    assert.ok(runItem(elements, 1).className.includes("selected"));
+    assert.equal(markerState(elements, 2), "success");
+  }
+
+  await runItem(elements, 2).dispatch("click");
+  assert.ok(runItem(elements, 2).className.includes("selected"));
+  assert.equal(markerState(elements, 1), "suspended");
+  assert.equal(markerState(elements, 2), "success");
+});
+
+test("stale refresh cannot roll a newer run indicator back", async () => {
+  const delayedRuns = deferred();
+  let delayNextRuns = false;
+  const runs = [{runId: 1, state: "running", cwd: "/work/run-1"}];
+  const details = {1: snapshot({runId: 1, state: "running", stdout: "active"})};
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayNextRuns && url === "/api/runs") {
+        delayNextRuns = false;
+        return delayedRuns.promise;
+      }
+      return undefined;
+    },
+  });
+
+  delayNextRuns = true;
+  const staleRefresh = runItem(elements, 1).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  runs[0] = {...runs[0], state: "success"};
+  details[1] = {...details[1], state: "success", exitCode: 0};
+  eventSource.emit("runner-change");
+  await waitFor(() => markerState(elements, 1) === "success");
+
+  delayedRuns.resolve(response({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+  }));
+  await staleRefresh;
+
+  assert.equal(markerState(elements, 1), "success");
+  assert.match(runItem(elements, 1).textContent, /  success  /);
+});
 
 test("initial state loads through read APIs before any SSE event", async () => {
   const running = snapshot({runId: 1, state: "running", stdout: "already running"});
