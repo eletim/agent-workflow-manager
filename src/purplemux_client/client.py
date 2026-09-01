@@ -36,7 +36,7 @@ class ResultNotReady(WorkerFailure):
 
 
 class MutationOutcomeUnknown(WorkerFailure):
-    """Raised when a timed-out mutation may have been applied remotely."""
+    """Raised when a mutation may have been applied but cannot be confirmed."""
 
 
 @dataclass(frozen=True)
@@ -165,7 +165,10 @@ class PurpleMuxCLIClient:
         )
         session_id = data.get("tabId") or data.get("tab_id") or data.get("id")
         if not isinstance(session_id, str) or not session_id:
-            raise WorkerFailure("PurpleMux create did not return a tab ID")
+            raise MutationOutcomeUnknown(
+                "PurpleMux create succeeded without a usable tab ID; "
+                "remote outcome is unknown"
+            )
         return session_id
 
     def start_shell(self, request: ShellCommandRequest) -> str:
@@ -196,8 +199,9 @@ class PurpleMuxCLIClient:
         )
         session_id = data.get("tabId") or data.get("tab_id") or data.get("id")
         if not isinstance(session_id, str) or not session_id:
-            raise WorkerFailure(
-                "PurpleMux shell terminal create did not return a tab ID"
+            raise MutationOutcomeUnknown(
+                "PurpleMux shell terminal create succeeded without a usable tab ID; "
+                "remote outcome is unknown"
             )
 
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
@@ -632,11 +636,17 @@ class PurpleMuxCLIClient:
         try:
             data = json.loads(completed.stdout)
         except (json.JSONDecodeError, TypeError) as exc:
-            raise WorkerFailure(
-                f"PurpleMux {operation} returned malformed JSON"
-            ) from exc
+            message = f"PurpleMux {operation} returned malformed JSON"
+            if not read_only:
+                message += "; remote outcome is unknown"
+                raise MutationOutcomeUnknown(message) from exc
+            raise WorkerFailure(message) from exc
         if not isinstance(data, dict):
-            raise WorkerFailure(f"PurpleMux {operation} returned non-object JSON")
+            message = f"PurpleMux {operation} returned non-object JSON"
+            if not read_only:
+                message += "; remote outcome is unknown"
+                raise MutationOutcomeUnknown(message)
+            raise WorkerFailure(message)
         return cast(dict[str, Any], data)
 
     def _run(

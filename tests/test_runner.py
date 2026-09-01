@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -568,6 +569,42 @@ def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:
     while time.monotonic() < deadline and _process_is_live(child_pid):
         time.sleep(0.05)
     assert not _process_is_live(child_pid)
+
+
+def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> None:
+    runner = PythonRunner(stop_timeout=0.2)
+    child_pid: int | None = None
+    try:
+        run_id = runner.start(
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        result = wait_for(runner, lambda snapshot: snapshot.stdout.strip() != "")
+        child_pid = int(result.stdout.strip())
+
+        started = time.monotonic()
+        assert runner.stop(run_id) is True
+        result = wait_for(
+            runner,
+            lambda snapshot: snapshot.state == "stopped",
+            timeout=2,
+            run_id=run_id,
+        )
+        runner.close()
+        elapsed = time.monotonic() - started
+
+        assert result.state == "stopped"
+        assert elapsed < 1.5
+        assert _process_is_live(child_pid)
+    finally:
+        runner.close()
+        if child_pid is not None and _process_is_live(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
 
 
 def _process_is_live(pid: int) -> bool:

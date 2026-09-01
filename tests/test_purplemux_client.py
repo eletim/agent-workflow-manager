@@ -126,7 +126,7 @@ def test_create_rejects_unknown_provider() -> None:
 def test_create_requires_tab_id() -> None:
     runner = FakeRunner([completed({"workspaceId": "ws-test"})])
 
-    with pytest.raises(WorkerFailure, match="did not return a tab ID"):
+    with pytest.raises(MutationOutcomeUnknown, match="outcome is unknown"):
         client(runner).create_session(request())
 
 
@@ -205,6 +205,38 @@ def test_shell_start_timeout_reports_created_tab_for_reconciliation(tmp_path) ->
         )
 
     cli.close_session("tab-shell")
+
+
+@pytest.mark.parametrize("output", ["not-json", "[]", '{"workspaceId":"ws-test"}'])
+def test_shell_create_unusable_response_has_unknown_outcome(
+    tmp_path, output: str
+) -> None:
+    runner = FakeRunner([completed(output)])
+
+    with pytest.raises(MutationOutcomeUnknown, match="outcome is unknown"):
+        client(runner).start_shell(
+            ShellCommandRequest(command="make test", cwd=str(tmp_path), name="Run 5")
+        )
+
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("output", ["not-json", "[]"])
+def test_shell_send_unusable_response_preserves_created_tab_correlation(
+    tmp_path, output: str
+) -> None:
+    runner = FakeRunner([completed({"tabId": "tab-shell"}), completed(output)])
+    cli = client(runner)
+
+    with pytest.raises(
+        MutationOutcomeUnknown,
+        match="shell terminal tab-shell was created.*outcome is unknown",
+    ):
+        cli.start_shell(
+            ShellCommandRequest(command="make test", cwd=str(tmp_path), name="Run 5")
+        )
+
+    assert "tab-shell" in cli._shell_runs
 
 
 def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> None:

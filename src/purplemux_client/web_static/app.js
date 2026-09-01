@@ -44,6 +44,10 @@ let guideText = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
+let activeRunGeneration = 0;
+let refreshRequestGeneration = 0;
+let renderedRefreshGeneration = 0;
+let validationRequestGeneration = 0;
 
 function renderRun(result) {
   const running = result.state === "running";
@@ -101,6 +105,7 @@ function renderRunList(runs) {
     button.textContent = `#${run.runId}  ${run.state}  ${run.cwd}`;
     button.addEventListener("click", async () => {
       activeRunId = run.runId;
+      activeRunGeneration += 1;
       await refresh();
     });
     runList.append(button);
@@ -252,17 +257,35 @@ async function request(path, options = {}) {
 }
 
 async function refresh() {
+  const requestGeneration = ++refreshRequestGeneration;
+  let selectionGeneration = activeRunGeneration;
   try {
     const {runs} = await request("/api/runs");
+    if (selectionGeneration !== activeRunGeneration) return;
     if (activeRunId === null && runs.length > 0) {
       activeRunId = runs[runs.length - 1].runId;
+      activeRunGeneration += 1;
+      selectionGeneration = activeRunGeneration;
     }
-    const selected = runs.find((run) => run.runId === activeRunId);
-    if (selected) renderRun(await request(`/api/runs/${activeRunId}`));
+    const targetRunId = activeRunId;
+    const selected = runs.find((run) => run.runId === targetRunId);
+    const result = selected
+      ? await request(`/api/runs/${targetRunId}`)
+      : null;
+    if (
+      selectionGeneration !== activeRunGeneration
+      || targetRunId !== activeRunId
+      || requestGeneration <= renderedRefreshGeneration
+    ) return;
+    if (result) renderRun(result);
     renderRunList(runs);
     updatePolling(runs);
+    renderedRefreshGeneration = requestGeneration;
   } catch (error) {
-    stderr.textContent = String(error);
+    if (
+      selectionGeneration === activeRunGeneration
+      && requestGeneration > renderedRefreshGeneration
+    ) stderr.textContent = String(error);
   }
 }
 
@@ -304,37 +327,52 @@ function executionContextPayload() {
 }
 
 runButton.addEventListener("click", async () => {
+  const selectionGeneration = ++activeRunGeneration;
+  const validationGeneration = ++validationRequestGeneration;
   try {
     const result = await request("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     });
-    activeRunId = result.runId;
-    renderValidation(result.validation || []);
-    renderRun(result);
+    if (selectionGeneration === activeRunGeneration) {
+      activeRunId = result.runId;
+      activeRunGeneration += 1;
+      if (validationGeneration === validationRequestGeneration) {
+        renderValidation(result.validation || []);
+      }
+      renderRun(result);
+    }
     await refresh();
   } catch (error) {
     if (Array.isArray(error.result?.validation)) {
-      renderValidation(error.result.validation);
-    } else {
+      if (validationGeneration === validationRequestGeneration) {
+        renderValidation(error.result.validation);
+      }
+    } else if (selectionGeneration === activeRunGeneration) {
       stderr.textContent = String(error);
     }
   }
 });
 
 validateButton.addEventListener("click", async () => {
+  const requestGeneration = ++validationRequestGeneration;
   try {
     const result = await request("/api/validate", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     });
-    renderValidation(result.validation || []);
+    if (requestGeneration === validationRequestGeneration) {
+      renderValidation(result.validation || []);
+    }
   } catch (error) {
-    if (Array.isArray(error.result?.validation)) {
+    if (
+      requestGeneration === validationRequestGeneration
+      && Array.isArray(error.result?.validation)
+    ) {
       renderValidation(error.result.validation);
-    } else {
+    } else if (requestGeneration === validationRequestGeneration) {
       stderr.textContent = String(error);
     }
   }
@@ -342,23 +380,51 @@ validateButton.addEventListener("click", async () => {
 
 stopButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
+  const targetRunId = activeRunId;
+  const selectionGeneration = ++activeRunGeneration;
   try {
-    renderRun(await request(`/api/runs/${activeRunId}/stop`, {method: "POST"}));
+    const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) {
+      activeRunGeneration += 1;
+      renderRun(result);
+    }
     await refresh();
   } catch (error) {
-    stderr.textContent = String(error);
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) stderr.textContent = String(error);
   }
 });
 
 resumeButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
+  const targetRunId = activeRunId;
+  const selectionGeneration = ++activeRunGeneration;
+  const validationGeneration = ++validationRequestGeneration;
   resumeButton.disabled = true;
   try {
-    renderRun(await request(`/api/runs/${activeRunId}/resume`, {method: "POST"}));
+    const result = await request(`/api/runs/${targetRunId}/resume`, {method: "POST"});
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) {
+      activeRunGeneration += 1;
+      renderRun(result);
+    }
     await refresh();
   } catch (error) {
-    if (error.result) renderValidation(error.result.validation || []);
-    stderr.textContent = String(error);
+    if (Array.isArray(error.result?.validation)) {
+      if (validationGeneration === validationRequestGeneration) {
+        renderValidation(error.result.validation);
+      }
+    } else if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) stderr.textContent = String(error);
     await refresh();
   }
 });

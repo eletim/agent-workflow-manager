@@ -596,17 +596,16 @@ class PythonRunner:
             except Exception:
                 logger.warning("Failed to close terminal notifier")
         current_thread = threading.current_thread()
-        while True:
-            with self._lock:
-                wait_threads = tuple(
-                    thread
-                    for thread in self._wait_threads
-                    if thread is not current_thread
-                )
-            if not wait_threads:
+        with self._lock:
+            wait_threads = tuple(
+                thread for thread in self._wait_threads if thread is not current_thread
+            )
+        deadline = time.monotonic() + self._stop_timeout + 1
+        for thread in wait_threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            for thread in wait_threads:
-                thread.join()
+            thread.join(remaining)
 
     def _read_stream(
         self,
@@ -767,9 +766,12 @@ class PythonRunner:
         try:
             exit_code = process.wait()
             self._terminate_process_group(run)
-            stdout_thread.join()
-            stderr_thread.join()
-            progress_thread.join()
+            drain_deadline = time.monotonic() + self._stop_timeout
+            for thread in (stdout_thread, stderr_thread, progress_thread):
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(remaining)
             script_path.unlink(missing_ok=True)
             with self._lock:
                 if run.process is not process:

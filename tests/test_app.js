@@ -95,7 +95,13 @@ function response(body, status = 200) {
   };
 }
 
-async function loadApp({runs, details, validation}) {
+function deferred() {
+  let resolve;
+  const promise = new Promise((promiseResolve) => { resolve = promiseResolve; });
+  return {promise, resolve};
+}
+
+async function loadApp({runs, details, validation, fetchOverride = null}) {
   const ids = [
     "code", "working-directory", "run-arguments", "active-context", "run-list",
     "runs-empty", "run", "resume", "validate", "stop", "status", "stdout",
@@ -131,6 +137,8 @@ async function loadApp({runs, details, validation}) {
   };
   const fetch = async (url, options = {}) => {
     calls.push([url, options.method || "GET"]);
+    const override = fetchOverride?.(url, options);
+    if (override !== undefined) return override;
     if (url === "/api/token") return response({token: "request-token"});
     if (url === "/api/status") return response(initial);
     if (url === "/api/runs") return response({runs});
@@ -265,4 +273,122 @@ test("validation preserves another selected running run through refresh", async 
   assert.equal(elements.stdout.textContent, "live output");
   assert.equal(elements.stop.disabled, false);
   assert.equal(elements.validation.children[0].textContent, "preview path missing");
+});
+
+test("slow run response cannot replace a newly selected run", async () => {
+  const delayedRun = deferred();
+  let delayRunTwo = false;
+  const runOne = snapshot({runId: 1, state: "running", stdout: "run one output"});
+  const runTwo = snapshot({runId: 2, state: "failed", stdout: "run two output"});
+  const {calls, elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "running", cwd: "/work/run-1"},
+      {runId: 2, state: "failed", cwd: "/work/run-2"},
+    ],
+    details: {1: runOne, 2: runTwo},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunTwo && url === "/api/runs/2") return delayedRun.promise;
+      return undefined;
+    },
+  });
+
+  delayRunTwo = true;
+  const slowRefresh = selectedRun(elements).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(calls.filter(([url]) => url === "/api/runs/2").length >= 2);
+
+  const runOneButton = elements["run-list"].children.find(
+    (element) => element.textContent.startsWith("#1"),
+  );
+  await runOneButton.dispatch("click");
+  assert.match(selectedRun(elements).textContent, /^#1/);
+  assert.equal(elements.stdout.textContent, "run one output");
+  assert.equal(elements.stop.disabled, false);
+
+  delayedRun.resolve(response(runTwo));
+  await slowRefresh;
+
+  assert.match(selectedRun(elements).textContent, /^#1/);
+  assert.equal(elements.status.textContent, "running");
+  assert.equal(elements.stdout.textContent, "run one output");
+  assert.equal(elements.stop.disabled, false);
+  assert.equal(elements.resume.disabled, true);
+});
+
+test("slow run action cannot replace a newly selected run", async () => {
+  const delayedStop = deferred();
+  const runOne = snapshot({
+    runId: 1,
+    state: "failed",
+    stdout: "selected failed run",
+    resumable: true,
+    checkpoint: {name: "safe-step"},
+  });
+  const runTwo = snapshot({runId: 2, state: "running", stdout: "stopping run"});
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "failed", cwd: "/work/run-1"},
+      {runId: 2, state: "running", cwd: "/work/run-2"},
+    ],
+    details: {1: runOne, 2: runTwo},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/runs/2/stop") return delayedStop.promise;
+      return undefined;
+    },
+  });
+
+  const slowStop = elements.stop.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  const runOneButton = elements["run-list"].children.find(
+    (element) => element.textContent.startsWith("#1"),
+  );
+  await runOneButton.dispatch("click");
+
+  delayedStop.resolve(response({
+    ...runTwo,
+    state: "stopped",
+    exitCode: -15,
+  }, 202));
+  await slowStop;
+
+  assert.match(selectedRun(elements).textContent, /^#1/);
+  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.stdout.textContent, "selected failed run");
+  assert.equal(elements.stop.disabled, true);
+  assert.equal(elements.resume.disabled, false);
+});
+
+test("slow validation response cannot replace a newer validation result", async () => {
+  const delayedValidation = deferred();
+  let validationCalls = 0;
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1"}],
+    details: {1: snapshot({runId: 1, state: "success", stdout: "done"})},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/validate") return undefined;
+      validationCalls += 1;
+      if (validationCalls === 1) return delayedValidation.promise;
+      return response({
+        error: "workflow validation failed",
+        validation: [{line: 8, column: null, message: "newer result"}],
+      }, 422);
+    },
+  });
+
+  const slowValidation = elements.validate.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await elements.validate.dispatch("click");
+  assert.equal(elements.validation.children[0].textContent, "Line 8: newer result");
+
+  delayedValidation.resolve(response({
+    error: "workflow validation failed",
+    validation: [{line: 2, column: null, message: "stale result"}],
+  }, 422));
+  await slowValidation;
+
+  assert.equal(elements.validation.children.length, 1);
+  assert.equal(elements.validation.children[0].textContent, "Line 8: newer result");
 });
