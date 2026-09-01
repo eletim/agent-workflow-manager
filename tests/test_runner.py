@@ -1056,6 +1056,37 @@ def test_runner_page_exposes_execution_context_inputs(
     assert 'id="run-list"' in page
 
 
+def test_runner_page_exposes_copy_actions_and_shared_helper(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    documents = {}
+    for path in ["/", "/output-copy.js", "/app.js"]:
+        connection = http.client.HTTPConnection(*address, timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        documents[path] = response.read().decode()
+        connection.close()
+        assert response.status == 200
+
+    index = documents["/"]
+    helper = documents["/output-copy.js"]
+    script = documents["/app.js"]
+    assert 'id="output-copy"' in index
+    assert 'id="guide-copy"' in index
+    assert "writeText" in helper
+    assert 'execCommand("copy")' in helper
+    assert "runnerOutputClipboard.writeText" in script
+    assert 'guideCopy.textContent = "Copy failed"' in script
+    assert 'outputCopy.textContent = "Copy failed"' in script
+
+
+def test_copy_browser_logic() -> None:
+    test_file = Path(__file__).with_name("test_output_copy.js")
+
+    subprocess.run(["node", "--test", str(test_file)], check=True)
+
+
 def test_validation_api_and_run_preflight_report_distinct_state(
     web_server: tuple[tuple[str, int], str],
 ) -> None:

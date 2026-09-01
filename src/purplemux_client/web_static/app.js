@@ -41,6 +41,7 @@ const testNotificationButton = document.querySelector("#test-notification");
 let timer = null;
 let requestToken = null;
 let guideText = null;
+let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
 
@@ -194,13 +195,23 @@ guideOpen.addEventListener("click", async () => {
 guideClose.addEventListener("click", () => guideDialog.close());
 
 guideCopy.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(await loadGuide());
-    guideCopy.textContent = "Copied";
-    window.setTimeout(() => { guideCopy.textContent = "Copy"; }, 1200);
-  } catch (error) {
-    guideContent.textContent = `${guideText || ""}\n\nCopy failed: ${error}`;
+  if (guideCopyResetTimer !== null) {
+    window.clearTimeout(guideCopyResetTimer);
   }
+  try {
+    await runnerOutputClipboard.writeText(
+      await loadGuide(),
+      navigator.clipboard,
+      document,
+    );
+    guideCopy.textContent = "Copied";
+  } catch (error) {
+    guideCopy.textContent = "Copy failed";
+  }
+  guideCopyResetTimer = window.setTimeout(() => {
+    guideCopy.textContent = "Copy";
+    guideCopyResetTimer = null;
+  }, 1200);
 });
 
 outputCopy.addEventListener("click", async () => {
@@ -212,6 +223,7 @@ outputCopy.addEventListener("click", async () => {
       navigator.clipboard,
       stdout.textContent,
       stderr.textContent,
+      document,
     );
     outputCopy.textContent = "Copied";
   } catch (error) {

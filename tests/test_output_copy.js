@@ -13,7 +13,7 @@ require(path.join(
   "output-copy.js",
 ));
 
-const {write} = globalThis.runnerOutputClipboard;
+const {write, writeText} = globalThis.runnerOutputClipboard;
 
 function recordingClipboard(error = null) {
   return {
@@ -23,6 +23,47 @@ function recordingClipboard(error = null) {
       if (error !== null) throw error;
     },
   };
+}
+
+function fallbackDocument({result = true, error = null} = {}) {
+  const document = {
+    appended: [],
+    commands: [],
+    body: {
+      appendChild(element) {
+        document.appended.push(element);
+      },
+      removeChild(element) {
+        element.removed = true;
+      },
+    },
+    createElement(tagName) {
+      assert.equal(tagName, "textarea");
+      return {
+        attributes: {},
+        removed: false,
+        selected: false,
+        selection: null,
+        style: {},
+        value: "",
+        setAttribute(name, value) {
+          this.attributes[name] = value;
+        },
+        select() {
+          this.selected = true;
+        },
+        setSelectionRange(start, end) {
+          this.selection = [start, end];
+        },
+      };
+    },
+    execCommand(command) {
+      this.commands.push(command);
+      if (error !== null) throw error;
+      return result;
+    },
+  };
+  return document;
 }
 
 test("copies stdout-only output", async () => {
@@ -83,9 +124,48 @@ test("copies output in every completed state", async () => {
 
 test("reports clipboard failures without disabling later copies", async () => {
   const failure = new Error("permission denied");
-  await assert.rejects(write(recordingClipboard(failure), "out", ""), failure);
+  await assert.rejects(
+    write(recordingClipboard(failure), "out", "", null),
+    /Clipboard access is unavailable/,
+  );
 
   const clipboard = recordingClipboard();
   await write(clipboard, "next", "");
   assert.deepEqual(clipboard.writes, ["stdout:\nnext"]);
+});
+
+test("falls back when the Clipboard API is unavailable", async () => {
+  const document = fallbackDocument();
+
+  await writeText("guide <text>\n", undefined, document);
+
+  assert.equal(document.appended.length, 1);
+  const textarea = document.appended[0];
+  assert.equal(textarea.value, "guide <text>\n");
+  assert.equal(textarea.attributes.readonly, "");
+  assert.equal(textarea.selected, true);
+  assert.deepEqual(textarea.selection, [0, 13]);
+  assert.deepEqual(document.commands, ["copy"]);
+  assert.equal(textarea.removed, true);
+});
+
+test("falls back when Clipboard API permission is denied", async () => {
+  const clipboard = recordingClipboard(new Error("permission denied"));
+  const document = fallbackDocument();
+
+  await write(clipboard, "out", "err", document);
+
+  assert.deepEqual(clipboard.writes, ["stdout:\nout\n\nstderr:\nerr"]);
+  assert.equal(document.appended[0].value, "stdout:\nout\n\nstderr:\nerr");
+});
+
+test("reports fallback failure and always removes its textarea", async () => {
+  const document = fallbackDocument({result: false});
+
+  await assert.rejects(
+    writeText("cannot copy", undefined, document),
+    /Browser copy command failed/,
+  );
+
+  assert.equal(document.appended[0].removed, true);
 });
