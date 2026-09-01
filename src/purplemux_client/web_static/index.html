@@ -13,14 +13,18 @@
           <p class="eyebrow">Trusted local development tool</p>
           <h1>Python Runner</h1>
         </div>
-        <span id="status" class="status idle">idle</span>
+        <div class="header-actions">
+          <button id="guide-open">Workflow Guide</button>
+          <span id="status" class="status idle">idle</span>
+        </div>
       </header>
 
       <section class="panel editor-panel">
         <label for="code">Python</label>
-        <textarea id="code" spellcheck="false">from purplemux_client import PurpleMuxCLIClient
+        <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
-print(PurpleMuxCLIClient.__name__)</textarea>
+emit_step("workspace create", "started")
+emit_step("workspace create", "completed")</textarea>
         <div class="controls">
           <button id="run" class="primary">Run</button>
           <button id="stop" disabled>Stop</button>
@@ -28,14 +32,25 @@ print(PurpleMuxCLIClient.__name__)</textarea>
         </div>
       </section>
 
-      <section class="outputs" aria-live="polite">
-        <div class="panel output-panel">
-          <h2>stdout</h2>
-          <pre id="stdout"></pre>
+      <section class="panel progress-panel" aria-live="polite">
+        <h2>Progress</h2>
+        <p id="progress-empty" class="empty-progress">No progress events.</p>
+        <ol id="progress" class="progress-list"></ol>
+      </section>
+
+      <section class="output-section" aria-live="polite">
+        <div class="output-actions">
+          <button id="output-copy">Copy output</button>
         </div>
-        <div class="panel output-panel stderr-panel">
-          <h2>stderr</h2>
-          <pre id="stderr"></pre>
+        <div class="outputs">
+          <div class="panel output-panel">
+            <h2>stdout</h2>
+            <pre id="stdout"></pre>
+          </div>
+          <div class="panel output-panel stderr-panel">
+            <h2>stderr</h2>
+            <pre id="stderr"></pre>
+          </div>
         </div>
       </section>
 
@@ -71,6 +86,20 @@ print(PurpleMuxCLIClient.__name__)</textarea>
         </form>
       </details>
     </main>
+
+    <dialog id="guide-dialog" aria-labelledby="guide-title">
+      <div class="guide-toolbar">
+        <h2 id="guide-title">Workflow Guide</h2>
+        <div class="guide-actions">
+          <a href="/python-workflow-guide.md" target="_blank" rel="noopener">Raw</a>
+          <button id="guide-copy" disabled>Copy</button>
+          <button id="guide-close">Close</button>
+        </div>
+      </div>
+      <pre id="guide-content">Loading…</pre>
+    </dialog>
+
+    <script src="/output-copy.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

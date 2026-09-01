@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import logging
 import os
 import signal
@@ -12,11 +13,17 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import IO, Literal, Protocol
+from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.notifier import NotificationResult, TerminalState
+from purplemux_client.progress import (
+    MAX_PROGRESS_EVENT_BYTES,
+    PROGRESS_FD_ENV,
+    StepStatus,
+)
 
 RunnerState = Literal["idle", "running", "success", "failed", "stopped"]
+DEFAULT_MAX_PROGRESS_EVENTS = 200
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +33,18 @@ class TerminalNotifier(Protocol):
     ) -> NotificationResult: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    name: str
+    status: StepStatus
+    iteration: int | None = None
+    attempt: int | None = None
+    message: str | None = None
+    error: str | None = None
+    workspace: str | None = None
+    tab: str | None = None
 
 
 class AlreadyRunningError(RuntimeError):
@@ -43,11 +62,13 @@ class RunnerSnapshot:
     stderr: str
     exit_code: int | None
     run_id: int | None
+    progress: tuple[ProgressEvent, ...]
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
+        payload["progress"] = [asdict(event) for event in self.progress]
         return payload
 
 
@@ -59,12 +80,15 @@ class PythonRunner:
         *,
         stop_timeout: float = 3.0,
         max_output_chars: int = 1_000_000,
+        max_progress_events: int = DEFAULT_MAX_PROGRESS_EVENTS,
         notifier: TerminalNotifier | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
         if max_output_chars < 1:
             raise ValueError("max_output_chars must be positive")
+        if max_progress_events < 1:
+            raise ValueError("max_progress_events must be positive")
         self._stop_timeout = stop_timeout
         self._max_output_chars = max_output_chars
         self._lock = threading.Lock()
@@ -86,6 +110,7 @@ class PythonRunner:
         self._notifier = notifier
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
+        self._progress: deque[ProgressEvent] = deque(maxlen=max_progress_events)
 
     def start(self, code: str) -> int:
         with self._lock:
@@ -103,17 +128,26 @@ class PythonRunner:
                 script.close()
             script_path = Path(script.name)
 
+            progress_read_fd, progress_write_fd = os.pipe()
+            child_env = os.environ.copy()
+            child_env[PROGRESS_FD_ENV] = str(progress_write_fd)
+
             try:
                 process = subprocess.Popen(
                     [sys.executable, str(script_path)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=child_env,
+                    pass_fds=(progress_write_fd,),
                     shell=False,
                     start_new_session=True,
                 )
             except BaseException:
+                os.close(progress_read_fd)
+                os.close(progress_write_fd)
                 script_path.unlink(missing_ok=True)
                 raise
+            os.close(progress_write_fd)
 
             run_id = self._next_run_id
             self._next_run_id += 1
@@ -130,6 +164,7 @@ class PythonRunner:
             self._exit_code = None
             self._run_id = run_id
             self._stop_requested = False
+            self._progress.clear()
 
             stdout_thread = threading.Thread(
                 target=self._read_stream,
@@ -143,15 +178,28 @@ class PythonRunner:
                 name=f"python-runner-stderr-{run_id}",
                 daemon=True,
             )
+            progress_thread = threading.Thread(
+                target=self._read_progress,
+                args=(progress_read_fd,),
+                name=f"python-runner-progress-{run_id}",
+                daemon=True,
+            )
             wait_thread = threading.Thread(
                 target=self._wait_for_process,
-                args=(process, script_path, stdout_thread, stderr_thread),
+                args=(
+                    process,
+                    script_path,
+                    stdout_thread,
+                    stderr_thread,
+                    progress_thread,
+                ),
                 name=f"python-runner-wait-{run_id}",
                 daemon=True,
             )
             self._wait_threads.add(wait_thread)
             stdout_thread.start()
             stderr_thread.start()
+            progress_thread.start()
             wait_thread.start()
         return run_id
 
@@ -163,6 +211,7 @@ class PythonRunner:
                 stderr=self._render_output(self._stderr, self._stderr_truncated),
                 exit_code=self._exit_code,
                 run_id=self._run_id,
+                progress=tuple(self._progress),
             )
 
     def stop(self) -> bool:
@@ -253,6 +302,60 @@ class PythonRunner:
             if was_truncated:
                 setattr(self, truncated_attribute, True)
 
+    def _read_progress(self, fd: int) -> None:
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
+                    if len(line) > MAX_PROGRESS_EVENT_BYTES or not line.endswith(b"\n"):
+                        while line and not line.endswith(b"\n"):
+                            line = stream.readline(MAX_PROGRESS_EVENT_BYTES + 1)
+                        continue
+                    event = self._parse_progress_event(
+                        line.decode("utf-8", errors="replace")
+                    )
+                    if event is not None:
+                        with self._lock:
+                            self._progress.append(event)
+        except OSError:
+            return
+
+    @staticmethod
+    def _parse_progress_event(line: str) -> ProgressEvent | None:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        name = value.get("name")
+        status = value.get("status")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if status not in ("started", "completed", "failed"):
+            return None
+        optional_strings = ("message", "error", "workspace", "tab")
+        if any(
+            value.get(key) is not None and not isinstance(value.get(key), str)
+            for key in optional_strings
+        ):
+            return None
+        for key in ("iteration", "attempt"):
+            number = value.get(key)
+            if number is not None and (
+                isinstance(number, bool) or not isinstance(number, int) or number < 1
+            ):
+                return None
+        return ProgressEvent(
+            name=name,
+            status=cast(StepStatus, status),
+            iteration=value.get("iteration"),
+            attempt=value.get("attempt"),
+            message=value.get("message"),
+            error=value.get("error"),
+            workspace=value.get("workspace"),
+            tab=value.get("tab"),
+        )
+
     @staticmethod
     def _render_output(chunks: deque[str], truncated: bool) -> str:
         prefix = "[output truncated; showing tail]\n" if truncated else ""
@@ -264,12 +367,14 @@ class PythonRunner:
         script_path: Path,
         stdout_thread: threading.Thread,
         stderr_thread: threading.Thread,
+        progress_thread: threading.Thread,
     ) -> None:
         try:
             exit_code = process.wait()
             self._terminate_process_group(process.pid)
             stdout_thread.join()
             stderr_thread.join()
+            progress_thread.join()
             script_path.unlink(missing_ok=True)
             with self._lock:
                 if self._process is not process:
