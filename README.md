@@ -1,3 +1,36 @@
+## Personal self-hosted setup
+
+```bash
+# Install and start the custom PurpleMux fork (keep this terminal running).
+git clone https://github.com/eletim/purplemux.git "$HOME/DevEnv/purplemux"
+cd "$HOME/DevEnv/purplemux"
+corepack enable
+pnpm install
+pnpm start
+```
+
+```bash
+# In another terminal, expose the fork's custom CLI and start this project.
+mkdir -p "$HOME/.local/bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'exec node "$HOME/DevEnv/purplemux/bin/cli.js" "$@"' \
+  >"$HOME/.local/bin/purplemux"
+chmod 0755 "$HOME/.local/bin/purplemux"
+export PATH="$HOME/.local/bin:$PATH"
+
+git clone https://github.com/eletim/agent-workflow-manager.git \
+  "$HOME/DevEnv/agent-workflow-manager"
+cd "$HOME/DevEnv/agent-workflow-manager"
+bash start.sh
+```
+
+This setup intentionally uses the custom CLI from
+[`eletim/purplemux`](https://github.com/eletim/purplemux). Do **not** substitute
+the upstream `npm install -g purplemux` package: it does not provide the CLI
+contract required by Agent Workflow Manager. No token needs to be copied into
+these commands; the custom CLI reads the runtime connection files created under
+`~/.purplemux/`.
+
 # Agent Workflow Manager
 
 Agent Workflow Manager contains a thin PurpleMux CLI adapter and a trusted
@@ -33,6 +66,9 @@ create. The adapter supports:
 - `interrupt()`
 - `close_session()`
 - `capture_screen()` for diagnostics only
+- `start_shell()`
+- `wait_for_shell_completion()`
+- `read_shell_result()`
 
 Turn completion is correlated with `eventSeq`, `readyForReviewAt`, and
 `completionTimestamp`. Stale results are rejected, including when the
@@ -41,6 +77,14 @@ and interruptions are explicit. Read-only CLI timeouts can be retried;
 mutation timeouts raise `MutationOutcomeUnknown` because the remote outcome is
 unknown. Screen capture is never used to decide completion or as a result
 fallback.
+
+Observable Bash work runs in named PurpleMux `terminal` tabs. The adapter sends
+the command with an explicit working directory and correlates completion with a
+machine-readable exit-code sidecar; it does not parse pane text or guess from a
+shell prompt. Starting commands is non-blocking, so shell tabs, agent sessions,
+and separate workflows can run concurrently. A completed tab stays open until
+the workflow explicitly closes it, which lets failed commands remain available
+for inspection.
 
 ```python
 from purplemux_client import CreateSessionRequest, PurpleMuxCLIClient
@@ -59,6 +103,23 @@ finally:
     client.close_session(session_id)
 ```
 
+```python
+from purplemux_client import ShellCommandRequest
+
+shell_tab = client.start_shell(
+    ShellCommandRequest(
+        command="uv run pytest",
+        cwd="/workspace/project",
+        name="Run 12: tests",
+    )
+)
+client.wait_for_shell_completion(shell_tab, 900)
+shell_result = client.read_shell_result(shell_tab)
+if shell_result.exit_code != 0:
+    raise RuntimeError(f"tests failed in {shell_tab}: {shell_result.exit_code}")
+client.close_session(shell_tab)
+```
+
 PurpleMux owns provider launch commands and the workspace directory. The
 adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
 
@@ -66,9 +127,72 @@ adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
 
 The trusted local Runner UI executes arbitrary Python with the current Python
 interpreter and shows stdout, stderr, exit code, and the
-idle/running/success/failed/stopped state. Run and Stop operate on one script at
-a time. Stop and server shutdown clean up the script's POSIX process group,
-including child processes.
+idle/running/success/failed/suspended/stopped/validation_failed state. Validate
+performs side-effect-free, best-effort static checks, and Run performs the same
+preflight before creating a process. Stop and server shutdown clean up the
+script's POSIX process group, including child processes.
+
+Failed work can be continued explicitly when the plain Python workflow has
+published a replay-safe boundary with `save_checkpoint()`. The Runner keeps the
+latest non-secret string metadata and supplies it to the same script through
+`resume_checkpoint()` only after the operator selects **Continue after fix**.
+The workflow owns validation, branching, and reuse of PurpleMux workspace/tab
+IDs; runs without a proven checkpoint are not resumed. `suspend_run()` records
+a human-needs-input state separately from hard failure while preserving the
+same recovery path and diagnostic sessions. Resume history is retained with
+the run for the lifetime of the Runner process.
+
+Runs are independent and may execute concurrently. The UI lists every run and
+lets the operator select its state, output, progress, execution context, and
+Stop action without changing another run. `GET /api/runs` lists compact summaries,
+`GET /api/runs/{runId}` reads one snapshot, and
+`POST /api/runs/{runId}/stop` stops only that run.
+`POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
+from its latest safe checkpoint. The original `/api/status`,
+`/api/output`, and `/api/stop` routes remain available and address the most
+recently created run.
+
+Each Run or Validate request owns its execution context. The UI exposes an
+explicit working directory and zero or more arguments (one argument per line),
+and every run snapshot keeps the resolved `cwd` and `args` visible with that
+run. The HTTP form is `{"code": "...", "cwd": "/absolute/repo", "args":
+["--repo", "/absolute/repo"]}`. Omitting `cwd` preserves the original behavior
+of using the Runner process directory; an explicit relative path is resolved
+against that directory before launch.
+
+When `cwd` is explicit, the child still receives the Runner's ordinary
+environment, but it does not inherit `VIRTUAL_ENV` or matching virtualenv `bin`
+entries from Agent Workflow Manager. This prevents subprocesses in a target
+repository from accidentally selecting the manager's Python environment. The
+workflow itself still starts with the Runner interpreter so the public
+`purplemux_client` API is available. Target-project commands should select
+their environment explicitly, for example `uv run --project /absolute/repo
+python -m package.module`; choosing a directory does not automatically activate
+that repository's virtualenv.
+
+Preflight always checks syntax. It also checks direct module-level imports,
+direct module-level `os.environ["NAME"]` access, and names imported directly from
+the public `purplemux_client` API. Guarded, conditional, and deferred uses are
+not assumed to be mandatory. Workflows can declare requirements that are known
+before agent work with a literal module-level value:
+
+```python
+WORKFLOW_PREFLIGHT = {
+    "commands": ["git", "gh", "uv"],
+    "imports": ["project_package"],
+    "environment": ["GH_TOKEN"],
+    "paths": ["pyproject.toml", "/absolute/input/data.json"],
+}
+```
+
+All four keys are optional lists of non-empty strings. Commands are located on
+the workflow child's `PATH`, imports use the Runner interpreter, environment
+names must be present, and relative paths resolve from the selected run working
+directory. The declaration is parsed as data; neither it nor any other workflow
+code is executed during validation. Read-only discovery is bounded; a stalled
+lookup is reported as a validation timeout without blocking Runner status or
+shutdown. Preflight is deliberately best-effort: dynamic Python behavior and
+external state can still fail after execution starts.
 
 The normal setup and startup path is:
 
@@ -81,7 +205,10 @@ committed, secret-free `sample_config.sh` to the gitignored `config.sh`, walks
 through the short network setup, and saves the selected runtime settings.
 Later starts load that file without repeating setup questions. The script then
 validates the configuration, syncs locked Python dependencies, verifies `uv`
-and `purplemux`, and starts the UI at the configured URL.
+and the custom `eletim/purplemux` command contract, confirms the PurpleMux
+runtime responds to a bounded read-only workspace query, and starts the UI at
+the configured URL. An incompatible upstream npm CLI or an unreachable runtime
+fails startup with installation and connection guidance before the UI launches.
 
 `config.sh` owns Agent Workflow Manager startup settings:
 

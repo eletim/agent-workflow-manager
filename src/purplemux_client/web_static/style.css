@@ -27,6 +27,24 @@ h2, label { font-size: 14px; font-weight: 650; }
   background: #171b24;
   padding: 16px;
 }
+.runs-panel { margin-bottom: 14px; }
+.runs-heading { display: flex; align-items: center; gap: 12px; }
+.runs-heading h2 { margin: 0; }
+#runs-empty { color: #737d91; font-size: 13px; }
+.run-list { display: grid; gap: 7px; margin-top: 10px; }
+.run-item {
+  width: 100%;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.run-item.selected { border-color: #9b83ef; background: #34295a; }
+.run-item[data-state="running"] { color: #ffd66b; }
+.run-item[data-state="success"] { color: #75e2a8; }
+.run-item[data-state="failed"], .run-item[data-state="stopped"] { color: #ff9ca8; }
+.run-item[data-state="suspended"] { color: #ffd66b; }
 
 textarea, pre, input[type="text"], input[type="url"], input[type="password"] {
   width: 100%;
@@ -49,6 +67,25 @@ textarea {
   resize: vertical;
   tab-size: 4;
 }
+.execution-context {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.context-field { display: grid; gap: 7px; }
+.context-field label span { color: #9ba3b5; font-weight: 400; }
+#run-arguments {
+  min-height: 70px;
+  margin: 0;
+  padding: 8px 10px;
+}
+.active-context {
+  margin: 0 0 14px;
+  color: #9ba3b5;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
 button {
   padding: 8px 18px;
   color: #e8eaf0;
@@ -70,7 +107,16 @@ a { color: #bcaaff; }
 }
 .status.running { background: #513d12; color: #ffd66b; }
 .status.success { background: #163f2b; color: #75e2a8; }
-.status.failed, .status.stopped { background: #4b252b; color: #ff9ca8; }
+.status.failed, .status.stopped, .status.validation_failed { background: #4b252b; color: #ff9ca8; }
+.status.suspended { background: #513d12; color: #ffd66b; }
+
+.recovery-panel { margin-top: 14px; border-color: #6c5a2c; }
+.recovery-panel h2 { margin: 0 0 8px; }
+.recovery-panel p { margin: 0; color: #d7c68f; font-size: 13px; }
+.attempt-history { margin-bottom: 0; color: #aab0bf; font-size: 13px; }
+
+.validation-panel { border-color: #7d4148; }
+.validation-list { margin-bottom: 0; color: #ffb3bc; }
 
 .progress-panel { margin-top: 14px; }
 .progress-panel h2 { margin: 0 0 10px; }
@@ -174,6 +220,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 @media (max-width: 760px) {
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
   .outputs { grid-template-columns: 1fr; }
+  .execution-context { grid-template-columns: 1fr; }
   textarea { min-height: 330px; }
   .settings-heading { align-items: flex-start; }
   .toggle-grid { grid-template-columns: 1fr 1fr; }

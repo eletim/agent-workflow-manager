@@ -18,7 +18,14 @@ from purplemux_client.notification_settings import (
     SettingsValidationError,
 )
 from purplemux_client.notifier import NotifyCLI
-from purplemux_client.runner import AlreadyRunningError, PythonRunner
+from purplemux_client.runner import (
+    AlreadyRunningError,
+    InvalidExecutionContextError,
+    PythonRunner,
+    RunNotFoundError,
+    RunNotResumableError,
+    WorkflowValidationError,
+)
 
 STATIC_DIR = Path(__file__).with_name("web_static")
 STATIC_FILES = {
@@ -209,9 +216,12 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         return f"{normalized}:{port}"
 
     def server_close(self) -> None:
-        self.runner.close()
-        if self._settings_notifier is not None:
-            self._settings_notifier.close()
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.close()
+        settings_notifier = getattr(self, "_settings_notifier", None)
+        if settings_notifier is not None:
+            settings_notifier.close()
         super().server_close()
 
 
@@ -228,6 +238,25 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             return
         if path in {"/api/status", "/api/output"}:
             self._send_json(HTTPStatus.OK, self.server.runner.snapshot().as_json())
+            return
+        if path == "/api/runs":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "runs": [
+                        run.as_summary_json() for run in self.server.runner.snapshots()
+                    ]
+                },
+            )
+            return
+        run_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)", path)
+        if run_match is not None:
+            try:
+                snapshot = self.server.runner.snapshot(int(run_match.group(1)))
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, snapshot.as_json())
             return
         if path == "/api/settings/notifications":
             try:
@@ -259,13 +288,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         json_paths = {
             "/api/run",
+            "/api/validate",
             "/api/settings/notifications",
             "/api/settings/notifications/test",
         }
         if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
             return
-        if path == "/api/run":
+        if path in {"/api/run", "/api/validate"}:
             payload = self._read_json()
             if payload is None:
                 return
@@ -275,14 +305,53 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, {"error": "code must be a string"}
                 )
                 return
+            cwd = payload.get("cwd")
+            if cwd == "":
+                cwd = None
+            if cwd is not None and not isinstance(cwd, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "cwd must be a string or null"},
+                )
+                return
+            args = payload.get("args", [])
+            if not isinstance(args, list) or any(
+                not isinstance(argument, str) for argument in args
+            ):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "args must be an array of strings"},
+                )
+                return
             try:
-                run_id = self.server.runner.start(code)
+                if path == "/api/validate":
+                    result = self.server.runner.validate(code, cwd=cwd, args=args)
+                    self._send_json(
+                        HTTPStatus.OK
+                        if result.valid
+                        else HTTPStatus.UNPROCESSABLE_ENTITY,
+                        self.server.runner.validation_snapshot().as_json(),
+                    )
+                    return
+                run_id = self.server.runner.start(code, cwd=cwd, args=args)
+            except InvalidExecutionContextError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except WorkflowValidationError:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "workflow validation failed",
+                        **self.server.runner.validation_snapshot().as_json(),
+                    },
+                )
+                return
             except AlreadyRunningError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
             self._send_json(
                 HTTPStatus.ACCEPTED,
-                {"runId": run_id, **self.server.runner.snapshot().as_json()},
+                {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
             )
             return
         if path == "/api/stop":
@@ -294,6 +363,46 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     **self.server.runner.snapshot().as_json(),
                 },
             )
+            return
+        stop_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/stop", path)
+        if stop_match is not None:
+            run_id = int(stop_match.group(1))
+            try:
+                stopped = self.server.runner.stop(run_id)
+                snapshot = self.server.runner.snapshot(run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED if stopped else HTTPStatus.CONFLICT,
+                {"stopped": stopped, **snapshot.as_json()},
+            )
+            return
+        resume_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/resume", path)
+        if resume_match is not None:
+            run_id = int(resume_match.group(1))
+            try:
+                self.server.runner.resume(run_id)
+                snapshot = self.server.runner.snapshot(run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except RunNotResumableError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except InvalidExecutionContextError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except WorkflowValidationError as exc:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "workflow validation failed before resume",
+                        "validation": [issue.as_json() for issue in exc.result.issues],
+                    },
+                )
+                return
+            self._send_json(HTTPStatus.ACCEPTED, snapshot.as_json())
             return
         if path == "/api/settings/notifications":
             payload = self._read_json()

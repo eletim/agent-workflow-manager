@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -15,10 +16,11 @@ import pytest
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.runner import (
-    AlreadyRunningError,
+    InvalidExecutionContextError,
     PythonRunner,
     RunnerClosedError,
     RunnerSnapshot,
+    RunNotResumableError,
 )
 from purplemux_client.web import RunnerHTTPServer, build_parser
 
@@ -35,14 +37,17 @@ def wait_for(
     predicate: Callable[[RunnerSnapshot], bool],
     *,
     timeout: float = 5,
+    run_id: int | None = None,
 ) -> RunnerSnapshot:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        snapshot = runner.snapshot()
+        snapshot = runner.snapshot(run_id)
         if predicate(snapshot):
             return snapshot
         time.sleep(0.02)
-    raise AssertionError(f"runner did not reach expected state: {runner.snapshot()}")
+    raise AssertionError(
+        f"runner did not reach expected state: {runner.snapshot(run_id)}"
+    )
 
 
 def wait_until_finished(runner: PythonRunner) -> RunnerSnapshot:
@@ -69,6 +74,15 @@ def test_stderr(runner: PythonRunner) -> None:
     assert result.stderr == "BAD\n"
 
 
+def test_standard_library_alias_import_passes_and_runs(runner: PythonRunner) -> None:
+    runner.start("import os.path; print(os.path.basename('/tmp/example'))")
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert result.stdout == "example\n"
+
+
 def test_nonzero_exit(runner: PythonRunner) -> None:
     runner.start("raise SystemExit(3)")
 
@@ -78,9 +92,8 @@ def test_nonzero_exit(runner: PythonRunner) -> None:
     assert result.exit_code == 3
 
 
-@pytest.mark.parametrize("code", ["def broken(", "raise RuntimeError('boom')"])
-def test_python_error_is_reported(runner: PythonRunner, code: str) -> None:
-    runner.start(code)
+def test_runtime_python_error_is_reported(runner: PythonRunner) -> None:
+    runner.start("raise RuntimeError('boom')")
 
     result = wait_until_finished(runner)
 
@@ -96,6 +109,79 @@ def test_empty_code(runner: PythonRunner) -> None:
 
     assert result.state == "success"
     assert result.exit_code == 0
+
+
+def test_run_uses_and_records_explicit_cwd_and_args(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    runner.start(
+        "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
+        cwd=tmp_path,
+        args=("--repo", "path with spaces"),
+    )
+
+    result = wait_until_finished(runner)
+
+    assert json.loads(result.stdout) == [
+        str(tmp_path),
+        ["--repo", "path with spaces"],
+    ]
+    assert result.cwd == str(tmp_path)
+    assert result.args == ("--repo", "path with spaces")
+
+
+def test_explicit_cwd_removes_runner_virtualenv_from_child_environment(
+    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager_venv = tmp_path / "manager-venv"
+    target_bin = tmp_path / "target-bin"
+    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(manager_venv / "bin"), str(target_bin)))
+    )
+
+    runner.start(
+        "import json, os; print(json.dumps([os.environ.get('VIRTUAL_ENV'), "
+        "os.environ.get('PATH')]))",
+        cwd=tmp_path,
+    )
+    result = wait_until_finished(runner)
+
+    assert json.loads(result.stdout) == [None, str(target_bin)]
+
+
+def test_implicit_cwd_preserves_existing_environment(
+    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager_venv = tmp_path / "manager-venv"
+    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
+
+    runner.start("import os; print(os.environ.get('VIRTUAL_ENV'))")
+    result = wait_until_finished(runner)
+
+    assert result.stdout == f"{manager_venv}\n"
+
+
+def test_execution_context_rejects_non_directory(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing"
+
+    with pytest.raises(InvalidExecutionContextError, match="not a directory"):
+        runner.start("", cwd=missing)
+
+
+def test_preflight_resolves_relative_paths_from_explicit_cwd(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    (tmp_path / "input.txt").write_text("input", encoding="utf-8")
+
+    result = runner.validate(
+        "WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}", cwd=tmp_path
+    )
+
+    assert result.valid
+    assert runner.snapshot().cwd == str(tmp_path)
 
 
 def test_stop_long_running_process(runner: PythonRunner) -> None:
@@ -135,11 +221,105 @@ def test_runner_rejects_non_posix_platform(monkeypatch: pytest.MonkeyPatch) -> N
         PythonRunner()
 
 
-def test_second_run_is_rejected_while_running(runner: PythonRunner) -> None:
-    runner.start("import time; time.sleep(60)")
+def test_runs_execute_concurrently_with_independent_output(
+    runner: PythonRunner,
+) -> None:
+    first_id = runner.start(
+        'import time; print("first-start", flush=True); time.sleep(60)'
+    )
+    first_running = wait_for(
+        runner,
+        lambda snapshot: snapshot.stdout == "first-start\n",
+        run_id=first_id,
+    )
 
-    with pytest.raises(AlreadyRunningError, match="already running"):
-        runner.start('print("second")')
+    second_id = runner.start('print("second")')
+    second = wait_for(
+        runner,
+        lambda snapshot: snapshot.state != "running",
+        run_id=second_id,
+    )
+
+    assert first_running.state == "running"
+    assert runner.snapshot(first_id).state == "running"
+    assert runner.snapshot(first_id).stdout == "first-start\n"
+    assert second.state == "success"
+    assert second.stdout == "second\n"
+    assert runner.stop(first_id) is True
+
+
+def test_stopping_one_run_does_not_affect_another(runner: PythonRunner) -> None:
+    first_id = runner.start("import time; time.sleep(60)")
+    second_id = runner.start("import time; time.sleep(60)")
+
+    assert runner.stop(first_id) is True
+    first = wait_for(
+        runner,
+        lambda snapshot: snapshot.state != "running",
+        run_id=first_id,
+    )
+
+    assert first.state == "stopped"
+    assert runner.snapshot(second_id).state == "running"
+    assert runner.stop(second_id) is True
+
+
+def test_concurrent_targeted_stops_have_independent_grace_periods() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    stubborn_code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    try:
+        run_ids = [runner.start(stubborn_code) for _ in range(2)]
+        for run_id in run_ids:
+            wait_for(
+                runner,
+                lambda snapshot: snapshot.stdout == "READY\n",
+                run_id=run_id,
+            )
+
+        stop_results: list[bool] = []
+        stop_threads = [
+            threading.Thread(
+                target=lambda target=run_id: stop_results.append(runner.stop(target))
+            )
+            for run_id in run_ids
+        ]
+        started = time.monotonic()
+        for thread in stop_threads:
+            thread.start()
+        for thread in stop_threads:
+            thread.join(timeout=2)
+        elapsed = time.monotonic() - started
+
+        assert all(not thread.is_alive() for thread in stop_threads)
+        assert stop_results == [True, True]
+        assert elapsed < 0.85
+        for run_id in run_ids:
+            assert (
+                wait_for(
+                    runner,
+                    lambda snapshot: snapshot.state != "running",
+                    run_id=run_id,
+                ).state
+                == "stopped"
+            )
+    finally:
+        runner.close()
+
+
+def test_validation_does_not_overwrite_an_active_run(runner: PythonRunner) -> None:
+    run_id = runner.start("import time; time.sleep(60)")
+
+    validation = runner.validate("def broken(")
+
+    assert not validation.valid
+    assert runner.snapshot(run_id).state == "running"
+    assert [snapshot.run_id for snapshot in runner.snapshots()] == [run_id]
+    assert runner.stop(run_id) is True
 
 
 def test_can_run_again_after_finish(runner: PythonRunner) -> None:
@@ -166,6 +346,163 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
     assert result.state == "success"
 
 
+def test_resume_reuses_same_run_from_explicit_checkpoint_without_replaying_side_effect(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    code = """\
+from pathlib import Path
+from purplemux_client import resume_checkpoint, save_checkpoint
+
+side_effect = Path("side-effect.txt")
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    side_effect.write_text("created once")
+    save_checkpoint("resource created", {"resource": str(side_effect.resolve())})
+else:
+    assert checkpoint.name == "resource created"
+    assert Path(checkpoint.data["resource"]).read_text() == "manually repaired"
+if not Path("repair.complete").exists():
+    raise RuntimeError("manual repair required")
+print("continued safely")
+"""
+    run_id = runner.start(code, cwd=tmp_path)
+    first = wait_until_finished(runner)
+    assert first.state == "failed"
+    assert first.checkpoint is not None
+    assert first.checkpoint.name == "resource created"
+    assert first.attempts[0].state == "failed"
+
+    (tmp_path / "side-effect.txt").write_text("manually repaired", encoding="utf-8")
+    (tmp_path / "repair.complete").touch()
+    runner.resume(run_id)
+    resumed = wait_until_finished(runner)
+
+    assert resumed.run_id == run_id
+    assert resumed.state == "success"
+    assert (tmp_path / "side-effect.txt").read_text() == "manually repaired"
+    assert "[resume attempt 2 from checkpoint 'resource created']" in resumed.stdout
+    assert resumed.stdout.endswith("continued safely\n")
+    assert [(attempt.state, attempt.resumed_from) for attempt in resumed.attempts] == [
+        ("failed", None),
+        ("success", "resource created"),
+    ]
+
+
+def test_default_cwd_resume_preserves_environment_and_preflight(
+    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager_venv = tmp_path / "manager-venv"
+    manager_bin = manager_venv / "bin"
+    manager_bin.mkdir(parents=True)
+    required_command = manager_bin / "legacy-tool"
+    required_command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    required_command.chmod(0o755)
+    inherited_path = os.pathsep.join((str(manager_bin), os.environ.get("PATH", "")))
+    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
+    monkeypatch.setenv("PATH", inherited_path)
+    monkeypatch.chdir(tmp_path)
+    code = """\
+WORKFLOW_PREFLIGHT = {
+    "commands": ["legacy-tool"],
+    "environment": ["VIRTUAL_ENV"],
+}
+import json
+import os
+from purplemux_client import resume_checkpoint, save_checkpoint
+
+checkpoint = resume_checkpoint()
+print(json.dumps({"virtualEnv": os.environ.get("VIRTUAL_ENV"), "path": os.environ.get("PATH")}))
+if checkpoint is None:
+    save_checkpoint("legacy boundary", {"ready": "yes"})
+    raise RuntimeError("manual repair required")
+assert checkpoint.name == "legacy boundary"
+"""
+
+    run_id = runner.start(code)
+    first = wait_until_finished(runner)
+    assert first.state == "failed"
+    assert first.checkpoint is not None
+
+    runner.resume(run_id)
+    resumed = wait_until_finished(runner)
+
+    environments = [
+        json.loads(line) for line in resumed.stdout.splitlines() if line.startswith("{")
+    ]
+    assert resumed.state == "success"
+    assert environments == [
+        {"virtualEnv": str(manager_venv), "path": inherited_path},
+        {"virtualEnv": str(manager_venv), "path": inherited_path},
+    ]
+
+
+def test_resume_rejects_failure_without_safe_checkpoint(runner: PythonRunner) -> None:
+    run_id = runner.start("raise RuntimeError('unsafe to replay')")
+    wait_until_finished(runner)
+
+    with pytest.raises(RunNotResumableError, match="no safe checkpoint"):
+        runner.resume(run_id)
+
+
+def test_suspended_run_is_distinct_and_resumable(runner: PythonRunner) -> None:
+    code = """\
+from purplemux_client import resume_checkpoint, save_checkpoint, suspend_run
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    save_checkpoint("agent waiting", {"tab": "tab-1"})
+    suspend_run("reply in tab-1 before continuing")
+print("continued after input")
+"""
+    run_id = runner.start(code)
+    suspended = wait_until_finished(runner)
+
+    assert suspended.state == "suspended"
+    assert suspended.suspension_reason == "reply in tab-1 before continuing"
+    runner.resume(run_id)
+    resumed = wait_until_finished(runner)
+    assert resumed.state == "success"
+    assert [attempt.state for attempt in resumed.attempts] == ["suspended", "success"]
+
+
+def test_repeated_manual_recovery_uses_latest_safe_checkpoint(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    code = """\
+from pathlib import Path
+from purplemux_client import resume_checkpoint, save_checkpoint
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    save_checkpoint("phase one", {"workspace": "ws-1"})
+    raise RuntimeError("first repair")
+if checkpoint.name == "phase one":
+    assert Path("first-fixed").exists()
+    save_checkpoint("phase two", {"workspace": checkpoint.data["workspace"], "tab": "tab-2"})
+    raise RuntimeError("second repair")
+assert checkpoint.name == "phase two"
+assert Path("second-fixed").exists()
+print(checkpoint.data["workspace"], checkpoint.data["tab"])
+"""
+    run_id = runner.start(code, cwd=tmp_path)
+    wait_until_finished(runner)
+    (tmp_path / "first-fixed").touch()
+    runner.resume(run_id)
+    second = wait_until_finished(runner)
+    assert second.state == "failed"
+    assert second.checkpoint is not None
+    assert second.checkpoint.name == "phase two"
+
+    (tmp_path / "second-fixed").touch()
+    runner.resume(run_id)
+    final = wait_until_finished(runner)
+    assert final.state == "success"
+    assert final.stdout.endswith("ws-1 tab-2\n")
+    assert [attempt.resumed_from for attempt in final.attempts] == [
+        None,
+        "phase one",
+        "phase two",
+    ]
+
+
 def test_start_after_close_is_rejected() -> None:
     runner = PythonRunner()
     runner.close()
@@ -182,8 +519,9 @@ def test_close_cannot_miss_concurrent_start_registration(
     allow_popen = threading.Event()
 
     def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-        popen_entered.set()
-        assert allow_popen.wait(timeout=3)
+        if kwargs.get("start_new_session") is True:
+            popen_entered.set()
+            assert allow_popen.wait(timeout=3)
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
 
     monkeypatch.setattr(subprocess, "Popen", blocking_popen)
@@ -233,6 +571,34 @@ def test_close_stops_process_group() -> None:
     assert not _process_is_live(child_pid)
 
 
+def test_close_cleans_up_stubborn_runs_with_one_bounded_grace_period() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    stubborn_code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    run_ids = [runner.start(stubborn_code) for _ in range(3)]
+    for run_id in run_ids:
+        wait_for(
+            runner,
+            lambda snapshot: snapshot.stdout == "READY\n",
+            run_id=run_id,
+        )
+
+    started = time.monotonic()
+    runner.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.85
+    assert [runner.snapshot(run_id).state for run_id in run_ids] == [
+        "stopped",
+        "stopped",
+        "stopped",
+    ]
+
+
 def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:
     runner.start(
         "import subprocess, sys, time\n"
@@ -251,6 +617,82 @@ def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:
     while time.monotonic() < deadline and _process_is_live(child_pid):
         time.sleep(0.05)
     assert not _process_is_live(child_pid)
+
+
+def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> None:
+    runner = PythonRunner(stop_timeout=0.2)
+    child_pid: int | None = None
+    try:
+        run_id = runner.start(
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        result = wait_for(runner, lambda snapshot: snapshot.stdout.strip() != "")
+        child_pid = int(result.stdout.strip())
+
+        started = time.monotonic()
+        assert runner.stop(run_id) is True
+        result = wait_for(
+            runner,
+            lambda snapshot: snapshot.state == "stopped",
+            timeout=2,
+            run_id=run_id,
+        )
+        runner.close()
+        elapsed = time.monotonic() - started
+
+        assert result.state == "stopped"
+        assert elapsed < 1.5
+        assert _process_is_live(child_pid)
+    finally:
+        runner.close()
+        if child_pid is not None and _process_is_live(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+def test_stop_rejects_exited_main_with_detached_child_output() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    child_pid: int | None = None
+    try:
+        run_id = runner.start(
+            "import subprocess, sys\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "print(child.pid, flush=True)\n"
+        )
+        result = wait_for(
+            runner,
+            lambda snapshot: (
+                bool(snapshot.stdout.strip())
+                and runner._runs[run_id].process.poll() == 0
+            ),
+            run_id=run_id,
+        )
+        child_pid = int(result.stdout.strip())
+        assert result.state == "running"
+
+        started = time.monotonic()
+        assert runner.stop(run_id) is False
+        runner.close()
+        elapsed = time.monotonic() - started
+        result = runner.snapshot(run_id)
+
+        assert elapsed < 1.5
+        assert result.state == "success"
+        assert result.exit_code == 0
+        assert result.attempts[-1].state == "success"
+        assert _process_is_live(child_pid)
+    finally:
+        runner.close()
+        if child_pid is not None and _process_is_live(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
 
 
 def _process_is_live(pid: int) -> bool:
@@ -277,11 +719,16 @@ def test_popen_uses_current_interpreter_without_shell(
     runner.start("")
     wait_until_finished(runner)
 
-    command, options = calls[0]
+    command, options = next(
+        (command, options)
+        for command, options in calls
+        if options.get("start_new_session") is True
+    )
     assert isinstance(command, list)
     assert command[0] == sys.executable
     assert options["shell"] is False
     assert options["start_new_session"] is True
+    assert options["cwd"] == Path.cwd()
 
 
 @pytest.fixture
@@ -445,9 +892,369 @@ def test_runner_http_lifecycle(
         "state": "success",
         "stdout": "HTTP_OK\n",
         "stderr": "",
+        "progress": [],
+        "validation": [],
         "exitCode": 0,
         "runId": 1,
+        "cwd": str(Path.cwd()),
+        "args": [],
+        "checkpoint": None,
+        "attempts": [
+            {
+                "number": 1,
+                "state": "success",
+                "exitCode": 0,
+                "resumedFrom": None,
+            }
+        ],
+        "suspensionReason": None,
+        "resumable": False,
     }
+
+
+def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+
+    status, first = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": "import time; print('first', flush=True); time.sleep(60)",
+                "cwd": str(first_cwd),
+                "args": ["--first"],
+            }
+        ),
+        token=token,
+    )
+    assert status == 202
+    status, second = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": "import time; print('second', flush=True); time.sleep(60)",
+                "cwd": str(second_cwd),
+                "args": ["--second"],
+            }
+        ),
+        token=token,
+    )
+    assert status == 202
+    first_id = int(first["runId"])
+    second_id = int(second["runId"])
+
+    status, listed = request(address, "GET", "/api/runs")
+    assert status == 200
+    assert [(run["runId"], run["cwd"], run["args"]) for run in listed["runs"]] == [
+        (first_id, str(first_cwd), ["--first"]),
+        (second_id, str(second_cwd), ["--second"]),
+    ]
+
+    status, stopped = request(
+        address, "POST", f"/api/runs/{first_id}/stop", token=token
+    )
+    assert status == 202
+    assert stopped["stopped"] is True
+    assert stopped["runId"] == first_id
+
+    status, still_running = request(address, "GET", f"/api/runs/{second_id}")
+    assert status == 200
+    assert still_running["state"] == "running"
+
+    status, _ = request(address, "POST", f"/api/runs/{second_id}/stop", token=token)
+    assert status == 202
+
+
+def test_run_api_returns_not_found_for_unknown_run(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+
+    assert request(address, "GET", "/api/runs/999")[0] == 404
+    assert request(address, "POST", "/api/runs/999/stop")[0] == 403
+    assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
+
+
+def test_run_api_resumes_same_run_and_rejects_unsafe_replay(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    code = """\
+from pathlib import Path
+from purplemux_client import resume_checkpoint, save_checkpoint
+if resume_checkpoint() is None:
+    save_checkpoint("before repair", {"workspace": "ws-1", "tab": "tab-1"})
+if not Path("fixed").exists():
+    raise RuntimeError("fix required")
+print("resumed")
+"""
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": code, "cwd": str(tmp_path)}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, failed = request(address, "GET", f"/api/runs/{run_id}")
+        if failed["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert failed["state"] == "failed"
+    assert failed["resumable"] is True
+    assert failed["checkpoint"] == {
+        "name": "before repair",
+        "data": {"workspace": "ws-1", "tab": "tab-1"},
+    }
+
+    (tmp_path / "fixed").touch()
+    status, resumed = request(
+        address, "POST", f"/api/runs/{run_id}/resume", token=token
+    )
+    assert status == 202
+    assert resumed["runId"] == run_id
+
+    unsafe_status, unsafe = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "raise RuntimeError('no checkpoint')"}),
+        token=token,
+    )
+    assert unsafe_status == 202
+    unsafe_id = int(unsafe["runId"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, unsafe = request(address, "GET", f"/api/runs/{unsafe_id}")
+        if unsafe["state"] != "running":
+            break
+        time.sleep(0.02)
+    status, refusal = request(
+        address, "POST", f"/api/runs/{unsafe_id}/resume", token=token
+    )
+    assert status == 409
+    assert "no safe checkpoint" in str(refusal["error"])
+
+
+def test_resume_api_reports_removed_working_directory_without_mutating_run(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    run_cwd = tmp_path / "removed-after-failure"
+    run_cwd.mkdir()
+    code = """\
+from purplemux_client import save_checkpoint
+save_checkpoint("safe boundary", {"workspace": "ws-1"})
+raise RuntimeError("manual repair required")
+"""
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": code, "cwd": str(run_cwd)}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, before = request(address, "GET", f"/api/runs/{run_id}")
+        if before["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert before["state"] == "failed"
+    run_cwd.rmdir()
+
+    status, refusal = request(
+        address, "POST", f"/api/runs/{run_id}/resume", token=token
+    )
+
+    assert status == 400
+    assert refusal == {"error": f"working directory is not a directory: {run_cwd}"}
+    _, after = request(address, "GET", f"/api/runs/{run_id}")
+    assert after == before
+
+
+def test_run_api_passes_run_scoped_execution_context(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
+                "cwd": str(tmp_path),
+                "args": ["--repo", "target repo"],
+            }
+        ),
+        token=token,
+    )
+
+    assert status == 202
+    assert started["cwd"] == str(tmp_path)
+    assert started["args"] == ["--repo", "target repo"]
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, result = request(address, "GET", "/api/status")
+        if result["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert json.loads(str(result["stdout"])) == [
+        str(tmp_path),
+        ["--repo", "target repo"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("context", "error"),
+    [
+        ({"cwd": 42}, "cwd must be a string or null"),
+        ({"args": "--repo target"}, "args must be an array of strings"),
+        ({"args": ["--repo", 42]}, "args must be an array of strings"),
+    ],
+)
+def test_run_api_rejects_invalid_execution_context_shape(
+    web_server: tuple[tuple[str, int], str],
+    context: dict[str, object],
+    error: str,
+) -> None:
+    address, token = web_server
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "", **context}),
+        token=token,
+    )
+
+    assert status == 400
+    assert payload == {"error": error}
+
+
+def test_run_api_rejects_missing_working_directory(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+
+    status, payload = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "", "cwd": str(tmp_path / "missing")}),
+        token=token,
+    )
+
+    assert status == 400
+    assert "working directory is not a directory" in str(payload["error"])
+
+
+def test_runner_page_exposes_execution_context_inputs(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/")
+    response = connection.getresponse()
+    page = response.read().decode()
+    connection.close()
+
+    assert response.status == 200
+    assert 'id="working-directory"' in page
+    assert 'id="run-arguments"' in page
+    assert 'id="run-list"' in page
+
+
+def test_runner_page_exposes_copy_actions_and_shared_helper(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    documents = {}
+    for path in ["/", "/output-copy.js", "/app.js"]:
+        connection = http.client.HTTPConnection(*address, timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        documents[path] = response.read().decode()
+        connection.close()
+        assert response.status == 200
+
+    index = documents["/"]
+    helper = documents["/output-copy.js"]
+    script = documents["/app.js"]
+    assert 'id="output-copy"' in index
+    assert 'id="guide-copy"' in index
+    assert "writeText" in helper
+    assert 'execCommand("copy")' in helper
+    assert "runnerOutputClipboard.writeText" in script
+    assert 'guideCopy.textContent = "Copy failed"' in script
+    assert 'outputCopy.textContent = "Copy failed"' in script
+
+
+def test_copy_browser_logic() -> None:
+    test_file = Path(__file__).with_name("test_output_copy.js")
+
+    subprocess.run(["node", "--test", str(test_file)], check=True)
+
+
+def test_runner_browser_logic() -> None:
+    test_file = Path(__file__).with_name("test_app.js")
+
+    subprocess.run(["node", "--test", str(test_file)], check=True)
+
+
+def test_validation_api_and_run_preflight_report_distinct_state(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    body = json.dumps({"code": "def broken("})
+
+    status, validated = request(address, "POST", "/api/validate", body, token=token)
+    assert status == 422
+    assert validated["state"] == "validation_failed"
+    assert validated["runId"] is None
+    assert validated["validation"][0]["kind"] == "syntax"
+    assert validated["validation"][0]["line"] == 1
+
+    status, rejected = request(address, "POST", "/api/run", body, token=token)
+    assert status == 422
+    assert rejected["error"] == "workflow validation failed"
+    assert rejected["state"] == "validation_failed"
+    assert rejected["runId"] is None
+
+
+@pytest.mark.parametrize("path", ["/api/validate", "/api/run"])
+def test_workflow_api_reports_unresolvable_preflight_path(
+    web_server: tuple[tuple[str, int], str], path: str
+) -> None:
+    address, token = web_server
+    status, result = request(
+        address,
+        "POST",
+        path,
+        json.dumps({"code": "WORKFLOW_PREFLIGHT = {'paths': ['~unknown-user/input']}"}),
+        token=token,
+    )
+
+    assert status == 422
+    assert result["state"] == "validation_failed"
+    assert result["validation"][0]["kind"] == "path"
+    assert "could not check required path" in result["validation"][0]["message"]
 
 
 def test_notification_settings_api_read_never_returns_token(
@@ -773,22 +1580,29 @@ def test_notification_settings_mutation_rejects_untrusted_request(
 
 
 @pytest.mark.parametrize(
-    ("token", "origin"),
+    ("path", "token", "origin"),
     [
-        (None, None),
-        ("wrong", None),
-        ("valid", "https://attacker.example"),
-        ("valid", "http://["),
+        (path, token, origin)
+        for path in ("/api/run", "/api/validate")
+        for token, origin in (
+            (None, None),
+            ("wrong", None),
+            ("valid", "https://attacker.example"),
+            ("valid", "http://["),
+        )
     ],
 )
-def test_run_rejects_untrusted_request(
-    web_server: tuple[tuple[str, int], str], token: str | None, origin: str | None
+def test_workflow_action_rejects_untrusted_request(
+    web_server: tuple[tuple[str, int], str],
+    path: str,
+    token: str | None,
+    origin: str | None,
 ) -> None:
     address, actual_token = web_server
     status, payload = request(
         address,
         "POST",
-        "/api/run",
+        path,
         json.dumps({"code": 'print("must not run")'}),
         token=actual_token if token == "valid" else token,
         origin=origin,
@@ -1036,3 +1850,13 @@ def test_web_server_close_stops_running_process() -> None:
     server.server_close()
 
     assert wait_until_finished(runner).state == "stopped"
+
+
+def test_web_server_bind_failure_preserves_address_in_use_error() -> None:
+    first = RunnerHTTPServer(("127.0.0.1", 0))
+    address = first.server_address
+    try:
+        with pytest.raises(OSError, match="Address already in use"):
+            RunnerHTTPServer(address)
+    finally:
+        first.server_close()

@@ -10,7 +10,7 @@ graph, DSL, state machine, or UI-side copy of its control flow.
 plain Python workflow
   -> purplemux_client
   -> PurpleMux public CLI/runtime
-  -> Codex or Claude
+  -> Codex, Claude, or managed Bash terminal
 
 Runner UI = execute / stop / observe stdout, stderr, process state, and progress
 PurpleMux UI = runtime inspection and manual intervention
@@ -24,8 +24,49 @@ PurpleMux UI = runtime inspection and manual intervention
   observes output and explicitly emitted progress. It is not a workflow engine.
 - Never operate tmux directly. Never infer completion or results from terminal
   screen text. Do not assume Graph, Node, Edge, LangGraph, or a workflow DSL.
-- The current Python adapter creates Codex and Claude sessions only. Do not
-  generate Shell/Bash sessions through `PurpleMuxCLIClient` as if supported.
+- Shell work that should be observable or run in parallel must use
+  `start_shell()` so it appears as a named PurpleMux terminal associated with
+  the workflow workspace and target path. Do not hide that work in a local
+  `subprocess` call.
+
+## Run execution context
+
+Choose the target repository in the Runner's **Working directory** field. Put
+each workflow argument on its own line in **Arguments**; spaces within a line
+belong to that single argument. The resolved directory and argument list are
+shown with the run and apply to both preflight and execution. They are not
+global workflow configuration.
+
+Selecting a working directory prevents the workflow child from inheriting
+Agent Workflow Manager's `VIRTUAL_ENV` and matching virtualenv `bin` path. It
+does not activate the target repository's environment. Commands that require a
+project environment should make it explicit, such as `uv run --project
+/absolute/repo python -m package.module` or an absolute interpreter path.
+
+## Preflight requirements
+
+Run performs static validation before starting the workflow. Syntax, direct
+module-level imports, direct module-level `os.environ["NAME"]` requirements, and
+direct public `purplemux_client` imports are checked without importing or
+executing the script. Guarded, conditional, and deferred uses are not assumed to
+be mandatory. Declare requirements known before expensive agent work with an
+optional literal module-level value:
+
+```python
+WORKFLOW_PREFLIGHT = {
+    "commands": ["git", "gh", "uv"],
+    "imports": ["project_package"],
+    "environment": ["GH_TOKEN"],
+    "paths": ["pyproject.toml", "/absolute/input/data.json"],
+}
+```
+
+All keys are optional lists of non-empty strings. Relative paths resolve from
+the selected run working directory. Keep these checks deterministic and
+side-effect-free; do not use metadata as a workflow DSL. Read-only discovery is
+bounded and reports a validation timeout if a lookup stalls. Preflight is
+best-effort and cannot prove that dynamic code or later external operations will
+succeed.
 
 ## Installed Python API
 
@@ -37,12 +78,18 @@ from purplemux_client import (
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
     ResultNotReady,
+    ResumeCheckpoint,
+    ShellCommandRequest,
+    ShellResult,
     SessionReadyTimeout,
     TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
     emit_step,
+    resume_checkpoint,
+    save_checkpoint,
+    suspend_run,
 )
 ```
 
@@ -78,6 +125,61 @@ diagnostic_text = client.capture_screen(session_id)
 client.close_session(session_id)
 ```
 
+Shell operations are separate from agent turn operations:
+
+```python
+shell_tab = client.start_shell(
+    ShellCommandRequest(
+        command="uv run pytest tests/test_feature.py",
+        cwd="/absolute/repo",
+        name="Issue 123 run: focused tests",
+    )
+)
+emit_step(
+    "focused tests",
+    "started",
+    workspace=workspace_id,
+    tab=shell_tab,
+)
+
+# start_shell() returns after launch. Create/use agent sessions or start other
+# shell tabs here when the tasks are independent.
+client.wait_for_shell_completion(shell_tab, timeout_seconds=900)
+shell_result = client.read_shell_result(shell_tab)
+if shell_result.exit_code != 0:
+    emit_step(
+        "focused tests",
+        "failed",
+        error=f"exit code {shell_result.exit_code}",
+        workspace=workspace_id,
+        tab=shell_tab,
+    )
+    raise WorkerFailure(
+        f"focused tests failed with exit code {shell_result.exit_code}; "
+        f"inspect {workspace_id} / {shell_tab}"
+    )
+emit_step(
+    "focused tests",
+    "completed",
+    workspace=workspace_id,
+    tab=shell_tab,
+)
+```
+
+The non-empty `name` is the PurpleMux UI label; include the logical run and task
+so an operator can find the tab. `cwd` is resolved and validated before the tab
+is created, then applied explicitly inside the terminal. The command runs under
+`bash -lc`, so select a project environment explicitly when needed.
+
+`wait_for_shell_completion()` uses PurpleMux's structured `alive` lifecycle and,
+when available, its optional `terminalStatus` field for timeout diagnostics.
+Completion and `ShellResult.exit_code` come from a machine-readable sidecar
+written by the command wrapper. It never parses pane text and cannot miss a fast
+command that runs between status polls. `read_shell_result()` raises
+`ResultNotReady` before completion. A nonzero exit code is an explicit result,
+not an automatic cleanup decision; plain Python decides whether to fail, retry,
+or retain the tab.
+
 `worker` selects `codex-cli` or `claude-code`; recognized aliases are `codex`,
 `codex-cli`, `claude`, and `claude-code`. If `worker` is unrecognized, the
 adapter checks `command` against the same aliases. The current adapter does not
@@ -90,7 +192,9 @@ Relevant errors all derive from `TerminalSessionError`:
 - `SessionReadyTimeout`: the session did not become ready in time.
 - `WorkerFailure`: CLI failure, invalid state/result, turn timeout, or another
   worker failure.
-- `WorkerNeedsInput`: the agent needs additional input.
+- `WorkerNeedsInput`: the agent needs additional input. Unlike hard worker
+  failure, this derives directly from `TerminalSessionError` so a workflow can
+  suspend for a human response explicitly.
 - `WorkerInterrupted`: the current turn was interrupted.
 - `ResultNotReady`: no fresh structured result is ready.
 - `MutationOutcomeUnknown`: a mutation timed out and may have happened remotely.
@@ -160,11 +264,13 @@ timeout; inspect/list workspaces first or stop for human reconciliation.
 
 ## Mutation and read semantics
 
-Mutations are `workspace create`, `create_session`, `send_input`, `interrupt`,
-and `close_session`. The adapter attempts each session mutation once. If one
-times out, it raises `MutationOutcomeUnknown`: the remote side may have applied
-it. Do not catch that exception and immediately repeat the mutation. Preserve
-the workspace/session references and reconcile the remote state first.
+Mutations are `workspace create`, `create_session`, `start_shell` (tab creation
+and one send), `send_input`, `interrupt`, and `close_session`. The adapter
+attempts each mutation once. If one times out, it raises
+`MutationOutcomeUnknown`: the remote side may have applied it. Do not catch that
+exception and immediately repeat the mutation. A shell-start failure after tab
+creation includes the tab ID in the error so it can be inspected. Preserve the
+workspace/session references and reconcile the remote state first.
 
 Read-only operations (`read_status`, result/status polling used by completion,
 and `capture_screen`) may retry command timeouts according to
@@ -219,6 +325,61 @@ FAILURE -> keep sessions open and print workspace/tab references for inspection
 Do not retry a timed-out close blindly. There is currently no workspace deletion
 method in `purplemux_client`; do not invent one. A workflow may use
 `capture_screen` after failure for diagnostics, without parsing it as a result.
+
+## Explicit checkpoints and manual recovery
+
+The Runner resumes only a failed or suspended run that published a safe
+checkpoint. Checkpoints are execution metadata, not progress and not a workflow
+graph. Save one only after preceding side effects have completed:
+
+```python
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    workspace_id = create_workspace()
+    client = PurpleMuxCLIClient(workspace_id)
+    implementer = client.create_session(...)
+    save_checkpoint(
+        "sessions ready",
+        {"workspace": workspace_id, "implementer": implementer},
+    )
+else:
+    if checkpoint.name != "sessions ready":
+        raise WorkerFailure(f"unsupported checkpoint: {checkpoint.name}")
+    workspace_id = checkpoint.data["workspace"]
+    implementer = checkpoint.data["implementer"]
+    client = PurpleMuxCLIClient(workspace_id)
+    # Validate the retained tab/repository/manual repair before continuing.
+```
+
+The workflow must branch before any completed non-idempotent action, reuse
+checkpoint IDs, and validate assumptions that manual repair could change.
+It may leave a checkpoint active only when every operation from that point to
+the next checkpoint is safe/idempotent to re-enter after an arbitrary failure.
+Checkpoint values are exposed in the UI/API, so store only short non-secret
+strings. A checkpoint event over 4 KiB is rejected. On each Resume click the
+Runner re-runs preflight and the same saved script, cwd, and arguments under the
+same run ID; output and terminal attempt history are appended. It never edits
+or restores repository files, so manual changes are preserved unless the
+workflow itself overwrites them.
+
+For an agent question, save a safe checkpoint and convert the typed condition
+to a suspended run while leaving the PurpleMux tab open:
+
+```python
+try:
+    client.wait_for_turn_completion(implementer, TURN_TIMEOUT)
+except WorkerNeedsInput as exc:
+    save_checkpoint(
+        "implementer needs input",
+        {"workspace": workspace_id, "implementer": implementer},
+    )
+    suspend_run(str(exc))
+```
+
+If safe continuation cannot be represented this way, do not publish a
+checkpoint. The UI will explain that the run cannot be resumed, and the user
+must start a new workflow-specific recovery path. Resume state lasts only for
+the current Runner process; this is deliberately not a persistence framework.
 
 ## Progress instrumentation
 
@@ -294,7 +455,9 @@ Do not:
   workspace creation after an unknown timeout;
 - let the UI decide the next step;
 - ask an implementer to self-review when an independent review is required;
-- invent Bash support, checkpoint/resume, graph semantics, or missing APIs.
+- run observable/parallel Bash work as an invisible local subprocess;
+- invent additional checkpoint/graph semantics or missing APIs beyond the
+  explicit `save_checkpoint()` / `resume_checkpoint()` contract.
 
 ## Complete example: implement, review, fix, and ready a PR
 

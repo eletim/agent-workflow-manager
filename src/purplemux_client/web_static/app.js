@@ -1,5 +1,12 @@
 const code = document.querySelector("#code");
+const workingDirectory = document.querySelector("#working-directory");
+const runArguments = document.querySelector("#run-arguments");
+const activeContext = document.querySelector("#active-context");
+const runList = document.querySelector("#run-list");
+const runsEmpty = document.querySelector("#runs-empty");
 const runButton = document.querySelector("#run");
+const resumeButton = document.querySelector("#resume");
+const validateButton = document.querySelector("#validate");
 const stopButton = document.querySelector("#stop");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
@@ -8,6 +15,11 @@ const outputCopy = document.querySelector("#output-copy");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
+const recoveryPanel = document.querySelector("#recovery-panel");
+const recoverySummary = document.querySelector("#recovery-summary");
+const attemptHistory = document.querySelector("#attempt-history");
+const validationPanel = document.querySelector("#validation-panel");
+const validation = document.querySelector("#validation");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -29,26 +41,96 @@ const testNotificationButton = document.querySelector("#test-notification");
 let timer = null;
 let requestToken = null;
 let guideText = null;
+let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
+let activeRunId = null;
+let activeRunGeneration = 0;
+let refreshRequestGeneration = 0;
+let renderedRefreshGeneration = 0;
+let validationRequestGeneration = 0;
 
-function render(result) {
+function renderRun(result) {
   const running = result.state === "running";
   statusBadge.textContent = result.state;
   statusBadge.className = `status ${result.state}`;
   stdout.textContent = result.stdout;
   stderr.textContent = result.stderr;
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
-  runButton.disabled = running;
-  stopButton.disabled = !running;
+  runButton.disabled = false;
+  validateButton.disabled = false;
+  stopButton.disabled = activeRunId === null || !running;
+  resumeButton.disabled = activeRunId === null || !result.resumable;
   renderProgress(result.progress || []);
+  renderRecovery(result);
+  const renderedArgs = (result.args || []).map((argument) => JSON.stringify(argument)).join(" ");
+  const label = result.runId == null ? "Configured run" : `Run #${result.runId}`;
+  activeContext.textContent = `${label}: ${result.cwd}${renderedArgs ? ` ${renderedArgs}` : ""}`;
 
   if (running) {
     stdout.scrollTop = stdout.scrollHeight;
     stderr.scrollTop = stderr.scrollHeight;
-    if (timer === null) timer = window.setInterval(refresh, 500);
-  } else if (timer !== null) {
+  }
+}
+
+function renderRecovery(result) {
+  const attempts = result.attempts || [];
+  recoveryPanel.hidden = !["failed", "suspended"].includes(result.state)
+    && result.checkpoint == null && attempts.length < 2;
+  if (result.checkpoint) {
+    recoverySummary.textContent = `Safe checkpoint: ${result.checkpoint.name}. Manual fixes are preserved; the Python workflow decides how continuation validates and uses this checkpoint.`;
+  } else if (result.state === "failed") {
+    recoverySummary.textContent = "No safe checkpoint was published. This run cannot be resumed without risking replay of completed side effects.";
+  } else {
+    recoverySummary.textContent = result.suspensionReason || "";
+  }
+  if (result.suspensionReason) {
+    recoverySummary.textContent += ` Suspended: ${result.suspensionReason}`;
+  }
+  attemptHistory.replaceChildren();
+  for (const attempt of attempts) {
+    const item = document.createElement("li");
+    item.textContent = `Attempt ${attempt.number}: ${attempt.state} (exit ${attempt.exitCode})${attempt.resumedFrom ? `, resumed from ${attempt.resumedFrom}` : ""}`;
+    attemptHistory.append(item);
+  }
+}
+
+function renderRunList(runs) {
+  runList.replaceChildren();
+  runsEmpty.hidden = runs.length > 0;
+  for (const run of [...runs].reverse()) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
+    button.dataset.state = run.state;
+    button.textContent = `#${run.runId}  ${run.state}  ${run.cwd}`;
+    button.addEventListener("click", async () => {
+      activeRunId = run.runId;
+      activeRunGeneration += 1;
+      await refresh();
+    });
+    runList.append(button);
+  }
+}
+
+function updatePolling(runs) {
+  if (runs.some((run) => run.state === "running") && timer === null) {
+    timer = window.setInterval(refresh, 500);
+  } else if (!runs.some((run) => run.state === "running") && timer !== null) {
     window.clearInterval(timer);
     timer = null;
+  }
+}
+
+function renderValidation(issues) {
+  validation.replaceChildren();
+  validationPanel.hidden = issues.length === 0;
+  for (const issue of issues) {
+    const item = document.createElement("li");
+    const location = issue.line == null
+      ? ""
+      : `Line ${issue.line}${issue.column == null ? "" : `:${issue.column}`}: `;
+    item.textContent = `${location}${issue.message}`;
+    validation.append(item);
   }
 }
 
@@ -117,13 +199,23 @@ guideOpen.addEventListener("click", async () => {
 guideClose.addEventListener("click", () => guideDialog.close());
 
 guideCopy.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(await loadGuide());
-    guideCopy.textContent = "Copied";
-    window.setTimeout(() => { guideCopy.textContent = "Copy"; }, 1200);
-  } catch (error) {
-    guideContent.textContent = `${guideText || ""}\n\nCopy failed: ${error}`;
+  if (guideCopyResetTimer !== null) {
+    window.clearTimeout(guideCopyResetTimer);
   }
+  try {
+    await runnerOutputClipboard.writeText(
+      await loadGuide(),
+      navigator.clipboard,
+      document,
+    );
+    guideCopy.textContent = "Copied";
+  } catch (error) {
+    guideCopy.textContent = "Copy failed";
+  }
+  guideCopyResetTimer = window.setTimeout(() => {
+    guideCopy.textContent = "Copy";
+    guideCopyResetTimer = null;
+  }, 1200);
 });
 
 outputCopy.addEventListener("click", async () => {
@@ -135,6 +227,7 @@ outputCopy.addEventListener("click", async () => {
       navigator.clipboard,
       stdout.textContent,
       stderr.textContent,
+      document,
     );
     outputCopy.textContent = "Copied";
   } catch (error) {
@@ -155,15 +248,44 @@ async function request(path, options = {}) {
   }
   const response = await fetch(path, options);
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(result.error || `HTTP ${response.status}`);
+    error.result = result;
+    throw error;
+  }
   return result;
 }
 
 async function refresh() {
+  const requestGeneration = ++refreshRequestGeneration;
+  let selectionGeneration = activeRunGeneration;
   try {
-    render(await request("/api/status"));
+    const {runs} = await request("/api/runs");
+    if (selectionGeneration !== activeRunGeneration) return;
+    if (activeRunId === null && runs.length > 0) {
+      activeRunId = runs[runs.length - 1].runId;
+      activeRunGeneration += 1;
+      selectionGeneration = activeRunGeneration;
+    }
+    const targetRunId = activeRunId;
+    const selected = runs.find((run) => run.runId === targetRunId);
+    const result = selected
+      ? await request(`/api/runs/${targetRunId}`)
+      : null;
+    if (
+      selectionGeneration !== activeRunGeneration
+      || targetRunId !== activeRunId
+      || requestGeneration <= renderedRefreshGeneration
+    ) return;
+    if (result) renderRun(result);
+    renderRunList(runs);
+    updatePolling(runs);
+    renderedRefreshGeneration = requestGeneration;
   } catch (error) {
-    stderr.textContent = String(error);
+    if (
+      selectionGeneration === activeRunGeneration
+      && requestGeneration > renderedRefreshGeneration
+    ) stderr.textContent = String(error);
   }
 }
 
@@ -197,24 +319,113 @@ function settingsPayload() {
   return payload;
 }
 
+function executionContextPayload() {
+  return {
+    cwd: workingDirectory.value.trim() || null,
+    args: runArguments.value === "" ? [] : runArguments.value.split("\n"),
+  };
+}
+
 runButton.addEventListener("click", async () => {
+  const selectionGeneration = ++activeRunGeneration;
+  const validationGeneration = ++validationRequestGeneration;
   try {
-    render(await request("/api/run", {
+    const result = await request("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value}),
-    }));
+      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+    });
+    if (selectionGeneration === activeRunGeneration) {
+      activeRunId = result.runId;
+      activeRunGeneration += 1;
+      if (validationGeneration === validationRequestGeneration) {
+        renderValidation(result.validation || []);
+      }
+      renderRun(result);
+    }
+    await refresh();
   } catch (error) {
-    stderr.textContent = String(error);
+    if (Array.isArray(error.result?.validation)) {
+      if (validationGeneration === validationRequestGeneration) {
+        renderValidation(error.result.validation);
+      }
+    } else if (selectionGeneration === activeRunGeneration) {
+      stderr.textContent = String(error);
+    }
+  }
+});
+
+validateButton.addEventListener("click", async () => {
+  const requestGeneration = ++validationRequestGeneration;
+  try {
+    const result = await request("/api/validate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+    });
+    if (requestGeneration === validationRequestGeneration) {
+      renderValidation(result.validation || []);
+    }
+  } catch (error) {
+    if (
+      requestGeneration === validationRequestGeneration
+      && Array.isArray(error.result?.validation)
+    ) {
+      renderValidation(error.result.validation);
+    } else if (requestGeneration === validationRequestGeneration) {
+      stderr.textContent = String(error);
+    }
   }
 });
 
 stopButton.addEventListener("click", async () => {
+  if (activeRunId === null) return;
+  const targetRunId = activeRunId;
+  const selectionGeneration = ++activeRunGeneration;
   try {
-    render(await request("/api/stop", {method: "POST"}));
+    const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) {
+      activeRunGeneration += 1;
+      renderRun(result);
+    }
     await refresh();
   } catch (error) {
-    stderr.textContent = String(error);
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) stderr.textContent = String(error);
+  }
+});
+
+resumeButton.addEventListener("click", async () => {
+  if (activeRunId === null) return;
+  const targetRunId = activeRunId;
+  const selectionGeneration = ++activeRunGeneration;
+  const validationGeneration = ++validationRequestGeneration;
+  resumeButton.disabled = true;
+  try {
+    const result = await request(`/api/runs/${targetRunId}/resume`, {method: "POST"});
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) {
+      activeRunGeneration += 1;
+      renderRun(result);
+    }
+    await refresh();
+  } catch (error) {
+    if (Array.isArray(error.result?.validation)) {
+      if (validationGeneration === validationRequestGeneration) {
+        renderValidation(error.result.validation);
+      }
+    } else if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) stderr.textContent = String(error);
+    await refresh();
   }
 });
 
@@ -259,6 +470,12 @@ testNotificationButton.addEventListener("click", async () => {
 async function initialize() {
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
+  const initialStatus = await request("/api/status");
+  if (!workingDirectory.value) workingDirectory.value = initialStatus.cwd;
+  if (initialStatus.runId == null) {
+    renderValidation(initialStatus.validation || []);
+  }
+  renderRun(initialStatus);
   await refresh();
   try {
     renderSettings(await request("/api/settings/notifications"));
