@@ -81,6 +81,11 @@ def test_sample_has_separate_issue_and_whole_version_review_phases() -> None:
     assert "integration_reviewer_create_pending" in source
     assert "integration_checks_start_pending" in source
     assert "do not replay creation" in source
+    assert "issue_implementation_turn_done" in source
+    assert "issue_review_turn_done" in source
+    assert "issue_fix_turn_done" in source
+    assert "integration_review_turn_done" in source
+    assert "integration_fix_turn_done" in source
 
 
 def test_issue_prs_can_only_target_integration_and_main_is_never_merged() -> None:
@@ -731,3 +736,105 @@ def test_integration_pending_turn_resume_stops_before_resend(
         purplemux_client.MutationOutcomeUnknown, match="do not resend the prompt"
     ):
         SAMPLE_MODULE.integration_review(config, object(), recovery)
+
+
+def test_confirmed_review_resumes_post_result_verification_without_resend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase="issue_implementation_done",
+        issue_number=1,
+        implementer="tab-1",
+        reviewer="tab-2",
+    )
+    reviewed_sha = "a" * 40
+    checkpoints: list[tuple[str, dict[str, str]]] = []
+
+    class CompletedTurnClient:
+        workspace_id = "ws-1"
+
+        def __init__(self) -> None:
+            self.send_attempts = 0
+            self.result_reads = 0
+
+        def wait_until_ready(self, _tab: str, _timeout: int) -> None:
+            return None
+
+        def send_input(self, _tab: str, _prompt: str) -> None:
+            self.send_attempts += 1
+
+        def wait_for_turn_completion(self, _tab: str, _timeout: int) -> None:
+            return None
+
+        def read_result(self, _tab: str) -> str:
+            self.result_reads += 1
+            return "APPROVED\n"
+
+    client = CompletedTurnClient()
+    head_checks = 0
+
+    def require_issue_head(
+        _issue: object, _config: object
+    ) -> tuple[str, dict[str, str]]:
+        nonlocal head_checks
+        head_checks += 1
+        if head_checks == 2:
+            raise purplemux_client.WorkerFailure("post-result verification timed out")
+        return reviewed_sha, {"headRefOid": reviewed_sha}
+
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "save_checkpoint",
+        lambda name, data: checkpoints.append((name, dict(data))),
+    )
+    monkeypatch.setattr(SAMPLE_MODULE, "merged_issue_pr", lambda *_args: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "prepare_issue_branch", lambda *_args: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "require_issue_head", require_issue_head)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "merge_issue_pr",
+        lambda _issue, _config, state: {
+            "url": "https://github.com/OWNER/REPOSITORY/pull/1",
+            "headRefOid": state.approved_sha,
+        },
+    )
+    monkeypatch.setattr(SAMPLE_MODULE, "close_tabs", lambda *_args: None)
+
+    with pytest.raises(
+        purplemux_client.WorkerFailure, match="post-result verification timed out"
+    ):
+        SAMPLE_MODULE.process_issue(config.issues[0], config, client, recovery)
+
+    assert recovery.phase == "issue_review_turn_done"
+    assert recovery.turn_sha == reviewed_sha
+    assert [name for name, _data in checkpoints[-2:]] == [
+        "issue_review_turn_pending",
+        "issue_review_turn_done",
+    ]
+    assert client.send_attempts == 1
+    assert client.result_reads == 1
+
+    confirmed_name, confirmed_data = checkpoints[-1]
+    recovery = SAMPLE_MODULE.load_recovery(
+        config,
+        purplemux_client.ResumeCheckpoint(
+            name=confirmed_name,
+            data=confirmed_data,
+        ),
+    )
+    SAMPLE_MODULE.process_issue(config.issues[0], config, client, recovery)
+
+    assert recovery.phase == "workspace_ready"
+    assert client.send_attempts == 1
+    assert client.result_reads == 2

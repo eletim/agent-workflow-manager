@@ -92,6 +92,7 @@ class Recovery:
     reviewer: str | None = None
     reviews_used: int = 0
     approved_sha: str | None = None
+    turn_sha: str | None = None
 
     def checkpoint(self, config: Config) -> None:
         data = {
@@ -108,6 +109,8 @@ class Recovery:
             data["reviewer"] = self.reviewer
         if self.approved_sha is not None:
             data["approved_sha"] = self.approved_sha
+        if self.turn_sha is not None:
+            data["turn_sha"] = self.turn_sha
         save_checkpoint(self.phase, data)
 
 
@@ -355,6 +358,7 @@ def load_recovery(config: Config, checkpoint: ResumeCheckpoint | None) -> Recove
             reviewer=data.get("reviewer"),
             reviews_used=reviews_used,
             approved_sha=data.get("approved_sha"),
+            turn_sha=data.get("turn_sha"),
         )
     except (KeyError, ValueError) as exc:
         raise WorkerFailure("checkpoint is incomplete or malformed") from exc
@@ -548,6 +552,7 @@ def run_turn(
     recovery: Recovery,
     config: Config,
     pending_phase: str,
+    completed_phase: str,
     *,
     iteration: int | None = None,
 ) -> str:
@@ -568,6 +573,11 @@ def run_turn(
         client.send_input(tab, prompt)
         client.wait_for_turn_completion(tab, TURN_TIMEOUT)
         result = client.read_result(tab)
+        # The retained tab remains the source of the structured result. This
+        # checkpoint records that correlation succeeded, so later verification
+        # failures can resume without sending the prompt again.
+        recovery.phase = completed_phase
+        recovery.checkpoint(config)
     except BaseException as exc:
         emit_step(
             name,
@@ -657,6 +667,7 @@ def reopen_review_if_approval_drifted(
     if recovery.approved_sha == actual_sha:
         return False
     recovery.approved_sha = None
+    recovery.turn_sha = None
     # Keep the counter monotonic so repeated pushes cannot extend the bounded loop.
     recovery.phase = reviewable_phase
     recovery.checkpoint(config)
@@ -775,6 +786,7 @@ def process_issue(
             recovery.reviewer = None
             recovery.reviews_used = 0
             recovery.approved_sha = None
+            recovery.turn_sha = None
             recovery.checkpoint(config)
         print(
             f"Skipping already-merged Issue #{issue.number} PR: "
@@ -799,6 +811,7 @@ def process_issue(
         recovery.reviewer = None
         recovery.reviews_used = 0
         recovery.approved_sha = None
+        recovery.turn_sha = None
         recovery.checkpoint(config)
         recovery.implementer = create_agent(client, config)
         recovery.phase = "issue_implementer_ready"
@@ -832,11 +845,14 @@ def process_issue(
             recovery,
             config,
             "issue_implementation_turn_pending",
+            "issue_implementation_turn_done",
         )
+    if recovery.phase == "issue_implementation_turn_done":
         require_branch_pushed(issue.branch, config)
         require_open_issue_pr(issue, config)
         recovery.phase = "issue_implementation_done"
         recovery.approved_sha = None
+        recovery.turn_sha = None
         recovery.checkpoint(config)
 
     approved = recovery.phase == "issue_approved"
@@ -847,53 +863,72 @@ def process_issue(
         )
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
-        reviewed_sha, _ = require_issue_head(issue, config)
-        result = run_turn(
-            client,
-            recovery.reviewer,
-            f"Issue #{issue.number} review",
-            f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
-            recovery,
-            config,
-            "issue_review_turn_pending",
-            iteration=review_number,
-        )
-        current_sha, _ = require_issue_head(issue, config)
-        if current_sha != reviewed_sha:
-            raise WorkerFailure(
-                f"Issue #{issue.number} head changed during review; discard this "
-                "verdict and run a new review"
-            )
-        if decision(result) == "APPROVED":
-            recovery.reviews_used = review_number
-            recovery.phase = "issue_approved"
-            recovery.approved_sha = reviewed_sha
-            recovery.checkpoint(config)
-            approved = True
-            break
-        if review_number == MAX_REVIEWS:
-            raise WorkerFailure(f"Issue #{issue.number} reached {MAX_REVIEWS} reviews")
-        run_turn(
-            client,
-            recovery.implementer,
-            f"Issue #{issue.number} fixes",
-            f"""Fix every actionable finding from independent review round
+        if recovery.phase != "issue_fix_turn_done":
+            if recovery.phase == "issue_review_turn_done":
+                if recovery.turn_sha is None:
+                    raise WorkerFailure(
+                        "confirmed Issue review checkpoint has no reviewed commit SHA"
+                    )
+                reviewed_sha = recovery.turn_sha
+                result = client.read_result(recovery.reviewer)
+            else:
+                reviewed_sha, _ = require_issue_head(issue, config)
+                recovery.turn_sha = reviewed_sha
+                result = run_turn(
+                    client,
+                    recovery.reviewer,
+                    f"Issue #{issue.number} review",
+                    f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
+                    recovery,
+                    config,
+                    "issue_review_turn_pending",
+                    "issue_review_turn_done",
+                    iteration=review_number,
+                )
+            current_sha, _ = require_issue_head(issue, config)
+            if current_sha != reviewed_sha:
+                recovery.phase = "issue_fix_done"
+                recovery.turn_sha = None
+                recovery.checkpoint(config)
+                raise WorkerFailure(
+                    f"Issue #{issue.number} head changed during review; discard this "
+                    "verdict and run a new review"
+                )
+            if decision(result) == "APPROVED":
+                recovery.reviews_used = review_number
+                recovery.phase = "issue_approved"
+                recovery.approved_sha = reviewed_sha
+                recovery.turn_sha = None
+                recovery.checkpoint(config)
+                approved = True
+                break
+            if review_number == MAX_REVIEWS:
+                raise WorkerFailure(
+                    f"Issue #{issue.number} reached {MAX_REVIEWS} reviews"
+                )
+            run_turn(
+                client,
+                recovery.implementer,
+                f"Issue #{issue.number} fixes",
+                f"""Fix every actionable finding from independent review round
 {review_number} for {issue_url(issue, config)}. Inspect the current branch/PR first.
 Keep {issue.branch}; do not create or merge PRs. Make the smallest coherent fixes,
 run all normal checks and git diff --check, then commit and push.
 
 REVIEW RESULT:
 {result}""",
-            recovery,
-            config,
-            "issue_fix_turn_pending",
-            iteration=review_number,
-        )
+                recovery,
+                config,
+                "issue_fix_turn_pending",
+                "issue_fix_turn_done",
+                iteration=review_number,
+            )
         require_branch_pushed(issue.branch, config)
         require_open_issue_pr(issue, config)
         recovery.reviews_used = review_number
         recovery.phase = "issue_fix_done"
         recovery.approved_sha = None
+        recovery.turn_sha = None
         recovery.checkpoint(config)
 
     if not approved:
@@ -911,6 +946,7 @@ REVIEW RESULT:
     recovery.reviewer = None
     recovery.reviews_used = 0
     recovery.approved_sha = None
+    recovery.turn_sha = None
     recovery.checkpoint(config)
 
 
@@ -1116,6 +1152,7 @@ def integration_review(
         recovery.reviewer = None
         recovery.reviews_used = 0
         recovery.approved_sha = None
+        recovery.turn_sha = None
         recovery.checkpoint(config)
         recovery.implementer = create_agent(client, config)
         recovery.phase = "integration_fixer_ready"
@@ -1163,39 +1200,55 @@ CHANGES_REQUESTED, followed by concrete findings."""
         )
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
-        reviewed_sha, _ = require_integration_head(int(pr["number"]), config)
-        result = run_turn(
-            client,
-            recovery.reviewer,
-            "whole-version integration review",
-            f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
-            recovery,
-            config,
-            "integration_review_turn_pending",
-            iteration=review_number,
-        )
-        current_sha, _ = require_integration_head(int(pr["number"]), config)
-        if current_sha != reviewed_sha:
-            raise WorkerFailure(
-                "integration head changed during review; discard this verdict and "
-                "run a new review"
-            )
-        if decision(result) == "APPROVED":
-            recovery.reviews_used = review_number
-            recovery.phase = "integration_approved"
-            recovery.approved_sha = reviewed_sha
-            recovery.checkpoint(config)
-            approved = True
-            break
-        if review_number == MAX_REVIEWS:
-            raise WorkerFailure(
-                f"whole-version integration review reached {MAX_REVIEWS} rounds"
-            )
-        run_turn(
-            client,
-            recovery.implementer,
-            "integration fixes",
-            f"""You are the integration fixer for PR #{pr["number"]} in {config.slug}.
+        if recovery.phase != "integration_fix_turn_done":
+            if recovery.phase == "integration_review_turn_done":
+                if recovery.turn_sha is None:
+                    raise WorkerFailure(
+                        "confirmed integration review checkpoint has no reviewed "
+                        "commit SHA"
+                    )
+                reviewed_sha = recovery.turn_sha
+                result = client.read_result(recovery.reviewer)
+            else:
+                reviewed_sha, _ = require_integration_head(int(pr["number"]), config)
+                recovery.turn_sha = reviewed_sha
+                result = run_turn(
+                    client,
+                    recovery.reviewer,
+                    "whole-version integration review",
+                    f"{review_prompt}\nReview exactly commit {reviewed_sha}.",
+                    recovery,
+                    config,
+                    "integration_review_turn_pending",
+                    "integration_review_turn_done",
+                    iteration=review_number,
+                )
+            current_sha, _ = require_integration_head(int(pr["number"]), config)
+            if current_sha != reviewed_sha:
+                recovery.phase = "integration_fix_done"
+                recovery.turn_sha = None
+                recovery.checkpoint(config)
+                raise WorkerFailure(
+                    "integration head changed during review; discard this verdict "
+                    "and run a new review"
+                )
+            if decision(result) == "APPROVED":
+                recovery.reviews_used = review_number
+                recovery.phase = "integration_approved"
+                recovery.approved_sha = reviewed_sha
+                recovery.turn_sha = None
+                recovery.checkpoint(config)
+                approved = True
+                break
+            if review_number == MAX_REVIEWS:
+                raise WorkerFailure(
+                    f"whole-version integration review reached {MAX_REVIEWS} rounds"
+                )
+            run_turn(
+                client,
+                recovery.implementer,
+                "integration fixes",
+                f"""You are the integration fixer for PR #{pr["number"]} in {config.slug}.
 Fix only the actionable whole-version findings below on the existing
 {config.integration_branch} branch. Inspect current state before mutation. Follow the
 existing architecture and choose the smallest coherent fix. Do not create another PR,
@@ -1204,15 +1257,17 @@ and git diff --check, commit, and push to {config.integration_branch}.
 
 INTEGRATION REVIEW RESULT:
 {result}""",
-            recovery,
-            config,
-            "integration_fix_turn_pending",
-            iteration=review_number,
-        )
+                recovery,
+                config,
+                "integration_fix_turn_pending",
+                "integration_fix_turn_done",
+                iteration=review_number,
+            )
         require_branch_pushed(config.integration_branch, config)
         recovery.reviews_used = review_number
         recovery.phase = "integration_fix_done"
         recovery.approved_sha = None
+        recovery.turn_sha = None
         recovery.checkpoint(config)
 
     if not approved:
