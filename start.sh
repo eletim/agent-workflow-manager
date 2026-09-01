@@ -70,7 +70,7 @@ validate_purplemux() {
     for required_contract in \
         'workspaces' \
         'workspace create --cwd PATH' \
-        'tab create -w WS' \
+        'tab create -w WS [-n NAME] [-t TYPE]' \
         'tab send -w WS TAB_ID' \
         'tab interrupt -w WS TAB_ID' \
         'tab status -w WS TAB_ID' \
@@ -94,7 +94,9 @@ validate_purplemux() {
         purplemux_remediation
         exit 1
     fi
-    if [[ ! $runtime_output =~ \"workspaces\"[[:space:]]*: ]]; then
+    if ! printf '%s' "$runtime_output" | uv run --no-sync python -c \
+        'import json, sys; data = json.load(sys.stdin); sys.exit(not (isinstance(data, dict) and isinstance(data.get("workspaces"), list)))' \
+        2>/dev/null; then
         printf '%s\n' \
             'ERROR: purplemux workspaces returned an unexpected response instead of the custom runtime contract.' >&2
         purplemux_remediation
