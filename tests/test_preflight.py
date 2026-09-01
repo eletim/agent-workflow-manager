@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -281,10 +282,12 @@ def test_close_prevents_helper_registration_that_has_not_started(
     validator = WorkflowValidator(cwd=tmp_path, check_timeout=10)
     original_run_worker = validator._run_worker
 
-    def delayed_run_worker(code: str) -> ValidationResult:
+    def delayed_run_worker(
+        code: str, *, environment: Mapping[str, str] | None, cwd: Path | None
+    ) -> ValidationResult:
         validation_entered.set()
         assert allow_registration.wait(timeout=2)
-        return original_run_worker(code)
+        return original_run_worker(code, environment=environment, cwd=cwd)
 
     monkeypatch.setattr(validator, "_run_worker", delayed_run_worker)
     monkeypatch.setattr(

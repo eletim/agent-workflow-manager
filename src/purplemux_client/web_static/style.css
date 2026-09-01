@@ -49,6 +49,25 @@ textarea {
   resize: vertical;
   tab-size: 4;
 }
+.execution-context {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.context-field { display: grid; gap: 7px; }
+.context-field label span { color: #9ba3b5; font-weight: 400; }
+#run-arguments {
+  min-height: 70px;
+  margin: 0;
+  padding: 8px 10px;
+}
+.active-context {
+  margin: 0 0 14px;
+  color: #9ba3b5;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
 button {
   padding: 8px 18px;
   color: #e8eaf0;
@@ -177,6 +196,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 @media (max-width: 760px) {
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
   .outputs { grid-template-columns: 1fr; }
+  .execution-context { grid-template-columns: 1fr; }
   textarea { min-height: 330px; }
   .settings-heading { align-items: flex-start; }
   .toggle-grid { grid-template-columns: 1fr 1fr; }

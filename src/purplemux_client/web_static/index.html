@@ -20,6 +20,17 @@
       </header>
 
       <section class="panel editor-panel">
+        <div class="execution-context">
+          <div class="context-field context-cwd">
+            <label for="working-directory">Working directory</label>
+            <input id="working-directory" type="text" autocomplete="off" placeholder="Use Runner working directory">
+          </div>
+          <div class="context-field context-args">
+            <label for="run-arguments">Arguments <span>(one per line)</span></label>
+            <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
+          </div>
+        </div>
+        <p id="active-context" class="active-context"></p>
         <label for="code">Python</label>
         <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 

@@ -72,7 +72,13 @@ class WorkflowValidator:
         self._workers: set[subprocess.Popen[str]] = set()
         self._closed = False
 
-    def validate(self, code: str) -> ValidationResult:
+    def validate(
+        self,
+        code: str,
+        *,
+        environment: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> ValidationResult:
         try:
             tree = ast.parse(code, filename="<workflow>")
             compile(tree, "<workflow>", "exec")
@@ -88,7 +94,7 @@ class WorkflowValidator:
                 )
             )
 
-        return self._run_worker(code)
+        return self._run_worker(code, environment=environment, cwd=cwd)
 
     def close(self) -> None:
         """Permanently prevent new helpers, then kill and reap active ones."""
@@ -103,12 +109,20 @@ class WorkflowValidator:
         with self._worker_lock:
             self._workers.difference_update(workers)
 
-    def _run_worker(self, code: str) -> ValidationResult:
+    def _run_worker(
+        self,
+        code: str,
+        *,
+        environment: Mapping[str, str] | None,
+        cwd: Path | None,
+    ) -> ValidationResult:
         payload = json.dumps(
             {
                 "code": code,
-                "environment": dict(self._environment),
-                "cwd": str(self._cwd),
+                "environment": dict(
+                    self._environment if environment is None else environment
+                ),
+                "cwd": str(self._cwd if cwd is None else cwd),
                 "moduleSearchPath": self._module_search_path,
             }
         )
