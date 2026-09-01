@@ -1087,6 +1087,12 @@ def test_copy_browser_logic() -> None:
     subprocess.run(["node", "--test", str(test_file)], check=True)
 
 
+def test_runner_browser_logic() -> None:
+    test_file = Path(__file__).with_name("test_app.js")
+
+    subprocess.run(["node", "--test", str(test_file)], check=True)
+
+
 def test_validation_api_and_run_preflight_report_distinct_state(
     web_server: tuple[tuple[str, int], str],
 ) -> None:

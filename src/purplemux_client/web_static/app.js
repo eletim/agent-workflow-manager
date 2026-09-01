@@ -45,7 +45,7 @@ let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
 
-function render(result) {
+function renderRun(result) {
   const running = result.state === "running";
   statusBadge.textContent = result.state;
   statusBadge.className = `status ${result.state}`;
@@ -57,7 +57,6 @@ function render(result) {
   stopButton.disabled = activeRunId === null || !running;
   resumeButton.disabled = activeRunId === null || !result.resumable;
   renderProgress(result.progress || []);
-  renderValidation(result.validation || []);
   renderRecovery(result);
   const renderedArgs = (result.args || []).map((argument) => JSON.stringify(argument)).join(" ");
   const label = result.runId == null ? "Configured run" : `Run #${result.runId}`;
@@ -259,7 +258,7 @@ async function refresh() {
       activeRunId = runs[runs.length - 1].runId;
     }
     const selected = runs.find((run) => run.runId === activeRunId);
-    if (selected) render(await request(`/api/runs/${activeRunId}`));
+    if (selected) renderRun(await request(`/api/runs/${activeRunId}`));
     renderRunList(runs);
     updatePolling(runs);
   } catch (error) {
@@ -312,31 +311,39 @@ runButton.addEventListener("click", async () => {
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     });
     activeRunId = result.runId;
-    render(result);
+    renderValidation(result.validation || []);
+    renderRun(result);
     await refresh();
   } catch (error) {
-    if (error.result) render(error.result);
-    stderr.textContent = String(error);
+    if (Array.isArray(error.result?.validation)) {
+      renderValidation(error.result.validation);
+    } else {
+      stderr.textContent = String(error);
+    }
   }
 });
 
 validateButton.addEventListener("click", async () => {
   try {
-    render(await request("/api/validate", {
+    const result = await request("/api/validate", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
-    }));
+    });
+    renderValidation(result.validation || []);
   } catch (error) {
-    if (error.result) render(error.result);
-    else stderr.textContent = String(error);
+    if (Array.isArray(error.result?.validation)) {
+      renderValidation(error.result.validation);
+    } else {
+      stderr.textContent = String(error);
+    }
   }
 });
 
 stopButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
   try {
-    render(await request(`/api/runs/${activeRunId}/stop`, {method: "POST"}));
+    renderRun(await request(`/api/runs/${activeRunId}/stop`, {method: "POST"}));
     await refresh();
   } catch (error) {
     stderr.textContent = String(error);
@@ -347,9 +354,10 @@ resumeButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
   resumeButton.disabled = true;
   try {
-    render(await request(`/api/runs/${activeRunId}/resume`, {method: "POST"}));
+    renderRun(await request(`/api/runs/${activeRunId}/resume`, {method: "POST"}));
     await refresh();
   } catch (error) {
+    if (error.result) renderValidation(error.result.validation || []);
     stderr.textContent = String(error);
     await refresh();
   }
@@ -398,7 +406,10 @@ async function initialize() {
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
   if (!workingDirectory.value) workingDirectory.value = initialStatus.cwd;
-  render(initialStatus);
+  if (initialStatus.runId == null) {
+    renderValidation(initialStatus.validation || []);
+  }
+  renderRun(initialStatus);
   await refresh();
   try {
     renderSettings(await request("/api/settings/notifications"));
