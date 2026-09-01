@@ -1,3 +1,36 @@
+## Personal self-hosted setup
+
+```bash
+# Install and start the custom PurpleMux fork (keep this terminal running).
+git clone https://github.com/eletim/purplemux.git "$HOME/DevEnv/purplemux"
+cd "$HOME/DevEnv/purplemux"
+corepack enable
+pnpm install
+pnpm start
+```
+
+```bash
+# In another terminal, expose the fork's custom CLI and start this project.
+mkdir -p "$HOME/.local/bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'exec node "$HOME/DevEnv/purplemux/bin/cli.js" "$@"' \
+  >"$HOME/.local/bin/purplemux"
+chmod 0755 "$HOME/.local/bin/purplemux"
+export PATH="$HOME/.local/bin:$PATH"
+
+git clone https://github.com/eletim/agent-workflow-manager.git \
+  "$HOME/DevEnv/agent-workflow-manager"
+cd "$HOME/DevEnv/agent-workflow-manager"
+bash start.sh
+```
+
+This setup intentionally uses the custom CLI from
+[`eletim/purplemux`](https://github.com/eletim/purplemux). Do **not** substitute
+the upstream `npm install -g purplemux` package: it does not provide the CLI
+contract required by Agent Workflow Manager. No token needs to be copied into
+these commands; the custom CLI reads the runtime connection files created under
+`~/.purplemux/`.
+
 # Agent Workflow Manager
 
 Agent Workflow Manager contains a thin PurpleMux CLI adapter and a trusted
