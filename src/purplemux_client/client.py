@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -49,6 +52,27 @@ class CreateSessionRequest:
     cwd: str
     command: str
     metadata: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ShellCommandRequest:
+    """Describe one observable Bash command in a named PurpleMux terminal."""
+
+    command: str
+    cwd: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ShellResult:
+    """Structured completion result for a PurpleMux-backed shell command."""
+
+    exit_code: int
+
+
+@dataclass(frozen=True)
+class _ShellRun:
+    result_path: str
 
 
 class SubprocessRunner(Protocol):
@@ -121,6 +145,8 @@ class PurpleMuxCLIClient:
         self._monotonic = monotonic
         self._turn_baselines: dict[str, _TurnBaseline] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
+        self._shell_runs: dict[str, _ShellRun] = {}
+        self._completed_shell_runs: dict[str, ShellResult] = {}
 
     def create_session(self, request: CreateSessionRequest) -> str:
         """Create and launch a Codex or Claude session."""
@@ -141,6 +167,108 @@ class PurpleMuxCLIClient:
         if not isinstance(session_id, str) or not session_id:
             raise WorkerFailure("PurpleMux create did not return a tab ID")
         return session_id
+
+    def start_shell(self, request: ShellCommandRequest) -> str:
+        """Start one Bash command in a visible, named PurpleMux terminal."""
+        if not request.command:
+            raise ValueError("shell command must not be empty")
+        if not request.name.strip():
+            raise ValueError("shell terminal name must not be empty")
+        if "\0" in request.command or "\0" in request.name or "\0" in request.cwd:
+            raise ValueError("shell request values must not contain null bytes")
+        cwd = os.path.abspath(os.path.expanduser(request.cwd))
+        if not os.path.isdir(cwd):
+            raise ValueError(f"shell working directory is not a directory: {cwd}")
+
+        data = self._run_json(
+            [
+                "tab",
+                "create",
+                "-w",
+                self.workspace_id,
+                "-n",
+                request.name,
+                "-t",
+                "terminal",
+            ],
+            operation="create shell terminal",
+            read_only=False,
+        )
+        session_id = data.get("tabId") or data.get("tab_id") or data.get("id")
+        if not isinstance(session_id, str) or not session_id:
+            raise WorkerFailure(
+                "PurpleMux shell terminal create did not return a tab ID"
+            )
+
+        result_dir = tempfile.mkdtemp(prefix="awm-shell-")
+        result_path = os.path.join(result_dir, "result.json")
+        self._shell_runs[session_id] = _ShellRun(result_path=result_path)
+        wrapper = self._shell_wrapper(request.command, cwd, result_path)
+        try:
+            self._run_json(
+                ["tab", "send", "-w", self.workspace_id, session_id, wrapper],
+                operation="start shell command",
+                read_only=False,
+            )
+        except MutationOutcomeUnknown as exc:
+            # Keep both the tab and correlation data: a timed-out send may have
+            # started the command, and the terminal remains useful for inspection.
+            raise MutationOutcomeUnknown(
+                f"shell terminal {session_id} was created; {exc}"
+            ) from exc
+        except WorkerFailure as exc:
+            raise WorkerFailure(
+                f"shell terminal {session_id} was created but command start failed: {exc}"
+            ) from exc
+        return session_id
+
+    def wait_for_shell_completion(
+        self, session_id: str, timeout_seconds: float
+    ) -> None:
+        """Wait for a machine-readable shell result, never terminal screen text."""
+        if session_id not in self._shell_runs:
+            raise WorkerFailure(f"session {session_id} has no managed shell command")
+        deadline = self._monotonic() + timeout_seconds
+        last_status = "unknown"
+        while True:
+            result = self._read_shell_result_file(session_id)
+            if result is not None:
+                self._completed_shell_runs[session_id] = result
+                return
+            status = self._status(session_id)
+            panel_type = status.get("panelType")
+            if panel_type != "terminal":
+                raise WorkerFailure(f"session {session_id} is not a PurpleMux terminal")
+            terminal_status = status.get("terminalStatus")
+            if isinstance(terminal_status, str) and terminal_status:
+                last_status = terminal_status
+            else:
+                cli_state = status.get("cliState")
+                last_status = (
+                    f"unavailable; cliState={cli_state}"
+                    if isinstance(cli_state, str) and cli_state
+                    else "unavailable"
+                )
+            if status.get("alive") is False:
+                raise WorkerFailure(
+                    f"shell terminal {session_id} exited before publishing a result"
+                )
+            if self._monotonic() >= deadline:
+                raise WorkerFailure(
+                    f"shell terminal {session_id} did not complete within "
+                    f"{timeout_seconds}s (last terminalStatus={last_status})"
+                )
+            self._sleep(self.poll_interval_seconds)
+
+    def read_shell_result(self, session_id: str) -> ShellResult:
+        """Return the structured exit code for a completed managed shell command."""
+        result = self._completed_shell_runs.get(session_id)
+        if result is None:
+            result = self._read_shell_result_file(session_id)
+        if result is None:
+            raise ResultNotReady(f"shell terminal {session_id} result is not ready")
+        self._completed_shell_runs[session_id] = result
+        return result
 
     def read_status(self, session_id: str) -> dict[str, Any]:
         """Read authoritative agent state from PurpleMux StatusManager output."""
@@ -279,6 +407,10 @@ class PurpleMuxCLIClient:
         )
         self._turn_baselines.pop(session_id, None)
         self._completed_turns.pop(session_id, None)
+        shell_run = self._shell_runs.pop(session_id, None)
+        self._completed_shell_runs.pop(session_id, None)
+        if shell_run is not None:
+            self._cleanup_shell_result(shell_run)
 
     def capture_screen(self, session_id: str) -> str:
         """Capture diagnostic pane text; never use this as an agent result."""
@@ -291,6 +423,52 @@ class PurpleMuxCLIClient:
         if not isinstance(content, str):
             raise WorkerFailure("PurpleMux capture did not return text content")
         return content
+
+    @staticmethod
+    def _shell_wrapper(command: str, cwd: str, result_path: str) -> str:
+        command_text = shlex.quote(command)
+        cwd_text = shlex.quote(cwd)
+        result_text = shlex.quote(result_path)
+        pending_result_text = shlex.quote(f"{result_path}.pending")
+        return (
+            f"__awm_exit=0; (cd -- {cwd_text} && bash -lc {command_text}) "
+            f"|| __awm_exit=$?; printf '{{\"exitCode\":%s}}\\n' "
+            f'"$__awm_exit" > {pending_result_text} && '
+            f"mv -- {pending_result_text} {result_text}"
+        )
+
+    def _read_shell_result_file(self, session_id: str) -> ShellResult | None:
+        shell_run = self._shell_runs.get(session_id)
+        if shell_run is None:
+            raise WorkerFailure(f"session {session_id} has no managed shell command")
+        try:
+            with open(shell_run.result_path, encoding="utf-8") as stream:
+                data = json.load(stream)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkerFailure(
+                f"shell terminal {session_id} published an invalid result"
+            ) from exc
+        exit_code = data.get("exitCode") if isinstance(data, dict) else None
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise WorkerFailure(
+                f"shell terminal {session_id} published an invalid exit code"
+            )
+        self._cleanup_shell_result(shell_run)
+        return ShellResult(exit_code=exit_code)
+
+    @staticmethod
+    def _cleanup_shell_result(shell_run: _ShellRun) -> None:
+        for path in (shell_run.result_path, f"{shell_run.result_path}.pending"):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        try:
+            os.rmdir(os.path.dirname(shell_run.result_path))
+        except FileNotFoundError:
+            pass
 
     def _accept_fresh_result(
         self,

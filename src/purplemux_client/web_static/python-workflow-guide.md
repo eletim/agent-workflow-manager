@@ -10,7 +10,7 @@ graph, DSL, state machine, or UI-side copy of its control flow.
 plain Python workflow
   -> purplemux_client
   -> PurpleMux public CLI/runtime
-  -> Codex or Claude
+  -> Codex, Claude, or managed Bash terminal
 
 Runner UI = execute / stop / observe stdout, stderr, process state, and progress
 PurpleMux UI = runtime inspection and manual intervention
@@ -24,8 +24,10 @@ PurpleMux UI = runtime inspection and manual intervention
   observes output and explicitly emitted progress. It is not a workflow engine.
 - Never operate tmux directly. Never infer completion or results from terminal
   screen text. Do not assume Graph, Node, Edge, LangGraph, or a workflow DSL.
-- The current Python adapter creates Codex and Claude sessions only. Do not
-  generate Shell/Bash sessions through `PurpleMuxCLIClient` as if supported.
+- Shell work that should be observable or run in parallel must use
+  `start_shell()` so it appears as a named PurpleMux terminal associated with
+  the workflow workspace and target path. Do not hide that work in a local
+  `subprocess` call.
 
 ## Run execution context
 
@@ -76,6 +78,8 @@ from purplemux_client import (
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
     ResultNotReady,
+    ShellCommandRequest,
+    ShellResult,
     SessionReadyTimeout,
     TerminalSessionError,
     WorkerFailure,
@@ -116,6 +120,61 @@ client.interrupt(session_id)
 diagnostic_text = client.capture_screen(session_id)
 client.close_session(session_id)
 ```
+
+Shell operations are separate from agent turn operations:
+
+```python
+shell_tab = client.start_shell(
+    ShellCommandRequest(
+        command="uv run pytest tests/test_feature.py",
+        cwd="/absolute/repo",
+        name="Issue 123 run: focused tests",
+    )
+)
+emit_step(
+    "focused tests",
+    "started",
+    workspace=workspace_id,
+    tab=shell_tab,
+)
+
+# start_shell() returns after launch. Create/use agent sessions or start other
+# shell tabs here when the tasks are independent.
+client.wait_for_shell_completion(shell_tab, timeout_seconds=900)
+shell_result = client.read_shell_result(shell_tab)
+if shell_result.exit_code != 0:
+    emit_step(
+        "focused tests",
+        "failed",
+        error=f"exit code {shell_result.exit_code}",
+        workspace=workspace_id,
+        tab=shell_tab,
+    )
+    raise WorkerFailure(
+        f"focused tests failed with exit code {shell_result.exit_code}; "
+        f"inspect {workspace_id} / {shell_tab}"
+    )
+emit_step(
+    "focused tests",
+    "completed",
+    workspace=workspace_id,
+    tab=shell_tab,
+)
+```
+
+The non-empty `name` is the PurpleMux UI label; include the logical run and task
+so an operator can find the tab. `cwd` is resolved and validated before the tab
+is created, then applied explicitly inside the terminal. The command runs under
+`bash -lc`, so select a project environment explicitly when needed.
+
+`wait_for_shell_completion()` uses PurpleMux's structured `alive` lifecycle and,
+when available, its optional `terminalStatus` field for timeout diagnostics.
+Completion and `ShellResult.exit_code` come from a machine-readable sidecar
+written by the command wrapper. It never parses pane text and cannot miss a fast
+command that runs between status polls. `read_shell_result()` raises
+`ResultNotReady` before completion. A nonzero exit code is an explicit result,
+not an automatic cleanup decision; plain Python decides whether to fail, retry,
+or retain the tab.
 
 `worker` selects `codex-cli` or `claude-code`; recognized aliases are `codex`,
 `codex-cli`, `claude`, and `claude-code`. If `worker` is unrecognized, the
@@ -199,11 +258,13 @@ timeout; inspect/list workspaces first or stop for human reconciliation.
 
 ## Mutation and read semantics
 
-Mutations are `workspace create`, `create_session`, `send_input`, `interrupt`,
-and `close_session`. The adapter attempts each session mutation once. If one
-times out, it raises `MutationOutcomeUnknown`: the remote side may have applied
-it. Do not catch that exception and immediately repeat the mutation. Preserve
-the workspace/session references and reconcile the remote state first.
+Mutations are `workspace create`, `create_session`, `start_shell` (tab creation
+and one send), `send_input`, `interrupt`, and `close_session`. The adapter
+attempts each mutation once. If one times out, it raises
+`MutationOutcomeUnknown`: the remote side may have applied it. Do not catch that
+exception and immediately repeat the mutation. A shell-start failure after tab
+creation includes the tab ID in the error so it can be inspected. Preserve the
+workspace/session references and reconcile the remote state first.
 
 Read-only operations (`read_status`, result/status polling used by completion,
 and `capture_screen`) may retry command timeouts according to
@@ -333,7 +394,8 @@ Do not:
   workspace creation after an unknown timeout;
 - let the UI decide the next step;
 - ask an implementer to self-review when an independent review is required;
-- invent Bash support, checkpoint/resume, graph semantics, or missing APIs.
+- run observable/parallel Bash work as an invisible local subprocess;
+- invent checkpoint/resume, graph semantics, or missing APIs.
 
 ## Complete example: implement, review, fix, and ready a PR
 
