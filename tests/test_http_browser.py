@@ -106,6 +106,16 @@ def test_copy_actions_on_insecure_http_origin(
         assert driver.find_element(By.ID, "guide-copy").text == "Copied"
         driver.find_element(By.ID, "guide-close").click()
 
+        # The code editor is a read-only view of the selected run's own
+        # snapshot; using it as a scratch paste target requires switching to
+        # the New run draft first.
+        driver.find_element(By.ID, "new-run").click()
+        wait.until(
+            lambda browser: (
+                browser.find_element(By.ID, "code").get_attribute("readonly") is None
+            )
+        )
+
         editor = driver.find_element(By.ID, "code")
         editor.click()
         editor.send_keys(Keys.CONTROL, "a")

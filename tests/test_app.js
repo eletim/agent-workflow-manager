@@ -84,12 +84,16 @@ function snapshot({
   resumable = false,
   checkpoint = null,
   attempts = [],
+  cwd = `/work/run-${runId}`,
+  args = [],
+  code = `print("run-${runId}")`,
 }) {
   return {
-    args: [],
+    args,
     attempts,
     checkpoint,
-    cwd: `/work/run-${runId}`,
+    code,
+    cwd,
     exitCode: state === "running" ? null : 1,
     progress: [{name: `step-${runId}`, status: "completed"}],
     resumable,
@@ -134,7 +138,7 @@ async function loadApp({
 }) {
   const ids = [
     "code", "working-directory", "run-arguments", "active-context", "run-list",
-    "runs-empty", "run", "resume", "validate", "stop", "status", "stdout",
+    "runs-empty", "new-run", "run", "resume", "validate", "stop", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
     "validation-success", "validation", "guide-dialog", "guide-open", "guide-close", "guide-copy",
@@ -638,21 +642,25 @@ test("validation preserves a selected failed resumable run through refresh", asy
   assert.equal(elements.stdout.textContent, "failed run output");
   assert.equal(elements.resume.disabled, false);
   assert.equal(elements["recovery-panel"].hidden, false);
+  // Viewing an existing run: Validate is a draft-only action, blocked until
+  // "New run" is clicked, so it can never submit this run's own snapshot.
+  assert.equal(elements.validate.disabled, true);
 
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.validate.disabled, false);
   await elements.validate.dispatch("click");
 
-  assert.match(selectedRun(elements).textContent, /^#2/);
-  assert.equal(elements.status.textContent, "failed");
-  assert.equal(elements.stdout.textContent, "failed run output");
-  assert.equal(elements.resume.disabled, false);
-  assert.equal(elements["recovery-panel"].hidden, false);
   assert.equal(elements["validation-panel"].hidden, false);
   assert.equal(elements.validation.children[0].textContent, "Line 4:2: broken preview");
 
-  await selectedRun(elements).dispatch("click");
+  await runItem(elements, 2).dispatch("click");
 
+  assert.match(selectedRun(elements).textContent, /^#2/);
   assert.equal(elements.stdout.textContent, "failed run output");
   assert.equal(elements.resume.disabled, false);
+  assert.equal(elements["recovery-panel"].hidden, false);
+  // Validation state is independent of run selection: it survives switching
+  // through the draft and back to the run without being cleared or applied.
   assert.equal(elements.validation.children[0].textContent, "Line 4:2: broken preview");
 });
 
@@ -680,17 +688,16 @@ test("validation preserves another selected running run through refresh", async 
   await runOne.dispatch("click");
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements.stop.disabled, false);
+  assert.equal(elements.validate.disabled, true);
 
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.validate.disabled, false);
   await elements.validate.dispatch("click");
 
-  assert.equal(elements.status.textContent, "running");
-  assert.equal(elements.stdout.textContent, "live output");
-  assert.equal(elements.stop.disabled, false);
-  assert.equal(elements.resume.disabled, true);
   assert.equal(elements["validation-success"].hidden, false);
   assert.equal(elements["validation-success"].textContent, "✓ Valid");
 
-  await selectedRun(elements).dispatch("click");
+  await runOne.dispatch("click");
 
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements.stdout.textContent, "live output");
@@ -798,6 +805,7 @@ test("slow validation response cannot replace a newer validation result", async 
       return response({validation: []});
     },
   });
+  await elements["new-run"].dispatch("click");
 
   const slowValidation = elements.validate.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
@@ -861,4 +869,214 @@ test("manual output copy preserves the payload attempted before a run switch", a
     elements["manual-copy-content"].selection,
     [0, attemptedRunTwo.length],
   );
+});
+
+// Issue #45: Working directory / Arguments / Python must always reflect the
+// currently selected run's own immutable snapshot, never another run's
+// values and never the new-run draft.
+
+test("selecting a run renders its own cwd/args/code, never another run's values", async () => {
+  const runA = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "A output",
+    cwd: "/tmp/awm-run-a",
+    args: ["A-ARG-1", "A-ARG-2"],
+    code: "print('RUN=A')",
+  });
+  const runB = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "B output",
+    cwd: "/tmp/awm-run-b",
+    args: ["B-ARG-1"],
+    code: "print('RUN=B')",
+  });
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/tmp/awm-run-a"},
+      {runId: 2, state: "success", cwd: "/tmp/awm-run-b"},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  // The most recent run (B) is auto-selected and shown read-only on load.
+  assert.equal(elements["working-directory"].value, "/tmp/awm-run-b");
+  assert.equal(elements["run-arguments"].value, "B-ARG-1");
+  assert.equal(elements.code.value, "print('RUN=B')");
+  assert.equal(elements["working-directory"].readOnly, true);
+  assert.equal(elements["run-arguments"].readOnly, true);
+  assert.equal(elements.code.readOnly, true);
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
+  assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
+  assert.equal(elements.code.value, "print('RUN=A')");
+
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(elements["working-directory"].value, "/tmp/awm-run-b");
+  assert.equal(elements["run-arguments"].value, "B-ARG-1");
+  assert.equal(elements.code.value, "print('RUN=B')");
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
+  assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
+  assert.equal(elements.code.value, "print('RUN=A')");
+});
+
+test("New run restores the retained draft unchanged after switching between runs", async () => {
+  const runA = snapshot({
+    runId: 1, state: "success", stdout: "A", cwd: "/work/run-1",
+    args: ["a"], code: "print('A')",
+  });
+  const runB = snapshot({
+    runId: 2, state: "success", stdout: "B", cwd: "/work/run-2",
+    args: ["b"], code: "print('B')",
+  });
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1"},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["working-directory"].readOnly, false);
+  elements["working-directory"].value = "/tmp/draft-dir";
+  elements["run-arguments"].value = "draft-arg-1\ndraft-arg-2";
+  elements.code.value = "print('draft')";
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["working-directory"].value, "/work/run-1");
+
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(elements["working-directory"].value, "/work/run-2");
+
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["working-directory"].value, "/tmp/draft-dir");
+  assert.equal(elements["run-arguments"].value, "draft-arg-1\ndraft-arg-2");
+  assert.equal(elements.code.value, "print('draft')");
+  assert.equal(elements["working-directory"].readOnly, false);
+  assert.equal(elements.run.disabled, false);
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("selecting a run never calls a mutating endpoint", async () => {
+  const runA = snapshot({runId: 1, state: "success", stdout: "A"});
+  const runB = snapshot({
+    runId: 2, state: "failed", stdout: "B",
+    resumable: true, checkpoint: {name: "step"},
+  });
+  const {calls, elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1"},
+      {runId: 2, state: "failed", cwd: "/work/run-2"},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  const callsBefore = calls.length;
+  await runItem(elements, 1).dispatch("click");
+  await runItem(elements, 2).dispatch("click");
+  await elements["new-run"].dispatch("click");
+
+  const madeSinceSelecting = calls.slice(callsBefore);
+  assert.ok(madeSinceSelecting.length > 0);
+  assert.ok(madeSinceSelecting.every(([, method]) => (method || "GET") === "GET"));
+});
+
+test("Run submission after returning to New run uses the draft, not a viewed run's snapshot", async () => {
+  const runA = snapshot({
+    runId: 1, state: "success", stdout: "A", cwd: "/work/run-1",
+    args: ["a"], code: "print('A')",
+  });
+  let runRequestBody = null;
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1"}],
+    details: {1: runA},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url !== "/api/run") return undefined;
+      runRequestBody = JSON.parse(options.body);
+      return response({
+        runId: 2,
+        state: "running",
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        progress: [],
+        validation: [],
+        cwd: "/tmp/draft-dir",
+        args: ["draft-arg"],
+        code: "print('draft')",
+        checkpoint: null,
+        attempts: [],
+        suspensionReason: null,
+        resumable: false,
+      });
+    },
+  });
+
+  // Viewing run #1: Run is blocked until an explicit New run.
+  assert.equal(elements.run.disabled, true);
+
+  await elements["new-run"].dispatch("click");
+  elements["working-directory"].value = "/tmp/draft-dir";
+  elements["run-arguments"].value = "draft-arg";
+  elements.code.value = "print('draft')";
+
+  await elements.run.dispatch("click");
+
+  assert.deepEqual(runRequestBody, {
+    code: "print('draft')",
+    cwd: "/tmp/draft-dir",
+    args: ["draft-arg"],
+  });
+});
+
+test("a delayed run-detail response cannot overwrite fields belonging to a newer selection", async () => {
+  const delayedRun = deferred();
+  let delayRunTwo = false;
+  const runOne = snapshot({
+    runId: 1, state: "running", stdout: "A", cwd: "/work/run-1",
+    args: ["a"], code: "print('A')",
+  });
+  const runTwo = snapshot({
+    runId: 2, state: "failed", stdout: "B", cwd: "/work/run-2",
+    args: ["b"], code: "print('B')",
+  });
+  const {elements, eventSource} = await loadApp({
+    runs: [
+      {runId: 1, state: "running", cwd: "/work/run-1"},
+      {runId: 2, state: "failed", cwd: "/work/run-2"},
+    ],
+    details: {1: runOne, 2: runTwo},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunTwo && url === "/api/runs/2") return delayedRun.promise;
+      return undefined;
+    },
+  });
+
+  delayRunTwo = true;
+  eventSource.emit("runner-change");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["working-directory"].value, "/work/run-1");
+  assert.equal(elements["run-arguments"].value, "a");
+  assert.equal(elements.code.value, "print('A')");
+
+  delayedRun.resolve(response(runTwo));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(selectedRun(elements).textContent, /^#1/);
+  assert.equal(elements["working-directory"].value, "/work/run-1");
+  assert.equal(elements["run-arguments"].value, "a");
+  assert.equal(elements.code.value, "print('A')");
 });

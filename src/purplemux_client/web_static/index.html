@@ -29,6 +29,10 @@
       </section>
 
       <section class="panel editor-panel">
+        <div class="editor-mode-bar">
+          <p id="active-context" class="active-context"></p>
+          <button id="new-run" type="button">New run</button>
+        </div>
         <div class="execution-context">
           <div class="context-field context-cwd">
             <label for="working-directory">Working directory</label>
@@ -39,7 +43,6 @@
             <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
           </div>
         </div>
-        <p id="active-context" class="active-context"></p>
         <label for="code">Python</label>
         <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 

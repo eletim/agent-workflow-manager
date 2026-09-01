@@ -110,11 +110,23 @@ textarea {
   margin: 0;
   padding: 8px 10px;
 }
+.editor-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
 .active-context {
   margin: 0 0 14px;
   color: #9ba3b5;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
   overflow-wrap: anywhere;
+}
+.editor-mode-bar .active-context { margin: 0; }
+input[readonly], textarea[readonly] {
+  opacity: 0.7;
+  cursor: default;
 }
 button {
   padding: 8px 18px;
