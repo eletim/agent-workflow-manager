@@ -22,6 +22,7 @@ from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
     PythonRunner,
+    RunNotFoundError,
     WorkflowValidationError,
 )
 
@@ -237,6 +238,25 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         if path in {"/api/status", "/api/output"}:
             self._send_json(HTTPStatus.OK, self.server.runner.snapshot().as_json())
             return
+        if path == "/api/runs":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "runs": [
+                        run.as_summary_json() for run in self.server.runner.snapshots()
+                    ]
+                },
+            )
+            return
+        run_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)", path)
+        if run_match is not None:
+            try:
+                snapshot = self.server.runner.snapshot(int(run_match.group(1)))
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, snapshot.as_json())
+            return
         if path == "/api/settings/notifications":
             try:
                 settings = self.server.notification_settings.read()
@@ -309,7 +329,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.OK
                         if result.valid
                         else HTTPStatus.UNPROCESSABLE_ENTITY,
-                        self.server.runner.snapshot().as_json(),
+                        self.server.runner.validation_snapshot().as_json(),
                     )
                     return
                 run_id = self.server.runner.start(code, cwd=cwd, args=args)
@@ -321,7 +341,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.UNPROCESSABLE_ENTITY,
                     {
                         "error": "workflow validation failed",
-                        **self.server.runner.snapshot().as_json(),
+                        **self.server.runner.validation_snapshot().as_json(),
                     },
                 )
                 return
@@ -330,7 +350,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 HTTPStatus.ACCEPTED,
-                {"runId": run_id, **self.server.runner.snapshot().as_json()},
+                {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
             )
             return
         if path == "/api/stop":
@@ -341,6 +361,20 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     "stopped": stopped,
                     **self.server.runner.snapshot().as_json(),
                 },
+            )
+            return
+        stop_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/stop", path)
+        if stop_match is not None:
+            run_id = int(stop_match.group(1))
+            try:
+                stopped = self.server.runner.stop(run_id)
+                snapshot = self.server.runner.snapshot(run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED if stopped else HTTPStatus.CONFLICT,
+                {"stopped": stopped, **snapshot.as_json()},
             )
             return
         if path == "/api/settings/notifications":

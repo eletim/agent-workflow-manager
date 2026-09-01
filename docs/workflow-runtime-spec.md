@@ -184,7 +184,10 @@ same trusted-request boundary as Run and Stop. Test delivery calls public
 cleanup as terminal delivery. CLI absence, invalid/missing config or token,
 timeout, and nonzero exit produce sanitized actionable messages; CLI output is
 discarded and never returned. A test notification never reads or mutates
-PythonRunner state.
+PythonRunner state. PythonRunner owns a run registry rather than one
+process-state singleton: process group, output, progress, terminal state, and
+execution context are stored per run. Stopping a run targets its identifier;
+server shutdown is the only operation that stops every active run.
 
 ## Credentials and configuration
 
