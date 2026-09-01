@@ -18,7 +18,11 @@ from purplemux_client.notification_settings import (
     SettingsValidationError,
 )
 from purplemux_client.notifier import NotifyCLI
-from purplemux_client.runner import AlreadyRunningError, PythonRunner
+from purplemux_client.runner import (
+    AlreadyRunningError,
+    PythonRunner,
+    WorkflowValidationError,
+)
 
 STATIC_DIR = Path(__file__).with_name("web_static")
 STATIC_FILES = {
@@ -262,13 +266,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         json_paths = {
             "/api/run",
+            "/api/validate",
             "/api/settings/notifications",
             "/api/settings/notifications/test",
         }
         if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
             return
-        if path == "/api/run":
+        if path in {"/api/run", "/api/validate"}:
             payload = self._read_json()
             if payload is None:
                 return
@@ -279,7 +284,25 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             try:
+                if path == "/api/validate":
+                    result = self.server.runner.validate(code)
+                    self._send_json(
+                        HTTPStatus.OK
+                        if result.valid
+                        else HTTPStatus.UNPROCESSABLE_ENTITY,
+                        self.server.runner.snapshot().as_json(),
+                    )
+                    return
                 run_id = self.server.runner.start(code)
+            except WorkflowValidationError:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "workflow validation failed",
+                        **self.server.runner.snapshot().as_json(),
+                    },
+                )
+                return
             except AlreadyRunningError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return

@@ -69,6 +69,15 @@ def test_stderr(runner: PythonRunner) -> None:
     assert result.stderr == "BAD\n"
 
 
+def test_standard_library_alias_import_passes_and_runs(runner: PythonRunner) -> None:
+    runner.start("import os.path; print(os.path.basename('/tmp/example'))")
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert result.stdout == "example\n"
+
+
 def test_nonzero_exit(runner: PythonRunner) -> None:
     runner.start("raise SystemExit(3)")
 
@@ -78,9 +87,8 @@ def test_nonzero_exit(runner: PythonRunner) -> None:
     assert result.exit_code == 3
 
 
-@pytest.mark.parametrize("code", ["def broken(", "raise RuntimeError('boom')"])
-def test_python_error_is_reported(runner: PythonRunner, code: str) -> None:
-    runner.start(code)
+def test_runtime_python_error_is_reported(runner: PythonRunner) -> None:
+    runner.start("raise RuntimeError('boom')")
 
     result = wait_until_finished(runner)
 
@@ -182,8 +190,9 @@ def test_close_cannot_miss_concurrent_start_registration(
     allow_popen = threading.Event()
 
     def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-        popen_entered.set()
-        assert allow_popen.wait(timeout=3)
+        if kwargs.get("start_new_session") is True:
+            popen_entered.set()
+            assert allow_popen.wait(timeout=3)
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
 
     monkeypatch.setattr(subprocess, "Popen", blocking_popen)
@@ -277,7 +286,11 @@ def test_popen_uses_current_interpreter_without_shell(
     runner.start("")
     wait_until_finished(runner)
 
-    command, options = calls[0]
+    command, options = next(
+        (command, options)
+        for command, options in calls
+        if options.get("start_new_session") is True
+    )
     assert isinstance(command, list)
     assert command[0] == sys.executable
     assert options["shell"] is False
@@ -446,9 +459,49 @@ def test_runner_http_lifecycle(
         "stdout": "HTTP_OK\n",
         "stderr": "",
         "progress": [],
+        "validation": [],
         "exitCode": 0,
         "runId": 1,
     }
+
+
+def test_validation_api_and_run_preflight_report_distinct_state(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    body = json.dumps({"code": "def broken("})
+
+    status, validated = request(address, "POST", "/api/validate", body, token=token)
+    assert status == 422
+    assert validated["state"] == "validation_failed"
+    assert validated["runId"] is None
+    assert validated["validation"][0]["kind"] == "syntax"
+    assert validated["validation"][0]["line"] == 1
+
+    status, rejected = request(address, "POST", "/api/run", body, token=token)
+    assert status == 422
+    assert rejected["error"] == "workflow validation failed"
+    assert rejected["state"] == "validation_failed"
+    assert rejected["runId"] is None
+
+
+@pytest.mark.parametrize("path", ["/api/validate", "/api/run"])
+def test_workflow_api_reports_unresolvable_preflight_path(
+    web_server: tuple[tuple[str, int], str], path: str
+) -> None:
+    address, token = web_server
+    status, result = request(
+        address,
+        "POST",
+        path,
+        json.dumps({"code": "WORKFLOW_PREFLIGHT = {'paths': ['~unknown-user/input']}"}),
+        token=token,
+    )
+
+    assert status == 422
+    assert result["state"] == "validation_failed"
+    assert result["validation"][0]["kind"] == "path"
+    assert "could not check required path" in result["validation"][0]["message"]
 
 
 def test_notification_settings_api_read_never_returns_token(
@@ -774,22 +827,29 @@ def test_notification_settings_mutation_rejects_untrusted_request(
 
 
 @pytest.mark.parametrize(
-    ("token", "origin"),
+    ("path", "token", "origin"),
     [
-        (None, None),
-        ("wrong", None),
-        ("valid", "https://attacker.example"),
-        ("valid", "http://["),
+        (path, token, origin)
+        for path in ("/api/run", "/api/validate")
+        for token, origin in (
+            (None, None),
+            ("wrong", None),
+            ("valid", "https://attacker.example"),
+            ("valid", "http://["),
+        )
     ],
 )
-def test_run_rejects_untrusted_request(
-    web_server: tuple[tuple[str, int], str], token: str | None, origin: str | None
+def test_workflow_action_rejects_untrusted_request(
+    web_server: tuple[tuple[str, int], str],
+    path: str,
+    token: str | None,
+    origin: str | None,
 ) -> None:
     address, actual_token = web_server
     status, payload = request(
         address,
         "POST",
-        "/api/run",
+        path,
         json.dumps({"code": 'print("must not run")'}),
         token=actual_token if token == "valid" else token,
         origin=origin,

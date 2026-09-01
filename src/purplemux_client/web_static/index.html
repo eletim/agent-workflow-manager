@@ -26,10 +26,16 @@
 emit_step("workspace create", "started")
 emit_step("workspace create", "completed")</textarea>
         <div class="controls">
+          <button id="validate">Validate</button>
           <button id="run" class="primary">Run</button>
           <button id="stop" disabled>Stop</button>
           <span id="exit-code">Exit code: —</span>
         </div>
+      </section>
+
+      <section id="validation-panel" class="panel validation-panel" aria-live="polite" hidden>
+        <h2>Validation</h2>
+        <ol id="validation" class="validation-list"></ol>
       </section>
 
       <section class="panel progress-panel" aria-live="polite">

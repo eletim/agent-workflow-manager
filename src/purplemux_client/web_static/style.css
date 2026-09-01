@@ -70,7 +70,10 @@ a { color: #bcaaff; }
 }
 .status.running { background: #513d12; color: #ffd66b; }
 .status.success { background: #163f2b; color: #75e2a8; }
-.status.failed, .status.stopped { background: #4b252b; color: #ff9ca8; }
+.status.failed, .status.stopped, .status.validation_failed { background: #4b252b; color: #ff9ca8; }
+
+.validation-panel { border-color: #7d4148; }
+.validation-list { margin-bottom: 0; color: #ffb3bc; }
 
 .progress-panel { margin-top: 14px; }
 .progress-panel h2 { margin: 0 0 10px; }
