@@ -53,6 +53,10 @@ class Element {
     this.attributes[name] = value;
   }
 
+  getAttribute(name) {
+    return this.attributes[name];
+  }
+
   focus() {}
 
   select() {}
@@ -141,6 +145,8 @@ async function loadApp({
     "save-settings", "test-notification",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
+  elements.favicon = new Element();
+  elements.favicon.setAttribute("href", "/favicon.svg");
   elements["validation-panel"].hidden = true;
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
@@ -173,6 +179,9 @@ async function loadApp({
     if (url === "/api/token") return response({token: "request-token"});
     if (url === "/api/status") return response(initial);
     if (url === "/api/runs") return response({runs});
+    if (url === "/favicon.svg") {
+      return response('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+    }
     if (url === "/api/settings/notifications") return response(settings);
     if (url === "/api/validate") {
       return response(validation.body, validation.status);
@@ -249,6 +258,67 @@ function markerState(elements, runId) {
   assert.equal(item.children[0].attributes["aria-hidden"], "true");
   return item.dataset.state;
 }
+
+function faviconIsRunning(elements) {
+  return decodeURIComponent(elements.favicon.getAttribute("href"))
+    .includes('id="running-badge"');
+}
+
+test("favicon starts idle when there are no runs", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements.favicon.getAttribute("href"), "/favicon.svg");
+  assert.equal(faviconIsRunning(elements), false);
+});
+
+test("favicon badge reflects any running run independently of selection", async () => {
+  const runs = [
+    {runId: 1, state: "running", cwd: "/work/run-1"},
+    {runId: 2, state: "success", cwd: "/work/run-2"},
+  ];
+  const {elements} = await loadApp({
+    runs,
+    details: {
+      1: snapshot({runId: 1, state: "running", stdout: "active"}),
+      2: snapshot({runId: 2, state: "success", stdout: "done"}),
+    },
+    validation: {status: 200, body: {validation: []}},
+  });
+  await waitFor(() => faviconIsRunning(elements));
+
+  await runItem(elements, 2).dispatch("click");
+
+  assert.ok(runItem(elements, 2).className.includes("selected"));
+  assert.equal(faviconIsRunning(elements), true);
+});
+
+test("favicon badge clears through SSE when the final running run stops", async () => {
+  const runs = [
+    {runId: 1, state: "success", cwd: "/work/run-1"},
+    {runId: 2, state: "running", cwd: "/work/run-2"},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done"}),
+    2: snapshot({runId: 2, state: "running", stdout: "active"}),
+  };
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+  await waitFor(() => faviconIsRunning(elements));
+
+  runs[1] = {...runs[1], state: "stopped"};
+  details[2] = {...details[2], state: "stopped", exitCode: -15};
+  eventSource.emit("runner-change");
+  await waitFor(() => !faviconIsRunning(elements));
+
+  assert.equal(elements.favicon.getAttribute("href"), "/favicon.svg");
+});
 
 test("run rows render independent decorative indicators from textual states", async () => {
   const runs = [
@@ -334,6 +404,7 @@ test("stale refresh cannot roll a newer run indicator back", async () => {
   details[1] = {...details[1], state: "success", exitCode: 0};
   eventSource.emit("runner-change");
   await waitFor(() => markerState(elements, 1) === "success");
+  assert.equal(faviconIsRunning(elements), false);
 
   delayedRuns.resolve(response({
     runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
@@ -342,6 +413,7 @@ test("stale refresh cannot roll a newer run indicator back", async () => {
 
   assert.equal(markerState(elements, 1), "success");
   assert.match(runItem(elements, 1).textContent, /  success  /);
+  assert.equal(faviconIsRunning(elements), false);
 });
 
 test("initial state loads through read APIs before any SSE event", async () => {

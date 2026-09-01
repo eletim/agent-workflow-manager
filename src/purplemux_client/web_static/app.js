@@ -41,6 +41,7 @@ const credentialStatus = document.querySelector("#credential-status");
 const settingsMessage = document.querySelector("#settings-message");
 const saveSettingsButton = document.querySelector("#save-settings");
 const testNotificationButton = document.querySelector("#test-notification");
+const favicon = document.querySelector("#favicon");
 
 let requestToken = null;
 let eventSource = null;
@@ -54,6 +55,36 @@ let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
+let faviconRunning = false;
+let runningFaviconHrefPromise = null;
+
+function runningFaviconHref() {
+  if (runningFaviconHrefPromise === null) {
+    runningFaviconHrefPromise = fetch(favicon.getAttribute("href"))
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.text();
+      })
+      .then((source) => {
+        const badge = '<circle id="running-badge" cx="25" cy="25" r="5" fill="#ef4444" stroke="#fff" stroke-width="2"/>';
+        return `data:image/svg+xml,${encodeURIComponent(source.replace("</svg>", `${badge}</svg>`))}`;
+      });
+  }
+  return runningFaviconHrefPromise;
+}
+
+function renderFavicon(runs) {
+  faviconRunning = runs.some((run) => run.state === "running");
+  if (!faviconRunning) {
+    favicon.setAttribute("href", "/favicon.svg");
+    return;
+  }
+  void runningFaviconHref().then((href) => {
+    if (faviconRunning) favicon.setAttribute("href", href);
+  }).catch(() => {
+    // The base icon remains usable if a browser cannot generate the badge.
+  });
+}
 
 function renderRun(result) {
   const running = result.state === "running";
@@ -302,6 +333,7 @@ async function refresh() {
     ) return;
     if (result) renderRun(result);
     renderRunList(runs);
+    renderFavicon(runs);
     renderedRefreshGeneration = requestGeneration;
   } catch (error) {
     if (

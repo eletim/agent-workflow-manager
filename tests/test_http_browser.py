@@ -71,7 +71,7 @@ def test_copy_actions_on_insecure_http_origin(
 
     driver = webdriver.Chrome(options=options)
     try:
-        url, _ = insecure_browser_server
+        url, runner = insecure_browser_server
         driver.get(url)
         wait = WebDriverWait(driver, 5)
         wait.until(
@@ -79,6 +79,23 @@ def test_copy_actions_on_insecure_http_origin(
         )
         assert driver.execute_script("return window.isSecureContext") is False
         assert driver.execute_script("return typeof navigator.clipboard") == "undefined"
+
+        run_id = runner.start("import time\ntime.sleep(30)\n")
+        wait.until(
+            lambda browser: (
+                browser.find_element(By.ID, "favicon")
+                .get_attribute("href")
+                .startswith("data:image/svg+xml,")
+            )
+        )
+        runner.stop(run_id)
+        wait.until(
+            lambda browser: (
+                browser.find_element(By.ID, "favicon")
+                .get_attribute("href")
+                .endswith("/favicon.svg")
+            )
+        )
 
         driver.find_element(By.ID, "guide-open").click()
         wait.until(
