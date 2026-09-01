@@ -223,7 +223,7 @@ def test_issue_approved_resume_with_new_head_runs_a_new_bounded_review(
 
     SAMPLE_MODULE.process_issue(config.issues[0], config, object(), recovery)
 
-    assert reviews == [1]
+    assert reviews == [2]
     assert recovery.phase == "workspace_ready"
 
 
@@ -290,10 +290,105 @@ def test_integration_approved_resume_with_new_head_rereviews_and_rechecks(
 
     ready = SAMPLE_MODULE.integration_review(config, object(), recovery)
 
-    assert reviews == [1]
+    assert reviews == [2]
     assert checks == ["final whole-version checks"]
     assert ready["isDraft"] is False
     assert recovery.phase == "integration_ready"
+
+
+def test_issue_approval_drift_after_fourth_review_exhausts_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase="issue_approved",
+        issue_number=1,
+        implementer="tab-1",
+        reviewer="tab-2",
+        reviews_used=SAMPLE_MODULE.MAX_REVIEWS,
+        approved_sha="a" * 40,
+    )
+    new_sha = "b" * 40
+    monkeypatch.setattr(SAMPLE_MODULE, "merged_issue_pr", lambda *_args: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "prepare_issue_branch", lambda *_args: None)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "require_issue_head",
+        lambda *_args: (new_sha, {"headRefOid": new_sha}),
+    )
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "run_turn",
+        lambda *_args, **_kwargs: pytest.fail("review limit was bypassed"),
+    )
+
+    with pytest.raises(purplemux_client.WorkerFailure, match="ended without approval"):
+        SAMPLE_MODULE.process_issue(config.issues[0], config, object(), recovery)
+
+    assert recovery.phase == "issue_fix_done"
+    assert recovery.reviews_used == SAMPLE_MODULE.MAX_REVIEWS
+    assert recovery.approved_sha is None
+
+
+def test_integration_approval_drift_after_fourth_review_exhausts_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SAMPLE_MODULE.Config(
+        repo=tmp_path,
+        slug="OWNER/REPOSITORY",
+        integration_branch="dev/v1.2.3",
+        main_branch="main",
+        issues=(SAMPLE_MODULE.Issue(1, "feature/issue-1"),),
+        check_command="make test",
+    )
+    recovery = SAMPLE_MODULE.Recovery(
+        workspace="ws-1",
+        phase="integration_approved",
+        implementer="tab-1",
+        reviewer="tab-2",
+        reviews_used=SAMPLE_MODULE.MAX_REVIEWS,
+        approved_sha="a" * 40,
+    )
+    new_sha = "b" * 40
+    pr = {
+        "number": 10,
+        "url": "https://github.com/OWNER/REPOSITORY/pull/10",
+        "state": "OPEN",
+        "isDraft": True,
+        "headRefName": config.integration_branch,
+        "headRefOid": new_sha,
+        "baseRefName": config.main_branch,
+    }
+    monkeypatch.setattr(SAMPLE_MODULE, "worktree_is_dirty", lambda _config: False)
+    monkeypatch.setattr(SAMPLE_MODULE, "switch_to_integration", lambda _config: None)
+    monkeypatch.setattr(SAMPLE_MODULE, "integration_prs", lambda *_args: [pr])
+    monkeypatch.setattr(SAMPLE_MODULE, "ensure_draft_integration_pr", lambda *_args: pr)
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "require_integration_head",
+        lambda *_args: (new_sha, pr),
+    )
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "run_turn",
+        lambda *_args, **_kwargs: pytest.fail("review limit was bypassed"),
+    )
+
+    with pytest.raises(purplemux_client.WorkerFailure, match="ended without approval"):
+        SAMPLE_MODULE.integration_review(config, object(), recovery)
+
+    assert recovery.phase == "integration_fix_done"
+    assert recovery.reviews_used == SAMPLE_MODULE.MAX_REVIEWS
+    assert recovery.approved_sha is None
 
 
 def test_dirty_integration_resume_on_wrong_branch_stops_before_switch(

@@ -639,8 +639,7 @@ def reopen_review_if_approval_drifted(
     if recovery.approved_sha == actual_sha:
         return False
     recovery.approved_sha = None
-    # The reviewed subject changed, so start a new bounded loop for the new head.
-    recovery.reviews_used = 0
+    # Keep the counter monotonic so repeated pushes cannot extend the bounded loop.
     recovery.phase = reviewable_phase
     recovery.checkpoint(config)
     return True
