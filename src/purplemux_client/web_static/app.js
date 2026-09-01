@@ -237,20 +237,20 @@ outputCopy.addEventListener("click", async () => {
   if (outputCopyResetTimer !== null) {
     window.clearTimeout(outputCopyResetTimer);
   }
+  const text = runnerOutputClipboard.formatOutput(
+    stdout.textContent,
+    stderr.textContent,
+  );
   try {
-    await runnerOutputClipboard.write(
+    await runnerOutputClipboard.writeText(
+      text,
       navigator.clipboard,
-      stdout.textContent,
-      stderr.textContent,
       document,
     );
     outputCopy.textContent = "Copied";
   } catch (error) {
     outputCopy.textContent = "Copy manually";
-    showManualCopy(runnerOutputClipboard.formatOutput(
-      stdout.textContent,
-      stderr.textContent,
-    ));
+    showManualCopy(text);
   }
   outputCopyResetTimer = window.setTimeout(() => {
     outputCopy.textContent = "Copy output";
