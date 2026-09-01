@@ -923,6 +923,45 @@ print("resumed")
     assert "no safe checkpoint" in str(refusal["error"])
 
 
+def test_resume_api_reports_removed_working_directory_without_mutating_run(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    run_cwd = tmp_path / "removed-after-failure"
+    run_cwd.mkdir()
+    code = """\
+from purplemux_client import save_checkpoint
+save_checkpoint("safe boundary", {"workspace": "ws-1"})
+raise RuntimeError("manual repair required")
+"""
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": code, "cwd": str(run_cwd)}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, before = request(address, "GET", f"/api/runs/{run_id}")
+        if before["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert before["state"] == "failed"
+    run_cwd.rmdir()
+
+    status, refusal = request(
+        address, "POST", f"/api/runs/{run_id}/resume", token=token
+    )
+
+    assert status == 400
+    assert refusal == {"error": f"working directory is not a directory: {run_cwd}"}
+    _, after = request(address, "GET", f"/api/runs/{run_id}")
+    assert after == before
+
+
 def test_run_api_passes_run_scoped_execution_context(
     web_server: tuple[tuple[str, int], str], tmp_path: Path
 ) -> None:

@@ -816,6 +816,7 @@ class PythonRunner:
             not in (
                 "success",
                 "failed",
+                "suspended",
                 "stopped",
             )
         ):

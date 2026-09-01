@@ -390,6 +390,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             except RunNotResumableError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
+            except InvalidExecutionContextError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             except WorkflowValidationError as exc:
                 self._send_json(
                     HTTPStatus.UNPROCESSABLE_ENTITY,

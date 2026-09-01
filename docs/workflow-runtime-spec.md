@@ -36,6 +36,8 @@ terminal state is determined solely by the Python process:
 
 - exit code zero becomes `success`;
 - a nonzero exit becomes `failed`;
+- the reserved suspension exit with a matching `suspend_run()` event becomes
+  `suspended`;
 - a process terminated after a Runner stop request becomes `stopped`.
 
 Progress events are observational. They do not decide terminal state and must
@@ -160,6 +162,7 @@ not drive workflow control flow and do not participate in orchestration.
 | --- | --- | --- |
 | `success` | `Workflow completed` | Includes the run ID and `success` state. |
 | `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
+| `suspended` | `Workflow needs attention` | Says that the run is suspended for manual input or recovery. |
 | `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
 
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
@@ -169,6 +172,9 @@ notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,
 success and failure default on, and stopped defaults off. In `config.sh`, the
 first setting is expressed as `auto`, `enabled`, or `disabled`; `start.sh`
 resolves it to the runtime boolean after notify setup.
+Suspension is an operator-attention condition rather than a hard failure and is
+therefore sent whenever notifications are globally enabled; it does not use the
+failure policy or failure wording.
 
 Each enabled terminal notification has one attempt, an outer bounded timeout,
 and no retry loop. The CLI runs in its own process group, which is terminated
