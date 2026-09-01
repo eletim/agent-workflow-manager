@@ -33,6 +33,9 @@ create. The adapter supports:
 - `interrupt()`
 - `close_session()`
 - `capture_screen()` for diagnostics only
+- `start_shell()`
+- `wait_for_shell_completion()`
+- `read_shell_result()`
 
 Turn completion is correlated with `eventSeq`, `readyForReviewAt`, and
 `completionTimestamp`. Stale results are rejected, including when the
@@ -41,6 +44,14 @@ and interruptions are explicit. Read-only CLI timeouts can be retried;
 mutation timeouts raise `MutationOutcomeUnknown` because the remote outcome is
 unknown. Screen capture is never used to decide completion or as a result
 fallback.
+
+Observable Bash work runs in named PurpleMux `terminal` tabs. The adapter sends
+the command with an explicit working directory and correlates completion with a
+machine-readable exit-code sidecar; it does not parse pane text or guess from a
+shell prompt. Starting commands is non-blocking, so shell tabs, agent sessions,
+and separate workflows can run concurrently. A completed tab stays open until
+the workflow explicitly closes it, which lets failed commands remain available
+for inspection.
 
 ```python
 from purplemux_client import CreateSessionRequest, PurpleMuxCLIClient
@@ -57,6 +68,23 @@ try:
     print(client.read_result(session_id))
 finally:
     client.close_session(session_id)
+```
+
+```python
+from purplemux_client import ShellCommandRequest
+
+shell_tab = client.start_shell(
+    ShellCommandRequest(
+        command="uv run pytest",
+        cwd="/workspace/project",
+        name="Run 12: tests",
+    )
+)
+client.wait_for_shell_completion(shell_tab, 900)
+shell_result = client.read_shell_result(shell_tab)
+if shell_result.exit_code != 0:
+    raise RuntimeError(f"tests failed in {shell_tab}: {shell_result.exit_code}")
+client.close_session(shell_tab)
 ```
 
 PurpleMux owns provider launch commands and the workspace directory. The

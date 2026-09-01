@@ -42,8 +42,16 @@ Progress events are observational. They do not decide terminal state and must
 never drive workflow sequencing, branching, retries, cleanup, or completion.
 The Runner does not operate tmux.
 
-PurpleMux owns the agent runtime. `purplemux_client` uses PurpleMux's public
-CLI contract and does not replace its runtime or access tmux directly.
+PurpleMux owns agent and managed-terminal runtime. `purplemux_client` uses
+PurpleMux's public CLI contract and does not replace its runtime or access tmux
+directly. Observable or parallel shell work is launched in a named PurpleMux
+`terminal` tab with an explicit working directory. Its completion comes from a
+machine-readable exit-code sidecar written by the command wrapper; pane text is
+diagnostic only, and `terminalStatus` is optional status context rather than an
+inferred command result. The optional field is consumed when available and the
+tab's structured `alive` lifecycle remains authoritative. Tabs remain open until
+plain Python cleanup closes them, so a workflow can retain failed commands for
+inspection.
 
 ## Browser access and network trust
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Sequence
 
@@ -12,6 +13,7 @@ from purplemux_client import (
     PurpleMuxCLIClient,
     ResultNotReady,
     SessionReadyTimeout,
+    ShellCommandRequest,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
@@ -125,6 +127,209 @@ def test_create_requires_tab_id() -> None:
 
     with pytest.raises(WorkerFailure, match="did not return a tab ID"):
         client(runner).create_session(request())
+
+
+def test_start_shell_creates_named_terminal_and_sends_cwd_command(
+    tmp_path,
+) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed({"status": "closed"}),
+        ]
+    )
+    cli = client(runner)
+
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command="printf 'hello world'",
+            cwd=str(tmp_path),
+            name="Run 12: tests",
+        )
+    )
+
+    assert session_id == "tab-shell"
+    assert runner.calls[0] == [
+        "purplemux",
+        "tab",
+        "create",
+        "-w",
+        "ws-test",
+        "-n",
+        "Run 12: tests",
+        "-t",
+        "terminal",
+    ]
+    wrapper = runner.calls[1][-1]
+    assert f"cd -- {tmp_path}" in wrapper
+    assert "bash -lc" in wrapper
+    assert 'printf \'{"exitCode":%s}' in wrapper
+    cli.close_session(session_id)
+
+
+@pytest.mark.parametrize(
+    "shell_request",
+    [
+        ShellCommandRequest(command="", cwd="/tmp", name="run"),
+        ShellCommandRequest(command="true", cwd="/tmp", name="  "),
+        ShellCommandRequest(command="true\0false", cwd="/tmp", name="run"),
+    ],
+)
+def test_start_shell_rejects_invalid_request(shell_request) -> None:
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError):
+        client(runner).start_shell(shell_request)
+
+    assert runner.calls == []
+
+
+def test_shell_start_timeout_reports_created_tab_for_reconciliation(tmp_path) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            subprocess.TimeoutExpired(["purplemux"], 30),
+            completed({"status": "closed"}),
+        ]
+    )
+    cli = client(runner)
+
+    with pytest.raises(
+        MutationOutcomeUnknown,
+        match="shell terminal tab-shell was created.*outcome is unknown",
+    ):
+        cli.start_shell(
+            ShellCommandRequest(command="make test", cwd=str(tmp_path), name="Run 5")
+        )
+
+    cli.close_session("tab-shell")
+
+
+def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(command="exit 7", cwd=str(tmp_path), name="Run 4: check")
+    )
+    result_path = cli._shell_runs[session_id].result_path
+    with pytest.raises(ResultNotReady, match="result is not ready"):
+        cli.read_shell_result(session_id)
+    with open(result_path, "w", encoding="utf-8") as stream:
+        json.dump({"exitCode": 7}, stream)
+
+    cli.wait_for_shell_completion(session_id, 1)
+
+    assert cli.read_shell_result(session_id).exit_code == 7
+    assert cli.read_shell_result(session_id).exit_code == 7
+    assert not os.path.exists(os.path.dirname(result_path))
+    assert len(runner.calls) == 2
+
+
+def test_shell_commands_can_complete_independently(tmp_path) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-a"}),
+            completed({"status": "sent"}),
+            completed({"tabId": "tab-b"}),
+            completed({"status": "sent"}),
+        ]
+    )
+    cli = client(runner)
+    tab_a = cli.start_shell(
+        ShellCommandRequest(command="task-a", cwd=str(tmp_path), name="Run A")
+    )
+    tab_b = cli.start_shell(
+        ShellCommandRequest(command="task-b", cwd=str(tmp_path), name="Run B")
+    )
+    for tab, exit_code in ((tab_b, 0), (tab_a, 3)):
+        with open(cli._shell_runs[tab].result_path, "w", encoding="utf-8") as stream:
+            json.dump({"exitCode": exit_code}, stream)
+        cli.wait_for_shell_completion(tab, 1)
+
+    assert cli.read_shell_result(tab_a).exit_code == 3
+    assert cli.read_shell_result(tab_b).exit_code == 0
+
+
+def test_shell_wait_uses_structured_terminal_status_for_timeout(tmp_path) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "panelType": "terminal",
+                    "terminalStatus": "running",
+                    "alive": True,
+                }
+            ),
+            completed({"status": "closed"}),
+        ]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(command="sleep 5", cwd=str(tmp_path), name="Run 9")
+    )
+
+    with pytest.raises(WorkerFailure, match="last terminalStatus=running"):
+        cli.wait_for_shell_completion(session_id, 0)
+    cli.close_session(session_id)
+
+
+def test_shell_wait_tolerates_optional_terminal_status_during_startup(
+    tmp_path,
+) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed(
+                {
+                    "panelType": "terminal",
+                    "cliState": "inactive",
+                    "alive": True,
+                }
+            ),
+            completed({"status": "closed"}),
+        ]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(command="true", cwd=str(tmp_path), name="Run 10")
+    )
+
+    with pytest.raises(
+        WorkerFailure,
+        match="last terminalStatus=unavailable; cliState=inactive",
+    ):
+        cli.wait_for_shell_completion(session_id, 0)
+    cli.close_session(session_id)
+
+
+def test_failed_shell_terminal_is_retained_until_explicit_close(tmp_path) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed({"status": "closed"}),
+        ]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(command="false", cwd=str(tmp_path), name="Run 3: lint")
+    )
+    result_path = cli._shell_runs[session_id].result_path
+    with open(result_path, "w", encoding="utf-8") as stream:
+        json.dump({"exitCode": 1}, stream)
+    cli.wait_for_shell_completion(session_id, 1)
+
+    assert runner.calls[-1][2] == "send"
+    assert cli.read_shell_result(session_id).exit_code == 1
+
+    cli.close_session(session_id)
+    assert runner.calls[-1][2] == "close"
 
 
 def test_read_status_returns_structured_status() -> None:
