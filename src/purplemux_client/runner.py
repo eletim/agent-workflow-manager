@@ -155,6 +155,7 @@ class _RunRecord:
     run_id: int
     cwd: str
     args: tuple[str, ...]
+    explicit_cwd: bool
     process: subprocess.Popen[bytes]
     process_group_id: int
     script_path: Path
@@ -257,7 +258,11 @@ class PythonRunner:
                     self._apply_validation(validation, run_cwd, run_args)
                     raise WorkflowValidationError(validation)
                 return self._start_validated(
-                    code, run_cwd=run_cwd, run_args=run_args, child_env=child_env
+                    code,
+                    run_cwd=run_cwd,
+                    run_args=run_args,
+                    child_env=child_env,
+                    explicit_cwd=cwd is not None,
                 )
 
     def resume(self, run_id: int) -> None:
@@ -271,7 +276,10 @@ class PythonRunner:
                 checkpoint = run.checkpoint
                 cwd = run.cwd
                 args = run.args
-            run_cwd, run_args, child_env = self._execution_context(cwd, args)
+                explicit_cwd = run.explicit_cwd
+            run_cwd, run_args, child_env = self._execution_context(
+                cwd, args, explicit_cwd=explicit_cwd
+            )
             validation = self._validator.validate(
                 code, cwd=run_cwd, environment=child_env
             )
@@ -338,6 +346,7 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
+        explicit_cwd: bool,
     ) -> int:
         process, script_path, progress_read_fd = self._spawn_process(
             code,
@@ -352,6 +361,7 @@ class PythonRunner:
             run_id=run_id,
             cwd=str(run_cwd),
             args=run_args,
+            explicit_cwd=explicit_cwd,
             process=process,
             process_group_id=process.pid,
             script_path=script_path,
@@ -503,9 +513,13 @@ class PythonRunner:
 
     @staticmethod
     def _execution_context(
-        cwd: str | os.PathLike[str] | None, args: Sequence[str]
+        cwd: str | os.PathLike[str] | None,
+        args: Sequence[str],
+        *,
+        explicit_cwd: bool | None = None,
     ) -> tuple[Path, tuple[str, ...], dict[str, str]]:
-        explicit_cwd = cwd is not None
+        if explicit_cwd is None:
+            explicit_cwd = cwd is not None
         try:
             run_cwd = Path.cwd() if cwd is None else Path(cwd).expanduser().resolve()
         except (OSError, RuntimeError, ValueError) as exc:

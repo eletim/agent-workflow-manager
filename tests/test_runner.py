@@ -388,6 +388,54 @@ print("continued safely")
     ]
 
 
+def test_default_cwd_resume_preserves_environment_and_preflight(
+    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager_venv = tmp_path / "manager-venv"
+    manager_bin = manager_venv / "bin"
+    manager_bin.mkdir(parents=True)
+    required_command = manager_bin / "legacy-tool"
+    required_command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    required_command.chmod(0o755)
+    inherited_path = os.pathsep.join((str(manager_bin), os.environ.get("PATH", "")))
+    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
+    monkeypatch.setenv("PATH", inherited_path)
+    monkeypatch.chdir(tmp_path)
+    code = """\
+WORKFLOW_PREFLIGHT = {
+    "commands": ["legacy-tool"],
+    "environment": ["VIRTUAL_ENV"],
+}
+import json
+import os
+from purplemux_client import resume_checkpoint, save_checkpoint
+
+checkpoint = resume_checkpoint()
+print(json.dumps({"virtualEnv": os.environ.get("VIRTUAL_ENV"), "path": os.environ.get("PATH")}))
+if checkpoint is None:
+    save_checkpoint("legacy boundary", {"ready": "yes"})
+    raise RuntimeError("manual repair required")
+assert checkpoint.name == "legacy boundary"
+"""
+
+    run_id = runner.start(code)
+    first = wait_until_finished(runner)
+    assert first.state == "failed"
+    assert first.checkpoint is not None
+
+    runner.resume(run_id)
+    resumed = wait_until_finished(runner)
+
+    environments = [
+        json.loads(line) for line in resumed.stdout.splitlines() if line.startswith("{")
+    ]
+    assert resumed.state == "success"
+    assert environments == [
+        {"virtualEnv": str(manager_venv), "path": inherited_path},
+        {"virtualEnv": str(manager_venv), "path": inherited_path},
+    ]
+
+
 def test_resume_rejects_failure_without_safe_checkpoint(runner: PythonRunner) -> None:
     run_id = runner.start("raise RuntimeError('unsafe to replay')")
     wait_until_finished(runner)
