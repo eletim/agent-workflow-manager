@@ -108,7 +108,13 @@ function renderRunList(runs) {
     button.type = "button";
     button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
     button.dataset.state = run.state;
+    button.dataset.runId = String(run.runId);
     button.textContent = `#${run.runId}  ${run.state}  ${run.cwd}`;
+
+    const marker = document.createElement("span");
+    marker.className = "run-state-marker";
+    marker.setAttribute("aria-hidden", "true");
+    button.prepend(marker);
     button.addEventListener("click", async () => {
       activeRunId = run.runId;
       activeRunGeneration += 1;
