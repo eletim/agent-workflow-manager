@@ -143,6 +143,23 @@ def test_start_syncs_and_launches_runner_with_notify_disabled(
     assert "notifications disabled" in completed.stdout.lower()
 
 
+def test_start_reports_custom_install_remediation_when_purplemux_is_missing(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    (tmp_path / "bin" / "purplemux").unlink()
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "required custom purplemux CLI not found" in completed.stderr
+    assert "eletim/purplemux" in completed.stderr
+    assert "cli-token" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_start_rejects_incompatible_upstream_purplemux_cli(tmp_path: Path) -> None:
     environment, call_log, _ = _start_environment(tmp_path)
     _executable(

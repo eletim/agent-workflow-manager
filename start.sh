@@ -51,7 +51,12 @@ validate_purplemux() {
     local runtime_output
     local required_contract
 
-    require_command purplemux
+    if ! command -v purplemux >/dev/null 2>&1; then
+        printf '%s\n' \
+            'ERROR: required custom purplemux CLI not found on PATH.' >&2
+        purplemux_remediation
+        exit 1
+    fi
     require_command timeout
 
     if ! help_output=$(timeout --signal=TERM --kill-after=1 5 \
