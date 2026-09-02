@@ -14,6 +14,7 @@ from purplemux_client import (
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
     SessionReadyTimeout,
+    TabState,
     WorkerFailure,
 )
 
@@ -251,6 +252,7 @@ def test_probe_close_uncertainty_retains_exact_tab_identity() -> None:
             timeout_seconds=1,
         )
     assert "tab-response" in runner.tabs
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "close"]]) == 1
 
 
 def test_probe_refuses_to_close_a_changed_tab_identity() -> None:
@@ -372,6 +374,54 @@ def test_probe_readiness_failure_still_closes_the_exact_probe() -> None:
             timeout_seconds=0,
         )
     assert runner.tabs == {}
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "close"]]) == 1
+
+
+def test_probe_readiness_interruption_still_closes_the_exact_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RuntimeRunner()
+    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+
+    def interrupt_readiness(session_id: str, timeout_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "_wait_until_ready_structured", interrupt_readiness)
+
+    with pytest.raises(KeyboardInterrupt):
+        client.probe_agent_readiness(
+            provider="codex",
+            probe_name="readiness-corr-1",
+            correlation_id="corr-1",
+            preexisting_tab_ids=(),
+            timeout_seconds=1,
+        )
+    assert runner.tabs == {}
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "close"]]) == 1
+
+
+def test_probe_cleanup_interruption_is_unknown_with_exact_retained_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RuntimeRunner()
+    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+
+    def interrupt_cleanup(
+        session_id: str, *, expected_state: TabState | None = None
+    ) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "close_session", interrupt_cleanup)
+
+    with pytest.raises(MutationOutcomeUnknown, match="tab-response.*retained"):
+        client.probe_agent_readiness(
+            provider="codex",
+            probe_name="readiness-corr-1",
+            correlation_id="corr-1",
+            preexisting_tab_ids=(),
+            timeout_seconds=1,
+        )
+    assert "tab-response" in runner.tabs
 
 
 def test_postcondition_read_failure_after_close_is_unknown_and_not_retried() -> None:

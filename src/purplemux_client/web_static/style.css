@@ -76,7 +76,7 @@ h2, label { font-size: 14px; font-weight: 650; }
 .run-item[data-state="failed"], .run-item[data-state="stopped"] { color: #ff9ca8; }
 .run-item[data-state="suspended"] { color: #ffd66b; }
 
-textarea, pre, input[type="text"], input[type="url"], input[type="password"] {
+textarea, pre, select, input[type="text"], input[type="url"], input[type="password"] {
   width: 100%;
   color: #e8eaf0;
   background: #0c0f15;
@@ -84,7 +84,7 @@ textarea, pre, input[type="text"], input[type="url"], input[type="password"] {
   border-radius: 7px;
   font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
-input[type="text"], input[type="url"], input[type="password"] {
+select, input[type="text"], input[type="url"], input[type="password"] {
   min-width: 0;
   padding: 8px 10px;
   font-family: inherit;
@@ -161,6 +161,36 @@ a { color: #bcaaff; }
 .validation-panel.valid { border-color: #296644; }
 .validation-success { margin: 0; color: #75e2a8; font-size: 13px; }
 .validation-list { margin-bottom: 0; color: #ffb3bc; }
+
+.readiness-panel { margin-top: 14px; }
+.readiness-heading, .readiness-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.readiness-heading { justify-content: space-between; }
+.readiness-heading h2 { margin: 0 0 4px; }
+.readiness-heading p, .readiness-summary {
+  margin: 0;
+  color: #9ba3b5;
+  font-size: 13px;
+}
+.readiness-controls { margin-top: 14px; }
+.readiness-controls select { width: auto; min-width: 150px; }
+#readiness-workspace { flex: 1; }
+.readiness-summary { margin-top: 12px; }
+.readiness-summary.succeeded { color: #75e2a8; }
+.readiness-summary.failed, .readiness-summary.unknown { color: #ffb3bc; }
+.readiness-details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 14px;
+  margin: 12px 0 0;
+  font-size: 13px;
+}
+.readiness-details[hidden] { display: none; }
+.readiness-details dt { color: #9ba3b5; }
+.readiness-details dd { margin: 0; overflow-wrap: anywhere; }
 
 .outline-panel { margin-top: 14px; }
 .outline-panel h2 { margin: 0 0 10px; }
@@ -298,6 +328,8 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   textarea { min-height: 330px; }
   .settings-heading { align-items: flex-start; }
   .toggle-grid { grid-template-columns: 1fr 1fr; }
+  .readiness-heading, .readiness-controls { align-items: stretch; flex-direction: column; }
+  .readiness-controls select { width: 100%; }
   .field-grid { grid-template-columns: 1fr; }
   .settings-actions { align-items: stretch; flex-direction: column; }
 }

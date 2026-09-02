@@ -28,6 +28,19 @@ const dryRunStatus = document.querySelector("#dry-run-status");
 const dryRunEligibility = document.querySelector("#dry-run-eligibility");
 const topologyFindings = document.querySelector("#topology-findings");
 const nextMutation = document.querySelector("#next-mutation");
+const readinessWorkspace = document.querySelector("#readiness-workspace");
+const readinessProvider = document.querySelector("#readiness-provider");
+const runReadinessButton = document.querySelector("#run-readiness");
+const reconcileReadinessButton = document.querySelector("#reconcile-readiness");
+const refreshReadinessButton = document.querySelector("#refresh-readiness");
+const readinessSummary = document.querySelector("#readiness-summary");
+const readinessDetails = document.querySelector("#readiness-details");
+const readinessResultProvider = document.querySelector("#readiness-result-provider");
+const readinessIdentity = document.querySelector("#readiness-identity");
+const readinessTab = document.querySelector("#readiness-tab");
+const readinessState = document.querySelector("#readiness-state");
+const readinessCleanup = document.querySelector("#readiness-cleanup");
+const readinessGuidance = document.querySelector("#readiness-guidance");
 const outlinePanel = document.querySelector("#outline-panel");
 const outline = document.querySelector("#outline");
 const guideDialog = document.querySelector("#guide-dialog");
@@ -297,6 +310,71 @@ function renderDryRun(result) {
   nextMutation.textContent = dryRun.nextMutation
     ? `${dryRun.nextMutation.operation} — ${dryRun.nextMutation.target}\n${JSON.stringify(dryRun.nextMutation.preState, null, 2)}`
     : "No reachable mutation.";
+}
+
+function renderReadinessProbe(probe) {
+  if (!probe) {
+    readinessDetails.hidden = true;
+    return;
+  }
+  readinessDetails.hidden = false;
+  readinessSummary.className = `readiness-summary ${probe.status}`;
+  const messages = {
+    succeeded: "Ready, with cleanup confirmed.",
+    failed: "The provider did not reach a structured ready state; cleanup was confirmed.",
+    unknown: "Outcome requires reconciliation. This is not a successful readiness probe.",
+    reconciled: "The unresolved probe is authoritatively absent. The probe block is cleared.",
+    pending: "Probe dispatch is pending.",
+  };
+  readinessSummary.textContent = probe.status === "failed" && probe.tabId == null
+    ? "Probe stopped before tab identification; readiness was not observed and cleanup was not attempted."
+    : (messages[probe.status] || probe.status);
+  readinessResultProvider.textContent = probe.provider;
+  readinessIdentity.textContent = `${probe.probeName} (${probe.provider})`;
+  readinessTab.textContent = probe.tabId || "Not authoritatively identified";
+  readinessState.textContent = probe.readiness;
+  readinessCleanup.textContent = probe.cleanup;
+  readinessGuidance.textContent = [probe.detail, probe.guidance]
+    .filter(Boolean).join(" ") || "None required.";
+}
+
+function renderReadiness(snapshot) {
+  const selected = readinessWorkspace.value;
+  readinessWorkspace.replaceChildren();
+  for (const workspace of snapshot.workspaces || []) {
+    const option = document.createElement("option");
+    option.value = workspace.id;
+    option.textContent = `${workspace.name} (${workspace.id})`;
+    readinessWorkspace.append(option);
+  }
+  const ids = (snapshot.workspaces || []).map((workspace) => workspace.id);
+  readinessWorkspace.value = ids.includes(selected) ? selected : (ids[0] || "");
+  const unavailable = ids.length === 0;
+  const reconciliationRequired = ["pending", "unknown"].includes(snapshot.probe?.status);
+  readinessWorkspace.disabled = unavailable || snapshot.running;
+  readinessProvider.disabled = unavailable || snapshot.running;
+  runReadinessButton.disabled = unavailable || snapshot.running || reconciliationRequired;
+  reconcileReadinessButton.hidden = !reconciliationRequired;
+  reconcileReadinessButton.disabled = snapshot.running;
+  if (unavailable) {
+    readinessSummary.className = "readiness-summary failed";
+    readinessSummary.textContent = "No existing PurpleMux workspace is available. Create or select one outside this probe.";
+    readinessDetails.hidden = true;
+  } else if (!snapshot.probe) {
+    readinessSummary.className = "readiness-summary";
+    readinessSummary.textContent = "Not run. Static Validation and Dry Run never invoke this mutating probe.";
+  }
+  renderReadinessProbe(snapshot.probe);
+}
+
+async function refreshReadiness() {
+  try {
+    renderReadiness(await request("/api/readiness"));
+  } catch (error) {
+    readinessSummary.className = "readiness-summary failed";
+    readinessSummary.textContent = String(error);
+    runReadinessButton.disabled = true;
+  }
 }
 
 function renderOutline(labels, events) {
@@ -683,6 +761,55 @@ dryRunButton.addEventListener("click", async () => {
   }
 });
 
+refreshReadinessButton.addEventListener("click", refreshReadiness);
+
+runReadinessButton.addEventListener("click", async () => {
+  if (!readinessWorkspace.value) return;
+  runReadinessButton.disabled = true;
+  refreshReadinessButton.disabled = true;
+  readinessSummary.className = "readiness-summary";
+  readinessSummary.textContent = "Creating exactly one probe tab…";
+  try {
+    const result = await request("/api/readiness/probe", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        workspaceId: readinessWorkspace.value,
+        provider: readinessProvider.value,
+      }),
+    });
+    renderReadinessProbe(result.probe);
+  } catch (error) {
+    if (error.result?.probe) renderReadinessProbe(error.result.probe);
+    else {
+      readinessSummary.className = "readiness-summary failed";
+      readinessSummary.textContent = String(error);
+    }
+  } finally {
+    refreshReadinessButton.disabled = false;
+    await refreshReadiness();
+  }
+});
+
+reconcileReadinessButton.addEventListener("click", async () => {
+  reconcileReadinessButton.disabled = true;
+  readinessSummary.className = "readiness-summary";
+  readinessSummary.textContent = "Authoritatively inspecting the unresolved probe identity…";
+  try {
+    const result = await request("/api/readiness/reconcile", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    });
+    renderReadinessProbe(result.probe);
+  } catch (error) {
+    readinessSummary.className = "readiness-summary failed";
+    readinessSummary.textContent = String(error);
+  } finally {
+    await refreshReadiness();
+  }
+});
+
 stopButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
   const targetRunId = activeRunId;
@@ -787,6 +914,7 @@ async function initialize() {
   } catch (error) {
     showSettingsMessage(String(error), true);
   }
+  await refreshReadiness();
 }
 
 initialize().catch((error) => {

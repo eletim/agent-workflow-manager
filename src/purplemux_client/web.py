@@ -12,12 +12,18 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from purplemux_client.errors import TerminalSessionError
 from purplemux_client.notification_settings import (
     NotificationSettings,
     SettingsError,
     SettingsValidationError,
 )
 from purplemux_client.notifier import NotifyCLI
+from purplemux_client.readiness import (
+    AgentReadinessService,
+    ReadinessProbeBusy,
+    ReadinessReconciliationRequired,
+)
 from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
@@ -129,6 +135,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         runner: PythonRunner | None = None,
         notification_settings: NotificationSettings | None = None,
         host_aliases: tuple[str, ...] = (),
+        readiness_service: AgentReadinessService | None = None,
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
@@ -149,6 +156,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             ),
             notifier=cast(NotifyCLI, notifier),
         )
+        self.readiness_service = readiness_service or AgentReadinessService()
         self._settings_notifier = (
             notifier if runner is not None and notification_settings is None else None
         )
@@ -272,6 +280,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, settings.as_json())
             return
+        if path == "/api/readiness":
+            try:
+                snapshot = self.server.readiness_service.snapshot()
+            except TerminalSessionError as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, snapshot)
+            return
         static_file = STATIC_FILES.get(path)
         if static_file is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -323,6 +339,8 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/run",
             "/api/validate",
             "/api/dry-run",
+            "/api/readiness/probe",
+            "/api/readiness/reconcile",
             "/api/settings/notifications",
             "/api/settings/notifications/test",
         }
@@ -407,6 +425,59 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.ACCEPTED,
                 {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
             )
+            return
+        if path == "/api/readiness/probe":
+            payload = self._read_json()
+            if payload is None:
+                return
+            workspace_id = payload.get("workspaceId")
+            provider = payload.get("provider")
+            if not isinstance(workspace_id, str) or not isinstance(provider, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "workspaceId and provider must be strings"},
+                )
+                return
+            try:
+                result = self.server.readiness_service.probe(
+                    workspace_id=workspace_id, provider=provider
+                )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except ReadinessProbeBusy as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except ReadinessReconciliationRequired as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except TerminalSessionError as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, {"probe": result.as_json()})
+            return
+        if path == "/api/readiness/reconcile":
+            payload = self._read_json()
+            if payload is None:
+                return
+            if payload:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "readiness reconciliation request must be empty"},
+                )
+                return
+            try:
+                result = self.server.readiness_service.reconcile()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except ReadinessProbeBusy as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except TerminalSessionError as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, {"probe": result.as_json()})
             return
         if path == "/api/stop":
             stopped = self.server.runner.stop()
