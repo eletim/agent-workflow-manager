@@ -71,7 +71,7 @@ fi
     _executable(
         fake_bin / "purplemux",
         """
-if [[ ${1-} == --help ]]; then
+if [[ ${1-} == help ]]; then
     cat <<'HELP'
 purplemux CLI
 workspaces
@@ -186,6 +186,47 @@ def test_start_rejects_incompatible_upstream_purplemux_cli(tmp_path: Path) -> No
     )
 
 
+def test_start_reports_purplemux_help_cli_failure(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    _executable(
+        tmp_path / "bin" / "purplemux",
+        "printf '%s\\n' 'unknown command from purplemux' >&2\nexit 7\n",
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "purplemux help failed (exit 7)" in completed.stderr
+    assert "unknown command from purplemux" in completed.stderr
+    assert "did not respond within 5 seconds" not in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_hanging_purplemux_help_check_is_reported_as_timeout(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    _executable(tmp_path / "bin" / "purplemux", "sleep 30\n")
+
+    completed = subprocess.run(
+        ["bash", "start.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+    assert completed.returncode != 0
+    assert "did not respond within 5 seconds" in completed.stderr
+    assert "purplemux help failed" not in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_start_rejects_purplemux_cli_without_tab_type_option(tmp_path: Path) -> None:
     environment, call_log, _ = _start_environment(tmp_path)
     purplemux = tmp_path / "bin" / "purplemux"
@@ -214,9 +255,9 @@ def test_start_rejects_unreachable_purplemux_runtime(tmp_path: Path) -> None:
     original = purplemux.read_text(encoding="utf-8")
     purplemux.write_text(
         original.replace(
-            "if [[ ${1-} == --help ]]; then",
+            "if [[ ${1-} == help ]]; then",
             "if [[ ${1-} == workspaces ]]; then\n    exit 7\n"
-            "elif [[ ${1-} == --help ]]; then",
+            "elif [[ ${1-} == help ]]; then",
         ),
         encoding="utf-8",
     )
@@ -261,9 +302,9 @@ def test_hanging_purplemux_runtime_check_is_bounded(tmp_path: Path) -> None:
     original = purplemux.read_text(encoding="utf-8")
     purplemux.write_text(
         original.replace(
-            "if [[ ${1-} == --help ]]; then",
+            "if [[ ${1-} == help ]]; then",
             "if [[ ${1-} == workspaces ]]; then\n    sleep 30\n"
-            "elif [[ ${1-} == --help ]]; then",
+            "elif [[ ${1-} == help ]]; then",
         ),
         encoding="utf-8",
     )
