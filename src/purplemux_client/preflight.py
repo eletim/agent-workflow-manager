@@ -17,6 +17,9 @@ from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
 
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
 PREFLIGHT_KEYS = frozenset({"commands", "imports", "environment", "paths"})
+OUTLINE_NAME = "WORKFLOW_OUTLINE"
+MAX_OUTLINE_ITEMS = 100
+MAX_OUTLINE_LABEL_CHARS = 200
 DEFAULT_CHECK_TIMEOUT = 2.0
 STDLIB_MODULE_ALIASES = frozenset({"os.path"})
 
@@ -35,6 +38,7 @@ class ValidationIssue:
 @dataclass(frozen=True)
 class ValidationResult:
     issues: tuple[ValidationIssue, ...]
+    outline: tuple[str, ...] = ()
 
     @property
     def valid(self) -> bool:
@@ -44,6 +48,7 @@ class ValidationResult:
         return {
             "valid": self.valid,
             "issues": [issue.as_json() for issue in self.issues],
+            "outline": list(self.outline),
         }
 
 
@@ -185,9 +190,12 @@ class WorkflowValidator:
                 )
             )
         try:
-            values = json.loads(stdout)
-            issues = tuple(ValidationIssue(**value) for value in values)
-        except (json.JSONDecodeError, TypeError) as exc:
+            value = json.loads(stdout)
+            issues = tuple(ValidationIssue(**issue) for issue in value["issues"])
+            outline = tuple(value["outline"])
+            if any(not isinstance(label, str) for label in outline):
+                raise TypeError("outline labels must be strings")
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
             return ValidationResult(
                 (
                     ValidationIssue(
@@ -196,18 +204,21 @@ class WorkflowValidator:
                     ),
                 )
             )
-        return ValidationResult(issues)
+        return ValidationResult(issues, outline)
 
     @staticmethod
     def _worker_command() -> list[str]:
         return [sys.executable, "-m", "purplemux_client.preflight", "--check-worker"]
 
-    def _validate_read_checks(self, tree: ast.Module) -> tuple[ValidationIssue, ...]:
+    def _validate_read_checks(
+        self, tree: ast.Module
+    ) -> tuple[tuple[ValidationIssue, ...], tuple[str, ...]]:
         issues: list[ValidationIssue] = []
         self._validate_imports(tree, issues)
         self._validate_required_environment(tree, issues)
         self._validate_metadata(tree, issues)
-        return tuple(issues)
+        outline = self._validate_outline(tree, issues)
+        return tuple(issues), outline
 
     def _validate_imports(
         self, tree: ast.Module, issues: list[ValidationIssue]
@@ -417,6 +428,59 @@ class WorkflowValidator:
                 )
             )
 
+    def _validate_outline(
+        self, tree: ast.Module, issues: list[ValidationIssue]
+    ) -> tuple[str, ...]:
+        declarations = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and self._assignment_name(node) == OUTLINE_NAME
+        ]
+        if not declarations:
+            return ()
+        declaration = declarations[-1]
+        value_node = declaration.value
+        if value_node is None:
+            self._outline_issue(issues, declaration, "must have a literal value")
+            return ()
+        try:
+            value = ast.literal_eval(value_node)
+        except (ValueError, TypeError):
+            self._outline_issue(
+                issues, declaration, "must be a literal list of strings"
+            )
+            return ()
+        if not isinstance(value, list):
+            self._outline_issue(issues, declaration, "must be a list of strings")
+            return ()
+        if len(value) > MAX_OUTLINE_ITEMS:
+            self._outline_issue(
+                issues,
+                declaration,
+                f"must contain at most {MAX_OUTLINE_ITEMS} items",
+            )
+            return ()
+        for label in value:
+            if not isinstance(label, str) or not label.strip():
+                self._outline_issue(
+                    issues, declaration, "items must be non-empty strings"
+                )
+                return ()
+            if len(label) > MAX_OUTLINE_LABEL_CHARS:
+                self._outline_issue(
+                    issues,
+                    declaration,
+                    f"items must be at most {MAX_OUTLINE_LABEL_CHARS} characters",
+                )
+                return ()
+            if not label.isprintable():
+                self._outline_issue(
+                    issues, declaration, "items must be human-readable text"
+                )
+                return ()
+        return tuple(value)
+
     def _module_exists(self, name: str) -> bool:
         if name in STDLIB_MODULE_ALIASES:
             return True
@@ -473,6 +537,19 @@ class WorkflowValidator:
             )
         )
 
+    @staticmethod
+    def _outline_issue(
+        issues: list[ValidationIssue], node: ast.stmt, detail: str
+    ) -> None:
+        issues.append(
+            ValidationIssue(
+                "outline",
+                f"{OUTLINE_NAME} {detail}",
+                node.lineno,
+                node.col_offset + 1,
+            )
+        )
+
 
 def _run_check_worker() -> None:
     payload = json.load(sys.stdin)
@@ -482,8 +559,14 @@ def _run_check_worker() -> None:
         module_search_path=payload["moduleSearchPath"],
     )
     tree = ast.parse(payload["code"], filename="<workflow>")
-    issues = validator._validate_read_checks(tree)
-    json.dump([issue.as_json() for issue in issues], sys.stdout)
+    issues, outline = validator._validate_read_checks(tree)
+    json.dump(
+        {
+            "issues": [issue.as_json() for issue in issues],
+            "outline": list(outline),
+        },
+        sys.stdout,
+    )
 
 
 if __name__ == "__main__" and sys.argv[1:] == ["--check-worker"]:

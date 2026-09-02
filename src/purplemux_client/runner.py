@@ -114,6 +114,7 @@ class RunnerSnapshot:
     stderr: str
     stdout_entries: tuple[OutputEntry, ...]
     stderr_entries: tuple[OutputEntry, ...]
+    outline: tuple[str, ...]
     exit_code: int | None
     run_id: int | None
     progress: tuple[ProgressEvent, ...]
@@ -186,6 +187,7 @@ class _RunRecord:
     process_group_id: int
     script_path: Path
     code: str
+    outline: tuple[str, ...]
     state: RunnerState = "running"
     stdout: deque[OutputEntry] = field(default_factory=deque)
     stderr: deque[OutputEntry] = field(default_factory=deque)
@@ -239,6 +241,7 @@ class PythonRunner:
             stderr="",
             stdout_entries=(),
             stderr_entries=(),
+            outline=(),
             exit_code=None,
             run_id=None,
             progress=(),
@@ -289,6 +292,7 @@ class PythonRunner:
                     raise WorkflowValidationError(validation)
                 return self._start_validated(
                     code,
+                    outline=validation.outline,
                     run_cwd=run_cwd,
                     run_args=run_args,
                     child_env=child_env,
@@ -374,6 +378,7 @@ class PythonRunner:
         self,
         code: str,
         *,
+        outline: tuple[str, ...],
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
@@ -397,6 +402,7 @@ class PythonRunner:
             process_group_id=process.pid,
             script_path=script_path,
             code=code,
+            outline=outline,
             progress=deque(maxlen=self._max_progress_events),
         )
         self._runs[run_id] = run
@@ -496,6 +502,7 @@ class PythonRunner:
             stderr="",
             stdout_entries=(),
             stderr_entries=(),
+            outline=result.outline,
             exit_code=None,
             run_id=None,
             progress=(),
@@ -554,6 +561,7 @@ class PythonRunner:
             stderr="".join(entry.text for entry in stderr_entries),
             stdout_entries=stdout_entries,
             stderr_entries=stderr_entries,
+            outline=run.outline,
             exit_code=run.exit_code,
             run_id=run.run_id,
             progress=tuple(run.progress),
