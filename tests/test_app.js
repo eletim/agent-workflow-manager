@@ -118,6 +118,10 @@ function snapshot({
     stdoutEntries,
     suspensionReason: null,
     validation: [],
+    dryRun: null,
+    dryRunEligible: true,
+    dryRunIssues: [],
+    findings: [],
   };
 }
 
@@ -153,10 +157,12 @@ async function loadApp({
 }) {
   const ids = [
     "code", "working-directory", "run-arguments", "active-context", "run-list",
-    "runs-empty", "new-run", "run", "resume", "validate", "stop", "status", "stdout",
+    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
+    "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
+    "next-mutation",
     "guide-open", "guide-close", "guide-copy",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "notification-settings", "notifications-enabled",
@@ -288,6 +294,44 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Dry Run renders topology findings and the first mutation frontier", async () => {
+  const dryRunResult = {
+    ...snapshot({runId: null, state: "idle", stdout: ""}),
+    dryRunEligible: true,
+    dryRunIssues: [],
+    dryRun: {
+      status: "frontier",
+      stdout: "",
+      stderr: "",
+      findings: [{category: "github", status: "passed", message: "same-head set exhausted"}],
+      nextMutation: {
+        operation: "create PurpleMux tab",
+        target: "ws-1/reviewer",
+        preState: {tabs: []},
+      },
+    },
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/dry-run") return response(dryRunResult);
+      return undefined;
+    },
+  });
+
+  await elements["dry-run"].dispatch("click");
+
+  assert.equal(elements["dry-run-panel"].hidden, false);
+  assert.match(elements["dry-run-status"].textContent, /first reachable mutation/);
+  assert.equal(
+    elements["topology-findings"].children[0].textContent,
+    "github: same-head set exhausted",
+  );
+  assert.match(elements["next-mutation"].textContent, /create PurpleMux tab/);
+});
 
 test("formats observed timestamps with relative local dates", () => {
   const context = {};

@@ -8,6 +8,7 @@ const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
 const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
+const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
@@ -22,6 +23,11 @@ const attemptHistory = document.querySelector("#attempt-history");
 const validationPanel = document.querySelector("#validation-panel");
 const validationSuccess = document.querySelector("#validation-success");
 const validation = document.querySelector("#validation");
+const dryRunPanel = document.querySelector("#dry-run-panel");
+const dryRunStatus = document.querySelector("#dry-run-status");
+const dryRunEligibility = document.querySelector("#dry-run-eligibility");
+const topologyFindings = document.querySelector("#topology-findings");
+const nextMutation = document.querySelector("#next-mutation");
 const outlinePanel = document.querySelector("#outline-panel");
 const outline = document.querySelector("#outline");
 const guideDialog = document.querySelector("#guide-dialog");
@@ -111,6 +117,7 @@ function applyFieldMode() {
   code.readOnly = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
+  dryRunButton.disabled = !drafting;
 }
 
 function showDraftLabel() {
@@ -146,6 +153,7 @@ function renderRun(result) {
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderRecovery(result);
+  renderDryRun(result);
 
   // Only an authoritative snapshot for the run currently being viewed may
   // populate the fields, never a stale response or another run's data.
@@ -253,6 +261,42 @@ function renderValidation(issues) {
     item.textContent = `${location}${issue.message}`;
     validation.append(item);
   }
+}
+
+function renderDryRun(result) {
+  const dryRun = result.dryRun;
+  const eligibility = result.dryRunIssues || [];
+  dryRunPanel.hidden = dryRun == null && eligibility.length === 0;
+  dryRunEligibility.replaceChildren();
+  for (const issue of eligibility) {
+    const item = document.createElement("li");
+    item.textContent = issue.message;
+    dryRunEligibility.append(item);
+  }
+  if (!dryRun) {
+    dryRunStatus.textContent = result.dryRunEligible
+      ? "Eligible — run Dry Run to inspect the reachable frontier."
+      : "Ineligible until the contract findings below are resolved.";
+    topologyFindings.replaceChildren();
+    nextMutation.textContent = "No Dry Run result yet.";
+    return;
+  }
+  dryRunStatus.textContent = {
+    frontier: "Stopped truthfully before the first reachable mutation.",
+    complete: "Completed without reaching a mutation.",
+    failed: "Failed before reaching a safe mutation frontier.",
+    ineligible: "Workflow is not eligible for Dry Run.",
+  }[dryRun.status] || dryRun.status;
+  topologyFindings.replaceChildren();
+  for (const finding of dryRun.findings || []) {
+    const item = document.createElement("li");
+    item.className = finding.status;
+    item.textContent = `${finding.category}: ${finding.message}`;
+    topologyFindings.append(item);
+  }
+  nextMutation.textContent = dryRun.nextMutation
+    ? `${dryRun.nextMutation.operation} — ${dryRun.nextMutation.target}\n${JSON.stringify(dryRun.nextMutation.preState, null, 2)}`
+    : "No reachable mutation.";
 }
 
 function renderOutline(labels, events) {
@@ -609,6 +653,32 @@ validateButton.addEventListener("click", async () => {
       && activeRunId === null
     ) {
       stderr.textContent = String(error);
+    }
+  }
+});
+
+dryRunButton.addEventListener("click", async () => {
+  if (activeRunId !== null) return;
+  const selectionGeneration = activeRunGeneration;
+  try {
+    const result = await request("/api/dry-run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+    });
+    if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+      renderValidation(result.validation || []);
+      renderOutline(result.outline || [], []);
+      renderDryRun(result);
+    }
+  } catch (error) {
+    if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+      if (error.result) {
+        renderValidation(error.result.validation || []);
+        renderDryRun(error.result);
+      } else {
+        stderr.textContent = String(error);
+      }
     }
   }
 });

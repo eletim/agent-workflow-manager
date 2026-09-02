@@ -18,6 +18,8 @@ from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
 PREFLIGHT_KEYS = frozenset({"commands", "imports", "environment", "paths"})
 OUTLINE_NAME = "WORKFLOW_OUTLINE"
+DRY_RUN_NAME = "WORKFLOW_DRY_RUN"
+DRY_RUN_VERSION = 1
 MAX_OUTLINE_ITEMS = 100
 MAX_OUTLINE_LABEL_CHARS = 200
 DEFAULT_CHECK_TIMEOUT = 2.0
@@ -39,6 +41,7 @@ class ValidationIssue:
 class ValidationResult:
     issues: tuple[ValidationIssue, ...]
     outline: tuple[str, ...] = ()
+    dry_run_issues: tuple[ValidationIssue, ...] = ()
 
     @property
     def valid(self) -> bool:
@@ -49,6 +52,8 @@ class ValidationResult:
             "valid": self.valid,
             "issues": [issue.as_json() for issue in self.issues],
             "outline": list(self.outline),
+            "dryRunEligible": not self.dry_run_issues,
+            "dryRunIssues": [issue.as_json() for issue in self.dry_run_issues],
         }
 
 
@@ -193,6 +198,9 @@ class WorkflowValidator:
             value = json.loads(stdout)
             issues = tuple(ValidationIssue(**issue) for issue in value["issues"])
             outline = tuple(value["outline"])
+            dry_run_issues = tuple(
+                ValidationIssue(**issue) for issue in value["dryRunIssues"]
+            )
             if any(not isinstance(label, str) for label in outline):
                 raise TypeError("outline labels must be strings")
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -204,7 +212,7 @@ class WorkflowValidator:
                     ),
                 )
             )
-        return ValidationResult(issues, outline)
+        return ValidationResult(issues, outline, dry_run_issues)
 
     @staticmethod
     def _worker_command() -> list[str]:
@@ -212,13 +220,174 @@ class WorkflowValidator:
 
     def _validate_read_checks(
         self, tree: ast.Module
-    ) -> tuple[tuple[ValidationIssue, ...], tuple[str, ...]]:
+    ) -> tuple[
+        tuple[ValidationIssue, ...],
+        tuple[str, ...],
+        tuple[ValidationIssue, ...],
+    ]:
         issues: list[ValidationIssue] = []
         self._validate_imports(tree, issues)
         self._validate_required_environment(tree, issues)
         self._validate_metadata(tree, issues)
         outline = self._validate_outline(tree, issues)
-        return tuple(issues), outline
+        return tuple(issues), outline, self._validate_dry_run(tree)
+
+    def _validate_dry_run(self, tree: ast.Module) -> tuple[ValidationIssue, ...]:
+        issues: list[ValidationIssue] = []
+        aliases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".", 1)[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        declarations = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and self._assignment_name(node) == DRY_RUN_NAME
+        ]
+        if not declarations:
+            return (
+                ValidationIssue(
+                    "dry_run",
+                    f"declare {DRY_RUN_NAME} = {DRY_RUN_VERSION} to enable Dry Run",
+                ),
+            )
+        declaration = declarations[-1]
+        value_node = declaration.value
+        try:
+            value = ast.literal_eval(value_node) if value_node is not None else None
+        except (ValueError, TypeError):
+            value = None
+        if value != DRY_RUN_VERSION:
+            issues.append(
+                ValidationIssue(
+                    "dry_run",
+                    f"{DRY_RUN_NAME} must be the literal integer {DRY_RUN_VERSION}",
+                    declaration.lineno,
+                    declaration.col_offset + 1,
+                )
+            )
+        mutation_calls = {
+            "subprocess.run",
+            "subprocess.Popen",
+            "subprocess.call",
+            "subprocess.check_call",
+            "subprocess.check_output",
+            "os.system",
+            "os.remove",
+            "os.unlink",
+            "os.rename",
+            "os.replace",
+            "os.mkdir",
+            "os.makedirs",
+            "os.chmod",
+            "os.chown",
+            "os.link",
+            "os.symlink",
+            "os.truncate",
+            "shutil.copy",
+            "shutil.copy2",
+            "shutil.copyfile",
+            "shutil.copymode",
+            "shutil.copystat",
+            "shutil.copytree",
+            "shutil.move",
+            "shutil.rmtree",
+            "shutil.chown",
+            "requests.post",
+            "requests.put",
+            "requests.patch",
+            "requests.delete",
+            "urllib.request.urlopen",
+        }
+        mutation_method_suffixes = {
+            ".write_text",
+            ".write_bytes",
+            ".unlink",
+            ".mkdir",
+            ".rename",
+            ".replace",
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = self._qualified_name(node.func)
+            if name:
+                root, separator, remainder = name.partition(".")
+                name = aliases.get(root, root) + (
+                    separator + remainder if separator else ""
+                )
+            raw_open = name in {"open", "builtins.open"} and self._open_call_can_write(
+                node
+            )
+            if raw_open:
+                name = "open"
+            raw_mutation_method = False
+            if isinstance(node.func, ast.Attribute) and isinstance(
+                node.func.value, ast.Call
+            ):
+                receiver = self._qualified_name(node.func.value.func)
+                if receiver:
+                    receiver = aliases.get(receiver, receiver)
+                raw_mutation_method = receiver in {"pathlib.Path", "Path"} and any(
+                    node.func.attr == suffix.removeprefix(".")
+                    for suffix in mutation_method_suffixes
+                )
+            display_name = (
+                name
+                if name is not None
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else "unknown"
+            )
+            if (
+                raw_open
+                or name in mutation_calls
+                or raw_mutation_method
+                or (
+                    name is not None
+                    and any(
+                        name.endswith(suffix) for suffix in mutation_method_suffixes
+                    )
+                )
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "dry_run",
+                        f"raw mutation-capable call {display_name} makes Dry Run ineligible",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+        return tuple(issues)
+
+    @staticmethod
+    def _open_call_can_write(node: ast.Call) -> bool:
+        mode_node: ast.expr | None = node.args[1] if len(node.args) > 1 else None
+        for keyword in node.keywords:
+            if keyword.arg == "mode":
+                mode_node = keyword.value
+        if mode_node is None:
+            return False
+        try:
+            mode = ast.literal_eval(mode_node)
+        except (ValueError, TypeError):
+            return True
+        return not isinstance(mode, str) or any(flag in mode for flag in "wax+")
+
+    @staticmethod
+    def _qualified_name(node: ast.expr) -> str | None:
+        parts: list[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        parts.append(node.id)
+        return ".".join(reversed(parts))
 
     def _validate_imports(
         self, tree: ast.Module, issues: list[ValidationIssue]
@@ -559,11 +728,12 @@ def _run_check_worker() -> None:
         module_search_path=payload["moduleSearchPath"],
     )
     tree = ast.parse(payload["code"], filename="<workflow>")
-    issues, outline = validator._validate_read_checks(tree)
+    issues, outline, dry_run_issues = validator._validate_read_checks(tree)
     json.dump(
         {
             "issues": [issue.as_json() for issue in issues],
             "outline": list(outline),
+            "dryRunIssues": [issue.as_json() for issue in dry_run_issues],
         },
         sys.stdout,
     )

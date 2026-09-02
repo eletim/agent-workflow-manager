@@ -1,15 +1,20 @@
 from purplemux_client.client import (
+    AgentReadinessProbeResult,
     CreateSessionRequest,
+    CreateWorkspaceRequest,
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
+    PurpleMuxRuntime,
     ResultNotReady,
     SessionReadyTimeout,
     ShellCommandRequest,
     ShellResult,
+    TabState,
     TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
+    WorkspaceState,
 )
 from purplemux_client.git import (
     BranchState,
@@ -27,6 +32,7 @@ from purplemux_client.github import (
 from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
     ResumeCheckpoint,
+    emit_finding,
     emit_step,
     resume_checkpoint,
     save_checkpoint,
@@ -34,7 +40,9 @@ from purplemux_client.progress import (
 )
 
 __all__ = [
+    "AgentReadinessProbeResult",
     "CreateSessionRequest",
+    "CreateWorkspaceRequest",
     "BranchState",
     "FeaturePreparationState",
     "GitHubRepository",
@@ -44,6 +52,7 @@ __all__ = [
     "MutationConflict",
     "MutationOutcomeUnknown",
     "PurpleMuxCLIClient",
+    "PurpleMuxRuntime",
     "PullRequestState",
     "PullRequestTopologyError",
     "ResultNotReady",
@@ -52,11 +61,14 @@ __all__ = [
     "ShellCommandRequest",
     "ShellResult",
     "TerminalSessionError",
+    "TabState",
     "WorkerFailure",
     "WorkerInterrupted",
     "WorkerNeedsInput",
+    "WorkspaceState",
     "WorktreeState",
     "emit_step",
+    "emit_finding",
     "resume_checkpoint",
     "save_checkpoint",
     "suspend_run",

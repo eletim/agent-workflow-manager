@@ -24,6 +24,7 @@ from purplemux_client.runner import (
     PythonRunner,
     RunNotFoundError,
     RunNotResumableError,
+    WorkflowDryRunError,
     WorkflowValidationError,
 )
 
@@ -321,13 +322,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         json_paths = {
             "/api/run",
             "/api/validate",
+            "/api/dry-run",
             "/api/settings/notifications",
             "/api/settings/notifications/test",
         }
         if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
             return
-        if path in {"/api/run", "/api/validate"}:
+        if path in {"/api/run", "/api/validate", "/api/dry-run"}:
             payload = self._read_json()
             if payload is None:
                 return
@@ -365,6 +367,17 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         self.server.runner.validation_snapshot().as_json(),
                     )
                     return
+                if path == "/api/dry-run":
+                    result = self.server.runner.dry_run(code, cwd=cwd, args=args)
+                    status = (
+                        HTTPStatus.OK
+                        if result.status in {"frontier", "complete"}
+                        else HTTPStatus.UNPROCESSABLE_ENTITY
+                    )
+                    self._send_json(
+                        status, self.server.runner.validation_snapshot().as_json()
+                    )
+                    return
                 run_id = self.server.runner.start(code, cwd=cwd, args=args)
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -374,6 +387,15 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.UNPROCESSABLE_ENTITY,
                     {
                         "error": "workflow validation failed",
+                        **self.server.runner.validation_snapshot().as_json(),
+                    },
+                )
+                return
+            except WorkflowDryRunError:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "workflow is not eligible for Dry Run",
                         **self.server.runner.validation_snapshot().as_json(),
                     },
                 )

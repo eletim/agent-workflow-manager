@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 StepStatus = Literal["started", "completed", "failed"]
+FindingCategory = Literal["runtime", "git", "github"]
+FindingStatus = Literal["passed", "failed", "info"]
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESUME_CHECKPOINT_ENV = "PURPLEMUX_RUNNER_RESUME_CHECKPOINT"
@@ -62,6 +64,22 @@ def emit_step(
         if value is not None:
             event[key] = value
     _write_event(event, drop_oversized=True)
+
+
+def emit_finding(
+    category: FindingCategory, message: str, *, status: FindingStatus = "passed"
+) -> None:
+    """Publish an observed readiness/topology fact without controlling execution."""
+    if category not in ("runtime", "git", "github"):
+        raise ValueError("finding category must be runtime, git, or github")
+    if status not in ("passed", "failed", "info"):
+        raise ValueError("finding status must be passed, failed, or info")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("finding message must be non-empty")
+    _write_event(
+        {"type": "finding", "category": category, "status": status, "message": message},
+        drop_oversized=True,
+    )
 
 
 def save_checkpoint(name: str, data: Mapping[str, str] | None = None) -> None:

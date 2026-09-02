@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Generic, TypeVar, cast
 
-from purplemux_client.client import MutationOutcomeUnknown, WorkerFailure
+from purplemux_client.errors import MutationOutcomeUnknown, WorkerFailure
 
 DRY_RUN_FD_ENV = "AGENT_WORKFLOW_MANAGER_DRY_RUN_FD"
 DRY_RUN_BOUNDARY_EXIT_CODE = 86

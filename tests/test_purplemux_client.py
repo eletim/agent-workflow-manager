@@ -35,6 +35,7 @@ class FakeRunner:
     ) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[list[str]] = []
+        self.tabs: dict[str, dict[str, object]] = {}
 
     def __call__(
         self,
@@ -48,10 +49,34 @@ class FakeRunner:
         assert capture_output is True
         assert text is True
         assert check is False
-        self.calls.append(list(args))
+        command = list(args)
+        self.calls.append(command)
+        if command[1:3] == ["tab", "list"]:
+            return completed({"tabs": list(self.tabs.values())})
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
+        if command[1:3] == ["tab", "create"] and outcome.returncode == 0:
+            try:
+                data = json.loads(outcome.stdout)
+            except json.JSONDecodeError:
+                data = None
+            tab_id = data.get("tabId") if isinstance(data, dict) else None
+            if isinstance(tab_id, str):
+                panel_type = command[command.index("-t") + 1]
+                name = command[command.index("-n") + 1]
+                self.tabs[tab_id] = {
+                    "tabId": tab_id,
+                    "workspaceId": "ws-test",
+                    "name": name,
+                    "panelType": panel_type,
+                    "agentProviderId": {
+                        "codex-cli": "codex",
+                        "claude-code": "claude",
+                    }.get(panel_type),
+                }
+        if command[1:3] == ["tab", "close"] and outcome.returncode == 0:
+            self.tabs.pop(command[-1], None)
         return outcome
 
 
@@ -97,9 +122,9 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
 
     assert client(runner).create_session(request()) == "tab-123"
-    assert runner.calls == [
-        ["purplemux", "tab", "create", "-w", "ws-test", "-t", "codex-cli"]
-    ]
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    assert create[-2:] == ["-t", "codex-cli"]
+    assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
 @pytest.mark.parametrize(
@@ -111,7 +136,8 @@ def test_create_selects_claude_panel(worker: str, command: str) -> None:
 
     client(runner).create_session(request(worker, command))
 
-    assert runner.calls[0][-1] == "claude-code"
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    assert create[-1] == "claude-code"
 
 
 def test_create_rejects_unknown_provider() -> None:
@@ -126,7 +152,7 @@ def test_create_rejects_unknown_provider() -> None:
 def test_create_requires_tab_id() -> None:
     runner = FakeRunner([completed({"workspaceId": "ws-test"})])
 
-    with pytest.raises(MutationOutcomeUnknown, match="outcome is unknown"):
+    with pytest.raises(MutationOutcomeUnknown, match="unknown"):
         client(runner).create_session(request())
 
 
@@ -151,7 +177,8 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     )
 
     assert session_id == "tab-shell"
-    assert runner.calls[0] == [
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    assert create == [
         "purplemux",
         "tab",
         "create",
@@ -162,7 +189,7 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
         "-t",
         "terminal",
     ]
-    wrapper = runner.calls[1][-1]
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
     assert f"cd -- {tmp_path}" in wrapper
     assert "bash -lc" in wrapper
     assert 'printf \'{"exitCode":%s}' in wrapper
@@ -198,7 +225,7 @@ def test_shell_start_timeout_reports_created_tab_for_reconciliation(tmp_path) ->
 
     with pytest.raises(
         MutationOutcomeUnknown,
-        match="shell terminal tab-shell was created.*outcome is unknown",
+        match="shell terminal tab-shell was created.*unknown",
     ):
         cli.start_shell(
             ShellCommandRequest(command="make test", cwd=str(tmp_path), name="Run 5")
@@ -213,12 +240,12 @@ def test_shell_create_unusable_response_has_unknown_outcome(
 ) -> None:
     runner = FakeRunner([completed(output)])
 
-    with pytest.raises(MutationOutcomeUnknown, match="outcome is unknown"):
+    with pytest.raises(MutationOutcomeUnknown, match="unknown"):
         client(runner).start_shell(
             ShellCommandRequest(command="make test", cwd=str(tmp_path), name="Run 5")
         )
 
-    assert len(runner.calls) == 1
+    assert len([call for call in runner.calls if call[1:3] != ["tab", "list"]]) == 1
 
 
 @pytest.mark.parametrize("output", ["not-json", "[]"])
@@ -230,7 +257,7 @@ def test_shell_send_unusable_response_preserves_created_tab_correlation(
 
     with pytest.raises(
         MutationOutcomeUnknown,
-        match="shell terminal tab-shell was created.*outcome is unknown",
+        match="shell terminal tab-shell was created.*unknown",
     ):
         cli.start_shell(
             ShellCommandRequest(command="make test", cwd=str(tmp_path), name="Run 5")
@@ -258,7 +285,7 @@ def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> N
     assert cli.read_shell_result(session_id).exit_code == 7
     assert cli.read_shell_result(session_id).exit_code == 7
     assert not os.path.exists(os.path.dirname(result_path))
-    assert len(runner.calls) == 2
+    assert len([call for call in runner.calls if call[1:3] != ["tab", "list"]]) == 2
 
 
 def test_shell_commands_can_complete_independently(tmp_path) -> None:
@@ -362,7 +389,7 @@ def test_failed_shell_terminal_is_retained_until_explicit_close(tmp_path) -> Non
     assert cli.read_shell_result(session_id).exit_code == 1
 
     cli.close_session(session_id)
-    assert runner.calls[-1][2] == "close"
+    assert any(call[1:3] == ["tab", "close"] for call in runner.calls)
 
 
 def test_read_status_returns_structured_status() -> None:
@@ -1043,11 +1070,16 @@ def test_dead_runtime_is_not_ready() -> None:
 
 
 def test_interrupt_uses_public_cli() -> None:
-    runner = FakeRunner([completed({"status": "interrupted"})])
+    runner = FakeRunner(
+        [
+            completed({"cliState": "busy", "alive": True, "eventSeq": 1}),
+            completed({"status": "interrupted"}),
+        ]
+    )
 
     client(runner).interrupt("tab-1")
 
-    assert runner.calls[0][1:] == [
+    assert runner.calls[-1][1:] == [
         "tab",
         "interrupt",
         "-w",
@@ -1058,10 +1090,19 @@ def test_interrupt_uses_public_cli() -> None:
 
 def test_close_uses_public_cli_and_accepts_plain_ok() -> None:
     runner = FakeRunner([completed("ok\n")])
+    runner.tabs["tab-1"] = {
+        "tabId": "tab-1",
+        "workspaceId": "ws-test",
+        "name": "session",
+        "panelType": "codex-cli",
+        "agentProviderId": "codex",
+    }
 
     client(runner).close_session("tab-1")
 
-    assert runner.calls[0][1:] == ["tab", "close", "-w", "ws-test", "tab-1"]
+    assert any(
+        call[1:] == ["tab", "close", "-w", "ws-test", "tab-1"] for call in runner.calls
+    )
 
 
 def test_capture_screen_is_diagnostic_and_separate_from_result() -> None:
@@ -1137,7 +1178,26 @@ def test_mutation_timeout_is_not_retried(operation: str) -> None:
     runner = FakeRunner(outcomes)
     cli = client(runner)
 
-    with pytest.raises(MutationOutcomeUnknown, match="outcome is unknown"):
+    if operation == "interrupt":
+        runner.outcomes.insert(
+            0, completed({"cliState": "busy", "alive": True, "eventSeq": 1})
+        )
+        runner.outcomes.extend(
+            [
+                completed({"cliState": "busy", "alive": True, "eventSeq": 1}),
+                completed({"cliState": "busy", "alive": True, "eventSeq": 1}),
+            ]
+        )
+    if operation == "close":
+        runner.tabs["tab-1"] = {
+            "tabId": "tab-1",
+            "workspaceId": "ws-test",
+            "name": "session",
+            "panelType": "codex-cli",
+            "agentProviderId": "codex",
+        }
+
+    with pytest.raises(MutationOutcomeUnknown, match="unknown"):
         if operation == "create":
             cli.create_session(request())
         elif operation == "send":
