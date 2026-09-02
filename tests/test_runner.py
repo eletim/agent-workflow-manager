@@ -16,7 +16,10 @@ import pytest
 
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
-from purplemux_client.readiness import AgentReadinessStatus
+from purplemux_client.readiness import (
+    AgentReadinessStatus,
+    ReadinessReconciliationRequired,
+)
 from purplemux_client.runner import (
     InvalidExecutionContextError,
     PythonRunner,
@@ -1573,6 +1576,47 @@ class ReadinessAPIService:
             "confirmed",
         )
 
+    def reconcile(self) -> AgentReadinessStatus:
+        raise ValueError("there is no unresolved Agent readiness probe")
+
+
+class BlockedReadinessAPIService(ReadinessAPIService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocked = False
+
+    def probe(self, *, workspace_id: str, provider: str) -> AgentReadinessStatus:
+        if self.blocked:
+            raise ReadinessReconciliationRequired("probe must be reconciled")
+        self.calls.append((workspace_id, provider))
+        self.blocked = True
+        return AgentReadinessStatus(
+            "unknown",
+            workspace_id,
+            "Existing",
+            provider,
+            "awm-readiness-codex-api123",
+            "api123",
+            None,
+            "not-observed",
+            "not-attempted",
+            "create outcome unknown",
+        )
+
+    def reconcile(self) -> AgentReadinessStatus:
+        self.blocked = False
+        return AgentReadinessStatus(
+            "reconciled",
+            "ws-1",
+            "Existing",
+            "codex",
+            "awm-readiness-codex-api123",
+            "api123",
+            None,
+            "not-observed",
+            "confirmed-absent",
+        )
+
 
 def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
     runner = PythonRunner(stop_timeout=0.5)
@@ -1613,6 +1657,65 @@ def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
         assert readiness.calls == [("ws-1", "codex")]
         assert result["probe"]["readiness"] == "ready"
         assert result["probe"]["cleanup"] == "confirmed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_agent_readiness_api_blocks_retry_until_explicit_reconciliation() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    readiness = BlockedReadinessAPIService()
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        readiness_service=readiness,  # type: ignore[arg-type]
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    body = json.dumps({"workspaceId": "ws-1", "provider": "codex"})
+    try:
+        assert (
+            request(
+                address,
+                "POST",
+                "/api/readiness/probe",
+                body,
+                token=server.request_token,
+            )[0]
+            == 200
+        )
+        status, blocked = request(
+            address,
+            "POST",
+            "/api/readiness/probe",
+            body,
+            token=server.request_token,
+        )
+        assert status == 409
+        assert "reconciled" in str(blocked["error"])
+        assert readiness.calls == [("ws-1", "codex")]
+
+        status, reconciled = request(
+            address,
+            "POST",
+            "/api/readiness/reconcile",
+            "{}",
+            token=server.request_token,
+        )
+        assert status == 200
+        assert reconciled["probe"]["status"] == "reconciled"
+        assert (
+            request(
+                address,
+                "POST",
+                "/api/readiness/probe",
+                body,
+                token=server.request_token,
+            )[0]
+            == 200
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -1950,6 +2053,7 @@ def test_notification_settings_mutation_rejects_untrusted_request(
             "/api/validate",
             "/api/dry-run",
             "/api/readiness/probe",
+            "/api/readiness/reconcile",
         )
         for token, origin in (
             (None, None),

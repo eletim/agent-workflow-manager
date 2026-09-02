@@ -19,7 +19,11 @@ from purplemux_client.notification_settings import (
     SettingsValidationError,
 )
 from purplemux_client.notifier import NotifyCLI
-from purplemux_client.readiness import AgentReadinessService, ReadinessProbeBusy
+from purplemux_client.readiness import (
+    AgentReadinessService,
+    ReadinessProbeBusy,
+    ReadinessReconciliationRequired,
+)
 from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
@@ -336,6 +340,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/validate",
             "/api/dry-run",
             "/api/readiness/probe",
+            "/api/readiness/reconcile",
             "/api/settings/notifications",
             "/api/settings/notifications/test",
         }
@@ -437,6 +442,32 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.readiness_service.probe(
                     workspace_id=workspace_id, provider=provider
                 )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except ReadinessProbeBusy as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except ReadinessReconciliationRequired as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except TerminalSessionError as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, {"probe": result.as_json()})
+            return
+        if path == "/api/readiness/reconcile":
+            payload = self._read_json()
+            if payload is None:
+                return
+            if payload:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "readiness reconciliation request must be empty"},
+                )
+                return
+            try:
+                result = self.server.readiness_service.reconcile()
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return

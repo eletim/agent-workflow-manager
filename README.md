@@ -147,6 +147,10 @@ structured public listings, waits for structured readiness, and attempts to clos
 that exact tab once. Readiness and cleanup are reported independently, with the
 retained tab identity and recovery guidance when cleanup cannot be confirmed. This
 mutating probe never runs as part of Static Validation or Dry Run.
+Unresolved identities are persisted across Runner restarts and block new probes.
+The explicit reconciliation action clears that block only after structured public
+inspection proves the correlated tab (or its original workspace) is absent; it
+never retries the close mutation.
 
 Observable Bash work runs in named PurpleMux `terminal` tabs. The adapter sends
 the command with an explicit working directory and correlates completion with a

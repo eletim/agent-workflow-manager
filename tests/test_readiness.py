@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -13,9 +14,13 @@ from purplemux_client.client import (
 from purplemux_client.errors import (
     MutationOutcomeUnknown,
     SessionReadyTimeout,
+    WorkerFailure,
     WorkerNeedsInput,
 )
-from purplemux_client.readiness import AgentReadinessService
+from purplemux_client.readiness import (
+    AgentReadinessService,
+    ReadinessReconciliationRequired,
+)
 
 
 class ProbeClient:
@@ -25,6 +30,8 @@ class ProbeClient:
         self.tabs = (TabState("existing", "ws-1", "shell", "terminal", None),)
 
     def list_sessions(self) -> tuple[TabState, ...]:
+        if self.outcome == "list-failure":
+            raise WorkerFailure("authoritative tab listing failed")
         return self.tabs
 
     def probe_agent_readiness(
@@ -48,6 +55,11 @@ class ProbeClient:
         )
         if self.outcome == "create-unknown":
             raise MutationOutcomeUnknown("create may have been dispatched")
+        if self.outcome == "pre-create-failure":
+            self.tabs += (TabState("concurrent", "ws-1", "other", "terminal", None),)
+            raise WorkerFailure(
+                "probe preexisting tab set is not authoritative/current"
+            )
         tab = TabState("probe-tab", "ws-1", probe_name, "codex-cli", "codex")
         if on_identified is not None:
             on_identified(tab)
@@ -84,18 +96,25 @@ class ProbeRuntime:
         return self.client
 
 
-def service(outcome: str = "success") -> tuple[AgentReadinessService, ProbeClient]:
+def service(
+    tmp_path: Path, outcome: str = "success"
+) -> tuple[AgentReadinessService, ProbeClient]:
     client = ProbeClient(outcome)
     return (
         AgentReadinessService(
-            ProbeRuntime(client), token_factory=lambda: "unique123", timeout_seconds=7
+            ProbeRuntime(client),
+            token_factory=lambda: "unique123",
+            timeout_seconds=7,
+            state_file=tmp_path / "readiness.json",
         ),
         client,
     )
 
 
-def test_success_captures_precreate_set_and_reports_ready_cleanup_separately() -> None:
-    readiness, client = service()
+def test_success_captures_precreate_set_and_reports_ready_cleanup_separately(
+    tmp_path: Path,
+) -> None:
+    readiness, client = service(tmp_path)
 
     result = readiness.probe(workspace_id="ws-1", provider="codex")
 
@@ -114,8 +133,10 @@ def test_success_captures_precreate_set_and_reports_ready_cleanup_separately() -
     ]
 
 
-def test_provider_needs_input_is_failed_but_cleanup_is_confirmed() -> None:
-    readiness, _ = service("needs-input")
+def test_provider_needs_input_is_failed_but_cleanup_is_confirmed(
+    tmp_path: Path,
+) -> None:
+    readiness, _ = service(tmp_path, "needs-input")
 
     result = readiness.probe(workspace_id="ws-1", provider="codex")
 
@@ -126,8 +147,10 @@ def test_provider_needs_input_is_failed_but_cleanup_is_confirmed() -> None:
     assert "onboarding" in str(result.detail)
 
 
-def test_readiness_failure_is_distinct_from_confirmed_cleanup() -> None:
-    readiness, _ = service("readiness-failure")
+def test_readiness_failure_is_distinct_from_confirmed_cleanup(
+    tmp_path: Path,
+) -> None:
+    readiness, _ = service(tmp_path, "readiness-failure")
 
     result = readiness.probe(workspace_id="ws-1", provider="codex")
 
@@ -137,8 +160,38 @@ def test_readiness_failure_is_distinct_from_confirmed_cleanup() -> None:
     assert "did not become ready" in str(result.detail)
 
 
-def test_uncertain_create_requires_name_based_reconciliation_before_retry() -> None:
-    readiness, _ = service("create-unknown")
+def test_precreation_tab_set_change_is_not_reported_as_readiness_or_cleanup(
+    tmp_path: Path,
+) -> None:
+    readiness, client = service(tmp_path, "pre-create-failure")
+
+    result = readiness.probe(workspace_id="ws-1", provider="codex")
+
+    assert result.status == "failed"
+    assert result.tab_id is None
+    assert result.readiness == "not-observed"
+    assert result.cleanup == "not-attempted"
+    assert "not authoritative/current" in str(result.detail)
+    assert {tab.id for tab in client.tabs} == {"existing", "concurrent"}
+    assert not (tmp_path / "readiness.json").exists()
+
+
+def test_precreation_listing_failure_is_not_reported_as_readiness_or_cleanup(
+    tmp_path: Path,
+) -> None:
+    readiness, client = service(tmp_path, "list-failure")
+
+    result = readiness.probe(workspace_id="ws-1", provider="codex")
+
+    assert result.readiness == "not-observed"
+    assert result.cleanup == "not-attempted"
+    assert client.calls == []
+
+
+def test_uncertain_create_requires_name_based_reconciliation_before_retry(
+    tmp_path: Path,
+) -> None:
+    readiness, _ = service(tmp_path, "create-unknown")
 
     result = readiness.probe(workspace_id="ws-1", provider="codex")
     payload = result.as_json()
@@ -151,10 +204,10 @@ def test_uncertain_create_requires_name_based_reconciliation_before_retry() -> N
     assert "do not retry" in str(payload["guidance"])
 
 
-def test_uncertain_cleanup_reports_ready_but_not_success_and_retains_exact_tab() -> (
-    None
-):
-    readiness, _ = service("cleanup-unknown")
+def test_uncertain_cleanup_persists_and_blocks_direct_retry(
+    tmp_path: Path,
+) -> None:
+    readiness, client = service(tmp_path, "cleanup-unknown")
 
     result = readiness.probe(workspace_id="ws-1", provider="codex")
     payload = result.as_json()
@@ -164,12 +217,70 @@ def test_uncertain_cleanup_reports_ready_but_not_success_and_retains_exact_tab()
     assert result.cleanup == "unknown"
     assert result.retained_tab_id == "probe-tab"
     assert "probe-tab" in str(payload["guidance"])
+    with pytest.raises(ReadinessReconciliationRequired, match="reconciled"):
+        readiness.probe(workspace_id="ws-1", provider="codex")
+    assert len(client.calls) == 1
 
 
-def test_no_workspace_prevents_any_tab_inspection_or_mutation() -> None:
+def test_unresolved_creation_survives_restart_until_explicit_reconciliation(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "readiness.json"
+    client = ProbeClient("create-unknown")
+    runtime = ProbeRuntime(client)
+    first = AgentReadinessService(
+        runtime, token_factory=lambda: "first123", state_file=state_file
+    )
+    assert first.probe(workspace_id="ws-1", provider="codex").status == "unknown"
+    assert state_file.exists()
+
+    restarted = AgentReadinessService(
+        runtime, token_factory=lambda: "second123", state_file=state_file
+    )
+    with pytest.raises(ReadinessReconciliationRequired, match="reconciled"):
+        restarted.probe(workspace_id="ws-1", provider="codex")
+    assert len(client.calls) == 1
+
+    client.tabs += (
+        TabState(
+            "late-probe",
+            "ws-1",
+            "awm-readiness-codex-first123",
+            "codex-cli",
+            "codex",
+        ),
+    )
+    rediscovered = restarted.reconcile()
+    assert rediscovered.status == "unknown"
+    assert rediscovered.retained_tab_id == "late-probe"
+    assert state_file.exists()
+    with pytest.raises(ReadinessReconciliationRequired, match="reconciled"):
+        restarted.probe(workspace_id="ws-1", provider="codex")
+
+    client.tabs = tuple(tab for tab in client.tabs if tab.id != "late-probe")
+    reconciled = restarted.reconcile()
+    assert reconciled.status == "reconciled"
+    assert reconciled.cleanup == "confirmed-absent"
+    assert not state_file.exists()
+
+    client.outcome = "success"
+    after_reconciliation = AgentReadinessService(
+        runtime, token_factory=lambda: "third123", state_file=state_file
+    )
+    assert (
+        after_reconciliation.probe(workspace_id="ws-1", provider="codex").status
+        == "succeeded"
+    )
+
+
+def test_no_workspace_prevents_any_tab_inspection_or_mutation(tmp_path: Path) -> None:
     client = ProbeClient()
     runtime = ProbeRuntime(client, has_workspace=False)
-    readiness = AgentReadinessService(runtime, token_factory=lambda: "unique123")
+    readiness = AgentReadinessService(
+        runtime,
+        token_factory=lambda: "unique123",
+        state_file=tmp_path / "readiness.json",
+    )
 
     assert readiness.snapshot()["workspaces"] == []
     with pytest.raises(ValueError, match="workspace was not found"):

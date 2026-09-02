@@ -163,7 +163,7 @@ async function loadApp({
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
-    "readiness-workspace", "readiness-provider", "run-readiness",
+    "readiness-workspace", "readiness-provider", "run-readiness", "reconcile-readiness",
     "refresh-readiness", "readiness-summary", "readiness-details",
     "readiness-result-provider", "readiness-identity", "readiness-tab", "readiness-state",
     "readiness-cleanup", "readiness-guidance",
@@ -363,6 +363,14 @@ test("Agent readiness runs only by explicit click and shows retained cleanup sep
     detail: "close outcome unknown",
     guidance: "Inspect retained tab 'tab-probe'; do not retry.",
   };
+  const reconciled = {
+    ...uncertain,
+    status: "reconciled",
+    cleanup: "confirmed-absent",
+    retainedTabId: null,
+    detail: "probe tab is authoritatively absent",
+    guidance: null,
+  };
   let latest = null;
   const {calls, elements} = await loadApp({
     runs: [],
@@ -372,6 +380,10 @@ test("Agent readiness runs only by explicit click and shows retained cleanup sep
       if (url === "/api/readiness/probe") {
         latest = uncertain;
         return response({probe: uncertain});
+      }
+      if (url === "/api/readiness/reconcile") {
+        latest = reconciled;
+        return response({probe: reconciled});
       }
       if (url === "/api/readiness") {
         return response({...workspaceSnapshot, probe: latest});
@@ -392,6 +404,14 @@ test("Agent readiness runs only by explicit click and shows retained cleanup sep
   assert.equal(elements["readiness-tab"].textContent, "tab-probe");
   assert.match(elements["readiness-guidance"].textContent, /do not retry/);
   assert.equal(elements["run-readiness"].disabled, true);
+  assert.equal(elements["reconcile-readiness"].hidden, false);
+
+  await elements["reconcile-readiness"].dispatch("click");
+
+  assert.equal(calls.filter(([url]) => url === "/api/readiness/reconcile").length, 1);
+  assert.equal(elements["readiness-cleanup"].textContent, "confirmed-absent");
+  assert.equal(elements["run-readiness"].disabled, false);
+  assert.equal(elements["reconcile-readiness"].hidden, true);
 });
 
 test("Agent readiness is disabled when there is no existing workspace", async () => {
@@ -404,6 +424,39 @@ test("Agent readiness is disabled when there is no existing workspace", async ()
 
   assert.equal(elements["run-readiness"].disabled, true);
   assert.match(elements["readiness-summary"].textContent, /No existing/);
+});
+
+test("Agent pre-create failure does not claim readiness or cleanup", async () => {
+  const failed = {
+    status: "failed",
+    workspaceId: "ws-1",
+    workspaceName: "Existing",
+    provider: "codex",
+    probeName: "awm-readiness-codex-race123",
+    correlationId: "race123",
+    tabId: null,
+    readiness: "not-observed",
+    cleanup: "not-attempted",
+    detail: "authoritative tab set changed",
+    guidance: null,
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/readiness") return response({
+        workspaces: [{id: "ws-1", name: "Existing", directories: ["/repo"]}],
+        running: false,
+        probe: failed,
+      });
+      return undefined;
+    },
+  });
+
+  assert.match(elements["readiness-summary"].textContent, /before tab identification/);
+  assert.equal(elements["readiness-state"].textContent, "not-observed");
+  assert.equal(elements["readiness-cleanup"].textContent, "not-attempted");
 });
 
 test("formats observed timestamps with relative local dates", () => {

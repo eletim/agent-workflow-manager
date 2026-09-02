@@ -31,6 +31,7 @@ const nextMutation = document.querySelector("#next-mutation");
 const readinessWorkspace = document.querySelector("#readiness-workspace");
 const readinessProvider = document.querySelector("#readiness-provider");
 const runReadinessButton = document.querySelector("#run-readiness");
+const reconcileReadinessButton = document.querySelector("#reconcile-readiness");
 const refreshReadinessButton = document.querySelector("#refresh-readiness");
 const readinessSummary = document.querySelector("#readiness-summary");
 const readinessDetails = document.querySelector("#readiness-details");
@@ -318,12 +319,16 @@ function renderReadinessProbe(probe) {
   }
   readinessDetails.hidden = false;
   readinessSummary.className = `readiness-summary ${probe.status}`;
-  readinessSummary.textContent = {
+  const messages = {
     succeeded: "Ready, with cleanup confirmed.",
     failed: "The provider did not reach a structured ready state; cleanup was confirmed.",
     unknown: "Outcome requires reconciliation. This is not a successful readiness probe.",
+    reconciled: "The unresolved probe is authoritatively absent. The probe block is cleared.",
     pending: "Probe dispatch is pending.",
-  }[probe.status] || probe.status;
+  };
+  readinessSummary.textContent = probe.status === "failed" && probe.tabId == null
+    ? "Probe stopped before tab identification; readiness was not observed and cleanup was not attempted."
+    : (messages[probe.status] || probe.status);
   readinessResultProvider.textContent = probe.provider;
   readinessIdentity.textContent = `${probe.probeName} (${probe.provider})`;
   readinessTab.textContent = probe.tabId || "Not authoritatively identified";
@@ -345,10 +350,12 @@ function renderReadiness(snapshot) {
   const ids = (snapshot.workspaces || []).map((workspace) => workspace.id);
   readinessWorkspace.value = ids.includes(selected) ? selected : (ids[0] || "");
   const unavailable = ids.length === 0;
-  const reconciliationRequired = snapshot.probe?.status === "unknown";
+  const reconciliationRequired = ["pending", "unknown"].includes(snapshot.probe?.status);
   readinessWorkspace.disabled = unavailable || snapshot.running;
   readinessProvider.disabled = unavailable || snapshot.running;
   runReadinessButton.disabled = unavailable || snapshot.running || reconciliationRequired;
+  reconcileReadinessButton.hidden = !reconciliationRequired;
+  reconcileReadinessButton.disabled = snapshot.running;
   if (unavailable) {
     readinessSummary.className = "readiness-summary failed";
     readinessSummary.textContent = "No existing PurpleMux workspace is available. Create or select one outside this probe.";
@@ -780,6 +787,25 @@ runReadinessButton.addEventListener("click", async () => {
     }
   } finally {
     refreshReadinessButton.disabled = false;
+    await refreshReadiness();
+  }
+});
+
+reconcileReadinessButton.addEventListener("click", async () => {
+  reconcileReadinessButton.disabled = true;
+  readinessSummary.className = "readiness-summary";
+  readinessSummary.textContent = "Authoritatively inspecting the unresolved probe identity…";
+  try {
+    const result = await request("/api/readiness/reconcile", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    });
+    renderReadinessProbe(result.probe);
+  } catch (error) {
+    readinessSummary.className = "readiness-summary failed";
+    readinessSummary.textContent = String(error);
+  } finally {
     await refreshReadiness();
   }
 });
