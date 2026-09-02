@@ -69,6 +69,21 @@ def test_workflow_guide_prominently_links_to_existing_canonical_sample() -> None
     assert SAMPLE.is_file()
 
 
+def test_workflow_guide_documents_runtime_inspection_contract() -> None:
+    guide = GUIDE.read_text(encoding="utf-8")
+    section = guide.split("## Inspect a running workflow agent", maxsplit=1)[1]
+    section = section.split("## Recommended patterns", maxsplit=1)[0]
+
+    assert "workspace / tab" in section
+    assert "purplemux tab status -w WS_ID TAB_ID" in section
+    assert "purplemux tab result -w WS_ID TAB_ID" in section
+    assert "purplemux tab capture -w WS_ID TAB_ID" in section
+    assert "structured runtime state" in section
+    assert "latest completed structured agent response" in section
+    assert "diagnostic pane snapshot only" in section
+    assert "Do not parse `capture`" in section
+
+
 def test_sample_has_separate_issue_and_whole_version_review_phases() -> None:
     source = SAMPLE.read_text(encoding="utf-8")
 
