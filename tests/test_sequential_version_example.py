@@ -84,6 +84,19 @@ def test_workflow_guide_documents_runtime_inspection_contract() -> None:
     assert "Do not parse `capture`" in section
 
 
+def test_workflow_guide_documents_static_observation_only_outline() -> None:
+    guide = GUIDE.read_text(encoding="utf-8")
+    section = guide.split("## Optional execution outline", maxsplit=1)[1]
+    section = section.split("## Installed Python API", maxsplit=1)[0]
+    normalized = " ".join(section.split())
+
+    assert "WORKFLOW_OUTLINE" in section
+    assert "literal `list[str]`" in section
+    assert "never executes workflow code" in normalized
+    assert "Dynamic or unmatched progress remains visible" in normalized
+    assert "must never drive sequencing" in normalized
+
+
 def test_sample_has_separate_issue_and_whole_version_review_phases() -> None:
     source = SAMPLE.read_text(encoding="utf-8")
 

@@ -22,6 +22,8 @@ const attemptHistory = document.querySelector("#attempt-history");
 const validationPanel = document.querySelector("#validation-panel");
 const validationSuccess = document.querySelector("#validation-success");
 const validation = document.querySelector("#validation");
+const outlinePanel = document.querySelector("#outline-panel");
+const outline = document.querySelector("#outline");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -141,6 +143,7 @@ function renderRun(result) {
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
   resumeButton.disabled = activeRunId === null || !result.resumable;
+  renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderRecovery(result);
 
@@ -182,6 +185,7 @@ async function enterDraftMode() {
   showDraftLabel();
   stopButton.disabled = true;
   resumeButton.disabled = true;
+  renderOutline([], []);
   applyFieldMode();
   await refresh();
 }
@@ -248,6 +252,41 @@ function renderValidation(issues) {
       : `Line ${issue.line}${issue.column == null ? "" : `:${issue.column}`}: `;
     item.textContent = `${location}${issue.message}`;
     validation.append(item);
+  }
+}
+
+function renderOutline(labels, events) {
+  const states = new Map(labels.map((label) => [label, "pending"]));
+  for (const event of events) {
+    if (!states.has(event.name)) continue;
+    states.set(event.name, {
+      started: "running",
+      completed: "completed",
+      failed: "failed",
+    }[event.status]);
+  }
+
+  outline.replaceChildren();
+  outlinePanel.hidden = labels.length === 0;
+  for (const label of labels) {
+    const state = states.get(label);
+    const item = document.createElement("li");
+    item.className = `outline-item ${state}`;
+
+    const marker = document.createElement("span");
+    marker.className = "outline-marker";
+    marker.setAttribute("aria-hidden", "true");
+    marker.textContent = {
+      pending: "○",
+      running: "▶",
+      completed: "✓",
+      failed: "✕",
+    }[state];
+
+    const text = document.createElement("span");
+    text.textContent = label;
+    item.append(marker, text);
+    outline.append(item);
   }
 }
 
@@ -519,8 +558,13 @@ runButton.addEventListener("click", async () => {
     await refresh();
   } catch (error) {
     if (Array.isArray(error.result?.validation)) {
-      if (validationGeneration === validationRequestGeneration) {
+      if (
+        validationGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
         renderValidation(error.result.validation);
+        renderOutline(error.result.outline || [], []);
       }
     } else if (selectionGeneration === activeRunGeneration) {
       stderr.textContent = String(error);
@@ -535,22 +579,35 @@ newRunButton.addEventListener("click", async () => {
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
   const requestGeneration = ++validationRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
   try {
     const result = await request("/api/validate", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     });
-    if (requestGeneration === validationRequestGeneration) {
+    if (
+      requestGeneration === validationRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
+    ) {
       renderValidation(result.validation || []);
+      renderOutline(result.outline || [], []);
     }
   } catch (error) {
     if (
       requestGeneration === validationRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
       && Array.isArray(error.result?.validation)
     ) {
       renderValidation(error.result.validation);
-    } else if (requestGeneration === validationRequestGeneration) {
+      renderOutline(error.result.outline || [], []);
+    } else if (
+      requestGeneration === validationRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
+    ) {
       stderr.textContent = String(error);
     }
   }

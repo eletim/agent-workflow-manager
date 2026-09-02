@@ -77,6 +77,34 @@ bounded and reports a validation timeout if a lookup stalls. Preflight is
 best-effort and cannot prove that dynamic code or later external operations will
 succeed.
 
+## Optional execution outline
+
+A workflow may declare a coarse, static list of expected steps for operator
+orientation:
+
+```python
+WORKFLOW_OUTLINE = [
+    "prepare integration branch",
+    "implement Issue",
+    "review Issue",
+    "final integration review",
+    "ready PR",
+]
+```
+
+`WORKFLOW_OUTLINE` must be a literal `list[str]` with at most 100 items. Each
+label must be non-empty, printable human-readable text of at most 200
+characters. Validation reads this declaration from the syntax tree and never
+executes workflow code to discover it. The declaration is optional.
+
+The Runner snapshots the outline with the submitted run. A matching
+`emit_step()` name may update its display from pending to running, completed, or
+failed. Dynamic or unmatched progress remains visible in the Progress panel.
+The outline is observation metadata only: it must never drive sequencing,
+branching, retries, cleanup, Resume, or any other workflow decision. Keep all
+control flow in plain Python; do not encode graphs, dependencies, or conditions
+in the outline.
+
 ## Installed Python API
 
 Import the public names from `purplemux_client`:

@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from purplemux_client.preflight import ValidationResult, WorkflowValidator
+from purplemux_client.preflight import (
+    MAX_OUTLINE_ITEMS,
+    MAX_OUTLINE_LABEL_CHARS,
+    ValidationResult,
+    WorkflowValidator,
+)
 from purplemux_client.runner import (
     PythonRunner,
     RunnerClosedError,
@@ -72,6 +77,48 @@ def test_valid_script_passes_preflight(tmp_path: Path) -> None:
 
     assert result.valid
     assert result.issues == ()
+
+
+def test_static_workflow_outline_is_returned_without_execution(tmp_path: Path) -> None:
+    marker = tmp_path / "outline-side-effect"
+    result = validator(tmp_path).validate(
+        "WORKFLOW_OUTLINE = ['prepare', 'implement', 'review']\n"
+        f"open({str(marker)!r}, 'w').write('executed')\n"
+    )
+
+    assert result.valid
+    assert result.outline == ("prepare", "implement", "review")
+    assert not marker.exists()
+
+
+def test_workflow_outline_is_optional(tmp_path: Path) -> None:
+    result = validator(tmp_path).validate("print('no outline')")
+
+    assert result.valid
+    assert result.outline == ()
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "WORKFLOW_OUTLINE = make_outline()",
+        "WORKFLOW_OUTLINE = ('prepare', 'review')",
+        "WORKFLOW_OUTLINE = ['prepare', 2]",
+        "WORKFLOW_OUTLINE = ['   ']",
+        "WORKFLOW_OUTLINE = ['line\\nbreak']",
+        f"WORKFLOW_OUTLINE = [{('x' * (MAX_OUTLINE_LABEL_CHARS + 1))!r}]",
+        f"WORKFLOW_OUTLINE = {['step'] * (MAX_OUTLINE_ITEMS + 1)!r}",
+    ],
+)
+def test_malformed_workflow_outline_is_a_validation_error(
+    tmp_path: Path, declaration: str
+) -> None:
+    result = validator(tmp_path).validate(declaration)
+
+    assert not result.valid
+    assert result.outline == ()
+    assert result.issues[0].kind == "outline"
+    assert "WORKFLOW_OUTLINE" in result.issues[0].message
 
 
 def test_syntax_error_has_source_location(tmp_path: Path) -> None:
