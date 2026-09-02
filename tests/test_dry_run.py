@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from purplemux_client.preflight import WorkflowValidator
@@ -31,6 +33,27 @@ def test_static_validation_rejects_raw_filesystem_mutation_facilities(
 
     assert result.valid
     assert result.dry_run_issues
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from pathlib import Path\nPath('changed').open('w').write('changed')",
+        "from pathlib import Path\npath = Path('changed')\npath.open('w').close()",
+        ("import os\nfd = os.open('changed', os.O_WRONLY | os.O_CREAT)\nos.close(fd)"),
+    ],
+)
+def test_dry_run_rejects_raw_open_before_it_can_modify_files(
+    tmp_path: Path, source: str
+) -> None:
+    runner = PythonRunner()
+    try:
+        with pytest.raises(WorkflowDryRunError):
+            runner.dry_run(f"WORKFLOW_DRY_RUN = 1\n{source}\n", cwd=tmp_path)
+    finally:
+        runner.close()
+
+    assert not (tmp_path / "changed").exists()
 
 
 def test_dry_run_boundary_cannot_be_swallowed_and_dispatch_never_runs() -> None:

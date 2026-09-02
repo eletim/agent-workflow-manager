@@ -204,7 +204,7 @@ def inspect_issue_pr_topology(
 
 
 def inspect_integration_pr_topology(
-    github: GitHubRepository, config: Config
+    github: GitHubRepository, config: Config, recovery: Recovery
 ) -> PullRequestState | None:
     try:
         pr = github.find_pr(
@@ -220,6 +220,18 @@ def inspect_integration_pr_topology(
         f"{config.main_branch} @ {pr.base_sha}"
     )
     emit_finding("github", message)
+    if (
+        pr is not None
+        and not pr.is_draft
+        and not (
+            recovery.approved_sha == pr.head_sha
+            and recovery.approved_base_sha == pr.base_sha
+        )
+    ):
+        raise WorkerFailure(
+            f"integration PR #{pr.number} is Ready without checkpointed approval "
+            "for its exact head/base SHAs"
+        )
     return pr
 
 
@@ -601,12 +613,12 @@ def integration_review(
             "a prior integration workspace/session creation may have completed; "
             "inspect its saved identity and do not retry"
         )
-    pr = inspect_integration_pr_topology(github, config)
+    pr = inspect_integration_pr_topology(github, config, recovery)
     integration = repo.synchronize_branch(config.integration_branch)
     main = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or main.remote_sha is None:
         raise WorkerFailure("integration or main remote branch is missing")
-    pr = inspect_integration_pr_topology(github, config)
+    pr = inspect_integration_pr_topology(github, config, recovery)
     if pr is None:
         correlation = recovery.correlation_id or f"integration-{config.signature}"
         recovery.correlation_id = correlation
@@ -624,10 +636,10 @@ def integration_review(
     emit_finding(
         "github", f"integration PR #{pr.number}: {pr.head_sha} -> {pr.base_sha}"
     )
-    inspect_integration_pr_topology(github, config)
+    inspect_integration_pr_topology(github, config, recovery)
     client = ensure_workspace(runtime, config, recovery)
     if recovery.implementer is None:
-        inspect_integration_pr_topology(github, config)
+        inspect_integration_pr_topology(github, config, recovery)
         recovery.phase = "integration_fixer_create_pending"
         recovery.checkpoint(config)
         recovery.implementer = create_agent(
@@ -639,7 +651,7 @@ def integration_review(
         recovery.phase = "integration_fixer_ready"
         recovery.checkpoint(config)
     if recovery.reviewer is None:
-        inspect_integration_pr_topology(github, config)
+        inspect_integration_pr_topology(github, config, recovery)
         recovery.phase = "integration_reviewer_create_pending"
         recovery.checkpoint(config)
         recovery.reviewer = create_agent(

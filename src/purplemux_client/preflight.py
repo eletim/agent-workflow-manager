@@ -323,6 +323,13 @@ class WorkflowValidator:
             raw_open = name in {"open", "builtins.open"} and self._open_call_can_write(
                 node
             )
+            raw_os_open = name == "os.open" and self._os_open_can_write(node)
+            raw_method_open = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "open"
+                and not (name or "").startswith("purplemux_client.")
+                and self._method_open_can_write(node)
+            )
             if raw_open:
                 name = "open"
             raw_mutation_method = False
@@ -345,6 +352,8 @@ class WorkflowValidator:
             )
             if (
                 raw_open
+                or raw_os_open
+                or raw_method_open
                 or name in mutation_calls
                 or raw_mutation_method
                 or (
@@ -376,7 +385,60 @@ class WorkflowValidator:
             mode = ast.literal_eval(mode_node)
         except (ValueError, TypeError):
             return True
-        return not isinstance(mode, str) or any(flag in mode for flag in "wax+")
+        return not isinstance(mode, str) or (
+            bool(mode)
+            and set(mode) <= set("rwaxbt+")
+            and any(flag in mode for flag in "wax+")
+        )
+
+    @staticmethod
+    def _method_open_can_write(node: ast.Call) -> bool:
+        mode_node: ast.expr | None = node.args[0] if node.args else None
+        for keyword in node.keywords:
+            if keyword.arg == "mode":
+                mode_node = keyword.value
+        if mode_node is None:
+            return False
+        try:
+            mode = ast.literal_eval(mode_node)
+        except (ValueError, TypeError):
+            # Unknown receivers include safe factory methods such as
+            # GitRepository.open(path). Literal write modes remain detectable
+            # for both Path(...).open("w") and path.open("w").
+            return False
+        return not isinstance(mode, str) or (
+            bool(mode)
+            and set(mode) <= set("rwaxbt+")
+            and any(flag in mode for flag in "wax+")
+        )
+
+    @staticmethod
+    def _os_open_can_write(node: ast.Call) -> bool:
+        flags_node: ast.expr | None = node.args[1] if len(node.args) > 1 else None
+        for keyword in node.keywords:
+            if keyword.arg == "flags":
+                flags_node = keyword.value
+        if flags_node is None:
+            return True
+        write_flags = {
+            "O_WRONLY",
+            "O_RDWR",
+            "O_APPEND",
+            "O_CREAT",
+            "O_EXCL",
+            "O_TRUNC",
+            "O_TMPFILE",
+        }
+        for child in ast.walk(flags_node):
+            if isinstance(child, ast.Name) and child.id in write_flags:
+                return True
+            if isinstance(child, ast.Attribute) and child.attr in write_flags:
+                return True
+        try:
+            flags = ast.literal_eval(flags_node)
+        except (ValueError, TypeError):
+            return True
+        return not isinstance(flags, int) or isinstance(flags, bool) or flags != 0
 
     @staticmethod
     def _qualified_name(node: ast.expr) -> str | None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
@@ -179,3 +180,41 @@ def test_final_path_only_makes_exact_integration_topology_ready() -> None:
     assert "merge_pr" not in attributes
     assert "expected_head_sha" in source
     assert "expected_base_sha" in source
+
+
+def test_ready_integration_pr_without_exact_approval_stops_before_mutation(
+    tmp_path: Path,
+) -> None:
+    existing = replace(
+        pr(),
+        is_draft=False,
+        head_branch="dev/v1.2.3",
+        base_branch="main",
+    )
+    events: list[str] = []
+
+    class GitHub:
+        def find_pr(self, **_kwargs: object):
+            events.append("inspect-open")
+            return existing
+
+    class Repo:
+        def synchronize_branch(self, _branch: str):
+            events.append("git-mutation")
+            pytest.fail("Git mutation followed an unapproved Ready integration PR")
+
+    class Runtime:
+        def list_workspaces(self):
+            events.append("runtime")
+            pytest.fail("runtime mutation followed an unapproved Ready integration PR")
+
+    with pytest.raises(purplemux_client.WorkerFailure, match="checkpointed approval"):
+        SAMPLE_MODULE.integration_review(
+            config(tmp_path),
+            Runtime(),
+            Repo(),
+            GitHub(),
+            SAMPLE_MODULE.Recovery(),
+        )
+
+    assert events == ["inspect-open"]

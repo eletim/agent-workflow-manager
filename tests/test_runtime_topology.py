@@ -24,6 +24,7 @@ class RuntimeRunner:
         self.calls: list[list[str]] = []
         self.tabs: dict[str, dict[str, object]] = {}
         self.workspaces: dict[str, dict[str, object]] = {}
+        self.sent: list[str] = []
 
     def __call__(
         self,
@@ -56,6 +57,8 @@ class RuntimeRunner:
             self.workspaces["ws-new"] = workspace
             if self.mode == "workspace-timeout-after-apply":
                 raise subprocess.TimeoutExpired(command, timeout)
+            if self.mode == "workspace-nonzero-after-apply":
+                return self.failed("workspace create failed after apply")
             return self.done(workspace)
         if command[1:3] == ["tab", "create"]:
             name = command[command.index("-n") + 1]
@@ -75,6 +78,8 @@ class RuntimeRunner:
                 raise subprocess.TimeoutExpired(command, timeout)
             if self.mode == "timeout-after-apply":
                 raise subprocess.TimeoutExpired(command, timeout)
+            if self.mode == "create-nonzero-after-apply":
+                return self.failed("create failed after apply")
             if self.mode == "timeout-unchanged":
                 self.tabs.clear()
                 raise subprocess.TimeoutExpired(command, timeout)
@@ -83,16 +88,29 @@ class RuntimeRunner:
             return self.done(
                 {"tabId": command[-1], "cliState": "idle", "alive": True, "eventSeq": 1}
             )
+        if command[1:3] == ["tab", "result"]:
+            return self.done({"status": "not-ready"})
+        if command[1:3] == ["tab", "send"]:
+            self.sent.append(command[-1])
+            if self.mode == "send-nonzero-after-apply":
+                return self.failed("send failed after apply")
+            return self.done({"status": "sent"})
         if command[1:3] == ["tab", "close"]:
             if self.mode == "close-timeout":
                 raise subprocess.TimeoutExpired(command, timeout)
             self.tabs.pop(command[-1], None)
+            if self.mode == "close-nonzero-after-apply":
+                return self.failed("close failed after apply")
             return self.done({"status": "closed"})
         raise AssertionError(command)
 
     @staticmethod
     def done(value: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess([], 0, json.dumps(value), "")
+
+    @staticmethod
+    def failed(message: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 1, "", message)
 
 
 def request() -> CreateSessionRequest:
@@ -140,6 +158,40 @@ def test_create_ambiguity_or_possible_late_completion_is_unknown(mode: str) -> N
     with pytest.raises(MutationOutcomeUnknown):
         PurpleMuxCLIClient("ws-test", runner=runner).create_session(request())
     assert len([call for call in runner.calls if call[1:3] == ["tab", "create"]]) == 1
+
+
+def test_nonzero_create_after_apply_reconciles_without_retry() -> None:
+    runner = RuntimeRunner("create-nonzero-after-apply")
+
+    assert PurpleMuxCLIClient("ws-test", runner=runner).create_session(request()) == (
+        "tab-response"
+    )
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "create"]]) == 1
+
+
+def test_nonzero_send_after_apply_remains_unknown_without_retry() -> None:
+    runner = RuntimeRunner("send-nonzero-after-apply")
+    client = PurpleMuxCLIClient("ws-test", runner=runner)
+
+    with pytest.raises(MutationOutcomeUnknown):
+        client.send_input("tab-1", "work")
+    assert runner.sent == ["work"]
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "send"]]) == 1
+
+
+def test_nonzero_close_after_apply_reconciles_without_retry() -> None:
+    runner = RuntimeRunner("close-nonzero-after-apply")
+    runner.tabs["tab-1"] = {
+        "tabId": "tab-1",
+        "workspaceId": "ws-test",
+        "name": "session",
+        "panelType": "codex-cli",
+        "agentProviderId": "codex",
+    }
+
+    PurpleMuxCLIClient("ws-test", runner=runner).close_session("tab-1")
+    assert "tab-1" not in runner.tabs
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "close"]]) == 1
 
 
 def test_probe_uses_saved_preexisting_set_structured_readiness_and_exact_cleanup() -> (
@@ -239,6 +291,45 @@ def test_probe_refuses_to_close_a_changed_tab_identity() -> None:
     assert not any(call[1:3] == ["tab", "close"] for call in runner.calls)
 
 
+def test_probe_cleanup_ignores_readiness_state_changes() -> None:
+    runner = RuntimeRunner()
+    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    original_status = runner.__call__
+
+    def become_ready(
+        args: Sequence[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        result = original_status(
+            args,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+        )
+        if command[1:3] == ["tab", "status"]:
+            runner.tabs["tab-response"]["alive"] = True
+            runner.tabs["tab-response"]["cliState"] = "idle"
+        return result
+
+    client._runner = become_ready
+    result = client.probe_agent_readiness(
+        provider="codex",
+        probe_name="readiness-corr-1",
+        correlation_id="corr-1",
+        preexisting_tab_ids=(),
+        timeout_seconds=1,
+    )
+
+    assert result.cleanup_confirmed
+    assert runner.tabs == {}
+
+
 def test_probe_readiness_failure_still_closes_the_exact_probe() -> None:
     runner = RuntimeRunner()
     client = PurpleMuxCLIClient(
@@ -302,6 +393,22 @@ def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) ->
     runner = RuntimeRunner("workspace-timeout-after-apply")
     runtime = PurpleMuxRuntime(runner=runner)
     result = runtime.create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+
+    assert result.id == "ws-new"
+    assert (
+        len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
+        == 1
+    )
+
+
+def test_workspace_nonzero_after_apply_reconciles_without_retry(
+    tmp_path: Path,
+) -> None:
+    runner = RuntimeRunner("workspace-nonzero-after-apply")
+
+    result = PurpleMuxRuntime(runner=runner).create_workspace(
         CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
     )
 

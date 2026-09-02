@@ -21,7 +21,6 @@ from purplemux_client.errors import (
     WorkerNeedsInput,
 )
 from purplemux_client.operations import (
-    AuthoritativeMutationRejection,
     MutationConflict,
     MutationResolution,
     PossibleDispatchFailure,
@@ -343,7 +342,7 @@ def _run_mutation_json(
         raise PossibleDispatchFailure(f"PurpleMux {operation} was interrupted") from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
-        raise AuthoritativeMutationRejection(
+        raise PossibleDispatchFailure(
             f"PurpleMux {operation} failed with exit code {completed.returncode}: {detail}"
         )
     try:
@@ -742,11 +741,16 @@ class PurpleMuxCLIClient:
         """Close the tab and discard local correlation state."""
         before = self.list_sessions()
         selected = next((tab for tab in before if tab.id == session_id), None)
-        if expected_state is not None and selected not in (None, expected_state):
+        if (
+            expected_state is not None
+            and selected is not None
+            and self._tab_identity(selected) != self._tab_identity(expected_state)
+        ):
             raise MutationConflict(
                 f"tab {session_id} identity changed before close; refusing cleanup"
             )
         if selected is not None:
+            selected_identity = self._tab_identity(selected)
             self._execute_runtime_mutation(
                 operation="close PurpleMux tab",
                 target=f"{self.workspace_id}/{session_id}",
@@ -757,7 +761,10 @@ class PurpleMuxCLIClient:
                 desired=lambda: all(
                     tab.id != session_id for tab in self.list_sessions()
                 ),
-                unchanged=lambda: any(tab == selected for tab in self.list_sessions()),
+                unchanged=lambda: any(
+                    self._tab_identity(tab) == selected_identity
+                    for tab in self.list_sessions()
+                ),
                 success_is_authoritative=False,
                 plan={
                     "kind": "close_tab",
@@ -985,6 +992,10 @@ class PurpleMuxCLIClient:
         return TabState(
             tab_id, workspace_id, name, panel_type, provider, alive, cli_state
         )
+
+    @staticmethod
+    def _tab_identity(tab: TabState) -> tuple[str, str, str, str | None, str | None]:
+        return (tab.id, tab.workspace_id, tab.name, tab.panel_type, tab.provider)
 
     def _send_mutation(self, session_id: str, text: str, *, operation: str) -> None:
         self._execute_runtime_mutation(
