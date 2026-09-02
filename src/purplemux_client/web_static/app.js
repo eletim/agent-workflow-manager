@@ -153,18 +153,22 @@ function renderRun(result) {
 }
 
 async function enterDraftMode() {
-  // Already drafting: the fields are already the live draft, so restoring
-  // `draft` here would silently discard whatever the user is mid-typing.
-  if (activeRunId === null) return;
+  const wasViewingRun = activeRunId !== null;
+  // A New-run click is an explicit selection even if the fields are already
+  // editable. Preserve those live edits while invalidating requests started
+  // for the previous selection.
+  captureDraftIfEditing();
   // Only the draft/editable fields and the run-scoped controls change here;
   // the output/progress/recovery panels are left showing whatever was last
   // viewed (harmless reference) until a run is selected or started again.
   activeRunGeneration += 1;
   activeRunId = null;
   explicitNewRun = true;
-  workingDirectory.value = draft.cwd;
-  runArguments.value = draft.args;
-  code.value = draft.code;
+  if (wasViewingRun) {
+    workingDirectory.value = draft.cwd;
+    runArguments.value = draft.args;
+    code.value = draft.code;
+  }
   showDraftLabel();
   stopButton.disabled = true;
   resumeButton.disabled = true;
@@ -489,6 +493,10 @@ runButton.addEventListener("click", async () => {
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     });
     if (selectionGeneration === activeRunGeneration) {
+      // The fields remain editable while the request is pending. Retain any
+      // changes made since submission before replacing them with the run's
+      // authoritative snapshot.
+      captureDraftIfEditing();
       activeRunId = result.runId;
       activeRunGeneration += 1;
       explicitNewRun = false;
@@ -630,10 +638,6 @@ async function initialize() {
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
-  if (!workingDirectory.value) {
-    workingDirectory.value = initialStatus.cwd;
-    draft.cwd = initialStatus.cwd;
-  }
   if (initialStatus.state === "validation_failed") {
     renderValidation(initialStatus.validation || []);
   }

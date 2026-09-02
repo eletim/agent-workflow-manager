@@ -1081,7 +1081,7 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   assert.equal(elements.code.value, "print('A')");
 });
 
-test("New run is a no-op while already drafting and never discards in-progress edits", async () => {
+test("New run while already drafting never discards in-progress edits", async () => {
   const {elements} = await loadApp({
     runs: [],
     details: {},
@@ -1097,6 +1097,114 @@ test("New run is a no-op while already drafting and never discards in-progress e
   assert.equal(elements["working-directory"].value, "/tmp/still-typing");
   assert.equal(elements["run-arguments"].value, "still-typing-arg");
   assert.equal(elements.code.value, "print('still typing')");
+});
+
+test("New run while drafting prevents a later SSE run from taking the selection", async () => {
+  const runs = [];
+  const details = {};
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  elements["working-directory"].value = "/tmp/explicit-draft";
+  elements.code.value = "print('explicit draft')";
+  await elements["new-run"].dispatch("click");
+
+  runs.push({runId: 9, state: "running", cwd: "/work/run-9"});
+  details[9] = snapshot({runId: 9, state: "running", stdout: "elsewhere"});
+  eventSource.emit("runner-change");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(selectedRun(elements), undefined);
+  assert.equal(elements["working-directory"].value, "/tmp/explicit-draft");
+  assert.equal(elements.code.value, "print('explicit draft')");
+});
+
+test("New run while submitting invalidates the pending run selection", async () => {
+  const runResponse = deferred();
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/run") return runResponse.promise;
+      return undefined;
+    },
+  });
+
+  elements.code.value = "print('submitted')";
+  const submission = elements.run.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements.code.value = "print('newer draft')";
+  await elements["new-run"].dispatch("click");
+
+  runResponse.resolve(response(snapshot({
+    runId: 1, state: "running", stdout: "", code: "print('submitted')",
+  })));
+  await submission;
+
+  assert.equal(selectedRun(elements), undefined);
+  assert.equal(elements.code.value, "print('newer draft')");
+  assert.equal(elements.code.readOnly, false);
+});
+
+test("edits made while Run is pending remain in the retained draft", async () => {
+  const runResponse = deferred();
+  const runs = [];
+  const details = {};
+  const submitted = snapshot({
+    runId: 1, state: "running", stdout: "", cwd: "/tmp/before",
+    args: ["before"], code: "print('before')",
+  });
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/run") return runResponse.promise;
+      return undefined;
+    },
+  });
+
+  elements["working-directory"].value = "/tmp/before";
+  elements["run-arguments"].value = "before";
+  elements.code.value = "print('before')";
+  const submission = elements.run.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["working-directory"].value = "/tmp/after";
+  elements["run-arguments"].value = "after";
+  elements.code.value = "print('after')";
+
+  runs.push({runId: 1, state: "running", cwd: submitted.cwd});
+  details[1] = submitted;
+  runResponse.resolve(response(submitted));
+  await submission;
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["working-directory"].value, "/tmp/after");
+  assert.equal(elements["run-arguments"].value, "after");
+  assert.equal(elements.code.value, "print('after')");
+});
+
+test("an existing run's status cwd does not seed the New-run draft", async () => {
+  const existing = snapshot({
+    runId: 1, state: "success", stdout: "done", cwd: "/persisted/run-cwd",
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: existing.cwd}],
+    details: {1: existing},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/status") return response(existing);
+      return undefined;
+    },
+  });
+
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["working-directory"].value, "");
 });
 
 test("a run auto-selected via SSE while drafting captures in-progress edits first", async () => {
