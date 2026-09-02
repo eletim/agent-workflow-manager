@@ -639,7 +639,6 @@ class AgentReadinessService:
                 else detail,
                 tab_id if tab_id is not None else retained_tab_id,
             )
-            self._save_unresolved(loaded)
             return loaded
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise WorkerFailure(

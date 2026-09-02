@@ -129,6 +129,40 @@ class BlockingProbeClient(ProbeClient):
         )
 
 
+class IdentifyingBlockingProbeClient(ProbeClient):
+    def __init__(self) -> None:
+        super().__init__("cleanup-unknown")
+        self.before_identification = threading.Event()
+        self.allow_identification = threading.Event()
+        self.identified = threading.Event()
+        self.release = threading.Event()
+
+    def probe_agent_readiness(
+        self,
+        *,
+        provider: str,
+        probe_name: str,
+        correlation_id: str,
+        preexisting_tab_ids: Sequence[str],
+        timeout_seconds: float,
+        on_identified: Callable[[TabState], None] | None = None,
+    ) -> AgentReadinessProbeResult:
+        self.before_identification.set()
+        if not self.allow_identification.wait(3):
+            raise AssertionError("test did not allow probe identification")
+        tab = TabState("probe-tab", "ws-1", probe_name, "codex-cli", "codex")
+        if on_identified is not None:
+            on_identified(tab)
+        self.identified.set()
+        if not self.release.wait(3):
+            raise AssertionError("test did not release identified readiness probe")
+        raise AgentReadinessCleanupUnknown(
+            "probe tab retained after cleanup uncertainty",
+            tab=tab,
+            readiness_error=None,
+        )
+
+
 def service(
     tmp_path: Path, outcome: str = "success"
 ) -> tuple[AgentReadinessService, ProbeClient]:
@@ -324,6 +358,70 @@ def test_two_services_serialize_probe_ownership_and_reload_shared_state(
     with pytest.raises(ReadinessReconciliationRequired, match="reconciled"):
         second.probe(workspace_id="ws-1", provider="codex")
     assert second_client.calls == []
+
+
+def test_service_construction_cannot_overwrite_newer_identified_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "readiness.json"
+    client = IdentifyingBlockingProbeClient()
+    runtime = ProbeRuntime(client)
+    first = AgentReadinessService(
+        runtime, token_factory=lambda: "first-owner", state_file=state_file
+    )
+    probe_errors: list[BaseException] = []
+    constructed: list[AgentReadinessService] = []
+    construction_errors: list[BaseException] = []
+    constructor_read = threading.Event()
+    release_constructor = threading.Event()
+    original_read_text = Path.read_text
+
+    def delayed_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        content = original_read_text(path, *args, **kwargs)
+        if path == state_file and threading.current_thread().name == "constructor":
+            constructor_read.set()
+            if not release_constructor.wait(3):
+                raise AssertionError("test did not release service construction")
+        return content
+
+    monkeypatch.setattr(Path, "read_text", delayed_read_text)
+
+    def run_probe() -> None:
+        try:
+            first.probe(workspace_id="ws-1", provider="codex")
+        except BaseException as exc:
+            probe_errors.append(exc)
+
+    def construct_second() -> None:
+        try:
+            constructed.append(AgentReadinessService(runtime, state_file=state_file))
+        except BaseException as exc:
+            construction_errors.append(exc)
+
+    probe_thread = threading.Thread(target=run_probe)
+    constructor_thread = threading.Thread(target=construct_second, name="constructor")
+    probe_thread.start()
+    assert client.before_identification.wait(3)
+    constructor_thread.start()
+    assert constructor_read.wait(3)
+    client.allow_identification.set()
+    assert client.identified.wait(3)
+    try:
+        release_constructor.set()
+        constructor_thread.join(3)
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        assert persisted["probe"]["tabId"] == "probe-tab"
+    finally:
+        release_constructor.set()
+        client.release.set()
+        constructor_thread.join(3)
+        probe_thread.join(3)
+
+    assert not constructor_thread.is_alive()
+    assert not probe_thread.is_alive()
+    assert construction_errors == []
+    assert probe_errors == []
+    assert len(constructed) == 1
 
 
 def test_unresolved_creation_survives_restart_until_explicit_reconciliation(
