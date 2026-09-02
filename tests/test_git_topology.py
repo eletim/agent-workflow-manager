@@ -308,3 +308,68 @@ def test_local_mutation_external_interruption_quiesces_before_reconciliation(
 
     assert not isinstance(raised.value, MutationOutcomeUnknown)
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), InterruptedError()])
+def test_custom_runner_interruption_after_apply_reconciles_desired_state(
+    repositories: tuple[Path, Path, Path], interruption: BaseException
+) -> None:
+    _remote, _seed, work = repositories
+    state = {"value": "before"}
+    calls = 0
+
+    def interrupted_after_apply(*_args: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        state["value"] = "after"
+        raise interruption
+
+    repo = GitRepository(
+        root=work,
+        remote="origin",
+        expected_github_slug="acme/project",
+        command_timeout_seconds=1,
+        runner=interrupted_after_apply,  # type: ignore[arg-type]
+    )
+
+    repo._git_mutation(
+        ["switch", "main"],
+        operation="custom runner interruption",
+        target="main",
+        pre_state="before",
+        observe=lambda: state["value"],
+        desired=lambda: state["value"] == "after",
+    )
+    assert calls == 1
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), InterruptedError()])
+def test_custom_runner_interruption_with_unchanged_state_is_unknown(
+    repositories: tuple[Path, Path, Path], interruption: BaseException
+) -> None:
+    _remote, _seed, work = repositories
+    calls = 0
+
+    def interrupted_without_apply(*_args: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        raise interruption
+
+    repo = GitRepository(
+        root=work,
+        remote="origin",
+        expected_github_slug="acme/project",
+        command_timeout_seconds=1,
+        runner=interrupted_without_apply,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(MutationOutcomeUnknown, match="unknown"):
+        repo._git_mutation(
+            ["switch", "main"],
+            operation="custom runner interruption",
+            target="main",
+            pre_state="before",
+            observe=lambda: "before",
+            desired=lambda: False,
+        )
+    assert calls == 1

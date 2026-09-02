@@ -622,9 +622,18 @@ class GitRepository:
                 raise PossibleDispatchFailure(
                     f"local Git {operation} timed out without quiescence proof"
                 ) from exc
+            except InterruptedError as exc:
+                raise PossibleDispatchFailure(
+                    f"local Git {operation} communication was interrupted without "
+                    "quiescence proof"
+                ) from exc
             except OSError as exc:
                 raise PreDispatchFailure(
                     f"could not execute Git {operation}: {exc}"
+                ) from exc
+            except KeyboardInterrupt as exc:
+                raise PossibleDispatchFailure(
+                    f"local Git {operation} was interrupted without quiescence proof"
                 ) from exc
             if completed.returncode != 0:
                 detail = (
