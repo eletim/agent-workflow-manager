@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -271,3 +274,37 @@ def test_unproven_local_timeout_with_unchanged_state_is_unknown(
             observe=lambda: "unchanged",
             desired=lambda: False,
         )
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_local_mutation_external_interruption_quiesces_before_reconciliation(
+    repositories: tuple[Path, Path, Path], signum: signal.Signals
+) -> None:
+    _remote, _seed, work = repositories
+    git(work, "config", "alias.block", "!sleep 60")
+    repo = GitRepository(
+        root=work,
+        remote="origin",
+        expected_github_slug="acme/project",
+        command_timeout_seconds=5,
+        runner=subprocess.run,
+    )
+    interrupter = threading.Timer(0.1, os.kill, args=(os.getpid(), signum))
+    interrupter.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(WorkerFailure, match="confirmed_rejected") as raised:
+            repo._git_mutation(
+                ["block"],
+                operation="interrupted test mutation",
+                target="test",
+                pre_state="unchanged",
+                observe=lambda: "unchanged",
+                desired=lambda: False,
+            )
+    finally:
+        interrupter.cancel()
+        interrupter.join()
+
+    assert not isinstance(raised.value, MutationOutcomeUnknown)
+    assert time.monotonic() - started < 2

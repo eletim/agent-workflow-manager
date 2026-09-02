@@ -182,6 +182,8 @@ class FakeGitHubRunner:
         self.mutation_outcome = "success"
         if outcome == "timeout_after_apply":
             raise subprocess.TimeoutExpired(["gh"], 30)
+        if outcome == "interrupt_after_apply":
+            raise KeyboardInterrupt
         if outcome == "malformed_after_apply":
             return subprocess.CompletedProcess([], 0, "not-json", "")
         if outcome == "nonzero_after_apply":
@@ -251,7 +253,13 @@ def test_require_pr_guards_both_reviewed_shas_and_deferred_merge() -> None:
 
 
 @pytest.mark.parametrize(
-    "outcome", ["timeout_after_apply", "malformed_after_apply", "nonzero_after_apply"]
+    "outcome",
+    [
+        "timeout_after_apply",
+        "malformed_after_apply",
+        "nonzero_after_apply",
+        "interrupt_after_apply",
+    ],
 )
 def test_ready_reconciles_response_loss_after_apply(outcome: str) -> None:
     runner = FakeGitHubRunner([pr_data(1)])
@@ -294,6 +302,33 @@ def test_unchanged_after_possible_ready_dispatch_is_unknown() -> None:
             expected_base="dev/v0.1.4",
             expected_base_sha=BASE_SHA,
         )
+
+
+def test_interrupted_github_dispatch_with_unchanged_state_is_unknown() -> None:
+    runner = FakeGitHubRunner([pr_data(1)])
+    repo = repository(runner)
+    interruption_calls = 0
+
+    def interrupt_without_apply(
+        args: Sequence[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal interruption_calls
+        if any("markPullRequestReadyForReview" in value for value in args):
+            interruption_calls += 1
+            raise KeyboardInterrupt
+        return runner(args, **_kwargs)  # type: ignore[arg-type]
+
+    repo._runner = interrupt_without_apply  # type: ignore[assignment]
+    with pytest.raises(MutationOutcomeUnknown, match="unknown"):
+        repo.set_draft(
+            1,
+            draft=False,
+            expected_head="feature/65",
+            expected_head_sha=HEAD_SHA,
+            expected_base="dev/v0.1.4",
+            expected_base_sha=BASE_SHA,
+        )
+    assert interruption_calls == 1
 
 
 def test_authoritative_ready_rejection_confirms_exact_unchanged_state() -> None:

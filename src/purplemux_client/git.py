@@ -7,7 +7,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from purplemux_client.client import WorkerFailure
@@ -613,6 +613,11 @@ class GitRepository:
                 raise AuthoritativeMutationRejection(
                     f"local Git {operation} timed out after process-group quiescence"
                 ) from exc
+            except _QuiescentMutationInterruption as exc:
+                raise AuthoritativeMutationRejection(
+                    f"local Git {operation} was interrupted after process-group "
+                    "quiescence"
+                ) from exc
             except subprocess.TimeoutExpired as exc:
                 raise PossibleDispatchFailure(
                     f"local Git {operation} timed out without quiescence proof"
@@ -666,6 +671,8 @@ class GitRepository:
         self, args: Sequence[str]
     ) -> subprocess.CompletedProcess[str]:
         command = ["git", *args]
+        previous_mask = self._block_mutation_signals()
+        previous_handlers = self._install_mutation_signal_handlers()
         try:
             process = subprocess.Popen(
                 command,
@@ -675,24 +682,83 @@ class GitRepository:
                 text=True,
                 start_new_session=True,
             )
-        except OSError:
-            raise
-        try:
-            stdout, stderr = process.communicate(timeout=self.command_timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = process.communicate()
-            if process.poll() is None:
-                raise PossibleDispatchFailure(
-                    "local Git process group could not be proven quiescent"
+                self._restore_signal_mask(previous_mask)
+                stdout, stderr = process.communicate(
+                    timeout=self.command_timeout_seconds
+                )
+            except subprocess.TimeoutExpired as exc:
+                self._quiesce_process_group(process, exc)
+                raise _QuiescentMutationTimeout(
+                    command, self.command_timeout_seconds
                 ) from exc
-            raise _QuiescentMutationTimeout(
-                command, self.command_timeout_seconds
+            except BaseException as exc:
+                self._quiesce_process_group(process, exc)
+                raise _QuiescentMutationInterruption(command, exc) from exc
+            return subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr
+            )
+        finally:
+            self._restore_mutation_signal_handlers(previous_handlers)
+            self._restore_signal_mask(previous_mask)
+
+    @staticmethod
+    def _mutation_signals() -> set[signal.Signals]:
+        return {signal.SIGINT, signal.SIGHUP, signal.SIGTERM}
+
+    @classmethod
+    def _block_mutation_signals(cls) -> set[signal.Signals] | None:
+        if not hasattr(signal, "pthread_sigmask"):
+            return None
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, cls._mutation_signals())
+        return {signal.Signals(signum) for signum in previous}
+
+    @staticmethod
+    def _restore_signal_mask(mask: set[signal.Signals] | None) -> None:
+        if mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+    @staticmethod
+    def _install_mutation_signal_handlers() -> dict[signal.Signals, Any]:
+        handlers: dict[signal.Signals, Any] = {}
+        for signum in GitRepository._mutation_signals():
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, _raise_mutation_signal)
+            except ValueError:
+                # Python restricts handler changes to the main thread. Direct
+                # BaseException interruptions are still cleaned up below.
+                continue
+            handlers[signum] = previous
+        return handlers
+
+    @staticmethod
+    def _restore_mutation_signal_handlers(
+        handlers: dict[signal.Signals, Any],
+    ) -> None:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+
+    @staticmethod
+    def _quiesce_process_group(
+        process: subprocess.Popen[str], interruption: BaseException
+    ) -> None:
+        if hasattr(signal, "pthread_sigmask"):
+            signal.pthread_sigmask(signal.SIG_BLOCK, GitRepository._mutation_signals())
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired as exc:
+            raise PossibleDispatchFailure(
+                "local Git process group could not be proven quiescent"
             ) from exc
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        if process.poll() is None:
+            raise PossibleDispatchFailure(
+                "local Git process group could not be proven quiescent"
+            ) from interruption
 
     def _read(self, args: Sequence[str]) -> str:
         return self._command(args, {0}).stdout.strip()
@@ -735,3 +801,20 @@ def _require_slug(slug: str) -> None:
 
 class _QuiescentMutationTimeout(subprocess.TimeoutExpired):
     pass
+
+
+class _QuiescentMutationInterruption(BaseException):
+    def __init__(self, command: Sequence[str], interruption: BaseException) -> None:
+        self.command = tuple(command)
+        self.interruption = interruption
+        super().__init__(f"interrupted by {type(interruption).__name__}")
+
+
+class _MutationSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(f"received signal {signum}")
+
+
+def _raise_mutation_signal(signum: int, _frame: object) -> None:
+    raise _MutationSignal(signum)

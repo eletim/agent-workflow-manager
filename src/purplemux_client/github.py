@@ -801,9 +801,18 @@ class GitHubRepository:
             )
         except subprocess.TimeoutExpired as exc:
             raise PossibleDispatchFailure(f"GitHub {operation} timed out") from exc
+        except InterruptedError as exc:
+            raise PossibleDispatchFailure(
+                f"GitHub {operation} communication was interrupted"
+            ) from exc
         except OSError as exc:
             raise PreDispatchFailure(
                 f"could not dispatch GitHub {operation}: {exc}"
+            ) from exc
+        except BaseException as exc:
+            raise PossibleDispatchFailure(
+                f"GitHub {operation} communication was interrupted by "
+                f"{type(exc).__name__}"
             ) from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
