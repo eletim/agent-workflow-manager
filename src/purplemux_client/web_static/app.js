@@ -50,6 +50,8 @@ let guideText = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
+let rawStdout = "";
+let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
 // run" (fields editable) vs. "viewing an existing run" (fields read-only,
 // sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
@@ -126,8 +128,16 @@ function renderRun(result) {
   const running = result.state === "running";
   statusBadge.textContent = result.state;
   statusBadge.className = `status ${result.state}`;
-  stdout.textContent = result.stdout;
-  stderr.textContent = result.stderr;
+  rawStdout = result.stdout;
+  rawStderr = result.stderr;
+  stdout.textContent = runnerLogDisplay.formatOutputEntries(
+    result.stdoutEntries,
+    rawStdout,
+  );
+  stderr.textContent = runnerLogDisplay.formatOutputEntries(
+    result.stderrEntries,
+    rawStderr,
+  );
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
   resumeButton.disabled = activeRunId === null || !result.resumable;
@@ -342,8 +352,8 @@ outputCopy.addEventListener("click", async () => {
     window.clearTimeout(outputCopyResetTimer);
   }
   const text = runnerOutputClipboard.formatOutput(
-    stdout.textContent,
-    stderr.textContent,
+    rawStdout,
+    rawStderr,
   );
   try {
     await runnerOutputClipboard.writeText(

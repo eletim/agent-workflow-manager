@@ -14,6 +14,14 @@ const appSource = fs.readFileSync(path.join(
   "web_static",
   "app.js",
 ), "utf8");
+const logDisplaySource = fs.readFileSync(path.join(
+  __dirname,
+  "..",
+  "src",
+  "purplemux_client",
+  "web_static",
+  "log-display.js",
+), "utf8");
 
 class Element {
   constructor() {
@@ -81,6 +89,8 @@ function snapshot({
   runId,
   state,
   stdout,
+  stdoutEntries = [],
+  stderrEntries = [],
   resumable = false,
   checkpoint = null,
   attempts = [],
@@ -100,7 +110,9 @@ function snapshot({
     runId,
     state,
     stderr: `stderr-${runId}`,
+    stderrEntries,
     stdout,
+    stdoutEntries,
     suspensionReason: null,
     validation: [],
   };
@@ -232,6 +244,7 @@ async function loadApp({
       setTimeout,
     },
   };
+  vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
   vm.runInNewContext(appSource, context, {filename: "app.js"});
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -241,7 +254,12 @@ async function loadApp({
   assert.ok(calls.some(([url]) => url === "/api/settings/notifications"));
   assert.equal(eventSources.length, 1);
   assert.equal(eventSources[0].url, "/api/events");
-  return {calls, elements, eventSource: eventSources[0]};
+  return {
+    calls,
+    elements,
+    eventSource: eventSources[0],
+    logDisplay: context.runnerLogDisplay,
+  };
 }
 
 function selectedRun(elements) {
@@ -262,6 +280,38 @@ function markerState(elements, runId) {
   assert.equal(item.children[0].attributes["aria-hidden"], "true");
   return item.dataset.state;
 }
+
+test("formats observed timestamps with relative local dates", () => {
+  const context = {};
+  vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
+  const {formatObservedAt} = context.runnerLogDisplay;
+  const now = new Date(2026, 8, 2, 21, 40, 0);
+  const today = new Date(2026, 8, 2, 21, 34, 5).toISOString();
+  const yesterday = new Date(2026, 8, 1, 23, 10, 9).toISOString();
+  const older = new Date(2026, 7, 31, 9, 10, 0).toISOString();
+
+  assert.equal(formatObservedAt(today, now), "Today 21:34:05");
+  assert.equal(formatObservedAt(yesterday, now), "Yesterday 23:10:09");
+  assert.equal(formatObservedAt(older, now), "8/31 09:10:00");
+});
+
+test("renders entry timestamps without changing entry text", () => {
+  const context = {};
+  vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
+  const {formatObservedAt, formatOutputEntries} = context.runnerLogDisplay;
+  const first = new Date(2026, 8, 2, 21, 34, 5).toISOString();
+  const second = new Date(2026, 8, 2, 21, 35, 6).toISOString();
+  const firstLabel = formatObservedAt(first);
+  const secondLabel = formatObservedAt(second);
+
+  assert.equal(
+    formatOutputEntries([
+      {observedAt: first, text: "first\npart"},
+      {observedAt: second, text: "ial\nlast\n"},
+    ]),
+    `${firstLabel}  first\n${firstLabel}  partial\n${secondLabel}  last\n`,
+  );
+});
 
 function faviconIsRunning(elements) {
   return decodeURIComponent(elements.favicon.getAttribute("href"))
@@ -569,6 +619,32 @@ test("EventSource reconnect reconciles authoritative state", async () => {
   assert.equal(elements.status.textContent, "running");
 });
 
+test("EventSource reconnect preserves authoritative historical timestamps", async () => {
+  const observedAt = "2026-08-31T00:10:00.000000+00:00";
+  const run = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "recorded earlier\n",
+    stdoutEntries: [{observedAt, text: "recorded earlier\n"}],
+  });
+  const {calls, elements, eventSource, logDisplay} = await loadApp({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+    details: {1: run},
+    validation: {status: 200, body: {validation: []}},
+  });
+  const renderedBeforeReconnect = elements.stdout.textContent;
+  const callsBeforeReconnect = calls.length;
+
+  eventSource.emit("open");
+  await waitFor(() => calls.length > callsBeforeReconnect);
+
+  assert.equal(
+    renderedBeforeReconnect,
+    `${logDisplay.formatObservedAt(observedAt)}  recorded earlier\n`,
+  );
+  assert.equal(elements.stdout.textContent, renderedBeforeReconnect);
+});
+
 test("successful validation is explicit when no run exists", async () => {
   const {elements} = await loadApp({
     runs: [],
@@ -838,7 +914,12 @@ test("manual output copy preserves the payload attempted before a run switch", a
     },
   };
   const runOne = snapshot({runId: 1, state: "success", stdout: "run one"});
-  const runTwo = snapshot({runId: 2, state: "failed", stdout: "run two"});
+  const runTwo = snapshot({
+    runId: 2,
+    state: "failed",
+    stdout: "run two",
+    stdoutEntries: [{observedAt: "2026-08-31T00:10:00+00:00", text: "run two"}],
+  });
   const {elements} = await loadApp({
     runs: [
       {runId: 1, state: "success", cwd: "/work/run-1"},
@@ -853,6 +934,8 @@ test("manual output copy preserves the payload attempted before a run switch", a
   await new Promise((resolve) => setImmediate(resolve));
   const attemptedRunTwo = "stdout:\nrun two\n\nstderr:\nstderr-2";
   assert.deepEqual(attempted, [attemptedRunTwo]);
+  assert.notEqual(elements.stdout.textContent, "run two");
+  assert.match(elements.stdout.textContent, /run two$/);
 
   const runOneButton = elements["run-list"].children.find(
     (element) => element.textContent.startsWith("#1"),
@@ -923,6 +1006,46 @@ test("selecting a run renders its own cwd/args/code, never another run's values"
   assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
   assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
   assert.equal(elements.code.value, "print('RUN=A')");
+});
+
+test("selecting runs restores each run's timestamped output history", async () => {
+  const observedA = "2026-08-30T01:00:00+00:00";
+  const observedB = "2026-08-31T02:00:00+00:00";
+  const runA = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "A\n",
+    stdoutEntries: [{observedAt: observedA, text: "A\n"}],
+  });
+  const runB = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "B\n",
+    stdoutEntries: [{observedAt: observedB, text: "B\n"}],
+  });
+  const {elements, logDisplay} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1"},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(
+    elements.stdout.textContent,
+    `${logDisplay.formatObservedAt(observedB)}  B\n`,
+  );
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(
+    elements.stdout.textContent,
+    `${logDisplay.formatObservedAt(observedA)}  A\n`,
+  );
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(
+    elements.stdout.textContent,
+    `${logDisplay.formatObservedAt(observedB)}  B\n`,
+  );
 });
 
 test("New run restores the retained draft unchanged after switching between runs", async () => {

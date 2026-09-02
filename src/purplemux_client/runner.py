@@ -13,6 +13,7 @@ import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
@@ -101,10 +102,18 @@ class RunAttempt:
 
 
 @dataclass(frozen=True)
+class OutputEntry:
+    observed_at: str
+    text: str
+
+
+@dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
     stdout: str
     stderr: str
+    stdout_entries: tuple[OutputEntry, ...]
+    stderr_entries: tuple[OutputEntry, ...]
     exit_code: int | None
     run_id: int | None
     progress: tuple[ProgressEvent, ...]
@@ -127,6 +136,16 @@ class RunnerSnapshot:
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
         payload["suspensionReason"] = payload.pop("suspension_reason")
+        payload["stdoutEntries"] = [
+            {"observedAt": entry.observed_at, "text": entry.text}
+            for entry in self.stdout_entries
+        ]
+        payload["stderrEntries"] = [
+            {"observedAt": entry.observed_at, "text": entry.text}
+            for entry in self.stderr_entries
+        ]
+        payload.pop("stdout_entries")
+        payload.pop("stderr_entries")
         payload["progress"] = [asdict(event) for event in self.progress]
         payload["validation"] = [issue.as_json() for issue in self.validation]
         payload["attempts"] = [
@@ -168,8 +187,8 @@ class _RunRecord:
     script_path: Path
     code: str
     state: RunnerState = "running"
-    stdout: deque[str] = field(default_factory=deque)
-    stderr: deque[str] = field(default_factory=deque)
+    stdout: deque[OutputEntry] = field(default_factory=deque)
+    stderr: deque[OutputEntry] = field(default_factory=deque)
     stdout_chars: int = 0
     stderr_chars: int = 0
     stdout_truncated: bool = False
@@ -218,6 +237,8 @@ class PythonRunner:
             state="idle",
             stdout="",
             stderr="",
+            stdout_entries=(),
+            stderr_entries=(),
             exit_code=None,
             run_id=None,
             progress=(),
@@ -473,6 +494,8 @@ class PythonRunner:
             state="idle" if result.valid else "validation_failed",
             stdout="",
             stderr="",
+            stdout_entries=(),
+            stderr_entries=(),
             exit_code=None,
             run_id=None,
             progress=(),
@@ -523,10 +546,14 @@ class PythonRunner:
             return self._preview
 
     def _snapshot_run(self, run: _RunRecord) -> RunnerSnapshot:
+        stdout_entries = self._render_output_entries(run.stdout, run.stdout_truncated)
+        stderr_entries = self._render_output_entries(run.stderr, run.stderr_truncated)
         return RunnerSnapshot(
             state=run.state,
-            stdout=self._render_output(run.stdout, run.stdout_truncated),
-            stderr=self._render_output(run.stderr, run.stderr_truncated),
+            stdout="".join(entry.text for entry in stdout_entries),
+            stderr="".join(entry.text for entry in stderr_entries),
+            stdout_entries=stdout_entries,
+            stderr_entries=stderr_entries,
             exit_code=run.exit_code,
             run_id=run.run_id,
             progress=tuple(run.progress),
@@ -685,6 +712,8 @@ class PythonRunner:
         *,
         lock_held: bool = False,
     ) -> None:
+        observed_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
         def append() -> None:
             chunks = run.stdout if destination == "stdout" else run.stderr
             size_attribute = (
@@ -693,16 +722,19 @@ class PythonRunner:
             truncated_attribute = (
                 "stdout_truncated" if destination == "stdout" else "stderr_truncated"
             )
-            chunks.append(text)
+            chunks.append(OutputEntry(observed_at=observed_at, text=text))
             size = getattr(run, size_attribute) + len(text)
             was_truncated = size > self._max_output_chars
             while size > self._max_output_chars:
                 overflow = size - self._max_output_chars
                 first = chunks[0]
-                if len(first) <= overflow:
-                    size -= len(chunks.popleft())
+                if len(first.text) <= overflow:
+                    size -= len(chunks.popleft().text)
                 else:
-                    chunks[0] = first[overflow:]
+                    chunks[0] = OutputEntry(
+                        observed_at=first.observed_at,
+                        text=first.text[overflow:],
+                    )
                     size -= overflow
             setattr(run, size_attribute, size)
             if was_truncated:
@@ -803,9 +835,20 @@ class PythonRunner:
         )
 
     @staticmethod
-    def _render_output(chunks: deque[str], truncated: bool) -> str:
-        prefix = "[output truncated; showing tail]\n" if truncated else ""
-        return prefix + "".join(chunks)
+    def _render_output_entries(
+        chunks: deque[OutputEntry], truncated: bool
+    ) -> tuple[OutputEntry, ...]:
+        entries = tuple(chunks)
+        if not truncated or not entries:
+            return entries
+        first, *remaining = entries
+        return (
+            OutputEntry(
+                observed_at=first.observed_at,
+                text="[output truncated; showing tail]\n" + first.text,
+            ),
+            *remaining,
+        )
 
     def _wait_for_process(
         self,
