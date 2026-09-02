@@ -150,7 +150,9 @@ Stop action without changing another run. `GET /api/runs` lists compact summarie
 `POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
 from its latest safe checkpoint. The original `/api/status`,
 `/api/output`, and `/api/stop` routes remain available and address the most
-recently created run.
+recently created run. `GET /api/events` streams revision-only SSE change
+notifications; initial load, notifications, and reconnects all reconcile through
+the authoritative read APIs rather than treating the stream as workflow state.
 
 Each Run or Validate request owns its execution context. The UI exposes an
 explicit working directory and zero or more arguments (one argument per line),
@@ -305,6 +307,22 @@ and every configured alias URL. Unknown Hosts and Origins remain rejected, and
 every mutation still requires the per-server request token. Network access is
 an outer trust boundary, not a replacement for these checks.
 
+Local, LAN, and private-VPN HTTP is a first-class Runner deployment mode, not a
+degraded compatibility mode. Core actions—guide and output copy, validation,
+Run, Stop, Continue after fix, settings, progress, and read APIs—must remain
+usable at the printed `http://` URL. Browser features may use secure-context
+APIs when available, but must retain an HTTP-compatible path. Clipboard actions
+therefore try the Clipboard API first, then copy from a controlled textarea;
+if neither programmatic path succeeds, the UI presents the exact intended text
+selected for manual copying. Same-origin EventSource/SSE observation and
+favicon/status presentation do not require HTTPS and must remain compatible
+with this deployment model.
+
+This support does not weaken transport-independent application protections.
+Exact Host and matching Origin checks and the per-server request token apply as
+described above on HTTP. The supported trust boundary is a private local,
+LAN, or VPN network, never public-Internet exposure.
+
 This UI executes arbitrary trusted Python and is not a sandbox or multi-user
 service. Bind only to an interface whose network and connected devices you
 trust. Never use a public IP/interface, `0.0.0.0`, port forwarding, a public
@@ -372,6 +390,10 @@ Terminal notifications are a best-effort observation side effect through
 `notify send`. The Python process alone determines success, failure, or stopped
 state; notify failures cannot change it. The complete ownership and message
 contract is in [the workflow/runtime specification](docs/workflow-runtime-spec.md).
+Browser notification permission and Web Push are intentionally outside Agent
+Workflow Manager core. Notification delivery belongs to the external `notify`
+CLI/service boundary, so the Runner itself remains fully usable on local/VPN
+HTTP without a service worker, Push API, or secure browser context.
 
 ## Development
 

@@ -3,7 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Local Python Runner</title>
+    <title>Agent Workflow Manager</title>
+    <link id="favicon" rel="icon" href="/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
@@ -28,6 +29,10 @@
       </section>
 
       <section class="panel editor-panel">
+        <div class="editor-mode-bar">
+          <p id="active-context" class="active-context"></p>
+          <button id="new-run" type="button">New run</button>
+        </div>
         <div class="execution-context">
           <div class="context-field context-cwd">
             <label for="working-directory">Working directory</label>
@@ -38,7 +43,6 @@
             <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
           </div>
         </div>
-        <p id="active-context" class="active-context"></p>
         <label for="code">Python</label>
         <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
@@ -61,6 +65,7 @@ emit_step("workspace create", "completed")</textarea>
 
       <section id="validation-panel" class="panel validation-panel" aria-live="polite" hidden>
         <h2>Validation</h2>
+        <p id="validation-success" class="validation-success" hidden>✓ Valid</p>
         <ol id="validation" class="validation-list"></ol>
       </section>
 
@@ -129,6 +134,17 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </div>
       <pre id="guide-content">Loading…</pre>
+    </dialog>
+
+    <dialog id="manual-copy-dialog" aria-labelledby="manual-copy-title">
+      <div class="manual-copy-content">
+        <h2 id="manual-copy-title">Copy manually</h2>
+        <p>Your browser did not allow programmatic clipboard access. The intended text is selected below; copy it with your browser or keyboard.</p>
+        <textarea id="manual-copy-content" readonly aria-label="Text to copy manually"></textarea>
+        <div class="manual-copy-actions">
+          <button id="manual-copy-close" type="button">Close</button>
+        </div>
+      </div>
     </dialog>
 
     <script src="/output-copy.js"></script>

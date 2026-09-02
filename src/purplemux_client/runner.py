@@ -114,6 +114,13 @@ class RunnerSnapshot:
     checkpoint: ResumeCheckpoint | None
     attempts: tuple[RunAttempt, ...]
     suspension_reason: str | None
+    # Submitted Python source for this run's immutable execution snapshot.
+    # Populated only for an actual run (see ``_snapshot_run``); left ``None``
+    # for the idle/validation preview, which is not tied to a persisted run.
+    # Exposed via ``as_json`` (run detail) but intentionally left out of
+    # ``as_summary_json`` (the ``/api/runs`` list) to keep that summary
+    # lightweight.
+    code: str | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -199,6 +206,8 @@ class PythonRunner:
         self._max_output_chars = max_output_chars
         self._max_progress_events = max_progress_events
         self._lock = threading.Lock()
+        self._changes = threading.Condition(self._lock)
+        self._change_revision = 0
         self._validation_lock = threading.Lock()
         self._runs: dict[int, _RunRecord] = {}
         self._next_run_id = 1
@@ -326,6 +335,7 @@ class PythonRunner:
                 run.resumed_from = checkpoint.name
                 run.suspension_reason = None
                 self._start_attempt_threads(run, process, script_path, progress_read_fd)
+                self._mark_changed()
 
     @staticmethod
     def _ensure_resumable(run: _RunRecord) -> None:
@@ -371,6 +381,7 @@ class PythonRunner:
         self._runs[run_id] = run
 
         self._start_attempt_threads(run, process, script_path, progress_read_fd)
+        self._mark_changed()
         return run_id
 
     @staticmethod
@@ -472,6 +483,28 @@ class PythonRunner:
             attempts=(),
             suspension_reason=None,
         )
+        self._mark_changed()
+
+    def change_revision(self) -> int:
+        """Return the current observation revision without exposing runner state."""
+        with self._lock:
+            return self._change_revision
+
+    def wait_for_change(self, after: int, timeout: float) -> int | None:
+        """Wait for observable state to change, returning None after shutdown."""
+        with self._changes:
+            self._changes.wait_for(
+                lambda: self._change_revision > after or self._closed,
+                timeout=timeout,
+            )
+            if self._closed:
+                return None
+            return self._change_revision
+
+    def _mark_changed(self) -> None:
+        """Advance the observation revision while ``self._lock`` is held."""
+        self._change_revision += 1
+        self._changes.notify_all()
 
     def snapshot(self, run_id: int | None = None) -> RunnerSnapshot:
         with self._lock:
@@ -503,6 +536,7 @@ class PythonRunner:
             checkpoint=run.checkpoint,
             attempts=tuple(run.attempts),
             suspension_reason=run.suspension_reason,
+            code=run.code,
         )
 
     def _get_run(self, run_id: int) -> _RunRecord:
@@ -578,6 +612,7 @@ class PythonRunner:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._changes.notify_all()
             active_runs = tuple(
                 run
                 for run in self._runs.values()
@@ -672,6 +707,7 @@ class PythonRunner:
             setattr(run, size_attribute, size)
             if was_truncated:
                 setattr(run, truncated_attribute, True)
+            self._mark_changed()
 
         if lock_held:
             append()
@@ -700,6 +736,7 @@ class PythonRunner:
                             else:
                                 assert isinstance(event, ProgressEvent)
                                 run.progress.append(event)
+                            self._mark_changed()
         except OSError:
             return
 
@@ -815,6 +852,7 @@ class PythonRunner:
                     )
                 )
                 terminal_state = run.state
+                self._mark_changed()
 
             self._notify_terminal(
                 run_id=run.run_id, state=terminal_state, exit_code=exit_code

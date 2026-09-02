@@ -31,6 +31,7 @@ STATIC_DIR = Path(__file__).with_name("web_static")
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
     "/output-copy.js": ("output-copy.js", "text/javascript; charset=utf-8"),
     "/python-workflow-guide.md": (
         "python-workflow-guide.md",
@@ -233,6 +234,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted host"})
             return
         path = urlparse(self.path).path
+        if path == "/api/events":
+            self._send_events()
+            return
         if path == "/api/token":
             self._send_json(HTTPStatus.OK, {"token": self.server.request_token})
             return
@@ -283,6 +287,33 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
+
+    def _send_events(self) -> None:
+        revision = self.server.runner.change_revision()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self.wfile.write(b"retry: 1000\n\n")
+            self.wfile.flush()
+            while True:
+                changed = self.server.runner.wait_for_change(revision, timeout=15)
+                if changed is None:
+                    return
+                if changed == revision:
+                    content = b": keep-alive\n\n"
+                else:
+                    revision = changed
+                    content = f"event: runner-change\ndata: {revision}\n\n".encode(
+                        "ascii"
+                    )
+                self.wfile.write(content)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path

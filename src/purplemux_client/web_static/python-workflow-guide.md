@@ -4,6 +4,15 @@ Use this file as the contract when generating a workflow script. The generated
 plain Python script is the source of truth. Do not create a workflow framework,
 graph, DSL, state machine, or UI-side copy of its control flow.
 
+**Canonical version-development sample:**
+[sequential multi-Issue implementation and review](../../../examples/sequential-version-development.py).
+It is the primary adaptable reference for sequential Issue PRs, independent
+per-Issue review/fix loops, safe resume, and a final version PR. Its separate
+whole-version review is mandatory because defects in shared state, lifecycle,
+security, and cross-feature behavior may appear only after approved changes are
+combined. The final PR becomes Ready only after that review approves it and is
+never merged into `main` automatically.
+
 ## Architecture and responsibility
 
 ```text

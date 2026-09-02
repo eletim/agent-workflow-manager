@@ -33,12 +33,42 @@ h2, label { font-size: 14px; font-weight: 650; }
 #runs-empty { color: #737d91; font-size: 13px; }
 .run-list { display: grid; gap: 7px; margin-top: 10px; }
 .run-item {
+  position: relative;
   width: 100%;
+  padding-left: 32px;
   overflow: hidden;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.run-state-marker {
+  position: absolute;
+  top: 50%;
+  left: 14px;
+  width: 8px;
+  height: 8px;
+  border: 1px solid #737d91;
+  border-radius: 50%;
+  background: transparent;
+  transform: translateY(-50%);
+}
+.run-item[data-state="running"] .run-state-marker {
+  border-color: #ff596b;
+  background: #ff596b;
+  box-shadow: 0 0 0 3px rgb(255 89 107 / 18%);
+}
+.run-item[data-state="success"] .run-state-marker {
+  border-color: #75e2a8;
+  background: #75e2a8;
+}
+.run-item[data-state="failed"] .run-state-marker {
+  border-color: #ff9ca8;
+  background: #ff9ca8;
+}
+.run-item[data-state="suspended"] .run-state-marker {
+  border-color: #ffd66b;
+  background: #ffd66b;
 }
 .run-item.selected { border-color: #9b83ef; background: #34295a; }
 .run-item[data-state="running"] { color: #ffd66b; }
@@ -80,11 +110,23 @@ textarea {
   margin: 0;
   padding: 8px 10px;
 }
+.editor-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
 .active-context {
   margin: 0 0 14px;
   color: #9ba3b5;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
   overflow-wrap: anywhere;
+}
+.editor-mode-bar .active-context { margin: 0; }
+input[readonly], textarea[readonly] {
+  opacity: 0.7;
+  cursor: default;
 }
 button {
   padding: 8px 18px;
@@ -115,7 +157,9 @@ a { color: #bcaaff; }
 .recovery-panel p { margin: 0; color: #d7c68f; font-size: 13px; }
 .attempt-history { margin-bottom: 0; color: #aab0bf; font-size: 13px; }
 
-.validation-panel { border-color: #7d4148; }
+.validation-panel.invalid { border-color: #7d4148; }
+.validation-panel.valid { border-color: #296644; }
+.validation-success { margin: 0; color: #75e2a8; font-size: 13px; }
 .validation-list { margin-bottom: 0; color: #ffb3bc; }
 
 .progress-panel { margin-top: 14px; }
@@ -184,6 +228,13 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   border: 0;
   border-radius: 0;
 }
+
+#manual-copy-dialog { height: auto; max-height: calc(100% - 32px); }
+.manual-copy-content { padding: 18px; }
+.manual-copy-content h2 { margin: 0 0 8px; }
+.manual-copy-content p { color: #aab0bf; font-size: 13px; }
+#manual-copy-content { min-height: 220px; }
+.manual-copy-actions { display: flex; justify-content: flex-end; }
 
 .settings-panel { margin-top: 14px; }
 .settings-panel summary { cursor: pointer; font-weight: 650; }

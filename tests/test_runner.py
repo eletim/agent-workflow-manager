@@ -203,6 +203,56 @@ def test_streams_flushed_output_without_newline(runner: PythonRunner) -> None:
     assert result.state == "running"
 
 
+def test_change_revision_tracks_authoritative_observable_state(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    code = """\
+import time
+from pathlib import Path
+from purplemux_client import emit_step, save_checkpoint
+
+def wait_for(name):
+    while not Path(name).exists():
+        time.sleep(0.01)
+
+wait_for("output")
+print("visible", flush=True)
+wait_for("progress")
+emit_step("observed", "completed")
+wait_for("checkpoint")
+save_checkpoint("safe", {"workspace": "ws-1"})
+wait_for("finish")
+"""
+    run_id = runner.start(code, cwd=tmp_path)
+    revision = runner.change_revision()
+
+    (tmp_path / "output").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    revision = changed
+    assert runner.snapshot(run_id).stdout == "visible\n"
+
+    (tmp_path / "progress").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    revision = changed
+    assert runner.snapshot(run_id).progress[-1].name == "observed"
+
+    (tmp_path / "checkpoint").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    revision = changed
+    checkpoint = runner.snapshot(run_id).checkpoint
+    assert checkpoint is not None
+    assert checkpoint.name == "safe"
+    assert checkpoint.data == {"workspace": "ws-1"}
+
+    (tmp_path / "finish").touch()
+    changed = runner.wait_for_change(revision, timeout=2)
+    assert changed is not None
+    assert runner.snapshot(run_id).state == "success"
+
+
 def test_output_is_bounded_and_reports_truncation() -> None:
     runner = PythonRunner(max_output_chars=20)
     try:
@@ -907,9 +957,56 @@ def test_runner_http_lifecycle(
                 "resumedFrom": None,
             }
         ],
+        "code": 'print("HTTP_OK")',
         "suspensionReason": None,
         "resumable": False,
     }
+
+
+def test_events_endpoint_streams_runner_change_notifications(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    events = http.client.HTTPConnection(*address, timeout=3)
+    events.request("GET", "/api/events")
+    response = events.getresponse()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/event-stream; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-cache"
+    assert response.readline() == b"retry: 1000\n"
+    assert response.readline() == b"\n"
+
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "import time; time.sleep(60)"}),
+        token=token,
+    )
+    assert status == 202
+    assert started["state"] == "running"
+    assert response.readline() == b"event: runner-change\n"
+    revision_line = response.readline()
+    assert revision_line.startswith(b"data: ")
+    assert int(revision_line.removeprefix(b"data: ")) > 0
+    assert response.readline() == b"\n"
+
+    events.close()
+
+
+def test_events_endpoint_rejects_untrusted_host(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/api/events", headers={"Host": "attacker.example"})
+    response = connection.getresponse()
+    payload = json.loads(response.read())
+    connection.close()
+
+    assert response.status == 403
+    assert payload == {"error": "untrusted host"}
 
 
 def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
@@ -1121,6 +1218,66 @@ def test_run_api_passes_run_scoped_execution_context(
     ]
 
 
+def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    """Issue #45: /api/runs/{id} must return each run's own submitted code,
+    unaffected by other runs starting, while /api/runs list summaries stay
+    lightweight (no full source)."""
+    address, token = web_server
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    first_code = "print('RUN=A')"
+    second_code = "print('RUN=B')"
+
+    status, first = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": first_code, "cwd": str(first_cwd), "args": ["A-ARG"]}),
+        token=token,
+    )
+    assert status == 202
+    first_id = int(first["runId"])
+    assert first["code"] == first_code
+
+    status, before = request(address, "GET", f"/api/runs/{first_id}")
+    assert status == 200
+    assert before["code"] == first_code
+
+    status, second = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": second_code, "cwd": str(second_cwd), "args": ["B-ARG"]}),
+        token=token,
+    )
+    assert status == 202
+    second_id = int(second["runId"])
+    assert second["code"] == second_code
+
+    # The first run's own snapshot must be unaffected by the second run
+    # starting and executing with a different cwd/args/code.
+    status, after = request(address, "GET", f"/api/runs/{first_id}")
+    assert status == 200
+    assert after["code"] == before["code"] == first_code
+    assert after["cwd"] == before["cwd"] == str(first_cwd)
+    assert after["args"] == before["args"] == ["A-ARG"]
+
+    status, second_detail = request(address, "GET", f"/api/runs/{second_id}")
+    assert status == 200
+    assert second_detail["code"] == second_code
+    assert second_detail["cwd"] == str(second_cwd)
+
+    # The list summary intentionally omits the full source.
+    status, listed = request(address, "GET", "/api/runs")
+    assert status == 200
+    assert len(listed["runs"]) == 2
+    assert all("code" not in run for run in listed["runs"])
+
+
 @pytest.mark.parametrize(
     ("context", "error"),
     [
@@ -1181,6 +1338,24 @@ def test_runner_page_exposes_execution_context_inputs(
     assert 'id="run-list"' in page
 
 
+def test_runner_page_exposes_agent_workflow_manager_favicon(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    documents = {}
+    for path in ["/", "/favicon.svg"]:
+        connection = http.client.HTTPConnection(*address, timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        documents[path] = (response.getheader("Content-Type"), response.read().decode())
+        connection.close()
+        assert response.status == 200
+
+    assert '<link id="favicon" rel="icon" href="/favicon.svg"' in documents["/"][1]
+    assert documents["/favicon.svg"][0] == "image/svg+xml"
+    assert documents["/favicon.svg"][1].startswith("<svg ")
+
+
 def test_runner_page_exposes_copy_actions_and_shared_helper(
     web_server: tuple[tuple[str, int], str],
 ) -> None:
@@ -1202,8 +1377,9 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
     assert "writeText" in helper
     assert 'execCommand("copy")' in helper
     assert "runnerOutputClipboard.writeText" in script
-    assert 'guideCopy.textContent = "Copy failed"' in script
-    assert 'outputCopy.textContent = "Copy failed"' in script
+    assert 'guideCopy.textContent = "Copy manually"' in script
+    assert 'outputCopy.textContent = "Copy manually"' in script
+    assert 'id="manual-copy-dialog"' in index
 
 
 def test_copy_browser_logic() -> None:
