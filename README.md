@@ -140,6 +140,14 @@ through real inspections and stops before the first reachable mutation. The Runn
 shows reached runtime/Git/GitHub findings and that next mutation without fabricating
 future state or interpreting workflow control flow.
 
+The Runner also offers a separate, explicit **Agent readiness** action. It uses
+only an operator-selected existing PurpleMux workspace: AWM records the complete
+pre-create tab set, creates one uniquely named provider tab, correlates it through
+structured public listings, waits for structured readiness, and attempts to close
+that exact tab once. Readiness and cleanup are reported independently, with the
+retained tab identity and recovery guidance when cleanup cannot be confirmed. This
+mutating probe never runs as part of Static Validation or Dry Run.
+
 Observable Bash work runs in named PurpleMux `terminal` tabs. The adapter sends
 the command with an explicit working directory and correlates completion with a
 machine-readable exit-code sidecar; it does not parse pane text or guess from a

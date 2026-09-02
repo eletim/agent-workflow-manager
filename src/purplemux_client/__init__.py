@@ -10,12 +10,12 @@ from purplemux_client.client import (
     ShellCommandRequest,
     ShellResult,
     TabState,
-    TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
     WorkspaceState,
 )
+from purplemux_client.errors import TerminalSessionError
 from purplemux_client.git import (
     BranchState,
     FeaturePreparationState,

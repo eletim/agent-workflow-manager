@@ -15,7 +15,6 @@ from purplemux_client.errors import (
     MutationOutcomeUnknown,
     ResultNotReady,
     SessionReadyTimeout,
-    TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
@@ -81,6 +80,21 @@ class AgentReadinessProbeResult:
     correlation_id: str
     ready: bool
     cleanup_confirmed: bool
+
+
+class AgentReadinessCleanupUnknown(MutationOutcomeUnknown):
+    """Cleanup could not be confirmed after an identified readiness probe."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tab: TabState,
+        readiness_error: BaseException | None,
+    ) -> None:
+        super().__init__(message)
+        self.tab = tab
+        self.readiness_error = readiness_error
 
 
 @dataclass(frozen=True)
@@ -452,6 +466,7 @@ class PurpleMuxCLIClient:
         correlation_id: str,
         preexisting_tab_ids: Sequence[str],
         timeout_seconds: float,
+        on_identified: Callable[[TabState], None] | None = None,
     ) -> AgentReadinessProbeResult:
         """Create, identify, inspect, and clean up one explicit provider probe."""
         panel_type = _PANEL_TYPES.get(provider.lower())
@@ -480,16 +495,20 @@ class PurpleMuxCLIClient:
             name=probe_name,
             before=current,
         )
-        readiness_error: TerminalSessionError | None = None
+        readiness_error: BaseException | None = None
         try:
+            if on_identified is not None:
+                on_identified(tab)
             self._wait_until_ready_structured(tab.id, timeout_seconds)
-        except TerminalSessionError as exc:
+        except BaseException as exc:
             readiness_error = exc
         try:
             self.close_session(tab.id, expected_state=tab)
-        except TerminalSessionError as exc:
-            raise MutationOutcomeUnknown(
-                f"probe tab {tab.id} retained after cleanup uncertainty: {exc}"
+        except BaseException as exc:
+            raise AgentReadinessCleanupUnknown(
+                f"probe tab {tab.id} retained after cleanup uncertainty: {exc}",
+                tab=tab,
+                readiness_error=readiness_error,
             ) from exc
         if readiness_error is not None:
             raise readiness_error
