@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import tempfile
@@ -10,33 +11,23 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
-
-class TerminalSessionError(RuntimeError):
-    """Base error for PurpleMux terminal session operations."""
-
-
-class SessionReadyTimeout(TerminalSessionError):
-    """Raised when a PurpleMux session does not become ready in time."""
-
-
-class WorkerFailure(TerminalSessionError):
-    """Raised when a PurpleMux-backed worker or CLI operation fails."""
-
-
-class WorkerNeedsInput(TerminalSessionError):
-    """Raised when a worker cannot complete without additional input."""
-
-
-class WorkerInterrupted(WorkerFailure):
-    """Raised when a worker turn is interrupted."""
-
-
-class ResultNotReady(WorkerFailure):
-    """Raised when a fresh structured worker result is not ready."""
-
-
-class MutationOutcomeUnknown(WorkerFailure):
-    """Raised when a mutation may have been applied but cannot be confirmed."""
+from purplemux_client.errors import (
+    MutationOutcomeUnknown,
+    ResultNotReady,
+    SessionReadyTimeout,
+    TerminalSessionError,
+    WorkerFailure,
+    WorkerInterrupted,
+    WorkerNeedsInput,
+)
+from purplemux_client.operations import (
+    MutationConflict,
+    MutationResolution,
+    PossibleDispatchFailure,
+    PreDispatchFailure,
+    Reconciliation,
+    execute_mutation,
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +43,44 @@ class CreateSessionRequest:
     cwd: str
     command: str
     metadata: Mapping[str, str] = field(default_factory=dict)
+    name: str | None = None
+    correlation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CreateWorkspaceRequest:
+    cwd: str
+    name: str
+    correlation_id: str
+
+
+@dataclass(frozen=True)
+class WorkspaceState:
+    id: str
+    name: str
+    directories: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TabState:
+    id: str
+    workspace_id: str
+    name: str
+    panel_type: str | None
+    provider: str | None
+    alive: bool | None = None
+    cli_state: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentReadinessProbeResult:
+    workspace_id: str
+    tab_id: str
+    provider: str
+    probe_name: str
+    correlation_id: str
+    ready: bool
+    cleanup_confirmed: bool
 
 
 @dataclass(frozen=True)
@@ -112,6 +141,228 @@ class _TurnBaseline:
     interrupted: bool
 
 
+class PurpleMuxRuntime:
+    """Inspection-aware adapter for public workspace-level PurpleMux operations."""
+
+    def __init__(
+        self,
+        *,
+        executable: str = "purplemux",
+        command_timeout_seconds: float = 30.0,
+        read_timeout_retries: int = 1,
+        runner: SubprocessRunner = subprocess.run,
+    ) -> None:
+        if command_timeout_seconds <= 0:
+            raise ValueError("command_timeout_seconds must be positive")
+        if read_timeout_retries < 0:
+            raise ValueError("read_timeout_retries must not be negative")
+        self.executable = executable
+        self.command_timeout_seconds = command_timeout_seconds
+        self.read_timeout_retries = read_timeout_retries
+        self._runner = runner
+
+    def list_workspaces(self) -> tuple[WorkspaceState, ...]:
+        data = self._read_json(["workspaces"], "list workspaces")
+        values = data.get("workspaces")
+        if not isinstance(values, list):
+            raise WorkerFailure("PurpleMux workspace listing is incomplete")
+        if len(values) > 2_000:
+            raise WorkerFailure(
+                "PurpleMux workspace listing exceeds the authoritative cap"
+            )
+        workspaces: list[WorkspaceState] = []
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, Mapping):
+                raise WorkerFailure("PurpleMux workspace listing is malformed")
+            workspace_id = value.get("id")
+            name = value.get("name")
+            directories = value.get("directories")
+            if (
+                not isinstance(workspace_id, str)
+                or not workspace_id
+                or workspace_id in seen
+                or not isinstance(name, str)
+                or not isinstance(directories, list)
+                or any(not isinstance(item, str) for item in directories)
+            ):
+                raise WorkerFailure("PurpleMux workspace listing is malformed")
+            seen.add(workspace_id)
+            workspaces.append(WorkspaceState(workspace_id, name, tuple(directories)))
+        return tuple(workspaces)
+
+    def create_workspace(self, request: CreateWorkspaceRequest) -> WorkspaceState:
+        cwd = os.path.abspath(os.path.expanduser(request.cwd))
+        if not os.path.isdir(cwd):
+            raise ValueError(f"workspace directory is not a directory: {cwd}")
+        _validate_correlation(request.correlation_id)
+        if not request.name.strip() or "\0" in request.name:
+            raise ValueError("workspace name must be non-empty and contain no nulls")
+        correlated_name = f"{request.name} [awm:{request.correlation_id}]"
+        before = self.list_workspaces()
+        before_ids = {item.id for item in before}
+        if any(item.name == correlated_name for item in before):
+            raise WorkerFailure("workspace creation correlation is already in use")
+        response_id: str | None = None
+
+        def matches() -> tuple[WorkspaceState, ...]:
+            return tuple(
+                item
+                for item in self.list_workspaces()
+                if item.id not in before_ids
+                and item.name == correlated_name
+                and cwd in {os.path.abspath(path) for path in item.directories}
+            )
+
+        def dispatch() -> WorkspaceState:
+            nonlocal response_id
+            data = self._mutation_json(
+                ["workspace", "create", "--cwd", cwd, "--name", correlated_name],
+                "create workspace",
+            )
+            candidate = data.get("id") or data.get("workspaceId")
+            if isinstance(candidate, str) and candidate:
+                response_id = candidate
+            try:
+                found = matches()
+            except WorkerFailure as exc:
+                raise PossibleDispatchFailure(
+                    "workspace was dispatched but its postcondition could not be read"
+                ) from exc
+            if len(found) == 1 and (response_id is None or found[0].id == response_id):
+                return found[0]
+            raise PossibleDispatchFailure(
+                "workspace create response could not be authoritatively correlated"
+            )
+
+        def reconcile(quiescent: bool) -> Reconciliation[WorkspaceState]:
+            found = matches()
+            if len(found) == 1 and (response_id is None or found[0].id == response_id):
+                return Reconciliation(MutationResolution.DESIRED, found[0])
+            if len(found) > 1 or (found and response_id not in {None, found[0].id}):
+                return Reconciliation(
+                    MutationResolution.CONFLICT, detail="ambiguous workspace identity"
+                )
+            if quiescent:
+                return Reconciliation(
+                    MutationResolution.REJECTED, detail="workspace absent"
+                )
+            return Reconciliation(
+                MutationResolution.UNKNOWN, detail="workspace may appear later"
+            )
+
+        return execute_mutation(
+            operation="create PurpleMux workspace",
+            target=correlated_name,
+            pre_state=before,
+            dispatch=dispatch,
+            reconcile=reconcile,
+            plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
+        )
+
+    def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
+        if workspace_id not in {item.id for item in self.list_workspaces()}:
+            raise WorkerFailure(f"PurpleMux workspace {workspace_id!r} was not found")
+        return PurpleMuxCLIClient(
+            workspace_id,
+            executable=self.executable,
+            command_timeout_seconds=self.command_timeout_seconds,
+            read_timeout_retries=self.read_timeout_retries,
+            runner=self._runner,
+        )
+
+    def _read_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+        attempts = self.read_timeout_retries + 1
+        for attempt in range(attempts):
+            try:
+                completed = self._runner(
+                    [self.executable, *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.command_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                if attempt + 1 < attempts:
+                    continue
+                raise WorkerFailure(f"PurpleMux {operation} timed out") from exc
+            except OSError as exc:
+                raise WorkerFailure(
+                    f"could not execute PurpleMux {operation}: {exc}"
+                ) from exc
+            if completed.returncode != 0:
+                raise WorkerFailure(
+                    f"PurpleMux {operation} failed: {completed.stderr.strip() or 'no stderr'}"
+                )
+            return _parse_json_object(completed.stdout, operation)
+        raise AssertionError("unreachable")
+
+    def _mutation_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+        return _run_mutation_json(
+            self._runner, self.executable, args, operation, self.command_timeout_seconds
+        )
+
+
+def _parse_json_object(output: str, operation: str) -> dict[str, Any]:
+    try:
+        data = json.loads(output)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise WorkerFailure(f"PurpleMux {operation} returned malformed JSON") from exc
+    if not isinstance(data, dict):
+        raise WorkerFailure(f"PurpleMux {operation} returned non-object JSON")
+    return cast(dict[str, Any], data)
+
+
+def _run_mutation_json(
+    runner: SubprocessRunner,
+    executable: str,
+    args: Sequence[str],
+    operation: str,
+    timeout: float,
+) -> dict[str, Any]:
+    try:
+        completed = runner(
+            [executable, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PossibleDispatchFailure(f"PurpleMux {operation} timed out") from exc
+    except InterruptedError as exc:
+        raise PossibleDispatchFailure(
+            f"PurpleMux {operation} communication was interrupted"
+        ) from exc
+    except OSError as exc:
+        raise PreDispatchFailure(
+            f"could not execute PurpleMux {operation}: {exc}"
+        ) from exc
+    except KeyboardInterrupt as exc:
+        raise PossibleDispatchFailure(f"PurpleMux {operation} was interrupted") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+        raise PossibleDispatchFailure(
+            f"PurpleMux {operation} failed with exit code {completed.returncode}: {detail}"
+        )
+    try:
+        return _parse_json_object(completed.stdout, operation)
+    except WorkerFailure as exc:
+        raise PossibleDispatchFailure(str(exc)) from exc
+
+
+def _validate_correlation(value: str) -> None:
+    if (
+        not value
+        or len(value) > 64
+        or not value.isascii()
+        or any(not (character.isalnum() or character in "-_") for character in value)
+    ):
+        raise ValueError(
+            "correlation ID must be 1-64 ASCII letters, digits, hyphens, or underscores"
+        )
+
+
 class PurpleMuxCLIClient:
     """Thin Python adapter over the public PurpleMux CLI."""
 
@@ -158,20 +409,106 @@ class PurpleMuxCLIClient:
                 f"unsupported PurpleMux worker {request.worker!r}; "
                 "expected codex or claude-code"
             )
-        data = self._run_json(
-            ["tab", "create", "-w", self.workspace_id, "-t", panel_type],
-            operation="create",
-            read_only=False,
-        )
-        session_id = data.get("tabId") or data.get("tab_id") or data.get("id")
-        if not isinstance(session_id, str) or not session_id:
-            raise MutationOutcomeUnknown(
-                "PurpleMux create succeeded without a usable tab ID; "
-                "remote outcome is unknown"
-            )
-        return session_id
+        correlation_id = request.correlation_id or secrets.token_hex(8)
+        _validate_correlation(correlation_id)
+        name = request.name or f"awm-{panel_type}-{correlation_id}"
+        if request.name is not None and correlation_id not in name:
+            name = f"{name} [awm:{correlation_id}]"
+        return self._create_correlated_tab(
+            panel_type=panel_type,
+            provider="codex" if panel_type == "codex-cli" else "claude",
+            name=name,
+        ).id
 
-    def start_shell(self, request: ShellCommandRequest) -> str:
+    def list_sessions(self) -> tuple[TabState, ...]:
+        """Return one complete structured tab listing for this workspace."""
+        data = self._run_json(
+            ["tab", "list", "-w", self.workspace_id],
+            operation="list tabs",
+            read_only=True,
+        )
+        values = data.get("tabs")
+        if not isinstance(values, list):
+            raise WorkerFailure("PurpleMux tab listing is incomplete")
+        if len(values) > 2_000:
+            raise WorkerFailure("PurpleMux tab listing exceeds the authoritative cap")
+        tabs: list[TabState] = []
+        seen: set[str] = set()
+        for value in values:
+            tab = self._parse_tab(value)
+            if tab.workspace_id != self.workspace_id:
+                raise WorkerFailure("PurpleMux tab listing crossed workspace identity")
+            if tab.id in seen:
+                raise WorkerFailure("PurpleMux tab listing contains duplicate IDs")
+            seen.add(tab.id)
+            tabs.append(tab)
+        return tuple(tabs)
+
+    def probe_agent_readiness(
+        self,
+        *,
+        provider: str,
+        probe_name: str,
+        correlation_id: str,
+        preexisting_tab_ids: Sequence[str],
+        timeout_seconds: float,
+    ) -> AgentReadinessProbeResult:
+        """Create, identify, inspect, and clean up one explicit provider probe."""
+        panel_type = _PANEL_TYPES.get(provider.lower())
+        if panel_type is None:
+            raise ValueError("probe provider must be codex or claude-code")
+        _validate_correlation(correlation_id)
+        if correlation_id not in probe_name or not probe_name.strip():
+            raise ValueError("probe name must contain its correlation ID")
+        current = self.list_sessions()
+        expected_ids = tuple(preexisting_tab_ids)
+        if sum(len(item) + 1 for item in expected_ids) > 3_000:
+            raise WorkerFailure(
+                "probe preexisting tab set cannot fit its recovery record"
+            )
+        if len(set(expected_ids)) != len(expected_ids) or {
+            tab.id for tab in current
+        } != set(expected_ids):
+            raise WorkerFailure(
+                "probe preexisting tab set is not authoritative/current"
+            )
+        if any(tab.name == probe_name for tab in current):
+            raise WorkerFailure("probe correlation identity is already in use")
+        tab = self._create_correlated_tab(
+            panel_type=panel_type,
+            provider="codex" if panel_type == "codex-cli" else "claude",
+            name=probe_name,
+            before=current,
+        )
+        readiness_error: TerminalSessionError | None = None
+        try:
+            self._wait_until_ready_structured(tab.id, timeout_seconds)
+        except TerminalSessionError as exc:
+            readiness_error = exc
+        try:
+            self.close_session(tab.id, expected_state=tab)
+        except TerminalSessionError as exc:
+            raise MutationOutcomeUnknown(
+                f"probe tab {tab.id} retained after cleanup uncertainty: {exc}"
+            ) from exc
+        if readiness_error is not None:
+            raise readiness_error
+        return AgentReadinessProbeResult(
+            self.workspace_id,
+            tab.id,
+            provider,
+            probe_name,
+            correlation_id,
+            True,
+            True,
+        )
+
+    def start_shell(
+        self,
+        request: ShellCommandRequest,
+        *,
+        on_created: Callable[[str, str], None] | None = None,
+    ) -> str:
         """Start one Bash command in a visible, named PurpleMux terminal."""
         if not request.command:
             raise ValueError("shell command must not be empty")
@@ -183,37 +520,18 @@ class PurpleMuxCLIClient:
         if not os.path.isdir(cwd):
             raise ValueError(f"shell working directory is not a directory: {cwd}")
 
-        data = self._run_json(
-            [
-                "tab",
-                "create",
-                "-w",
-                self.workspace_id,
-                "-n",
-                request.name,
-                "-t",
-                "terminal",
-            ],
-            operation="create shell terminal",
-            read_only=False,
-        )
-        session_id = data.get("tabId") or data.get("tab_id") or data.get("id")
-        if not isinstance(session_id, str) or not session_id:
-            raise MutationOutcomeUnknown(
-                "PurpleMux shell terminal create succeeded without a usable tab ID; "
-                "remote outcome is unknown"
-            )
+        session_id = self._create_correlated_tab(
+            panel_type="terminal", provider=None, name=request.name
+        ).id
 
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
         self._shell_runs[session_id] = _ShellRun(result_path=result_path)
+        if on_created is not None:
+            on_created(session_id, result_path)
         wrapper = self._shell_wrapper(request.command, cwd, result_path)
         try:
-            self._run_json(
-                ["tab", "send", "-w", self.workspace_id, session_id, wrapper],
-                operation="start shell command",
-                read_only=False,
-            )
+            self._send_mutation(session_id, wrapper, operation="start shell command")
         except MutationOutcomeUnknown as exc:
             # Keep both the tab and correlation data: a timed-out send may have
             # started the command, and the terminal remains useful for inspection.
@@ -225,6 +543,30 @@ class PurpleMuxCLIClient:
                 f"shell terminal {session_id} was created but command start failed: {exc}"
             ) from exc
         return session_id
+
+    def resume_shell(self, session_id: str, result_path: str) -> None:
+        """Reattach a checkpointed managed shell without sending its command again."""
+        if session_id in self._shell_runs:
+            if self._shell_runs[session_id].result_path != result_path:
+                raise WorkerFailure(f"session {session_id} shell identity conflicts")
+            return
+        normalized = os.path.abspath(result_path)
+        parent = os.path.dirname(normalized)
+        if os.path.basename(normalized) != "result.json" or not os.path.basename(
+            parent
+        ).startswith("awm-shell-"):
+            raise WorkerFailure("checkpointed shell result path is invalid")
+        tabs = self.list_sessions()
+        tab = next((item for item in tabs if item.id == session_id), None)
+        if tab is None and not os.path.isfile(normalized):
+            raise MutationOutcomeUnknown(
+                f"checkpointed shell {session_id} and its result are not observable"
+            )
+        if tab is not None and tab.panel_type != "terminal":
+            raise MutationConflict(
+                f"checkpointed shell {session_id} is no longer a terminal"
+            )
+        self._shell_runs[session_id] = _ShellRun(result_path=normalized)
 
     def wait_for_shell_completion(
         self, session_id: str, timeout_seconds: float
@@ -310,11 +652,7 @@ class PurpleMuxCLIClient:
         if not text:
             raise ValueError("text must not be empty")
         baseline = self._read_turn_baseline(session_id)
-        self._run_json(
-            ["tab", "send", "-w", self.workspace_id, session_id, text],
-            operation="send",
-            read_only=False,
-        )
+        self._send_mutation(session_id, text, operation="send")
         self._turn_baselines[session_id] = baseline
         self._completed_turns.pop(session_id, None)
 
@@ -396,19 +734,75 @@ class PurpleMuxCLIClient:
 
     def interrupt(self, session_id: str) -> None:
         """Request interruption of the foreground agent turn."""
-        self._run_json(
-            ["tab", "interrupt", "-w", self.workspace_id, session_id],
-            operation="interrupt",
-            read_only=False,
+        before = self._status(session_id)
+
+        def dispatched() -> None:
+            self._mutation_json(
+                ["tab", "interrupt", "-w", self.workspace_id, session_id],
+                "interrupt",
+            )
+
+        def desired() -> bool:
+            current = self._status(session_id)
+            event = current.get("lastEvent")
+            return (
+                isinstance(event, Mapping)
+                and str(event.get("name", "")).lower() == "interrupt"
+                and event.get("seq") != self._event_seq(before)
+            )
+
+        self._execute_runtime_mutation(
+            operation="interrupt PurpleMux tab",
+            target=f"{self.workspace_id}/{session_id}",
+            pre_state=before,
+            dispatch=dispatched,
+            desired=desired,
+            unchanged=lambda: self._status(session_id) == before,
+            success_is_authoritative=True,
+            plan={
+                "kind": "interrupt_tab",
+                "workspace": self.workspace_id,
+                "tab": session_id,
+            },
         )
 
-    def close_session(self, session_id: str) -> None:
+    def close_session(
+        self, session_id: str, *, expected_state: TabState | None = None
+    ) -> None:
         """Close the tab and discard local correlation state."""
-        self._run(
-            ["tab", "close", "-w", self.workspace_id, session_id],
-            operation="close",
-            read_only=False,
-        )
+        before = self.list_sessions()
+        selected = next((tab for tab in before if tab.id == session_id), None)
+        if (
+            expected_state is not None
+            and selected is not None
+            and self._tab_identity(selected) != self._tab_identity(expected_state)
+        ):
+            raise MutationConflict(
+                f"tab {session_id} identity changed before close; refusing cleanup"
+            )
+        if selected is not None:
+            selected_identity = self._tab_identity(selected)
+            self._execute_runtime_mutation(
+                operation="close PurpleMux tab",
+                target=f"{self.workspace_id}/{session_id}",
+                pre_state=selected,
+                dispatch=lambda: self._mutation_json(
+                    ["tab", "close", "-w", self.workspace_id, session_id], "close"
+                ),
+                desired=lambda: all(
+                    tab.id != session_id for tab in self.list_sessions()
+                ),
+                unchanged=lambda: any(
+                    self._tab_identity(tab) == selected_identity
+                    for tab in self.list_sessions()
+                ),
+                success_is_authoritative=False,
+                plan={
+                    "kind": "close_tab",
+                    "workspace": self.workspace_id,
+                    "tab": session_id,
+                },
+            )
         self._turn_baselines.pop(session_id, None)
         self._completed_turns.pop(session_id, None)
         shell_run = self._shell_runs.pop(session_id, None)
@@ -459,7 +853,6 @@ class PurpleMuxCLIClient:
             raise WorkerFailure(
                 f"shell terminal {session_id} published an invalid exit code"
             )
-        self._cleanup_shell_result(shell_run)
         return ShellResult(exit_code=exit_code)
 
     @staticmethod
@@ -512,6 +905,220 @@ class PurpleMuxCLIClient:
             ["tab", "result", "-w", self.workspace_id, session_id],
             operation="result",
             read_only=True,
+        )
+
+    def _create_correlated_tab(
+        self,
+        *,
+        panel_type: str,
+        provider: str | None,
+        name: str,
+        before: tuple[TabState, ...] | None = None,
+    ) -> TabState:
+        if not name.strip() or "\0" in name or len(name) > 200:
+            raise ValueError("tab name must be 1-200 characters without nulls")
+        captured = self.list_sessions() if before is None else before
+        before_ids = {tab.id for tab in captured}
+        if any(tab.name == name for tab in captured):
+            raise WorkerFailure(f"tab correlation name {name!r} is already in use")
+        response_id: str | None = None
+
+        def matches() -> tuple[TabState, ...]:
+            return tuple(
+                tab
+                for tab in self.list_sessions()
+                if tab.id not in before_ids
+                and tab.name == name
+                and tab.panel_type == panel_type
+                and (provider is None or tab.provider == provider)
+            )
+
+        def dispatch() -> TabState:
+            nonlocal response_id
+            data = self._mutation_json(
+                [
+                    "tab",
+                    "create",
+                    "-w",
+                    self.workspace_id,
+                    "-n",
+                    name,
+                    "-t",
+                    panel_type,
+                ],
+                "create tab",
+            )
+            candidate = data.get("tabId") or data.get("tab_id") or data.get("id")
+            if isinstance(candidate, str) and candidate:
+                response_id = candidate
+            try:
+                found = matches()
+            except WorkerFailure as exc:
+                raise PossibleDispatchFailure(
+                    "tab was dispatched but its postcondition could not be read"
+                ) from exc
+            if len(found) == 1 and response_id == found[0].id:
+                return found[0]
+            raise PossibleDispatchFailure(
+                "tab create response could not be authoritatively correlated"
+            )
+
+        def reconcile(quiescent: bool) -> Reconciliation[TabState]:
+            found = matches()
+            if len(found) == 1 and (response_id is None or response_id == found[0].id):
+                return Reconciliation(MutationResolution.DESIRED, found[0])
+            if len(found) > 1 or (found and response_id not in {None, found[0].id}):
+                return Reconciliation(
+                    MutationResolution.CONFLICT,
+                    detail="multiple or response-mismatched correlated tabs",
+                )
+            if quiescent:
+                return Reconciliation(MutationResolution.REJECTED, detail="tab absent")
+            return Reconciliation(
+                MutationResolution.UNKNOWN, detail="tab may appear later"
+            )
+
+        return execute_mutation(
+            operation="create PurpleMux tab",
+            target=f"{self.workspace_id}/{name}",
+            pre_state=captured,
+            dispatch=dispatch,
+            reconcile=reconcile,
+            plan={
+                "kind": "create_tab",
+                "workspace": self.workspace_id,
+                "name": name,
+                "panelType": panel_type,
+            },
+        )
+
+    @staticmethod
+    def _parse_tab(value: object) -> TabState:
+        if not isinstance(value, Mapping):
+            raise WorkerFailure("PurpleMux tab listing is malformed")
+        tab_id = value.get("tabId") or value.get("id")
+        workspace_id = value.get("workspaceId")
+        name = value.get("name", "")
+        panel_type = value.get("panelType")
+        provider = value.get("agentProviderId")
+        alive = value.get("alive")
+        cli_state = value.get("cliState")
+        if (
+            not isinstance(tab_id, str)
+            or not tab_id
+            or not isinstance(workspace_id, str)
+            or not workspace_id
+            or not isinstance(name, str)
+            or panel_type is not None
+            and not isinstance(panel_type, str)
+            or provider is not None
+            and not isinstance(provider, str)
+            or alive is not None
+            and not isinstance(alive, bool)
+            or cli_state is not None
+            and not isinstance(cli_state, str)
+        ):
+            raise WorkerFailure("PurpleMux tab listing is malformed")
+        return TabState(
+            tab_id, workspace_id, name, panel_type, provider, alive, cli_state
+        )
+
+    @staticmethod
+    def _tab_identity(tab: TabState) -> tuple[str, str, str, str | None, str | None]:
+        return (tab.id, tab.workspace_id, tab.name, tab.panel_type, tab.provider)
+
+    def _send_mutation(self, session_id: str, text: str, *, operation: str) -> None:
+        self._execute_runtime_mutation(
+            operation=operation,
+            target=f"{self.workspace_id}/{session_id}",
+            pre_state={"workspace": self.workspace_id, "tab": session_id},
+            dispatch=lambda: self._mutation_json(
+                ["tab", "send", "-w", self.workspace_id, session_id, text], operation
+            ),
+            desired=lambda: False,
+            unchanged=lambda: True,
+            success_is_authoritative=True,
+            plan={
+                "kind": "send_tab",
+                "workspace": self.workspace_id,
+                "tab": session_id,
+            },
+        )
+
+    def _execute_runtime_mutation(
+        self,
+        *,
+        operation: str,
+        target: str,
+        pre_state: object,
+        dispatch: Callable[[], object],
+        desired: Callable[[], bool],
+        unchanged: Callable[[], bool],
+        success_is_authoritative: bool,
+        plan: Mapping[str, object],
+    ) -> None:
+        def perform() -> None:
+            dispatch()
+            if success_is_authoritative:
+                return
+            try:
+                postcondition_met = desired()
+            except WorkerFailure as exc:
+                raise PossibleDispatchFailure(
+                    "mutation was dispatched but its postcondition could not be read"
+                ) from exc
+            if not postcondition_met:
+                raise PossibleDispatchFailure(
+                    "successful response lacked its postcondition"
+                )
+
+        def reconcile(quiescent: bool) -> Reconciliation[None]:
+            if desired():
+                return Reconciliation(MutationResolution.DESIRED)
+            if quiescent and unchanged():
+                return Reconciliation(MutationResolution.REJECTED)
+            if quiescent:
+                return Reconciliation(MutationResolution.CONFLICT)
+            return Reconciliation(MutationResolution.UNKNOWN)
+
+        execute_mutation(
+            operation=operation,
+            target=target,
+            pre_state=pre_state,
+            dispatch=perform,
+            reconcile=reconcile,
+            plan=plan,
+        )
+
+    @staticmethod
+    def _event_seq(status: Mapping[str, Any]) -> int | None:
+        value = status.get("eventSeq")
+        if isinstance(value, int):
+            return value
+        event = status.get("lastEvent")
+        value = event.get("seq") if isinstance(event, Mapping) else None
+        return value if isinstance(value, int) else None
+
+    def _wait_until_ready_structured(
+        self, session_id: str, timeout_seconds: float
+    ) -> None:
+        deadline = self._monotonic() + timeout_seconds
+        while True:
+            status = self._status(session_id)
+            state = self._state(status, session_id)
+            self._raise_abnormal_state(session_id, state, status)
+            if state in _READY_STATES:
+                return
+            if self._monotonic() >= deadline:
+                raise SessionReadyTimeout(
+                    f"probe session {session_id} was not ready within {timeout_seconds}s "
+                    f"(last cliState={state})"
+                )
+            self._sleep(self.poll_interval_seconds)
+
+    def _mutation_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+        return _run_mutation_json(
+            self._runner, self.executable, args, operation, self.command_timeout_seconds
         )
 
     def _read_turn_baseline(self, session_id: str) -> _TurnBaseline:

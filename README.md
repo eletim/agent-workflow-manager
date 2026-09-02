@@ -107,6 +107,7 @@ approval provenance, and release policy remain ordinary Python control flow.
 create. The adapter supports:
 
 - `create_session()`
+- `list_sessions()` (complete structured tab discovery)
 - `read_status()`
 - `wait_until_ready()`
 - `send_input()`
@@ -126,6 +127,18 @@ and interruptions are explicit. Read-only CLI timeouts can be retried;
 mutation timeouts raise `MutationOutcomeUnknown` because the remote outcome is
 unknown. Screen capture is never used to decide completion or as a result
 fallback.
+
+`PurpleMuxRuntime` adds authoritative workspace listing and correlated workspace
+creation. Workspace and tab create responses are accepted only after their IDs and
+structured identities are confirmed by complete public listings. All first-party
+runtime mutations participate in the same first-mutation boundary used by whole-
+program Dry Run.
+
+Static Validation reports Dry Run eligibility separately. Eligible trusted
+workflows declare `WORKFLOW_DRY_RUN = 1`; Dry Run executes that same Python program
+through real inspections and stops before the first reachable mutation. The Runner
+shows reached runtime/Git/GitHub findings and that next mutation without fabricating
+future state or interpreting workflow control flow.
 
 Observable Bash work runs in named PurpleMux `terminal` tabs. The adapter sends
 the command with an explicit working directory and correlates completion with a

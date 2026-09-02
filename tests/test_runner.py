@@ -994,6 +994,10 @@ def test_runner_http_lifecycle(
         "outline": [],
         "progress": [],
         "validation": [],
+        "dryRun": None,
+        "dryRunEligible": True,
+        "dryRunIssues": [],
+        "findings": [],
         "exitCode": 0,
         "runId": 1,
         "cwd": str(Path.cwd()),
@@ -1494,7 +1498,7 @@ def test_workflow_api_validates_and_snapshots_static_outline(
     assert rejected["validation"][0]["kind"] == "outline"
 
 
-@pytest.mark.parametrize("path", ["/api/validate", "/api/run"])
+@pytest.mark.parametrize("path", ["/api/validate", "/api/dry-run", "/api/run"])
 def test_workflow_api_reports_unresolvable_preflight_path(
     web_server: tuple[tuple[str, int], str], path: str
 ) -> None:
@@ -1511,6 +1515,34 @@ def test_workflow_api_reports_unresolvable_preflight_path(
     assert result["state"] == "validation_failed"
     assert result["validation"][0]["kind"] == "path"
     assert "could not check required path" in result["validation"][0]["message"]
+
+
+def test_dry_run_api_reports_first_mutation_and_findings(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    code = """
+WORKFLOW_DRY_RUN = 1
+from purplemux_client import emit_finding
+from purplemux_client.operations import execute_mutation, Reconciliation, MutationResolution
+emit_finding("git", "base ref verified")
+execute_mutation(
+    operation="switch branch", target="feature/example", pre_state="main",
+    dispatch=lambda: None,
+    reconcile=lambda _: Reconciliation(MutationResolution.UNKNOWN),
+    plan={"kind": "switch", "branch": "feature/example"},
+)
+"""
+    status, payload = request(
+        address, "POST", "/api/dry-run", json.dumps({"code": code}), token=token
+    )
+
+    assert status == 200
+    assert payload["dryRun"]["status"] == "frontier"
+    assert payload["dryRun"]["nextMutation"]["operation"] == "switch branch"
+    assert payload["dryRun"]["findings"] == [
+        {"category": "git", "status": "passed", "message": "base ref verified"}
+    ]
 
 
 def test_notification_settings_api_read_never_returns_token(
@@ -1839,7 +1871,7 @@ def test_notification_settings_mutation_rejects_untrusted_request(
     ("path", "token", "origin"),
     [
         (path, token, origin)
-        for path in ("/api/run", "/api/validate")
+        for path in ("/api/run", "/api/validate", "/api/dry-run")
         for token, origin in (
             (None, None),
             ("wrong", None),

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.notifier import NotificationResult, TerminalState
+from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
     ValidationIssue,
     ValidationResult,
@@ -65,6 +66,31 @@ class ProgressEvent:
     tab: str | None = None
 
 
+@dataclass(frozen=True)
+class TopologyFinding:
+    category: Literal["runtime", "git", "github"]
+    status: Literal["passed", "failed", "info"]
+    message: str
+
+
+@dataclass(frozen=True)
+class DryRunResult:
+    status: Literal["frontier", "complete", "failed", "ineligible"]
+    stdout: str = ""
+    stderr: str = ""
+    findings: tuple[TopologyFinding, ...] = ()
+    next_mutation: Mapping[str, object] | None = None
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "findings": [asdict(item) for item in self.findings],
+            "nextMutation": dict(self.next_mutation) if self.next_mutation else None,
+        }
+
+
 class AlreadyRunningError(RuntimeError):
     """Raised when a run is requested while another process is active."""
 
@@ -78,6 +104,12 @@ class WorkflowValidationError(RuntimeError):
 
     def __init__(self, result: ValidationResult) -> None:
         super().__init__("workflow validation failed")
+        self.result = result
+
+
+class WorkflowDryRunError(RuntimeError):
+    def __init__(self, result: ValidationResult) -> None:
+        super().__init__("workflow is not eligible for Dry Run")
         self.result = result
 
 
@@ -119,11 +151,14 @@ class RunnerSnapshot:
     run_id: int | None
     progress: tuple[ProgressEvent, ...]
     validation: tuple[ValidationIssue, ...]
+    dry_run_issues: tuple[ValidationIssue, ...]
     cwd: str
     args: tuple[str, ...]
     checkpoint: ResumeCheckpoint | None
     attempts: tuple[RunAttempt, ...]
     suspension_reason: str | None
+    findings: tuple[TopologyFinding, ...]
+    dry_run: DryRunResult | None
     # Submitted Python source for this run's immutable execution snapshot.
     # Populated only for an actual run (see ``_snapshot_run``); left ``None``
     # for the idle/validation preview, which is not tied to a persisted run.
@@ -148,7 +183,13 @@ class RunnerSnapshot:
         payload.pop("stdout_entries")
         payload.pop("stderr_entries")
         payload["progress"] = [asdict(event) for event in self.progress]
+        payload["findings"] = [asdict(item) for item in self.findings]
+        payload["dryRun"] = self.dry_run.as_json() if self.dry_run else None
+        payload.pop("dry_run")
         payload["validation"] = [issue.as_json() for issue in self.validation]
+        payload["dryRunEligible"] = not self.dry_run_issues
+        payload["dryRunIssues"] = [issue.as_json() for issue in self.dry_run_issues]
+        payload.pop("dry_run_issues")
         payload["attempts"] = [
             {
                 "number": attempt.number,
@@ -198,6 +239,7 @@ class _RunRecord:
     exit_code: int | None = None
     stop_requested: bool = False
     progress: deque[ProgressEvent] = field(default_factory=deque)
+    findings: deque[TopologyFinding] = field(default_factory=deque)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     checkpoint: ResumeCheckpoint | None = None
     resumed_from: str | None = None
@@ -214,6 +256,7 @@ class PythonRunner:
         stop_timeout: float = 3.0,
         max_output_chars: int = 1_000_000,
         max_progress_events: int = DEFAULT_MAX_PROGRESS_EVENTS,
+        dry_run_timeout: float = 300.0,
         notifier: TerminalNotifier | None = None,
         validator: WorkflowValidator | None = None,
     ) -> None:
@@ -223,9 +266,12 @@ class PythonRunner:
             raise ValueError("max_output_chars must be positive")
         if max_progress_events < 1:
             raise ValueError("max_progress_events must be positive")
+        if dry_run_timeout <= 0:
+            raise ValueError("dry_run_timeout must be positive")
         self._stop_timeout = stop_timeout
         self._max_output_chars = max_output_chars
         self._max_progress_events = max_progress_events
+        self._dry_run_timeout = dry_run_timeout
         self._lock = threading.Lock()
         self._changes = threading.Condition(self._lock)
         self._change_revision = 0
@@ -246,11 +292,14 @@ class PythonRunner:
             run_id=None,
             progress=(),
             validation=(),
+            dry_run_issues=(),
             cwd=str(Path.cwd()),
             args=(),
             checkpoint=None,
             attempts=(),
             suspension_reason=None,
+            findings=(),
+            dry_run=None,
         )
         self._validator = validator or WorkflowValidator()
 
@@ -270,6 +319,176 @@ class PythonRunner:
                 self._ensure_open()
                 self._apply_validation(result, run_cwd, run_args)
             return result
+
+    def dry_run(
+        self,
+        code: str,
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+        args: Sequence[str] = (),
+    ) -> DryRunResult:
+        """Execute the real workflow until its first inspection-aware mutation."""
+        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        with self._validation_lock:
+            with self._lock:
+                self._ensure_open()
+            validation = self._validator.validate(
+                code, cwd=run_cwd, environment=child_env
+            )
+            if not validation.valid or validation.dry_run_issues:
+                with self._lock:
+                    self._apply_validation(validation, run_cwd, run_args)
+                raise WorkflowDryRunError(validation)
+            result = self._execute_dry_run(
+                code, run_cwd=run_cwd, run_args=run_args, child_env=child_env
+            )
+            with self._lock:
+                self._ensure_open()
+                self._preview = RunnerSnapshot(
+                    # A runtime Dry Run failure does not invalidate the separate
+                    # side-effect-free Static Validation result.
+                    state="idle",
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    stdout_entries=(),
+                    stderr_entries=(),
+                    outline=validation.outline,
+                    exit_code=None,
+                    run_id=None,
+                    progress=(),
+                    validation=validation.issues,
+                    dry_run_issues=validation.dry_run_issues,
+                    cwd=str(run_cwd),
+                    args=run_args,
+                    checkpoint=None,
+                    attempts=(),
+                    suspension_reason=None,
+                    findings=result.findings,
+                    dry_run=result,
+                )
+                self._mark_changed()
+            return result
+
+    def _execute_dry_run(
+        self,
+        code: str,
+        *,
+        run_cwd: Path,
+        run_args: tuple[str, ...],
+        child_env: Mapping[str, str],
+    ) -> DryRunResult:
+        script = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", encoding="utf-8", delete=False
+        )
+        try:
+            script.write(code)
+        finally:
+            script.close()
+        script_path = Path(script.name)
+        boundary_read, boundary_write = os.pipe()
+        progress_read, progress_write = os.pipe()
+        process_env = dict(child_env)
+        process_env[DRY_RUN_FD_ENV] = str(boundary_write)
+        process_env[PROGRESS_FD_ENV] = str(progress_write)
+        try:
+            process = subprocess.Popen(
+                [sys.executable, str(script_path), *run_args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=process_env,
+                cwd=run_cwd,
+                pass_fds=(boundary_write, progress_write),
+                shell=False,
+                start_new_session=True,
+            )
+        except BaseException:
+            os.close(boundary_read)
+            os.close(boundary_write)
+            os.close(progress_read)
+            os.close(progress_write)
+            script_path.unlink(missing_ok=True)
+            raise
+        os.close(boundary_write)
+        os.close(progress_write)
+        boundary_chunks: list[bytes] = []
+        progress_chunks: list[bytes] = []
+
+        def drain(fd: int, destination: list[bytes]) -> None:
+            with os.fdopen(fd, "rb") as stream:
+                destination.append(stream.read(1_000_001))
+
+        readers = [
+            threading.Thread(target=drain, args=(boundary_read, boundary_chunks)),
+            threading.Thread(target=drain, args=(progress_read, progress_chunks)),
+        ]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(timeout=self._dry_run_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._kill_process_group(process.pid)
+            stdout, stderr = process.communicate()
+        except BaseException:
+            # The inspected program must not outlive an interrupted Dry Run.
+            self._kill_process_group(process.pid)
+            process.communicate()
+            for reader in readers:
+                reader.join()
+            script_path.unlink(missing_ok=True)
+            raise
+        for reader in readers:
+            reader.join()
+        script_path.unlink(missing_ok=True)
+        findings: list[TopologyFinding] = []
+        for line in b"".join(progress_chunks).splitlines():
+            parsed = self._parse_runner_event(line.decode("utf-8", errors="replace"))
+            if parsed is not None and parsed[0] == "finding":
+                findings.append(cast(TopologyFinding, parsed[1]))
+        boundary = b"".join(boundary_chunks)
+        if timed_out:
+            return DryRunResult(
+                "failed",
+                stdout.decode(errors="replace"),
+                f"Dry Run exceeded {self._dry_run_timeout:g}s",
+                tuple(findings),
+            )
+        if process.returncode == DRY_RUN_BOUNDARY_EXIT_CODE:
+            try:
+                values = boundary.splitlines()
+                if len(values) != 1:
+                    raise ValueError
+                mutation = json.loads(values[0])
+                if not isinstance(mutation, dict) or mutation.get("protocol") != 1:
+                    raise ValueError
+            except (json.JSONDecodeError, ValueError):
+                return DryRunResult(
+                    "failed",
+                    stdout.decode(errors="replace"),
+                    "Dry Run boundary output was missing or malformed",
+                    tuple(findings),
+                )
+            return DryRunResult(
+                "frontier",
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+                tuple(findings),
+                cast(dict[str, object], mutation),
+            )
+        if process.returncode == 0 and not boundary:
+            return DryRunResult(
+                "complete",
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+                tuple(findings),
+            )
+        detail = stderr.decode(errors="replace")
+        if boundary:
+            detail += "\nDry Run emitted an unexpected mutation boundary"
+        return DryRunResult(
+            "failed", stdout.decode(errors="replace"), detail, tuple(findings)
+        )
 
     def start(
         self,
@@ -404,6 +623,7 @@ class PythonRunner:
             code=code,
             outline=outline,
             progress=deque(maxlen=self._max_progress_events),
+            findings=deque(maxlen=self._max_progress_events),
         )
         self._runs[run_id] = run
 
@@ -507,11 +727,14 @@ class PythonRunner:
             run_id=None,
             progress=(),
             validation=result.issues,
+            dry_run_issues=result.dry_run_issues,
             cwd=str(run_cwd),
             args=run_args,
             checkpoint=None,
             attempts=(),
             suspension_reason=None,
+            findings=(),
+            dry_run=None,
         )
         self._mark_changed()
 
@@ -566,11 +789,14 @@ class PythonRunner:
             run_id=run.run_id,
             progress=tuple(run.progress),
             validation=(),
+            dry_run_issues=(),
             cwd=run.cwd,
             args=run.args,
             checkpoint=run.checkpoint,
             attempts=tuple(run.attempts),
             suspension_reason=run.suspension_reason,
+            findings=tuple(run.findings),
+            dry_run=None,
             code=run.code,
         )
 
@@ -773,6 +999,8 @@ class PythonRunner:
                                 run.checkpoint = cast(ResumeCheckpoint, event)
                             elif event_type == "suspended":
                                 run.suspension_reason = cast(str, event)
+                            elif event_type == "finding":
+                                run.findings.append(cast(TopologyFinding, event))
                             else:
                                 assert isinstance(event, ProgressEvent)
                                 run.progress.append(event)
@@ -783,7 +1011,9 @@ class PythonRunner:
     @staticmethod
     def _parse_runner_event(
         line: str,
-    ) -> tuple[Literal["progress", "checkpoint", "suspended"], object] | None:
+    ) -> (
+        tuple[Literal["progress", "checkpoint", "suspended", "finding"], object] | None
+    ):
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
@@ -809,6 +1039,22 @@ class PythonRunner:
             reason = value.get("reason")
             if isinstance(reason, str) and reason.strip():
                 return "suspended", reason
+            return None
+        if event_type == "finding":
+            category = value.get("category")
+            status = value.get("status")
+            message = value.get("message")
+            if (
+                category in ("runtime", "git", "github")
+                and status in ("passed", "failed", "info")
+                and isinstance(message, str)
+                and message.strip()
+            ):
+                return "finding", TopologyFinding(
+                    cast(Literal["runtime", "git", "github"], category),
+                    cast(Literal["passed", "failed", "info"], status),
+                    message,
+                )
             return None
         name = value.get("name")
         status = value.get("status")
