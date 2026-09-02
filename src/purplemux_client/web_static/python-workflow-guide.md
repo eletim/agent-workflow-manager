@@ -427,6 +427,35 @@ Outside the Runner it is a no-op. Inside the Runner, encoded events over 4 KiB
 are dropped and only the latest 200 events are retained. Do not use events to
 drive the workflow, add statuses, or build decorators/state machines around it.
 
+## Inspect a running workflow agent
+
+After a workflow emits progress with `workspace` and `tab`, the Runner displays
+the pair as `workspace / tab`. Copy those IDs into the existing public PurpleMux
+CLI commands to inspect the agent without interrupting it:
+
+```text
+purplemux tab status -w WS_ID TAB_ID
+purplemux tab result -w WS_ID TAB_ID
+purplemux tab capture -w WS_ID TAB_ID
+```
+
+Each command has a distinct purpose:
+
+- `status` is the structured runtime state for the tab. Use it to check the
+  current lifecycle, process, and agent state.
+- `result` is the latest completed structured agent response. While the current
+  turn is still running, it may be unavailable or still refer to an earlier
+  completed turn; the workflow must continue to use the client's correlated
+  wait/read sequence for control.
+- `capture` is a diagnostic pane snapshot only. It can help an operator see
+  current terminal activity, but its screen text is not runtime state or an
+  agent result.
+
+These commands are for observation and manual diagnosis. Do not parse `capture`
+output to decide workflow completion, branching, retries, or approval. Keep
+those decisions in plain Python and use structured PurpleMux status/results
+through `purplemux_client`.
+
 ## Recommended patterns
 
 One-shot task:
