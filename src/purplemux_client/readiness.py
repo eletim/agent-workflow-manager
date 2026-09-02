@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import secrets
@@ -127,13 +128,25 @@ class AgentReadinessService:
         with self._lock:
             if self._running:
                 raise ReadinessProbeBusy("an Agent readiness probe is already running")
-            if self._last is not None and self._last.status in {"pending", "unknown"}:
+            self._running = True
+        ownership: int | None = None
+        try:
+            ownership = self._acquire_ownership()
+            persisted = self._load_unresolved()
+            with self._lock:
+                if persisted is not None:
+                    self._last = persisted
+                elif self._last is not None and self._last.status in {
+                    "pending",
+                    "unknown",
+                }:
+                    self._last = None
+                unresolved = self._last
+            if unresolved is not None and unresolved.status in {"pending", "unknown"}:
                 raise ReadinessReconciliationRequired(
                     "the unresolved Agent readiness probe must be authoritatively "
                     "reconciled before another probe"
                 )
-            self._running = True
-        try:
             workspaces = self._runtime.list_workspaces()
             selected = next(
                 (workspace for workspace in workspaces if workspace.id == workspace_id),
@@ -280,6 +293,8 @@ class AgentReadinessService:
             self._set_last(status)
             return status
         finally:
+            if ownership is not None:
+                self._release_ownership(ownership)
             with self._lock:
                 self._running = False
 
@@ -288,11 +303,15 @@ class AgentReadinessService:
         with self._lock:
             if self._running:
                 raise ReadinessProbeBusy("an Agent readiness probe is already running")
-            unresolved = self._last
-            if unresolved is None or unresolved.status not in {"pending", "unknown"}:
-                raise ValueError("there is no unresolved Agent readiness probe")
             self._running = True
+        ownership: int | None = None
         try:
+            ownership = self._acquire_ownership()
+            unresolved = self._load_unresolved()
+            with self._lock:
+                self._last = unresolved
+            if unresolved is None:
+                raise ValueError("there is no unresolved Agent readiness probe")
             if unresolved.status == "pending":
                 unresolved = AgentReadinessStatus(
                     "unknown",
@@ -325,11 +344,48 @@ class AgentReadinessService:
                     "block was cleared.",
                 )
             tabs = self._runtime.workspace(unresolved.workspace_id).list_sessions()
+            matches = tuple(tab for tab in tabs if self._matches_probe(tab, unresolved))
             if unresolved.tab_id is not None:
                 matching_id = next(
                     (tab for tab in tabs if tab.id == unresolved.tab_id), None
                 )
                 if matching_id is None:
+                    if len(matches) == 1:
+                        discovered = matches[0]
+                        retained = AgentReadinessStatus(
+                            "unknown",
+                            unresolved.workspace_id,
+                            selected.name,
+                            unresolved.provider,
+                            unresolved.probe_name,
+                            unresolved.correlation_id,
+                            discovered.id,
+                            unresolved.readiness,
+                            unresolved.cleanup,
+                            f"Recorded probe tab {unresolved.tab_id!r} is absent, but "
+                            f"the correlated identity is present as {discovered.id!r}; "
+                            "manual inspection is required.",
+                            discovered.id,
+                        )
+                        self._set_last(retained)
+                        return retained
+                    if len(matches) > 1:
+                        ambiguous = AgentReadinessStatus(
+                            "unknown",
+                            unresolved.workspace_id,
+                            selected.name,
+                            unresolved.provider,
+                            unresolved.probe_name,
+                            unresolved.correlation_id,
+                            None,
+                            unresolved.readiness,
+                            unresolved.cleanup,
+                            f"Recorded probe tab {unresolved.tab_id!r} is absent, but "
+                            "multiple tabs match the correlated identity; manual "
+                            "inspection is required.",
+                        )
+                        self._set_last(ambiguous)
+                        return ambiguous
                     return self._confirm_absent(
                         unresolved,
                         f"Probe tab {unresolved.tab_id!r} is authoritatively absent; "
@@ -361,7 +417,6 @@ class AgentReadinessService:
                 self._set_last(retained)
                 return retained
 
-            matches = tuple(tab for tab in tabs if self._matches_probe(tab, unresolved))
             if not matches:
                 return self._confirm_absent(
                     unresolved,
@@ -402,6 +457,8 @@ class AgentReadinessService:
             self._set_last(retained)
             return retained
         finally:
+            if ownership is not None:
+                self._release_ownership(ownership)
             with self._lock:
                 self._running = False
 
@@ -454,6 +511,34 @@ class AgentReadinessService:
             else Path.home() / ".local/state"
         )
         return root / "agent-workflow-manager" / "readiness-probe.json"
+
+    def _acquire_ownership(self) -> int:
+        lock_path = self._state_file.with_name(f".{self._state_file.name}.lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(descriptor)
+                raise ReadinessProbeBusy(
+                    "another Runner process owns Agent readiness probe recovery"
+                ) from exc
+            return descriptor
+        except ReadinessProbeBusy:
+            raise
+        except OSError as exc:
+            raise WorkerFailure(
+                "Agent readiness ownership lock could not be acquired"
+            ) from exc
+
+    @staticmethod
+    def _release_ownership(descriptor: int) -> None:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     def _save_unresolved(self, status: AgentReadinessStatus) -> None:
         payload = json.dumps(

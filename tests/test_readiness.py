@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -19,6 +21,8 @@ from purplemux_client.errors import (
 )
 from purplemux_client.readiness import (
     AgentReadinessService,
+    AgentReadinessStatus,
+    ReadinessProbeBusy,
     ReadinessReconciliationRequired,
 )
 
@@ -94,6 +98,35 @@ class ProbeRuntime:
     def workspace(self, workspace_id: str) -> ProbeClient:
         self.workspace_calls.append(workspace_id)
         return self.client
+
+
+class BlockingProbeClient(ProbeClient):
+    def __init__(self) -> None:
+        super().__init__("create-unknown")
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def probe_agent_readiness(
+        self,
+        *,
+        provider: str,
+        probe_name: str,
+        correlation_id: str,
+        preexisting_tab_ids: Sequence[str],
+        timeout_seconds: float,
+        on_identified: Callable[[TabState], None] | None = None,
+    ) -> AgentReadinessProbeResult:
+        self.entered.set()
+        if not self.release.wait(3):
+            raise AssertionError("test did not release the owning readiness probe")
+        return super().probe_agent_readiness(
+            provider=provider,
+            probe_name=probe_name,
+            correlation_id=correlation_id,
+            preexisting_tab_ids=preexisting_tab_ids,
+            timeout_seconds=timeout_seconds,
+            on_identified=on_identified,
+        )
 
 
 def service(
@@ -220,6 +253,77 @@ def test_uncertain_cleanup_persists_and_blocks_direct_retry(
     with pytest.raises(ReadinessReconciliationRequired, match="reconciled"):
         readiness.probe(workspace_id="ws-1", provider="codex")
     assert len(client.calls) == 1
+
+
+def test_recorded_id_absent_but_correlated_tab_present_remains_unknown(
+    tmp_path: Path,
+) -> None:
+    readiness, client = service(tmp_path, "cleanup-unknown")
+    unresolved = readiness.probe(workspace_id="ws-1", provider="codex")
+    client.outcome = "success"
+    client.tabs += (
+        TabState(
+            "replacement-id",
+            "ws-1",
+            unresolved.probe_name,
+            "codex-cli",
+            "codex",
+        ),
+    )
+
+    reconciled = readiness.reconcile()
+
+    assert reconciled.status == "unknown"
+    assert reconciled.tab_id == "replacement-id"
+    assert reconciled.retained_tab_id == "replacement-id"
+    assert "Recorded probe tab 'probe-tab' is absent" in str(reconciled.detail)
+    assert (tmp_path / "readiness.json").exists()
+
+
+def test_two_services_serialize_probe_ownership_and_reload_shared_state(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "readiness.json"
+    first_client = BlockingProbeClient()
+    second_client = ProbeClient()
+    first = AgentReadinessService(
+        ProbeRuntime(first_client),
+        token_factory=lambda: "first-owner",
+        state_file=state_file,
+    )
+    second = AgentReadinessService(
+        ProbeRuntime(second_client),
+        token_factory=lambda: "second-owner",
+        state_file=state_file,
+    )
+    results: list[AgentReadinessStatus] = []
+    errors: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            results.append(first.probe(workspace_id="ws-1", provider="codex"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert first_client.entered.wait(3)
+    try:
+        with pytest.raises(ReadinessProbeBusy, match="another Runner process"):
+            second.probe(workspace_id="ws-1", provider="codex")
+        assert second_client.calls == []
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        assert persisted["probe"]["correlationId"] == "first-owner"
+    finally:
+        first_client.release.set()
+        thread.join(3)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert [result.status for result in results] == ["unknown"]
+    with pytest.raises(ReadinessReconciliationRequired, match="reconciled"):
+        second.probe(workspace_id="ws-1", provider="codex")
+    assert second_client.calls == []
 
 
 def test_unresolved_creation_survives_restart_until_explicit_reconciliation(
