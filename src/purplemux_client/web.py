@@ -32,6 +32,7 @@ STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/log-display.js": ("log-display.js", "text/javascript; charset=utf-8"),
     "/output-copy.js": ("output-copy.js", "text/javascript; charset=utf-8"),
     "/python-workflow-guide.md": (
         "python-workflow-guide.md",

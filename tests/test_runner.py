@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,10 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     assert result.state == "success"
     assert result.stdout == "HELLO_RUNNER\n"
     assert result.stderr == ""
+    assert "".join(entry.text for entry in result.stdout_entries) == result.stdout
+    assert result.stderr_entries == ()
+    observed_at = datetime.fromisoformat(result.stdout_entries[0].observed_at)
+    assert observed_at.tzinfo is not None
     assert result.exit_code == 0
 
 
@@ -72,6 +77,25 @@ def test_stderr(runner: PythonRunner) -> None:
 
     assert result.state == "success"
     assert result.stderr == "BAD\n"
+    assert "".join(entry.text for entry in result.stderr_entries) == result.stderr
+    assert result.stdout_entries == ()
+
+
+def test_sequential_output_has_chronological_observation_timestamps(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        'import time; print("first", flush=True); time.sleep(0.2); print("second")'
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.stdout == "first\nsecond\n"
+    assert len(result.stdout_entries) >= 2
+    observed_at = [
+        datetime.fromisoformat(entry.observed_at) for entry in result.stdout_entries
+    ]
+    assert observed_at == sorted(observed_at)
 
 
 def test_standard_library_alias_import_passes_and_runs(runner: PythonRunner) -> None:
@@ -262,6 +286,7 @@ def test_output_is_bounded_and_reports_truncation() -> None:
         runner.close()
 
     assert result.stdout == "[output truncated; showing tail]\n" + "x" * 20
+    assert "".join(entry.text for entry in result.stdout_entries) == result.stdout
 
 
 def test_runner_rejects_non_posix_platform(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,8 +318,12 @@ def test_runs_execute_concurrently_with_independent_output(
     assert first_running.state == "running"
     assert runner.snapshot(first_id).state == "running"
     assert runner.snapshot(first_id).stdout == "first-start\n"
+    assert [entry.text for entry in runner.snapshot(first_id).stdout_entries] == [
+        "first-start\n"
+    ]
     assert second.state == "success"
     assert second.stdout == "second\n"
+    assert [entry.text for entry in second.stdout_entries] == ["second\n"]
     assert runner.stop(first_id) is True
 
 
@@ -421,6 +450,8 @@ print("continued safely")
     assert first.checkpoint is not None
     assert first.checkpoint.name == "resource created"
     assert first.attempts[0].state == "failed"
+    first_stdout_entries = first.stdout_entries
+    first_observed_at = [entry.observed_at for entry in first_stdout_entries]
 
     (tmp_path / "side-effect.txt").write_text("manually repaired", encoding="utf-8")
     (tmp_path / "repair.complete").touch()
@@ -432,6 +463,12 @@ print("continued safely")
     assert (tmp_path / "side-effect.txt").read_text() == "manually repaired"
     assert "[resume attempt 2 from checkpoint 'resource created']" in resumed.stdout
     assert resumed.stdout.endswith("continued safely\n")
+    assert resumed.stdout_entries[: len(first_stdout_entries)] == first_stdout_entries
+    assert [
+        entry.observed_at
+        for entry in resumed.stdout_entries[: len(first_stdout_entries)]
+    ] == first_observed_at
+    assert len(resumed.stdout_entries) > len(first_stdout_entries)
     assert [(attempt.state, attempt.resumed_from) for attempt in resumed.attempts] == [
         ("failed", None),
         ("success", "resource created"),
@@ -938,6 +975,11 @@ def test_runner_http_lifecycle(
         raise AssertionError("HTTP run did not finish")
 
     assert status == 200
+    stdout_entries = result.pop("stdoutEntries")
+    stderr_entries = result.pop("stderrEntries")
+    assert [entry["text"] for entry in stdout_entries] == ["HTTP_OK\n"]
+    assert datetime.fromisoformat(stdout_entries[0]["observedAt"]).tzinfo is not None
+    assert stderr_entries == []
     assert result == {
         "state": "success",
         "stdout": "HTTP_OK\n",
@@ -1361,7 +1403,7 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
 ) -> None:
     address, _ = web_server
     documents = {}
-    for path in ["/", "/output-copy.js", "/app.js"]:
+    for path in ["/", "/log-display.js", "/output-copy.js", "/app.js"]:
         connection = http.client.HTTPConnection(*address, timeout=3)
         connection.request("GET", path)
         response = connection.getresponse()
@@ -1370,10 +1412,13 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
         assert response.status == 200
 
     index = documents["/"]
+    log_display = documents["/log-display.js"]
     helper = documents["/output-copy.js"]
     script = documents["/app.js"]
     assert 'id="output-copy"' in index
     assert 'id="guide-copy"' in index
+    assert '<script src="/log-display.js"></script>' in index
+    assert "formatOutputEntries" in log_display
     assert "writeText" in helper
     assert 'execCommand("copy")' in helper
     assert "runnerOutputClipboard.writeText" in script

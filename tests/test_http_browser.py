@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import socket
 import threading
@@ -75,7 +76,14 @@ def test_copy_actions_on_insecure_http_origin(
         driver.get(url)
         wait = WebDriverWait(driver, 5)
         wait.until(
-            lambda browser: browser.find_element(By.ID, "stdout").text == "HTTP_STDOUT"
+            lambda browser: browser.find_element(By.ID, "stdout").text.endswith(
+                "  HTTP_STDOUT"
+            )
+        )
+        timestamped_stdout = driver.find_element(By.ID, "stdout").text
+        assert re.fullmatch(
+            r"(?:Today|Yesterday|\d{1,2}/\d{1,2}) \d{2}:\d{2}:\d{2}  HTTP_STDOUT",
+            timestamped_stdout,
         )
         assert driver.execute_script("return window.isSecureContext") is False
         assert driver.execute_script("return typeof navigator.clipboard") == "undefined"
