@@ -218,3 +218,89 @@ def test_ready_integration_pr_without_exact_approval_stops_before_mutation(
         )
 
     assert events == ["inspect-open"]
+
+
+@pytest.mark.parametrize(
+    "phase", ["integration_review_turn_pending", "integration_fix_turn_pending"]
+)
+def test_pending_integration_turn_is_never_resent(tmp_path: Path, phase: str) -> None:
+    class Unexpected:
+        def __getattr__(self, name: str):
+            pytest.fail(f"pending turn performed {name}")
+
+    with pytest.raises(purplemux_client.MutationOutcomeUnknown, match="do not resend"):
+        SAMPLE_MODULE.integration_review(
+            config(tmp_path),
+            Unexpected(),
+            Unexpected(),
+            Unexpected(),
+            SAMPLE_MODULE.Recovery(phase=phase),
+        )
+
+
+def test_final_check_send_uncertainty_checkpoints_exact_shell_before_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoints: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "save_checkpoint",
+        lambda name, data: checkpoints.append((name, data)),
+    )
+    state = SAMPLE_MODULE.Recovery(phase="integration_approved")
+
+    class Client:
+        def start_shell(self, _request: object, *, on_created: object):
+            on_created("tab-checks", "/tmp/awm-shell-checks/result.json")
+            raise purplemux_client.MutationOutcomeUnknown("send outcome unknown")
+
+    with pytest.raises(purplemux_client.MutationOutcomeUnknown):
+        SAMPLE_MODULE.run_final_checks(Client(), config(tmp_path), state)
+
+    assert state.phase == "integration_checks_running"
+    assert state.check_shell == "tab-checks"
+    assert state.check_result_path == "/tmp/awm-shell-checks/result.json"
+    assert checkpoints[-1][0] == "integration_checks_running"
+    assert checkpoints[-1][1]["check_shell"] == "tab-checks"
+
+
+def test_running_final_check_reattaches_without_new_shell_or_agent_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
+    state = SAMPLE_MODULE.Recovery(
+        phase="integration_checks_running",
+        check_shell="tab-checks",
+        check_result_path="/tmp/awm-shell-checks/result.json",
+    )
+    events: list[str] = []
+
+    class Client:
+        def start_shell(self, *_args: object, **_kwargs: object):
+            pytest.fail("resumed final checks created a new shell")
+
+        def send_input(self, *_args: object, **_kwargs: object):
+            pytest.fail("resumed final checks sent an agent turn")
+
+        def resume_shell(self, tab: str, result_path: str) -> None:
+            events.append(f"resume:{tab}:{result_path}")
+
+        def wait_for_shell_completion(self, tab: str, _timeout: int) -> None:
+            events.append(f"wait:{tab}")
+
+        def read_shell_result(self, tab: str):
+            events.append(f"read:{tab}")
+            return purplemux_client.ShellResult(0)
+
+        def close_session(self, tab: str) -> None:
+            events.append(f"close:{tab}")
+
+    SAMPLE_MODULE.run_final_checks(Client(), config(tmp_path), state)
+
+    assert state.phase == "integration_checks_closed"
+    assert events == [
+        "resume:tab-checks:/tmp/awm-shell-checks/result.json",
+        "wait:tab-checks",
+        "read:tab-checks",
+        "close:tab-checks",
+    ]

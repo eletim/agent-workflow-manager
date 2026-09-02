@@ -40,6 +40,7 @@ def test_static_validation_rejects_raw_filesystem_mutation_facilities(
     [
         "from pathlib import Path\nPath('changed').open('w').write('changed')",
         "from pathlib import Path\npath = Path('changed')\npath.open('w').close()",
+        ("from pathlib import Path\nmode = 'w'\nPath('changed').open(mode).close()"),
         ("import os\nfd = os.open('changed', os.O_WRONLY | os.O_CREAT)\nos.close(fd)"),
     ],
 )

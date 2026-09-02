@@ -268,7 +268,11 @@ def test_shell_send_unusable_response_preserves_created_tab_correlation(
 
 def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> None:
     runner = FakeRunner(
-        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed({"status": "closed"}),
+        ]
     )
     cli = client(runner)
     session_id = cli.start_shell(
@@ -284,8 +288,37 @@ def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> N
 
     assert cli.read_shell_result(session_id).exit_code == 7
     assert cli.read_shell_result(session_id).exit_code == 7
-    assert not os.path.exists(os.path.dirname(result_path))
     assert len([call for call in runner.calls if call[1:3] != ["tab", "list"]]) == 2
+    assert os.path.exists(result_path)
+
+    cli.close_session(session_id)
+    assert not os.path.exists(os.path.dirname(result_path))
+
+
+def test_checkpointed_shell_can_reattach_without_resending(tmp_path) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed({"status": "closed"}),
+        ]
+    )
+    first = client(runner)
+    session_id = first.start_shell(
+        ShellCommandRequest(command="true", cwd=str(tmp_path), name="checks")
+    )
+    result_path = first._shell_runs[session_id].result_path
+    with open(result_path, "w", encoding="utf-8") as stream:
+        json.dump({"exitCode": 0}, stream)
+
+    resumed = client(runner)
+    resumed.resume_shell(session_id, result_path)
+    resumed.wait_for_shell_completion(session_id, 1)
+
+    assert resumed.read_shell_result(session_id).exit_code == 0
+    assert len([call for call in runner.calls if call[1:3] == ["tab", "send"]]) == 1
+    resumed.close_session(session_id)
+    assert not os.path.exists(os.path.dirname(result_path))
 
 
 def test_shell_commands_can_complete_independently(tmp_path) -> None:

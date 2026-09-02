@@ -311,6 +311,28 @@ class WorkflowValidator:
             ".rename",
             ".replace",
         }
+        path_variables: set[str] = set()
+        for assignment in ast.walk(tree):
+            value: ast.expr | None = None
+            targets: list[ast.expr] = []
+            if isinstance(assignment, ast.Assign):
+                value = assignment.value
+                targets = assignment.targets
+            elif isinstance(assignment, ast.AnnAssign):
+                value = assignment.value
+                targets = [assignment.target]
+            if not isinstance(value, ast.Call):
+                continue
+            constructor = self._qualified_name(value.func)
+            if constructor:
+                root, separator, remainder = constructor.partition(".")
+                constructor = aliases.get(root, root) + (
+                    separator + remainder if separator else ""
+                )
+            if constructor == "pathlib.Path":
+                path_variables.update(
+                    target.id for target in targets if isinstance(target, ast.Name)
+                )
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -324,12 +346,20 @@ class WorkflowValidator:
                 node
             )
             raw_os_open = name == "os.open" and self._os_open_can_write(node)
-            raw_method_open = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "open"
-                and not (name or "").startswith("purplemux_client.")
-                and self._method_open_can_write(node)
-            )
+            filesystem_open = False
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "open":
+                receiver = node.func.value
+                if isinstance(receiver, ast.Name):
+                    filesystem_open = receiver.id in path_variables
+                elif isinstance(receiver, ast.Call):
+                    constructor = self._qualified_name(receiver.func)
+                    if constructor:
+                        root, separator, remainder = constructor.partition(".")
+                        constructor = aliases.get(root, root) + (
+                            separator + remainder if separator else ""
+                        )
+                    filesystem_open = constructor == "pathlib.Path"
+            raw_method_open = filesystem_open and self._method_open_can_write(node)
             if raw_open:
                 name = "open"
             raw_mutation_method = False
@@ -402,10 +432,7 @@ class WorkflowValidator:
         try:
             mode = ast.literal_eval(mode_node)
         except (ValueError, TypeError):
-            # Unknown receivers include safe factory methods such as
-            # GitRepository.open(path). Literal write modes remain detectable
-            # for both Path(...).open("w") and path.open("w").
-            return False
+            return True
         return not isinstance(mode, str) or (
             bool(mode)
             and set(mode) <= set("rwaxbt+")

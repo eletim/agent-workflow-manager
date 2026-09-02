@@ -503,7 +503,12 @@ class PurpleMuxCLIClient:
             True,
         )
 
-    def start_shell(self, request: ShellCommandRequest) -> str:
+    def start_shell(
+        self,
+        request: ShellCommandRequest,
+        *,
+        on_created: Callable[[str, str], None] | None = None,
+    ) -> str:
         """Start one Bash command in a visible, named PurpleMux terminal."""
         if not request.command:
             raise ValueError("shell command must not be empty")
@@ -522,6 +527,8 @@ class PurpleMuxCLIClient:
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
         self._shell_runs[session_id] = _ShellRun(result_path=result_path)
+        if on_created is not None:
+            on_created(session_id, result_path)
         wrapper = self._shell_wrapper(request.command, cwd, result_path)
         try:
             self._send_mutation(session_id, wrapper, operation="start shell command")
@@ -536,6 +543,30 @@ class PurpleMuxCLIClient:
                 f"shell terminal {session_id} was created but command start failed: {exc}"
             ) from exc
         return session_id
+
+    def resume_shell(self, session_id: str, result_path: str) -> None:
+        """Reattach a checkpointed managed shell without sending its command again."""
+        if session_id in self._shell_runs:
+            if self._shell_runs[session_id].result_path != result_path:
+                raise WorkerFailure(f"session {session_id} shell identity conflicts")
+            return
+        normalized = os.path.abspath(result_path)
+        parent = os.path.dirname(normalized)
+        if os.path.basename(normalized) != "result.json" or not os.path.basename(
+            parent
+        ).startswith("awm-shell-"):
+            raise WorkerFailure("checkpointed shell result path is invalid")
+        tabs = self.list_sessions()
+        tab = next((item for item in tabs if item.id == session_id), None)
+        if tab is None and not os.path.isfile(normalized):
+            raise MutationOutcomeUnknown(
+                f"checkpointed shell {session_id} and its result are not observable"
+            )
+        if tab is not None and tab.panel_type != "terminal":
+            raise MutationConflict(
+                f"checkpointed shell {session_id} is no longer a terminal"
+            )
+        self._shell_runs[session_id] = _ShellRun(result_path=normalized)
 
     def wait_for_shell_completion(
         self, session_id: str, timeout_seconds: float
@@ -822,7 +853,6 @@ class PurpleMuxCLIClient:
             raise WorkerFailure(
                 f"shell terminal {session_id} published an invalid exit code"
             )
-        self._cleanup_shell_result(shell_run)
         return ShellResult(exit_code=exit_code)
 
     @staticmethod

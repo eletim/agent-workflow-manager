@@ -90,6 +90,8 @@ class Recovery:
     turn_base_sha: str | None = None
     prepared_base_sha: str | None = None
     correlation_id: str | None = None
+    check_shell: str | None = None
+    check_result_path: str | None = None
 
     def checkpoint(self, config: Config) -> None:
         data = {
@@ -108,6 +110,8 @@ class Recovery:
             "turn_base_sha": self.turn_base_sha,
             "prepared_base_sha": self.prepared_base_sha,
             "correlation_id": self.correlation_id,
+            "check_shell": self.check_shell,
+            "check_result_path": self.check_result_path,
         }
         data.update({key: value for key, value in values.items() if value is not None})
         save_checkpoint(self.phase, data)
@@ -168,6 +172,8 @@ def load_recovery(config: Config, checkpoint: ResumeCheckpoint | None) -> Recove
             turn_base_sha=data.get("turn_base_sha"),
             prepared_base_sha=data.get("prepared_base_sha"),
             correlation_id=data.get("correlation_id"),
+            check_shell=data.get("check_shell"),
+            check_result_path=data.get("check_result_path"),
         )
     except (KeyError, ValueError) as exc:
         raise WorkerFailure("checkpoint is incomplete or malformed") from exc
@@ -382,6 +388,71 @@ def require_issue_pr(
         "git", f"{issue.branch} pushed at {feature.remote_sha}; base {pr.base_sha}"
     )
     return pr
+
+
+def run_final_checks(
+    client: PurpleMuxCLIClient, config: Config, recovery: Recovery
+) -> None:
+    if recovery.phase in {
+        "integration_checks_start_pending",
+        "integration_checks_create_pending",
+    }:
+        raise MutationOutcomeUnknown(
+            "final-check shell creation may have completed; inspect its saved "
+            "correlation before any new mutation"
+        )
+    if recovery.phase == "integration_checks_close_pending":
+        raise MutationOutcomeUnknown(
+            f"final-check shell {recovery.check_shell} close outcome is unknown; "
+            "do not retry until reconciled"
+        )
+
+    if recovery.phase == "integration_checks_running":
+        if recovery.check_shell is None or recovery.check_result_path is None:
+            raise WorkerFailure("final-check running checkpoint lacks shell identity")
+        shell = recovery.check_shell
+        client.resume_shell(shell, recovery.check_result_path)
+    elif recovery.phase not in {
+        "integration_checks_complete",
+        "integration_checks_closed",
+    }:
+        recovery.phase = "integration_checks_create_pending"
+        recovery.checkpoint(config)
+
+        def shell_created(tab: str, result_path: str) -> None:
+            recovery.check_shell = tab
+            recovery.check_result_path = result_path
+            recovery.phase = "integration_checks_running"
+            recovery.checkpoint(config)
+
+        shell = client.start_shell(
+            ShellCommandRequest(
+                config.check_command,
+                str(config.repo),
+                f"Final whole-version checks [awm:checks-{config.signature}]",
+            ),
+            on_created=shell_created,
+        )
+        if shell != recovery.check_shell:
+            raise MutationOutcomeUnknown(
+                "final-check shell identity changed after start"
+            )
+
+    if recovery.phase == "integration_checks_running":
+        assert recovery.check_shell is not None
+        client.wait_for_shell_completion(recovery.check_shell, SHELL_TIMEOUT)
+        if client.read_shell_result(recovery.check_shell).exit_code != 0:
+            raise WorkerFailure("final whole-version checks failed")
+        recovery.phase = "integration_checks_complete"
+        recovery.checkpoint(config)
+
+    if recovery.phase == "integration_checks_complete":
+        assert recovery.check_shell is not None
+        recovery.phase = "integration_checks_close_pending"
+        recovery.checkpoint(config)
+        client.close_session(recovery.check_shell)
+        recovery.phase = "integration_checks_closed"
+        recovery.checkpoint(config)
 
 
 def prepare_issue(
@@ -608,6 +679,24 @@ def integration_review(
     github: GitHubRepository,
     recovery: Recovery,
 ) -> PullRequestState:
+    if recovery.phase in {
+        "integration_review_turn_pending",
+        "integration_fix_turn_pending",
+    }:
+        raise MutationOutcomeUnknown(
+            "a prior integration agent turn may have been sent; do not resend "
+            "until its exact outcome is reconciled"
+        )
+    if recovery.phase == "integration_checks_close_pending":
+        raise MutationOutcomeUnknown(
+            f"final-check shell {recovery.check_shell} close outcome is unknown; "
+            "do not create or send anything until it is reconciled"
+        )
+    if recovery.phase == "integration_checks_start_pending":
+        raise MutationOutcomeUnknown(
+            "final-check shell creation may have completed under the prior "
+            "checkpoint; inspect before any new mutation"
+        )
     if recovery.phase.endswith("_create_pending"):
         raise MutationOutcomeUnknown(
             "a prior integration workspace/session creation may have completed; "
@@ -638,6 +727,12 @@ def integration_review(
     )
     inspect_integration_pr_topology(github, config, recovery)
     client = ensure_workspace(runtime, config, recovery)
+    if recovery.phase.startswith("integration_checks_") and (
+        recovery.implementer is None or recovery.reviewer is None
+    ):
+        raise WorkerFailure(
+            "final-check recovery lacks the original agent tab identities"
+        )
     if recovery.implementer is None:
         inspect_integration_pr_topology(github, config, recovery)
         recovery.phase = "integration_fixer_create_pending"
@@ -663,10 +758,22 @@ def integration_review(
         recovery.phase = "integration_sessions_ready"
         recovery.checkpoint(config)
     assert recovery.implementer and recovery.reviewer
-    approved = (
-        recovery.phase == "integration_approved"
-        and not reopen_if_topology_drifted(pr, recovery, "integration_fix_done", config)
-    )
+    if recovery.phase.startswith("integration_checks_"):
+        if (
+            recovery.approved_sha != pr.head_sha
+            or recovery.approved_base_sha != pr.base_sha
+        ):
+            raise MutationOutcomeUnknown(
+                "approved topology changed while the final-check shell may be active"
+            )
+        approved = True
+    else:
+        approved = (
+            recovery.phase == "integration_approved"
+            and not reopen_if_topology_drifted(
+                pr, recovery, "integration_fix_done", config
+            )
+        )
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
         pr = github.require_pr(
@@ -725,17 +832,7 @@ def integration_review(
     if not approved:
         raise WorkerFailure("whole-version review ended without approval")
     pr = require_reviewed_topology(github, pr, recovery)
-    recovery.phase = "integration_checks_start_pending"
-    recovery.checkpoint(config)
-    shell = client.start_shell(
-        ShellCommandRequest(
-            config.check_command, str(config.repo), "Final whole-version checks"
-        )
-    )
-    client.wait_for_shell_completion(shell, SHELL_TIMEOUT)
-    if client.read_shell_result(shell).exit_code != 0:
-        raise WorkerFailure("final whole-version checks failed")
-    client.close_session(shell)
+    run_final_checks(client, config, recovery)
     pr = github.set_draft(
         pr.number,
         draft=False,
