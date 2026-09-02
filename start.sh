@@ -48,6 +48,7 @@ purplemux_remediation() {
 
 validate_purplemux() {
     local help_output
+    local help_status=0
     local runtime_output
     local required_contract
 
@@ -59,10 +60,16 @@ validate_purplemux() {
     fi
     require_command timeout
 
-    if ! help_output=$(timeout --signal=TERM --kill-after=1 5 \
-        purplemux --help 2>&1); then
-        printf '%s\n' \
-            'ERROR: the purplemux CLI could not report its command contract within 5 seconds.' >&2
+    help_output=$(timeout --signal=TERM --kill-after=1 5 \
+        purplemux help 2>&1) || help_status=$?
+    if ((help_status != 0)); then
+        if ((help_status == 124)); then
+            printf '%s\n' \
+                'ERROR: the purplemux CLI did not respond within 5 seconds.' >&2
+        else
+            printf 'ERROR: purplemux help failed (exit %d):\n%s\n' \
+                "$help_status" "$help_output" >&2
+        fi
         purplemux_remediation
         exit 1
     fi
