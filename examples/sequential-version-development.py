@@ -407,9 +407,12 @@ def run_final_checks(
             "do not retry until reconciled"
         )
 
-    if recovery.phase == "integration_checks_running":
+    if recovery.phase in {
+        "integration_checks_running",
+        "integration_checks_complete",
+    }:
         if recovery.check_shell is None or recovery.check_result_path is None:
-            raise WorkerFailure("final-check running checkpoint lacks shell identity")
+            raise WorkerFailure("final-check checkpoint lacks shell identity")
         shell = recovery.check_shell
         client.resume_shell(shell, recovery.check_result_path)
     elif recovery.phase not in {
@@ -478,11 +481,27 @@ def prepare_issue(
     resumed = recovery.issue_number == issue.number and recovery.phase.startswith(
         "issue_"
     )
-    if worktree.dirty:
-        if not resumed or recovery.prepared_base_sha is None:
-            raise WorkerFailure("dirty worktree is not an active prepared Issue resume")
+    if resumed:
+        if recovery.prepared_base_sha is None:
+            raise WorkerFailure("prepared Issue checkpoint lacks its base SHA")
         repo.require_current_branch(issue.branch)
-        repo.require_contains(issue.branch, recovery.prepared_base_sha)
+        prepared = repo.inspect_feature_preparation(
+            issue.branch,
+            base=config.integration_branch,
+            expected_base_sha=recovery.prepared_base_sha,
+        )
+        if prepared.base_is_ancestor is not True:
+            raise WorkerFailure(
+                f"resumed branch {issue.branch} does not contain checkpointed base "
+                f"{recovery.prepared_base_sha}"
+            )
+        emit_finding(
+            "git",
+            f"resumed {issue.branch} still contains {config.integration_branch} "
+            f"@ {recovery.prepared_base_sha}",
+        )
+    elif worktree.dirty:
+        raise WorkerFailure("dirty worktree is not an active prepared Issue resume")
     else:
         integration = repo.synchronize_branch(config.integration_branch)
         assert integration.remote_sha is not None

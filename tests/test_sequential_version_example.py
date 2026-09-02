@@ -142,6 +142,65 @@ def test_each_issue_session_creation_has_an_immediate_open_pr_gate() -> None:
     assert calls.count("create_agent") == 2
 
 
+def test_clean_issue_resume_validates_checkpointed_preparation_without_mutation(
+    tmp_path: Path,
+) -> None:
+    base_sha = "b" * 40
+    branch = config(tmp_path).issues[0].branch
+    events: list[str] = []
+
+    class GitHub:
+        def find_pr(self, *, state: str, **_kwargs: object):
+            events.append(f"pr:{state}")
+            return None
+
+    class Repo:
+        def inspect_worktree(self):
+            events.append("worktree")
+            return purplemux_client.WorktreeState(tmp_path, branch, False, ())
+
+        def require_current_branch(self, requested: str):
+            events.append(f"current:{requested}")
+
+        def inspect_feature_preparation(
+            self, requested: str, *, base: str, expected_base_sha: str
+        ):
+            events.append(f"prepared:{requested}:{base}:{expected_base_sha}")
+            feature = purplemux_client.BranchState(requested, "c" * 40, "c" * 40, True)
+            base_state = purplemux_client.BranchState(base, base_sha, base_sha, False)
+            return purplemux_client.FeaturePreparationState(
+                feature, base_state, expected_base_sha, True, "switch"
+            )
+
+        def synchronize_branch(self, _branch: str):
+            pytest.fail("clean resume synchronized integration again")
+
+        def prepare_feature_branch(self, *_args: object, **_kwargs: object):
+            pytest.fail("clean resume prepared the feature again")
+
+    state = SAMPLE_MODULE.Recovery(
+        phase="issue_implementation_done",
+        issue_number=1,
+        prepared_base_sha=base_sha,
+    )
+
+    assert (
+        SAMPLE_MODULE.prepare_issue(
+            Repo(), GitHub(), config(tmp_path).issues[0], config(tmp_path), state
+        )
+        is None
+    )
+    assert state.prepared_base_sha == base_sha
+    assert events == [
+        "pr:OPEN",
+        "pr:MERGED",
+        "pr:OPEN",
+        "worktree",
+        f"current:{branch}",
+        f"prepared:{branch}:dev/v1.2.3:{base_sha}",
+    ]
+
+
 def test_review_approval_tracks_and_invalidates_both_shas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -302,5 +361,32 @@ def test_running_final_check_reattaches_without_new_shell_or_agent_turn(
         "resume:tab-checks:/tmp/awm-shell-checks/result.json",
         "wait:tab-checks",
         "read:tab-checks",
+        "close:tab-checks",
+    ]
+
+
+def test_completed_final_check_reattaches_before_confirmed_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
+    state = SAMPLE_MODULE.Recovery(
+        phase="integration_checks_complete",
+        check_shell="tab-checks",
+        check_result_path="/tmp/awm-shell-checks/result.json",
+    )
+    events: list[str] = []
+
+    class Client:
+        def resume_shell(self, tab: str, result_path: str) -> None:
+            events.append(f"resume:{tab}:{result_path}")
+
+        def close_session(self, tab: str) -> None:
+            events.append(f"close:{tab}")
+
+    SAMPLE_MODULE.run_final_checks(Client(), config(tmp_path), state)
+
+    assert state.phase == "integration_checks_closed"
+    assert events == [
+        "resume:tab-checks:/tmp/awm-shell-checks/result.json",
         "close:tab-checks",
     ]
