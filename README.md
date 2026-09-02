@@ -51,6 +51,55 @@ runtime dependency and none of its workflow framework is included here.
 - PurpleMux is an agent runtime.
 - The local runner executes, observes, and stops Python processes.
 
+## Git and GitHub topology operations
+
+Plain Python workflows can enforce repository and pull-request structure through
+`GitRepository` and `GitHubRepository`. These validated handles recheck repository
+identity on every public operation, keep read-named methods mutation-free, and only
+permit branch creation/tracking/switching and fast-forward Git changes. They never
+reset, rebase, force-push, delete branches, stash changes, or resolve conflicts.
+
+```python
+from purplemux_client import GitHubRepository, GitRepository
+
+repo = GitRepository.open(
+    "/workspace/project",
+    expected_github_slug="owner/project",
+)
+github = GitHubRepository.open("owner/project")
+
+integration = repo.synchronize_branch("dev/v1.2.3")
+assert integration.remote_sha is not None
+feature = repo.prepare_feature_branch(
+    "feature/issue-123",
+    base="dev/v1.2.3",
+    expected_base_sha=integration.remote_sha,
+)
+
+# Agent code still owns editing, testing, committing, and pushing.
+feature = repo.require_pushed("feature/issue-123")
+pull_request = github.require_pr(
+    head="feature/issue-123",
+    base="dev/v1.2.3",
+    expected_head_sha=feature.remote_sha,
+)
+```
+
+PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
+open PR for the requested head but a different base, multiple exact candidates,
+or an unproven final page fails closed. Ready/Draft changes require the exact
+reviewed head and base SHAs. `merge_pr()` uses only GitHub's immediate merge
+endpoint with merge-commit mode; it never invokes `gh pr merge`, enables
+auto-merge, or enters a merge queue, and it verifies the merge commit's parents
+and resulting base branch.
+
+Each mutation is dispatched once. A timeout, lost response, malformed response,
+or ambiguous nonzero result triggers read-only, operation-specific reconciliation.
+If later completion cannot be excluded, the operation raises
+`MutationOutcomeUnknown` even when an immediate read still matches the pre-state.
+This operation layer supplies safety primitives only: Issue order, review loops,
+approval provenance, and release policy remain ordinary Python control flow.
+
 ## PurpleMux adapter
 
 `purplemux_client.PurpleMuxCLIClient` is a thin adapter over the public
