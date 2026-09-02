@@ -957,6 +957,7 @@ def test_runner_http_lifecycle(
                 "resumedFrom": None,
             }
         ],
+        "code": 'print("HTTP_OK")',
         "suspensionReason": None,
         "resumable": False,
     }
@@ -1215,6 +1216,66 @@ def test_run_api_passes_run_scoped_execution_context(
         str(tmp_path),
         ["--repo", "target repo"],
     ]
+
+
+def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    """Issue #45: /api/runs/{id} must return each run's own submitted code,
+    unaffected by other runs starting, while /api/runs list summaries stay
+    lightweight (no full source)."""
+    address, token = web_server
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    first_code = "print('RUN=A')"
+    second_code = "print('RUN=B')"
+
+    status, first = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": first_code, "cwd": str(first_cwd), "args": ["A-ARG"]}),
+        token=token,
+    )
+    assert status == 202
+    first_id = int(first["runId"])
+    assert first["code"] == first_code
+
+    status, before = request(address, "GET", f"/api/runs/{first_id}")
+    assert status == 200
+    assert before["code"] == first_code
+
+    status, second = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": second_code, "cwd": str(second_cwd), "args": ["B-ARG"]}),
+        token=token,
+    )
+    assert status == 202
+    second_id = int(second["runId"])
+    assert second["code"] == second_code
+
+    # The first run's own snapshot must be unaffected by the second run
+    # starting and executing with a different cwd/args/code.
+    status, after = request(address, "GET", f"/api/runs/{first_id}")
+    assert status == 200
+    assert after["code"] == before["code"] == first_code
+    assert after["cwd"] == before["cwd"] == str(first_cwd)
+    assert after["args"] == before["args"] == ["A-ARG"]
+
+    status, second_detail = request(address, "GET", f"/api/runs/{second_id}")
+    assert status == 200
+    assert second_detail["code"] == second_code
+    assert second_detail["cwd"] == str(second_cwd)
+
+    # The list summary intentionally omits the full source.
+    status, listed = request(address, "GET", "/api/runs")
+    assert status == 200
+    assert len(listed["runs"]) == 2
+    assert all("code" not in run for run in listed["runs"])
 
 
 @pytest.mark.parametrize(

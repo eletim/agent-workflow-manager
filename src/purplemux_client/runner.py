@@ -114,6 +114,13 @@ class RunnerSnapshot:
     checkpoint: ResumeCheckpoint | None
     attempts: tuple[RunAttempt, ...]
     suspension_reason: str | None
+    # Submitted Python source for this run's immutable execution snapshot.
+    # Populated only for an actual run (see ``_snapshot_run``); left ``None``
+    # for the idle/validation preview, which is not tied to a persisted run.
+    # Exposed via ``as_json`` (run detail) but intentionally left out of
+    # ``as_summary_json`` (the ``/api/runs`` list) to keep that summary
+    # lightweight.
+    code: str | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -529,6 +536,7 @@ class PythonRunner:
             checkpoint=run.checkpoint,
             attempts=tuple(run.attempts),
             suspension_reason=run.suspension_reason,
+            code=run.code,
         )
 
     def _get_run(self, run_id: int) -> _RunRecord:

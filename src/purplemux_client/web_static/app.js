@@ -4,6 +4,7 @@ const runArguments = document.querySelector("#run-arguments");
 const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
+const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
 const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
@@ -49,6 +50,15 @@ let guideText = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
+// `activeRunId === null` is the single source of truth for "drafting a new
+// run" (fields editable) vs. "viewing an existing run" (fields read-only,
+// sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
+// retains the new-run cwd/args/code independently of whichever run is
+// currently being viewed, so switching runs never loses it. `explicitNewRun`
+// suppresses the "auto-select the latest run" behavior in refresh() once the
+// user has explicitly asked to compose or submit a new run.
+let draft = {cwd: "", args: "", code: code.value};
+let explicitNewRun = false;
 let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
@@ -86,6 +96,32 @@ function renderFavicon(runs) {
   });
 }
 
+// Fields are editable draft while no run is selected, and a read-only view of
+// that run's immutable snapshot once one is. Keep this in sync with
+// `activeRunId` after every render, since that's the single source of truth
+// for which mode is active.
+function applyFieldMode() {
+  const drafting = activeRunId === null;
+  workingDirectory.readOnly = !drafting;
+  runArguments.readOnly = !drafting;
+  code.readOnly = !drafting;
+  runButton.disabled = !drafting;
+  validateButton.disabled = !drafting;
+}
+
+function showDraftLabel() {
+  activeContext.textContent = "New run (draft) — not yet submitted";
+}
+
+// Snapshot the fields into the retained draft only when they currently *are*
+// the draft (i.e. before something else, like selecting a run, overwrites
+// them). Call this right before any transition away from drafting.
+function captureDraftIfEditing() {
+  if (activeRunId === null) {
+    draft = {cwd: workingDirectory.value, args: runArguments.value, code: code.value};
+  }
+}
+
 function renderRun(result) {
   const running = result.state === "running";
   statusBadge.textContent = result.state;
@@ -93,20 +129,51 @@ function renderRun(result) {
   stdout.textContent = result.stdout;
   stderr.textContent = result.stderr;
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
-  runButton.disabled = false;
-  validateButton.disabled = false;
   stopButton.disabled = activeRunId === null || !running;
   resumeButton.disabled = activeRunId === null || !result.resumable;
   renderProgress(result.progress || []);
   renderRecovery(result);
-  const renderedArgs = (result.args || []).map((argument) => JSON.stringify(argument)).join(" ");
-  const label = result.runId == null ? "Configured run" : `Run #${result.runId}`;
-  activeContext.textContent = `${label}: ${result.cwd}${renderedArgs ? ` ${renderedArgs}` : ""}`;
+
+  // Only an authoritative snapshot for the run currently being viewed may
+  // populate the fields, never a stale response or another run's data.
+  if (result.runId != null && result.runId === activeRunId) {
+    workingDirectory.value = result.cwd ?? "";
+    runArguments.value = (result.args || []).join("\n");
+    code.value = result.code ?? "";
+    activeContext.textContent = `Viewing Run #${result.runId} (read-only)`;
+  } else if (activeRunId === null) {
+    showDraftLabel();
+  }
+  applyFieldMode();
 
   if (running) {
     stdout.scrollTop = stdout.scrollHeight;
     stderr.scrollTop = stderr.scrollHeight;
   }
+}
+
+async function enterDraftMode() {
+  const wasViewingRun = activeRunId !== null;
+  // A New-run click is an explicit selection even if the fields are already
+  // editable. Preserve those live edits while invalidating requests started
+  // for the previous selection.
+  captureDraftIfEditing();
+  // Only the draft/editable fields and the run-scoped controls change here;
+  // the output/progress/recovery panels are left showing whatever was last
+  // viewed (harmless reference) until a run is selected or started again.
+  activeRunGeneration += 1;
+  activeRunId = null;
+  explicitNewRun = true;
+  if (wasViewingRun) {
+    workingDirectory.value = draft.cwd;
+    runArguments.value = draft.args;
+    code.value = draft.code;
+  }
+  showDraftLabel();
+  stopButton.disabled = true;
+  resumeButton.disabled = true;
+  applyFieldMode();
+  await refresh();
 }
 
 function renderRecovery(result) {
@@ -147,8 +214,10 @@ function renderRunList(runs) {
     marker.setAttribute("aria-hidden", "true");
     button.prepend(marker);
     button.addEventListener("click", async () => {
+      captureDraftIfEditing();
       activeRunId = run.runId;
       activeRunGeneration += 1;
+      explicitNewRun = false;
       await refresh();
     });
     runList.append(button);
@@ -316,7 +385,11 @@ async function refresh() {
   try {
     const {runs} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
-    if (activeRunId === null && runs.length > 0) {
+    if (activeRunId === null && !explicitNewRun && runs.length > 0) {
+      // A run just appeared (e.g. discovered via SSE) while the fields held
+      // in-progress draft edits nobody submitted yet; retain them before
+      // auto-selecting, exactly as an explicit run-list click would.
+      captureDraftIfEditing();
       activeRunId = runs[runs.length - 1].runId;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;
@@ -409,7 +482,10 @@ function executionContextPayload() {
 }
 
 runButton.addEventListener("click", async () => {
+  if (activeRunId !== null) return; // must explicitly start a New run first
+  captureDraftIfEditing();
   const selectionGeneration = ++activeRunGeneration;
+  explicitNewRun = true;
   const validationGeneration = ++validationRequestGeneration;
   try {
     const result = await request("/api/run", {
@@ -418,8 +494,13 @@ runButton.addEventListener("click", async () => {
       body: JSON.stringify({code: code.value, ...executionContextPayload()}),
     });
     if (selectionGeneration === activeRunGeneration) {
+      // The fields remain editable while the request is pending. Retain any
+      // changes made since submission before replacing them with the run's
+      // authoritative snapshot.
+      captureDraftIfEditing();
       activeRunId = result.runId;
       activeRunGeneration += 1;
+      explicitNewRun = false;
       if (validationGeneration === validationRequestGeneration) {
         renderValidation(result.validation || []);
       }
@@ -437,7 +518,12 @@ runButton.addEventListener("click", async () => {
   }
 });
 
+newRunButton.addEventListener("click", async () => {
+  await enterDraftMode();
+});
+
 validateButton.addEventListener("click", async () => {
+  if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
   const requestGeneration = ++validationRequestGeneration;
   try {
     const result = await request("/api/validate", {
@@ -553,7 +639,6 @@ async function initialize() {
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
-  if (!workingDirectory.value) workingDirectory.value = initialStatus.cwd;
   if (initialStatus.state === "validation_failed") {
     renderValidation(initialStatus.validation || []);
   }
