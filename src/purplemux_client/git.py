@@ -319,8 +319,21 @@ class GitRepository:
                 f"base {base!r} must be synchronized at {expected_base_sha} first"
             )
         feature_remote = self._remote_sha(branch)
+
+        def recheck_authoritative_refs() -> None:
+            self._require_feature_preparation_refs(
+                branch,
+                base=base,
+                expected_base_sha=expected_base_sha,
+                expected_feature_sha=feature_remote,
+            )
+
         if feature_remote is not None:
-            self._fetch_branch(branch, feature_remote)
+            self._fetch_branch(
+                branch,
+                feature_remote,
+                pre_dispatch=recheck_authoritative_refs,
+            )
         state = self._inspect_branch_from_tracking(branch, feature_remote)
         if state.local_sha is None and feature_remote is None:
             self._git_mutation(
@@ -330,6 +343,7 @@ class GitRepository:
                 pre_state=state,
                 observe=lambda: self._inspect_branch_from_tracking(branch, None),
                 desired=lambda: self._branch_matches(branch, expected_base_sha, True),
+                pre_dispatch=recheck_authoritative_refs,
             )
         elif state.local_sha is None:
             assert feature_remote is not None
@@ -347,6 +361,7 @@ class GitRepository:
                     branch, feature_remote
                 ),
                 desired=lambda: self._branch_matches(branch, feature_remote, True),
+                pre_dispatch=recheck_authoritative_refs,
             )
         else:
             if feature_remote is not None and state.local_sha != feature_remote:
@@ -377,6 +392,7 @@ class GitRepository:
                         branch, feature_remote
                     ),
                     desired=lambda: self._current_branch() == branch,
+                    pre_dispatch=recheck_authoritative_refs,
                 )
             if needs_fast_forward:
                 assert feature_remote is not None
@@ -390,6 +406,7 @@ class GitRepository:
                         branch, feature_remote
                     ),
                     desired=lambda: self._branch_matches(branch, feature_remote, True),
+                    pre_dispatch=recheck_authoritative_refs,
                 )
         result = self.inspect_branch(branch)
         if result.local_sha is None or not result.current:
@@ -565,7 +582,13 @@ class GitRepository:
     def _tracking_ref(self, branch: str) -> str:
         return f"refs/remotes/{self.remote}/{branch}"
 
-    def _fetch_branch(self, branch: str, authoritative_sha: str) -> None:
+    def _fetch_branch(
+        self,
+        branch: str,
+        authoritative_sha: str,
+        *,
+        pre_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         before = self._tracking_sha(branch)
         self._git_mutation(
             [
@@ -579,7 +602,29 @@ class GitRepository:
             pre_state=before,
             observe=lambda: self._tracking_sha(branch),
             desired=lambda: self._tracking_sha(branch) == authoritative_sha,
+            pre_dispatch=pre_dispatch,
         )
+
+    def _require_feature_preparation_refs(
+        self,
+        branch: str,
+        *,
+        base: str,
+        expected_base_sha: str,
+        expected_feature_sha: str | None,
+    ) -> None:
+        base_sha = self._remote_sha(base)
+        if base_sha != expected_base_sha:
+            raise WorkerFailure(
+                f"remote base {base!r} changed before feature preparation: "
+                f"expected {expected_base_sha}, found {base_sha}"
+            )
+        feature_sha = self._remote_sha(branch)
+        if feature_sha != expected_feature_sha:
+            raise WorkerFailure(
+                f"remote feature {branch!r} changed before feature preparation: "
+                f"expected {expected_feature_sha}, found {feature_sha}"
+            )
 
     def _branch_matches(self, branch: str, sha: str, current: bool) -> bool:
         return self._local_sha(branch) == sha and (
@@ -595,8 +640,11 @@ class GitRepository:
         pre_state: object,
         observe: Callable[[], object],
         desired: Callable[[], bool],
+        pre_dispatch: Callable[[], None] | None = None,
     ) -> None:
         def dispatch() -> None:
+            if pre_dispatch is not None:
+                pre_dispatch()
             try:
                 if self._owns_process_group:
                     completed = self._run_mutation_process_group(args)

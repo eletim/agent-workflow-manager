@@ -5,7 +5,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -42,6 +42,41 @@ class RecordingGitRunner:
             timeout=timeout,
             check=check,
         )
+
+
+class RefRaceGitRunner(RecordingGitRunner):
+    def __init__(self, branch: str, race: Callable[[], None]) -> None:
+        super().__init__()
+        self.branch = branch
+        self.race = race
+        self.triggered = False
+
+    def __call__(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        completed = super().__call__(
+            args,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+        )
+        if not self.triggered and list(args[1:]) == [
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{self.branch}",
+        ]:
+            self.triggered = True
+            self.race()
+        return completed
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -191,6 +226,54 @@ def test_stale_existing_feature_is_rejected_before_switch(
             "feature/stale", base="main", expected_base_sha=new_base
         )
     assert git(work, "branch", "--show-current") == "main"
+
+
+def test_prepare_rechecks_base_before_creating_feature_branch(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    branch = "feature/base-race"
+    initial_sha = git(work, "rev-parse", "HEAD")
+
+    def advance_base() -> None:
+        (seed / "racing-base.txt").write_text("advanced\n", encoding="utf-8")
+        git(seed, "add", "racing-base.txt")
+        git(seed, "commit", "-m", "advance base during preparation")
+        git(seed, "push", "origin", "main")
+
+    runner = RefRaceGitRunner(branch, advance_base)
+    repo = open_repo(work, runner)
+
+    with pytest.raises(WorkerFailure, match="remote base.*changed before"):
+        repo.prepare_feature_branch(branch, base="main", expected_base_sha=initial_sha)
+
+    assert runner.triggered
+    assert git(work, "branch", "--show-current") == "main"
+    assert git(work, "branch", "--list", branch) == ""
+    assert git(work, "rev-parse", "HEAD") == initial_sha
+
+
+def test_prepare_rechecks_absent_remote_feature_before_creating_local_branch(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    branch = "feature/appearance-race"
+    initial_sha = git(work, "rev-parse", "HEAD")
+
+    def publish_feature() -> None:
+        git(seed, "branch", branch)
+        git(seed, "push", "origin", branch)
+
+    runner = RefRaceGitRunner(branch, publish_feature)
+    repo = open_repo(work, runner)
+
+    with pytest.raises(WorkerFailure, match="remote feature.*changed before"):
+        repo.prepare_feature_branch(branch, base="main", expected_base_sha=initial_sha)
+
+    assert runner.triggered
+    assert git(work, "branch", "--show-current") == "main"
+    assert git(work, "branch", "--list", branch) == ""
+    assert git(work, "rev-parse", "HEAD") == initial_sha
 
 
 def test_advance_after_merge_requires_exact_remote_and_containment(
