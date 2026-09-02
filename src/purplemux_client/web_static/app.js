@@ -55,8 +55,8 @@ let activeRunId = null;
 // sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
 // retains the new-run cwd/args/code independently of whichever run is
 // currently being viewed, so switching runs never loses it. `explicitNewRun`
-// only suppresses the "auto-select the latest run" behavior in refresh() once
-// the user has explicitly asked to compose a new run.
+// suppresses the "auto-select the latest run" behavior in refresh() once the
+// user has explicitly asked to compose or submit a new run.
 let draft = {cwd: "", args: "", code: code.value};
 let explicitNewRun = false;
 let activeRunGeneration = 0;
@@ -485,6 +485,7 @@ runButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // must explicitly start a New run first
   captureDraftIfEditing();
   const selectionGeneration = ++activeRunGeneration;
+  explicitNewRun = true;
   const validationGeneration = ++validationRequestGeneration;
   try {
     const result = await request("/api/run", {

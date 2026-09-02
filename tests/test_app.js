@@ -1150,6 +1150,45 @@ test("New run while submitting invalidates the pending run selection", async () 
   assert.equal(elements.code.readOnly, false);
 });
 
+test("an SSE-discovered run cannot supersede a pending Run action", async () => {
+  const runResponse = deferred();
+  const runs = [];
+  const details = {};
+  const submitted = snapshot({
+    runId: 2, state: "running", stdout: "submitted", code: "print('mine')",
+  });
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/run") return runResponse.promise;
+      return undefined;
+    },
+  });
+
+  elements.code.value = "print('mine')";
+  const submission = elements.run.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  runs.push({runId: 1, state: "running", cwd: "/work/external"});
+  details[1] = snapshot({
+    runId: 1, state: "running", stdout: "external", code: "print('external')",
+  });
+  eventSource.emit("runner-change");
+  await waitFor(() => runItem(elements, 1) !== undefined);
+  assert.equal(selectedRun(elements), undefined);
+
+  runs.push({runId: 2, state: "running", cwd: submitted.cwd});
+  details[2] = submitted;
+  runResponse.resolve(response(submitted));
+  await submission;
+
+  assert.match(selectedRun(elements).textContent, /^#2/);
+  assert.equal(elements.code.value, "print('mine')");
+  assert.equal(elements.code.readOnly, true);
+});
+
 test("edits made while Run is pending remain in the retained draft", async () => {
   const runResponse = deferred();
   const runs = [];
