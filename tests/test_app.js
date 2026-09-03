@@ -14,6 +14,14 @@ const appSource = fs.readFileSync(path.join(
   "web_static",
   "app.js",
 ), "utf8");
+const logDisplaySource = fs.readFileSync(path.join(
+  __dirname,
+  "..",
+  "src",
+  "purplemux_client",
+  "web_static",
+  "log-display.js",
+), "utf8");
 
 class Element {
   constructor() {
@@ -81,6 +89,10 @@ function snapshot({
   runId,
   state,
   stdout,
+  stdoutEntries = [],
+  stderrEntries = [],
+  outline = [],
+  progress = null,
   resumable = false,
   checkpoint = null,
   attempts = [],
@@ -95,12 +107,15 @@ function snapshot({
     code,
     cwd,
     exitCode: state === "running" ? null : 1,
-    progress: [{name: `step-${runId}`, status: "completed"}],
+    outline,
+    progress: progress || [{name: `step-${runId}`, status: "completed"}],
     resumable,
     runId,
     state,
     stderr: `stderr-${runId}`,
+    stderrEntries,
     stdout,
+    stdoutEntries,
     suspensionReason: null,
     validation: [],
   };
@@ -141,7 +156,8 @@ async function loadApp({
     "runs-empty", "new-run", "run", "resume", "validate", "stop", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
-    "validation-success", "validation", "guide-dialog", "guide-open", "guide-close", "guide-copy",
+    "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
+    "guide-open", "guide-close", "guide-copy",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
@@ -232,6 +248,7 @@ async function loadApp({
       setTimeout,
     },
   };
+  vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
   vm.runInNewContext(appSource, context, {filename: "app.js"});
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -241,7 +258,12 @@ async function loadApp({
   assert.ok(calls.some(([url]) => url === "/api/settings/notifications"));
   assert.equal(eventSources.length, 1);
   assert.equal(eventSources[0].url, "/api/events");
-  return {calls, elements, eventSource: eventSources[0]};
+  return {
+    calls,
+    elements,
+    eventSource: eventSources[0],
+    logDisplay: context.runnerLogDisplay,
+  };
 }
 
 function selectedRun(elements) {
@@ -262,6 +284,42 @@ function markerState(elements, runId) {
   assert.equal(item.children[0].attributes["aria-hidden"], "true");
   return item.dataset.state;
 }
+
+function outlineLabels(elements) {
+  return elements.outline.children.map((item) => item.children[1].textContent);
+}
+
+test("formats observed timestamps with relative local dates", () => {
+  const context = {};
+  vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
+  const {formatObservedAt} = context.runnerLogDisplay;
+  const now = new Date(2026, 8, 2, 21, 40, 0);
+  const today = new Date(2026, 8, 2, 21, 34, 5).toISOString();
+  const yesterday = new Date(2026, 8, 1, 23, 10, 9).toISOString();
+  const older = new Date(2026, 7, 31, 9, 10, 0).toISOString();
+
+  assert.equal(formatObservedAt(today, now), "Today 21:34:05");
+  assert.equal(formatObservedAt(yesterday, now), "Yesterday 23:10:09");
+  assert.equal(formatObservedAt(older, now), "8/31 09:10:00");
+});
+
+test("renders entry timestamps without changing entry text", () => {
+  const context = {};
+  vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
+  const {formatObservedAt, formatOutputEntries} = context.runnerLogDisplay;
+  const first = new Date(2026, 8, 2, 21, 34, 5).toISOString();
+  const second = new Date(2026, 8, 2, 21, 35, 6).toISOString();
+  const firstLabel = formatObservedAt(first);
+  const secondLabel = formatObservedAt(second);
+
+  assert.equal(
+    formatOutputEntries([
+      {observedAt: first, text: "first\npart"},
+      {observedAt: second, text: "ial\nlast\n"},
+    ]),
+    `${firstLabel}  first\n${firstLabel}  partial\n${secondLabel}  last\n`,
+  );
+});
 
 function faviconIsRunning(elements) {
   return decodeURIComponent(elements.favicon.getAttribute("href"))
@@ -433,6 +491,59 @@ test("initial state loads through read APIs before any SSE event", async () => {
   assert.ok(calls.some(([url]) => url === "/api/runs/1"));
 });
 
+test("execution outline reflects matching progress and keeps dynamic progress", async () => {
+  const current = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    outline: ["prepare", "implement", "review", "ready PR"],
+    progress: [
+      {name: "prepare", status: "completed"},
+      {name: "implement", status: "started"},
+      {name: "dynamic check", status: "failed"},
+    ],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+    details: {1: current},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["outline-panel"].hidden, false);
+  assert.deepEqual(outlineLabels(elements), ["prepare", "implement", "review", "ready PR"]);
+  assert.deepEqual(
+    elements.outline.children.map((item) => item.className),
+    [
+      "outline-item completed",
+      "outline-item running",
+      "outline-item pending",
+      "outline-item pending",
+    ],
+  );
+  assert.deepEqual(
+    elements.progress.children.map((item) => item.children[1].children[0].textContent),
+    ["prepare", "implement", "dynamic check"],
+  );
+});
+
+test("validation displays a valid draft outline before execution", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {
+      status: 200,
+      body: {validation: [], outline: ["prepare", "review"]},
+    },
+  });
+
+  assert.equal(elements["outline-panel"].hidden, true);
+  await elements.validate.dispatch("click");
+
+  assert.equal(elements["outline-panel"].hidden, false);
+  assert.deepEqual(outlineLabels(elements), ["prepare", "review"]);
+  assert.ok(elements.outline.children.every((item) => item.className.endsWith("pending")));
+});
+
 test("SSE changes refresh state, output, and progress without polling", async () => {
   const runs = [{runId: 1, state: "running", cwd: "/work/run-1"}];
   const details = {1: snapshot({runId: 1, state: "running", stdout: "starting"})};
@@ -567,6 +678,32 @@ test("EventSource reconnect reconciles authoritative state", async () => {
   await waitFor(() => elements.stdout.textContent === "after reconnect");
 
   assert.equal(elements.status.textContent, "running");
+});
+
+test("EventSource reconnect preserves authoritative historical timestamps", async () => {
+  const observedAt = "2026-08-31T00:10:00.000000+00:00";
+  const run = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "recorded earlier\n",
+    stdoutEntries: [{observedAt, text: "recorded earlier\n"}],
+  });
+  const {calls, elements, eventSource, logDisplay} = await loadApp({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+    details: {1: run},
+    validation: {status: 200, body: {validation: []}},
+  });
+  const renderedBeforeReconnect = elements.stdout.textContent;
+  const callsBeforeReconnect = calls.length;
+
+  eventSource.emit("open");
+  await waitFor(() => calls.length > callsBeforeReconnect);
+
+  assert.equal(
+    renderedBeforeReconnect,
+    `${logDisplay.formatObservedAt(observedAt)}  recorded earlier\n`,
+  );
+  assert.equal(elements.stdout.textContent, renderedBeforeReconnect);
 });
 
 test("successful validation is explicit when no run exists", async () => {
@@ -709,8 +846,12 @@ test("validation preserves another selected running run through refresh", async 
 test("slow SSE refresh cannot replace a newly selected run", async () => {
   const delayedRun = deferred();
   let delayRunTwo = false;
-  const runOne = snapshot({runId: 1, state: "running", stdout: "run one output"});
-  const runTwo = snapshot({runId: 2, state: "failed", stdout: "run two output"});
+  const runOne = snapshot({
+    runId: 1, state: "running", stdout: "run one output", outline: ["run one plan"],
+  });
+  const runTwo = snapshot({
+    runId: 2, state: "failed", stdout: "run two output", outline: ["run two plan"],
+  });
   const {calls, elements, eventSource} = await loadApp({
     runs: [
       {runId: 1, state: "running", cwd: "/work/run-1"},
@@ -735,6 +876,7 @@ test("slow SSE refresh cannot replace a newly selected run", async () => {
   await runOneButton.dispatch("click");
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements.stdout.textContent, "run one output");
+  assert.deepEqual(outlineLabels(elements), ["run one plan"]);
   assert.equal(elements.stop.disabled, false);
 
   delayedRun.resolve(response(runTwo));
@@ -743,6 +885,7 @@ test("slow SSE refresh cannot replace a newly selected run", async () => {
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements.status.textContent, "running");
   assert.equal(elements.stdout.textContent, "run one output");
+  assert.deepEqual(outlineLabels(elements), ["run one plan"]);
   assert.equal(elements.stop.disabled, false);
   assert.equal(elements.resume.disabled, true);
 });
@@ -824,6 +967,37 @@ test("slow validation response cannot replace a newer validation result", async 
   assert.equal(elements.validation.children.length, 0);
 });
 
+test("slow draft validation cannot replace a selected run outline", async () => {
+  const delayedValidation = deferred();
+  const selected = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    outline: ["selected run plan"],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1"}],
+    details: {1: selected},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/validate") return delayedValidation.promise;
+      return undefined;
+    },
+  });
+  await elements["new-run"].dispatch("click");
+
+  const pendingValidation = elements.validate.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await runItem(elements, 1).dispatch("click");
+  delayedValidation.resolve(response({
+    validation: [],
+    outline: ["stale draft plan"],
+  }));
+  await pendingValidation;
+
+  assert.deepEqual(outlineLabels(elements), ["selected run plan"]);
+});
+
 test("manual output copy preserves the payload attempted before a run switch", async () => {
   const delayedCopy = deferred();
   const attempted = [];
@@ -838,7 +1012,12 @@ test("manual output copy preserves the payload attempted before a run switch", a
     },
   };
   const runOne = snapshot({runId: 1, state: "success", stdout: "run one"});
-  const runTwo = snapshot({runId: 2, state: "failed", stdout: "run two"});
+  const runTwo = snapshot({
+    runId: 2,
+    state: "failed",
+    stdout: "run two",
+    stdoutEntries: [{observedAt: "2026-08-31T00:10:00+00:00", text: "run two"}],
+  });
   const {elements} = await loadApp({
     runs: [
       {runId: 1, state: "success", cwd: "/work/run-1"},
@@ -853,6 +1032,8 @@ test("manual output copy preserves the payload attempted before a run switch", a
   await new Promise((resolve) => setImmediate(resolve));
   const attemptedRunTwo = "stdout:\nrun two\n\nstderr:\nstderr-2";
   assert.deepEqual(attempted, [attemptedRunTwo]);
+  assert.notEqual(elements.stdout.textContent, "run two");
+  assert.match(elements.stdout.textContent, /run two$/);
 
   const runOneButton = elements["run-list"].children.find(
     (element) => element.textContent.startsWith("#1"),
@@ -925,14 +1106,61 @@ test("selecting a run renders its own cwd/args/code, never another run's values"
   assert.equal(elements.code.value, "print('RUN=A')");
 });
 
+test("selecting runs restores each run's timestamped output history", async () => {
+  const observedA = "2026-08-30T01:00:00+00:00";
+  const observedB = "2026-08-31T02:00:00+00:00";
+  const runA = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "A\n",
+    stdoutEntries: [{observedAt: observedA, text: "A\n"}],
+    outline: ["A plan"],
+  });
+  const runB = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "B\n",
+    stdoutEntries: [{observedAt: observedB, text: "B\n"}],
+    outline: ["B plan"],
+  });
+  const {elements, logDisplay} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1"},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(
+    elements.stdout.textContent,
+    `${logDisplay.formatObservedAt(observedB)}  B\n`,
+  );
+  assert.deepEqual(outlineLabels(elements), ["B plan"]);
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(
+    elements.stdout.textContent,
+    `${logDisplay.formatObservedAt(observedA)}  A\n`,
+  );
+  assert.deepEqual(outlineLabels(elements), ["A plan"]);
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(
+    elements.stdout.textContent,
+    `${logDisplay.formatObservedAt(observedB)}  B\n`,
+  );
+  assert.deepEqual(outlineLabels(elements), ["B plan"]);
+  await runItem(elements, 1).dispatch("click");
+  assert.deepEqual(outlineLabels(elements), ["A plan"]);
+});
+
 test("New run restores the retained draft unchanged after switching between runs", async () => {
   const runA = snapshot({
     runId: 1, state: "success", stdout: "A", cwd: "/work/run-1",
-    args: ["a"], code: "print('A')",
+    args: ["a"], code: "print('A')", outline: ["A plan"],
   });
   const runB = snapshot({
     runId: 2, state: "success", stdout: "B", cwd: "/work/run-2",
-    args: ["b"], code: "print('B')",
+    args: ["b"], code: "print('B')", outline: ["B plan"],
   });
   const {elements} = await loadApp({
     runs: [
@@ -945,12 +1173,14 @@ test("New run restores the retained draft unchanged after switching between runs
 
   await elements["new-run"].dispatch("click");
   assert.equal(elements["working-directory"].readOnly, false);
+  assert.equal(elements["outline-panel"].hidden, true);
   elements["working-directory"].value = "/tmp/draft-dir";
   elements["run-arguments"].value = "draft-arg-1\ndraft-arg-2";
   elements.code.value = "print('draft')";
 
   await runItem(elements, 1).dispatch("click");
   assert.equal(elements["working-directory"].value, "/work/run-1");
+  assert.deepEqual(outlineLabels(elements), ["A plan"]);
 
   await runItem(elements, 2).dispatch("click");
   assert.equal(elements["working-directory"].value, "/work/run-2");
@@ -960,9 +1190,15 @@ test("New run restores the retained draft unchanged after switching between runs
   assert.equal(elements["working-directory"].value, "/tmp/draft-dir");
   assert.equal(elements["run-arguments"].value, "draft-arg-1\ndraft-arg-2");
   assert.equal(elements.code.value, "print('draft')");
+  assert.equal(elements["outline-panel"].hidden, true);
+
   assert.equal(elements["working-directory"].readOnly, false);
   assert.equal(elements.run.disabled, false);
   assert.equal(selectedRun(elements), undefined);
+
+  await runItem(elements, 1).dispatch("click");
+  assert.deepEqual(outlineLabels(elements), ["A plan"]);
+  assert.equal(elements["working-directory"].readOnly, true);
 });
 
 test("selecting a run never calls a mutating endpoint", async () => {

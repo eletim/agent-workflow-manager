@@ -162,6 +162,29 @@ a { color: #bcaaff; }
 .validation-success { margin: 0; color: #75e2a8; font-size: 13px; }
 .validation-list { margin-bottom: 0; color: #ffb3bc; }
 
+.outline-panel { margin-top: 14px; }
+.outline-panel h2 { margin: 0 0 10px; }
+.outline-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.outline-item {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  gap: 6px;
+  align-items: start;
+  color: #9ba3b5;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.outline-marker { text-align: center; }
+.outline-item.running { color: #ffd66b; }
+.outline-item.completed { color: #75e2a8; }
+.outline-item.failed { color: #ff9ca8; }
+
 .progress-panel { margin-top: 14px; }
 .progress-panel h2 { margin: 0 0 10px; }
 .empty-progress { margin: 0; color: #737d91; font-size: 13px; }

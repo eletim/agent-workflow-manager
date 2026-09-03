@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,10 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     assert result.state == "success"
     assert result.stdout == "HELLO_RUNNER\n"
     assert result.stderr == ""
+    assert "".join(entry.text for entry in result.stdout_entries) == result.stdout
+    assert result.stderr_entries == ()
+    observed_at = datetime.fromisoformat(result.stdout_entries[0].observed_at)
+    assert observed_at.tzinfo is not None
     assert result.exit_code == 0
 
 
@@ -72,6 +77,25 @@ def test_stderr(runner: PythonRunner) -> None:
 
     assert result.state == "success"
     assert result.stderr == "BAD\n"
+    assert "".join(entry.text for entry in result.stderr_entries) == result.stderr
+    assert result.stdout_entries == ()
+
+
+def test_sequential_output_has_chronological_observation_timestamps(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        'import time; print("first", flush=True); time.sleep(0.2); print("second")'
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.stdout == "first\nsecond\n"
+    assert len(result.stdout_entries) >= 2
+    observed_at = [
+        datetime.fromisoformat(entry.observed_at) for entry in result.stdout_entries
+    ]
+    assert observed_at == sorted(observed_at)
 
 
 def test_standard_library_alias_import_passes_and_runs(runner: PythonRunner) -> None:
@@ -262,6 +286,7 @@ def test_output_is_bounded_and_reports_truncation() -> None:
         runner.close()
 
     assert result.stdout == "[output truncated; showing tail]\n" + "x" * 20
+    assert "".join(entry.text for entry in result.stdout_entries) == result.stdout
 
 
 def test_runner_rejects_non_posix_platform(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,6 +300,7 @@ def test_runs_execute_concurrently_with_independent_output(
     runner: PythonRunner,
 ) -> None:
     first_id = runner.start(
+        'WORKFLOW_OUTLINE = ["first plan"]\n'
         'import time; print("first-start", flush=True); time.sleep(60)'
     )
     first_running = wait_for(
@@ -283,7 +309,7 @@ def test_runs_execute_concurrently_with_independent_output(
         run_id=first_id,
     )
 
-    second_id = runner.start('print("second")')
+    second_id = runner.start('WORKFLOW_OUTLINE = ["second plan"]\nprint("second")')
     second = wait_for(
         runner,
         lambda snapshot: snapshot.state != "running",
@@ -293,8 +319,14 @@ def test_runs_execute_concurrently_with_independent_output(
     assert first_running.state == "running"
     assert runner.snapshot(first_id).state == "running"
     assert runner.snapshot(first_id).stdout == "first-start\n"
+    assert runner.snapshot(first_id).outline == ("first plan",)
+    assert [entry.text for entry in runner.snapshot(first_id).stdout_entries] == [
+        "first-start\n"
+    ]
     assert second.state == "success"
     assert second.stdout == "second\n"
+    assert second.outline == ("second plan",)
+    assert [entry.text for entry in second.stdout_entries] == ["second\n"]
     assert runner.stop(first_id) is True
 
 
@@ -400,6 +432,8 @@ def test_resume_reuses_same_run_from_explicit_checkpoint_without_replaying_side_
     runner: PythonRunner, tmp_path: Path
 ) -> None:
     code = """\
+WORKFLOW_OUTLINE = ["repair", "continue"]
+
 from pathlib import Path
 from purplemux_client import resume_checkpoint, save_checkpoint
 
@@ -420,7 +454,10 @@ print("continued safely")
     assert first.state == "failed"
     assert first.checkpoint is not None
     assert first.checkpoint.name == "resource created"
+    assert first.outline == ("repair", "continue")
     assert first.attempts[0].state == "failed"
+    first_stdout_entries = first.stdout_entries
+    first_observed_at = [entry.observed_at for entry in first_stdout_entries]
 
     (tmp_path / "side-effect.txt").write_text("manually repaired", encoding="utf-8")
     (tmp_path / "repair.complete").touch()
@@ -429,9 +466,16 @@ print("continued safely")
 
     assert resumed.run_id == run_id
     assert resumed.state == "success"
+    assert resumed.outline == first.outline
     assert (tmp_path / "side-effect.txt").read_text() == "manually repaired"
     assert "[resume attempt 2 from checkpoint 'resource created']" in resumed.stdout
     assert resumed.stdout.endswith("continued safely\n")
+    assert resumed.stdout_entries[: len(first_stdout_entries)] == first_stdout_entries
+    assert [
+        entry.observed_at
+        for entry in resumed.stdout_entries[: len(first_stdout_entries)]
+    ] == first_observed_at
+    assert len(resumed.stdout_entries) > len(first_stdout_entries)
     assert [(attempt.state, attempt.resumed_from) for attempt in resumed.attempts] == [
         ("failed", None),
         ("success", "resource created"),
@@ -938,10 +982,16 @@ def test_runner_http_lifecycle(
         raise AssertionError("HTTP run did not finish")
 
     assert status == 200
+    stdout_entries = result.pop("stdoutEntries")
+    stderr_entries = result.pop("stderrEntries")
+    assert [entry["text"] for entry in stdout_entries] == ["HTTP_OK\n"]
+    assert datetime.fromisoformat(stdout_entries[0]["observedAt"]).tzinfo is not None
+    assert stderr_entries == []
     assert result == {
         "state": "success",
         "stdout": "HTTP_OK\n",
         "stderr": "",
+        "outline": [],
         "progress": [],
         "validation": [],
         "exitCode": 0,
@@ -1361,7 +1411,7 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
 ) -> None:
     address, _ = web_server
     documents = {}
-    for path in ["/", "/output-copy.js", "/app.js"]:
+    for path in ["/", "/log-display.js", "/output-copy.js", "/app.js"]:
         connection = http.client.HTTPConnection(*address, timeout=3)
         connection.request("GET", path)
         response = connection.getresponse()
@@ -1370,10 +1420,13 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
         assert response.status == 200
 
     index = documents["/"]
+    log_display = documents["/log-display.js"]
     helper = documents["/output-copy.js"]
     script = documents["/app.js"]
     assert 'id="output-copy"' in index
     assert 'id="guide-copy"' in index
+    assert '<script src="/log-display.js"></script>' in index
+    assert "formatOutputEntries" in log_display
     assert "writeText" in helper
     assert 'execCommand("copy")' in helper
     assert "runnerOutputClipboard.writeText" in script
@@ -1412,6 +1465,33 @@ def test_validation_api_and_run_preflight_report_distinct_state(
     assert rejected["error"] == "workflow validation failed"
     assert rejected["state"] == "validation_failed"
     assert rejected["runId"] is None
+
+
+def test_workflow_api_validates_and_snapshots_static_outline(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    code = "WORKFLOW_OUTLINE = ['prepare', 'execute']\nprint('done')"
+    body = json.dumps({"code": code})
+
+    status, validated = request(address, "POST", "/api/validate", body, token=token)
+    assert status == 200
+    assert validated["outline"] == ["prepare", "execute"]
+
+    status, started = request(address, "POST", "/api/run", body, token=token)
+    assert status == 202
+    run_id = int(started["runId"])
+    assert started["outline"] == ["prepare", "execute"]
+    assert request(address, "GET", f"/api/runs/{run_id}")[1]["outline"] == [
+        "prepare",
+        "execute",
+    ]
+
+    malformed = json.dumps({"code": "WORKFLOW_OUTLINE = build_outline()"})
+    status, rejected = request(address, "POST", "/api/validate", malformed, token=token)
+    assert status == 422
+    assert rejected["outline"] == []
+    assert rejected["validation"][0]["kind"] == "outline"
 
 
 @pytest.mark.parametrize("path", ["/api/validate", "/api/run"])
