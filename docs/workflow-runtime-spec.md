@@ -56,7 +56,10 @@ automatic retry. A workflow proves that replay can be avoided by calling
 The data is a small string map (normally PurpleMux workspace/tab IDs and other
 non-secret correlation values). The Runner retains only the latest checkpoint,
 the original output, and each terminal attempt in run history. It keeps the
-same code, working directory, arguments, run ID, and PurpleMux resources.
+same code, Runner-controlled subprocess directory, arguments, run ID, and
+run-owned resources. Repository workflows retain the structured source/base
+identity and isolated execution worktree registered by
+`prepare_run_repository()`.
 Publishing a checkpoint is also the workflow author's assertion that restarting
 from it remains safe until a newer checkpoint replaces it; otherwise the
 workflow must not publish one.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -18,6 +19,7 @@ RunResourceKind = Literal[
 ]
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
+RESOURCE_ACK_FD_ENV = "PURPLEMUX_RUNNER_RESOURCE_ACK_FD"
 RESUME_CHECKPOINT_ENV = "PURPLEMUX_RUNNER_RESUME_CHECKPOINT"
 MAX_PROGRESS_EVENT_BYTES = 4096
 SUSPENDED_EXIT_CODE = 75
@@ -128,6 +130,83 @@ def register_run_resource(
             "metadata": resource_metadata,
         }
     )
+
+
+def acknowledge_run_resource(
+    phase: Literal["pending", "verified"],
+    kind: RunResourceKind,
+    identity: str,
+    metadata: Mapping[str, str],
+) -> None:
+    """Synchronously establish or finalize manager-visible resource ownership.
+
+    Outside a managed Runner this retains the public helper's historical no-op
+    behavior. Inside one, the workflow cannot continue until the RunRecord has
+    accepted the ownership evidence.
+    """
+    if phase not in ("pending", "verified"):
+        raise ValueError("resource phase must be pending or verified")
+    # Dry Run has a diagnostic progress pipe but deliberately no ownership
+    # manager; its mutation boundary exits before a resource can be created.
+    if os.environ.get("AGENT_WORKFLOW_MANAGER_DRY_RUN_FD") is not None:
+        return
+    progress_fd = os.environ.get(PROGRESS_FD_ENV)
+    ack_fd = os.environ.get(RESOURCE_ACK_FD_ENV)
+    if progress_fd is None and ack_fd is None:
+        return
+    if progress_fd is None or ack_fd is None:
+        raise RuntimeError("Runner resource ownership channel is incomplete")
+    try:
+        output_fd = int(progress_fd)
+        input_fd = int(ack_fd)
+    except ValueError as exc:
+        raise RuntimeError("Runner resource ownership channel is invalid") from exc
+
+    token = uuid.uuid4().hex
+    event = {
+        "type": "resource_ownership",
+        "phase": phase,
+        "token": token,
+        "kind": kind,
+        "identity": identity,
+        "metadata": dict(metadata),
+    }
+    encoded = _encode_event(event)
+    if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
+        raise ValueError("Runner resource ownership event exceeds 4096 encoded bytes")
+    with _write_lock:
+        view = memoryview(encoded)
+        while view:
+            try:
+                written = os.write(output_fd, view)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Runner resource ownership event could not be delivered"
+                ) from exc
+            view = view[written:]
+        response = bytearray()
+        while not response.endswith(b"\n"):
+            try:
+                chunk = os.read(input_fd, MAX_PROGRESS_EVENT_BYTES + 1 - len(response))
+            except OSError as exc:
+                raise RuntimeError(
+                    "Runner resource ownership acknowledgement failed"
+                ) from exc
+            if not chunk:
+                raise RuntimeError("Runner resource ownership was not acknowledged")
+            response.extend(chunk)
+            if len(response) > MAX_PROGRESS_EVENT_BYTES:
+                raise RuntimeError(
+                    "Runner resource ownership acknowledgement is invalid"
+                )
+        try:
+            acknowledgement = json.loads(response)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Runner resource ownership acknowledgement is invalid"
+            ) from exc
+        if acknowledgement != {"token": token, "accepted": True}:
+            raise RuntimeError("Runner rejected resource ownership evidence")
 
 
 def save_checkpoint(name: str, data: Mapping[str, str] | None = None) -> None:

@@ -34,10 +34,6 @@
           <button id="new-run" type="button">New run</button>
         </div>
         <div class="execution-context">
-          <div class="context-field context-cwd">
-            <label for="working-directory">Working directory</label>
-            <input id="working-directory" type="text" autocomplete="off" placeholder="Use Runner working directory">
-          </div>
           <div class="context-field context-args">
             <label for="run-arguments">Arguments <span>(one per line)</span></label>
             <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
@@ -68,6 +64,7 @@ emit_step("workspace create", "completed")</textarea>
       <section id="resources-panel" class="panel recovery-panel" aria-live="polite" hidden>
         <h2>Owned resources</h2>
         <p id="resources-summary"></p>
+        <p id="execution-context-details"></p>
         <ol id="resources" class="attempt-history"></ol>
       </section>
 

@@ -1,5 +1,4 @@
 const code = document.querySelector("#code");
-const workingDirectory = document.querySelector("#working-directory");
 const runArguments = document.querySelector("#run-arguments");
 const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
@@ -23,6 +22,7 @@ const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
 const resourcesPanel = document.querySelector("#resources-panel");
 const resourcesSummary = document.querySelector("#resources-summary");
+const executionContextDetails = document.querySelector("#execution-context-details");
 const resourcesList = document.querySelector("#resources");
 const validationPanel = document.querySelector("#validation-panel");
 const validationSuccess = document.querySelector("#validation-success");
@@ -80,11 +80,11 @@ let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
 // run" (fields editable) vs. "viewing an existing run" (fields read-only,
 // sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
-// retains the new-run cwd/args/code independently of whichever run is
+// retains the new-run args/code independently of whichever run is
 // currently being viewed, so switching runs never loses it. `explicitNewRun`
 // suppresses the "auto-select the latest run" behavior in refresh() once the
 // user has explicitly asked to compose or submit a new run.
-let draft = {cwd: "", args: "", code: code.value};
+let draft = {args: "", code: code.value};
 let explicitNewRun = false;
 let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
@@ -129,7 +129,6 @@ function renderFavicon(runs) {
 // for which mode is active.
 function applyFieldMode() {
   const drafting = activeRunId === null;
-  workingDirectory.readOnly = !drafting;
   runArguments.readOnly = !drafting;
   code.readOnly = !drafting;
   runButton.disabled = !drafting;
@@ -146,7 +145,7 @@ function showDraftLabel() {
 // them). Call this right before any transition away from drafting.
 function captureDraftIfEditing() {
   if (activeRunId === null) {
-    draft = {cwd: workingDirectory.value, args: runArguments.value, code: code.value};
+    draft = {args: runArguments.value, code: code.value};
   }
 }
 
@@ -179,7 +178,6 @@ function renderRun(result) {
   // Only an authoritative snapshot for the run currently being viewed may
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
-    workingDirectory.value = result.cwd ?? "";
     runArguments.value = (result.args || []).join("\n");
     code.value = result.code ?? "";
     activeContext.textContent = `Viewing Run #${result.runId} (read-only)`;
@@ -207,7 +205,6 @@ async function enterDraftMode() {
   activeRunId = null;
   explicitNewRun = true;
   if (wasViewingRun) {
-    workingDirectory.value = draft.cwd;
     runArguments.value = draft.args;
     code.value = draft.code;
   }
@@ -227,6 +224,11 @@ function renderResources(result) {
   resourcesSummary.textContent = resources.length === 0
     ? "No run-owned resources were registered."
     : `${resources.length} registered — ${status.replaceAll("_", " ")}.`;
+  const context = result.executionContext;
+  executionContextDetails.hidden = context == null;
+  executionContextDetails.textContent = context == null
+    ? ""
+    : `Execution root: ${context.executionRoot} — ${context.baseRef} @ ${context.baseSha}`;
   resourcesList.replaceChildren();
   for (const resource of resources) {
     const item = document.createElement("li");
@@ -267,7 +269,8 @@ function renderRunList(runs) {
     button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
     button.dataset.state = run.state;
     button.dataset.runId = String(run.runId);
-    button.textContent = `#${run.runId}  ${run.state}  ${run.cwd}`;
+    const executionRoot = run.executionContext?.executionRoot || "execution context pending";
+    button.textContent = `#${run.runId}  ${run.state}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -672,7 +675,6 @@ function settingsPayload() {
 
 function executionContextPayload() {
   return {
-    cwd: workingDirectory.value.trim() || null,
     args: runArguments.value === "" ? [] : runArguments.value.split("\n"),
   };
 }

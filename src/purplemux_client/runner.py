@@ -20,6 +20,10 @@ from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
 from purplemux_client.errors import MutationOutcomeUnknown
+from purplemux_client.execution_context import (
+    PENDING_REPOSITORY_CONTEXT_ENV,
+    REPOSITORY_CONTEXT_ENV,
+)
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -30,6 +34,7 @@ from purplemux_client.preflight import (
 from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
+    RESOURCE_ACK_FD_ENV,
     RESUME_CHECKPOINT_ENV,
     SUSPENDED_EXIT_CODE,
     ResumeCheckpoint,
@@ -53,6 +58,13 @@ ResourceCleanupStatus = Literal[
 ]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ResourceOwnershipEvent:
+    phase: Literal["pending", "verified"]
+    token: str
+    resource: RunResource
 
 
 def _resource_cleanup_status(
@@ -194,6 +206,24 @@ class RunResource:
         }
 
 
+def _is_verified_repository_context(resource: RunResource) -> bool:
+    required = {
+        "repository",
+        "remote",
+        "base_branch",
+        "base_ref",
+        "base_sha",
+        "path_identity",
+        "git_file_identity",
+        "git_dir",
+    }
+    return (
+        resource.kind == "git_worktree"
+        and resource.metadata.get("registration_state") != "pending"
+        and required.issubset(resource.metadata)
+    )
+
+
 @dataclass(frozen=True)
 class RunAttempt:
     number: int
@@ -270,6 +300,7 @@ class RunnerSnapshot:
             for attempt in self.attempts
         ]
         payload["resources"] = [resource.as_json() for resource in self.resources]
+        payload["executionContext"] = self._execution_context_json()
         payload["resourceCleanupStatus"] = _resource_cleanup_status(self.resources)
         payload["cleanupAvailable"] = self.state not in (
             "idle",
@@ -284,11 +315,13 @@ class RunnerSnapshot:
         return payload
 
     def as_summary_json(self) -> dict[str, object]:
+        execution_context = self._execution_context_json()
         return {
             "state": self.state,
             "exitCode": self.exit_code,
             "runId": self.run_id,
             "cwd": self.cwd,
+            "executionContext": execution_context,
             "args": list(self.args),
             "checkpoint": asdict(self.checkpoint) if self.checkpoint else None,
             "attempts": len(self.attempts),
@@ -301,13 +334,29 @@ class RunnerSnapshot:
             "resourceCount": len(self.resources),
         }
 
+    def _execution_context_json(self) -> dict[str, str] | None:
+        for resource in self.resources:
+            if not _is_verified_repository_context(resource):
+                continue
+            metadata = resource.metadata
+            return {
+                "sourceRepository": metadata.get(
+                    "source_repository", metadata.get("repository", "")
+                ),
+                "remote": metadata.get("remote", ""),
+                "baseBranch": metadata.get("base_branch", ""),
+                "baseRef": metadata.get("base_ref", ""),
+                "baseSha": metadata.get("base_sha", metadata.get("head", "")),
+                "executionRoot": resource.identity,
+            }
+        return None
+
 
 @dataclass
 class _RunRecord:
     run_id: int
     cwd: str
     args: tuple[str, ...]
-    explicit_cwd: bool
     process: subprocess.Popen[bytes]
     process_group_id: int
     script_path: Path
@@ -344,6 +393,7 @@ class PythonRunner:
         dry_run_timeout: float = 300.0,
         notifier: TerminalNotifier | None = None,
         validator: WorkflowValidator | None = None,
+        workflow_cwd: str | os.PathLike[str] | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -366,6 +416,20 @@ class PythonRunner:
         self._notifier = notifier
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
+        try:
+            self._workflow_cwd = (
+                Path.cwd()
+                if workflow_cwd is None
+                else Path(workflow_cwd).expanduser().resolve()
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise InvalidExecutionContextError(
+                f"Runner working directory could not be resolved: {exc}"
+            ) from exc
+        if not self._workflow_cwd.is_dir():
+            raise InvalidExecutionContextError(
+                f"Runner working directory is not a directory: {self._workflow_cwd}"
+            )
         self._preview = RunnerSnapshot(
             state="idle",
             stdout="",
@@ -378,7 +442,7 @@ class PythonRunner:
             progress=(),
             validation=(),
             dry_run_issues=(),
-            cwd=str(Path.cwd()),
+            cwd=str(self._workflow_cwd),
             args=(),
             checkpoint=None,
             attempts=(),
@@ -392,10 +456,9 @@ class PythonRunner:
         self,
         code: str,
         *,
-        cwd: str | os.PathLike[str] | None = None,
         args: Sequence[str] = (),
     ) -> ValidationResult:
-        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -409,11 +472,10 @@ class PythonRunner:
         self,
         code: str,
         *,
-        cwd: str | os.PathLike[str] | None = None,
         args: Sequence[str] = (),
     ) -> DryRunResult:
         """Execute the real workflow until its first inspection-aware mutation."""
-        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -579,10 +641,9 @@ class PythonRunner:
         self,
         code: str,
         *,
-        cwd: str | os.PathLike[str] | None = None,
         args: Sequence[str] = (),
     ) -> int:
-        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -600,7 +661,6 @@ class PythonRunner:
                     run_cwd=run_cwd,
                     run_args=run_args,
                     child_env=child_env,
-                    explicit_cwd=cwd is not None,
                 )
 
     def resume(self, run_id: int) -> None:
@@ -617,12 +677,35 @@ class PythonRunner:
                     self._ensure_resumable(run)
                     code = run.code
                     checkpoint = run.checkpoint
-                    cwd = run.cwd
                     args = run.args
-                    explicit_cwd = run.explicit_cwd
-                run_cwd, run_args, child_env = self._execution_context(
-                    cwd, args, explicit_cwd=explicit_cwd
-                )
+                run_cwd, run_args, child_env = self._execution_context(args)
+                for resource in run.resources:
+                    if _is_verified_repository_context(resource):
+                        child_env[REPOSITORY_CONTEXT_ENV] = json.dumps(
+                            {
+                                **resource.metadata,
+                                "execution_root": resource.identity,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        break
+                else:
+                    for resource in run.resources:
+                        if (
+                            resource.kind == "git_worktree"
+                            and resource.metadata.get("registration_state") == "pending"
+                            and resource.cleanup_state == "retained"
+                        ):
+                            child_env[PENDING_REPOSITORY_CONTEXT_ENV] = json.dumps(
+                                {
+                                    **resource.metadata,
+                                    "execution_root": resource.identity,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            break
                 validation = self._validator.validate(
                     code, cwd=run_cwd, environment=child_env
                 )
@@ -640,11 +723,13 @@ class PythonRunner:
                     child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
                         asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
                     )
-                    process, script_path, progress_read_fd = self._spawn_process(
-                        code,
-                        run_cwd=run_cwd,
-                        run_args=run_args,
-                        child_env=child_env,
+                    process, script_path, progress_read_fd, resource_ack_fd = (
+                        self._spawn_process(
+                            code,
+                            run_cwd=run_cwd,
+                            run_args=run_args,
+                            child_env=child_env,
+                        )
                     )
                     self._append_output(
                         run,
@@ -669,7 +754,7 @@ class PythonRunner:
                     run.resumed_from = checkpoint.name
                     run.suspension_reason = None
                     self._start_attempt_threads(
-                        run, process, script_path, progress_read_fd
+                        run, process, script_path, progress_read_fd, resource_ack_fd
                     )
                     self._mark_changed()
 
@@ -697,9 +782,8 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
-        explicit_cwd: bool,
     ) -> int:
-        process, script_path, progress_read_fd = self._spawn_process(
+        process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
             code,
             run_cwd=run_cwd,
             run_args=run_args,
@@ -712,7 +796,6 @@ class PythonRunner:
             run_id=run_id,
             cwd=str(run_cwd),
             args=run_args,
-            explicit_cwd=explicit_cwd,
             process=process,
             process_group_id=process.pid,
             script_path=script_path,
@@ -723,7 +806,9 @@ class PythonRunner:
         )
         self._runs[run_id] = run
 
-        self._start_attempt_threads(run, process, script_path, progress_read_fd)
+        self._start_attempt_threads(
+            run, process, script_path, progress_read_fd, resource_ack_fd
+        )
         self._mark_changed()
         return run_id
 
@@ -734,7 +819,7 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
-    ) -> tuple[subprocess.Popen[bytes], Path, int]:
+    ) -> tuple[subprocess.Popen[bytes], Path, int, int]:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
         )
@@ -744,8 +829,10 @@ class PythonRunner:
             script.close()
         script_path = Path(script.name)
         progress_read_fd, progress_write_fd = os.pipe()
+        resource_ack_read_fd, resource_ack_write_fd = os.pipe()
         process_env = dict(child_env)
         process_env[PROGRESS_FD_ENV] = str(progress_write_fd)
+        process_env[RESOURCE_ACK_FD_ENV] = str(resource_ack_read_fd)
         try:
             process = subprocess.Popen(
                 [sys.executable, str(script_path), *run_args],
@@ -753,17 +840,20 @@ class PythonRunner:
                 stderr=subprocess.PIPE,
                 env=process_env,
                 cwd=run_cwd,
-                pass_fds=(progress_write_fd,),
+                pass_fds=(progress_write_fd, resource_ack_read_fd),
                 shell=False,
                 start_new_session=True,
             )
         except BaseException:
             os.close(progress_read_fd)
             os.close(progress_write_fd)
+            os.close(resource_ack_read_fd)
+            os.close(resource_ack_write_fd)
             script_path.unlink(missing_ok=True)
             raise
         os.close(progress_write_fd)
-        return process, script_path, progress_read_fd
+        os.close(resource_ack_read_fd)
+        return process, script_path, progress_read_fd, resource_ack_write_fd
 
     def _start_attempt_threads(
         self,
@@ -771,6 +861,7 @@ class PythonRunner:
         process: subprocess.Popen[bytes],
         script_path: Path,
         progress_read_fd: int,
+        resource_ack_fd: int,
     ) -> None:
         stdout_thread = threading.Thread(
             target=self._read_stream,
@@ -786,7 +877,7 @@ class PythonRunner:
         )
         progress_thread = threading.Thread(
             target=self._read_progress,
-            args=(run, progress_read_fd),
+            args=(run, progress_read_fd, resource_ack_fd),
             name=f"python-runner-progress-{run.run_id}",
             daemon=True,
         )
@@ -903,24 +994,14 @@ class PythonRunner:
         except KeyError as exc:
             raise RunNotFoundError(f"run {run_id} was not found") from exc
 
-    @staticmethod
     def _execution_context(
-        cwd: str | os.PathLike[str] | None,
+        self,
         args: Sequence[str],
-        *,
-        explicit_cwd: bool | None = None,
     ) -> tuple[Path, tuple[str, ...], dict[str, str]]:
-        if explicit_cwd is None:
-            explicit_cwd = cwd is not None
-        try:
-            run_cwd = Path.cwd() if cwd is None else Path(cwd).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise InvalidExecutionContextError(
-                f"working directory could not be resolved: {exc}"
-            ) from exc
+        run_cwd = self._workflow_cwd
         if not run_cwd.is_dir():
             raise InvalidExecutionContextError(
-                f"working directory is not a directory: {run_cwd}"
+                f"Runner working directory is not a directory: {run_cwd}"
             )
         if isinstance(args, (str, bytes)):
             raise InvalidExecutionContextError("args must be a sequence of strings")
@@ -932,20 +1013,8 @@ class PythonRunner:
 
         child_env = os.environ.copy()
         child_env.pop(RESUME_CHECKPOINT_ENV, None)
-        if explicit_cwd:
-            virtual_env = child_env.pop("VIRTUAL_ENV", None)
-            virtual_envs = {virtual_env} if virtual_env else set()
-            if sys.prefix != sys.base_prefix:
-                virtual_envs.add(sys.prefix)
-            virtual_env_bins = {
-                os.path.normpath(os.path.join(environment, "bin"))
-                for environment in virtual_envs
-            }
-            child_env["PATH"] = os.pathsep.join(
-                entry
-                for entry in child_env.get("PATH", "").split(os.pathsep)
-                if os.path.normpath(entry) not in virtual_env_bins
-            )
+        child_env.pop(REPOSITORY_CONTEXT_ENV, None)
+        child_env.pop(PENDING_REPOSITORY_CONTEXT_ENV, None)
         return run_cwd, run_args, child_env
 
     def _ensure_open(self) -> None:
@@ -1163,10 +1232,11 @@ class PythonRunner:
                     "could not reconcile owned Git worktree: "
                     + (listed.stderr.strip() or "no stderr")
                 )
-            return not any(
+            registered = any(
                 line == f"worktree {resource.identity}"
                 for line in listed.stdout.splitlines()
             )
+            return not registered and not os.path.lexists(resource.identity)
         raise OSError(f"unsupported run resource kind: {resource.kind}")
 
     @staticmethod
@@ -1264,6 +1334,11 @@ class PythonRunner:
             if line.startswith("worktree ")
         }
         if str(worktree) not in paths:
+            if os.path.lexists(worktree):
+                raise OSError(
+                    "Git worktree path exists but is not registered; refusing "
+                    "partial-state cleanup"
+                )
             return
         required_identity = {
             "path_identity",
@@ -1272,13 +1347,42 @@ class PythonRunner:
         }
         missing = sorted(required_identity.difference(resource.metadata))
         if missing:
-            raise OSError(
-                "Git worktree ownership metadata is incomplete: " + ", ".join(missing)
+            if resource.metadata.get("registration_state") != "pending":
+                raise OSError(
+                    "Git worktree ownership metadata is incomplete: "
+                    + ", ".join(missing)
+                )
+            observed_head = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
-        if _path_identity(worktree) != resource.metadata["path_identity"]:
+            observed_branch = subprocess.run(
+                ["git", "-C", str(worktree), "symbolic-ref", "-q", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if (
+                observed_head.returncode != 0
+                or observed_head.stdout.strip() != resource.metadata.get("base_sha")
+                or observed_branch.returncode != 1
+            ):
+                raise OSError(
+                    "pending Git worktree does not match its reserved identity"
+                )
+            path_identity = _path_identity(worktree)
+            git_file_identity = _administrative_identity(worktree / ".git")
+        else:
+            path_identity = resource.metadata["path_identity"]
+            git_file_identity = resource.metadata["git_file_identity"]
+        if _path_identity(worktree) != path_identity:
             raise OSError("Git worktree path identity changed; refusing cleanup")
         git_file = worktree / ".git"
-        if _administrative_identity(git_file) != resource.metadata["git_file_identity"]:
+        if _administrative_identity(git_file) != git_file_identity:
             raise OSError(
                 "Git worktree administrative identity changed; refusing cleanup"
             )
@@ -1289,9 +1393,11 @@ class PythonRunner:
             timeout=30,
             check=False,
         )
+        if observed_git_dir.returncode != 0:
+            raise OSError("Git worktree git_dir identity changed; refusing cleanup")
         if (
-            observed_git_dir.returncode != 0
-            or observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
+            not missing
+            and observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
         ):
             raise OSError("Git worktree git_dir identity changed; refusing cleanup")
         dirty = subprocess.run(
@@ -1444,9 +1550,12 @@ class PythonRunner:
             with self._lock:
                 append()
 
-    def _read_progress(self, run: _RunRecord, fd: int) -> None:
+    def _read_progress(self, run: _RunRecord, fd: int, resource_ack_fd: int) -> None:
         try:
-            with os.fdopen(fd, "rb") as stream:
+            with (
+                os.fdopen(fd, "rb") as stream,
+                os.fdopen(resource_ack_fd, "wb", buffering=0) as acknowledgements,
+            ):
                 while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
                     if len(line) > MAX_PROGRESS_EVENT_BYTES or not line.endswith(b"\n"):
                         while line and not line.endswith(b"\n"):
@@ -1466,6 +1575,19 @@ class PythonRunner:
                                 run.findings.append(cast(TopologyFinding, event))
                             elif event_type == "resource":
                                 self._register_resource(run, cast(RunResource, event))
+                            elif event_type == "resource_ownership":
+                                ownership = cast(_ResourceOwnershipEvent, event)
+                                accepted = self._register_owned_resource(run, ownership)
+                                acknowledgements.write(
+                                    json.dumps(
+                                        {
+                                            "token": ownership.token,
+                                            "accepted": accepted,
+                                        },
+                                        separators=(",", ":"),
+                                    ).encode("utf-8")
+                                    + b"\n"
+                                )
                             else:
                                 assert isinstance(event, ProgressEvent)
                                 run.progress.append(event)
@@ -1478,7 +1600,14 @@ class PythonRunner:
         line: str,
     ) -> (
         tuple[
-            Literal["progress", "checkpoint", "suspended", "finding", "resource"],
+            Literal[
+                "progress",
+                "checkpoint",
+                "suspended",
+                "finding",
+                "resource",
+                "resource_ownership",
+            ],
             object,
         ]
         | None
@@ -1547,6 +1676,31 @@ class PythonRunner:
             ):
                 return None
             return "resource", RunResource(kind, identity, dict(metadata))
+        if event_type == "resource_ownership":
+            phase = value.get("phase")
+            token = value.get("token")
+            kind = value.get("kind")
+            identity = value.get("identity")
+            metadata = value.get("metadata")
+            if (
+                phase not in ("pending", "verified")
+                or not isinstance(token, str)
+                or not token
+                or kind != "git_worktree"
+                or not isinstance(identity, str)
+                or not identity
+                or not isinstance(metadata, dict)
+                or any(
+                    not isinstance(key, str) or not key or not isinstance(item, str)
+                    for key, item in metadata.items()
+                )
+            ):
+                return None
+            return "resource_ownership", _ResourceOwnershipEvent(
+                cast(Literal["pending", "verified"], phase),
+                token,
+                RunResource("git_worktree", identity, dict(metadata)),
+            )
         name = value.get("name")
         status = value.get("status")
         if not isinstance(name, str) or not name.strip():
@@ -1597,6 +1751,33 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+
+    @staticmethod
+    def _register_owned_resource(
+        run: _RunRecord, ownership: _ResourceOwnershipEvent
+    ) -> bool:
+        resource = ownership.resource
+        for index, existing in enumerate(run.resources):
+            if existing.kind != resource.kind or existing.identity != resource.identity:
+                continue
+            if ownership.phase == "pending":
+                return existing.metadata == resource.metadata
+            if existing.metadata == resource.metadata:
+                return True
+            if existing.metadata.get("registration_state") != "pending" or any(
+                key == "registration_state"
+                and resource.metadata.get(key) != "verified"
+                or key != "registration_state"
+                and resource.metadata.get(key) != value
+                for key, value in existing.metadata.items()
+            ):
+                return False
+            run.resources[index] = resource
+            return True
+        if ownership.phase != "pending":
+            return False
+        run.resources.append(resource)
+        return True
 
     @staticmethod
     def _render_output_entries(

@@ -56,17 +56,32 @@ runtime and Git/GitHub facts reached before that frontier.
 
 ## Run execution context
 
-Choose the target repository in the Runner's **Working directory** field. Put
-each workflow argument on its own line in **Arguments**; spaces within a line
-belong to that single argument. The resolved directory and argument list are
-shown with the run and apply to both preflight and execution. They are not
-global workflow configuration.
+The Python workflow is the source of truth for repository execution context.
+Declare the source repository and remote base with literal keyword values so
+Static Validation and Dry Run can inspect them without guessing path variables:
 
-Selecting a working directory prevents the workflow child from inheriting
-Agent Workflow Manager's `VIRTUAL_ENV` and matching virtualenv `bin` path. It
-does not activate the target repository's environment. Commands that require a
-project environment should make it explicit, such as `uv run --project
-/absolute/repo python -m package.module` or an absolute interpreter path.
+```python
+from purplemux_client import prepare_run_repository
+
+context = prepare_run_repository(
+    repo="~/DevEnv/project",
+    base_branch="main",
+)
+REPO = context.execution_root
+```
+
+The helper resolves the source repository and exact current remote base SHA,
+creates and verifies a fresh detached run worktree under the AWM-owned data
+directory, registers it for explicit Cleanup, and returns both source and
+execution identities. Use `context.execution_root` for Git/GitHub operations,
+PurpleMux workspace creation, shell steps, and agent `cwd` values. The original
+checkout is never switched, reset, stashed, or cleaned.
+
+The workflow subprocess itself runs from a stable Runner-controlled directory;
+that directory is not the project and is not editable in Workflow mode. Put
+each workflow argument on its own line in **Arguments**. Lower-level PurpleMux
+workspace/session APIs still accept an explicit `cwd` for direct execution and
+Prompt mode.
 
 ## Preflight requirements
 
@@ -87,7 +102,7 @@ WORKFLOW_PREFLIGHT = {
 ```
 
 All keys are optional lists of non-empty strings. Relative paths resolve from
-the selected run working directory. Keep these checks deterministic and
+the Runner-controlled subprocess directory. Keep these checks deterministic and
 side-effect-free; do not use metadata as a workflow DSL. Read-only discovery is
 bounded and reports a validation timeout if a lookup stalls. Preflight is
 best-effort and cannot prove that dynamic code or later external operations will
@@ -397,8 +412,11 @@ It may leave a checkpoint active only when every operation from that point to
 the next checkpoint is safe/idempotent to re-enter after an arbitrary failure.
 Checkpoint values are exposed in the UI/API, so store only short non-secret
 strings. A checkpoint event over 4 KiB is rejected. On each Resume click the
-Runner re-runs preflight and the same saved script, cwd, and arguments under the
-same run ID; output and terminal attempt history are appended. It never edits
+Runner re-runs preflight and the same saved script and arguments from the
+Runner-controlled directory under the same run ID. The retained repository
+execution context is supplied back to `prepare_run_repository()`, so it verifies
+and reuses the registered worktree rather than creating another. Output and
+terminal attempt history are appended. The Runner never edits
 or restores repository files, so manual changes are preserved unless the
 workflow itself overwrites them.
 
@@ -530,15 +548,13 @@ Do not:
 
 ## Complete example: implement, review, fix, and ready a PR
 
-This example creates a workspace and separate Codex sessions, asks the
+This example prepares an isolated worktree, creates a workspace and separate Codex sessions, asks the
 implementer to create a Draft PR, performs at most four independent reviews,
-routes actionable findings back to the implementer, marks the PR ready after
-approval, closes sessions on success, and keeps them for inspection on failure.
+routes actionable findings back to the implementer, and marks the PR ready after
+approval. All owned resources remain available until explicit Cleanup.
 
 ```python
 from __future__ import annotations
-
-from pathlib import Path
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -548,9 +564,14 @@ from purplemux_client import (
     TerminalSessionError,
     WorkerFailure,
     emit_step,
+    prepare_run_repository,
 )
 
-REPO = Path("/absolute/path/to/repository").resolve()
+context = prepare_run_repository(
+    repo="/absolute/path/to/repository",
+    base_branch="dev/v0.1.0",
+)
+REPO = context.execution_root
 ISSUE_URL = "https://github.com/OWNER/REPO/issues/123"
 BASE_BRANCH = "dev/v0.1.0"
 FEATURE_BRANCH = "feature/issue-123"

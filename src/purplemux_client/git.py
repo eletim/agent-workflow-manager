@@ -727,37 +727,9 @@ class GitRepository:
     def _run_mutation_process_group(
         self, args: Sequence[str]
     ) -> subprocess.CompletedProcess[str]:
-        command = ["git", *args]
-        previous_mask = self._block_mutation_signals()
-        previous_handlers = self._install_mutation_signal_handlers()
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=self.root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-            try:
-                self._restore_signal_mask(previous_mask)
-                stdout, stderr = process.communicate(
-                    timeout=self.command_timeout_seconds
-                )
-            except subprocess.TimeoutExpired as exc:
-                self._quiesce_process_group(process, exc)
-                raise _QuiescentMutationTimeout(
-                    command, self.command_timeout_seconds
-                ) from exc
-            except BaseException as exc:
-                self._quiesce_process_group(process, exc)
-                raise _QuiescentMutationInterruption(command, exc) from exc
-            return subprocess.CompletedProcess(
-                command, process.returncode, stdout, stderr
-            )
-        finally:
-            self._restore_mutation_signal_handlers(previous_handlers)
-            self._restore_signal_mask(previous_mask)
+        return _run_git_mutation_process_group(
+            args, cwd=self.root, timeout=self.command_timeout_seconds
+        )
 
     @staticmethod
     def _mutation_signals() -> set[signal.Signals]:
@@ -875,3 +847,34 @@ class _MutationSignal(BaseException):
 
 def _raise_mutation_signal(signum: int, _frame: object) -> None:
     raise _MutationSignal(signum)
+
+
+def _run_git_mutation_process_group(
+    args: Sequence[str], *, cwd: Path, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """Run a mutating Git command and quiesce its whole process group on failure."""
+    command = ["git", *args]
+    previous_mask = GitRepository._block_mutation_signals()
+    previous_handlers = GitRepository._install_mutation_signal_handlers()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            GitRepository._restore_signal_mask(previous_mask)
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            GitRepository._quiesce_process_group(process, exc)
+            raise _QuiescentMutationTimeout(command, timeout) from exc
+        except BaseException as exc:
+            GitRepository._quiesce_process_group(process, exc)
+            raise _QuiescentMutationInterruption(command, exc) from exc
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        GitRepository._restore_mutation_signal_handlers(previous_handlers)
+        GitRepository._restore_signal_mask(previous_mask)

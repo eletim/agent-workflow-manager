@@ -101,6 +101,7 @@ function snapshot({
   code = `print("run-${runId}")`,
   resources = [],
   resourceCleanupStatus = resources.length ? "retained" : "cleaned",
+  executionContext = null,
 }) {
   return {
     args,
@@ -126,9 +127,38 @@ function snapshot({
     findings: [],
     resources,
     resourceCleanupStatus,
+    executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
   };
 }
+
+test("run details show structured repository execution identity", async () => {
+  const executionContext = {
+    sourceRepository: "/source/repository",
+    remote: "origin",
+    baseBranch: "main",
+    baseRef: "origin/main",
+    baseSha: "a".repeat(40),
+    executionRoot: "/managed/awm-run-repository-123",
+  };
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    executionContext,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", executionContext}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.match(
+    elements["execution-context-details"].textContent,
+    /origin\/main @ a{40}/,
+  );
+  assert.match(selectedRun(elements).textContent, /awm-run-repository-123/);
+});
 
 function response(body, status = 200) {
   return {
@@ -161,11 +191,11 @@ async function loadApp({
   clipboardOverride = null,
 }) {
   const ids = [
-    "code", "working-directory", "run-arguments", "active-context", "run-list",
+    "code", "run-arguments", "active-context", "run-list",
     "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
-    "resources-summary", "resources", "validation-panel",
+    "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
@@ -1228,11 +1258,11 @@ test("manual output copy preserves the payload attempted before a run switch", a
   );
 });
 
-// Issue #45: Working directory / Arguments / Python must always reflect the
+// Issue #45: Arguments / Python must always reflect the
 // currently selected run's own immutable snapshot, never another run's
 // values and never the new-run draft.
 
-test("selecting a run renders its own cwd/args/code, never another run's values", async () => {
+test("selecting a run renders its own args/code, never another run's values", async () => {
   const runA = snapshot({
     runId: 1,
     state: "success",
@@ -1259,25 +1289,20 @@ test("selecting a run renders its own cwd/args/code, never another run's values"
   });
 
   // The most recent run (B) is auto-selected and shown read-only on load.
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-b");
   assert.equal(elements["run-arguments"].value, "B-ARG-1");
   assert.equal(elements.code.value, "print('RUN=B')");
-  assert.equal(elements["working-directory"].readOnly, true);
   assert.equal(elements["run-arguments"].readOnly, true);
   assert.equal(elements.code.readOnly, true);
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
   assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
   assert.equal(elements.code.value, "print('RUN=A')");
 
   await runItem(elements, 2).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-b");
   assert.equal(elements["run-arguments"].value, "B-ARG-1");
   assert.equal(elements.code.value, "print('RUN=B')");
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
   assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
   assert.equal(elements.code.value, "print('RUN=A')");
 });
@@ -1348,33 +1373,26 @@ test("New run restores the retained draft unchanged after switching between runs
   });
 
   await elements["new-run"].dispatch("click");
-  assert.equal(elements["working-directory"].readOnly, false);
   assert.equal(elements["outline-panel"].hidden, true);
-  elements["working-directory"].value = "/tmp/draft-dir";
   elements["run-arguments"].value = "draft-arg-1\ndraft-arg-2";
   elements.code.value = "print('draft')";
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/work/run-1");
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
 
   await runItem(elements, 2).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/work/run-2");
 
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/draft-dir");
   assert.equal(elements["run-arguments"].value, "draft-arg-1\ndraft-arg-2");
   assert.equal(elements.code.value, "print('draft')");
   assert.equal(elements["outline-panel"].hidden, true);
 
-  assert.equal(elements["working-directory"].readOnly, false);
   assert.equal(elements.run.disabled, false);
   assert.equal(selectedRun(elements), undefined);
 
   await runItem(elements, 1).dispatch("click");
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
-  assert.equal(elements["working-directory"].readOnly, true);
 });
 
 test("selecting a run never calls a mutating endpoint", async () => {
@@ -1438,7 +1456,6 @@ test("Run submission after returning to New run uses the draft, not a viewed run
   assert.equal(elements.run.disabled, true);
 
   await elements["new-run"].dispatch("click");
-  elements["working-directory"].value = "/tmp/draft-dir";
   elements["run-arguments"].value = "draft-arg";
   elements.code.value = "print('draft')";
 
@@ -1446,7 +1463,6 @@ test("Run submission after returning to New run uses the draft, not a viewed run
 
   assert.deepEqual(runRequestBody, {
     code: "print('draft')",
-    cwd: "/tmp/draft-dir",
     args: ["draft-arg"],
   });
 });
@@ -1480,7 +1496,6 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   await new Promise((resolve) => setImmediate(resolve));
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/work/run-1");
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
 
@@ -1488,7 +1503,6 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.match(selectedRun(elements).textContent, /^#1/);
-  assert.equal(elements["working-directory"].value, "/work/run-1");
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
 });
@@ -1500,13 +1514,11 @@ test("New run while already drafting never discards in-progress edits", async ()
     validation: {status: 200, body: {validation: []}},
   });
 
-  elements["working-directory"].value = "/tmp/still-typing";
   elements["run-arguments"].value = "still-typing-arg";
   elements.code.value = "print('still typing')";
 
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/still-typing");
   assert.equal(elements["run-arguments"].value, "still-typing-arg");
   assert.equal(elements.code.value, "print('still typing')");
 });
@@ -1520,7 +1532,6 @@ test("New run while drafting prevents a later SSE run from taking the selection"
     validation: {status: 200, body: {validation: []}},
   });
 
-  elements["working-directory"].value = "/tmp/explicit-draft";
   elements.code.value = "print('explicit draft')";
   await elements["new-run"].dispatch("click");
 
@@ -1530,7 +1541,6 @@ test("New run while drafting prevents a later SSE run from taking the selection"
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(selectedRun(elements), undefined);
-  assert.equal(elements["working-directory"].value, "/tmp/explicit-draft");
   assert.equal(elements.code.value, "print('explicit draft')");
 });
 
@@ -1619,12 +1629,10 @@ test("edits made while Run is pending remain in the retained draft", async () =>
     },
   });
 
-  elements["working-directory"].value = "/tmp/before";
   elements["run-arguments"].value = "before";
   elements.code.value = "print('before')";
   const submission = elements.run.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
-  elements["working-directory"].value = "/tmp/after";
   elements["run-arguments"].value = "after";
   elements.code.value = "print('after')";
 
@@ -1634,28 +1642,8 @@ test("edits made while Run is pending remain in the retained draft", async () =>
   await submission;
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/after");
   assert.equal(elements["run-arguments"].value, "after");
   assert.equal(elements.code.value, "print('after')");
-});
-
-test("an existing run's status cwd does not seed the New-run draft", async () => {
-  const existing = snapshot({
-    runId: 1, state: "success", stdout: "done", cwd: "/persisted/run-cwd",
-  });
-  const {elements} = await loadApp({
-    runs: [{runId: 1, state: "success", cwd: existing.cwd}],
-    details: {1: existing},
-    validation: {status: 200, body: {validation: []}},
-    fetchOverride(url) {
-      if (url === "/api/status") return response(existing);
-      return undefined;
-    },
-  });
-
-  await elements["new-run"].dispatch("click");
-
-  assert.equal(elements["working-directory"].value, "");
 });
 
 test("a run auto-selected via SSE while drafting captures in-progress edits first", async () => {
@@ -1668,7 +1656,6 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   });
 
   // No runs exist yet, so the fields hold an untouched draft nobody submitted.
-  elements["working-directory"].value = "/tmp/in-progress-draft";
   elements["run-arguments"].value = "in-progress-arg";
   elements.code.value = "print('in progress')";
 
@@ -1683,11 +1670,8 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   eventSource.emit("runner-change");
   await waitFor(() => selectedRun(elements) !== undefined);
 
-  assert.equal(elements["working-directory"].value, "/work/run-9");
-
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/in-progress-draft");
   assert.equal(elements["run-arguments"].value, "in-progress-arg");
   assert.equal(elements.code.value, "print('in progress')");
 });
