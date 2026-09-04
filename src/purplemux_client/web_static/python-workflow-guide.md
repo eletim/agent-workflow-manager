@@ -205,17 +205,15 @@ emit_step(
 client.wait_for_shell_completion(shell_tab, timeout_seconds=900)
 shell_result = client.read_shell_result(shell_tab)
 if shell_result.exit_code != 0:
+    failure = shell_result.failure_message("focused tests")
     emit_step(
         "focused tests",
         "failed",
-        error=f"exit code {shell_result.exit_code}",
+        error=failure,
         workspace=workspace_id,
         tab=shell_tab,
     )
-    raise WorkerFailure(
-        f"focused tests failed with exit code {shell_result.exit_code}; "
-        f"inspect {workspace_id} / {shell_tab}"
-    )
+    raise WorkerFailure(failure)
 emit_step(
     "focused tests",
     "completed",
@@ -236,7 +234,11 @@ written by the command wrapper. It never parses pane text and cannot miss a fast
 command that runs between status polls. `read_shell_result()` raises
 `ResultNotReady` before completion. A nonzero exit code is an explicit result,
 not an automatic cleanup decision; plain Python decides whether to fail, retry,
-or retain the tab.
+or retain the tab. For a nonzero result, the client also attempts a diagnostic-only
+screen capture and retains a bounded tail on `ShellResult`. `failure_message()`
+formats that tail with the resolved cwd and workspace/tab references for Runner
+display. Capture text is never parsed for completion or workflow control, and a
+capture error is reported as secondary context without replacing the exit code.
 
 `worker` selects `codex-cli` or `claude-code`; recognized aliases are `codex`,
 `codex-cli`, `claude`, and `claude-code`. If `worker` is unrecognized, the
