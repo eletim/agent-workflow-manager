@@ -17,6 +17,7 @@ import pytest
 
 import purplemux_client.runner as runner_module
 from purplemux_client import WorkspaceState
+from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.readiness import (
@@ -158,7 +159,7 @@ register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
         identity = resource.identity  # type: ignore[attr-defined]
         attempted.append(identity)
         if identity == "tab-1":
-            raise OSError("identity verification failed")
+            raise MutationOutcomeUnknown("close outcome could not be confirmed")
 
     monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
 
@@ -168,11 +169,50 @@ register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
     states = {item.identity: item.cleanup_state for item in after.resources}
     assert states == {"ws-1": "retained", "tab-1": "blocked", "tab-2": "cleaned"}
     assert after.as_json()["resourceCleanupStatus"] == "blocked"
-    assert "identity verification failed" in str(after.resources[1].cleanup_error)
+    assert "could not be confirmed" in str(after.resources[1].cleanup_error)
     monkeypatch.setattr(runner, "_resource_is_absent", lambda _resource: False)
     reconciled = runner.cleanup(result.run_id or 0)
     assert reconciled.as_json()["resourceCleanupStatus"] == "blocked"
     assert attempted == ["tab-2", "tab-1"]
+
+
+def test_cleanup_retries_precondition_failure_after_remediation(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
+    result = wait_until_finished(runner)
+    precondition_satisfied = False
+    attempted: list[str] = []
+
+    def cleanup(resource: RunResource) -> None:
+        attempted.append(resource.identity)
+        if resource.identity == "tab-1" and not precondition_satisfied:
+            raise OSError("tab identity changed; refusing cleanup")
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+    blocked = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-1"]
+    assert [item.cleanup_state for item in blocked.resources] == [
+        "retained",
+        "cleanup_retryable",
+    ]
+    assert blocked.as_json()["resourceCleanupStatus"] == "blocked"
+    assert "identity changed" in str(blocked.resources[1].cleanup_error)
+
+    precondition_satisfied = True
+    cleaned = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-1", "tab-1", "ws-1"]
+    assert all(item.cleanup_state == "cleaned" for item in cleaned.resources)
+    assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
 
 
 def test_cleanup_rejects_running_workflow(runner: PythonRunner) -> None:

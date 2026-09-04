@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
+from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -44,7 +45,9 @@ RunnerState = Literal[
     "stopped",
     "validation_failed",
 ]
-ResourceCleanupState = Literal["retained", "cleanup_pending", "cleaned", "blocked"]
+ResourceCleanupState = Literal[
+    "retained", "cleanup_pending", "cleanup_retryable", "cleaned", "blocked"
+]
 ResourceCleanupStatus = Literal[
     "retained", "cleaning", "partially_cleaned", "cleaned", "blocked"
 ]
@@ -59,7 +62,9 @@ def _resource_cleanup_status(
         return "cleaned"
     if any(item.cleanup_state == "cleanup_pending" for item in resources):
         return "cleaning"
-    if any(item.cleanup_state == "blocked" for item in resources):
+    if any(
+        item.cleanup_state in ("cleanup_retryable", "blocked") for item in resources
+    ):
         return "blocked"
     if any(item.cleanup_state == "cleaned" for item in resources):
         return "partially_cleaned"
@@ -995,7 +1000,7 @@ class PythonRunner:
                     current = run.resources[index]
                     if current.cleanup_state == "cleaned":
                         continue
-                if current.cleanup_state == "blocked":
+                if current.cleanup_state in ("cleanup_pending", "blocked"):
                     try:
                         absent = self._resource_is_absent(current)
                     except Exception:
@@ -1024,12 +1029,17 @@ class PythonRunner:
                 try:
                     self._cleanup_resource(pending)
                 except Exception as exc:
+                    cleanup_state: ResourceCleanupState = (
+                        "blocked"
+                        if isinstance(exc, MutationOutcomeUnknown)
+                        else "cleanup_retryable"
+                    )
                     with self._lock:
                         run.resources[index] = RunResource(
                             pending.kind,
                             pending.identity,
                             pending.metadata,
-                            "blocked",
+                            cleanup_state,
                             str(exc),
                         )
                         self._mark_changed()
@@ -1318,7 +1328,7 @@ class PythonRunner:
             line == f"worktree {worktree}" for line in reconciled.stdout.splitlines()
         ):
             return
-        raise OSError(
+        raise MutationOutcomeUnknown(
             "Git worktree removal could not be confirmed: "
             + (removed.stderr.strip() or "no stderr")
         )
