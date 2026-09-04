@@ -52,11 +52,42 @@ def test_emit_step_is_noop_outside_runner(monkeypatch: pytest.MonkeyPatch) -> No
     emit_step("ordinary script", "completed")
 
 
-def test_emit_step_drops_oversized_event(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_emit_step_truncates_oversized_error_after_json_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     read_fd, write_fd = os.pipe()
     monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
     try:
-        emit_step("step", "failed", error="x" * MAX_PROGRESS_EVENT_BYTES)
+        emit_step(
+            "step",
+            "failed",
+            error="failure context\n" + ('"\\\0' * MAX_PROGRESS_EVENT_BYTES),
+            workspace="ws-1",
+            tab="tab-1",
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, "rb") as stream:
+        encoded = stream.read()
+
+    assert len(encoded) <= MAX_PROGRESS_EVENT_BYTES
+    event = json.loads(encoded)
+    assert event["name"] == "step"
+    assert event["status"] == "failed"
+    assert event["workspace"] == "ws-1"
+    assert event["tab"] == "tab-1"
+    assert event["error"].startswith("failure context\n")
+    assert event["error"].endswith("\n[error truncated]")
+
+
+def test_emit_step_still_drops_oversized_event_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_step("step", "completed", message="x" * MAX_PROGRESS_EVENT_BYTES)
     finally:
         os.close(write_fd)
 

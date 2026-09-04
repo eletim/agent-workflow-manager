@@ -15,6 +15,7 @@ from purplemux_client.errors import (
     MutationOutcomeUnknown,
     ResultNotReady,
     SessionReadyTimeout,
+    TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
@@ -108,14 +109,33 @@ class ShellCommandRequest:
 
 @dataclass(frozen=True)
 class ShellResult:
-    """Structured completion result for a PurpleMux-backed shell command."""
+    """Structured completion plus display-only failure diagnostics."""
 
     exit_code: int
+    diagnostic_output: str | None = None
+    diagnostic_error: str | None = None
+    cwd: str | None = None
+    workspace_id: str | None = None
+    tab_id: str | None = None
+
+    def failure_message(self, step_name: str) -> str:
+        """Format a failed step for display without deriving its outcome from text."""
+        lines = [f"{step_name} failed (exit code {self.exit_code})"]
+        if self.cwd:
+            lines.append(f"cwd: {self.cwd}")
+        if self.workspace_id and self.tab_id:
+            lines.append(f"workspace/tab: {self.workspace_id} / {self.tab_id}")
+        if self.diagnostic_output:
+            lines.append(self.diagnostic_output)
+        if self.diagnostic_error:
+            lines.append(f"diagnostic capture failed: {self.diagnostic_error}")
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
 class _ShellRun:
     result_path: str
+    cwd: str | None
 
 
 class SubprocessRunner(Protocol):
@@ -145,6 +165,8 @@ _RESULT_STATUSES = {
     "not-applicable",
     "unavailable",
 }
+_SHELL_DIAGNOSTIC_MAX_LINES = 40
+_SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
 
 
 @dataclass(frozen=True)
@@ -545,7 +567,7 @@ class PurpleMuxCLIClient:
 
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
-        self._shell_runs[session_id] = _ShellRun(result_path=result_path)
+        self._shell_runs[session_id] = _ShellRun(result_path=result_path, cwd=cwd)
         if on_created is not None:
             on_created(session_id, result_path)
         wrapper = self._shell_wrapper(request.command, cwd, result_path)
@@ -563,11 +585,25 @@ class PurpleMuxCLIClient:
             ) from exc
         return session_id
 
-    def resume_shell(self, session_id: str, result_path: str) -> None:
+    def resume_shell(
+        self, session_id: str, result_path: str, *, cwd: str | None = None
+    ) -> None:
         """Reattach a checkpointed managed shell without sending its command again."""
+        resolved_cwd = (
+            os.path.abspath(os.path.expanduser(cwd)) if cwd is not None else None
+        )
+        if resolved_cwd is not None and not os.path.isdir(resolved_cwd):
+            raise ValueError(
+                f"shell working directory is not a directory: {resolved_cwd}"
+            )
         if session_id in self._shell_runs:
             if self._shell_runs[session_id].result_path != result_path:
                 raise WorkerFailure(f"session {session_id} shell identity conflicts")
+            if (
+                resolved_cwd is not None
+                and self._shell_runs[session_id].cwd != resolved_cwd
+            ):
+                raise WorkerFailure(f"session {session_id} shell cwd conflicts")
             return
         normalized = os.path.abspath(result_path)
         parent = os.path.dirname(normalized)
@@ -585,7 +621,9 @@ class PurpleMuxCLIClient:
             raise MutationConflict(
                 f"checkpointed shell {session_id} is no longer a terminal"
             )
-        self._shell_runs[session_id] = _ShellRun(result_path=normalized)
+        self._shell_runs[session_id] = _ShellRun(
+            result_path=normalized, cwd=resolved_cwd
+        )
 
     def wait_for_shell_completion(
         self, session_id: str, timeout_seconds: float
@@ -598,7 +636,9 @@ class PurpleMuxCLIClient:
         while True:
             result = self._read_shell_result_file(session_id)
             if result is not None:
-                self._completed_shell_runs[session_id] = result
+                self._completed_shell_runs[session_id] = self._with_shell_diagnostic(
+                    session_id, result
+                )
                 return
             status = self._status(session_id)
             panel_type = status.get("panelType")
@@ -632,8 +672,9 @@ class PurpleMuxCLIClient:
             result = self._read_shell_result_file(session_id)
         if result is None:
             raise ResultNotReady(f"shell terminal {session_id} result is not ready")
-        self._completed_shell_runs[session_id] = result
-        return result
+        completed = self._with_shell_diagnostic(session_id, result)
+        self._completed_shell_runs[session_id] = completed
+        return completed
 
     def read_status(self, session_id: str) -> dict[str, Any]:
         """Read authoritative agent state from PurpleMux StatusManager output."""
@@ -840,6 +881,37 @@ class PurpleMuxCLIClient:
         if not isinstance(content, str):
             raise WorkerFailure("PurpleMux capture did not return text content")
         return content
+
+    def _with_shell_diagnostic(
+        self, session_id: str, result: ShellResult
+    ) -> ShellResult:
+        """Attach bounded pane text to failures without using it as control state."""
+        if result.exit_code == 0 or result.tab_id is not None:
+            return result
+        output: str | None = None
+        error: str | None = None
+        try:
+            output = self._bounded_shell_diagnostic(self.capture_screen(session_id))
+        except TerminalSessionError as exc:
+            error = str(exc)
+        shell_run = self._shell_runs[session_id]
+        return ShellResult(
+            exit_code=result.exit_code,
+            diagnostic_output=output,
+            diagnostic_error=error,
+            cwd=shell_run.cwd,
+            workspace_id=self.workspace_id,
+            tab_id=session_id,
+        )
+
+    @staticmethod
+    def _bounded_shell_diagnostic(content: str) -> str | None:
+        lines = content.strip().splitlines()[-_SHELL_DIAGNOSTIC_MAX_LINES:]
+        tail = "\n".join(lines)
+        encoded = tail.encode()
+        if len(encoded) > _SHELL_DIAGNOSTIC_MAX_BYTES:
+            tail = encoded[-_SHELL_DIAGNOSTIC_MAX_BYTES:].decode(errors="ignore")
+        return tail or None
 
     @staticmethod
     def _shell_wrapper(command: str, cwd: str, result_path: str) -> str:

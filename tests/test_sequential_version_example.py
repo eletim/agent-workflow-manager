@@ -341,7 +341,7 @@ def test_running_final_check_reattaches_without_new_shell_or_agent_turn(
         def send_input(self, *_args: object, **_kwargs: object):
             pytest.fail("resumed final checks sent an agent turn")
 
-        def resume_shell(self, tab: str, result_path: str) -> None:
+        def resume_shell(self, tab: str, result_path: str, *, cwd: str) -> None:
             events.append(f"resume:{tab}:{result_path}")
 
         def wait_for_shell_completion(self, tab: str, _timeout: int) -> None:
@@ -377,7 +377,7 @@ def test_completed_final_check_reattaches_before_confirmed_close(
     events: list[str] = []
 
     class Client:
-        def resume_shell(self, tab: str, result_path: str) -> None:
+        def resume_shell(self, tab: str, result_path: str, *, cwd: str) -> None:
             events.append(f"resume:{tab}:{result_path}")
 
         def close_session(self, tab: str) -> None:
@@ -389,4 +389,58 @@ def test_completed_final_check_reattaches_before_confirmed_close(
     assert events == [
         "resume:tab-checks:/tmp/awm-shell-checks/result.json",
         "close:tab-checks",
+    ]
+
+
+def test_failed_final_check_emits_runner_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
+    emitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        SAMPLE_MODULE,
+        "emit_step",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+    state = SAMPLE_MODULE.Recovery(
+        phase="integration_checks_running",
+        check_shell="tab-checks",
+        check_result_path="/tmp/awm-shell-checks/result.json",
+    )
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def resume_shell(self, _tab: str, _result_path: str, *, cwd: str) -> None:
+            assert cwd == str(tmp_path)
+
+        def wait_for_shell_completion(self, _tab: str, _timeout: int) -> None:
+            pass
+
+        def read_shell_result(self, _tab: str):
+            return purplemux_client.ShellResult(
+                2,
+                diagnostic_output="expected branch main, got: feature/work",
+                cwd=str(tmp_path),
+                workspace_id="ws-test",
+                tab_id="tab-checks",
+            )
+
+    with pytest.raises(purplemux_client.WorkerFailure) as failure:
+        SAMPLE_MODULE.run_final_checks(Client(), config(tmp_path), state)
+
+    message = str(failure.value)
+    assert "final whole-version checks failed (exit code 2)" in message
+    assert "expected branch main, got: feature/work" in message
+    assert f"cwd: {tmp_path}" in message
+    assert "workspace/tab: ws-test / tab-checks" in message
+    assert emitted == [
+        (
+            ("final whole-version checks", "failed"),
+            {
+                "error": message,
+                "workspace": "ws-test",
+                "tab": "tab-checks",
+            },
+        )
     ]

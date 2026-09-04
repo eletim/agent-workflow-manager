@@ -414,7 +414,7 @@ def run_final_checks(
         if recovery.check_shell is None or recovery.check_result_path is None:
             raise WorkerFailure("final-check checkpoint lacks shell identity")
         shell = recovery.check_shell
-        client.resume_shell(shell, recovery.check_result_path)
+        client.resume_shell(shell, recovery.check_result_path, cwd=str(config.repo))
     elif recovery.phase not in {
         "integration_checks_complete",
         "integration_checks_closed",
@@ -444,8 +444,17 @@ def run_final_checks(
     if recovery.phase == "integration_checks_running":
         assert recovery.check_shell is not None
         client.wait_for_shell_completion(recovery.check_shell, SHELL_TIMEOUT)
-        if client.read_shell_result(recovery.check_shell).exit_code != 0:
-            raise WorkerFailure("final whole-version checks failed")
+        result = client.read_shell_result(recovery.check_shell)
+        if result.exit_code != 0:
+            failure = result.failure_message("final whole-version checks")
+            emit_step(
+                "final whole-version checks",
+                "failed",
+                error=failure,
+                workspace=client.workspace_id,
+                tab=recovery.check_shell,
+            )
+            raise WorkerFailure(failure)
         recovery.phase = "integration_checks_complete"
         recovery.checkpoint(config)
 
