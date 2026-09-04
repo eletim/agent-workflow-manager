@@ -325,6 +325,7 @@ class WorkflowValidator:
                     base_branch=base_branch,
                     remote=remote,
                     command_timeout_seconds=float(timeout),
+                    cwd=self._cwd,
                 )
             except (OSError, TypeError, ValueError, RuntimeError) as exc:
                 issues.append(

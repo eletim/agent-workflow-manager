@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from purplemux_client.errors import WorkerFailure
+from purplemux_client.git import (
+    _QuiescentMutationInterruption,
+    _QuiescentMutationTimeout,
+    _run_git_mutation_process_group,
+)
 from purplemux_client.operations import (
     AuthoritativeMutationRejection,
     MutationResolution,
@@ -17,7 +22,7 @@ from purplemux_client.operations import (
     Reconciliation,
     execute_mutation,
 )
-from purplemux_client.progress import emit_finding, register_run_resource
+from purplemux_client.progress import acknowledge_run_resource, emit_finding
 
 DEFAULT_WORKTREE_ROOT = Path("~/.local/share/agent-workflow-manager/worktrees")
 REPOSITORY_CONTEXT_ENV = "PURPLEMUX_RUNNER_REPOSITORY_CONTEXT"
@@ -71,6 +76,7 @@ def _inspect_repository_declaration(
     base_branch: str,
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
+    cwd: Path | None = None,
 ) -> RepositoryPreparation:
     """Validate static declarations without contacting an arbitrary remote."""
 
@@ -80,6 +86,7 @@ def _inspect_repository_declaration(
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
         live_remote=False,
+        resolution_base=cwd,
     )
 
 
@@ -90,6 +97,7 @@ def _inspect_run_repository(
     remote: str,
     command_timeout_seconds: float,
     live_remote: bool,
+    resolution_base: Path | None = None,
 ) -> RepositoryPreparation:
     if not isinstance(base_branch, str) or not base_branch or "\0" in base_branch:
         raise ValueError("base_branch must be a non-empty string without nulls")
@@ -103,7 +111,10 @@ def _inspect_run_repository(
     if command_timeout_seconds <= 0:
         raise ValueError("command_timeout_seconds must be positive")
     try:
-        requested = Path(repo).expanduser().resolve()
+        requested = Path(repo).expanduser()
+        if not requested.is_absolute() and resolution_base is not None:
+            requested = resolution_base / requested
+        requested = requested.resolve()
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise WorkerFailure(f"repository path could not be resolved: {exc}") from exc
     if not requested.is_dir():
@@ -216,24 +227,32 @@ def prepare_run_repository(
             f"fresh worktree path unexpectedly exists: {execution_root}"
         )
 
+    pending_metadata = {
+        "registration_state": "pending",
+        "repository": str(preparation.source_repository),
+        "source_repository": str(preparation.source_repository),
+        "remote": preparation.remote,
+        "base_branch": preparation.base_branch,
+        "base_ref": preparation.base_ref,
+        "base_sha": preparation.base_sha,
+    }
+    acknowledge_run_resource(
+        "pending", "git_worktree", str(execution_root), pending_metadata
+    )
+
     def dispatch() -> None:
         try:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fetched = subprocess.run(
+            fetched = _run_git_mutation_process_group(
                 [
-                    "git",
-                    "-C",
-                    str(preparation.source_repository),
                     "fetch",
                     "--no-tags",
                     preparation.remote,
                     f"+refs/heads/{preparation.base_branch}:"
                     f"refs/remotes/{preparation.remote}/{preparation.base_branch}",
                 ],
-                capture_output=True,
-                text=True,
+                cwd=preparation.source_repository,
                 timeout=command_timeout_seconds,
-                check=False,
             )
             if fetched.returncode != 0:
                 detail = fetched.stderr.strip() or fetched.stdout.strip() or "no output"
@@ -259,25 +278,25 @@ def prepare_run_repository(
                     f"remote base changed during preparation: expected "
                     f"{preparation.base_sha}, fetched {fetched_sha}"
                 )
-            completed = subprocess.run(
+            completed = _run_git_mutation_process_group(
                 [
-                    "git",
-                    "-C",
-                    str(preparation.source_repository),
                     "worktree",
                     "add",
                     "--detach",
                     str(execution_root),
                     preparation.base_sha,
                 ],
-                capture_output=True,
-                text=True,
+                cwd=preparation.source_repository,
                 timeout=command_timeout_seconds,
-                check=False,
             )
-        except subprocess.TimeoutExpired as exc:
+        except _QuiescentMutationTimeout as exc:
             raise AuthoritativeMutationRejection(
-                "Git worktree creation timed out after the Git process was reaped"
+                "Git repository preparation timed out after process-group quiescence"
+            ) from exc
+        except _QuiescentMutationInterruption as exc:
+            raise AuthoritativeMutationRejection(
+                "Git repository preparation was interrupted after process-group "
+                "quiescence"
             ) from exc
         except OSError as exc:
             raise PreDispatchFailure(
@@ -352,12 +371,8 @@ def prepare_run_repository(
 
     git_file = execution_root / ".git"
     metadata = {
-        "repository": str(preparation.source_repository),
-        "source_repository": str(preparation.source_repository),
-        "remote": preparation.remote,
-        "base_branch": preparation.base_branch,
-        "base_ref": preparation.base_ref,
-        "base_sha": preparation.base_sha,
+        **pending_metadata,
+        "registration_state": "verified",
         "path_identity": _path_identity(execution_root),
         "git_file_identity": _administrative_identity(git_file),
         "git_dir": _git_read(
@@ -368,7 +383,7 @@ def prepare_run_repository(
         "head": preparation.base_sha,
         "branch": "HEAD",
     }
-    register_run_resource("git_worktree", str(execution_root), metadata)
+    acknowledge_run_resource("verified", "git_worktree", str(execution_root), metadata)
     emit_finding(
         "git",
         f"prepared {preparation.base_ref} at {preparation.base_sha} in {execution_root}",

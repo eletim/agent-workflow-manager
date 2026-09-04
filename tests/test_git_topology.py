@@ -11,6 +11,10 @@ from pathlib import Path
 import pytest
 
 from purplemux_client import GitRepository, MutationOutcomeUnknown, WorkerFailure
+from purplemux_client.git import (
+    _QuiescentMutationTimeout,
+    _run_git_mutation_process_group,
+)
 
 
 class RecordingGitRunner:
@@ -331,6 +335,25 @@ def test_local_mutation_timeout_kills_process_group_before_confirming_rejection(
 
     assert not isinstance(raised.value, MutationOutcomeUnknown)
     assert time.monotonic() - started < 2
+
+
+def test_shared_git_mutation_timeout_kills_surviving_descendant(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    marker = tmp_path / "descendant-survived"
+    git(
+        work,
+        "config",
+        "alias.descendant",
+        f"!sh -c '(sleep 0.4; touch {marker}) & wait'",
+    )
+
+    with pytest.raises(_QuiescentMutationTimeout):
+        _run_git_mutation_process_group(["descendant"], cwd=work, timeout=0.05)
+
+    time.sleep(0.5)
+    assert not marker.exists()
 
 
 def test_unproven_local_timeout_with_unchanged_state_is_unknown(

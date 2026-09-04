@@ -127,6 +127,24 @@ context = prepare_run_repository(repo={str(repository)!r}, base_branch="main")
     assert missing.issues[0].kind == "execution_context"
 
 
+def test_static_validation_resolves_relative_repository_from_workflow_cwd(
+    tmp_path: Path,
+) -> None:
+    workflow_cwd = tmp_path / "workflow"
+    workflow_cwd.mkdir()
+    repository, _sha = repository_with_remote(workflow_cwd)
+    source = """
+from purplemux_client import prepare_run_repository
+WORKFLOW_DRY_RUN = 1
+prepare_run_repository(repo="source", base_branch="main")
+"""
+
+    result = WorkflowValidator().validate(source, cwd=workflow_cwd)
+
+    assert result.valid
+    assert repository == workflow_cwd / "source"
+
+
 def test_dry_run_reports_worktree_plan_without_creating_it(tmp_path: Path) -> None:
     repository, sha = repository_with_remote(tmp_path)
     worktree_root = tmp_path / "managed-worktrees"
@@ -179,6 +197,7 @@ print(context.execution_root)
         assert context["baseRef"] == "origin/main"
         assert context["baseSha"] == sha
         assert context["executionRoot"] == result.resources[0].identity
+        assert result.resources[0].metadata["registration_state"] == "verified"
         assert Path(result.resources[0].identity).is_dir()
 
         cleaned = runner.cleanup(result.run_id or 0)
@@ -186,6 +205,72 @@ print(context.execution_root)
         assert not Path(result.resources[0].identity).exists()
     finally:
         runner.close()
+
+
+def test_interrupted_post_creation_metadata_keeps_cleanup_owned(
+    tmp_path: Path,
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "managed-worktrees"
+    code = f"""
+import time
+import purplemux_client.execution_context as execution_context
+from purplemux_client import prepare_run_repository
+execution_context._path_identity = lambda path: time.sleep(60)
+prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={str(worktree_root)!r},
+)
+"""
+    runner = PythonRunner()
+    try:
+        run_id = runner.start(code)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            snapshot = runner.snapshot(run_id)
+            if snapshot.resources and Path(snapshot.resources[0].identity).exists():
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("worktree was not created before interruption")
+
+        assert snapshot.resources[0].metadata["registration_state"] == "pending"
+        assert runner.stop(run_id)
+        stopped = wait_until_finished(runner)
+        assert stopped.state == "stopped"
+        cleaned = runner.cleanup(run_id)
+        assert cleaned.resources[0].cleanup_state == "cleaned"
+        assert not Path(snapshot.resources[0].identity).exists()
+    finally:
+        runner.close()
+
+
+def test_oversized_ownership_event_fails_before_worktree_mutation(
+    tmp_path: Path,
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    oversized_root = str(tmp_path / ("x" * 4100))
+    code = f"""
+from purplemux_client import prepare_run_repository
+prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={oversized_root!r},
+)
+"""
+    runner = PythonRunner()
+    try:
+        runner.start(code)
+        result = wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert result.state == "failed"
+    assert "ownership event exceeds" in result.stderr
+    assert not result.resources
+    worktrees = git(repository, "worktree", "list", "--porcelain").splitlines()
+    assert sum(line.startswith("worktree ") for line in worktrees) == 1
 
 
 def test_resume_reuses_the_run_owned_worktree(tmp_path: Path) -> None:

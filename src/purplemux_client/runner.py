@@ -31,6 +31,7 @@ from purplemux_client.preflight import (
 from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
+    RESOURCE_ACK_FD_ENV,
     RESUME_CHECKPOINT_ENV,
     SUSPENDED_EXIT_CODE,
     ResumeCheckpoint,
@@ -54,6 +55,13 @@ ResourceCleanupStatus = Literal[
 ]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ResourceOwnershipEvent:
+    phase: Literal["pending", "verified"]
+    token: str
+    resource: RunResource
 
 
 def _resource_cleanup_status(
@@ -678,11 +686,13 @@ class PythonRunner:
                     child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
                         asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
                     )
-                    process, script_path, progress_read_fd = self._spawn_process(
-                        code,
-                        run_cwd=run_cwd,
-                        run_args=run_args,
-                        child_env=child_env,
+                    process, script_path, progress_read_fd, resource_ack_fd = (
+                        self._spawn_process(
+                            code,
+                            run_cwd=run_cwd,
+                            run_args=run_args,
+                            child_env=child_env,
+                        )
                     )
                     self._append_output(
                         run,
@@ -707,7 +717,7 @@ class PythonRunner:
                     run.resumed_from = checkpoint.name
                     run.suspension_reason = None
                     self._start_attempt_threads(
-                        run, process, script_path, progress_read_fd
+                        run, process, script_path, progress_read_fd, resource_ack_fd
                     )
                     self._mark_changed()
 
@@ -736,7 +746,7 @@ class PythonRunner:
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
     ) -> int:
-        process, script_path, progress_read_fd = self._spawn_process(
+        process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
             code,
             run_cwd=run_cwd,
             run_args=run_args,
@@ -759,7 +769,9 @@ class PythonRunner:
         )
         self._runs[run_id] = run
 
-        self._start_attempt_threads(run, process, script_path, progress_read_fd)
+        self._start_attempt_threads(
+            run, process, script_path, progress_read_fd, resource_ack_fd
+        )
         self._mark_changed()
         return run_id
 
@@ -770,7 +782,7 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
-    ) -> tuple[subprocess.Popen[bytes], Path, int]:
+    ) -> tuple[subprocess.Popen[bytes], Path, int, int]:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
         )
@@ -780,8 +792,10 @@ class PythonRunner:
             script.close()
         script_path = Path(script.name)
         progress_read_fd, progress_write_fd = os.pipe()
+        resource_ack_read_fd, resource_ack_write_fd = os.pipe()
         process_env = dict(child_env)
         process_env[PROGRESS_FD_ENV] = str(progress_write_fd)
+        process_env[RESOURCE_ACK_FD_ENV] = str(resource_ack_read_fd)
         try:
             process = subprocess.Popen(
                 [sys.executable, str(script_path), *run_args],
@@ -789,17 +803,20 @@ class PythonRunner:
                 stderr=subprocess.PIPE,
                 env=process_env,
                 cwd=run_cwd,
-                pass_fds=(progress_write_fd,),
+                pass_fds=(progress_write_fd, resource_ack_read_fd),
                 shell=False,
                 start_new_session=True,
             )
         except BaseException:
             os.close(progress_read_fd)
             os.close(progress_write_fd)
+            os.close(resource_ack_read_fd)
+            os.close(resource_ack_write_fd)
             script_path.unlink(missing_ok=True)
             raise
         os.close(progress_write_fd)
-        return process, script_path, progress_read_fd
+        os.close(resource_ack_read_fd)
+        return process, script_path, progress_read_fd, resource_ack_write_fd
 
     def _start_attempt_threads(
         self,
@@ -807,6 +824,7 @@ class PythonRunner:
         process: subprocess.Popen[bytes],
         script_path: Path,
         progress_read_fd: int,
+        resource_ack_fd: int,
     ) -> None:
         stdout_thread = threading.Thread(
             target=self._read_stream,
@@ -822,7 +840,7 @@ class PythonRunner:
         )
         progress_thread = threading.Thread(
             target=self._read_progress,
-            args=(run, progress_read_fd),
+            args=(run, progress_read_fd, resource_ack_fd),
             name=f"python-runner-progress-{run.run_id}",
             daemon=True,
         )
@@ -1285,13 +1303,42 @@ class PythonRunner:
         }
         missing = sorted(required_identity.difference(resource.metadata))
         if missing:
-            raise OSError(
-                "Git worktree ownership metadata is incomplete: " + ", ".join(missing)
+            if resource.metadata.get("registration_state") != "pending":
+                raise OSError(
+                    "Git worktree ownership metadata is incomplete: "
+                    + ", ".join(missing)
+                )
+            observed_head = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
-        if _path_identity(worktree) != resource.metadata["path_identity"]:
+            observed_branch = subprocess.run(
+                ["git", "-C", str(worktree), "symbolic-ref", "-q", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if (
+                observed_head.returncode != 0
+                or observed_head.stdout.strip() != resource.metadata.get("base_sha")
+                or observed_branch.returncode != 1
+            ):
+                raise OSError(
+                    "pending Git worktree does not match its reserved identity"
+                )
+            path_identity = _path_identity(worktree)
+            git_file_identity = _administrative_identity(worktree / ".git")
+        else:
+            path_identity = resource.metadata["path_identity"]
+            git_file_identity = resource.metadata["git_file_identity"]
+        if _path_identity(worktree) != path_identity:
             raise OSError("Git worktree path identity changed; refusing cleanup")
         git_file = worktree / ".git"
-        if _administrative_identity(git_file) != resource.metadata["git_file_identity"]:
+        if _administrative_identity(git_file) != git_file_identity:
             raise OSError(
                 "Git worktree administrative identity changed; refusing cleanup"
             )
@@ -1302,9 +1349,11 @@ class PythonRunner:
             timeout=30,
             check=False,
         )
+        if observed_git_dir.returncode != 0:
+            raise OSError("Git worktree git_dir identity changed; refusing cleanup")
         if (
-            observed_git_dir.returncode != 0
-            or observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
+            not missing
+            and observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
         ):
             raise OSError("Git worktree git_dir identity changed; refusing cleanup")
         dirty = subprocess.run(
@@ -1457,9 +1506,12 @@ class PythonRunner:
             with self._lock:
                 append()
 
-    def _read_progress(self, run: _RunRecord, fd: int) -> None:
+    def _read_progress(self, run: _RunRecord, fd: int, resource_ack_fd: int) -> None:
         try:
-            with os.fdopen(fd, "rb") as stream:
+            with (
+                os.fdopen(fd, "rb") as stream,
+                os.fdopen(resource_ack_fd, "wb", buffering=0) as acknowledgements,
+            ):
                 while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
                     if len(line) > MAX_PROGRESS_EVENT_BYTES or not line.endswith(b"\n"):
                         while line and not line.endswith(b"\n"):
@@ -1479,6 +1531,19 @@ class PythonRunner:
                                 run.findings.append(cast(TopologyFinding, event))
                             elif event_type == "resource":
                                 self._register_resource(run, cast(RunResource, event))
+                            elif event_type == "resource_ownership":
+                                ownership = cast(_ResourceOwnershipEvent, event)
+                                accepted = self._register_owned_resource(run, ownership)
+                                acknowledgements.write(
+                                    json.dumps(
+                                        {
+                                            "token": ownership.token,
+                                            "accepted": accepted,
+                                        },
+                                        separators=(",", ":"),
+                                    ).encode("utf-8")
+                                    + b"\n"
+                                )
                             else:
                                 assert isinstance(event, ProgressEvent)
                                 run.progress.append(event)
@@ -1491,7 +1556,14 @@ class PythonRunner:
         line: str,
     ) -> (
         tuple[
-            Literal["progress", "checkpoint", "suspended", "finding", "resource"],
+            Literal[
+                "progress",
+                "checkpoint",
+                "suspended",
+                "finding",
+                "resource",
+                "resource_ownership",
+            ],
             object,
         ]
         | None
@@ -1560,6 +1632,31 @@ class PythonRunner:
             ):
                 return None
             return "resource", RunResource(kind, identity, dict(metadata))
+        if event_type == "resource_ownership":
+            phase = value.get("phase")
+            token = value.get("token")
+            kind = value.get("kind")
+            identity = value.get("identity")
+            metadata = value.get("metadata")
+            if (
+                phase not in ("pending", "verified")
+                or not isinstance(token, str)
+                or not token
+                or kind != "git_worktree"
+                or not isinstance(identity, str)
+                or not identity
+                or not isinstance(metadata, dict)
+                or any(
+                    not isinstance(key, str) or not key or not isinstance(item, str)
+                    for key, item in metadata.items()
+                )
+            ):
+                return None
+            return "resource_ownership", _ResourceOwnershipEvent(
+                cast(Literal["pending", "verified"], phase),
+                token,
+                RunResource("git_worktree", identity, dict(metadata)),
+            )
         name = value.get("name")
         status = value.get("status")
         if not isinstance(name, str) or not name.strip():
@@ -1610,6 +1707,33 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+
+    @staticmethod
+    def _register_owned_resource(
+        run: _RunRecord, ownership: _ResourceOwnershipEvent
+    ) -> bool:
+        resource = ownership.resource
+        for index, existing in enumerate(run.resources):
+            if existing.kind != resource.kind or existing.identity != resource.identity:
+                continue
+            if ownership.phase == "pending":
+                return existing.metadata == resource.metadata
+            if existing.metadata == resource.metadata:
+                return True
+            if existing.metadata.get("registration_state") != "pending" or any(
+                key == "registration_state"
+                and resource.metadata.get(key) != "verified"
+                or key != "registration_state"
+                and resource.metadata.get(key) != value
+                for key, value in existing.metadata.items()
+            ):
+                return False
+            run.resources[index] = resource
+            return True
+        if ownership.phase != "pending":
+            return False
+        run.resources.append(resource)
+        return True
 
     @staticmethod
     def _render_output_entries(
