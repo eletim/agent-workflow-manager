@@ -118,6 +118,10 @@ function snapshot({
     stdoutEntries,
     suspensionReason: null,
     validation: [],
+    dryRun: null,
+    dryRunEligible: true,
+    dryRunIssues: [],
+    findings: [],
   };
 }
 
@@ -153,10 +157,16 @@ async function loadApp({
 }) {
   const ids = [
     "code", "working-directory", "run-arguments", "active-context", "run-list",
-    "runs-empty", "new-run", "run", "resume", "validate", "stop", "status", "stdout",
+    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
+    "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
+    "next-mutation",
+    "readiness-workspace", "readiness-provider", "run-readiness", "reconcile-readiness",
+    "refresh-readiness", "readiness-summary", "readiness-details",
+    "readiness-result-provider", "readiness-identity", "readiness-tab", "readiness-state",
+    "readiness-cleanup", "readiness-guidance",
     "guide-open", "guide-close", "guide-copy",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "notification-settings", "notifications-enabled",
@@ -170,6 +180,7 @@ async function loadApp({
   elements["validation-panel"].hidden = true;
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
+  elements["readiness-provider"].value = "codex";
   const calls = [];
   const eventSources = [];
   const document = {
@@ -203,6 +214,7 @@ async function loadApp({
       return response('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
     }
     if (url === "/api/settings/notifications") return response(settings);
+    if (url === "/api/readiness") return response({workspaces: [], running: false, probe: null});
     if (url === "/api/validate") {
       return response(validation.body, validation.status);
     }
@@ -252,10 +264,14 @@ async function loadApp({
   vm.runInNewContext(appSource, context, {filename: "app.js"});
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    if (calls.some(([url]) => url === "/api/settings/notifications")) break;
+    if (
+      calls.some(([url]) => url === "/api/settings/notifications")
+      && calls.some(([url]) => url === "/api/readiness")
+    ) break;
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.ok(calls.some(([url]) => url === "/api/settings/notifications"));
+  assert.ok(calls.some(([url]) => url === "/api/readiness"));
   assert.equal(eventSources.length, 1);
   assert.equal(eventSources[0].url, "/api/events");
   return {
@@ -288,6 +304,160 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Dry Run renders topology findings and the first mutation frontier", async () => {
+  const dryRunResult = {
+    ...snapshot({runId: null, state: "idle", stdout: ""}),
+    dryRunEligible: true,
+    dryRunIssues: [],
+    dryRun: {
+      status: "frontier",
+      stdout: "",
+      stderr: "",
+      findings: [{category: "github", status: "passed", message: "same-head set exhausted"}],
+      nextMutation: {
+        operation: "create PurpleMux tab",
+        target: "ws-1/reviewer",
+        preState: {tabs: []},
+      },
+    },
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/dry-run") return response(dryRunResult);
+      return undefined;
+    },
+  });
+
+  await elements["dry-run"].dispatch("click");
+
+  assert.equal(elements["dry-run-panel"].hidden, false);
+  assert.match(elements["dry-run-status"].textContent, /first reachable mutation/);
+  assert.equal(
+    elements["topology-findings"].children[0].textContent,
+    "github: same-head set exhausted",
+  );
+  assert.match(elements["next-mutation"].textContent, /create PurpleMux tab/);
+});
+
+test("Agent readiness runs only by explicit click and shows retained cleanup separately", async () => {
+  const workspaceSnapshot = {
+    workspaces: [{id: "ws-1", name: "Existing", directories: ["/repo"]}],
+    running: false,
+    probe: null,
+  };
+  const uncertain = {
+    status: "unknown",
+    workspaceId: "ws-1",
+    workspaceName: "Existing",
+    provider: "codex",
+    probeName: "awm-readiness-codex-abc123",
+    correlationId: "abc123",
+    tabId: "tab-probe",
+    readiness: "ready",
+    cleanup: "unknown",
+    retainedTabId: "tab-probe",
+    detail: "close outcome unknown",
+    guidance: "Inspect retained tab 'tab-probe'; do not retry.",
+  };
+  const reconciled = {
+    ...uncertain,
+    status: "reconciled",
+    cleanup: "confirmed-absent",
+    retainedTabId: null,
+    detail: "probe tab is authoritatively absent",
+    guidance: null,
+  };
+  let latest = null;
+  const {calls, elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/readiness/probe") {
+        latest = uncertain;
+        return response({probe: uncertain});
+      }
+      if (url === "/api/readiness/reconcile") {
+        latest = reconciled;
+        return response({probe: reconciled});
+      }
+      if (url === "/api/readiness") {
+        return response({...workspaceSnapshot, probe: latest});
+      }
+      return undefined;
+    },
+  });
+  await waitFor(() => calls.some(([url]) => url === "/api/readiness"));
+
+  assert.equal(calls.some(([url]) => url === "/api/readiness/probe"), false);
+  await elements["run-readiness"].dispatch("click");
+
+  assert.equal(calls.filter(([url]) => url === "/api/readiness/probe").length, 1);
+  assert.match(elements["readiness-summary"].textContent, /not a successful/);
+  assert.equal(elements["readiness-state"].textContent, "ready");
+  assert.equal(elements["readiness-result-provider"].textContent, "codex");
+  assert.equal(elements["readiness-cleanup"].textContent, "unknown");
+  assert.equal(elements["readiness-tab"].textContent, "tab-probe");
+  assert.match(elements["readiness-guidance"].textContent, /do not retry/);
+  assert.equal(elements["run-readiness"].disabled, true);
+  assert.equal(elements["reconcile-readiness"].hidden, false);
+
+  await elements["reconcile-readiness"].dispatch("click");
+
+  assert.equal(calls.filter(([url]) => url === "/api/readiness/reconcile").length, 1);
+  assert.equal(elements["readiness-cleanup"].textContent, "confirmed-absent");
+  assert.equal(elements["run-readiness"].disabled, false);
+  assert.equal(elements["reconcile-readiness"].hidden, true);
+});
+
+test("Agent readiness is disabled when there is no existing workspace", async () => {
+  const {calls, elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+  });
+  await waitFor(() => calls.some(([url]) => url === "/api/readiness"));
+
+  assert.equal(elements["run-readiness"].disabled, true);
+  assert.match(elements["readiness-summary"].textContent, /No existing/);
+});
+
+test("Agent pre-create failure does not claim readiness or cleanup", async () => {
+  const failed = {
+    status: "failed",
+    workspaceId: "ws-1",
+    workspaceName: "Existing",
+    provider: "codex",
+    probeName: "awm-readiness-codex-race123",
+    correlationId: "race123",
+    tabId: null,
+    readiness: "not-observed",
+    cleanup: "not-attempted",
+    detail: "authoritative tab set changed",
+    guidance: null,
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/readiness") return response({
+        workspaces: [{id: "ws-1", name: "Existing", directories: ["/repo"]}],
+        running: false,
+        probe: failed,
+      });
+      return undefined;
+    },
+  });
+
+  assert.match(elements["readiness-summary"].textContent, /before tab identification/);
+  assert.equal(elements["readiness-state"].textContent, "not-observed");
+  assert.equal(elements["readiness-cleanup"].textContent, "not-attempted");
+});
 
 test("formats observed timestamps with relative local dates", () => {
   const context = {};

@@ -16,6 +16,10 @@ import pytest
 
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
+from purplemux_client.readiness import (
+    AgentReadinessStatus,
+    ReadinessReconciliationRequired,
+)
 from purplemux_client.runner import (
     InvalidExecutionContextError,
     PythonRunner,
@@ -994,6 +998,10 @@ def test_runner_http_lifecycle(
         "outline": [],
         "progress": [],
         "validation": [],
+        "dryRun": None,
+        "dryRunEligible": True,
+        "dryRunIssues": [],
+        "findings": [],
         "exitCode": 0,
         "runId": 1,
         "cwd": str(Path.cwd()),
@@ -1494,7 +1502,7 @@ def test_workflow_api_validates_and_snapshots_static_outline(
     assert rejected["validation"][0]["kind"] == "outline"
 
 
-@pytest.mark.parametrize("path", ["/api/validate", "/api/run"])
+@pytest.mark.parametrize("path", ["/api/validate", "/api/dry-run", "/api/run"])
 def test_workflow_api_reports_unresolvable_preflight_path(
     web_server: tuple[tuple[str, int], str], path: str
 ) -> None:
@@ -1511,6 +1519,207 @@ def test_workflow_api_reports_unresolvable_preflight_path(
     assert result["state"] == "validation_failed"
     assert result["validation"][0]["kind"] == "path"
     assert "could not check required path" in result["validation"][0]["message"]
+
+
+def test_dry_run_api_reports_first_mutation_and_findings(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    code = """
+WORKFLOW_DRY_RUN = 1
+from purplemux_client import emit_finding
+from purplemux_client.operations import execute_mutation, Reconciliation, MutationResolution
+emit_finding("git", "base ref verified")
+execute_mutation(
+    operation="switch branch", target="feature/example", pre_state="main",
+    dispatch=lambda: None,
+    reconcile=lambda _: Reconciliation(MutationResolution.UNKNOWN),
+    plan={"kind": "switch", "branch": "feature/example"},
+)
+"""
+    status, payload = request(
+        address, "POST", "/api/dry-run", json.dumps({"code": code}), token=token
+    )
+
+    assert status == 200
+    assert payload["dryRun"]["status"] == "frontier"
+    assert payload["dryRun"]["nextMutation"]["operation"] == "switch branch"
+    assert payload["dryRun"]["findings"] == [
+        {"category": "git", "status": "passed", "message": "base ref verified"}
+    ]
+
+
+class ReadinessAPIService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "workspaces": [
+                {"id": "ws-1", "name": "Existing", "directories": ["/repo"]}
+            ],
+            "running": False,
+            "probe": None,
+        }
+
+    def probe(self, *, workspace_id: str, provider: str) -> AgentReadinessStatus:
+        self.calls.append((workspace_id, provider))
+        return AgentReadinessStatus(
+            "succeeded",
+            workspace_id,
+            "Existing",
+            provider,
+            "awm-readiness-codex-api123",
+            "api123",
+            "tab-probe",
+            "ready",
+            "confirmed",
+        )
+
+    def reconcile(self) -> AgentReadinessStatus:
+        raise ValueError("there is no unresolved Agent readiness probe")
+
+
+class BlockedReadinessAPIService(ReadinessAPIService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocked = False
+
+    def probe(self, *, workspace_id: str, provider: str) -> AgentReadinessStatus:
+        if self.blocked:
+            raise ReadinessReconciliationRequired("probe must be reconciled")
+        self.calls.append((workspace_id, provider))
+        self.blocked = True
+        return AgentReadinessStatus(
+            "unknown",
+            workspace_id,
+            "Existing",
+            provider,
+            "awm-readiness-codex-api123",
+            "api123",
+            None,
+            "not-observed",
+            "not-attempted",
+            "create outcome unknown",
+        )
+
+    def reconcile(self) -> AgentReadinessStatus:
+        self.blocked = False
+        return AgentReadinessStatus(
+            "reconciled",
+            "ws-1",
+            "Existing",
+            "codex",
+            "awm-readiness-codex-api123",
+            "api123",
+            None,
+            "not-observed",
+            "confirmed-absent",
+        )
+
+
+def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    readiness = ReadinessAPIService()
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        readiness_service=readiness,  # type: ignore[arg-type]
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    try:
+        status, available = request(address, "GET", "/api/readiness")
+        assert status == 200
+        assert available["workspaces"][0]["id"] == "ws-1"
+        assert readiness.calls == []
+
+        for path in ("/api/validate", "/api/dry-run"):
+            status, _ = request(
+                address,
+                "POST",
+                path,
+                json.dumps({"code": "WORKFLOW_DRY_RUN = 1"}),
+                token=server.request_token,
+            )
+            assert status == 200
+        assert readiness.calls == []
+
+        status, result = request(
+            address,
+            "POST",
+            "/api/readiness/probe",
+            json.dumps({"workspaceId": "ws-1", "provider": "codex"}),
+            token=server.request_token,
+        )
+        assert status == 200
+        assert readiness.calls == [("ws-1", "codex")]
+        assert result["probe"]["readiness"] == "ready"
+        assert result["probe"]["cleanup"] == "confirmed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_agent_readiness_api_blocks_retry_until_explicit_reconciliation() -> None:
+    runner = PythonRunner(stop_timeout=0.5)
+    readiness = BlockedReadinessAPIService()
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        readiness_service=readiness,  # type: ignore[arg-type]
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    body = json.dumps({"workspaceId": "ws-1", "provider": "codex"})
+    try:
+        assert (
+            request(
+                address,
+                "POST",
+                "/api/readiness/probe",
+                body,
+                token=server.request_token,
+            )[0]
+            == 200
+        )
+        status, blocked = request(
+            address,
+            "POST",
+            "/api/readiness/probe",
+            body,
+            token=server.request_token,
+        )
+        assert status == 409
+        assert "reconciled" in str(blocked["error"])
+        assert readiness.calls == [("ws-1", "codex")]
+
+        status, reconciled = request(
+            address,
+            "POST",
+            "/api/readiness/reconcile",
+            "{}",
+            token=server.request_token,
+        )
+        assert status == 200
+        assert reconciled["probe"]["status"] == "reconciled"
+        assert (
+            request(
+                address,
+                "POST",
+                "/api/readiness/probe",
+                body,
+                token=server.request_token,
+            )[0]
+            == 200
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_notification_settings_api_read_never_returns_token(
@@ -1839,7 +2048,13 @@ def test_notification_settings_mutation_rejects_untrusted_request(
     ("path", "token", "origin"),
     [
         (path, token, origin)
-        for path in ("/api/run", "/api/validate")
+        for path in (
+            "/api/run",
+            "/api/validate",
+            "/api/dry-run",
+            "/api/readiness/probe",
+            "/api/readiness/reconcile",
+        )
         for token, origin in (
             (None, None),
             ("wrong", None),

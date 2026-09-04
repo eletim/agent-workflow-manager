@@ -38,6 +38,22 @@ PurpleMux UI = runtime inspection and manual intervention
   the workflow workspace and target path. Do not hide that work in a local
   `subprocess` call.
 
+## Static Validation and whole-program Dry Run
+
+Static Validation remains side-effect-free. To opt a trusted workflow into Dry
+Run, declare the supported contract literally:
+
+```python
+WORKFLOW_DRY_RUN = 1
+```
+
+Validation reports detectable raw mutation-capable calls as Dry-Run-ineligible.
+This is a workflow contract check, not a security sandbox. Dry Run executes the
+same plain Python program and its real read-only inspections, then terminates at
+the first inspection-aware mutation boundary. It never invents the mutation's
+result or continues into later Python branches. Use `emit_finding()` to expose
+runtime and Git/GitHub facts reached before that frontier.
+
 ## Run execution context
 
 Choose the target repository in the Runner's **Working directory** field. Put
@@ -112,8 +128,10 @@ Import the public names from `purplemux_client`:
 ```python
 from purplemux_client import (
     CreateSessionRequest,
+    CreateWorkspaceRequest,
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
+    PurpleMuxRuntime,
     ResultNotReady,
     ResumeCheckpoint,
     ShellCommandRequest,
@@ -124,6 +142,7 @@ from purplemux_client import (
     WorkerInterrupted,
     WorkerNeedsInput,
     emit_step,
+    emit_finding,
     resume_checkpoint,
     save_checkpoint,
     suspend_run,
@@ -150,6 +169,8 @@ session_id = client.create_session(
         cwd="/absolute/repo",
         command="codex",
         metadata={},
+        name="Issue 123 implementer",
+        correlation_id="issue-123-implementer-ab12",
     )
 )
 status = client.read_status(session_id)
@@ -238,70 +259,29 @@ Relevant errors all derive from `TerminalSessionError`:
 
 ## Workspace creation
 
-There is no workspace-creation method on `PurpleMuxCLIClient`. When a new
-workspace is required, call the public CLI once and parse its JSON response:
+Use the inspection-aware runtime adapter rather than a raw subprocess:
 
 ```python
-import json
-import subprocess
-from pathlib import Path
-
-from purplemux_client import MutationOutcomeUnknown, WorkerFailure
-
-
-def create_workspace(repo: Path, name: str) -> str:
-    try:
-        completed = subprocess.run(
-            [
-                "purplemux",
-                "workspace",
-                "create",
-                "--cwd",
-                str(repo),
-                "--name",
-                name,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise MutationOutcomeUnknown(
-            "workspace create timed out; remote outcome is unknown"
-        ) from exc
-    except OSError as exc:
-        raise WorkerFailure(f"could not execute workspace create: {exc}") from exc
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or "no stderr"
-        raise WorkerFailure(f"workspace create failed: {detail}")
-    try:
-        data = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise MutationOutcomeUnknown(
-            "workspace was created but its JSON response was malformed; "
-            "remote outcome is unknown"
-        ) from exc
-    workspace_id = data.get("id") if isinstance(data, dict) else None
-    if not isinstance(workspace_id, str) or not workspace_id:
-        raise MutationOutcomeUnknown(
-            "workspace create returned no id; remote outcome is unknown"
-        )
-    return workspace_id
+runtime = PurpleMuxRuntime()
+workspace = runtime.create_workspace(
+    CreateWorkspaceRequest(
+        cwd="/absolute/repo",
+        name="owner/project dev/v1.2.3",
+        correlation_id="version-development-ab12",
+    )
+)
+client = runtime.workspace(workspace.id)
 ```
 
-The public command is:
-
-```text
-purplemux workspace create --cwd PATH [--name NAME]
-```
-
-Workspace creation is a non-idempotent mutation. Never blindly retry it after a
-timeout; inspect/list workspaces first or stop for human reconciliation.
+The adapter captures a complete workspace listing, creates exactly once with the
+saved non-secret correlation, and confirms any response ID against a new matching
+workspace in a second authoritative listing. Unknown outcomes are never retried.
+`list_sessions()` provides the corresponding complete structured tab discovery.
+No screen or tmux state participates in identity.
 
 ## Mutation and read semantics
 
-Mutations are `workspace create`, `create_session`, `start_shell` (tab creation
+Mutations are workspace creation, `create_session`, `start_shell` (tab creation
 and one send), `send_input`, `interrupt`, and `close_session`. The adapter
 attempts each mutation once. If one times out, it raises
 `MutationOutcomeUnknown`: the remote side may have applied it. Do not catch that
@@ -535,14 +515,13 @@ approval, closes sessions on success, and keeps them for inspection on failure.
 ```python
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 
 from purplemux_client import (
     CreateSessionRequest,
-    MutationOutcomeUnknown,
+    CreateWorkspaceRequest,
     PurpleMuxCLIClient,
+    PurpleMuxRuntime,
     TerminalSessionError,
     WorkerFailure,
     emit_step,
@@ -555,48 +534,7 @@ FEATURE_BRANCH = "feature/issue-123"
 MAX_REVIEWS = 4
 READY_TIMEOUT = 60
 TURN_TIMEOUT = 900
-
-
-def create_workspace() -> str:
-    try:
-        completed = subprocess.run(
-            [
-                "purplemux",
-                "workspace",
-                "create",
-                "--cwd",
-                str(REPO),
-                "--name",
-                "Issue 123 workflow",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise MutationOutcomeUnknown(
-            "workspace create timed out; remote outcome is unknown"
-        ) from exc
-    except OSError as exc:
-        raise WorkerFailure(f"could not create workspace: {exc}") from exc
-    if completed.returncode != 0:
-        raise WorkerFailure(
-            "workspace create failed: " + (completed.stderr.strip() or "no stderr")
-        )
-    try:
-        data = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise MutationOutcomeUnknown(
-            "workspace was created but its JSON response was malformed; "
-            "remote outcome is unknown"
-        ) from exc
-    workspace_id = data.get("id") if isinstance(data, dict) else None
-    if not isinstance(workspace_id, str) or not workspace_id:
-        raise MutationOutcomeUnknown(
-            "workspace create returned no id; remote outcome is unknown"
-        )
-    return workspace_id
+WORKFLOW_DRY_RUN = 1
 
 
 def short_error(exc: BaseException) -> str:
@@ -653,17 +591,31 @@ def review_decision(result: str) -> str:
 
 
 emit_step("workspace create", "started")
-workspace_id = create_workspace()  # Do not retry automatically on timeout.
+runtime = PurpleMuxRuntime()
+workspace = runtime.create_workspace(
+    CreateWorkspaceRequest(
+        cwd=str(REPO),
+        name="Issue 123 workflow",
+        correlation_id="issue-123-workspace",
+    )
+)
+workspace_id = workspace.id  # Do not retry automatically on an unknown outcome.
 emit_step("workspace create", "completed", workspace=workspace_id)
 
-client = PurpleMuxCLIClient(workspace_id)
+client = runtime.workspace(workspace_id)
 session_ids: list[str] = []
 workflow_succeeded = False
 
 try:
     emit_step("implementer create", "started", workspace=workspace_id)
     implementer = client.create_session(
-        CreateSessionRequest(worker="codex", cwd=str(REPO), command="codex")
+        CreateSessionRequest(
+            worker="codex",
+            cwd=str(REPO),
+            command="codex",
+            name="Issue 123 implementer",
+            correlation_id="issue-123-implementer",
+        )
     )
     session_ids.append(implementer)
     emit_step(
@@ -675,7 +627,13 @@ try:
 
     emit_step("reviewer create", "started", workspace=workspace_id)
     reviewer = client.create_session(
-        CreateSessionRequest(worker="codex", cwd=str(REPO), command="codex")
+        CreateSessionRequest(
+            worker="codex",
+            cwd=str(REPO),
+            command="codex",
+            name="Issue 123 reviewer",
+            correlation_id="issue-123-reviewer",
+        )
     )
     session_ids.append(reviewer)
     emit_step("reviewer create", "completed", workspace=workspace_id, tab=reviewer)

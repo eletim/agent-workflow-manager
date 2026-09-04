@@ -51,6 +51,55 @@ runtime dependency and none of its workflow framework is included here.
 - PurpleMux is an agent runtime.
 - The local runner executes, observes, and stops Python processes.
 
+## Git and GitHub topology operations
+
+Plain Python workflows can enforce repository and pull-request structure through
+`GitRepository` and `GitHubRepository`. These validated handles recheck repository
+identity on every public operation, keep read-named methods mutation-free, and only
+permit branch creation/tracking/switching and fast-forward Git changes. They never
+reset, rebase, force-push, delete branches, stash changes, or resolve conflicts.
+
+```python
+from purplemux_client import GitHubRepository, GitRepository
+
+repo = GitRepository.open(
+    "/workspace/project",
+    expected_github_slug="owner/project",
+)
+github = GitHubRepository.open("owner/project")
+
+integration = repo.synchronize_branch("dev/v1.2.3")
+assert integration.remote_sha is not None
+feature = repo.prepare_feature_branch(
+    "feature/issue-123",
+    base="dev/v1.2.3",
+    expected_base_sha=integration.remote_sha,
+)
+
+# Agent code still owns editing, testing, committing, and pushing.
+feature = repo.require_pushed("feature/issue-123")
+pull_request = github.require_pr(
+    head="feature/issue-123",
+    base="dev/v1.2.3",
+    expected_head_sha=feature.remote_sha,
+)
+```
+
+PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
+open PR for the requested head but a different base, multiple exact candidates,
+or an unproven final page fails closed. Ready/Draft changes require the exact
+reviewed head and base SHAs. `merge_pr()` uses only GitHub's immediate merge
+endpoint with merge-commit mode; it never invokes `gh pr merge`, enables
+auto-merge, or enters a merge queue, and it verifies the merge commit's parents
+and resulting base branch.
+
+Each mutation is dispatched once. A timeout, lost response, malformed response,
+or ambiguous nonzero result triggers read-only, operation-specific reconciliation.
+If later completion cannot be excluded, the operation raises
+`MutationOutcomeUnknown` even when an immediate read still matches the pre-state.
+This operation layer supplies safety primitives only: Issue order, review loops,
+approval provenance, and release policy remain ordinary Python control flow.
+
 ## PurpleMux adapter
 
 `purplemux_client.PurpleMuxCLIClient` is a thin adapter over the public
@@ -58,6 +107,7 @@ runtime dependency and none of its workflow framework is included here.
 create. The adapter supports:
 
 - `create_session()`
+- `list_sessions()` (complete structured tab discovery)
 - `read_status()`
 - `wait_until_ready()`
 - `send_input()`
@@ -77,6 +127,32 @@ and interruptions are explicit. Read-only CLI timeouts can be retried;
 mutation timeouts raise `MutationOutcomeUnknown` because the remote outcome is
 unknown. Screen capture is never used to decide completion or as a result
 fallback.
+
+`PurpleMuxRuntime` adds authoritative workspace listing and correlated workspace
+creation. Workspace and tab create responses are accepted only after their IDs and
+structured identities are confirmed by complete public listings. All first-party
+runtime mutations participate in the same first-mutation boundary used by whole-
+program Dry Run.
+
+Static Validation reports Dry Run eligibility separately. Eligible trusted
+workflows declare `WORKFLOW_DRY_RUN = 1`; Dry Run executes that same Python program
+through real inspections and stops before the first reachable mutation. The Runner
+shows reached runtime/Git/GitHub findings and that next mutation without fabricating
+future state or interpreting workflow control flow.
+
+The Runner also offers a separate, explicit **Agent readiness** action. It uses
+only an operator-selected existing PurpleMux workspace: AWM records the complete
+pre-create tab set, creates one uniquely named provider tab, correlates it through
+structured public listings, waits for structured readiness, and attempts to close
+that exact tab once. Readiness and cleanup are reported independently, with the
+retained tab identity and recovery guidance when cleanup cannot be confirmed. This
+mutating probe never runs as part of Static Validation or Dry Run.
+Unresolved identities are persisted across Runner restarts and block new probes.
+File-backed ownership serializes probe and reconciliation decisions across Runner
+processes sharing that recovery record.
+The explicit reconciliation action clears that block only after structured public
+inspection proves the correlated tab (or its original workspace) is absent; it
+never retries the close mutation.
 
 Observable Bash work runs in named PurpleMux `terminal` tabs. The adapter sends
 the command with an explicit working directory and correlates completion with a
