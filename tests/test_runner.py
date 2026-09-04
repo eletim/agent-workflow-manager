@@ -281,6 +281,53 @@ wait_for("finish")
     assert runner.snapshot(run_id).state == "success"
 
 
+def test_shell_failure_diagnostic_survives_real_progress_event_encoding(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    diagnostic = '"\\' * 1_250
+    code = f"""\
+from purplemux_client import ShellResult, emit_step
+
+result = ShellResult(
+    2,
+    diagnostic_output={diagnostic!r},
+    cwd={str(tmp_path)!r},
+    workspace_id="ws-test",
+    tab_id="tab-test",
+)
+if result.exit_code != 0:
+    failure = result.failure_message("sync and verify main")
+    emit_step(
+        "sync and verify main",
+        "failed",
+        error=failure,
+        workspace=result.workspace_id,
+        tab=result.tab_id,
+    )
+    raise SystemExit(result.exit_code)
+"""
+
+    run_id = runner.start(code)
+    snapshot = wait_until_finished(runner)
+
+    assert snapshot.run_id == run_id
+    assert snapshot.state == "failed"
+    assert snapshot.exit_code == 2
+    assert len(snapshot.progress) == 1
+    event = snapshot.progress[0]
+    assert event.name == "sync and verify main"
+    assert event.status == "failed"
+    assert event.workspace == "ws-test"
+    assert event.tab == "tab-test"
+    assert event.error is not None
+    assert event.error.startswith(
+        "sync and verify main failed (exit code 2)\n"
+        f"cwd: {tmp_path}\n"
+        "workspace/tab: ws-test / tab-test\n"
+    )
+    assert event.error.endswith("\n[error truncated]")
+
+
 def test_output_is_bounded_and_reports_truncation() -> None:
     runner = PythonRunner(max_output_chars=20)
     try:

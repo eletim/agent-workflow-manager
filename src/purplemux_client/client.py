@@ -121,14 +121,14 @@ class ShellResult:
     def failure_message(self, step_name: str) -> str:
         """Format a failed step for display without deriving its outcome from text."""
         lines = [f"{step_name} failed (exit code {self.exit_code})"]
-        if self.diagnostic_output:
-            lines.append(self.diagnostic_output)
-        if self.diagnostic_error:
-            lines.append(f"diagnostic capture failed: {self.diagnostic_error}")
         if self.cwd:
             lines.append(f"cwd: {self.cwd}")
         if self.workspace_id and self.tab_id:
             lines.append(f"workspace/tab: {self.workspace_id} / {self.tab_id}")
+        if self.diagnostic_output:
+            lines.append(self.diagnostic_output)
+        if self.diagnostic_error:
+            lines.append(f"diagnostic capture failed: {self.diagnostic_error}")
         return "\n".join(lines)
 
 

@@ -15,6 +15,7 @@ PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESUME_CHECKPOINT_ENV = "PURPLEMUX_RUNNER_RESUME_CHECKPOINT"
 MAX_PROGRESS_EVENT_BYTES = 4096
 SUSPENDED_EXIT_CODE = 75
+_TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
 
 
@@ -149,13 +150,14 @@ def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -
         fd = int(fd_text)
     except ValueError:
         return
-    encoded = (
-        json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-    ).encode()
+    encoded = _encode_event(event)
     if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
         if drop_oversized:
-            return
-        raise ValueError("Runner event exceeds 4096 encoded bytes")
+            encoded = _truncate_event_error(event)
+            if encoded is None:
+                return
+        else:
+            raise ValueError("Runner event exceeds 4096 encoded bytes")
     with _write_lock:
         view = memoryview(encoded)
         while view:
@@ -164,6 +166,35 @@ def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -
             except OSError:
                 return
             view = view[written:]
+
+
+def _encode_event(event: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode()
+
+
+def _truncate_event_error(event: Mapping[str, object]) -> bytes | None:
+    """Fit a display error exactly while preserving the event's structured fields."""
+    error = event.get("error")
+    if not isinstance(error, str):
+        return None
+    truncated = dict(event)
+    truncated["error"] = _TRUNCATED_ERROR_SUFFIX
+    if len(_encode_event(truncated)) > MAX_PROGRESS_EVENT_BYTES:
+        return None
+
+    low = 0
+    high = len(error)
+    while low < high:
+        keep = (low + high + 1) // 2
+        truncated["error"] = error[:keep] + _TRUNCATED_ERROR_SUFFIX
+        if len(_encode_event(truncated)) <= MAX_PROGRESS_EVENT_BYTES:
+            low = keep
+        else:
+            high = keep - 1
+    truncated["error"] = error[:low] + _TRUNCATED_ERROR_SUFFIX
+    return _encode_event(truncated)
 
 
 def _validate_number(name: str, value: int | None) -> None:

@@ -296,9 +296,9 @@ def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> N
     assert result.tab_id == "tab-shell"
     assert result.failure_message("sync and verify main") == (
         "sync and verify main failed (exit code 7)\n"
-        "expected branch main, got: feature/work\n"
         f"cwd: {tmp_path}\n"
-        "workspace/tab: ws-test / tab-shell"
+        "workspace/tab: ws-test / tab-shell\n"
+        "expected branch main, got: feature/work"
     )
     assert cli.read_shell_result(session_id) is result
     assert len([call for call in runner.calls if call[1:3] != ["tab", "list"]]) == 3
