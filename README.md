@@ -211,7 +211,16 @@ adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI executes arbitrary Python with the current Python
+The trusted local Runner UI has two explicit modes. **Prompt** accepts an agent,
+an existing working directory, and one prompt. It generates a single-step plain
+Python execution that creates a PurpleMux workspace rooted at that exact directory,
+creates the selected provider tab, and observes its structured turn result. Prompt
+resources stay directly available in PurpleMux; they are not registered as
+Workflow-owned resources and have no automatic or explicit Workflow cleanup path.
+The generated Python remains an implementation detail rather than an editable or
+historical UI field.
+
+**Workflow** executes arbitrary Python with the current Python
 interpreter and shows stdout, stderr, exit code, and the
 idle/running/success/failed/suspended/stopped/validation_failed state. Validate
 performs side-effect-free, best-effort static checks, and Run performs the same

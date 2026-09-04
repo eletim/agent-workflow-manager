@@ -19,6 +19,7 @@ from purplemux_client.notification_settings import (
     SettingsValidationError,
 )
 from purplemux_client.notifier import NotifyCLI
+from purplemux_client.prompt import build_prompt_workflow, prepare_prompt_execution
 from purplemux_client.readiness import (
     AgentReadinessService,
     ReadinessProbeBusy,
@@ -338,6 +339,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         json_paths = {
+            "/api/prompt",
             "/api/run",
             "/api/validate",
             "/api/dry-run",
@@ -348,6 +350,44 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         }
         if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+            return
+        if path == "/api/prompt":
+            payload = self._read_json()
+            if payload is None:
+                return
+            agent = payload.get("agent")
+            cwd = payload.get("cwd")
+            prompt = payload.get("prompt")
+            if not all(isinstance(value, str) for value in (agent, cwd, prompt)):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "agent, cwd, and prompt must be strings"},
+                )
+                return
+            try:
+                execution = prepare_prompt_execution(
+                    agent=cast(str, agent),
+                    cwd=cast(str, cwd),
+                    prompt=cast(str, prompt),
+                )
+                code = build_prompt_workflow(execution)
+                run_id = self.server.runner.start(code, prompt=execution)
+            except (InvalidExecutionContextError, ValueError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except WorkflowValidationError:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "generated Prompt execution failed validation"},
+                )
+                return
+            except AlreadyRunningError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
+            )
             return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:
             payload = self._read_json()
