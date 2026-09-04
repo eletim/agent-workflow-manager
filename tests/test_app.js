@@ -198,6 +198,9 @@ async function loadApp({
   const ids = [
     "code", "run-arguments", "prompt-mode", "workflow-mode", "prompt-fields",
     "workflow-fields", "prompt-agent", "prompt-cwd", "prompt-text",
+    "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
+    "directory-picker-parent", "directory-picker-path", "directory-picker-message",
+    "directory-picker-list", "directory-picker-select",
     "active-context", "run-list",
     "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
@@ -386,6 +389,85 @@ test("Prompt mode shows only one-shot inputs and submits them directly", async (
   assert.match(elements["active-context"].textContent, /Prompt Run #1/);
   assert.equal(elements["prompt-text"].readOnly, true);
   assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+});
+
+test("Prompt directory picker navigates and selects its resolved current path", async () => {
+  const listings = {
+    "/typed/project": {
+      path: "/typed/project",
+      parent: "/typed",
+      directories: [{name: "source", path: "/typed/project/source"}],
+    },
+    "/typed": {
+      path: "/typed",
+      parent: "/",
+      directories: [{name: "project", path: "/typed/project"}],
+    },
+    "/typed/project/source": {
+      path: "/typed/project/source",
+      parent: "/typed/project",
+      directories: [],
+    },
+  };
+  const requestedPaths = [];
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/directories") return undefined;
+      const requestedPath = JSON.parse(options.body).path;
+      requestedPaths.push(requestedPath);
+      return response(listings[requestedPath]);
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  elements["prompt-cwd"].value = "/typed/project";
+  await elements["directory-picker-open"].dispatch("click");
+  await waitFor(() => elements["directory-picker-list"].children.length === 1);
+
+  assert.equal(elements["directory-picker-path"].textContent, "/typed/project");
+  assert.equal(elements["directory-picker-list"].children[0].textContent, "📁 source");
+  await elements["directory-picker-parent"].dispatch("click");
+  await waitFor(() => elements["directory-picker-path"].textContent === "/typed");
+  await elements["directory-picker-list"].children[0].dispatch("click");
+  await waitFor(() => elements["directory-picker-path"].textContent === "/typed/project");
+  await elements["directory-picker-list"].children[0].dispatch("click");
+  await waitFor(() => elements["directory-picker-path"].textContent.endsWith("/source"));
+  assert.match(
+    elements["directory-picker-list"].children[0].textContent,
+    /No subdirectories/,
+  );
+
+  await elements["directory-picker-select"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/typed/project/source");
+  assert.deepEqual(requestedPaths, [
+    "/typed/project", "/typed", "/typed/project", "/typed/project/source",
+  ]);
+});
+
+test("Prompt directory picker reports invalid manual paths without replacing them", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") {
+        return response({error: "path is not a directory"}, 400);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  elements["prompt-cwd"].value = "/missing";
+  await elements["directory-picker-open"].dispatch("click");
+  await waitFor(() => elements["directory-picker-message"].textContent !== "Loading…");
+
+  assert.match(elements["directory-picker-message"].textContent, /not a directory/);
+  assert.equal(elements["prompt-cwd"].value, "/missing");
+  assert.equal(elements["directory-picker-select"].disabled, true);
 });
 
 test("Prompt history restores Prompt fields without exposing generated Python", async () => {

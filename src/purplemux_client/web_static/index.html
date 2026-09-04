@@ -48,7 +48,10 @@
             </div>
             <div class="context-field prompt-cwd-field">
               <label for="prompt-cwd">Working directory</label>
-              <input id="prompt-cwd" type="text" autocomplete="off" placeholder="/path/to/project">
+              <div class="prompt-cwd-control">
+                <input id="prompt-cwd" type="text" autocomplete="off" placeholder="/path/to/project">
+                <button id="directory-picker-open" type="button" aria-label="Browse working directories" title="Browse working directories">📁</button>
+              </div>
             </div>
           </div>
           <label for="prompt-text">Prompt</label>
@@ -208,6 +211,24 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </div>
       <pre id="guide-content">Loading…</pre>
+    </dialog>
+
+    <dialog id="directory-picker-dialog" class="directory-picker-dialog" aria-labelledby="directory-picker-title">
+      <div class="directory-picker-toolbar">
+        <div>
+          <h2 id="directory-picker-title">Choose working directory</h2>
+          <p id="directory-picker-path" class="directory-picker-path"></p>
+        </div>
+        <button id="directory-picker-close" type="button">Close</button>
+      </div>
+      <div class="directory-picker-navigation">
+        <button id="directory-picker-parent" type="button">Parent directory</button>
+        <span id="directory-picker-message" role="status" aria-live="polite"></span>
+      </div>
+      <div id="directory-picker-list" class="directory-picker-list" aria-label="Directories"></div>
+      <div class="directory-picker-actions">
+        <button id="directory-picker-select" type="button" class="primary">Select current directory</button>
+      </div>
     </dialog>
 
     <dialog id="manual-copy-dialog" aria-labelledby="manual-copy-title">

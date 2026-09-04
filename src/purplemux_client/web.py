@@ -53,6 +53,43 @@ STATIC_FILES = {
 HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
+def list_directory(path: str) -> dict[str, object]:
+    """Describe one directory without reading or returning file entries."""
+    if not path or "\0" in path:
+        raise ValueError("path must be a non-empty directory path")
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"path could not be resolved: {exc}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"path is not a directory: {resolved}")
+
+    directories: list[dict[str, str]] = []
+    try:
+        with os.scandir(resolved) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        directories.append(
+                            {
+                                "name": entry.name,
+                                "path": str(Path(entry.path).resolve(strict=True)),
+                            }
+                        )
+                except (OSError, RuntimeError):
+                    # An entry may disappear or become inaccessible while listing.
+                    continue
+    except OSError as exc:
+        raise ValueError(f"directory could not be listed: {exc}") from exc
+    directories.sort(key=lambda item: (item["name"].casefold(), item["name"]))
+    parent = None if resolved.parent == resolved else str(resolved.parent)
+    return {
+        "path": str(resolved),
+        "parent": parent,
+        "directories": directories,
+    }
+
+
 def _parse_ipv4_number(value: str) -> int | None:
     base = 10
     digits = value
@@ -339,6 +376,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         json_paths = {
+            "/api/directories",
             "/api/prompt",
             "/api/run",
             "/api/validate",
@@ -350,6 +388,29 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         }
         if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+            return
+        if path == "/api/directories":
+            payload = self._read_json()
+            if payload is None:
+                return
+            directory_path = payload.get("path")
+            if not isinstance(directory_path, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "path must be a string"}
+                )
+                return
+            if set(payload) != {"path"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "directory request must contain only path"},
+                )
+                return
+            try:
+                listing = list_directory(directory_path)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, listing)
             return
         if path == "/api/prompt":
             payload = self._read_json()

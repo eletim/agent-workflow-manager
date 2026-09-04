@@ -7,6 +7,14 @@ const workflowFields = document.querySelector("#workflow-fields");
 const promptAgent = document.querySelector("#prompt-agent");
 const promptCwd = document.querySelector("#prompt-cwd");
 const promptText = document.querySelector("#prompt-text");
+const directoryPickerOpen = document.querySelector("#directory-picker-open");
+const directoryPickerDialog = document.querySelector("#directory-picker-dialog");
+const directoryPickerClose = document.querySelector("#directory-picker-close");
+const directoryPickerParent = document.querySelector("#directory-picker-parent");
+const directoryPickerPath = document.querySelector("#directory-picker-path");
+const directoryPickerMessage = document.querySelector("#directory-picker-message");
+const directoryPickerList = document.querySelector("#directory-picker-list");
+const directoryPickerSelect = document.querySelector("#directory-picker-select");
 const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
@@ -107,6 +115,9 @@ let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
 let runningFaviconHrefPromise = null;
+let directoryPickerCurrentPath = null;
+let directoryPickerParentPath = null;
+let directoryPickerRequestGeneration = 0;
 
 function runningFaviconHref() {
   if (runningFaviconHrefPromise === null) {
@@ -147,6 +158,7 @@ function applyFieldMode() {
   promptAgent.disabled = !drafting;
   promptCwd.readOnly = !drafting;
   promptText.readOnly = !drafting;
+  directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
   dryRunButton.disabled = !drafting;
@@ -640,6 +652,80 @@ async function request(path, options = {}) {
   }
   return result;
 }
+
+async function browseDirectory(path) {
+  const requestGeneration = ++directoryPickerRequestGeneration;
+  directoryPickerMessage.textContent = "Loading…";
+  directoryPickerParent.disabled = true;
+  directoryPickerSelect.disabled = true;
+  try {
+    const listing = await request("/api/directories", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path}),
+    });
+    if (requestGeneration !== directoryPickerRequestGeneration) return;
+    directoryPickerCurrentPath = listing.path;
+    directoryPickerParentPath = listing.parent;
+    directoryPickerPath.textContent = listing.path;
+    directoryPickerPath.setAttribute("title", listing.path);
+    directoryPickerMessage.textContent = "";
+    directoryPickerParent.disabled = listing.parent === null;
+    directoryPickerSelect.disabled = false;
+    directoryPickerList.replaceChildren();
+    if (listing.directories.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "directory-picker-empty";
+      empty.textContent = "No subdirectories.";
+      directoryPickerList.append(empty);
+    }
+    for (const directory of listing.directories) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = `📁 ${directory.name}`;
+      button.setAttribute("title", directory.path);
+      button.addEventListener("click", () => {
+        void browseDirectory(directory.path);
+      });
+      directoryPickerList.append(button);
+    }
+  } catch (error) {
+    if (requestGeneration !== directoryPickerRequestGeneration) return;
+    directoryPickerMessage.textContent = String(error);
+    directoryPickerSelect.disabled = directoryPickerCurrentPath === null;
+    directoryPickerParent.disabled = directoryPickerParentPath === null;
+  }
+}
+
+directoryPickerOpen.addEventListener("click", () => {
+  if (activeRunId !== null) return;
+  directoryPickerCurrentPath = null;
+  directoryPickerParentPath = null;
+  directoryPickerPath.textContent = "";
+  directoryPickerList.replaceChildren();
+  directoryPickerDialog.showModal();
+  void browseDirectory(promptCwd.value || "~");
+});
+
+directoryPickerClose.addEventListener("click", () => {
+  directoryPickerRequestGeneration += 1;
+  directoryPickerDialog.close();
+});
+
+directoryPickerParent.addEventListener("click", () => {
+  if (directoryPickerParentPath !== null) {
+    void browseDirectory(directoryPickerParentPath);
+  }
+});
+
+directoryPickerSelect.addEventListener("click", () => {
+  if (directoryPickerCurrentPath === null || activeRunId !== null) return;
+  promptCwd.value = directoryPickerCurrentPath;
+  promptDraft.cwd = directoryPickerCurrentPath;
+  directoryPickerRequestGeneration += 1;
+  directoryPickerDialog.close();
+  promptCwd.focus();
+});
 
 async function refresh() {
   const requestGeneration = ++refreshRequestGeneration;
