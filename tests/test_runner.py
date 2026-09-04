@@ -40,7 +40,7 @@ from purplemux_client.runner import (
     RunNotResumableError,
     RunResource,
 )
-from purplemux_client.web import RunnerHTTPServer, build_parser
+from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
 
 
 @pytest.fixture
@@ -1635,6 +1635,58 @@ def test_prompt_api_rejects_invalid_inputs(
     assert isinstance(result["error"], str)
 
 
+def test_list_directory_returns_only_sorted_directories(tmp_path: Path) -> None:
+    (tmp_path / "zeta").mkdir()
+    (tmp_path / "Alpha").mkdir()
+    (tmp_path / "notes.txt").write_text("not exposed", encoding="utf-8")
+
+    listing = list_directory(str(tmp_path))
+
+    assert listing == {
+        "path": str(tmp_path.resolve()),
+        "parent": str(tmp_path.resolve().parent),
+        "directories": [
+            {"name": "Alpha", "path": str((tmp_path / "Alpha").resolve())},
+            {"name": "zeta", "path": str((tmp_path / "zeta").resolve())},
+        ],
+    }
+
+
+def test_directory_api_navigates_and_validates_paths(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    child = tmp_path / "child"
+    child.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("secret", encoding="utf-8")
+
+    status, listing = request(
+        address,
+        "POST",
+        "/api/directories",
+        json.dumps({"path": str(tmp_path)}),
+        token=token,
+    )
+
+    assert status == 200
+    assert listing["path"] == str(tmp_path.resolve())
+    assert listing["parent"] == str(tmp_path.resolve().parent)
+    assert listing["directories"] == [{"name": "child", "path": str(child.resolve())}]
+    assert "file.txt" not in json.dumps(listing)
+
+    for invalid_path in (str(file_path), str(tmp_path / "missing"), ""):
+        status, payload = request(
+            address,
+            "POST",
+            "/api/directories",
+            json.dumps({"path": invalid_path}),
+            token=token,
+        )
+        assert status == 400
+        assert isinstance(payload["error"], str)
+
+
 def test_events_endpoint_streams_runner_change_notifications(
     web_server: tuple[tuple[str, int], str],
 ) -> None:
@@ -2047,6 +2099,11 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         "prompt-agent",
         "prompt-cwd",
         "prompt-text",
+        "directory-picker-open",
+        "directory-picker-dialog",
+        "directory-picker-path",
+        "directory-picker-parent",
+        "directory-picker-select",
     ):
         assert f'id="{element_id}"' in page
 
@@ -2704,6 +2761,7 @@ def test_notification_settings_mutation_rejects_untrusted_request(
     [
         (path, token, origin)
         for path in (
+            "/api/directories",
             "/api/prompt",
             "/api/run",
             "/api/validate",

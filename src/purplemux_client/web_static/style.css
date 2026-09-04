@@ -136,6 +136,9 @@ textarea {
 }
 .prompt-fields { margin-top: 6px; }
 #prompt-text { min-height: 220px; }
+.prompt-cwd-control { display: flex; gap: 7px; }
+.prompt-cwd-control input { flex: 1; }
+#directory-picker-open { flex: 0 0 auto; padding: 8px 11px; }
 .active-context {
   margin: 0 0 14px;
   color: #9ba3b5;
@@ -287,6 +290,49 @@ dialog {
   border-radius: 10px;
 }
 dialog::backdrop { background: rgb(5 7 11 / 75%); }
+.directory-picker-dialog {
+  height: min(620px, calc(100% - 32px));
+}
+.directory-picker-toolbar, .directory-picker-navigation,
+.directory-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+}
+.directory-picker-toolbar {
+  justify-content: space-between;
+  border-bottom: 1px solid #303746;
+}
+.directory-picker-toolbar h2 { margin: 0 0 5px; }
+.directory-picker-path {
+  margin: 0;
+  color: #bcaaff;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.directory-picker-navigation { padding-bottom: 8px; }
+#directory-picker-message { color: #ffb3bc; font-size: 13px; }
+.directory-picker-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  height: calc(100% - 174px);
+  padding: 0 16px;
+  overflow-y: auto;
+}
+.directory-picker-list button {
+  width: 100%;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.directory-picker-empty { margin: 8px 0; color: #737d91; font-size: 13px; }
+.directory-picker-actions {
+  justify-content: flex-end;
+  border-top: 1px solid #303746;
+}
 .guide-toolbar {
   justify-content: space-between;
   padding: 14px 16px;
