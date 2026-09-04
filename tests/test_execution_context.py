@@ -4,6 +4,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from purplemux_client import inspect_run_repository, prepare_run_repository
 from purplemux_client.preflight import WorkflowValidator
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
@@ -77,6 +79,47 @@ def test_prepare_creates_fresh_detached_worktree_and_returns_identity(
         == "HEAD"
     )
     assert git(repository, "branch", "--show-current") == "main"
+
+
+def test_prepare_ignores_ambient_checkout_branch_and_dirty_state(
+    tmp_path: Path,
+) -> None:
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "switch", "-qc", "ambient-work")
+    dirty_file = repository / "unrelated-untracked"
+    dirty_file.write_text("preserve me\n", encoding="utf-8")
+
+    first = prepare_run_repository(
+        repo=repository,
+        base_branch="main",
+        worktree_root=tmp_path / "managed-worktrees",
+    )
+    second = prepare_run_repository(
+        repo=repository,
+        base_branch="main",
+        worktree_root=tmp_path / "managed-worktrees",
+    )
+
+    assert first.execution_root != second.execution_root
+    assert git(first.execution_root, "rev-parse", "HEAD") == sha
+    assert git(second.execution_root, "rev-parse", "HEAD") == sha
+    assert git(repository, "branch", "--show-current") == "ambient-work"
+    assert dirty_file.read_text(encoding="utf-8") == "preserve me\n"
+
+
+def test_prepare_defaults_to_persistent_awm_owned_home_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    managed_home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(managed_home))
+
+    result = prepare_run_repository(repo=repository, base_branch="main")
+
+    assert result.execution_root.parent == (
+        managed_home / ".local/share/agent-workflow-manager/worktrees"
+    )
+    assert result.execution_root.name.startswith("awm-run-source-")
 
 
 def test_prepare_fetches_the_exact_current_remote_base(tmp_path: Path) -> None:
@@ -203,6 +246,34 @@ print(context.execution_root)
         cleaned = runner.cleanup(result.run_id or 0)
         assert cleaned.resources[0].cleanup_state == "cleaned"
         assert not Path(result.resources[0].identity).exists()
+    finally:
+        runner.close()
+
+
+def test_cleanup_refuses_dirty_prepared_worktree(tmp_path: Path) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "managed-worktrees"
+    code = f"""
+from pathlib import Path
+from purplemux_client import prepare_run_repository
+context = prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={str(worktree_root)!r},
+)
+Path(context.execution_root, "uncommitted").write_text("retain for inspection")
+"""
+    runner = PythonRunner()
+    try:
+        run_id = runner.start(code)
+        completed = wait_until_finished(runner)
+        worktree = Path(completed.resources[0].identity)
+
+        cleanup = runner.cleanup(run_id)
+
+        assert cleanup.resources[0].cleanup_state == "cleanup_retryable"
+        assert "uncommitted changes" in (cleanup.resources[0].cleanup_error or "")
+        assert worktree.is_dir()
     finally:
         runner.close()
 

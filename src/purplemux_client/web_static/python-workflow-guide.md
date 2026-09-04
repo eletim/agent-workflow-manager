@@ -4,8 +4,11 @@ Use this file as the contract when generating a workflow script. The generated
 plain Python script is the source of truth. Do not create a workflow framework,
 graph, DSL, state machine, or UI-side copy of its control flow.
 
-**Canonical version-development sample:**
+**Lower-level direct-execution sample:**
 [sequential multi-Issue implementation and review](../../../examples/sequential-version-development.py).
+That configurable CLI sample intentionally operates on its explicit repository
+path. For normal repository-modifying Workflow mode, use the isolated preparation
+pattern documented below.
 It is the primary adaptable reference for sequential Issue PRs, independent
 per-Issue review/fix loops, safe resume, and a final version PR. Its separate
 whole-version review is mandatory because defects in shared state, lifecycle,
@@ -76,6 +79,15 @@ directory, registers it for explicit Cleanup, and returns both source and
 execution identities. Use `context.execution_root` for Git/GitHub operations,
 PurpleMux workspace creation, shell steps, and agent `cwd` values. The original
 checkout is never switched, reset, stashed, or cleaned.
+
+The validated topology layer accepts that clean detached root as the exact base
+for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sha)`.
+This keeps branch preparation inside the isolated worktree even when the source
+checkout already has the configured base branch checked out. If the logical
+feature branch is also checked out in another worktree, the topology layer uses
+a unique `awm-run/...` local branch. Always push the isolated checkout explicitly
+with `git push origin HEAD:refs/heads/<logical-feature-branch>`; topology and PR
+checks continue to use the logical remote branch name.
 
 The workflow subprocess itself runs from a stable Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put
@@ -559,6 +571,7 @@ from __future__ import annotations
 from purplemux_client import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
+    GitRepository,
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
     TerminalSessionError,
@@ -579,6 +592,16 @@ MAX_REVIEWS = 4
 READY_TIMEOUT = 60
 TURN_TIMEOUT = 900
 WORKFLOW_DRY_RUN = 1
+
+repository = GitRepository.open(
+    REPO,
+    expected_github_slug="OWNER/REPO",
+)
+repository.prepare_feature_branch(
+    FEATURE_BRANCH,
+    base=BASE_BRANCH,
+    expected_base_sha=context.base_sha,
+)
 
 
 def short_error(exc: BaseException) -> str:
@@ -687,9 +710,11 @@ try:
         implementer,
         "implementation",
         f"""Implement {ISSUE_URL}. Treat the Issue body as Source of Truth.
-Use the existing branch {FEATURE_BRANCH}, based on {BASE_BRANCH}; create no other branch.
+Work in the prepared checkout based on {BASE_BRANCH}; publish its HEAD to the
+logical branch {FEATURE_BRANCH} and create no other branch yourself.
 Run required format/lint/typecheck/tests and git diff --check.
-Commit, push, and create a Draft PR targeting {BASE_BRANCH}.
+Commit, push with `git push origin HEAD:refs/heads/{FEATURE_BRANCH}`, and create a
+Draft PR targeting {BASE_BRANCH}.
 Do not merge main or {BASE_BRANCH}. Do not start a review yourself.
 Return a concise implementation and verification summary.""",
     )
@@ -719,7 +744,8 @@ Otherwise return CHANGES_REQUESTED on the first non-empty line, followed by spec
             "fix",
             f"""Fix only the actionable review findings below for {ISSUE_URL}.
 Keep branch {FEATURE_BRANCH}; do not create another branch or merge anything.
-Run required checks, commit, and push to the existing Draft PR.
+Run required checks, commit, and push with
+`git push origin HEAD:refs/heads/{FEATURE_BRANCH}` to the existing Draft PR.
 Do not start a review yourself.
 
 REVIEW FINDINGS:
