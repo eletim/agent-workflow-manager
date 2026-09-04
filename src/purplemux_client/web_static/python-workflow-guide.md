@@ -83,7 +83,11 @@ checkout is never switched, reset, stashed, or cleaned.
 The validated topology layer accepts that clean detached root as the exact base
 for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sha)`.
 This keeps branch preparation inside the isolated worktree even when the source
-checkout already has the configured base branch checked out.
+checkout already has the configured base branch checked out. If the logical
+feature branch is also checked out in another worktree, the topology layer uses
+a unique `awm-run/...` local branch. Always push the isolated checkout explicitly
+with `git push origin HEAD:refs/heads/<logical-feature-branch>`; topology and PR
+checks continue to use the logical remote branch name.
 
 The workflow subprocess itself runs from a stable Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put
@@ -706,9 +710,11 @@ try:
         implementer,
         "implementation",
         f"""Implement {ISSUE_URL}. Treat the Issue body as Source of Truth.
-Use the existing branch {FEATURE_BRANCH}, based on {BASE_BRANCH}; create no other branch.
+Work in the prepared checkout based on {BASE_BRANCH}; publish its HEAD to the
+logical branch {FEATURE_BRANCH} and create no other branch yourself.
 Run required format/lint/typecheck/tests and git diff --check.
-Commit, push, and create a Draft PR targeting {BASE_BRANCH}.
+Commit, push with `git push origin HEAD:refs/heads/{FEATURE_BRANCH}`, and create a
+Draft PR targeting {BASE_BRANCH}.
 Do not merge main or {BASE_BRANCH}. Do not start a review yourself.
 Return a concise implementation and verification summary.""",
     )
@@ -738,7 +744,8 @@ Otherwise return CHANGES_REQUESTED on the first non-empty line, followed by spec
             "fix",
             f"""Fix only the actionable review findings below for {ISSUE_URL}.
 Keep branch {FEATURE_BRANCH}; do not create another branch or merge anything.
-Run required checks, commit, and push to the existing Draft PR.
+Run required checks, commit, and push with
+`git push origin HEAD:refs/heads/{FEATURE_BRANCH}` to the existing Draft PR.
 Do not start a review yourself.
 
 REVIEW FINDINGS:

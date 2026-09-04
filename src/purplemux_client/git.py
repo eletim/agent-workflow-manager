@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import signal
@@ -241,9 +242,16 @@ class GitRepository:
             raise WorkerFailure(f"remote branch {branch!r} does not exist")
         self._fetch_branch(branch, authoritative_sha)
         state = self._inspect_branch_from_tracking(branch, authoritative_sha)
+        checkout_branch = self._checkout_branch(branch)
         if state.local_sha is None:
             self._git_mutation(
-                ["switch", "--track", "-c", branch, self._tracking_ref(branch)],
+                [
+                    "switch",
+                    "--track",
+                    "-c",
+                    checkout_branch,
+                    self._tracking_ref(branch),
+                ],
                 operation="create tracking branch",
                 target=branch,
                 pre_state=state,
@@ -266,14 +274,14 @@ class GitRepository:
                     )
             if not state.current:
                 self._git_mutation(
-                    ["switch", branch],
+                    ["switch", checkout_branch],
                     operation="switch branch",
                     target=branch,
                     pre_state=state,
                     observe=lambda: self._inspect_branch_from_tracking(
                         branch, authoritative_sha
                     ),
-                    desired=lambda: self._current_branch() == branch,
+                    desired=lambda: self._branch_is_current(branch),
                 )
             if state.local_sha != authoritative_sha:
                 before = self._inspect_branch_from_tracking(branch, authoritative_sha)
@@ -343,9 +351,10 @@ class GitRepository:
                 pre_dispatch=recheck_authoritative_refs,
             )
         state = self._inspect_branch_from_tracking(branch, feature_remote)
+        checkout_branch = self._checkout_branch(branch)
         if state.local_sha is None and feature_remote is None:
             self._git_mutation(
-                ["switch", "-c", branch, expected_base_sha],
+                ["switch", "-c", checkout_branch, expected_base_sha],
                 operation="create feature branch",
                 target=branch,
                 pre_state=state,
@@ -361,7 +370,13 @@ class GitRepository:
                     f"{expected_base_sha}"
                 )
             self._git_mutation(
-                ["switch", "--track", "-c", branch, self._tracking_ref(branch)],
+                [
+                    "switch",
+                    "--track",
+                    "-c",
+                    checkout_branch,
+                    self._tracking_ref(branch),
+                ],
                 operation="create tracking feature branch",
                 target=branch,
                 pre_state=state,
@@ -392,14 +407,14 @@ class GitRepository:
                 )
             if not state.current:
                 self._git_mutation(
-                    ["switch", branch],
+                    ["switch", checkout_branch],
                     operation="switch feature branch",
                     target=branch,
                     pre_state=state,
                     observe=lambda: self._inspect_branch_from_tracking(
                         branch, feature_remote
                     ),
-                    desired=lambda: self._current_branch() == branch,
+                    desired=lambda: self._branch_is_current(branch),
                     pre_dispatch=recheck_authoritative_refs,
                 )
             if needs_fast_forward:
@@ -522,9 +537,9 @@ class GitRepository:
     def _inspect_branch(self, branch: str) -> BranchState:
         return BranchState(
             name=branch,
-            local_sha=self._local_sha(branch),
+            local_sha=self._checkout_sha(branch),
             remote_sha=self._remote_sha(branch),
-            current=self._current_branch() == branch,
+            current=self._branch_is_current(branch),
         )
 
     def _inspect_branch_from_tracking(
@@ -538,10 +553,41 @@ class GitRepository:
             )
         return BranchState(
             branch,
-            self._local_sha(branch),
+            self._checkout_sha(branch),
             authoritative_sha,
-            self._current_branch() == branch,
+            self._branch_is_current(branch),
         )
+
+    def _checkout_branch(self, branch: str) -> str:
+        private = self._private_branch(branch)
+        current = self._current_branch()
+        if current == private:
+            return private
+        owner = self._branch_worktree(branch)
+        if owner is not None and owner != self.root:
+            return private
+        return branch
+
+    def _checkout_sha(self, branch: str) -> str | None:
+        return self._local_sha(self._checkout_branch(branch))
+
+    def _branch_is_current(self, branch: str) -> bool:
+        return self._current_branch() == self._checkout_branch(branch)
+
+    def _private_branch(self, branch: str) -> str:
+        run_identity = hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
+        return f"awm-run/{run_identity}/{branch}"
+
+    def _branch_worktree(self, branch: str) -> Path | None:
+        output = self._read(
+            [
+                "for-each-ref",
+                "--format=%(worktreepath)%00",
+                f"refs/heads/{branch}",
+            ]
+        )
+        path = output.split("\0", 1)[0]
+        return Path(path).resolve() if path else None
 
     def _local_sha(self, branch: str) -> str | None:
         return self._optional_ref_sha(f"refs/heads/{branch}")
@@ -635,8 +681,8 @@ class GitRepository:
             )
 
     def _branch_matches(self, branch: str, sha: str, current: bool) -> bool:
-        return self._local_sha(branch) == sha and (
-            not current or self._current_branch() == branch
+        return self._checkout_sha(branch) == sha and (
+            not current or self._branch_is_current(branch)
         )
 
     def _git_mutation(

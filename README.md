@@ -83,7 +83,10 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Agent code still owns editing, testing, committing, and pushing.
+# Agent code still owns editing, testing, committing, and pushing. Push HEAD to
+# the logical branch explicitly because an occupied branch uses a run-private
+# local checkout.
+# git push origin HEAD:refs/heads/feature/issue-123
 feature = repo.require_pushed("feature/issue-123")
 pull_request = github.require_pr(
     head="feature/issue-123",

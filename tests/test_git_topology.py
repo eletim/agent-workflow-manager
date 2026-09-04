@@ -159,6 +159,65 @@ def test_prepare_feature_from_detached_exact_base_without_switching_source(
     assert git(work, "branch", "--show-current") == "main"
 
 
+def test_synchronize_uses_run_private_branch_when_base_is_occupied(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    isolated = tmp_path / "awm-run-isolated"
+    git(work, "worktree", "add", "--detach", str(isolated), base_sha)
+    repo = open_repo(isolated, RecordingGitRunner())
+
+    synchronized = repo.synchronize_branch("main")
+
+    assert synchronized.current
+    assert synchronized.local_sha == base_sha
+    assert git(isolated, "branch", "--show-current").startswith("awm-run/")
+    assert git(work, "branch", "--show-current") == "main"
+    assert git(work, "rev-parse", "HEAD") == base_sha
+
+
+@pytest.mark.parametrize("feature_owner", ["source", "retained"])
+def test_prepare_feature_uses_run_private_branch_when_logical_branch_is_occupied(
+    repositories: tuple[Path, Path, Path],
+    tmp_path: Path,
+    feature_owner: str,
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    branch = "feature/occupied"
+    holder = work
+    if feature_owner == "source":
+        git(work, "switch", "-c", branch)
+    else:
+        holder = tmp_path / "retained-run"
+        git(work, "branch", branch)
+        git(work, "worktree", "add", str(holder), branch)
+    git(work, "push", "-u", "origin", branch)
+    isolated = tmp_path / "new-run"
+    git(work, "worktree", "add", "--detach", str(isolated), base_sha)
+    repo = open_repo(isolated, RecordingGitRunner())
+
+    feature = repo.prepare_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    private_branch = git(isolated, "branch", "--show-current")
+    git(isolated, "commit", "--allow-empty", "-m", "isolated change")
+
+    assert feature.current
+    assert feature.local_sha == base_sha
+    assert private_branch.startswith("awm-run/")
+    assert private_branch.endswith(f"/{branch}")
+    assert git(holder, "branch", "--show-current") == branch
+    assert git(holder, "rev-parse", "HEAD") == base_sha
+    assert git(work, "rev-parse", branch) == base_sha
+
+    git(isolated, "push", "origin", f"HEAD:refs/heads/{branch}")
+    pushed = repo.require_pushed(branch)
+    assert pushed.current
+    assert pushed.local_sha == pushed.remote_sha
+
+
 def test_synchronize_fast_forwards_but_rejects_ahead_and_dirty(
     repositories: tuple[Path, Path, Path],
 ) -> None:
