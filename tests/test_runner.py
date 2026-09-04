@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -14,6 +15,9 @@ from pathlib import Path
 
 import pytest
 
+import purplemux_client.runner as runner_module
+from purplemux_client import WorkspaceState
+from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.readiness import (
@@ -23,9 +27,11 @@ from purplemux_client.readiness import (
 from purplemux_client.runner import (
     InvalidExecutionContextError,
     PythonRunner,
+    RunCleanupNotAllowedError,
     RunnerClosedError,
     RunnerSnapshot,
     RunNotResumableError,
+    RunResource,
 )
 from purplemux_client.web import RunnerHTTPServer, build_parser
 
@@ -72,6 +78,429 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     observed_at = datetime.fromisoformat(result.stdout_entries[0].observed_at)
     assert observed_at.tzinfo is not None
     assert result.exit_code == 0
+
+
+def test_run_owned_resources_are_retained_structurally_after_success(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {
+    "workspace_id": "ws-1", "name": "Agent", "panel_type": "codex-cli"
+})
+register_run_resource("purplemux_tab", "tab-1", {
+    "workspace_id": "ws-1", "name": "Agent", "panel_type": "codex-cli"
+})
+"""
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert [(item.kind, item.identity) for item in result.resources] == [
+        ("purplemux_workspace", "ws-1"),
+        ("purplemux_tab", "tab-1"),
+    ]
+    assert result.resources[1].metadata["workspace_id"] == "ws-1"
+    assert result.resources[1].cleanup_state == "retained"
+    assert result.as_json()["resourceCleanupStatus"] == "retained"
+
+
+def test_explicit_cleanup_uses_dependency_order_and_keeps_run_history(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
+register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo"})
+"""
+    )
+    result = wait_until_finished(runner)
+    cleaned: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_resource",
+        lambda resource: cleaned.append((resource.kind, resource.identity)),
+    )
+
+    after = runner.cleanup(result.run_id or 0)
+
+    assert cleaned == [
+        ("purplemux_tab", "tab-2"),
+        ("purplemux_tab", "tab-1"),
+        ("purplemux_workspace", "ws-1"),
+        ("git_worktree", "/tmp/worktree"),
+    ]
+    assert all(item.cleanup_state == "cleaned" for item in after.resources)
+    assert after.as_json()["resourceCleanupStatus"] == "cleaned"
+    assert runner.snapshot(result.run_id).state == "success"
+
+
+def test_cleanup_aggregates_sibling_failures_and_blocks_parent_resources(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
+"""
+    )
+    result = wait_until_finished(runner)
+    attempted: list[str] = []
+
+    def cleanup(resource: object) -> None:
+        identity = resource.identity  # type: ignore[attr-defined]
+        attempted.append(identity)
+        if identity == "tab-1":
+            raise MutationOutcomeUnknown("close outcome could not be confirmed")
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+    after = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-2", "tab-1"]
+    states = {item.identity: item.cleanup_state for item in after.resources}
+    assert states == {"ws-1": "retained", "tab-1": "blocked", "tab-2": "cleaned"}
+    assert after.as_json()["resourceCleanupStatus"] == "blocked"
+    assert "could not be confirmed" in str(after.resources[1].cleanup_error)
+    monkeypatch.setattr(runner, "_resource_is_absent", lambda _resource: False)
+    reconciled = runner.cleanup(result.run_id or 0)
+    assert reconciled.as_json()["resourceCleanupStatus"] == "blocked"
+    assert attempted == ["tab-2", "tab-1"]
+
+
+def test_cleanup_retries_precondition_failure_after_remediation(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
+    result = wait_until_finished(runner)
+    precondition_satisfied = False
+    attempted: list[str] = []
+
+    def cleanup(resource: RunResource) -> None:
+        attempted.append(resource.identity)
+        if resource.identity == "tab-1" and not precondition_satisfied:
+            raise OSError("tab identity changed; refusing cleanup")
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+    blocked = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-1"]
+    assert [item.cleanup_state for item in blocked.resources] == [
+        "retained",
+        "cleanup_retryable",
+    ]
+    assert blocked.as_json()["resourceCleanupStatus"] == "blocked"
+    assert "identity changed" in str(blocked.resources[1].cleanup_error)
+
+    precondition_satisfied = True
+    cleaned = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-1", "tab-1", "ws-1"]
+    assert all(item.cleanup_state == "cleaned" for item in cleaned.resources)
+    assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
+
+
+def test_cleanup_rejects_running_workflow(runner: PythonRunner) -> None:
+    run_id = runner.start("import time; time.sleep(60)")
+
+    with pytest.raises(RunCleanupNotAllowedError, match="non-running"):
+        runner.cleanup(run_id)
+
+    assert runner.stop(run_id)
+
+
+def test_cleanup_serializes_resume_and_server_rejects_resume_after_cleanup(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start(
+        """
+from purplemux_client import register_run_resource, save_checkpoint
+register_run_resource("managed_shell_result", "/tmp/awm-shell-owned", {
+    "result_path": "/tmp/awm-shell-owned/result.json", "tab_id": "tab-1"
+})
+save_checkpoint("resource ready", {"tab": "tab-1"})
+raise RuntimeError("repair first")
+"""
+    )
+    wait_until_finished(runner)
+    cleanup_started = threading.Event()
+    allow_cleanup = threading.Event()
+
+    def cleanup_resource(_resource: RunResource) -> None:
+        cleanup_started.set()
+        assert allow_cleanup.wait(2)
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup_resource)
+    cleanup_thread = threading.Thread(target=lambda: runner.cleanup(run_id))
+    resume_errors: list[BaseException] = []
+    resume_thread = threading.Thread(
+        target=lambda: _capture_exception(lambda: runner.resume(run_id), resume_errors)
+    )
+
+    cleanup_thread.start()
+    assert cleanup_started.wait(2)
+    resume_thread.start()
+    time.sleep(0.05)
+    assert resume_thread.is_alive()
+    allow_cleanup.set()
+    cleanup_thread.join(2)
+    resume_thread.join(2)
+
+    assert not cleanup_thread.is_alive()
+    assert not resume_thread.is_alive()
+    assert len(resume_errors) == 1
+    assert isinstance(resume_errors[0], RunNotResumableError)
+    assert "entered cleanup" in str(resume_errors[0])
+    assert runner.snapshot(run_id).state == "failed"
+
+
+def _capture_exception(
+    action: Callable[[], object], errors: list[BaseException]
+) -> None:
+    try:
+        action()
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def test_managed_shell_result_cleanup_removes_only_expected_temp_directory(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    result.write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    runner._cleanup_resource(resource)
+
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_managed_shell_result_cleanup_rejects_replaced_directory_without_unlinking(
+    runner: PythonRunner, tmp_path: Path, replacement_kind: str
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    result.write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+    result.unlink()
+    directory.rmdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    replacement_result = replacement / "result.json"
+    replacement_result.write_text("replacement", encoding="utf-8")
+    if replacement_kind == "directory":
+        directory.mkdir()
+        (directory / "result.json").write_text("replacement", encoding="utf-8")
+        protected_result = directory / "result.json"
+    else:
+        directory.symlink_to(replacement, target_is_directory=True)
+        protected_result = replacement_result
+
+    with pytest.raises(OSError, match="owned directory|identity changed"):
+        runner._cleanup_resource(resource)
+
+    assert protected_result.read_text(encoding="utf-8") == "replacement"
+
+
+def test_workspace_cleanup_releases_verified_empty_workspace(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = WorkspaceState("ws-owned", "Owned", ("/repo",))
+    deleted: list[tuple[str, WorkspaceState]] = []
+
+    class Runtime:
+        def list_workspaces(self) -> tuple[WorkspaceState, ...]:
+            return (workspace,)
+
+        def delete_workspace(
+            self, workspace_id: str, *, expected_state: WorkspaceState
+        ) -> None:
+            deleted.append((workspace_id, expected_state))
+
+    class Client:
+        def list_sessions(self) -> tuple[object, ...]:
+            return ()
+
+    monkeypatch.setattr(runner_module, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        runner_module, "PurpleMuxCLIClient", lambda _workspace: Client()
+    )
+
+    runner._cleanup_resource(
+        RunResource(
+            "purplemux_workspace",
+            "ws-owned",
+            {"name": "Owned", "directories": "/repo"},
+        )
+    )
+
+    assert deleted == [("ws-owned", workspace)]
+
+
+def test_git_worktree_cleanup_rejects_replacement_at_owned_path(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "owned-worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    (repository / "tracked").write_text("one", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "initial"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-qb",
+            "feature",
+            str(worktree),
+        ],
+        check=True,
+    )
+
+    def output(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    metadata = {
+        "repository": str(repository),
+        "path_identity": _test_path_identity(worktree),
+        "git_file_identity": _test_path_identity(worktree / ".git", ctime=True),
+        "git_dir": output("rev-parse", "--absolute-git-dir"),
+        "head": output("rev-parse", "HEAD"),
+        "branch": output("rev-parse", "--symbolic-full-name", "HEAD"),
+    }
+    subprocess.run(
+        ["git", "-C", str(repository), "worktree", "remove", str(worktree)],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-q",
+            str(worktree),
+            "feature",
+        ],
+        check=True,
+    )
+
+    with pytest.raises(OSError, match="identity changed"):
+        runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
+
+    assert worktree.is_dir()
+
+
+def test_git_worktree_cleanup_allows_branch_and_head_to_change_after_registration(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "owned-worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    (repository / "tracked").write_text("one", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "initial"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        capture_output=True,
+    )
+
+    def output(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    metadata = {
+        "repository": str(repository),
+        "path_identity": _test_path_identity(worktree),
+        "git_file_identity": _test_path_identity(worktree / ".git", ctime=True),
+        "git_dir": output("rev-parse", "--absolute-git-dir"),
+        "head": output("rev-parse", "HEAD"),
+        "branch": output("rev-parse", "--symbolic-full-name", "HEAD"),
+    }
+    subprocess.run(["git", "-C", str(worktree), "switch", "-c", "feature"], check=True)
+    (worktree / "tracked").write_text("two", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-qm", "implementation"],
+        check=True,
+    )
+
+    runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
+
+    assert not worktree.exists()
+
+
+def _test_path_identity(path: Path, *, ctime: bool = False) -> str:
+    state = path.stat(follow_symlinks=False)
+    suffix = f":{state.st_ctime_ns}" if ctime else ""
+    return f"{state.st_dev}:{state.st_ino}{suffix}"
 
 
 def test_stderr(runner: PythonRunner) -> None:
@@ -1065,6 +1494,9 @@ def test_runner_http_lifecycle(
         "code": 'print("HTTP_OK")',
         "suspensionReason": None,
         "resumable": False,
+        "resources": [],
+        "resourceCleanupStatus": "cleaned",
+        "cleanupAvailable": True,
     }
 
 
@@ -1184,6 +1616,72 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "GET", "/api/runs/999")[0] == 404
     assert request(address, "POST", "/api/runs/999/stop")[0] == 403
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
+    assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
+
+
+def test_run_api_exposes_explicit_cleanup_without_deleting_history(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "print('done')"}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, cleaned = request(
+        address, "POST", f"/api/runs/{run_id}/cleanup", token=token
+    )
+
+    assert status == 200
+    assert cleaned["state"] == "success"
+    assert cleaned["resourceCleanupStatus"] == "cleaned"
+    assert request(address, "GET", f"/api/runs/{run_id}")[0] == 200
+
+
+def test_resume_api_rejects_run_after_its_resources_enter_cleanup(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    code = """
+from purplemux_client import register_run_resource, save_checkpoint
+register_run_resource("managed_shell_result", "/tmp/awm-shell-absent", {
+    "result_path": "/tmp/awm-shell-absent/result.json", "tab_id": "tab-1"
+})
+save_checkpoint("resource created", {"tab": "tab-1"})
+raise RuntimeError("repair")
+"""
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": code}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    assert (
+        request(address, "POST", f"/api/runs/{run_id}/cleanup", token=token)[0] == 200
+    )
+    status, refusal = request(
+        address, "POST", f"/api/runs/{run_id}/resume", token=token
+    )
+
+    assert status == 409
+    assert "entered cleanup" in str(refusal["error"])
 
 
 def test_run_api_resumes_same_run_and_rejects_unsafe_replay(

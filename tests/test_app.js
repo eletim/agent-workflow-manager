@@ -99,6 +99,8 @@ function snapshot({
   cwd = `/work/run-${runId}`,
   args = [],
   code = `print("run-${runId}")`,
+  resources = [],
+  resourceCleanupStatus = resources.length ? "retained" : "cleaned",
 }) {
   return {
     args,
@@ -122,6 +124,9 @@ function snapshot({
     dryRunEligible: true,
     dryRunIssues: [],
     findings: [],
+    resources,
+    resourceCleanupStatus,
+    cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
   };
 }
 
@@ -157,9 +162,10 @@ async function loadApp({
 }) {
   const ids = [
     "code", "working-directory", "run-arguments", "active-context", "run-list",
-    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "status", "stdout",
+    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
-    "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
+    "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
+    "resources-summary", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
@@ -1684,4 +1690,47 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   assert.equal(elements["working-directory"].value, "/tmp/in-progress-draft");
   assert.equal(elements["run-arguments"].value, "in-progress-arg");
   assert.equal(elements.code.value, "print('in progress')");
+});
+
+test("completed Workflow runs expose explicit Cleanup and retain their history", async () => {
+  const retained = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    resources: [{
+      kind: "purplemux_tab",
+      identity: "tab-1",
+      metadata: {workspace_id: "ws-1"},
+      cleanupState: "retained",
+      cleanupError: null,
+    }],
+  });
+  const cleaned = snapshot({
+    ...retained,
+    resources: [{...retained.resources[0], cleanupState: "cleaned"}],
+    resourceCleanupStatus: "cleaned",
+  });
+  const runs = [{runId: 1, state: "success", cwd: retained.cwd}];
+  const details = {1: retained};
+  const {calls, elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/runs/1/cleanup" && options.method === "POST") {
+        details[1] = cleaned;
+        return response(cleaned);
+      }
+      return undefined;
+    },
+  });
+
+  assert.equal(elements.cleanup.disabled, false);
+  assert.match(elements["resources-summary"].textContent, /retained/);
+  await elements.cleanup.dispatch("click");
+
+  assert.ok(calls.some(([url, method]) => url === "/api/runs/1/cleanup" && method === "POST"));
+  assert.equal(runs.length, 1);
+  assert.equal(elements.cleanup.disabled, true);
+  assert.match(elements["resources-summary"].textContent, /cleaned/);
 });

@@ -356,16 +356,15 @@ def test_running_final_check_reattaches_without_new_shell_or_agent_turn(
 
     SAMPLE_MODULE.run_final_checks(Client(), config(tmp_path), state)
 
-    assert state.phase == "integration_checks_closed"
+    assert state.phase == "integration_checks_complete"
     assert events == [
         "resume:tab-checks:/tmp/awm-shell-checks/result.json",
         "wait:tab-checks",
         "read:tab-checks",
-        "close:tab-checks",
     ]
 
 
-def test_completed_final_check_reattaches_before_confirmed_close(
+def test_completed_final_check_reattaches_without_automatic_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
@@ -385,10 +384,9 @@ def test_completed_final_check_reattaches_before_confirmed_close(
 
     SAMPLE_MODULE.run_final_checks(Client(), config(tmp_path), state)
 
-    assert state.phase == "integration_checks_closed"
+    assert state.phase == "integration_checks_complete"
     assert events == [
         "resume:tab-checks:/tmp/awm-shell-checks/result.json",
-        "close:tab-checks",
     ]
 
 

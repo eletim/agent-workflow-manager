@@ -77,6 +77,7 @@ validate_purplemux() {
     for required_contract in \
         'workspaces' \
         'workspace create --cwd PATH' \
+        'workspace delete -w WS --if-empty' \
         'tab create -w WS [-n NAME] [-t TYPE]' \
         'tab send -w WS TAB_ID' \
         'tab interrupt -w WS TAB_ID' \

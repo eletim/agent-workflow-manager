@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
+from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
+from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -42,8 +45,48 @@ RunnerState = Literal[
     "stopped",
     "validation_failed",
 ]
+ResourceCleanupState = Literal[
+    "retained", "cleanup_pending", "cleanup_retryable", "cleaned", "blocked"
+]
+ResourceCleanupStatus = Literal[
+    "retained", "cleaning", "partially_cleaned", "cleaned", "blocked"
+]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
 logger = logging.getLogger(__name__)
+
+
+def _resource_cleanup_status(
+    resources: Sequence[RunResource],
+) -> ResourceCleanupStatus:
+    if not resources or all(item.cleanup_state == "cleaned" for item in resources):
+        return "cleaned"
+    if any(item.cleanup_state == "cleanup_pending" for item in resources):
+        return "cleaning"
+    if any(
+        item.cleanup_state in ("cleanup_retryable", "blocked") for item in resources
+    ):
+        return "blocked"
+    if any(item.cleanup_state == "cleaned" for item in resources):
+        return "partially_cleaned"
+    return "retained"
+
+
+def _path_identity(path: Path) -> str:
+    try:
+        state = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(f"could not inspect path identity for {path}: {exc}") from exc
+    return f"{state.st_dev}:{state.st_ino}"
+
+
+def _administrative_identity(path: Path) -> str:
+    try:
+        state = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(
+            f"could not inspect administrative identity for {path}: {exc}"
+        ) from exc
+    return f"{state.st_dev}:{state.st_ino}:{state.st_ctime_ns}"
 
 
 class TerminalNotifier(Protocol):
@@ -125,6 +168,32 @@ class RunNotResumableError(RuntimeError):
     """Raised when a run has no workflow-proven safe continuation point."""
 
 
+class RunCleanupNotAllowedError(RuntimeError):
+    """Raised when explicit cleanup is unsafe for the selected run."""
+
+
+class RunCleanupInProgressError(RuntimeError):
+    """Raised when cleanup is already active for the selected run."""
+
+
+@dataclass(frozen=True)
+class RunResource:
+    kind: str
+    identity: str
+    metadata: dict[str, str]
+    cleanup_state: ResourceCleanupState = "retained"
+    cleanup_error: str | None = None
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "identity": self.identity,
+            "metadata": dict(self.metadata),
+            "cleanupState": self.cleanup_state,
+            "cleanupError": self.cleanup_error,
+        }
+
+
 @dataclass(frozen=True)
 class RunAttempt:
     number: int
@@ -159,6 +228,7 @@ class RunnerSnapshot:
     suspension_reason: str | None
     findings: tuple[TopologyFinding, ...]
     dry_run: DryRunResult | None
+    resources: tuple[RunResource, ...] = ()
     # Submitted Python source for this run's immutable execution snapshot.
     # Populated only for an actual run (see ``_snapshot_run``); left ``None``
     # for the idle/validation preview, which is not tied to a persisted run.
@@ -199,8 +269,17 @@ class RunnerSnapshot:
             }
             for attempt in self.attempts
         ]
-        payload["resumable"] = self.state in ("failed", "suspended") and (
-            self.checkpoint is not None
+        payload["resources"] = [resource.as_json() for resource in self.resources]
+        payload["resourceCleanupStatus"] = _resource_cleanup_status(self.resources)
+        payload["cleanupAvailable"] = self.state not in (
+            "idle",
+            "running",
+            "validation_failed",
+        )
+        payload["resumable"] = (
+            self.state in ("failed", "suspended")
+            and self.checkpoint is not None
+            and all(resource.cleanup_state == "retained" for resource in self.resources)
         )
         return payload
 
@@ -214,7 +293,12 @@ class RunnerSnapshot:
             "checkpoint": asdict(self.checkpoint) if self.checkpoint else None,
             "attempts": len(self.attempts),
             "resumable": self.state in ("failed", "suspended")
-            and self.checkpoint is not None,
+            and self.checkpoint is not None
+            and all(
+                resource.cleanup_state == "retained" for resource in self.resources
+            ),
+            "resourceCleanupStatus": _resource_cleanup_status(self.resources),
+            "resourceCount": len(self.resources),
         }
 
 
@@ -245,6 +329,7 @@ class _RunRecord:
     resumed_from: str | None = None
     attempts: list[RunAttempt] = field(default_factory=list)
     suspension_reason: str | None = None
+    resources: list[RunResource] = field(default_factory=list)
 
 
 class PythonRunner:
@@ -524,62 +609,69 @@ class PythonRunner:
             with self._lock:
                 self._ensure_open()
                 run = self._get_run(run_id)
-                self._ensure_resumable(run)
-                code = run.code
-                checkpoint = run.checkpoint
-                cwd = run.cwd
-                args = run.args
-                explicit_cwd = run.explicit_cwd
-            run_cwd, run_args, child_env = self._execution_context(
-                cwd, args, explicit_cwd=explicit_cwd
-            )
-            validation = self._validator.validate(
-                code, cwd=run_cwd, environment=child_env
-            )
-            with self._lock:
-                self._ensure_open()
-                run = self._get_run(run_id)
-                self._ensure_resumable(run)
-                if run.checkpoint != checkpoint:
-                    raise RunNotResumableError(
-                        f"run {run_id} checkpoint changed while resume was prepared"
+                lifecycle_lock = run.cleanup_lock
+            with lifecycle_lock:
+                with self._lock:
+                    self._ensure_open()
+                    run = self._get_run(run_id)
+                    self._ensure_resumable(run)
+                    code = run.code
+                    checkpoint = run.checkpoint
+                    cwd = run.cwd
+                    args = run.args
+                    explicit_cwd = run.explicit_cwd
+                run_cwd, run_args, child_env = self._execution_context(
+                    cwd, args, explicit_cwd=explicit_cwd
+                )
+                validation = self._validator.validate(
+                    code, cwd=run_cwd, environment=child_env
+                )
+                with self._lock:
+                    self._ensure_open()
+                    run = self._get_run(run_id)
+                    self._ensure_resumable(run)
+                    if run.checkpoint != checkpoint:
+                        raise RunNotResumableError(
+                            f"run {run_id} checkpoint changed while resume was prepared"
+                        )
+                    if not validation.valid:
+                        raise WorkflowValidationError(validation)
+                    assert checkpoint is not None
+                    child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
+                        asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
                     )
-                if not validation.valid:
-                    raise WorkflowValidationError(validation)
-                assert checkpoint is not None
-                child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
-                    asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
-                )
-                process, script_path, progress_read_fd = self._spawn_process(
-                    code,
-                    run_cwd=run_cwd,
-                    run_args=run_args,
-                    child_env=child_env,
-                )
-                self._append_output(
-                    run,
-                    "stdout",
-                    f"\n[resume attempt {len(run.attempts) + 1} "
-                    f"from checkpoint {checkpoint.name!r}]\n",
-                    lock_held=True,
-                )
-                self._append_output(
-                    run,
-                    "stderr",
-                    f"\n[resume attempt {len(run.attempts) + 1} "
-                    f"from checkpoint {checkpoint.name!r}]\n",
-                    lock_held=True,
-                )
-                run.process = process
-                run.process_group_id = process.pid
-                run.script_path = script_path
-                run.state = "running"
-                run.exit_code = None
-                run.stop_requested = False
-                run.resumed_from = checkpoint.name
-                run.suspension_reason = None
-                self._start_attempt_threads(run, process, script_path, progress_read_fd)
-                self._mark_changed()
+                    process, script_path, progress_read_fd = self._spawn_process(
+                        code,
+                        run_cwd=run_cwd,
+                        run_args=run_args,
+                        child_env=child_env,
+                    )
+                    self._append_output(
+                        run,
+                        "stdout",
+                        f"\n[resume attempt {len(run.attempts) + 1} "
+                        f"from checkpoint {checkpoint.name!r}]\n",
+                        lock_held=True,
+                    )
+                    self._append_output(
+                        run,
+                        "stderr",
+                        f"\n[resume attempt {len(run.attempts) + 1} "
+                        f"from checkpoint {checkpoint.name!r}]\n",
+                        lock_held=True,
+                    )
+                    run.process = process
+                    run.process_group_id = process.pid
+                    run.script_path = script_path
+                    run.state = "running"
+                    run.exit_code = None
+                    run.stop_requested = False
+                    run.resumed_from = checkpoint.name
+                    run.suspension_reason = None
+                    self._start_attempt_threads(
+                        run, process, script_path, progress_read_fd
+                    )
+                    self._mark_changed()
 
     @staticmethod
     def _ensure_resumable(run: _RunRecord) -> None:
@@ -591,6 +683,10 @@ class PythonRunner:
             raise RunNotResumableError(
                 f"run {run.run_id} has no safe checkpoint; start a new run or update "
                 "the workflow to call save_checkpoint() after completed side effects"
+            )
+        if any(resource.cleanup_state != "retained" for resource in run.resources):
+            raise RunNotResumableError(
+                f"run {run.run_id} resources entered cleanup; Resume is no longer safe"
             )
 
     def _start_validated(
@@ -798,6 +894,7 @@ class PythonRunner:
             findings=tuple(run.findings),
             dry_run=None,
             code=run.code,
+            resources=tuple(run.resources),
         )
 
     def _get_run(self, run_id: int) -> _RunRecord:
@@ -869,6 +966,372 @@ class PythonRunner:
 
         self._terminate_process_group(run)
         return True
+
+    def cleanup(self, run_id: int) -> RunnerSnapshot:
+        """Explicitly release resources owned by one completed Workflow run."""
+        with self._lock:
+            self._ensure_open()
+            run = self._get_run(run_id)
+            cleanup_lock = run.cleanup_lock
+        if not cleanup_lock.acquire(blocking=False):
+            raise RunCleanupInProgressError(f"run {run_id} cleanup is already active")
+        try:
+            with self._lock:
+                self._ensure_open()
+                run = self._get_run(run_id)
+                if run.state in ("idle", "running", "validation_failed"):
+                    raise RunCleanupNotAllowedError(
+                        f"run {run_id} is {run.state}; cleanup requires a non-running run"
+                    )
+                ordered = sorted(
+                    enumerate(run.resources),
+                    key=lambda item: (
+                        self._resource_cleanup_priority(item[1]),
+                        -item[0] if item[1].kind == "purplemux_tab" else item[0],
+                    ),
+                )
+
+            failed_priority: int | None = None
+            for index, original in ordered:
+                priority = self._resource_cleanup_priority(original)
+                if failed_priority is not None and priority > failed_priority:
+                    break
+                with self._lock:
+                    current = run.resources[index]
+                    if current.cleanup_state == "cleaned":
+                        continue
+                if current.cleanup_state in ("cleanup_pending", "blocked"):
+                    try:
+                        absent = self._resource_is_absent(current)
+                    except Exception:
+                        absent = False
+                    if absent:
+                        with self._lock:
+                            run.resources[index] = RunResource(
+                                current.kind,
+                                current.identity,
+                                current.metadata,
+                                "cleaned",
+                            )
+                            self._mark_changed()
+                    else:
+                        failed_priority = priority
+                    continue
+                with self._lock:
+                    pending = RunResource(
+                        current.kind,
+                        current.identity,
+                        current.metadata,
+                        "cleanup_pending",
+                    )
+                    run.resources[index] = pending
+                    self._mark_changed()
+                try:
+                    self._cleanup_resource(pending)
+                except Exception as exc:
+                    cleanup_state: ResourceCleanupState = (
+                        "blocked"
+                        if isinstance(exc, MutationOutcomeUnknown)
+                        else "cleanup_retryable"
+                    )
+                    with self._lock:
+                        run.resources[index] = RunResource(
+                            pending.kind,
+                            pending.identity,
+                            pending.metadata,
+                            cleanup_state,
+                            str(exc),
+                        )
+                        self._mark_changed()
+                    failed_priority = priority
+                else:
+                    with self._lock:
+                        run.resources[index] = RunResource(
+                            pending.kind,
+                            pending.identity,
+                            pending.metadata,
+                            "cleaned",
+                        )
+                        self._mark_changed()
+            with self._lock:
+                return self._snapshot_run(run)
+        finally:
+            cleanup_lock.release()
+
+    @staticmethod
+    def _resource_cleanup_priority(resource: RunResource) -> int:
+        return {
+            "purplemux_tab": 0,
+            "managed_shell_result": 1,
+            "purplemux_workspace": 2,
+            "git_worktree": 3,
+        }.get(resource.kind, 3)
+
+    def _cleanup_resource(self, resource: RunResource) -> None:
+        if resource.kind == "purplemux_tab":
+            workspace_id = resource.metadata.get("workspace_id")
+            if not workspace_id:
+                raise OSError("PurpleMux tab ownership lacks workspace_id")
+            client = PurpleMuxCLIClient(workspace_id)
+            tabs = client.list_sessions()
+            selected = next((tab for tab in tabs if tab.id == resource.identity), None)
+            if selected is None:
+                return
+            expected_name = resource.metadata.get("name")
+            expected_panel = resource.metadata.get("panel_type")
+            if expected_name is not None and selected.name != expected_name:
+                raise OSError("PurpleMux tab name changed; refusing cleanup")
+            if (
+                expected_panel is not None
+                and (selected.panel_type or "") != expected_panel
+            ):
+                raise OSError("PurpleMux tab type changed; refusing cleanup")
+            expected_provider = resource.metadata.get("provider")
+            if (
+                expected_provider is not None
+                and (selected.provider or "") != expected_provider
+            ):
+                raise OSError("PurpleMux tab provider changed; refusing cleanup")
+            client.close_session(resource.identity, expected_state=selected)
+            return
+        if resource.kind == "managed_shell_result":
+            self._cleanup_managed_shell_result(resource)
+            return
+        if resource.kind == "purplemux_workspace":
+            runtime = PurpleMuxRuntime()
+            selected = next(
+                (
+                    workspace
+                    for workspace in runtime.list_workspaces()
+                    if workspace.id == resource.identity
+                ),
+                None,
+            )
+            if selected is None:
+                return
+            expected_name = resource.metadata.get("name")
+            if expected_name is not None and selected.name != expected_name:
+                raise OSError("PurpleMux workspace name changed; refusing cleanup")
+            expected_directories = resource.metadata.get("directories")
+            if expected_directories is not None and selected.directories != tuple(
+                expected_directories.splitlines()
+            ):
+                raise OSError(
+                    "PurpleMux workspace directories changed; refusing cleanup"
+                )
+            if PurpleMuxCLIClient(resource.identity).list_sessions():
+                raise OSError(
+                    "PurpleMux workspace contains unregistered tabs; refusing cleanup"
+                )
+            runtime.delete_workspace(resource.identity, expected_state=selected)
+            return
+        if resource.kind == "git_worktree":
+            self._cleanup_git_worktree(resource)
+            return
+        raise OSError(f"unsupported run resource kind: {resource.kind}")
+
+    @staticmethod
+    def _resource_is_absent(resource: RunResource) -> bool:
+        if resource.kind == "purplemux_tab":
+            workspace_id = resource.metadata.get("workspace_id")
+            if not workspace_id:
+                raise OSError("PurpleMux tab ownership lacks workspace_id")
+            return all(
+                tab.id != resource.identity
+                for tab in PurpleMuxCLIClient(workspace_id).list_sessions()
+            )
+        if resource.kind == "purplemux_workspace":
+            return all(
+                workspace.id != resource.identity
+                for workspace in PurpleMuxRuntime().list_workspaces()
+            )
+        if resource.kind == "managed_shell_result":
+            return not os.path.lexists(resource.identity)
+        if resource.kind == "git_worktree":
+            repository = resource.metadata.get("repository")
+            if repository is None:
+                raise OSError("Git worktree ownership lacks repository metadata")
+            listed = subprocess.run(
+                ["git", "-C", repository, "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if listed.returncode != 0:
+                raise OSError(
+                    "could not reconcile owned Git worktree: "
+                    + (listed.stderr.strip() or "no stderr")
+                )
+            return not any(
+                line == f"worktree {resource.identity}"
+                for line in listed.stdout.splitlines()
+            )
+        raise OSError(f"unsupported run resource kind: {resource.kind}")
+
+    @staticmethod
+    def _cleanup_managed_shell_result(resource: RunResource) -> None:
+        directory = Path(resource.identity)
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        if (
+            not directory.is_absolute()
+            or directory.parent != temp_root
+            or not directory.name.startswith("awm-shell-")
+        ):
+            raise OSError("managed shell result directory identity is invalid")
+        expected_result = directory / "result.json"
+        if resource.metadata.get("result_path") != str(expected_result):
+            raise OSError("managed shell result path metadata conflicts")
+        expected_identity = resource.metadata.get("directory_identity")
+        if expected_identity is None:
+            raise OSError(
+                "managed shell result directory ownership identity is missing"
+            )
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(directory, flags)
+        except FileNotFoundError:
+            if os.path.lexists(directory):
+                raise OSError(
+                    "managed shell result path identity changed; refusing cleanup"
+                )
+            return
+        except OSError as exc:
+            raise OSError(
+                "managed shell result directory is not the owned directory; "
+                "refusing cleanup"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            opened_identity = f"{opened.st_dev}:{opened.st_ino}"
+            if opened_identity != expected_identity:
+                raise OSError(
+                    "managed shell result directory identity changed; refusing cleanup"
+                )
+            entries = os.listdir(descriptor)
+            if any(name != "result.json" for name in entries):
+                raise OSError(
+                    "managed shell result directory contains unexpected files"
+                )
+            if "result.json" in entries:
+                result_state = os.stat(
+                    "result.json", dir_fd=descriptor, follow_symlinks=False
+                )
+                if not stat.S_ISREG(result_state.st_mode):
+                    raise OSError(
+                        "managed shell result entry is not a regular file; "
+                        "refusing cleanup"
+                    )
+                os.unlink("result.json", dir_fd=descriptor)
+            current = os.stat(directory, follow_symlinks=False)
+            current_identity = f"{current.st_dev}:{current.st_ino}"
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current_identity != expected_identity
+            ):
+                raise OSError(
+                    "managed shell result directory identity changed; refusing cleanup"
+                )
+            os.rmdir(directory)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _cleanup_git_worktree(resource: RunResource) -> None:
+        worktree = Path(resource.identity)
+        repository_text = resource.metadata.get("repository")
+        if repository_text is None:
+            raise OSError("Git worktree ownership lacks repository metadata")
+        repository = Path(repository_text)
+        if not worktree.is_absolute() or not repository.is_absolute():
+            raise OSError("Git worktree cleanup requires absolute paths")
+
+        listed = subprocess.run(
+            ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if listed.returncode != 0:
+            raise OSError(
+                "could not inspect owned Git worktrees: "
+                + (listed.stderr.strip() or "no stderr")
+            )
+        paths = {
+            line.removeprefix("worktree ")
+            for line in listed.stdout.splitlines()
+            if line.startswith("worktree ")
+        }
+        if str(worktree) not in paths:
+            return
+        required_identity = {
+            "path_identity",
+            "git_file_identity",
+            "git_dir",
+        }
+        missing = sorted(required_identity.difference(resource.metadata))
+        if missing:
+            raise OSError(
+                "Git worktree ownership metadata is incomplete: " + ", ".join(missing)
+            )
+        if _path_identity(worktree) != resource.metadata["path_identity"]:
+            raise OSError("Git worktree path identity changed; refusing cleanup")
+        git_file = worktree / ".git"
+        if _administrative_identity(git_file) != resource.metadata["git_file_identity"]:
+            raise OSError(
+                "Git worktree administrative identity changed; refusing cleanup"
+            )
+        observed_git_dir = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if (
+            observed_git_dir.returncode != 0
+            or observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
+        ):
+            raise OSError("Git worktree git_dir identity changed; refusing cleanup")
+        dirty = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if dirty.returncode != 0:
+            raise OSError(
+                "could not inspect owned Git worktree: "
+                + (dirty.stderr.strip() or "no stderr")
+            )
+        if dirty.stdout:
+            raise OSError("Git worktree has uncommitted changes; refusing cleanup")
+        removed = subprocess.run(
+            ["git", "-C", str(repository), "worktree", "remove", str(worktree)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if removed.returncode == 0:
+            return
+        reconciled = subprocess.run(
+            ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if reconciled.returncode == 0 and not any(
+            line == f"worktree {worktree}" for line in reconciled.stdout.splitlines()
+        ):
+            return
+        raise MutationOutcomeUnknown(
+            "Git worktree removal could not be confirmed: "
+            + (removed.stderr.strip() or "no stderr")
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -1001,6 +1464,8 @@ class PythonRunner:
                                 run.suspension_reason = cast(str, event)
                             elif event_type == "finding":
                                 run.findings.append(cast(TopologyFinding, event))
+                            elif event_type == "resource":
+                                self._register_resource(run, cast(RunResource, event))
                             else:
                                 assert isinstance(event, ProgressEvent)
                                 run.progress.append(event)
@@ -1012,7 +1477,11 @@ class PythonRunner:
     def _parse_runner_event(
         line: str,
     ) -> (
-        tuple[Literal["progress", "checkpoint", "suspended", "finding"], object] | None
+        tuple[
+            Literal["progress", "checkpoint", "suspended", "finding", "resource"],
+            object,
+        ]
+        | None
     ):
         try:
             value = json.loads(line)
@@ -1056,6 +1525,28 @@ class PythonRunner:
                     message,
                 )
             return None
+        if event_type == "resource":
+            kind = value.get("kind")
+            identity = value.get("identity")
+            metadata = value.get("metadata")
+            if (
+                kind
+                not in (
+                    "purplemux_tab",
+                    "managed_shell_result",
+                    "purplemux_workspace",
+                    "git_worktree",
+                )
+                or not isinstance(identity, str)
+                or not identity
+                or not isinstance(metadata, dict)
+                or any(
+                    not isinstance(key, str) or not key or not isinstance(item, str)
+                    for key, item in metadata.items()
+                )
+            ):
+                return None
+            return "resource", RunResource(kind, identity, dict(metadata))
         name = value.get("name")
         status = value.get("status")
         if not isinstance(name, str) or not name.strip():
@@ -1087,6 +1578,25 @@ class PythonRunner:
                 tab=value.get("tab"),
             ),
         )
+
+    @staticmethod
+    def _register_resource(run: _RunRecord, resource: RunResource) -> None:
+        for existing in run.resources:
+            if (
+                existing.kind == resource.kind
+                and existing.identity == resource.identity
+            ):
+                # Repeated registration across Resume is idempotent only when the
+                # ownership evidence remains exactly the same.
+                if existing.metadata != resource.metadata:
+                    logger.warning(
+                        "Ignored conflicting registration for run %s resource %s/%s",
+                        run.run_id,
+                        resource.kind,
+                        resource.identity,
+                    )
+                return
+        run.resources.append(resource)
 
     @staticmethod
     def _render_output_entries(

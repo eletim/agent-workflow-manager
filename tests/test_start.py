@@ -76,6 +76,7 @@ if [[ ${1-} == help ]]; then
 purplemux CLI
 workspaces
 workspace create --cwd PATH [--name NAME]
+workspace delete -w WS --if-empty
 tab create -w WS [-n NAME] [-t TYPE]
 tab send -w WS TAB_ID CONTENT...
 tab interrupt -w WS TAB_ID
@@ -244,6 +245,27 @@ def test_start_rejects_purplemux_cli_without_tab_type_option(tmp_path: Path) -> 
     assert completed.returncode != 0
     assert "does not provide the required custom CLI contract" in completed.stderr
     assert "tab create -w WS [-n NAME] [-t TYPE]" in completed.stderr
+    assert "uv run python -m purplemux_client.web" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_start_rejects_purplemux_without_atomic_workspace_cleanup_contract(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    purplemux = tmp_path / "bin" / "purplemux"
+    original = purplemux.read_text(encoding="utf-8")
+    purplemux.write_text(
+        original.replace("workspace delete -w WS --if-empty\n", ""),
+        encoding="utf-8",
+    )
+
+    completed = _run_start(environment)
+
+    assert completed.returncode != 0
+    assert "does not provide the required custom CLI contract" in completed.stderr
+    assert "workspace delete -w WS --if-empty" in completed.stderr
     assert "uv run python -m purplemux_client.web" not in call_log.read_text(
         encoding="utf-8"
     )

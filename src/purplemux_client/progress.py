@@ -10,6 +10,12 @@ from typing import Literal
 StepStatus = Literal["started", "completed", "failed"]
 FindingCategory = Literal["runtime", "git", "github"]
 FindingStatus = Literal["passed", "failed", "info"]
+RunResourceKind = Literal[
+    "purplemux_tab",
+    "managed_shell_result",
+    "purplemux_workspace",
+    "git_worktree",
+]
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESUME_CHECKPOINT_ENV = "PURPLEMUX_RUNNER_RESUME_CHECKPOINT"
@@ -80,6 +86,47 @@ def emit_finding(
     _write_event(
         {"type": "finding", "category": category, "status": status, "message": message},
         drop_oversized=True,
+    )
+
+
+def register_run_resource(
+    kind: RunResourceKind,
+    identity: str,
+    metadata: Mapping[str, str] | None = None,
+) -> None:
+    """Register an authoritatively identified resource with the current run.
+
+    Registration is observational and does not mutate the resource. Outside the
+    Runner it is a no-op, like progress and checkpoint events.
+    """
+    if kind not in (
+        "purplemux_tab",
+        "managed_shell_result",
+        "purplemux_workspace",
+        "git_worktree",
+    ):
+        raise ValueError("unsupported run resource kind")
+    if not isinstance(identity, str) or not identity or "\0" in identity:
+        raise ValueError("resource identity must be a non-empty string without nulls")
+    resource_metadata = dict(metadata or {})
+    if any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, str)
+        or "\0" in key
+        or "\0" in value
+        for key, value in resource_metadata.items()
+    ):
+        raise TypeError(
+            "resource metadata must contain non-empty string keys and string values"
+        )
+    _write_event(
+        {
+            "type": "resource",
+            "kind": kind,
+            "identity": identity,
+            "metadata": resource_metadata,
+        }
     )
 
 
