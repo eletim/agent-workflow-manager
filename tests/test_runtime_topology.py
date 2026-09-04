@@ -16,6 +16,7 @@ from purplemux_client import (
     SessionReadyTimeout,
     TabState,
     WorkerFailure,
+    WorkspaceState,
 )
 
 
@@ -467,3 +468,29 @@ def test_workspace_nonzero_after_apply_reconciles_without_retry(
         len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
         == 1
     )
+
+
+def test_workspace_delete_verifies_identity_and_reconciles_authoritative_absence(
+    tmp_path: Path,
+) -> None:
+    runner = RuntimeRunner()
+    workspace = {
+        "id": "ws-owned",
+        "name": "Owned",
+        "directories": [str(tmp_path)],
+    }
+    runner.workspaces["ws-owned"] = workspace
+    delete_calls: list[str] = []
+
+    def delete(workspace_id: str) -> None:
+        delete_calls.append(workspace_id)
+        runner.workspaces.pop(workspace_id)
+
+    runtime = PurpleMuxRuntime(runner=runner, workspace_deleter=delete)
+    runtime.delete_workspace(
+        "ws-owned",
+        expected_state=WorkspaceState("ws-owned", "Owned", (str(tmp_path),)),
+    )
+
+    assert delete_calls == ["ws-owned"]
+    assert runtime.list_workspaces() == ()

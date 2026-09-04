@@ -10,7 +10,12 @@ from typing import Literal
 StepStatus = Literal["started", "completed", "failed"]
 FindingCategory = Literal["runtime", "git", "github"]
 FindingStatus = Literal["passed", "failed", "info"]
-RunResourceKind = Literal["purplemux_tab", "purplemux_workspace", "git_worktree"]
+RunResourceKind = Literal[
+    "purplemux_tab",
+    "managed_shell_result",
+    "purplemux_workspace",
+    "git_worktree",
+]
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESUME_CHECKPOINT_ENV = "PURPLEMUX_RUNNER_RESUME_CHECKPOINT"
@@ -94,7 +99,12 @@ def register_run_resource(
     Registration is observational and does not mutate the resource. Outside the
     Runner it is a no-op, like progress and checkpoint events.
     """
-    if kind not in ("purplemux_tab", "purplemux_workspace", "git_worktree"):
+    if kind not in (
+        "purplemux_tab",
+        "managed_shell_result",
+        "purplemux_workspace",
+        "git_worktree",
+    ):
         raise ValueError("unsupported run resource kind")
     if not isinstance(identity, str) or not identity or "\0" in identity:
         raise ValueError("resource identity must be a non-empty string without nulls")

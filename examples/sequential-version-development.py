@@ -847,7 +847,9 @@ def main() -> None:
             "workspace creation may have completed; reconcile the saved correlation "
             "before any further mutation"
         )
-    runtime = PurpleMuxRuntime(command_timeout_seconds=COMMAND_TIMEOUT)
+    runtime = PurpleMuxRuntime(
+        command_timeout_seconds=COMMAND_TIMEOUT, owned_by_run=True
+    )
     repo = GitRepository.open(
         config.repo,
         expected_github_slug=config.slug,

@@ -222,7 +222,9 @@ Runs are independent and may execute concurrently. The UI lists every run and
 lets the operator select its state, output, progress, execution context, Stop,
 and explicit Cleanup action without changing another run. Workflow-owned
 resources remain inspectable after every terminal result and are registered on
-the existing run record rather than a separate lifecycle store. `GET /api/runs` lists compact summaries,
+the existing run record rather than a separate lifecycle store. Canonical
+Workflow runtimes opt into ownership registration; direct/Prompt adapter use is
+registration-free by default. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run

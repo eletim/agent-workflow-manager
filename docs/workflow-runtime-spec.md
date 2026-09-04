@@ -46,7 +46,7 @@ never drive workflow sequencing, branching, retries, or completion. The one
 structured resource-registration event extends the existing run record with an
 authoritative identity; it does not decide control flow. The Runner's explicit
 Cleanup action operates only on that generic inventory through PurpleMux's
-public API and never operates tmux directly.
+authenticated runtime interfaces and never operates tmux directly.
 
 ## Manual recovery and resume contract
 
@@ -69,6 +69,9 @@ non-idempotent side effect. Publishing a checkpoint does not cause the Runner
 to infer or execute a next step. If a failed/suspended run has no checkpoint,
 the resume API rejects it instead of starting the script blindly. Checkpoint
 data must not contain credentials because it is returned by the run API/UI.
+Resume and Cleanup share a per-run lifecycle lock. Once any owned resource has
+entered cleanup, Resume is rejected server-side even if the workflow previously
+published a checkpoint.
 
 `suspend_run(reason)` lets a workflow distinguish a human-needs-input boundary
 from a hard failure after it has saved a safe checkpoint. The process exits and
@@ -88,6 +91,10 @@ inferred command result. The optional field is consumed when available and the
 tab's structured `alive` lifecycle remains authoritative. Tabs remain open after
 success, failure, suspension, and stop until the operator invokes the run's
 explicit Cleanup action, so completed commands remain available for inspection.
+Workflow code opts into registration with `PurpleMuxRuntime(owned_by_run=True)`;
+the default direct adapter path does not register resources and remains suitable
+for Prompt mode. Managed shell result directories are registered alongside their
+tabs and removed only after the tab has been reconciled as closed.
 
 ## Browser access and network trust
 

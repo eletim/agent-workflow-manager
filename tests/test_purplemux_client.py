@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
+import purplemux_client.client as client_module
 from purplemux_client import (
     CreateSessionRequest,
     MutationOutcomeUnknown,
@@ -194,6 +196,39 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     assert "bash -lc" in wrapper
     assert 'printf \'{"exitCode":%s}' in wrapper
     cli.close_session(session_id)
+
+
+def test_run_ownership_is_opt_in_and_registers_shell_result_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registrations: list[tuple[str, str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        client_module,
+        "register_run_resource",
+        lambda kind, identity, metadata: registrations.append(
+            (kind, identity, metadata)
+        ),
+    )
+    ordinary_runner = FakeRunner([completed({"tabId": "tab-prompt"})])
+    client(ordinary_runner).create_session(request())
+    assert registrations == []
+
+    owned_runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    owned = client(owned_runner, owned_by_run=True)
+    tab = owned.start_shell(ShellCommandRequest("true", str(tmp_path), "Owned shell"))
+
+    assert [item[0] for item in registrations] == [
+        "purplemux_tab",
+        "managed_shell_result",
+    ]
+    result_directory = Path(registrations[1][1])
+    assert registrations[1][2] == {
+        "result_path": str(result_directory / "result.json"),
+        "tab_id": tab,
+    }
+    owned._cleanup_shell_result(owned._shell_runs[tab])
 
 
 @pytest.mark.parametrize(

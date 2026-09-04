@@ -7,8 +7,12 @@ import shlex
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from purplemux_client.errors import (
@@ -170,6 +174,14 @@ _SHELL_DIAGNOSTIC_MAX_LINES = 40
 _SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
 
 
+def _read_purplemux_setting(name: str) -> str | None:
+    try:
+        value = (Path.home() / ".purplemux" / name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
 @dataclass(frozen=True)
 class _TurnBaseline:
     completion_timestamp: int | float | None
@@ -188,6 +200,8 @@ class PurpleMuxRuntime:
         command_timeout_seconds: float = 30.0,
         read_timeout_retries: int = 1,
         runner: SubprocessRunner = subprocess.run,
+        owned_by_run: bool = False,
+        workspace_deleter: Callable[[str], None] | None = None,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
@@ -197,6 +211,8 @@ class PurpleMuxRuntime:
         self.command_timeout_seconds = command_timeout_seconds
         self.read_timeout_retries = read_timeout_retries
         self._runner = runner
+        self.owned_by_run = owned_by_run
+        self._workspace_deleter = workspace_deleter or self._delete_workspace_http
 
     def list_workspaces(self) -> tuple[WorkspaceState, ...]:
         data = self._read_json(["workspaces"], "list workspaces")
@@ -296,16 +312,92 @@ class PurpleMuxRuntime:
             reconcile=reconcile,
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
         )
-        register_run_resource(
-            "purplemux_workspace",
-            workspace.id,
-            {
-                "name": workspace.name,
-                "directories": "\n".join(workspace.directories),
-                "correlation_id": request.correlation_id,
-            },
-        )
+        if self.owned_by_run:
+            register_run_resource(
+                "purplemux_workspace",
+                workspace.id,
+                {
+                    "name": workspace.name,
+                    "directories": "\n".join(workspace.directories),
+                    "correlation_id": request.correlation_id,
+                },
+            )
         return workspace
+
+    def delete_workspace(
+        self, workspace_id: str, *, expected_state: WorkspaceState
+    ) -> None:
+        """Delete one empty, identity-verified workspace with reconciliation."""
+        before = self.list_workspaces()
+        selected = next((item for item in before if item.id == workspace_id), None)
+        if selected is None:
+            return
+        if selected != expected_state:
+            raise MutationConflict(
+                f"workspace {workspace_id} identity changed before cleanup"
+            )
+
+        def desired() -> bool:
+            return all(item.id != workspace_id for item in self.list_workspaces())
+
+        def dispatch() -> None:
+            self._workspace_deleter(workspace_id)
+            try:
+                deleted = desired()
+            except WorkerFailure as exc:
+                raise PossibleDispatchFailure(
+                    "workspace deletion was dispatched but could not be observed"
+                ) from exc
+            if not deleted:
+                raise PossibleDispatchFailure(
+                    "workspace deletion response lacked its postcondition"
+                )
+
+        def reconcile(quiescent: bool) -> Reconciliation[None]:
+            current = self.list_workspaces()
+            if all(item.id != workspace_id for item in current):
+                return Reconciliation(MutationResolution.DESIRED)
+            unchanged = any(item == selected for item in current)
+            if quiescent and unchanged:
+                return Reconciliation(MutationResolution.REJECTED)
+            if quiescent:
+                return Reconciliation(MutationResolution.CONFLICT)
+            return Reconciliation(MutationResolution.UNKNOWN)
+
+        execute_mutation(
+            operation="delete PurpleMux workspace",
+            target=workspace_id,
+            pre_state=selected,
+            dispatch=dispatch,
+            reconcile=reconcile,
+            plan={"kind": "delete_workspace", "workspace": workspace_id},
+        )
+
+    def _delete_workspace_http(self, workspace_id: str) -> None:
+        port = os.environ.get("PMUX_PORT") or _read_purplemux_setting("port")
+        token = os.environ.get("PMUX_TOKEN") or _read_purplemux_setting("cli-token")
+        if not port or not token:
+            raise PreDispatchFailure(
+                "PurpleMux port/token are unavailable for workspace cleanup"
+            )
+        encoded_id = urllib.parse.quote(workspace_id, safe="")
+        request = urllib.request.Request(
+            f"http://localhost:{port}/api/workspace/{encoded_id}",
+            method="DELETE",
+            headers={"X-Pmux-Token": token},
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.command_timeout_seconds
+            ) as response:
+                if response.status != 204:
+                    raise PossibleDispatchFailure(
+                        f"PurpleMux workspace deletion returned HTTP {response.status}"
+                    )
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise PossibleDispatchFailure(
+                "PurpleMux workspace deletion outcome is unknown"
+            ) from exc
 
     def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
         if workspace_id not in {item.id for item in self.list_workspaces()}:
@@ -316,6 +408,7 @@ class PurpleMuxRuntime:
             command_timeout_seconds=self.command_timeout_seconds,
             read_timeout_retries=self.read_timeout_retries,
             runner=self._runner,
+            owned_by_run=self.owned_by_run,
         )
 
     def _read_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
@@ -424,6 +517,7 @@ class PurpleMuxCLIClient:
         runner: SubprocessRunner = subprocess.run,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        owned_by_run: bool = False,
     ) -> None:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
@@ -441,6 +535,7 @@ class PurpleMuxCLIClient:
         self._runner = runner
         self._sleep = sleep
         self._monotonic = monotonic
+        self.owned_by_run = owned_by_run
         self._turn_baselines: dict[str, _TurnBaseline] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
         self._shell_runs: dict[str, _ShellRun] = {}
@@ -466,7 +561,8 @@ class PurpleMuxCLIClient:
             provider="codex" if panel_type == "codex-cli" else "claude",
             name=name,
         )
-        self._register_owned_tab(tab)
+        if self.owned_by_run:
+            self._register_owned_tab(tab)
         return tab.id
 
     def list_sessions(self) -> tuple[TabState, ...]:
@@ -577,11 +673,18 @@ class PurpleMuxCLIClient:
         tab = self._create_correlated_tab(
             panel_type="terminal", provider=None, name=request.name
         )
-        self._register_owned_tab(tab)
+        if self.owned_by_run:
+            self._register_owned_tab(tab)
         session_id = tab.id
 
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
+        if self.owned_by_run:
+            register_run_resource(
+                "managed_shell_result",
+                result_dir,
+                {"result_path": result_path, "tab_id": session_id},
+            )
         self._shell_runs[session_id] = _ShellRun(result_path=result_path, cwd=cwd)
         if on_created is not None:
             on_created(session_id, result_path)

@@ -264,7 +264,7 @@ Relevant errors all derive from `TerminalSessionError`:
 Use the inspection-aware runtime adapter rather than a raw subprocess:
 
 ```python
-runtime = PurpleMuxRuntime()
+runtime = PurpleMuxRuntime(owned_by_run=True)
 workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd="/absolute/repo",
@@ -334,26 +334,30 @@ The script—not an agent prompt and not the UI—owns this loop and its limit.
 
 ## Cleanup policy
 
-Register every resource immediately after its concrete identity is known:
+Workflow runs opt into automatic PurpleMux resource registration:
 
 ```python
-from purplemux_client import register_run_resource
-
-register_run_resource(
-    "purplemux_tab",
-    session_id,
-    {"workspace_id": workspace_id, "name": tab_name, "panel_type": "codex-cli"},
-)
+runtime = PurpleMuxRuntime(owned_by_run=True)
+workspace = runtime.create_workspace(request)
+client = runtime.workspace(workspace.id)
 ```
+
+The default `owned_by_run=False` path is intentionally registration-free for
+Prompt mode and other direct adapter use. Future Git worktree registration must
+include the repository, HEAD, branch, absolute Git directory, and filesystem
+identities for both the worktree path and its `.git` administrative file so
+Cleanup cannot delete a replacement created later at the same path.
 
 Do not automatically close a Workflow run's tabs on success or failure. The
 Runner retains the structured inventory on the run record and exposes one manual
 Cleanup action after execution ends. Cleanup verifies identities, closes child
-tabs in reverse deterministic order, and stops before dependent parent resources
-when an outcome is blocked. There is currently no PurpleMux workspace deletion
-method, so an owned workspace that still exists is reported as concretely blocked.
-A workflow may use `capture_screen` for diagnostics, without parsing it as a
-result. Prompt mode does not use this Workflow resource model.
+tabs in reverse deterministic order, removes managed-shell result directories,
+deletes an identity-verified empty workspace through PurpleMux, and then handles
+the Git worktree. It stops before dependent parent resources when an outcome is
+blocked. A workflow may use `capture_screen` for diagnostics, without parsing it
+as a result. Prompt mode does not use this Workflow resource model. Cleanup and
+Resume are mutually exclusive, and cleanup permanently disables Resume for that
+run.
 
 ## Explicit checkpoints and manual recovery
 
@@ -603,7 +607,7 @@ def review_decision(result: str) -> str:
 
 
 emit_step("workspace create", "started")
-runtime = PurpleMuxRuntime()
+runtime = PurpleMuxRuntime(owned_by_run=True)
 workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd=str(REPO),
