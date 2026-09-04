@@ -4,8 +4,11 @@ Use this file as the contract when generating a workflow script. The generated
 plain Python script is the source of truth. Do not create a workflow framework,
 graph, DSL, state machine, or UI-side copy of its control flow.
 
-**Canonical version-development sample:**
+**Lower-level direct-execution sample:**
 [sequential multi-Issue implementation and review](../../../examples/sequential-version-development.py).
+That configurable CLI sample intentionally operates on its explicit repository
+path. For normal repository-modifying Workflow mode, use the isolated preparation
+pattern documented below.
 It is the primary adaptable reference for sequential Issue PRs, independent
 per-Issue review/fix loops, safe resume, and a final version PR. Its separate
 whole-version review is mandatory because defects in shared state, lifecycle,
@@ -76,6 +79,11 @@ directory, registers it for explicit Cleanup, and returns both source and
 execution identities. Use `context.execution_root` for Git/GitHub operations,
 PurpleMux workspace creation, shell steps, and agent `cwd` values. The original
 checkout is never switched, reset, stashed, or cleaned.
+
+The validated topology layer accepts that clean detached root as the exact base
+for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sha)`.
+This keeps branch preparation inside the isolated worktree even when the source
+checkout already has the configured base branch checked out.
 
 The workflow subprocess itself runs from a stable Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put
@@ -559,6 +567,7 @@ from __future__ import annotations
 from purplemux_client import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
+    GitRepository,
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
     TerminalSessionError,
@@ -579,6 +588,16 @@ MAX_REVIEWS = 4
 READY_TIMEOUT = 60
 TURN_TIMEOUT = 900
 WORKFLOW_DRY_RUN = 1
+
+repository = GitRepository.open(
+    REPO,
+    expected_github_slug="OWNER/REPO",
+)
+repository.prepare_feature_branch(
+    FEATURE_BRANCH,
+    base=BASE_BRANCH,
+    expected_base_sha=context.base_sha,
+)
 
 
 def short_error(exc: BaseException) -> str:

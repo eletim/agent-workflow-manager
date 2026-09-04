@@ -314,9 +314,17 @@ class GitRepository:
                 f"remote base {base!r} changed: expected {expected_base_sha}, "
                 f"found {base_state.remote_sha}"
             )
-        if base_state.local_sha != expected_base_sha or not base_state.current:
+        detached_at_base = (
+            self._current_branch() is None
+            and self._read(["rev-parse", "HEAD"]) == expected_base_sha
+        )
+        if (
+            not (base_state.local_sha == expected_base_sha and base_state.current)
+            and not detached_at_base
+        ):
             raise WorkerFailure(
-                f"base {base!r} must be synchronized at {expected_base_sha} first"
+                f"base {base!r} must be synchronized at {expected_base_sha}, or "
+                "the worktree must be detached at that exact commit"
             )
         feature_remote = self._remote_sha(branch)
 

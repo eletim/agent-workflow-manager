@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Canonical plain-Python sequential version-development workflow.
+"""Lower-level direct plain-Python sequential version-development workflow.
 
 AWM owns structural Git/GitHub/runtime safety. Agents own edits, project checks,
-commits, and pushes. Dry Run executes this program to its first mutation.
+commits, and pushes. Dry Run executes this program to its first mutation. This
+configurable CLI example intentionally uses the direct repository path; normal
+repository-modifying Workflow mode should use ``prepare_run_repository()``.
 """
 
 from __future__ import annotations

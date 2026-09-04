@@ -58,7 +58,7 @@ def pr(*, head: str = "a" * 40, base: str = "b" * 40):
     )
 
 
-def test_canonical_sample_is_plain_python_and_dry_run_eligible() -> None:
+def test_direct_sample_is_plain_python_and_dry_run_eligible() -> None:
     source = SAMPLE.read_text(encoding="utf-8")
     compile(source, str(SAMPLE), "exec")
     result = WorkflowValidator().validate(source)
@@ -68,7 +68,7 @@ def test_canonical_sample_is_plain_python_and_dry_run_eligible() -> None:
     assert SAMPLE_MODULE.WORKFLOW_DRY_RUN == 1
 
 
-def test_canonical_sample_has_no_raw_topology_or_workspace_subprocess_layer() -> None:
+def test_direct_sample_has_no_raw_topology_or_workspace_subprocess_layer() -> None:
     source = SAMPLE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     imports = {

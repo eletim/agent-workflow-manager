@@ -60,20 +60,27 @@ permit branch creation/tracking/switching and fast-forward Git changes. They nev
 reset, rebase, force-push, delete branches, stash changes, or resolve conflicts.
 
 ```python
-from purplemux_client import GitHubRepository, GitRepository
+from purplemux_client import (
+    GitHubRepository,
+    GitRepository,
+    prepare_run_repository,
+)
+
+context = prepare_run_repository(
+    repo="~/DevEnv/project",
+    base_branch="dev/v1.2.3",
+)
 
 repo = GitRepository.open(
-    "/workspace/project",
+    context.execution_root,
     expected_github_slug="owner/project",
 )
 github = GitHubRepository.open("owner/project")
 
-integration = repo.synchronize_branch("dev/v1.2.3")
-assert integration.remote_sha is not None
 feature = repo.prepare_feature_branch(
     "feature/issue-123",
     base="dev/v1.2.3",
-    expected_base_sha=integration.remote_sha,
+    expected_base_sha=context.base_sha,
 )
 
 # Agent code still owns editing, testing, committing, and pushing.

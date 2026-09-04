@@ -140,6 +140,25 @@ def test_safe_synchronize_prepare_and_read_only_require_pushed(
     )
 
 
+def test_prepare_feature_from_detached_exact_base_without_switching_source(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    isolated = tmp_path / "awm-run-isolated"
+    git(work, "worktree", "add", "--detach", str(isolated), base_sha)
+    repo = open_repo(isolated, RecordingGitRunner())
+
+    feature = repo.prepare_feature_branch(
+        "feature/isolated", base="main", expected_base_sha=base_sha
+    )
+
+    assert feature.current
+    assert feature.local_sha == base_sha
+    assert git(isolated, "branch", "--show-current") == "feature/isolated"
+    assert git(work, "branch", "--show-current") == "main"
+
+
 def test_synchronize_fast_forwards_but_rejects_ahead_and_dirty(
     repositories: tuple[Path, Path, Path],
 ) -> None:
