@@ -29,21 +29,45 @@
       </section>
 
       <section class="panel editor-panel">
+        <div class="mode-switch" role="group" aria-label="Execution mode">
+          <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
+          <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Workflow</button>
+        </div>
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
           <button id="new-run" type="button">New run</button>
         </div>
-        <div class="execution-context">
-          <div class="context-field context-args">
-            <label for="run-arguments">Arguments <span>(one per line)</span></label>
-            <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
+        <div id="prompt-fields" class="prompt-fields" hidden>
+          <div class="prompt-options">
+            <div class="context-field">
+              <label for="prompt-agent">Agent</label>
+              <select id="prompt-agent">
+                <option value="codex">Codex</option>
+                <option value="claude-code">Claude</option>
+              </select>
+            </div>
+            <div class="context-field prompt-cwd-field">
+              <label for="prompt-cwd">Working directory</label>
+              <input id="prompt-cwd" type="text" autocomplete="off" placeholder="/path/to/project">
+            </div>
           </div>
+          <label for="prompt-text">Prompt</label>
+          <textarea id="prompt-text" spellcheck="true"></textarea>
         </div>
-        <label for="code">Python</label>
-        <textarea id="code" spellcheck="false">from purplemux_client import emit_step
+
+        <div id="workflow-fields">
+          <div class="execution-context">
+            <div class="context-field context-args">
+              <label for="run-arguments">Arguments <span>(one per line)</span></label>
+              <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
+            </div>
+          </div>
+          <label for="code">Python</label>
+          <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
 emit_step("workspace create", "started")
 emit_step("workspace create", "completed")</textarea>
+        </div>
         <div class="controls">
           <button id="validate">Validate</button>
           <button id="dry-run">Dry Run</button>

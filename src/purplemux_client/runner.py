@@ -40,6 +40,7 @@ from purplemux_client.progress import (
     ResumeCheckpoint,
     StepStatus,
 )
+from purplemux_client.prompt import PromptExecution
 
 RunnerState = Literal[
     "idle",
@@ -266,9 +267,14 @@ class RunnerSnapshot:
     # ``as_summary_json`` (the ``/api/runs`` list) to keep that summary
     # lightweight.
     code: str | None = None
+    prompt: PromptExecution | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
+        prompt = payload.pop("prompt")
+        payload["mode"] = "prompt" if prompt is not None else "workflow"
+        if prompt is not None:
+            payload["prompt"] = prompt
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
         payload["suspensionReason"] = payload.pop("suspension_reason")
@@ -302,13 +308,14 @@ class RunnerSnapshot:
         payload["resources"] = [resource.as_json() for resource in self.resources]
         payload["executionContext"] = self._execution_context_json()
         payload["resourceCleanupStatus"] = _resource_cleanup_status(self.resources)
-        payload["cleanupAvailable"] = self.state not in (
+        payload["cleanupAvailable"] = self.prompt is None and self.state not in (
             "idle",
             "running",
             "validation_failed",
         )
         payload["resumable"] = (
-            self.state in ("failed", "suspended")
+            self.prompt is None
+            and self.state in ("failed", "suspended")
             and self.checkpoint is not None
             and all(resource.cleanup_state == "retained" for resource in self.resources)
         )
@@ -316,7 +323,8 @@ class RunnerSnapshot:
 
     def as_summary_json(self) -> dict[str, object]:
         execution_context = self._execution_context_json()
-        return {
+        payload: dict[str, object] = {
+            "mode": "prompt" if self.prompt is not None else "workflow",
             "state": self.state,
             "exitCode": self.exit_code,
             "runId": self.run_id,
@@ -325,7 +333,8 @@ class RunnerSnapshot:
             "args": list(self.args),
             "checkpoint": asdict(self.checkpoint) if self.checkpoint else None,
             "attempts": len(self.attempts),
-            "resumable": self.state in ("failed", "suspended")
+            "resumable": self.prompt is None
+            and self.state in ("failed", "suspended")
             and self.checkpoint is not None
             and all(
                 resource.cleanup_state == "retained" for resource in self.resources
@@ -333,6 +342,12 @@ class RunnerSnapshot:
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
         }
+        if self.prompt is not None:
+            payload["prompt"] = {
+                "agent": self.prompt.agent,
+                "cwd": self.prompt.cwd,
+            }
+        return payload
 
     def _execution_context_json(self) -> dict[str, str] | None:
         for resource in self.resources:
@@ -379,6 +394,7 @@ class _RunRecord:
     attempts: list[RunAttempt] = field(default_factory=list)
     suspension_reason: str | None = None
     resources: list[RunResource] = field(default_factory=list)
+    prompt: PromptExecution | None = None
 
 
 class PythonRunner:
@@ -642,6 +658,7 @@ class PythonRunner:
         code: str,
         *,
         args: Sequence[str] = (),
+        prompt: PromptExecution | None = None,
     ) -> int:
         run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
@@ -661,6 +678,7 @@ class PythonRunner:
                     run_cwd=run_cwd,
                     run_args=run_args,
                     child_env=child_env,
+                    prompt=prompt,
                 )
 
     def resume(self, run_id: int) -> None:
@@ -782,6 +800,7 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
+        prompt: PromptExecution | None = None,
     ) -> int:
         process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
             code,
@@ -794,7 +813,7 @@ class PythonRunner:
         self._next_run_id += 1
         run = _RunRecord(
             run_id=run_id,
-            cwd=str(run_cwd),
+            cwd=prompt.cwd if prompt is not None else str(run_cwd),
             args=run_args,
             process=process,
             process_group_id=process.pid,
@@ -803,6 +822,7 @@ class PythonRunner:
             outline=outline,
             progress=deque(maxlen=self._max_progress_events),
             findings=deque(maxlen=self._max_progress_events),
+            prompt=prompt,
         )
         self._runs[run_id] = run
 
@@ -984,8 +1004,9 @@ class PythonRunner:
             suspension_reason=run.suspension_reason,
             findings=tuple(run.findings),
             dry_run=None,
-            code=run.code,
+            code=None if run.prompt is not None else run.code,
             resources=tuple(run.resources),
+            prompt=run.prompt,
         )
 
     def _get_run(self, run_id: int) -> _RunRecord:
@@ -1048,6 +1069,10 @@ class PythonRunner:
             with self._lock:
                 self._ensure_open()
                 run = self._get_run(run_id)
+                if run.prompt is not None:
+                    raise RunCleanupNotAllowedError(
+                        f"run {run_id} is a Prompt run; Workflow cleanup does not apply"
+                    )
                 if run.state in ("idle", "running", "validation_failed"):
                     raise RunCleanupNotAllowedError(
                         f"run {run_id} is {run.state}; cleanup requires a non-running run"

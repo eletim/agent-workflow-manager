@@ -102,8 +102,10 @@ function snapshot({
   resources = [],
   resourceCleanupStatus = resources.length ? "retained" : "cleaned",
   executionContext = null,
+  mode = undefined,
+  prompt = undefined,
 }) {
-  return {
+  const result = {
     args,
     attempts,
     checkpoint,
@@ -130,6 +132,9 @@ function snapshot({
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
   };
+  if (mode !== undefined) result.mode = mode;
+  if (prompt !== undefined) result.prompt = prompt;
+  return result;
 }
 
 test("run details show structured repository execution identity", async () => {
@@ -191,7 +196,9 @@ async function loadApp({
   clipboardOverride = null,
 }) {
   const ids = [
-    "code", "run-arguments", "active-context", "run-list",
+    "code", "run-arguments", "prompt-mode", "workflow-mode", "prompt-fields",
+    "workflow-fields", "prompt-agent", "prompt-cwd", "prompt-text",
+    "active-context", "run-list",
     "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
@@ -217,6 +224,7 @@ async function loadApp({
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
   elements["readiness-provider"].value = "codex";
+  elements["prompt-agent"].value = "codex";
   const calls = [];
   const eventSources = [];
   const document = {
@@ -340,6 +348,76 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Prompt mode shows only one-shot inputs and submits them directly", async () => {
+  let submitted = null;
+  const prompt = {agent: "claude-code", cwd: "/work/project", prompt: "Fix it"};
+  const result = {
+    ...snapshot({runId: 1, state: "running", stdout: "", mode: "prompt", prompt}),
+    code: null,
+    cleanupAvailable: false,
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/prompt") return undefined;
+      submitted = JSON.parse(options.body);
+      return response(result, 202);
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  assert.equal(elements["prompt-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements.validate.hidden, true);
+  assert.equal(elements["dry-run"].hidden, true);
+  assert.equal(elements.resume.hidden, true);
+  assert.equal(elements.cleanup.hidden, true);
+  assert.equal(elements["guide-open"].hidden, true);
+
+  elements["prompt-agent"].value = prompt.agent;
+  elements["prompt-cwd"].value = prompt.cwd;
+  elements["prompt-text"].value = prompt.prompt;
+  await elements.run.dispatch("click");
+
+  assert.deepEqual(submitted, prompt);
+  assert.match(elements["active-context"].textContent, /Prompt Run #1/);
+  assert.equal(elements["prompt-text"].readOnly, true);
+  assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+});
+
+test("Prompt history restores Prompt fields without exposing generated Python", async () => {
+  const prompt = {agent: "codex", cwd: "/selected/project", prompt: "Summarize"};
+  const detail = {
+    ...snapshot({runId: 4, state: "success", stdout: "done", mode: "prompt", prompt}),
+    code: null,
+    cleanupAvailable: false,
+  };
+  const summary = {
+    runId: 4,
+    state: "success",
+    cwd: prompt.cwd,
+    mode: "prompt",
+    prompt,
+    executionContext: null,
+  };
+
+  const {elements} = await loadApp({
+    runs: [summary],
+    details: {4: detail},
+    validation: {body: {}, status: 200},
+  });
+
+  assert.equal(elements["prompt-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements["prompt-agent"].value, "codex");
+  assert.equal(elements["prompt-cwd"].value, prompt.cwd);
+  assert.equal(elements["prompt-text"].value, prompt.prompt);
+  assert.match(selectedRun(elements).textContent, /Prompt.*selected\/project/);
+  assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+});
 
 test("Dry Run renders topology findings and the first mutation frontier", async () => {
   const dryRunResult = {

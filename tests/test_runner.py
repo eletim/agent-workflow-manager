@@ -16,10 +16,17 @@ from pathlib import Path
 import pytest
 
 import purplemux_client.runner as runner_module
+import purplemux_client.web as web_module
 from purplemux_client import WorkspaceState
 from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
+from purplemux_client.preflight import WorkflowValidator
+from purplemux_client.prompt import (
+    PromptExecution,
+    build_prompt_workflow,
+    prepare_prompt_execution,
+)
 from purplemux_client.readiness import (
     AgentReadinessStatus,
     ReadinessReconciliationRequired,
@@ -78,6 +85,71 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     observed_at = datetime.fromisoformat(result.stdout_entries[0].observed_at)
     assert observed_at.tzinfo is not None
     assert result.exit_code == 0
+
+
+def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
+    tmp_path: Path,
+) -> None:
+    execution = prepare_prompt_execution(
+        agent="claude-code", cwd=str(tmp_path), prompt='Review "this".\nBe concise.'
+    )
+
+    code = build_prompt_workflow(execution)
+
+    assert "runtime = PurpleMuxRuntime()" in code
+    assert "owned_by_run" not in code
+    assert "runtime.create_workspace(" in code
+    assert "client = runtime.workspace(workspace.id)" in code
+    assert "client.create_session(" in code
+    assert "client.wait_for_turn_completion(tab, 3600)" in code
+    assert "result = client.read_result(tab)" in code
+    assert "client.interrupt(tab)" in code
+    assert "capture_screen" not in code
+    assert "close_session" not in code
+    assert "delete_workspace" not in code
+    assert json.dumps(execution.cwd) in code
+    assert json.dumps(execution.prompt) in code
+    validation = WorkflowValidator().validate(code)
+    assert validation.valid
+    assert validation.outline == ("Prompt",)
+
+
+@pytest.mark.parametrize(
+    ("agent", "cwd", "prompt", "message"),
+    [
+        ("other", ".", "work", "agent must be"),
+        ("codex", "", "work", "cwd must be"),
+        ("codex", ".", "  ", "prompt must not be empty"),
+    ],
+)
+def test_prompt_input_validation(
+    agent: str, cwd: str, prompt: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        prepare_prompt_execution(agent=agent, cwd=cwd, prompt=prompt)
+
+
+def test_prompt_run_hides_generated_code_and_rejects_workflow_cleanup(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    execution = PromptExecution("codex", str(tmp_path), "answer")
+    run_id = runner.start("print('structured answer')", prompt=execution)
+    result = wait_for(
+        runner, lambda snapshot: snapshot.state == "success", run_id=run_id
+    )
+
+    payload = result.as_json()
+    assert payload["mode"] == "prompt"
+    assert payload["prompt"] == execution.as_json()
+    assert payload["code"] is None
+    assert payload["cwd"] == str(tmp_path)
+    assert payload["resources"] == []
+    assert payload["cleanupAvailable"] is False
+    summary = result.as_summary_json()
+    assert summary["mode"] == "prompt"
+    assert summary["prompt"] == {"agent": "codex", "cwd": str(tmp_path)}
+    with pytest.raises(RunCleanupNotAllowedError, match="Prompt run"):
+        runner.cleanup(run_id)
 
 
 def test_run_owned_resources_are_retained_structurally_after_success(
@@ -1470,6 +1542,7 @@ def test_runner_http_lifecycle(
     assert datetime.fromisoformat(stdout_entries[0]["observedAt"]).tzinfo is not None
     assert stderr_entries == []
     assert result == {
+        "mode": "workflow",
         "state": "success",
         "stdout": "HTTP_OK\n",
         "stderr": "",
@@ -1501,6 +1574,65 @@ def test_runner_http_lifecycle(
         "resourceCleanupStatus": "cleaned",
         "cleanupAvailable": True,
     }
+
+
+def test_prompt_api_starts_shared_run_with_authoritative_cwd(
+    web_server: tuple[tuple[str, int], str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    address, token = web_server
+    monkeypatch.setattr(
+        web_module,
+        "build_prompt_workflow",
+        lambda _execution: "print('PROMPT_RESULT')",
+    )
+
+    status, started = request(
+        address,
+        "POST",
+        "/api/prompt",
+        json.dumps({"agent": "codex", "cwd": str(tmp_path), "prompt": "Do the work"}),
+        token=token,
+    )
+
+    assert status == 202
+    assert started["mode"] == "prompt"
+    assert started["prompt"] == {
+        "agent": "codex",
+        "cwd": str(tmp_path.resolve()),
+        "prompt": "Do the work",
+    }
+    assert started["cwd"] == str(tmp_path.resolve())
+    assert started["code"] is None
+    assert started["resources"] == []
+    assert started["cleanupAvailable"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"agent": "codex", "cwd": ".", "prompt": 1},
+        {"agent": "unknown", "cwd": ".", "prompt": "work"},
+        {"agent": "codex", "cwd": "/definitely/missing", "prompt": "work"},
+    ],
+)
+def test_prompt_api_rejects_invalid_inputs(
+    web_server: tuple[tuple[str, int], str], payload: dict[str, object]
+) -> None:
+    address, token = web_server
+
+    status, result = request(
+        address,
+        "POST",
+        "/api/prompt",
+        json.dumps(payload),
+        token=token,
+    )
+
+    assert status == 400
+    assert isinstance(result["error"], str)
 
 
 def test_events_endpoint_streams_runner_change_notifications(
@@ -1896,6 +2028,27 @@ def test_runner_page_keeps_repository_context_in_python(
     assert 'id="working-directory"' not in page
     assert 'id="run-arguments"' in page
     assert 'id="run-list"' in page
+
+
+def test_runner_page_exposes_prompt_and_workflow_modes(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/")
+    response = connection.getresponse()
+    page = response.read().decode()
+    connection.close()
+
+    assert response.status == 200
+    for element_id in (
+        "prompt-mode",
+        "workflow-mode",
+        "prompt-agent",
+        "prompt-cwd",
+        "prompt-text",
+    ):
+        assert f'id="{element_id}"' in page
 
 
 def test_runner_page_exposes_agent_workflow_manager_favicon(
@@ -2551,6 +2704,7 @@ def test_notification_settings_mutation_rejects_untrusted_request(
     [
         (path, token, origin)
         for path in (
+            "/api/prompt",
             "/api/run",
             "/api/validate",
             "/api/dry-run",

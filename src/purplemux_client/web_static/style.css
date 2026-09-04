@@ -117,6 +117,25 @@ textarea {
   gap: 12px;
   margin-bottom: 10px;
 }
+.mode-switch {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 3px;
+  border: 1px solid #303746;
+  border-radius: 8px;
+  background: #0c0f15;
+}
+.mode-switch button { border-color: transparent; background: transparent; }
+.mode-switch button.selected { border-color: #8061e8; background: #34295a; }
+.prompt-options {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(0, 3fr);
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.prompt-fields { margin-top: 6px; }
+#prompt-text { min-height: 220px; }
 .active-context {
   margin: 0 0 14px;
   color: #9ba3b5;
@@ -325,6 +344,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
   .outputs { grid-template-columns: 1fr; }
   .execution-context { grid-template-columns: 1fr; }
+  .prompt-options { grid-template-columns: 1fr; }
   textarea { min-height: 330px; }
   .settings-heading { align-items: flex-start; }
   .toggle-grid { grid-template-columns: 1fr 1fr; }

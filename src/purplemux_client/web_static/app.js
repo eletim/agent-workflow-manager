@@ -1,5 +1,12 @@
 const code = document.querySelector("#code");
 const runArguments = document.querySelector("#run-arguments");
+const promptModeButton = document.querySelector("#prompt-mode");
+const workflowModeButton = document.querySelector("#workflow-mode");
+const promptFields = document.querySelector("#prompt-fields");
+const workflowFields = document.querySelector("#workflow-fields");
+const promptAgent = document.querySelector("#prompt-agent");
+const promptCwd = document.querySelector("#prompt-cwd");
+const promptText = document.querySelector("#prompt-text");
 const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
@@ -75,6 +82,7 @@ let guideText = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
+let currentMode = "workflow";
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
@@ -85,6 +93,11 @@ let rawStderr = "";
 // suppresses the "auto-select the latest run" behavior in refresh() once the
 // user has explicitly asked to compose or submit a new run.
 let draft = {args: "", code: code.value};
+let promptDraft = {
+  agent: promptAgent.value,
+  cwd: promptCwd.value,
+  prompt: promptText.value,
+};
 let explicitNewRun = false;
 let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
@@ -131,13 +144,37 @@ function applyFieldMode() {
   const drafting = activeRunId === null;
   runArguments.readOnly = !drafting;
   code.readOnly = !drafting;
+  promptAgent.disabled = !drafting;
+  promptCwd.readOnly = !drafting;
+  promptText.readOnly = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
   dryRunButton.disabled = !drafting;
+  applyModeVisibility();
+}
+
+function applyModeVisibility() {
+  const promptMode = currentMode === "prompt";
+  promptFields.hidden = !promptMode;
+  workflowFields.hidden = promptMode;
+  validateButton.hidden = promptMode;
+  dryRunButton.hidden = promptMode;
+  resumeButton.hidden = promptMode;
+  cleanupButton.hidden = promptMode;
+  guideOpen.hidden = promptMode;
+  validationPanel.hidden = promptMode || validationPanel.hidden;
+  dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
+  outlinePanel.hidden = promptMode || outlinePanel.hidden;
+  recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
+  resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
+  promptModeButton.className = promptMode ? "selected" : "";
+  workflowModeButton.className = promptMode ? "" : "selected";
+  promptModeButton.setAttribute("aria-pressed", String(promptMode));
+  workflowModeButton.setAttribute("aria-pressed", String(!promptMode));
 }
 
 function showDraftLabel() {
-  activeContext.textContent = "New run (draft) — not yet submitted";
+  activeContext.textContent = `New ${currentMode === "prompt" ? "Prompt" : "Workflow"} run (draft) — not yet submitted`;
 }
 
 // Snapshot the fields into the retained draft only when they currently *are*
@@ -145,11 +182,20 @@ function showDraftLabel() {
 // them). Call this right before any transition away from drafting.
 function captureDraftIfEditing() {
   if (activeRunId === null) {
-    draft = {args: runArguments.value, code: code.value};
+    if (currentMode === "prompt") {
+      promptDraft = {
+        agent: promptAgent.value,
+        cwd: promptCwd.value,
+        prompt: promptText.value,
+      };
+    } else {
+      draft = {args: runArguments.value, code: code.value};
+    }
   }
 }
 
 function renderRun(result) {
+  currentMode = result.mode === "prompt" ? "prompt" : "workflow";
   const running = result.state === "running";
   statusBadge.textContent = result.state;
   statusBadge.className = `status ${result.state}`;
@@ -178,9 +224,15 @@ function renderRun(result) {
   // Only an authoritative snapshot for the run currently being viewed may
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
-    runArguments.value = (result.args || []).join("\n");
-    code.value = result.code ?? "";
-    activeContext.textContent = `Viewing Run #${result.runId} (read-only)`;
+    if (currentMode === "prompt") {
+      promptAgent.value = result.prompt?.agent || "codex";
+      promptCwd.value = result.prompt?.cwd || result.cwd || "";
+      promptText.value = result.prompt?.prompt || "";
+    } else {
+      runArguments.value = (result.args || []).join("\n");
+      code.value = result.code ?? "";
+    }
+    activeContext.textContent = `Viewing ${currentMode === "prompt" ? "Prompt" : "Workflow"} Run #${result.runId} (read-only)`;
   } else if (activeRunId === null) {
     showDraftLabel();
   }
@@ -192,8 +244,9 @@ function renderRun(result) {
   }
 }
 
-async function enterDraftMode() {
+async function enterDraftMode(mode = currentMode) {
   const wasViewingRun = activeRunId !== null;
+  const changedMode = mode !== currentMode;
   // A New-run click is an explicit selection even if the fields are already
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
@@ -203,10 +256,17 @@ async function enterDraftMode() {
   // viewed (harmless reference) until a run is selected or started again.
   activeRunGeneration += 1;
   activeRunId = null;
+  currentMode = mode;
   explicitNewRun = true;
-  if (wasViewingRun) {
-    runArguments.value = draft.args;
-    code.value = draft.code;
+  if (wasViewingRun || changedMode) {
+    if (currentMode === "prompt") {
+      promptAgent.value = promptDraft.agent;
+      promptCwd.value = promptDraft.cwd;
+      promptText.value = promptDraft.prompt;
+    } else {
+      runArguments.value = draft.args;
+      code.value = draft.code;
+    }
   }
   showDraftLabel();
   stopButton.disabled = true;
@@ -269,8 +329,11 @@ function renderRunList(runs) {
     button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
     button.dataset.state = run.state;
     button.dataset.runId = String(run.runId);
-    const executionRoot = run.executionContext?.executionRoot || "execution context pending";
-    button.textContent = `#${run.runId}  ${run.state}  ${executionRoot}`;
+    const mode = run.mode === "prompt" ? "Prompt" : "Workflow";
+    const executionRoot = run.mode === "prompt"
+      ? run.prompt?.cwd || run.cwd
+      : run.executionContext?.executionRoot || "execution context pending";
+    button.textContent = `#${run.runId}  ${mode}  ${run.state}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -682,14 +745,23 @@ function executionContextPayload() {
 runButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // must explicitly start a New run first
   captureDraftIfEditing();
+  const submittedMode = currentMode;
   const selectionGeneration = ++activeRunGeneration;
   explicitNewRun = true;
   const validationGeneration = ++validationRequestGeneration;
   try {
-    const result = await request("/api/run", {
+    const requestPath = submittedMode === "prompt" ? "/api/prompt" : "/api/run";
+    const payload = submittedMode === "prompt"
+      ? {
+        agent: promptAgent.value,
+        cwd: promptCwd.value,
+        prompt: promptText.value,
+      }
+      : {code: code.value, ...executionContextPayload()};
+    const result = await request(requestPath, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+      body: JSON.stringify(payload),
     });
     if (selectionGeneration === activeRunGeneration) {
       // The fields remain editable while the request is pending. Retain any
@@ -699,7 +771,10 @@ runButton.addEventListener("click", async () => {
       activeRunId = result.runId;
       activeRunGeneration += 1;
       explicitNewRun = false;
-      if (validationGeneration === validationRequestGeneration) {
+      if (
+        submittedMode === "workflow"
+        && validationGeneration === validationRequestGeneration
+      ) {
         renderValidation(result.validation || []);
       }
       renderRun(result);
@@ -723,6 +798,14 @@ runButton.addEventListener("click", async () => {
 
 newRunButton.addEventListener("click", async () => {
   await enterDraftMode();
+});
+
+promptModeButton.addEventListener("click", async () => {
+  await enterDraftMode("prompt");
+});
+
+workflowModeButton.addEventListener("click", async () => {
+  await enterDraftMode("workflow");
 });
 
 validateButton.addEventListener("click", async () => {
