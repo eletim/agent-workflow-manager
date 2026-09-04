@@ -219,12 +219,15 @@ same recovery path and diagnostic sessions. Resume history is retained with
 the run for the lifetime of the Runner process.
 
 Runs are independent and may execute concurrently. The UI lists every run and
-lets the operator select its state, output, progress, execution context, and
-Stop action without changing another run. `GET /api/runs` lists compact summaries,
+lets the operator select its state, output, progress, execution context, Stop,
+and explicit Cleanup action without changing another run. Workflow-owned
+resources remain inspectable after every terminal result and are registered on
+the existing run record rather than a separate lifecycle store. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
-from its latest safe checkpoint. The original `/api/status`,
+from its latest safe checkpoint. `POST /api/runs/{runId}/cleanup` releases
+registered resources without deleting run history. The original `/api/status`,
 `/api/output`, and `/api/stop` routes remain available and address the most
 recently created run. `GET /api/events` streams revision-only SSE change
 notifications; initial load, notifications, and reconnects all reconcile through

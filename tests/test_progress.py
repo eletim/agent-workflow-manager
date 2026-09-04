@@ -5,7 +5,13 @@ import os
 
 import pytest
 
-from purplemux_client import emit_step, resume_checkpoint, save_checkpoint, suspend_run
+from purplemux_client import (
+    emit_step,
+    register_run_resource,
+    resume_checkpoint,
+    save_checkpoint,
+    suspend_run,
+)
 from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
@@ -130,6 +136,30 @@ def test_checkpoint_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resume_checkpoint() is not None
     assert resume_checkpoint().name == "sessions ready"  # type: ignore[union-attr]
     assert resume_checkpoint().data["workspace"] == "ws-1"  # type: ignore[union-attr]
+
+
+def test_register_run_resource_writes_structured_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        register_run_resource(
+            "purplemux_tab",
+            "tab-1",
+            {"workspace_id": "ws-1", "panel_type": "codex-cli"},
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        event = json.loads(stream.read())
+    assert event == {
+        "type": "resource",
+        "kind": "purplemux_tab",
+        "identity": "tab-1",
+        "metadata": {"workspace_id": "ws-1", "panel_type": "codex-cli"},
+    }
 
 
 def test_suspend_run_publishes_reason_and_uses_distinct_exit(

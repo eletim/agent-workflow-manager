@@ -26,7 +26,8 @@ browser on another trusted device
 ```
 
 The plain Python workflow is the sole source of truth for workflow control
-flow. It owns sequencing, branching, retries, success criteria, and cleanup.
+flow. It owns sequencing, branching, retries, success criteria, and resource
+creation/identification.
 Those decisions must not be copied into the Runner, encoded in progress
 events, or replaced by a workflow framework, graph, DSL, or state machine.
 
@@ -41,8 +42,11 @@ terminal state is determined solely by the Python process:
 - a process terminated after a Runner stop request becomes `stopped`.
 
 Progress events are observational. They do not decide terminal state and must
-never drive workflow sequencing, branching, retries, cleanup, or completion.
-The Runner does not operate tmux.
+never drive workflow sequencing, branching, retries, or completion. The one
+structured resource-registration event extends the existing run record with an
+authoritative identity; it does not decide control flow. The Runner's explicit
+Cleanup action operates only on that generic inventory through PurpleMux's
+public API and never operates tmux directly.
 
 ## Manual recovery and resume contract
 
@@ -81,9 +85,9 @@ directly. Observable or parallel shell work is launched in a named PurpleMux
 machine-readable exit-code sidecar written by the command wrapper; pane text is
 diagnostic only, and `terminalStatus` is optional status context rather than an
 inferred command result. The optional field is consumed when available and the
-tab's structured `alive` lifecycle remains authoritative. Tabs remain open until
-plain Python cleanup closes them, so a workflow can retain failed commands for
-inspection.
+tab's structured `alive` lifecycle remains authoritative. Tabs remain open after
+success, failure, suspension, and stop until the operator invokes the run's
+explicit Cleanup action, so completed commands remain available for inspection.
 
 ## Browser access and network trust
 

@@ -334,16 +334,26 @@ The script—not an agent prompt and not the UI—owns this loop and its limit.
 
 ## Cleanup policy
 
-Recommended default:
+Register every resource immediately after its concrete identity is known:
 
-```text
-SUCCESS -> close every created session once
-FAILURE -> keep sessions open and print workspace/tab references for inspection
+```python
+from purplemux_client import register_run_resource
+
+register_run_resource(
+    "purplemux_tab",
+    session_id,
+    {"workspace_id": workspace_id, "name": tab_name, "panel_type": "codex-cli"},
+)
 ```
 
-Do not retry a timed-out close blindly. There is currently no workspace deletion
-method in `purplemux_client`; do not invent one. A workflow may use
-`capture_screen` after failure for diagnostics, without parsing it as a result.
+Do not automatically close a Workflow run's tabs on success or failure. The
+Runner retains the structured inventory on the run record and exposes one manual
+Cleanup action after execution ends. Cleanup verifies identities, closes child
+tabs in reverse deterministic order, and stops before dependent parent resources
+when an outcome is blocked. There is currently no PurpleMux workspace deletion
+method, so an owned workspace that still exists is reported as concretely blocked.
+A workflow may use `capture_screen` for diagnostics, without parsing it as a
+result. Prompt mode does not use this Workflow resource model.
 
 ## Explicit checkpoints and manual recovery
 
@@ -714,23 +724,8 @@ except BaseException as exc:
         else:
             print(f"Diagnostic capture for {session_id}:\n{diagnostic}")
     raise
-finally:
-    if workflow_succeeded:
-        emit_step("cleanup", "started", workspace=workspace_id)
-        cleanup_errors: list[str] = []
-        for session_id in reversed(session_ids):
-            try:
-                client.close_session(session_id)  # One attempt; never blind retry.
-            except TerminalSessionError as exc:
-                cleanup_errors.append(f"{session_id}: {exc}")
-        if cleanup_errors:
-            message = "; ".join(cleanup_errors)
-            emit_step("cleanup", "failed", error=message[:500], workspace=workspace_id)
-            raise WorkerFailure(f"session cleanup failed: {message}")
-        emit_step("cleanup", "completed", workspace=workspace_id)
-        emit_step("workflow", "completed", workspace=workspace_id)
 ```
 
 Replace constants and prompts for the requested Issue, but keep orchestration,
-review separation, bounded attempts, mutation handling, and cleanup explicit in
-plain Python.
+review separation, bounded attempts, and mutation handling explicit in plain
+Python. Resource destruction is the separate, explicit run Cleanup action.

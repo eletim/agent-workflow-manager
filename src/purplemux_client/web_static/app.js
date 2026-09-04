@@ -10,6 +10,7 @@ const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
 const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
+const cleanupButton = document.querySelector("#cleanup");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
 const stderr = document.querySelector("#stderr");
@@ -20,6 +21,9 @@ const progressEmpty = document.querySelector("#progress-empty");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
+const resourcesPanel = document.querySelector("#resources-panel");
+const resourcesSummary = document.querySelector("#resources-summary");
+const resourcesList = document.querySelector("#resources");
 const validationPanel = document.querySelector("#validation-panel");
 const validationSuccess = document.querySelector("#validation-success");
 const validation = document.querySelector("#validation");
@@ -163,9 +167,13 @@ function renderRun(result) {
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
   resumeButton.disabled = activeRunId === null || !result.resumable;
+  cleanupButton.disabled = activeRunId === null
+    || !result.cleanupAvailable
+    || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderRecovery(result);
+  renderResources(result);
   renderDryRun(result);
 
   // Only an authoritative snapshot for the run currently being viewed may
@@ -206,9 +214,26 @@ async function enterDraftMode() {
   showDraftLabel();
   stopButton.disabled = true;
   resumeButton.disabled = true;
+  cleanupButton.disabled = true;
   renderOutline([], []);
   applyFieldMode();
   await refresh();
+}
+
+function renderResources(result) {
+  const resources = result.resources || [];
+  resourcesPanel.hidden = result.runId == null;
+  const status = result.resourceCleanupStatus || "cleaned";
+  resourcesSummary.textContent = resources.length === 0
+    ? "No run-owned resources were registered."
+    : `${resources.length} registered — ${status.replaceAll("_", " ")}.`;
+  resourcesList.replaceChildren();
+  for (const resource of resources) {
+    const item = document.createElement("li");
+    const error = resource.cleanupError ? ` — ${resource.cleanupError}` : "";
+    item.textContent = `${resource.kind}: ${resource.identity} — ${resource.cleanupState}${error}`;
+    resourcesList.append(item);
+  }
 }
 
 function renderRecovery(result) {
@@ -816,6 +841,29 @@ stopButton.addEventListener("click", async () => {
   const selectionGeneration = ++activeRunGeneration;
   try {
     const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) {
+      activeRunGeneration += 1;
+      renderRun(result);
+    }
+    await refresh();
+  } catch (error) {
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) stderr.textContent = String(error);
+  }
+});
+
+cleanupButton.addEventListener("click", async () => {
+  if (activeRunId === null) return;
+  const targetRunId = activeRunId;
+  const selectionGeneration = ++activeRunGeneration;
+  cleanupButton.disabled = true;
+  try {
+    const result = await request(`/api/runs/${targetRunId}/cleanup`, {method: "POST"});
     if (
       targetRunId === activeRunId
       && selectionGeneration === activeRunGeneration

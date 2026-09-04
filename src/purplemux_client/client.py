@@ -28,6 +28,7 @@ from purplemux_client.operations import (
     Reconciliation,
     execute_mutation,
 )
+from purplemux_client.progress import register_run_resource
 
 
 @dataclass(frozen=True)
@@ -287,7 +288,7 @@ class PurpleMuxRuntime:
                 MutationResolution.UNKNOWN, detail="workspace may appear later"
             )
 
-        return execute_mutation(
+        workspace = execute_mutation(
             operation="create PurpleMux workspace",
             target=correlated_name,
             pre_state=before,
@@ -295,6 +296,16 @@ class PurpleMuxRuntime:
             reconcile=reconcile,
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
         )
+        register_run_resource(
+            "purplemux_workspace",
+            workspace.id,
+            {
+                "name": workspace.name,
+                "directories": "\n".join(workspace.directories),
+                "correlation_id": request.correlation_id,
+            },
+        )
+        return workspace
 
     def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
         if workspace_id not in {item.id for item in self.list_workspaces()}:
@@ -450,11 +461,13 @@ class PurpleMuxCLIClient:
         name = request.name or f"awm-{panel_type}-{correlation_id}"
         if request.name is not None and correlation_id not in name:
             name = f"{name} [awm:{correlation_id}]"
-        return self._create_correlated_tab(
+        tab = self._create_correlated_tab(
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",
             name=name,
-        ).id
+        )
+        self._register_owned_tab(tab)
+        return tab.id
 
     def list_sessions(self) -> tuple[TabState, ...]:
         """Return one complete structured tab listing for this workspace."""
@@ -561,9 +574,11 @@ class PurpleMuxCLIClient:
         if not os.path.isdir(cwd):
             raise ValueError(f"shell working directory is not a directory: {cwd}")
 
-        session_id = self._create_correlated_tab(
+        tab = self._create_correlated_tab(
             panel_type="terminal", provider=None, name=request.name
-        ).id
+        )
+        self._register_owned_tab(tab)
+        session_id = tab.id
 
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
@@ -584,6 +599,19 @@ class PurpleMuxCLIClient:
                 f"shell terminal {session_id} was created but command start failed: {exc}"
             ) from exc
         return session_id
+
+    @staticmethod
+    def _register_owned_tab(tab: TabState) -> None:
+        register_run_resource(
+            "purplemux_tab",
+            tab.id,
+            {
+                "workspace_id": tab.workspace_id,
+                "name": tab.name,
+                "panel_type": tab.panel_type or "",
+                "provider": tab.provider or "",
+            },
+        )
 
     def resume_shell(
         self, session_id: str, result_path: str, *, cwd: str | None = None

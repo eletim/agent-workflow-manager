@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +23,6 @@ from purplemux_client import (
     PurpleMuxRuntime,
     ResumeCheckpoint,
     ShellCommandRequest,
-    TerminalSessionError,
     WorkerFailure,
     emit_finding,
     emit_step,
@@ -327,17 +325,6 @@ def decision(result: str) -> str:
     return verdict
 
 
-def close_tabs(client: PurpleMuxCLIClient, tabs: Sequence[str | None]) -> None:
-    errors: list[str] = []
-    for tab in reversed(tuple(dict.fromkeys(item for item in tabs if item))):
-        try:
-            client.close_session(tab)
-        except TerminalSessionError as exc:
-            errors.append(f"{tab}: {exc}")
-    if errors:
-        raise WorkerFailure("session cleanup failed: " + "; ".join(errors))
-
-
 def reopen_if_topology_drifted(
     pr: PullRequestState, recovery: Recovery, phase: str, config: Config
 ) -> bool:
@@ -401,12 +388,6 @@ def run_final_checks(
             "final-check shell creation may have completed; inspect its saved "
             "correlation before any new mutation"
         )
-    if recovery.phase == "integration_checks_close_pending":
-        raise MutationOutcomeUnknown(
-            f"final-check shell {recovery.check_shell} close outcome is unknown; "
-            "do not retry until reconciled"
-        )
-
     if recovery.phase in {
         "integration_checks_running",
         "integration_checks_complete",
@@ -417,7 +398,6 @@ def run_final_checks(
         client.resume_shell(shell, recovery.check_result_path, cwd=str(config.repo))
     elif recovery.phase not in {
         "integration_checks_complete",
-        "integration_checks_closed",
     }:
         recovery.phase = "integration_checks_create_pending"
         recovery.checkpoint(config)
@@ -457,15 +437,6 @@ def run_final_checks(
             raise WorkerFailure(failure)
         recovery.phase = "integration_checks_complete"
         recovery.checkpoint(config)
-
-    if recovery.phase == "integration_checks_complete":
-        assert recovery.check_shell is not None
-        recovery.phase = "integration_checks_close_pending"
-        recovery.checkpoint(config)
-        client.close_session(recovery.check_shell)
-        recovery.phase = "integration_checks_closed"
-        recovery.checkpoint(config)
-
 
 def prepare_issue(
     repo: GitRepository,
@@ -692,7 +663,6 @@ def process_issue(
         merge_commit_sha=merged.merge_commit_sha,
         required_commit_sha=recovery.approved_sha or "",
     )
-    close_tabs(client, (recovery.implementer, recovery.reviewer))
     print(f"Merged approved Issue #{issue.number} PR: {merged.pr.url}", flush=True)
     workspace = recovery.workspace
     recovery.__dict__.update(Recovery(workspace=workspace).__dict__)
@@ -714,11 +684,6 @@ def integration_review(
         raise MutationOutcomeUnknown(
             "a prior integration agent turn may have been sent; do not resend "
             "until its exact outcome is reconciled"
-        )
-    if recovery.phase == "integration_checks_close_pending":
-        raise MutationOutcomeUnknown(
-            f"final-check shell {recovery.check_shell} close outcome is unknown; "
-            "do not create or send anything until it is reconciled"
         )
     if recovery.phase == "integration_checks_start_pending":
         raise MutationOutcomeUnknown(
@@ -871,7 +836,6 @@ def integration_review(
     )
     recovery.phase = "integration_ready"
     recovery.checkpoint(config)
-    close_tabs(client, (recovery.implementer, recovery.reviewer))
     return pr
 
 

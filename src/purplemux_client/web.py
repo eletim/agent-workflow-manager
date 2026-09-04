@@ -28,6 +28,8 @@ from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
     PythonRunner,
+    RunCleanupInProgressError,
+    RunCleanupNotAllowedError,
     RunNotFoundError,
     RunNotResumableError,
     WorkflowDryRunError,
@@ -528,6 +530,19 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(HTTPStatus.ACCEPTED, snapshot.as_json())
+            return
+        cleanup_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/cleanup", path)
+        if cleanup_match is not None:
+            run_id = int(cleanup_match.group(1))
+            try:
+                snapshot = self.server.runner.cleanup(run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except (RunCleanupInProgressError, RunCleanupNotAllowedError) as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, snapshot.as_json())
             return
         if path == "/api/settings/notifications":
             payload = self._read_json()
