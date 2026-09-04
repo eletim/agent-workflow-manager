@@ -359,13 +359,13 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, {"error": "code must be a string"}
                 )
                 return
-            cwd = payload.get("cwd")
-            if cwd == "":
-                cwd = None
-            if cwd is not None and not isinstance(cwd, str):
+            if "cwd" in payload:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "cwd must be a string or null"},
+                    {
+                        "error": "cwd is not a Workflow input; declare repository "
+                        "context with prepare_run_repository()"
+                    },
                 )
                 return
             args = payload.get("args", [])
@@ -379,7 +379,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 if path == "/api/validate":
-                    result = self.server.runner.validate(code, cwd=cwd, args=args)
+                    result = self.server.runner.validate(code, args=args)
                     self._send_json(
                         HTTPStatus.OK
                         if result.valid
@@ -388,7 +388,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
                 if path == "/api/dry-run":
-                    result = self.server.runner.dry_run(code, cwd=cwd, args=args)
+                    result = self.server.runner.dry_run(code, args=args)
                     status = (
                         HTTPStatus.OK
                         if result.status in {"frontier", "complete"}
@@ -398,7 +398,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         status, self.server.runner.validation_snapshot().as_json()
                     )
                     return
-                run_id = self.server.runner.start(code, cwd=cwd, args=args)
+                run_id = self.server.runner.start(code, args=args)
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return

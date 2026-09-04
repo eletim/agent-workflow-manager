@@ -99,7 +99,7 @@ textarea {
 }
 .execution-context {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   margin-bottom: 8px;
 }

@@ -568,16 +568,15 @@ def test_empty_code(runner: PythonRunner) -> None:
     assert result.exit_code == 0
 
 
-def test_run_uses_and_records_explicit_cwd_and_args(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
+def test_run_uses_runner_controlled_cwd_and_records_args(tmp_path: Path) -> None:
+    runner = PythonRunner(workflow_cwd=tmp_path)
     runner.start(
         "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
-        cwd=tmp_path,
         args=("--repo", "path with spaces"),
     )
 
     result = wait_until_finished(runner)
+    runner.close()
 
     assert json.loads(result.stdout) == [
         str(tmp_path),
@@ -587,8 +586,8 @@ def test_run_uses_and_records_explicit_cwd_and_args(
     assert result.args == ("--repo", "path with spaces")
 
 
-def test_explicit_cwd_removes_runner_virtualenv_from_child_environment(
-    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_runner_controlled_cwd_preserves_runner_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager_venv = tmp_path / "manager-venv"
     target_bin = tmp_path / "target-bin"
@@ -597,14 +596,18 @@ def test_explicit_cwd_removes_runner_virtualenv_from_child_environment(
         "PATH", os.pathsep.join((str(manager_venv / "bin"), str(target_bin)))
     )
 
+    runner = PythonRunner(workflow_cwd=tmp_path)
     runner.start(
         "import json, os; print(json.dumps([os.environ.get('VIRTUAL_ENV'), "
-        "os.environ.get('PATH')]))",
-        cwd=tmp_path,
+        "os.environ.get('PATH')]))"
     )
     result = wait_until_finished(runner)
+    runner.close()
 
-    assert json.loads(result.stdout) == [None, str(target_bin)]
+    assert json.loads(result.stdout) == [
+        str(manager_venv),
+        os.pathsep.join((str(manager_venv / "bin"), str(target_bin))),
+    ]
 
 
 def test_implicit_cwd_preserves_existing_environment(
@@ -619,23 +622,19 @@ def test_implicit_cwd_preserves_existing_environment(
     assert result.stdout == f"{manager_venv}\n"
 
 
-def test_execution_context_rejects_non_directory(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
+def test_runner_rejects_non_directory_workflow_cwd(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
 
     with pytest.raises(InvalidExecutionContextError, match="not a directory"):
-        runner.start("", cwd=missing)
+        PythonRunner(workflow_cwd=missing)
 
 
-def test_preflight_resolves_relative_paths_from_explicit_cwd(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
+def test_preflight_resolves_relative_paths_from_runner_cwd(tmp_path: Path) -> None:
     (tmp_path / "input.txt").write_text("input", encoding="utf-8")
 
-    result = runner.validate(
-        "WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}", cwd=tmp_path
-    )
+    runner = PythonRunner(workflow_cwd=tmp_path)
+    result = runner.validate("WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}")
+    runner.close()
 
     assert result.valid
     assert runner.snapshot().cwd == str(tmp_path)
@@ -680,7 +679,8 @@ wait_for("checkpoint")
 save_checkpoint("safe", {"workspace": "ws-1"})
 wait_for("finish")
 """
-    run_id = runner.start(code, cwd=tmp_path)
+    runner._workflow_cwd = tmp_path
+    run_id = runner.start(code)
     revision = runner.change_revision()
 
     (tmp_path / "output").touch()
@@ -929,7 +929,8 @@ if not Path("repair.complete").exists():
     raise RuntimeError("manual repair required")
 print("continued safely")
 """
-    run_id = runner.start(code, cwd=tmp_path)
+    runner._workflow_cwd = tmp_path
+    run_id = runner.start(code)
     first = wait_until_finished(runner)
     assert first.state == "failed"
     assert first.checkpoint is not None
@@ -1056,7 +1057,8 @@ assert checkpoint.name == "phase two"
 assert Path("second-fixed").exists()
 print(checkpoint.data["workspace"], checkpoint.data["tab"])
 """
-    run_id = runner.start(code, cwd=tmp_path)
+    runner._workflow_cwd = tmp_path
+    run_id = runner.start(code)
     wait_until_finished(runner)
     (tmp_path / "first-fixed").touch()
     runner.resume(run_id)
@@ -1477,6 +1479,7 @@ def test_runner_http_lifecycle(
         "dryRun": None,
         "dryRunEligible": True,
         "dryRunIssues": [],
+        "executionContext": None,
         "findings": [],
         "exitCode": 0,
         "runId": 1,
@@ -1547,13 +1550,9 @@ def test_events_endpoint_rejects_untrusted_host(
 
 
 def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
+    web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, token = web_server
-    first_cwd = tmp_path / "first"
-    second_cwd = tmp_path / "second"
-    first_cwd.mkdir()
-    second_cwd.mkdir()
 
     status, first = request(
         address,
@@ -1562,7 +1561,6 @@ def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
         json.dumps(
             {
                 "code": "import time; print('first', flush=True); time.sleep(60)",
-                "cwd": str(first_cwd),
                 "args": ["--first"],
             }
         ),
@@ -1576,7 +1574,6 @@ def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
         json.dumps(
             {
                 "code": "import time; print('second', flush=True); time.sleep(60)",
-                "cwd": str(second_cwd),
                 "args": ["--second"],
             }
         ),
@@ -1589,8 +1586,8 @@ def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
     status, listed = request(address, "GET", "/api/runs")
     assert status == 200
     assert [(run["runId"], run["cwd"], run["args"]) for run in listed["runs"]] == [
-        (first_id, str(first_cwd), ["--first"]),
-        (second_id, str(second_cwd), ["--second"]),
+        (first_id, str(Path.cwd()), ["--first"]),
+        (second_id, str(Path.cwd()), ["--second"]),
     ]
 
     status, stopped = request(
@@ -1688,12 +1685,13 @@ def test_run_api_resumes_same_run_and_rejects_unsafe_replay(
     web_server: tuple[tuple[str, int], str], tmp_path: Path
 ) -> None:
     address, token = web_server
-    code = """\
+    fixed = tmp_path / "fixed"
+    code = f"""\
 from pathlib import Path
 from purplemux_client import resume_checkpoint, save_checkpoint
 if resume_checkpoint() is None:
-    save_checkpoint("before repair", {"workspace": "ws-1", "tab": "tab-1"})
-if not Path("fixed").exists():
+    save_checkpoint("before repair", {{"workspace": "ws-1", "tab": "tab-1"}})
+if not Path({str(fixed)!r}).exists():
     raise RuntimeError("fix required")
 print("resumed")
 """
@@ -1701,7 +1699,7 @@ print("resumed")
         address,
         "POST",
         "/api/run",
-        json.dumps({"code": code, "cwd": str(tmp_path)}),
+        json.dumps({"code": code}),
         token=token,
     )
     assert status == 202
@@ -1719,7 +1717,7 @@ print("resumed")
         "data": {"workspace": "ws-1", "tab": "tab-1"},
     }
 
-    (tmp_path / "fixed").touch()
+    fixed.touch()
     status, resumed = request(
         address, "POST", f"/api/runs/{run_id}/resume", token=token
     )
@@ -1748,47 +1746,8 @@ print("resumed")
     assert "no safe checkpoint" in str(refusal["error"])
 
 
-def test_resume_api_reports_removed_working_directory_without_mutating_run(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
-) -> None:
-    address, token = web_server
-    run_cwd = tmp_path / "removed-after-failure"
-    run_cwd.mkdir()
-    code = """\
-from purplemux_client import save_checkpoint
-save_checkpoint("safe boundary", {"workspace": "ws-1"})
-raise RuntimeError("manual repair required")
-"""
-    status, started = request(
-        address,
-        "POST",
-        "/api/run",
-        json.dumps({"code": code, "cwd": str(run_cwd)}),
-        token=token,
-    )
-    assert status == 202
-    run_id = int(started["runId"])
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        _, before = request(address, "GET", f"/api/runs/{run_id}")
-        if before["state"] != "running":
-            break
-        time.sleep(0.02)
-    assert before["state"] == "failed"
-    run_cwd.rmdir()
-
-    status, refusal = request(
-        address, "POST", f"/api/runs/{run_id}/resume", token=token
-    )
-
-    assert status == 400
-    assert refusal == {"error": f"working directory is not a directory: {run_cwd}"}
-    _, after = request(address, "GET", f"/api/runs/{run_id}")
-    assert after == before
-
-
-def test_run_api_passes_run_scoped_execution_context(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
+def test_run_api_uses_runner_cwd_and_passes_arguments(
+    web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, token = web_server
     status, started = request(
@@ -1798,7 +1757,6 @@ def test_run_api_passes_run_scoped_execution_context(
         json.dumps(
             {
                 "code": "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
-                "cwd": str(tmp_path),
                 "args": ["--repo", "target repo"],
             }
         ),
@@ -1806,7 +1764,7 @@ def test_run_api_passes_run_scoped_execution_context(
     )
 
     assert status == 202
-    assert started["cwd"] == str(tmp_path)
+    assert started["cwd"] == str(Path.cwd())
     assert started["args"] == ["--repo", "target repo"]
 
     deadline = time.monotonic() + 5
@@ -1816,22 +1774,18 @@ def test_run_api_passes_run_scoped_execution_context(
             break
         time.sleep(0.02)
     assert json.loads(str(result["stdout"])) == [
-        str(tmp_path),
+        str(Path.cwd()),
         ["--repo", "target repo"],
     ]
 
 
 def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
+    web_server: tuple[tuple[str, int], str],
 ) -> None:
     """Issue #45: /api/runs/{id} must return each run's own submitted code,
     unaffected by other runs starting, while /api/runs list summaries stay
     lightweight (no full source)."""
     address, token = web_server
-    first_cwd = tmp_path / "first"
-    second_cwd = tmp_path / "second"
-    first_cwd.mkdir()
-    second_cwd.mkdir()
     first_code = "print('RUN=A')"
     second_code = "print('RUN=B')"
 
@@ -1839,7 +1793,7 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
         address,
         "POST",
         "/api/run",
-        json.dumps({"code": first_code, "cwd": str(first_cwd), "args": ["A-ARG"]}),
+        json.dumps({"code": first_code, "args": ["A-ARG"]}),
         token=token,
     )
     assert status == 202
@@ -1854,7 +1808,7 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
         address,
         "POST",
         "/api/run",
-        json.dumps({"code": second_code, "cwd": str(second_cwd), "args": ["B-ARG"]}),
+        json.dumps({"code": second_code, "args": ["B-ARG"]}),
         token=token,
     )
     assert status == 202
@@ -1862,17 +1816,17 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
     assert second["code"] == second_code
 
     # The first run's own snapshot must be unaffected by the second run
-    # starting and executing with a different cwd/args/code.
+    # starting and executing with different args/code.
     status, after = request(address, "GET", f"/api/runs/{first_id}")
     assert status == 200
     assert after["code"] == before["code"] == first_code
-    assert after["cwd"] == before["cwd"] == str(first_cwd)
+    assert after["cwd"] == before["cwd"] == str(Path.cwd())
     assert after["args"] == before["args"] == ["A-ARG"]
 
     status, second_detail = request(address, "GET", f"/api/runs/{second_id}")
     assert status == 200
     assert second_detail["code"] == second_code
-    assert second_detail["cwd"] == str(second_cwd)
+    assert second_detail["cwd"] == str(Path.cwd())
 
     # The list summary intentionally omits the full source.
     status, listed = request(address, "GET", "/api/runs")
@@ -1884,7 +1838,10 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
 @pytest.mark.parametrize(
     ("context", "error"),
     [
-        ({"cwd": 42}, "cwd must be a string or null"),
+        (
+            {"cwd": 42},
+            "cwd is not a Workflow input; declare repository context with prepare_run_repository()",
+        ),
         ({"args": "--repo target"}, "args must be an array of strings"),
         ({"args": ["--repo", 42]}, "args must be an array of strings"),
     ],
@@ -1908,7 +1865,7 @@ def test_run_api_rejects_invalid_execution_context_shape(
     assert payload == {"error": error}
 
 
-def test_run_api_rejects_missing_working_directory(
+def test_run_api_rejects_workflow_cwd_input(
     web_server: tuple[tuple[str, int], str], tmp_path: Path
 ) -> None:
     address, token = web_server
@@ -1922,10 +1879,10 @@ def test_run_api_rejects_missing_working_directory(
     )
 
     assert status == 400
-    assert "working directory is not a directory" in str(payload["error"])
+    assert "cwd is not a Workflow input" in str(payload["error"])
 
 
-def test_runner_page_exposes_execution_context_inputs(
+def test_runner_page_keeps_repository_context_in_python(
     web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, _ = web_server
@@ -1936,7 +1893,7 @@ def test_runner_page_exposes_execution_context_inputs(
     connection.close()
 
     assert response.status == 200
-    assert 'id="working-directory"' in page
+    assert 'id="working-directory"' not in page
     assert 'id="run-arguments"' in page
     assert 'id="run-list"' in page
 

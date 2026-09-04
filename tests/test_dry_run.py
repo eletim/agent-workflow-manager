@@ -47,10 +47,10 @@ def test_static_validation_rejects_raw_filesystem_mutation_facilities(
 def test_dry_run_rejects_raw_open_before_it_can_modify_files(
     tmp_path: Path, source: str
 ) -> None:
-    runner = PythonRunner()
+    runner = PythonRunner(workflow_cwd=tmp_path)
     try:
         with pytest.raises(WorkflowDryRunError):
-            runner.dry_run(f"WORKFLOW_DRY_RUN = 1\n{source}\n", cwd=tmp_path)
+            runner.dry_run(f"WORKFLOW_DRY_RUN = 1\n{source}\n")
     finally:
         runner.close()
 

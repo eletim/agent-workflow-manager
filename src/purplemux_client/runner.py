@@ -20,6 +20,7 @@ from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
 from purplemux_client.errors import MutationOutcomeUnknown
+from purplemux_client.execution_context import REPOSITORY_CONTEXT_ENV
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -270,6 +271,7 @@ class RunnerSnapshot:
             for attempt in self.attempts
         ]
         payload["resources"] = [resource.as_json() for resource in self.resources]
+        payload["executionContext"] = self._execution_context_json()
         payload["resourceCleanupStatus"] = _resource_cleanup_status(self.resources)
         payload["cleanupAvailable"] = self.state not in (
             "idle",
@@ -284,11 +286,13 @@ class RunnerSnapshot:
         return payload
 
     def as_summary_json(self) -> dict[str, object]:
+        execution_context = self._execution_context_json()
         return {
             "state": self.state,
             "exitCode": self.exit_code,
             "runId": self.run_id,
             "cwd": self.cwd,
+            "executionContext": execution_context,
             "args": list(self.args),
             "checkpoint": asdict(self.checkpoint) if self.checkpoint else None,
             "attempts": len(self.attempts),
@@ -301,13 +305,29 @@ class RunnerSnapshot:
             "resourceCount": len(self.resources),
         }
 
+    def _execution_context_json(self) -> dict[str, str] | None:
+        for resource in self.resources:
+            if resource.kind != "git_worktree":
+                continue
+            metadata = resource.metadata
+            return {
+                "sourceRepository": metadata.get(
+                    "source_repository", metadata.get("repository", "")
+                ),
+                "remote": metadata.get("remote", ""),
+                "baseBranch": metadata.get("base_branch", ""),
+                "baseRef": metadata.get("base_ref", ""),
+                "baseSha": metadata.get("base_sha", metadata.get("head", "")),
+                "executionRoot": resource.identity,
+            }
+        return None
+
 
 @dataclass
 class _RunRecord:
     run_id: int
     cwd: str
     args: tuple[str, ...]
-    explicit_cwd: bool
     process: subprocess.Popen[bytes]
     process_group_id: int
     script_path: Path
@@ -344,6 +364,7 @@ class PythonRunner:
         dry_run_timeout: float = 300.0,
         notifier: TerminalNotifier | None = None,
         validator: WorkflowValidator | None = None,
+        workflow_cwd: str | os.PathLike[str] | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -366,6 +387,20 @@ class PythonRunner:
         self._notifier = notifier
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
+        try:
+            self._workflow_cwd = (
+                Path.cwd()
+                if workflow_cwd is None
+                else Path(workflow_cwd).expanduser().resolve()
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise InvalidExecutionContextError(
+                f"Runner working directory could not be resolved: {exc}"
+            ) from exc
+        if not self._workflow_cwd.is_dir():
+            raise InvalidExecutionContextError(
+                f"Runner working directory is not a directory: {self._workflow_cwd}"
+            )
         self._preview = RunnerSnapshot(
             state="idle",
             stdout="",
@@ -378,7 +413,7 @@ class PythonRunner:
             progress=(),
             validation=(),
             dry_run_issues=(),
-            cwd=str(Path.cwd()),
+            cwd=str(self._workflow_cwd),
             args=(),
             checkpoint=None,
             attempts=(),
@@ -392,10 +427,9 @@ class PythonRunner:
         self,
         code: str,
         *,
-        cwd: str | os.PathLike[str] | None = None,
         args: Sequence[str] = (),
     ) -> ValidationResult:
-        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -409,11 +443,10 @@ class PythonRunner:
         self,
         code: str,
         *,
-        cwd: str | os.PathLike[str] | None = None,
         args: Sequence[str] = (),
     ) -> DryRunResult:
         """Execute the real workflow until its first inspection-aware mutation."""
-        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -579,10 +612,9 @@ class PythonRunner:
         self,
         code: str,
         *,
-        cwd: str | os.PathLike[str] | None = None,
         args: Sequence[str] = (),
     ) -> int:
-        run_cwd, run_args, child_env = self._execution_context(cwd, args)
+        run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -600,7 +632,6 @@ class PythonRunner:
                     run_cwd=run_cwd,
                     run_args=run_args,
                     child_env=child_env,
-                    explicit_cwd=cwd is not None,
                 )
 
     def resume(self, run_id: int) -> None:
@@ -617,12 +648,19 @@ class PythonRunner:
                     self._ensure_resumable(run)
                     code = run.code
                     checkpoint = run.checkpoint
-                    cwd = run.cwd
                     args = run.args
-                    explicit_cwd = run.explicit_cwd
-                run_cwd, run_args, child_env = self._execution_context(
-                    cwd, args, explicit_cwd=explicit_cwd
-                )
+                run_cwd, run_args, child_env = self._execution_context(args)
+                for resource in run.resources:
+                    if resource.kind == "git_worktree":
+                        child_env[REPOSITORY_CONTEXT_ENV] = json.dumps(
+                            {
+                                **resource.metadata,
+                                "execution_root": resource.identity,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        break
                 validation = self._validator.validate(
                     code, cwd=run_cwd, environment=child_env
                 )
@@ -697,7 +735,6 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
-        explicit_cwd: bool,
     ) -> int:
         process, script_path, progress_read_fd = self._spawn_process(
             code,
@@ -712,7 +749,6 @@ class PythonRunner:
             run_id=run_id,
             cwd=str(run_cwd),
             args=run_args,
-            explicit_cwd=explicit_cwd,
             process=process,
             process_group_id=process.pid,
             script_path=script_path,
@@ -903,24 +939,14 @@ class PythonRunner:
         except KeyError as exc:
             raise RunNotFoundError(f"run {run_id} was not found") from exc
 
-    @staticmethod
     def _execution_context(
-        cwd: str | os.PathLike[str] | None,
+        self,
         args: Sequence[str],
-        *,
-        explicit_cwd: bool | None = None,
     ) -> tuple[Path, tuple[str, ...], dict[str, str]]:
-        if explicit_cwd is None:
-            explicit_cwd = cwd is not None
-        try:
-            run_cwd = Path.cwd() if cwd is None else Path(cwd).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise InvalidExecutionContextError(
-                f"working directory could not be resolved: {exc}"
-            ) from exc
+        run_cwd = self._workflow_cwd
         if not run_cwd.is_dir():
             raise InvalidExecutionContextError(
-                f"working directory is not a directory: {run_cwd}"
+                f"Runner working directory is not a directory: {run_cwd}"
             )
         if isinstance(args, (str, bytes)):
             raise InvalidExecutionContextError("args must be a sequence of strings")
@@ -932,20 +958,7 @@ class PythonRunner:
 
         child_env = os.environ.copy()
         child_env.pop(RESUME_CHECKPOINT_ENV, None)
-        if explicit_cwd:
-            virtual_env = child_env.pop("VIRTUAL_ENV", None)
-            virtual_envs = {virtual_env} if virtual_env else set()
-            if sys.prefix != sys.base_prefix:
-                virtual_envs.add(sys.prefix)
-            virtual_env_bins = {
-                os.path.normpath(os.path.join(environment, "bin"))
-                for environment in virtual_envs
-            }
-            child_env["PATH"] = os.pathsep.join(
-                entry
-                for entry in child_env.get("PATH", "").split(os.pathsep)
-                if os.path.normpath(entry) not in virtual_env_bins
-            )
+        child_env.pop(REPOSITORY_CONTEXT_ENV, None)
         return run_cwd, run_args, child_env
 
     def _ensure_open(self) -> None:
