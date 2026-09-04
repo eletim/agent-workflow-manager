@@ -356,7 +356,9 @@ Cleanup action after execution ends. Cleanup verifies identities, closes child
 tabs in reverse deterministic order, removes managed-shell result directories,
 deletes an identity-verified empty workspace through PurpleMux's public atomic
 `workspace delete -w ID --if-empty` contract, and then handles the Git worktree.
-PurpleMux versions without that contract fail closed and retain the workspace.
+Startup rejects PurpleMux versions without that contract. Only its structured
+`not-empty` response proves rejection; transport errors and other nonzero exits
+remain uncertain until authoritative workspace listing reconciles them.
 Managed-shell directories are registered with their no-follow filesystem
 identity. Cleanup stops before dependent parent resources when an outcome is
 blocked. A workflow may use `capture_screen` for diagnostics, without parsing it

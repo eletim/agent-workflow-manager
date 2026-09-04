@@ -75,9 +75,20 @@ class RuntimeRunner:
             if any(
                 tab.get("workspaceId") == workspace_id for tab in self.tabs.values()
             ):
-                return self.failed("workspace is not empty")
+                return subprocess.CompletedProcess(
+                    [],
+                    3,
+                    json.dumps({"status": "not-empty", "workspaceId": workspace_id}),
+                    "",
+                )
+            if self.mode == "workspace-delete-generic-nonzero":
+                return self.failed("server failure")
             if self.workspaces.pop(workspace_id, None) is None:
                 return self.failed("workspace not found")
+            if self.mode == "workspace-delete-timeout-after-apply":
+                raise subprocess.TimeoutExpired(command, 30)
+            if self.mode == "workspace-delete-nonzero-after-apply":
+                return self.failed("server response lost after dispatch")
             return self.done({"status": "deleted", "workspaceId": workspace_id})
         if command[1:3] == ["tab", "create"]:
             name = command[command.index("-n") + 1]
@@ -561,3 +572,53 @@ def test_workspace_delete_atomically_refuses_tab_created_after_preinspection(
 
     assert "ws-owned" in runner.workspaces
     assert runner.tabs["concurrent"]["workspaceId"] == "ws-owned"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "workspace-delete-timeout-after-apply",
+        "workspace-delete-nonzero-after-apply",
+    ],
+)
+def test_workspace_delete_possible_dispatch_failure_reconciles_absence(
+    tmp_path: Path, mode: str
+) -> None:
+    runner = RuntimeRunner(mode)
+    runner.workspaces["ws-owned"] = {
+        "id": "ws-owned",
+        "name": "Owned",
+        "directories": [str(tmp_path)],
+    }
+    runtime = PurpleMuxRuntime(runner=runner)
+
+    runtime.delete_workspace(
+        "ws-owned",
+        expected_state=WorkspaceState("ws-owned", "Owned", (str(tmp_path),)),
+    )
+
+    assert "ws-owned" not in runner.workspaces
+    assert (
+        len([call for call in runner.calls if call[1:3] == ["workspace", "delete"]])
+        == 1
+    )
+
+
+def test_workspace_delete_generic_nonzero_with_unchanged_state_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    runner = RuntimeRunner("workspace-delete-generic-nonzero")
+    runner.workspaces["ws-owned"] = {
+        "id": "ws-owned",
+        "name": "Owned",
+        "directories": [str(tmp_path)],
+    }
+    runtime = PurpleMuxRuntime(runner=runner)
+
+    with pytest.raises(MutationOutcomeUnknown, match="unknown"):
+        runtime.delete_workspace(
+            "ws-owned",
+            expected_state=WorkspaceState("ws-owned", "Owned", (str(tmp_path),)),
+        )
+
+    assert "ws-owned" in runner.workspaces

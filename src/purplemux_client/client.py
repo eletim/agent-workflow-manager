@@ -402,8 +402,21 @@ class PurpleMuxRuntime:
             ) from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
-            raise AuthoritativeMutationRejection(
-                "PurpleMux atomically refused empty workspace deletion: " + detail
+            try:
+                rejection = json.loads(completed.stdout)
+            except (json.JSONDecodeError, TypeError):
+                rejection = None
+            if (
+                isinstance(rejection, dict)
+                and rejection.get("status") == "not-empty"
+                and rejection.get("workspaceId") == workspace_id
+            ):
+                raise AuthoritativeMutationRejection(
+                    "PurpleMux atomically refused non-empty workspace deletion"
+                )
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion failed with exit code "
+                f"{completed.returncode}: {detail}"
             )
         try:
             response = _parse_json_object(completed.stdout, "delete empty workspace")

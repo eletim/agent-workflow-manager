@@ -97,7 +97,10 @@ for Prompt mode. Managed shell result directories are registered alongside their
 tabs with a no-follow filesystem identity and removed only after the tab has been
 reconciled as closed. Workspace removal uses PurpleMux's public authenticated
 empty-workspace deletion command, whose server-side atomic precondition protects
-tabs created concurrently with Cleanup.
+tabs created concurrently with Cleanup. Startup requires that command. Cleanup
+treats only its correlated structured `not-empty` result as authoritative
+rejection; timeouts and generic nonzero exits use normal uncertain-outcome
+reconciliation.
 
 ## Browser access and network trust
 
