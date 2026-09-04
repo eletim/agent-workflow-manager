@@ -246,6 +246,112 @@ prepare_run_repository(
         runner.close()
 
 
+def test_resume_retries_preparation_instead_of_injecting_pending_context(
+    tmp_path: Path,
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "managed-worktrees"
+    code = f"""
+import purplemux_client.execution_context as execution_context
+from purplemux_client import prepare_run_repository, resume_checkpoint, save_checkpoint
+checkpoint = resume_checkpoint()
+if checkpoint is None:
+    save_checkpoint("before repository preparation")
+    def fail_identity(path):
+        raise RuntimeError("pre-verification failure")
+    execution_context._path_identity = fail_identity
+context = prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={str(worktree_root)!r},
+)
+print(context.execution_root)
+"""
+    runner = PythonRunner()
+    try:
+        run_id = runner.start(code)
+        failed = wait_until_finished(runner)
+        assert failed.state == "failed"
+        assert failed.as_json()["resumable"] is True
+        assert failed.as_json()["executionContext"] is None
+        assert failed.resources[0].metadata["registration_state"] == "pending"
+
+        runner.resume(run_id)
+        resumed = wait_until_finished(runner)
+
+        assert resumed.state == "success"
+        assert len(resumed.resources) == 2
+        assert resumed.resources[0].metadata["registration_state"] == "pending"
+        assert resumed.resources[1].metadata["registration_state"] == "verified"
+        assert resumed.as_json()["executionContext"] == {
+            "sourceRepository": str(repository.resolve()),
+            "remote": "origin",
+            "baseBranch": "main",
+            "baseRef": "origin/main",
+            "baseSha": resumed.resources[1].metadata["base_sha"],
+            "executionRoot": resumed.resources[1].identity,
+        }
+
+        cleaned = runner.cleanup(run_id)
+        assert all(
+            resource.cleanup_state == "cleaned" for resource in cleaned.resources
+        )
+        assert all(
+            not Path(resource.identity).exists() for resource in cleaned.resources
+        )
+    finally:
+        runner.close()
+
+
+def test_cleanup_blocks_for_unregistered_partial_worktree_path(
+    tmp_path: Path,
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "managed-worktrees"
+    code = f"""
+from pathlib import Path
+import purplemux_client.execution_context as execution_context
+from purplemux_client import prepare_run_repository
+run_git = execution_context._run_git_mutation_process_group
+def interrupt_worktree_add(args, *, cwd, timeout):
+    if args[0] == "worktree":
+        Path(args[3]).mkdir()
+        raise execution_context._QuiescentMutationTimeout(["git", *args], timeout)
+    return run_git(args, cwd=cwd, timeout=timeout)
+execution_context._run_git_mutation_process_group = interrupt_worktree_add
+prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={str(worktree_root)!r},
+)
+"""
+    runner = PythonRunner()
+    partial_path: Path | None = None
+    try:
+        run_id = runner.start(code)
+        failed = wait_until_finished(runner)
+        assert failed.state == "failed"
+        assert len(failed.resources) == 1
+        partial_path = Path(failed.resources[0].identity)
+        assert partial_path.is_dir()
+        assert (
+            f"worktree {partial_path}"
+            not in git(repository, "worktree", "list", "--porcelain").splitlines()
+        )
+
+        cleanup = runner.cleanup(run_id)
+
+        assert cleanup.resources[0].cleanup_state == "cleanup_retryable"
+        assert "exists but is not registered" in (
+            cleanup.resources[0].cleanup_error or ""
+        )
+        assert partial_path.is_dir()
+    finally:
+        runner.close()
+        if partial_path is not None and partial_path.is_dir():
+            partial_path.rmdir()
+
+
 def test_oversized_ownership_event_fails_before_worktree_mutation(
     tmp_path: Path,
 ) -> None:

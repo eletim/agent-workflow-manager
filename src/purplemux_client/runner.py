@@ -203,6 +203,24 @@ class RunResource:
         }
 
 
+def _is_verified_repository_context(resource: RunResource) -> bool:
+    required = {
+        "repository",
+        "remote",
+        "base_branch",
+        "base_ref",
+        "base_sha",
+        "path_identity",
+        "git_file_identity",
+        "git_dir",
+    }
+    return (
+        resource.kind == "git_worktree"
+        and resource.metadata.get("registration_state") != "pending"
+        and required.issubset(resource.metadata)
+    )
+
+
 @dataclass(frozen=True)
 class RunAttempt:
     number: int
@@ -315,7 +333,7 @@ class RunnerSnapshot:
 
     def _execution_context_json(self) -> dict[str, str] | None:
         for resource in self.resources:
-            if resource.kind != "git_worktree":
+            if not _is_verified_repository_context(resource):
                 continue
             metadata = resource.metadata
             return {
@@ -659,7 +677,7 @@ class PythonRunner:
                     args = run.args
                 run_cwd, run_args, child_env = self._execution_context(args)
                 for resource in run.resources:
-                    if resource.kind == "git_worktree":
+                    if _is_verified_repository_context(resource):
                         child_env[REPOSITORY_CONTEXT_ENV] = json.dumps(
                             {
                                 **resource.metadata,
@@ -1194,10 +1212,11 @@ class PythonRunner:
                     "could not reconcile owned Git worktree: "
                     + (listed.stderr.strip() or "no stderr")
                 )
-            return not any(
+            registered = any(
                 line == f"worktree {resource.identity}"
                 for line in listed.stdout.splitlines()
             )
+            return not registered and not os.path.lexists(resource.identity)
         raise OSError(f"unsupported run resource kind: {resource.kind}")
 
     @staticmethod
@@ -1295,6 +1314,11 @@ class PythonRunner:
             if line.startswith("worktree ")
         }
         if str(worktree) not in paths:
+            if os.path.lexists(worktree):
+                raise OSError(
+                    "Git worktree path exists but is not registered; refusing "
+                    "partial-state cleanup"
+                )
             return
         required_identity = {
             "path_identity",
