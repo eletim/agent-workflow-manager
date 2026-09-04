@@ -20,7 +20,10 @@ from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
 from purplemux_client.errors import MutationOutcomeUnknown
-from purplemux_client.execution_context import REPOSITORY_CONTEXT_ENV
+from purplemux_client.execution_context import (
+    PENDING_REPOSITORY_CONTEXT_ENV,
+    REPOSITORY_CONTEXT_ENV,
+)
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -687,6 +690,22 @@ class PythonRunner:
                             separators=(",", ":"),
                         )
                         break
+                else:
+                    for resource in run.resources:
+                        if (
+                            resource.kind == "git_worktree"
+                            and resource.metadata.get("registration_state") == "pending"
+                            and resource.cleanup_state == "retained"
+                        ):
+                            child_env[PENDING_REPOSITORY_CONTEXT_ENV] = json.dumps(
+                                {
+                                    **resource.metadata,
+                                    "execution_root": resource.identity,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            break
                 validation = self._validator.validate(
                     code, cwd=run_cwd, environment=child_env
                 )
@@ -995,6 +1014,7 @@ class PythonRunner:
         child_env = os.environ.copy()
         child_env.pop(RESUME_CHECKPOINT_ENV, None)
         child_env.pop(REPOSITORY_CONTEXT_ENV, None)
+        child_env.pop(PENDING_REPOSITORY_CONTEXT_ENV, None)
         return run_cwd, run_args, child_env
 
     def _ensure_open(self) -> None:
