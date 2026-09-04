@@ -247,12 +247,52 @@ def test_managed_shell_result_cleanup_removes_only_expected_temp_directory(
     resource = RunResource(
         "managed_shell_result",
         str(directory),
-        {"result_path": str(result), "tab_id": "tab-1"},
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
     )
 
     runner._cleanup_resource(resource)
 
     assert not directory.exists()
+
+
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_managed_shell_result_cleanup_rejects_replaced_directory_without_unlinking(
+    runner: PythonRunner, tmp_path: Path, replacement_kind: str
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    result.write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+    result.unlink()
+    directory.rmdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    replacement_result = replacement / "result.json"
+    replacement_result.write_text("replacement", encoding="utf-8")
+    if replacement_kind == "directory":
+        directory.mkdir()
+        (directory / "result.json").write_text("replacement", encoding="utf-8")
+        protected_result = directory / "result.json"
+    else:
+        directory.symlink_to(replacement, target_is_directory=True)
+        protected_result = replacement_result
+
+    with pytest.raises(OSError, match="owned directory|identity changed"):
+        runner._cleanup_resource(resource)
+
+    assert protected_result.read_text(encoding="utf-8") == "replacement"
 
 
 def test_workspace_cleanup_releases_verified_empty_workspace(
@@ -361,6 +401,60 @@ def test_git_worktree_cleanup_rejects_replacement_at_owned_path(
         runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
 
     assert worktree.is_dir()
+
+
+def test_git_worktree_cleanup_allows_branch_and_head_to_change_after_registration(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "owned-worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    (repository / "tracked").write_text("one", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "initial"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        capture_output=True,
+    )
+
+    def output(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    metadata = {
+        "repository": str(repository),
+        "path_identity": _test_path_identity(worktree),
+        "git_file_identity": _test_path_identity(worktree / ".git", ctime=True),
+        "git_dir": output("rev-parse", "--absolute-git-dir"),
+        "head": output("rev-parse", "HEAD"),
+        "branch": output("rev-parse", "--symbolic-full-name", "HEAD"),
+    }
+    subprocess.run(["git", "-C", str(worktree), "switch", "-c", "feature"], check=True)
+    (worktree / "tracked").write_text("two", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-qm", "implementation"],
+        check=True,
+    )
+
+    runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
+
+    assert not worktree.exists()
 
 
 def _test_path_identity(path: Path, *, ctime: bool = False) -> str:

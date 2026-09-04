@@ -7,12 +7,8 @@ import shlex
 import subprocess
 import tempfile
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Protocol, cast
 
 from purplemux_client.errors import (
@@ -25,6 +21,7 @@ from purplemux_client.errors import (
     WorkerNeedsInput,
 )
 from purplemux_client.operations import (
+    AuthoritativeMutationRejection,
     MutationConflict,
     MutationResolution,
     PossibleDispatchFailure,
@@ -174,12 +171,9 @@ _SHELL_DIAGNOSTIC_MAX_LINES = 40
 _SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
 
 
-def _read_purplemux_setting(name: str) -> str | None:
-    try:
-        value = (Path.home() / ".purplemux" / name).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
+def _filesystem_identity(path: str) -> str:
+    state = os.stat(path, follow_symlinks=False)
+    return f"{state.st_dev}:{state.st_ino}"
 
 
 @dataclass(frozen=True)
@@ -212,7 +206,7 @@ class PurpleMuxRuntime:
         self.read_timeout_retries = read_timeout_retries
         self._runner = runner
         self.owned_by_run = owned_by_run
-        self._workspace_deleter = workspace_deleter or self._delete_workspace_http
+        self._workspace_deleter = workspace_deleter or self._delete_empty_workspace
 
     def list_workspaces(self) -> tuple[WorkspaceState, ...]:
         data = self._read_json(["workspaces"], "list workspaces")
@@ -373,31 +367,55 @@ class PurpleMuxRuntime:
             plan={"kind": "delete_workspace", "workspace": workspace_id},
         )
 
-    def _delete_workspace_http(self, workspace_id: str) -> None:
-        port = os.environ.get("PMUX_PORT") or _read_purplemux_setting("port")
-        token = os.environ.get("PMUX_TOKEN") or _read_purplemux_setting("cli-token")
-        if not port or not token:
-            raise PreDispatchFailure(
-                "PurpleMux port/token are unavailable for workspace cleanup"
-            )
-        encoded_id = urllib.parse.quote(workspace_id, safe="")
-        request = urllib.request.Request(
-            f"http://localhost:{port}/api/workspace/{encoded_id}",
-            method="DELETE",
-            headers={"X-Pmux-Token": token},
-        )
+    def _delete_empty_workspace(self, workspace_id: str) -> None:
+        """Use PurpleMux's public, atomic empty-workspace deletion contract."""
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.command_timeout_seconds
-            ) as response:
-                if response.status != 204:
-                    raise PossibleDispatchFailure(
-                        f"PurpleMux workspace deletion returned HTTP {response.status}"
-                    )
-        except (urllib.error.URLError, TimeoutError) as exc:
+            completed = self._runner(
+                [
+                    self.executable,
+                    "workspace",
+                    "delete",
+                    "-w",
+                    workspace_id,
+                    "--if-empty",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.command_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
             raise PossibleDispatchFailure(
-                "PurpleMux workspace deletion outcome is unknown"
+                "PurpleMux empty workspace deletion timed out"
             ) from exc
+        except InterruptedError as exc:
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion was interrupted"
+            ) from exc
+        except OSError as exc:
+            raise PreDispatchFailure(
+                f"could not execute PurpleMux empty workspace deletion: {exc}"
+            ) from exc
+        except KeyboardInterrupt as exc:
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion was interrupted"
+            ) from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+            raise AuthoritativeMutationRejection(
+                "PurpleMux atomically refused empty workspace deletion: " + detail
+            )
+        try:
+            response = _parse_json_object(completed.stdout, "delete empty workspace")
+        except WorkerFailure as exc:
+            raise PossibleDispatchFailure(str(exc)) from exc
+        if (
+            response.get("status") != "deleted"
+            or response.get("workspaceId") != workspace_id
+        ):
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion returned an invalid response"
+            )
 
     def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
         if workspace_id not in {item.id for item in self.list_workspaces()}:
@@ -683,7 +701,11 @@ class PurpleMuxCLIClient:
             register_run_resource(
                 "managed_shell_result",
                 result_dir,
-                {"result_path": result_path, "tab_id": session_id},
+                {
+                    "result_path": result_path,
+                    "tab_id": session_id,
+                    "directory_identity": _filesystem_identity(result_dir),
+                },
             )
         self._shell_runs[session_id] = _ShellRun(result_path=result_path, cwd=cwd)
         if on_created is not None:

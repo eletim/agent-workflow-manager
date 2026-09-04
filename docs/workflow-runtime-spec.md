@@ -94,7 +94,10 @@ explicit Cleanup action, so completed commands remain available for inspection.
 Workflow code opts into registration with `PurpleMuxRuntime(owned_by_run=True)`;
 the default direct adapter path does not register resources and remains suitable
 for Prompt mode. Managed shell result directories are registered alongside their
-tabs and removed only after the tab has been reconciled as closed.
+tabs with a no-follow filesystem identity and removed only after the tab has been
+reconciled as closed. Workspace removal uses PurpleMux's public authenticated
+empty-workspace deletion command, whose server-side atomic precondition protects
+tabs created concurrently with Cleanup.
 
 ## Browser access and network trust
 

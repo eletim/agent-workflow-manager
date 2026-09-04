@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1135,7 +1136,7 @@ class PythonRunner:
                 for workspace in PurpleMuxRuntime().list_workspaces()
             )
         if resource.kind == "managed_shell_result":
-            return not Path(resource.identity).exists()
+            return not os.path.lexists(resource.identity)
         if resource.kind == "git_worktree":
             repository = resource.metadata.get("repository")
             if repository is None:
@@ -1164,22 +1165,66 @@ class PythonRunner:
         temp_root = Path(tempfile.gettempdir()).resolve()
         if (
             not directory.is_absolute()
-            or directory.parent.resolve() != temp_root
+            or directory.parent != temp_root
             or not directory.name.startswith("awm-shell-")
         ):
             raise OSError("managed shell result directory identity is invalid")
         expected_result = directory / "result.json"
         if resource.metadata.get("result_path") != str(expected_result):
             raise OSError("managed shell result path metadata conflicts")
-        if not directory.exists():
+        expected_identity = resource.metadata.get("directory_identity")
+        if expected_identity is None:
+            raise OSError(
+                "managed shell result directory ownership identity is missing"
+            )
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(directory, flags)
+        except FileNotFoundError:
+            if os.path.lexists(directory):
+                raise OSError(
+                    "managed shell result path identity changed; refusing cleanup"
+                )
             return
-        entries = list(directory.iterdir())
-        if any(item.name != "result.json" for item in entries):
-            raise OSError("managed shell result directory contains unexpected files")
-        if expected_result.is_dir():
-            raise OSError("managed shell result path is unexpectedly a directory")
-        expected_result.unlink(missing_ok=True)
-        directory.rmdir()
+        except OSError as exc:
+            raise OSError(
+                "managed shell result directory is not the owned directory; "
+                "refusing cleanup"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            opened_identity = f"{opened.st_dev}:{opened.st_ino}"
+            if opened_identity != expected_identity:
+                raise OSError(
+                    "managed shell result directory identity changed; refusing cleanup"
+                )
+            entries = os.listdir(descriptor)
+            if any(name != "result.json" for name in entries):
+                raise OSError(
+                    "managed shell result directory contains unexpected files"
+                )
+            if "result.json" in entries:
+                result_state = os.stat(
+                    "result.json", dir_fd=descriptor, follow_symlinks=False
+                )
+                if not stat.S_ISREG(result_state.st_mode):
+                    raise OSError(
+                        "managed shell result entry is not a regular file; "
+                        "refusing cleanup"
+                    )
+                os.unlink("result.json", dir_fd=descriptor)
+            current = os.stat(directory, follow_symlinks=False)
+            current_identity = f"{current.st_dev}:{current.st_ino}"
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current_identity != expected_identity
+            ):
+                raise OSError(
+                    "managed shell result directory identity changed; refusing cleanup"
+                )
+            os.rmdir(directory)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _cleanup_git_worktree(resource: RunResource) -> None:
@@ -1214,8 +1259,6 @@ class PythonRunner:
             "path_identity",
             "git_file_identity",
             "git_dir",
-            "head",
-            "branch",
         }
         missing = sorted(required_identity.difference(resource.metadata))
         if missing:
@@ -1229,22 +1272,18 @@ class PythonRunner:
             raise OSError(
                 "Git worktree administrative identity changed; refusing cleanup"
             )
-        identity_checks = {
-            "git_dir": ["rev-parse", "--absolute-git-dir"],
-            "head": ["rev-parse", "HEAD"],
-            "branch": ["rev-parse", "--symbolic-full-name", "HEAD"],
-        }
-        for key, args in identity_checks.items():
-            observed = subprocess.run(
-                ["git", "-C", str(worktree), *args],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            value = observed.stdout.strip()
-            if observed.returncode != 0 or value != resource.metadata[key]:
-                raise OSError(f"Git worktree {key} identity changed; refusing cleanup")
+        observed_git_dir = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if (
+            observed_git_dir.returncode != 0
+            or observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
+        ):
+            raise OSError("Git worktree git_dir identity changed; refusing cleanup")
         dirty = subprocess.run(
             ["git", "-C", str(worktree), "status", "--porcelain"],
             capture_output=True,

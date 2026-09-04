@@ -343,17 +343,22 @@ client = runtime.workspace(workspace.id)
 ```
 
 The default `owned_by_run=False` path is intentionally registration-free for
-Prompt mode and other direct adapter use. Future Git worktree registration must
-include the repository, HEAD, branch, absolute Git directory, and filesystem
-identities for both the worktree path and its `.git` administrative file so
-Cleanup cannot delete a replacement created later at the same path.
+Prompt mode and other direct adapter use. Git worktree registration must include
+the repository and immutable ownership evidence: the absolute Git directory and
+filesystem identities for both the worktree path and its `.git` administrative
+file. Registration-time HEAD and branch may be retained as diagnostics, but
+Cleanup does not require them to remain fixed because normal branch preparation
+and commits change both after a detached worktree is created.
 
 Do not automatically close a Workflow run's tabs on success or failure. The
 Runner retains the structured inventory on the run record and exposes one manual
 Cleanup action after execution ends. Cleanup verifies identities, closes child
 tabs in reverse deterministic order, removes managed-shell result directories,
-deletes an identity-verified empty workspace through PurpleMux, and then handles
-the Git worktree. It stops before dependent parent resources when an outcome is
+deletes an identity-verified empty workspace through PurpleMux's public atomic
+`workspace delete -w ID --if-empty` contract, and then handles the Git worktree.
+PurpleMux versions without that contract fail closed and retain the workspace.
+Managed-shell directories are registered with their no-follow filesystem
+identity. Cleanup stops before dependent parent resources when an outcome is
 blocked. A workflow may use `capture_screen` for diagnostics, without parsing it
 as a result. Prompt mode does not use this Workflow resource model. Cleanup and
 Resume are mutually exclusive, and cleanup permanently disables Resume for that

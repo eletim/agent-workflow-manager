@@ -62,6 +62,23 @@ class RuntimeRunner:
             if self.mode == "workspace-nonzero-after-apply":
                 return self.failed("workspace create failed after apply")
             return self.done(workspace)
+        if command[1:3] == ["workspace", "delete"]:
+            workspace_id = command[command.index("-w") + 1]
+            if self.mode == "workspace-delete-concurrent-tab":
+                self.tabs["concurrent"] = {
+                    "tabId": "concurrent",
+                    "workspaceId": workspace_id,
+                    "name": "Concurrent",
+                    "panelType": "terminal",
+                    "agentProviderId": None,
+                }
+            if any(
+                tab.get("workspaceId") == workspace_id for tab in self.tabs.values()
+            ):
+                return self.failed("workspace is not empty")
+            if self.workspaces.pop(workspace_id, None) is None:
+                return self.failed("workspace not found")
+            return self.done({"status": "deleted", "workspaceId": workspace_id})
         if command[1:3] == ["tab", "create"]:
             name = command[command.index("-n") + 1]
             panel_type = command[command.index("-t") + 1]
@@ -494,3 +511,53 @@ def test_workspace_delete_verifies_identity_and_reconciles_authoritative_absence
 
     assert delete_calls == ["ws-owned"]
     assert runtime.list_workspaces() == ()
+
+
+def test_workspace_delete_uses_public_atomic_empty_workspace_cli_contract(
+    tmp_path: Path,
+) -> None:
+    runner = RuntimeRunner()
+    runner.workspaces["ws-owned"] = {
+        "id": "ws-owned",
+        "name": "Owned",
+        "directories": [str(tmp_path)],
+    }
+    runtime = PurpleMuxRuntime(runner=runner)
+
+    runtime.delete_workspace(
+        "ws-owned",
+        expected_state=WorkspaceState("ws-owned", "Owned", (str(tmp_path),)),
+    )
+
+    assert [call for call in runner.calls if call[1:3] == ["workspace", "delete"]] == [
+        [
+            "purplemux",
+            "workspace",
+            "delete",
+            "-w",
+            "ws-owned",
+            "--if-empty",
+        ]
+    ]
+    assert runtime.list_workspaces() == ()
+
+
+def test_workspace_delete_atomically_refuses_tab_created_after_preinspection(
+    tmp_path: Path,
+) -> None:
+    runner = RuntimeRunner("workspace-delete-concurrent-tab")
+    runner.workspaces["ws-owned"] = {
+        "id": "ws-owned",
+        "name": "Owned",
+        "directories": [str(tmp_path)],
+    }
+    runtime = PurpleMuxRuntime(runner=runner)
+
+    with pytest.raises(WorkerFailure, match="confirmed_rejected"):
+        runtime.delete_workspace(
+            "ws-owned",
+            expected_state=WorkspaceState("ws-owned", "Owned", (str(tmp_path),)),
+        )
+
+    assert "ws-owned" in runner.workspaces
+    assert runner.tabs["concurrent"]["workspaceId"] == "ws-owned"

@@ -229,9 +229,11 @@ registration-free by default. `GET /api/runs` lists compact summaries,
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
 from its latest safe checkpoint. `POST /api/runs/{runId}/cleanup` releases
-registered resources without deleting run history. The original `/api/status`,
-`/api/output`, and `/api/stop` routes remain available and address the most
-recently created run. `GET /api/events` streams revision-only SSE change
+registered resources without deleting run history. Workspace release requires
+PurpleMux's public atomic `workspace delete -w ID --if-empty` CLI contract;
+unsupported versions fail closed and retain the workspace. The original
+`/api/status`, `/api/output`, and `/api/stop` routes remain available and address
+the most recently created run. `GET /api/events` streams revision-only SSE change
 notifications; initial load, notifications, and reconnects all reconcile through
 the authoritative read APIs rather than treating the stream as workflow state.
 

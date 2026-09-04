@@ -227,8 +227,14 @@ def test_run_ownership_is_opt_in_and_registers_shell_result_directory(
     assert registrations[1][2] == {
         "result_path": str(result_directory / "result.json"),
         "tab_id": tab,
+        "directory_identity": _path_identity(result_directory),
     }
     owned._cleanup_shell_result(owned._shell_runs[tab])
+
+
+def _path_identity(path: Path) -> str:
+    state = path.stat(follow_symlinks=False)
+    return f"{state.st_dev}:{state.st_ino}"
 
 
 @pytest.mark.parametrize(
