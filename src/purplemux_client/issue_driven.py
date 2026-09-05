@@ -114,12 +114,15 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     for key in sorted(set(value) - _ALLOWED_FIELDS):
         findings.append(IssueDrivenFinding(f"$.{key}", "unknown field is not allowed"))
     if "mode" in value and value["mode"] != "issue-driven":
-        findings.append(
-            IssueDrivenFinding("$.mode", "must be exactly 'issue-driven'")
-        )
+        findings.append(IssueDrivenFinding("$.mode", "must be exactly 'issue-driven'"))
     for key in ("repository", "integration_branch", "final_branch"):
         item = value.get(key)
-        if not isinstance(item, str) or not item or item != item.strip() or "\0" in item:
+        if (
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            or "\0" in item
+        ):
             findings.append(
                 IssueDrivenFinding(f"$.{key}", "must be a non-empty trimmed string")
             )
@@ -135,9 +138,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             )
     if isinstance(integration, str) and integration == final:
         findings.append(
-            IssueDrivenFinding(
-                "$.final_branch", "must differ from integration_branch"
-            )
+            IssueDrivenFinding("$.final_branch", "must differ from integration_branch")
         )
     issues = value.get("issues")
     if not isinstance(issues, list) or not issues:
@@ -184,17 +185,17 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
 
 
 def _canonical_source() -> str:
-    packaged = resources.files("purplemux_client").joinpath(
-        "_issue_driven_sequential_template.py"
-    )
-    if packaged.is_file():
-        return packaged.read_text(encoding="utf-8")
     development_copy = (
         Path(__file__).resolve().parents[2]
         / "examples"
         / "sequential-version-development.py"
     )
-    return development_copy.read_text(encoding="utf-8")
+    if development_copy.is_file():
+        return development_copy.read_text(encoding="utf-8")
+    packaged = resources.files("purplemux_client").joinpath(
+        "_issue_driven_sequential_template.py"
+    )
+    return packaged.read_text(encoding="utf-8")
 
 
 def _replace_region(source: str, start: str, end: str, replacement: str) -> str:
@@ -207,7 +208,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
     issues = ",\n        ".join(
         f"Issue({number}, 'feature/issue-{number}')" for number in config.issues
     )
-    return f'''def parse_args() -> Config:
+    return f"""def parse_args() -> Config:
     context = prepare_run_repository(
         repo={config.repository!r},
         base_branch={config.integration_branch!r},
@@ -228,24 +229,29 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
     )
 
 
-'''
+"""
 
 
-_NO_ISSUE_MERGE = '''    print(f"Approved Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
+_NO_ISSUE_MERGE = """    print(f"Approved Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
     workspace = recovery.workspace
     recovery.__dict__.update(Recovery(workspace=workspace).__dict__)
     recovery.phase = "workspace_ready"
     recovery.checkpoint(config)
-'''
+"""
 
 
-_FINAL_WITHOUT_REVIEW = '''def integration_delivery_without_review(
+_FINAL_WITHOUT_REVIEW = """def integration_delivery_without_review(
     config: Config,
     runtime: PurpleMuxRuntime,
     repo: GitRepository,
     github: GitHubRepository,
     recovery: Recovery,
 ) -> PullRequestState:
+    if recovery.phase.endswith("_create_pending"):
+        raise MutationOutcomeUnknown(
+            "a prior integration resource creation may have completed; inspect "
+            "its saved correlation and do not retry"
+        )
     integration = repo.synchronize_branch(config.integration_branch)
     final = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or final.remote_sha is None:
@@ -303,7 +309,7 @@ _FINAL_WITHOUT_REVIEW = '''def integration_delivery_without_review(
     return pr
 
 
-'''
+"""
 
 
 def _main_function(config: IssueDrivenConfig) -> str:
@@ -313,9 +319,11 @@ def _main_function(config: IssueDrivenConfig) -> str:
         else "integration_delivery_without_review(config, runtime, repo, github, recovery)"
     )
     merge = ""
-    conclusion = 'print(f"Final integration PR is Ready (not merged): {ready.url}", flush=True)'
+    conclusion = (
+        'print(f"Final integration PR is Ready (not merged): {ready.url}", flush=True)'
+    )
     if config.merge_final:
-        merge = '''
+        merge = """
     merged = github.merge_pr(
         ready.number,
         expected_head=config.integration_branch,
@@ -328,9 +336,11 @@ def _main_function(config: IssueDrivenConfig) -> str:
         previous_sha=ready.base_sha,
         merge_commit_sha=merged.merge_commit_sha,
         required_commit_sha=ready.head_sha,
-    )'''
-        conclusion = 'print(f"Merged final integration PR: {merged.pr.url}", flush=True)'
-    return f'''def main() -> None:
+    )"""
+        conclusion = (
+            'print(f"Merged final integration PR: {merged.pr.url}", flush=True)'
+        )
+    return f"""def main() -> None:
     config = parse_args()
     recovery = load_recovery(config, resume_checkpoint())
     if recovery.phase == "workspace_create_pending":
@@ -355,7 +365,7 @@ def _main_function(config: IssueDrivenConfig) -> str:
 
 if __name__ == "__main__":
     main()
-'''
+"""
 
 
 def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
@@ -368,7 +378,12 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
         1,
     )
     source = source.replace("MAX_REVIEWS = 4", f"MAX_REVIEWS = {config.max_reviews}", 1)
-    source = _replace_region(source, "def parse_args() -> Config:\n", "def load_recovery(", _fixed_config_function(config))
+    source = _replace_region(
+        source,
+        "def parse_args() -> Config:\n",
+        "def load_recovery(",
+        _fixed_config_function(config),
+    )
     source = source.replace(
         'or recovery.review_outcome not in {None, "approved", "no-change-policy"}',
         'or recovery.review_outcome not in {None, "approved", "no-change-policy", "review-disabled-policy"}',

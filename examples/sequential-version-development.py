@@ -498,7 +498,7 @@ def run_final_checks(
             ShellCommandRequest(
                 config.check_command,
                 str(config.repo),
-                f"Final whole-version checks [awm:checks-{config.signature}]",
+                "Final whole-version checks",
             ),
             on_created=shell_created,
         )
