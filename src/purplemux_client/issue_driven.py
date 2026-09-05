@@ -216,7 +216,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         (
         {issues},
         ),
-        "python -m pytest",
+        "git diff --check",
     )
 
 
