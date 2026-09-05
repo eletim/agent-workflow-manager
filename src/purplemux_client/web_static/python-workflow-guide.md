@@ -276,7 +276,8 @@ Treat returned state as immutable observations. Re-read authoritative state
 after another actor could have changed it; do not edit these values to represent
 a desired result.
 
-Construct a client with authoritative directory context for an existing workspace:
+Construct a client for an existing workspace. Codex creation re-reads its
+authoritative directories immediately before every launch:
 
 ```python
 runtime = PurpleMuxRuntime(command_timeout_seconds=30.0)
@@ -285,8 +286,9 @@ client = runtime.workspace(workspace_id)
 
 Direct `PurpleMuxCLIClient(workspace_id)` construction remains compatible for
 inspection and cleanup. Before a direct client creates a Codex session, it
-authoritatively reads the selected workspace and requires `CreateSessionRequest.cwd`
-to equal one of that workspace's exact directories.
+authoritatively re-reads the selected workspace and requires
+`CreateSessionRequest.cwd` to equal its exact first directory, which is the
+directory PurpleMux launches for a CLI-created tab.
 
 The public session operations and their exact workflow-facing signatures are:
 
@@ -418,14 +420,14 @@ adapter checks `command` against the same aliases. The current adapter does not
 pass `cwd`, `command`, or `metadata` through as arbitrary launch configuration;
 PurpleMux owns provider launch and the workspace directory. Keep these request
 fields accurate, but do not claim they configure unsupported runtime behavior.
-For Codex, `create_session()` first canonicalizes `cwd`, constrains it to an
-exact directory from the authoritative selected PurpleMux workspace (querying
-the workspace when a direct client lacks directory context), and establishes
-trust for only that path through Codex's app-server configuration API. The
-effective trust value is read back before the tab is created, so an unavailable
-or overridden trust configuration fails early. Trust mutations are serialized
-through a user-local lock so concurrent Workflow processes cannot lose another
-worktree's configuration update.
+For Codex, `create_session()` first canonicalizes `cwd`, re-reads the selected
+PurpleMux workspace immediately before launch, and requires `cwd` to equal its
+first directory because PurpleMux launches CLI-created tabs there. It
+establishes trust for only that current launch path through Codex's app-server
+configuration API. The effective trust value is read back before the tab is
+created, so an unavailable or overridden trust configuration fails early. Trust
+mutations are serialized through a user-local lock so concurrent Workflow
+processes cannot lose another worktree's configuration update.
 Fresh worktrees are handled independently from their source repository path.
 This does not change sandbox or approval policy. AWM does not apply a broad
 permission bypass or simulated trust-dialog keystrokes to Claude Code.

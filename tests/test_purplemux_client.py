@@ -13,6 +13,7 @@ from purplemux_client import (
     CreateSessionRequest,
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
+    PurpleMuxRuntime,
     ResultNotReady,
     SessionReadyTimeout,
     ShellCommandRequest,
@@ -176,22 +177,45 @@ def test_codex_trust_failure_prevents_tab_creation() -> None:
     assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
-def test_codex_trust_is_limited_to_an_exact_workspace_directory() -> None:
-    runner = FakeRunner([])
+def test_codex_request_cwd_must_equal_first_workspace_directory() -> None:
+    runner = FakeRunner(
+        [], workspace_directories=("/workspace/project", "/workspace/secondary")
+    )
     trusted: list[str] = []
     cli = client(
         runner, codex_project_truster=lambda path: trusted.append(path) or path
     )
 
     unrelated = CreateSessionRequest(
-        worker="codex", cwd="/workspace/unrelated", command="codex"
+        worker="codex", cwd="/workspace/secondary", command="codex"
     )
 
-    with pytest.raises(WorkerFailure, match="not an exact directory"):
+    with pytest.raises(WorkerFailure, match="does not match.*launch directory"):
         cli.create_session(unrelated)
 
     assert trusted == []
     assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_runtime_client_refreshes_reordered_workspace_before_codex_launch() -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-123"})],
+        workspace_directories=("/workspace/project", "/workspace/secondary"),
+    )
+    cli = PurpleMuxRuntime(runner=runner).workspace("ws-test")
+    trusted: list[str] = []
+    cli._codex_project_truster = lambda path: trusted.append(path) or path
+    runner.workspace_directories = ("/workspace/secondary", "/workspace/project")
+
+    session_id = cli.create_session(
+        CreateSessionRequest(
+            worker="codex", cwd="/workspace/secondary", command="codex"
+        )
+    )
+
+    assert session_id == "tab-123"
+    assert trusted == ["/workspace/secondary"]
+    assert sum(call[1:] == ["workspaces"] for call in runner.calls) == 2
 
 
 def test_direct_client_requires_selected_workspace_to_exist() -> None:

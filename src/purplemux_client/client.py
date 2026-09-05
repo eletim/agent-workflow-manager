@@ -463,7 +463,6 @@ class PurpleMuxRuntime:
             read_timeout_retries=self.read_timeout_retries,
             runner=self._runner,
             owned_by_run=self.owned_by_run,
-            workspace_directories=workspace.directories,
         )
 
     def _read_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
@@ -574,7 +573,6 @@ class PurpleMuxCLIClient:
         monotonic: Callable[[], float] = time.monotonic,
         owned_by_run: bool = False,
         codex_project_truster: Callable[[str], str] = ensure_codex_project_trust,
-        workspace_directories: Sequence[str] | None = None,
     ) -> None:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
@@ -594,9 +592,6 @@ class PurpleMuxCLIClient:
         self._monotonic = monotonic
         self.owned_by_run = owned_by_run
         self._codex_project_truster = codex_project_truster
-        self._workspace_directories = (
-            None if workspace_directories is None else tuple(workspace_directories)
-        )
         self._turn_baselines: dict[str, _TurnBaseline] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
         self._shell_runs: dict[str, _ShellRun] = {}
@@ -613,22 +608,19 @@ class PurpleMuxCLIClient:
                 "expected codex or claude-code"
             )
         if panel_type == "codex-cli":
+            launch_directory = self._current_workspace_launch_directory()
             try:
                 requested = os.path.realpath(os.path.expanduser(request.cwd))
             except (OSError, ValueError) as exc:
                 raise WorkerFailure(
                     f"Codex project trust path could not be resolved: {exc}"
                 ) from exc
-            allowed = {
-                os.path.realpath(os.path.expanduser(path))
-                for path in self._authoritative_workspace_directories()
-            }
-            if requested not in allowed:
+            if requested != launch_directory:
                 raise WorkerFailure(
-                    "Codex project trust path is not an exact directory of the "
-                    "selected PurpleMux workspace"
+                    "Codex request cwd does not match the current PurpleMux "
+                    "workspace launch directory"
                 )
-            self._codex_project_truster(requested)
+            self._codex_project_truster(launch_directory)
         correlation_id = request.correlation_id or (
             run_correlation(request.name)
             if request.name is not None
@@ -703,8 +695,7 @@ class PurpleMuxCLIClient:
         if any(tab.name == probe_name for tab in current):
             raise WorkerFailure("probe correlation identity is already in use")
         if panel_type == "codex-cli":
-            for directory in self._authoritative_workspace_directories():
-                self._codex_project_truster(directory)
+            self._codex_project_truster(self._current_workspace_launch_directory())
         tab = self._create_correlated_tab(
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",
@@ -738,33 +729,36 @@ class PurpleMuxCLIClient:
             True,
         )
 
-    def _authoritative_workspace_directories(self) -> tuple[str, ...]:
-        if self._workspace_directories is None:
-            runtime = PurpleMuxRuntime(
-                executable=self.executable,
-                command_timeout_seconds=self.command_timeout_seconds,
-                read_timeout_retries=self.read_timeout_retries,
-                runner=self._runner,
+    def _current_workspace_launch_directory(self) -> str:
+        runtime = PurpleMuxRuntime(
+            executable=self.executable,
+            command_timeout_seconds=self.command_timeout_seconds,
+            read_timeout_retries=self.read_timeout_retries,
+            runner=self._runner,
+        )
+        selected = next(
+            (
+                workspace
+                for workspace in runtime.list_workspaces()
+                if workspace.id == self.workspace_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise WorkerFailure(
+                f"PurpleMux workspace {self.workspace_id!r} was not found "
+                "before Codex project trust"
             )
-            selected = next(
-                (
-                    workspace
-                    for workspace in runtime.list_workspaces()
-                    if workspace.id == self.workspace_id
-                ),
-                None,
-            )
-            if selected is None:
-                raise WorkerFailure(
-                    f"PurpleMux workspace {self.workspace_id!r} was not found "
-                    "before Codex project trust"
-                )
-            self._workspace_directories = selected.directories
-        if not self._workspace_directories:
+        if not selected.directories:
             raise WorkerFailure(
                 "selected PurpleMux workspace has no directory for Codex project trust"
             )
-        return self._workspace_directories
+        directory = selected.directories[0]
+        if not directory or "\0" in directory:
+            raise WorkerFailure(
+                "selected PurpleMux workspace has an invalid Codex launch directory"
+            )
+        return os.path.realpath(os.path.expanduser(directory))
 
     def start_shell(
         self,

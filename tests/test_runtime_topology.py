@@ -165,10 +165,12 @@ def request() -> CreateSessionRequest:
 
 
 def topology_client(runner: RuntimeRunner) -> PurpleMuxCLIClient:
+    runner.workspaces.setdefault(
+        "ws-test", {"id": "ws-test", "name": "Test", "directories": ["/repo"]}
+    )
     return PurpleMuxCLIClient(
         "ws-test",
         runner=runner,
-        workspace_directories=("/repo",),
         codex_project_truster=lambda path: path,
     )
 
@@ -176,11 +178,13 @@ def topology_client(runner: RuntimeRunner) -> PurpleMuxCLIClient:
 def probe_client(
     runner: RuntimeRunner, *, monotonic: Callable[[], float] = time.monotonic
 ) -> PurpleMuxCLIClient:
+    runner.workspaces.setdefault(
+        "ws-test", {"id": "ws-test", "name": "Test", "directories": ["/repo"]}
+    )
     return PurpleMuxCLIClient(
         "ws-test",
         runner=runner,
         poll_interval_seconds=0,
-        workspace_directories=("/repo",),
         codex_project_truster=lambda path: path,
         monotonic=monotonic,
     )
@@ -280,6 +284,32 @@ def test_probe_uses_saved_preexisting_set_structured_readiness_and_exact_cleanup
     assert result.ready and result.cleanup_confirmed
     assert set(runner.tabs) == {"old"}
     assert not any(call[1:3] == ["tab", "capture"] for call in runner.calls)
+
+
+def test_probe_trusts_only_current_first_workspace_directory() -> None:
+    runner = RuntimeRunner()
+    runner.workspaces["ws-test"] = {
+        "id": "ws-test",
+        "name": "Test",
+        "directories": ["/repo", "/secondary"],
+    }
+    trusted: list[str] = []
+    client = PurpleMuxCLIClient(
+        "ws-test",
+        runner=runner,
+        poll_interval_seconds=0,
+        codex_project_truster=lambda path: trusted.append(path) or path,
+    )
+
+    client.probe_agent_readiness(
+        provider="codex",
+        probe_name="readiness-corr-1",
+        correlation_id="corr-1",
+        preexisting_tab_ids=(),
+        timeout_seconds=1,
+    )
+
+    assert trusted == ["/repo"]
 
 
 def test_probe_rejects_stale_preexisting_set_before_creation() -> None:

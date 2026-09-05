@@ -268,13 +268,14 @@ client.close_session(shell_tab)
 PurpleMux owns provider launch commands and the workspace directory. The
 adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
 Before creating a Codex tab, the adapter canonicalizes the requested working
-directory, limits it to an exact directory of a runtime-selected workspace when
-that context is available, and marks only that path trusted through Codex's
-supported app-server `config/batchWrite` API. It reads the effective Codex
-configuration back before launch and fails immediately if trust cannot be
-confirmed. This also covers fresh run worktrees, whose new paths do not inherit
-trust from their source repositories. The operation does not change Codex
-sandbox or approval settings and does not trust a parent or unrelated path.
+directory, re-reads the selected workspace, and requires it to match the
+workspace's current first directory—the directory PurpleMux actually launches.
+It marks only that path trusted through Codex's supported app-server
+`config/batchWrite` API. It reads the effective Codex configuration back before
+launch and fails immediately if trust cannot be confirmed. This also covers
+fresh run worktrees, whose new paths do not inherit trust from their source
+repositories. The operation does not change Codex sandbox or approval settings
+and does not trust a parent, secondary, or unrelated path.
 
 Claude Code has no equivalent narrow path-trust mutation in the integration
 used here. AWM does not use a broad permission bypass or terminal keystroke
