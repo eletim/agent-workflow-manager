@@ -159,7 +159,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             ("integration_branch", integration),
             ("final_branch", final),
         ):
-            if branch in generated_branches:
+            if isinstance(branch, str) and branch in generated_branches:
                 findings.append(
                     IssueDrivenFinding(
                         f"$.{key}", "must differ from every generated Issue branch"

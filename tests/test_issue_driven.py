@@ -60,6 +60,22 @@ def test_delivery_branches_cannot_collide_with_generated_issue_branch(
     }
 
 
+@pytest.mark.parametrize("key", ["integration_branch", "final_branch"])
+@pytest.mark.parametrize("branch", [[], {}])
+def test_delivery_branch_containers_report_structured_validation(
+    key: str, branch: object
+) -> None:
+    value = payload()
+    value[key] = branch
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (f"$.{key}", "must be a non-empty trimmed string") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
+
+
 @pytest.mark.parametrize(
     ("source", "path"),
     [
