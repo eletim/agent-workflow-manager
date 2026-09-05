@@ -1,9 +1,16 @@
 const code = document.querySelector("#code");
 const runArguments = document.querySelector("#run-arguments");
 const promptModeButton = document.querySelector("#prompt-mode");
+const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
 const promptFields = document.querySelector("#prompt-fields");
+const issueDrivenFields = document.querySelector("#issue-driven-fields");
 const workflowFields = document.querySelector("#workflow-fields");
+const issueDrivenJson = document.querySelector("#issue-driven-json");
+const issueDrivenPython = document.querySelector("#issue-driven-python");
+const issueDrivenGenerate = document.querySelector("#issue-driven-generate");
+const issueDrivenSuccess = document.querySelector("#issue-driven-success");
+const issueDrivenValidation = document.querySelector("#issue-driven-validation");
 const promptAgent = document.querySelector("#prompt-agent");
 const promptCwd = document.querySelector("#prompt-cwd");
 const promptText = document.querySelector("#prompt-text");
@@ -106,11 +113,13 @@ let promptDraft = {
   cwd: promptCwd.value,
   prompt: promptText.value,
 };
+let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
 let explicitNewRun = false;
 let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
+let issueDrivenRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
@@ -158,6 +167,8 @@ function applyFieldMode() {
   promptAgent.disabled = !drafting;
   promptCwd.readOnly = !drafting;
   promptText.readOnly = !drafting;
+  issueDrivenJson.readOnly = !drafting;
+  issueDrivenGenerate.disabled = !drafting;
   directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
@@ -167,8 +178,10 @@ function applyFieldMode() {
 
 function applyModeVisibility() {
   const promptMode = currentMode === "prompt";
+  const issueDrivenMode = currentMode === "issue-driven";
   promptFields.hidden = !promptMode;
-  workflowFields.hidden = promptMode;
+  issueDrivenFields.hidden = !issueDrivenMode;
+  workflowFields.hidden = promptMode || issueDrivenMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
   resumeButton.hidden = promptMode;
@@ -180,13 +193,16 @@ function applyModeVisibility() {
   recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
-  workflowModeButton.className = promptMode ? "" : "selected";
+  issueDrivenModeButton.className = issueDrivenMode ? "selected" : "";
+  workflowModeButton.className = !promptMode && !issueDrivenMode ? "selected" : "";
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
-  workflowModeButton.setAttribute("aria-pressed", String(!promptMode));
+  issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
+  workflowModeButton.setAttribute("aria-pressed", String(!promptMode && !issueDrivenMode));
 }
 
 function showDraftLabel() {
-  activeContext.textContent = `New ${currentMode === "prompt" ? "Prompt" : "Workflow"} run (draft) — not yet submitted`;
+  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", workflow: "Python Workflow"}[currentMode];
+  activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
 }
 
 // Snapshot the fields into the retained draft only when they currently *are*
@@ -200,6 +216,8 @@ function captureDraftIfEditing() {
         cwd: promptCwd.value,
         prompt: promptText.value,
       };
+    } else if (currentMode === "issue-driven") {
+      issueDrivenDraft = {json: issueDrivenJson.value, code: issueDrivenPython.value};
     } else {
       draft = {args: runArguments.value, code: code.value};
     }
@@ -240,6 +258,9 @@ function renderRun(result) {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
       promptText.value = result.prompt?.prompt || "";
+    } else if (currentMode === "issue-driven") {
+      issueDrivenJson.value = issueDrivenDraft.json;
+      issueDrivenPython.value = issueDrivenDraft.code;
     } else {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
@@ -828,6 +849,72 @@ function executionContextPayload() {
   };
 }
 
+function renderIssueDrivenValidation(findings) {
+  issueDrivenValidation.replaceChildren();
+  const valid = findings.length === 0;
+  issueDrivenSuccess.hidden = !valid;
+  for (const finding of findings) {
+    const item = document.createElement("li");
+    item.textContent = `${finding.path}: ${finding.message}`;
+    issueDrivenValidation.append(item);
+  }
+}
+
+async function generateIssueDrivenCode() {
+  const requestGeneration = ++issueDrivenRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
+  const source = issueDrivenJson.value;
+  try {
+    const result = await request("/api/issue-driven/generate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({json: source}),
+    });
+    if (
+      requestGeneration === issueDrivenRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
+      && currentMode === "issue-driven"
+      && issueDrivenJson.value === source
+    ) {
+      issueDrivenPython.value = result.generatedCode;
+      issueDrivenDraft = {json: source, code: result.generatedCode};
+      renderIssueDrivenValidation(result.issueDrivenValidation || []);
+    }
+    return result.generatedCode;
+  } catch (error) {
+    if (
+      requestGeneration === issueDrivenRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
+      && currentMode === "issue-driven"
+      && issueDrivenJson.value === source
+      && Array.isArray(error.result?.issueDrivenValidation)
+    ) {
+      renderIssueDrivenValidation(error.result.issueDrivenValidation);
+    }
+    throw error;
+  }
+}
+
+async function workflowSubmissionPayload() {
+  if (currentMode === "issue-driven") {
+    return {code: await generateIssueDrivenCode(), args: []};
+  }
+  return {code: code.value, ...executionContextPayload()};
+}
+
+issueDrivenGenerate.addEventListener("click", async () => {
+  if (activeRunId !== null) return;
+  try {
+    await generateIssueDrivenCode();
+  } catch (error) {
+    if (!Array.isArray(error.result?.issueDrivenValidation)) {
+      stderr.textContent = String(error);
+    }
+  }
+});
+
 runButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // must explicitly start a New run first
   captureDraftIfEditing();
@@ -843,7 +930,7 @@ runButton.addEventListener("click", async () => {
         cwd: promptCwd.value,
         prompt: promptText.value,
       }
-      : {code: code.value, ...executionContextPayload()};
+      : await workflowSubmissionPayload();
     const result = await request(requestPath, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -858,7 +945,7 @@ runButton.addEventListener("click", async () => {
       activeRunGeneration += 1;
       explicitNewRun = false;
       if (
-        submittedMode === "workflow"
+        submittedMode !== "prompt"
         && validationGeneration === validationRequestGeneration
       ) {
         renderValidation(result.validation || []);
@@ -894,15 +981,20 @@ workflowModeButton.addEventListener("click", async () => {
   await enterDraftMode("workflow");
 });
 
+issueDrivenModeButton.addEventListener("click", async () => {
+  await enterDraftMode("issue-driven");
+});
+
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
   const requestGeneration = ++validationRequestGeneration;
   const selectionGeneration = activeRunGeneration;
   try {
+    const payload = await workflowSubmissionPayload();
     const result = await request("/api/validate", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+      body: JSON.stringify(payload),
     });
     if (
       requestGeneration === validationRequestGeneration
@@ -935,10 +1027,11 @@ dryRunButton.addEventListener("click", async () => {
   if (activeRunId !== null) return;
   const selectionGeneration = activeRunGeneration;
   try {
+    const payload = await workflowSubmissionPayload();
     const result = await request("/api/dry-run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+      body: JSON.stringify(payload),
     });
     if (selectionGeneration === activeRunGeneration && activeRunId === null) {
       renderValidation(result.validation || []);

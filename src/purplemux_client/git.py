@@ -121,18 +121,33 @@ class GitRepository:
         path: str | Path,
         *,
         remote: str = "origin",
-        expected_github_slug: str,
+        expected_github_slug: str | None = None,
         command_timeout_seconds: float = 30.0,
         runner: GitCommandRunner = subprocess.run,
     ) -> GitRepository:
         if not remote or "\0" in remote or remote.startswith("-"):
             raise ValueError("remote must be a non-empty name")
-        _require_slug(expected_github_slug)
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
         root = Path(path).expanduser().resolve()
         if not root.is_dir():
             raise WorkerFailure(f"repository directory does not exist: {root}")
+        if expected_github_slug is None:
+            completed = runner(
+                ["git", "remote", "get-url", remote],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout_seconds,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise WorkerFailure(
+                    f"could not read Git remote {remote!r}: {detail or 'git failed'}"
+                )
+            expected_github_slug = github_origin_slug(completed.stdout.strip())
+        _require_slug(expected_github_slug)
         repository = cls(
             root=root,
             remote=remote,
@@ -224,6 +239,94 @@ class GitRepository:
                 f"remote {state.remote_sha}"
             )
         return state
+
+    def require_committed_result(
+        self,
+        branch: str,
+        *,
+        previous_sha: str,
+        allow_unchanged: bool = False,
+    ) -> BranchState:
+        """Require a clean committed result on the current logical branch."""
+        self._validate_sha(previous_sha)
+        self.require_clean()
+        state = self.require_current_branch(branch)
+        if state.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} does not exist")
+        if state.local_sha == previous_sha:
+            if allow_unchanged:
+                return state
+            raise WorkerFailure(
+                f"agent turn produced no new commit on branch {branch!r}"
+            )
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._is_ancestor(previous_sha, state.local_sha):
+            raise WorkerFailure(
+                f"branch {branch!r} no longer descends from pre-turn commit "
+                f"{previous_sha}"
+            )
+        return state
+
+    def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+        """Push a clean exact local branch only when its remote is absent or behind."""
+        self._validate_sha(expected_local_sha)
+        self.require_clean()
+        state = self.require_current_branch(branch)
+        if state.local_sha != expected_local_sha:
+            raise WorkerFailure(
+                f"local {branch!r} changed: expected {expected_local_sha}, "
+                f"found {state.local_sha}"
+            )
+        if state.remote_sha == expected_local_sha:
+            return state
+        remote_before = state.remote_sha
+        if remote_before is not None:
+            if not self._has_commit(remote_before):
+                self._fetch_branch(branch, remote_before)
+            if not self._is_ancestor(remote_before, expected_local_sha):
+                relationship = (
+                    "is ahead of local"
+                    if self._is_ancestor(expected_local_sha, remote_before)
+                    else "has diverged from local"
+                )
+                raise WorkerFailure(
+                    f"remote {branch!r} {relationship}; refusing push repair"
+                )
+
+        def require_unchanged_preconditions() -> None:
+            self.require_clean()
+            current = self.require_current_branch(branch)
+            if current.local_sha != expected_local_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed before push: expected "
+                    f"{expected_local_sha}, found {current.local_sha}"
+                )
+            actual_remote = self._remote_sha(branch)
+            if actual_remote != remote_before:
+                raise WorkerFailure(
+                    f"remote {branch!r} changed before push: expected "
+                    f"{remote_before}, found {actual_remote}"
+                )
+
+        self._git_mutation(
+            ["push", self.remote, f"HEAD:refs/heads/{branch}"],
+            operation="push committed branch",
+            target=f"{self.remote}/{branch}",
+            pre_state=remote_before,
+            observe=lambda: self._remote_sha(branch),
+            desired=lambda: self._remote_sha(branch) == expected_local_sha,
+            pre_dispatch=require_unchanged_preconditions,
+        )
+        result = self.inspect_branch(branch)
+        if (
+            not result.current
+            or result.local_sha != expected_local_sha
+            or result.remote_sha != expected_local_sha
+        ):
+            raise WorkerFailure(f"push postcondition failed for {branch!r}")
+        self.require_clean()
+        return result
 
     def require_contains(self, branch: str, commit_sha: str) -> None:
         self._validate_sha(commit_sha)

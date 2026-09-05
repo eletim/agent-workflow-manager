@@ -29,6 +29,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/purplemux_client"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"examples/sequential-version-development.py" = "purplemux_client/_issue_driven_sequential_template.py"
+
 [tool.ruff]
 lint.select = ["E", "F", "I", "RUF100", "UP"]
 lint.ignore = ["E501"]

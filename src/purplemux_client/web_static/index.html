@@ -31,7 +31,8 @@
       <section class="panel editor-panel">
         <div class="mode-switch" role="group" aria-label="Execution mode">
           <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
-          <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Workflow</button>
+          <button id="issue-driven-mode" type="button" aria-pressed="false">Issue Driven</button>
+          <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Python Workflow</button>
         </div>
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
@@ -56,6 +57,28 @@
           </div>
           <label for="prompt-text">Prompt</label>
           <textarea id="prompt-text" spellcheck="true"></textarea>
+        </div>
+
+        <div id="issue-driven-fields" hidden>
+          <label for="issue-driven-json">Issue Driven JSON</label>
+          <textarea id="issue-driven-json" spellcheck="false">{
+  "mode": "issue-driven",
+  "repository": "~/DevEnv/project",
+  "integration_branch": "dev/v0.2.0",
+  "final_branch": "main",
+  "issues": [90, 89],
+  "max_reviews": 8,
+  "merge_to_integration": true,
+  "final_review": true,
+  "merge_final": false
+}</textarea>
+          <div class="generated-heading">
+            <label for="issue-driven-python">Generated Python (read-only)</label>
+            <button id="issue-driven-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="issue-driven-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <ol id="issue-driven-validation" class="validation-list"></ol>
+          <textarea id="issue-driven-python" spellcheck="false" readonly aria-label="Generated Python workflow"></textarea>
         </div>
 
         <div id="workflow-fields">

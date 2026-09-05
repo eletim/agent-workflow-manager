@@ -16,6 +16,23 @@ security, and cross-feature behavior may appear only after approved changes are
 combined. The final PR becomes Ready only after that review approves it and is
 never merged into `main` automatically.
 
+## Issue Driven generation
+
+Issue Driven mode is a deterministic authoring aid in front of this same contract.
+It validates a deliberately small JSON object (repository, integration/final
+branches, ordered Issue numbers, bounded review count, and merge/review policies),
+then displays a complete generated plain-Python workflow. Static Validation, Dry
+Run, and Run operate on that generated Python through the existing Runner path.
+The JSON is never interpreted as runtime control flow, and it has no generic
+actions, conditions, loops, graph edges, or executable nesting.
+
+The generated workflow uses the canonical commit-and-clean CodingAgent
+postcondition, fills safe push/Draft-PR gaps before independent review, and uses
+Runner-scoped correlation through named PurpleMux resources and
+`run_correlation()`. It does not generate UUIDs or correlation tokens. With
+`merge_final: false`, it generates no final-branch merge call. The displayed
+Python remains the sole execution and control-flow source of truth.
+
 ## Architecture and responsibility
 
 ```text
@@ -85,9 +102,14 @@ for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sh
 This keeps branch preparation inside the isolated worktree even when the source
 checkout already has the configured base branch checked out. If the logical
 feature branch is also checked out in another worktree, the topology layer uses
-a unique `awm-run/...` local branch. Always push the isolated checkout explicitly
-with `git push origin HEAD:refs/heads/<logical-feature-branch>`; topology and PR
-checks continue to use the logical remote branch name.
+a unique `awm-run/...` local branch. Record the prepared SHA before an agent
+turn, then require the CodingAgent's new commit and clean worktree with
+`require_committed_result()`. Use `ensure_pushed()` to complete delivery through
+the logical remote branch name. It creates an absent branch or fast-forwards a
+behind branch only; remote-ahead and divergence fail closed. The Workflow must
+then create or reuse and verify the exact Draft PR before starting review. Push
+and PR creation may be agent conveniences, but are not CodingAgent hard
+postconditions.
 
 The workflow subprocess itself runs from a stable Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put
@@ -197,7 +219,6 @@ session_id = client.create_session(
         command="codex",
         metadata={},
         name="Issue 123 implementer",
-        correlation_id="issue-123-implementer-ab12",
     )
 )
 status = client.read_status(session_id)
@@ -296,15 +317,18 @@ workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd="/absolute/repo",
         name="owner/project dev/v1.2.3",
-        correlation_id="version-development-ab12",
     )
 )
 client = runtime.workspace(workspace.id)
 ```
 
-The adapter captures a complete workspace listing, creates exactly once with the
-saved non-secret correlation, and confirms any response ID against a new matching
-workspace in a second authoritative listing. Unknown outcomes are never retried.
+The adapter derives a stable correlation from the Runner's run identity and the
+logical `name`, captures a complete workspace listing, creates exactly once, and
+confirms any response ID against a new matching workspace in a second
+authoritative listing. The same logical name is stable within one Run and differs
+between Runs. Direct execution outside the Runner uses one process-stable random
+namespace. Pass an explicit `correlation_id` only for compatibility or special
+reconciliation needs. Unknown outcomes are never retried.
 `list_sessions()` provides the corresponding complete structured tab discovery.
 No screen or tmux state participates in identity.
 
@@ -560,10 +584,11 @@ Do not:
 
 ## Complete example: implement, review, fix, and ready a PR
 
-This example prepares an isolated worktree, creates a workspace and separate Codex sessions, asks the
-implementer to create a Draft PR, performs at most four independent reviews,
-routes actionable findings back to the implementer, and marks the PR ready after
-approval. All owned resources remain available until explicit Cleanup.
+This lower-level example focuses on agent turn orchestration. Production
+repository workflows should combine it with the commit/clean and delivery gates
+above; the canonical `examples/sequential-version-development.py` shows safe
+push and exact Draft-PR gap absorption. All owned resources remain available
+until explicit Cleanup.
 
 ```python
 from __future__ import annotations
@@ -663,7 +688,6 @@ workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd=str(REPO),
         name="Issue 123 workflow",
-        correlation_id="issue-123-workspace",
     )
 )
 workspace_id = workspace.id  # Do not retry automatically on an unknown outcome.
@@ -681,7 +705,6 @@ try:
             cwd=str(REPO),
             command="codex",
             name="Issue 123 implementer",
-            correlation_id="issue-123-implementer",
         )
     )
     session_ids.append(implementer)
@@ -699,7 +722,6 @@ try:
             cwd=str(REPO),
             command="codex",
             name="Issue 123 reviewer",
-            correlation_id="issue-123-reviewer",
         )
     )
     session_ids.append(reviewer)
