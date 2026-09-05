@@ -227,7 +227,7 @@ def prepare_issue(
     github: GitHubRepository,
     issue: Issue,
     config: Config,
-) -> tuple[PullRequestState | None, str, bool, bool] | None:
+) -> tuple[PullRequestState | None, str, bool] | None:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
@@ -272,7 +272,30 @@ def prepare_issue(
         open_pr,
         feature.local_sha,
         reused_existing_work,
-        open_pr is not None and not open_pr.is_draft,
+    )
+
+
+def return_to_draft_for_review(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    *,
+    head: str,
+    base: str,
+) -> PullRequestState:
+    """Ensure an open PR cannot use Ready state as approval provenance."""
+    if pr.is_draft:
+        return pr
+    emit_finding(
+        "github",
+        f"PR #{pr.number} is Ready without review provenance; returning it to Draft",
+    )
+    return github.set_draft(
+        pr.number,
+        draft=True,
+        expected_head=head,
+        expected_head_sha=pr.head_sha,
+        expected_base=base,
+        expected_base_sha=pr.base_sha,
     )
 
 
@@ -351,35 +374,14 @@ def process_issue(
     if prepared is None:
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
         return
-    existing_pr, start_sha, reused_existing_work, already_approved = prepared
-    if already_approved:
-        assert existing_pr is not None
-        approved = github.require_pr(
-            number=existing_pr.number,
-            head=issue.branch,
-            base=config.integration_branch,
-            state="OPEN",
-            expected_head_sha=existing_pr.head_sha,
-            expected_base_sha=existing_pr.base_sha,
-            draft=False,
-        )
-        if not MERGE_TO_INTEGRATION:
-            print(
-                f"Skipping already-Ready Issue #{issue.number} PR: {approved.url}",
-                flush=True,
-            )
-            return
-        merged = merge_pr_and_advance(
-            repo,
+    existing_pr, start_sha, reused_existing_work = prepared
+    if existing_pr is not None:
+        existing_pr = return_to_draft_for_review(
             github,
-            number=approved.number,
+            existing_pr,
             head=issue.branch,
-            head_sha=approved.head_sha,
             base=config.integration_branch,
-            base_sha=approved.base_sha,
         )
-        print(f"Merged already-approved Issue #{issue.number} PR: {merged.pr.url}")
-        return
     implementer = create_agent(client, config, name=f"Issue {issue.number} implementer")
     reviewer = create_agent(client, config, name=f"Issue {issue.number} reviewer")
     implementation_prompt, review_prompt = issue_prompts(issue, config)
@@ -560,28 +562,13 @@ def integration_delivery(
             body="Sequential integration; Ready only after whole-version checks.",
             correlation_id=run_correlation("integration-pr"),
         )
-    elif not pr.is_draft:
-        ready = github.require_pr(
-            number=pr.number,
-            head=config.integration_branch,
-            base=config.main_branch,
-            state="OPEN",
-            expected_head_sha=integration.remote_sha,
-            expected_base_sha=main.remote_sha,
-            draft=False,
-        )
-        if not MERGE_FINAL:
-            return ready
-        merged = merge_pr_and_advance(
-            repo,
+    else:
+        pr = return_to_draft_for_review(
             github,
-            number=ready.number,
+            pr,
             head=config.integration_branch,
-            head_sha=ready.head_sha,
             base=config.main_branch,
-            base_sha=ready.base_sha,
         )
-        return merged.pr
     pr = github.require_pr(
         number=pr.number,
         head=config.integration_branch,

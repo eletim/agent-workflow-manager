@@ -45,6 +45,21 @@ def test_valid_json_preserves_issue_order() -> None:
     assert config.merge_final is False
 
 
+@pytest.mark.parametrize("key", ["integration_branch", "final_branch"])
+def test_delivery_branches_cannot_collide_with_generated_issue_branch(
+    key: str,
+) -> None:
+    value = payload(issues=[90, 91])
+    value[key] = "feature/issue-91"
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (f"$.{key}", "must differ from every generated Issue branch") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
+
+
 @pytest.mark.parametrize(
     ("source", "path"),
     [

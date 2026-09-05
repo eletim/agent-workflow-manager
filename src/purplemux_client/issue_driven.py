@@ -154,6 +154,17 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                 )
             else:
                 seen.add(issue)
+        generated_branches = {f"feature/issue-{issue}" for issue in seen}
+        for key, branch in (
+            ("integration_branch", integration),
+            ("final_branch", final),
+        ):
+            if branch in generated_branches:
+                findings.append(
+                    IssueDrivenFinding(
+                        f"$.{key}", "must differ from every generated Issue branch"
+                    )
+                )
     max_reviews = value.get("max_reviews")
     if (
         isinstance(max_reviews, bool)
