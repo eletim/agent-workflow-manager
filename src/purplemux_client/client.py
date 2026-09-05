@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
+from purplemux_client.codex_trust import ensure_codex_project_trust
 from purplemux_client.correlation import run_correlation
 from purplemux_client.errors import (
     MutationOutcomeUnknown,
@@ -450,7 +451,10 @@ class PurpleMuxRuntime:
         )
 
     def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
-        if workspace_id not in {item.id for item in self.list_workspaces()}:
+        workspace = next(
+            (item for item in self.list_workspaces() if item.id == workspace_id), None
+        )
+        if workspace is None:
             raise WorkerFailure(f"PurpleMux workspace {workspace_id!r} was not found")
         return PurpleMuxCLIClient(
             workspace_id,
@@ -459,6 +463,7 @@ class PurpleMuxRuntime:
             read_timeout_retries=self.read_timeout_retries,
             runner=self._runner,
             owned_by_run=self.owned_by_run,
+            workspace_directories=workspace.directories,
         )
 
     def _read_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
@@ -568,6 +573,8 @@ class PurpleMuxCLIClient:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         owned_by_run: bool = False,
+        codex_project_truster: Callable[[str], str] = ensure_codex_project_trust,
+        workspace_directories: Sequence[str] = (),
     ) -> None:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
@@ -586,6 +593,8 @@ class PurpleMuxCLIClient:
         self._sleep = sleep
         self._monotonic = monotonic
         self.owned_by_run = owned_by_run
+        self._codex_project_truster = codex_project_truster
+        self._workspace_directories = tuple(workspace_directories)
         self._turn_baselines: dict[str, _TurnBaseline] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
         self._shell_runs: dict[str, _ShellRun] = {}
@@ -601,6 +610,24 @@ class PurpleMuxCLIClient:
                 f"unsupported PurpleMux worker {request.worker!r}; "
                 "expected codex or claude-code"
             )
+        if panel_type == "codex-cli":
+            try:
+                requested = os.path.realpath(os.path.expanduser(request.cwd))
+            except (OSError, ValueError) as exc:
+                raise WorkerFailure(
+                    f"Codex project trust path could not be resolved: {exc}"
+                ) from exc
+            if self._workspace_directories:
+                allowed = {
+                    os.path.realpath(os.path.expanduser(path))
+                    for path in self._workspace_directories
+                }
+                if requested not in allowed:
+                    raise WorkerFailure(
+                        "Codex project trust path is not an exact directory of the "
+                        "selected PurpleMux workspace"
+                    )
+            self._codex_project_truster(requested)
         correlation_id = request.correlation_id or (
             run_correlation(request.name)
             if request.name is not None
@@ -674,6 +701,14 @@ class PurpleMuxCLIClient:
             )
         if any(tab.name == probe_name for tab in current):
             raise WorkerFailure("probe correlation identity is already in use")
+        if panel_type == "codex-cli":
+            if not self._workspace_directories:
+                raise WorkerFailure(
+                    "Codex readiness probe requires workspace directory context; "
+                    "construct the client with PurpleMuxRuntime.workspace()"
+                )
+            for directory in self._workspace_directories:
+                self._codex_project_truster(directory)
         tab = self._create_correlated_tab(
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",

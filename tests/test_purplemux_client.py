@@ -84,6 +84,7 @@ class FakeRunner:
 
 
 def client(runner: FakeRunner, **kwargs: object) -> PurpleMuxCLIClient:
+    kwargs.setdefault("codex_project_truster", lambda path: path)
     return PurpleMuxCLIClient(
         "ws-test",
         poll_interval_seconds=0,
@@ -128,6 +129,60 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
     assert create[-2:] == ["-t", "codex-cli"]
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
+
+
+def test_codex_project_is_trusted_before_tab_creation() -> None:
+    events: list[str] = []
+    runner = FakeRunner([completed({"tabId": "tab-123"})])
+
+    def trust(path: str) -> str:
+        assert runner.calls == []
+        events.append(path)
+        return path
+
+    cli = client(runner, codex_project_truster=trust)
+    cli.create_session(request())
+
+    assert events == ["/workspace/project"]
+
+
+def test_codex_trust_failure_prevents_tab_creation() -> None:
+    runner = FakeRunner([])
+
+    def fail(_path: str) -> str:
+        raise WorkerFailure("trust unavailable")
+
+    with pytest.raises(WorkerFailure, match="trust unavailable"):
+        client(runner, codex_project_truster=fail).create_session(request())
+
+    assert runner.calls == []
+
+
+def test_codex_trust_is_limited_to_an_exact_workspace_directory() -> None:
+    runner = FakeRunner([])
+    trusted: list[str] = []
+    cli = client(
+        runner,
+        workspace_directories=("/workspace/selected",),
+        codex_project_truster=lambda path: trusted.append(path) or path,
+    )
+
+    with pytest.raises(WorkerFailure, match="not an exact directory"):
+        cli.create_session(request())
+
+    assert trusted == []
+    assert runner.calls == []
+
+
+def test_claude_session_does_not_change_codex_trust() -> None:
+    trusted: list[str] = []
+    runner = FakeRunner([completed({"tabId": "tab-claude"})])
+
+    client(
+        runner, codex_project_truster=lambda path: trusted.append(path) or path
+    ).create_session(request("claude-code", "claude"))
+
+    assert trusted == []
 
 
 def test_named_session_derives_run_scoped_correlation(

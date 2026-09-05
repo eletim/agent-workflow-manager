@@ -400,6 +400,14 @@ adapter checks `command` against the same aliases. The current adapter does not
 pass `cwd`, `command`, or `metadata` through as arbitrary launch configuration;
 PurpleMux owns provider launch and the workspace directory. Keep these request
 fields accurate, but do not claim they configure unsupported runtime behavior.
+For Codex, `create_session()` first canonicalizes `cwd`, constrains it to an
+exact selected PurpleMux workspace directory when the runtime supplied that
+context, and establishes trust for only that path through Codex's app-server
+configuration API. The effective trust value is read back before the tab is
+created, so an unavailable or overridden trust configuration fails early.
+Fresh worktrees are handled independently from their source repository path.
+This does not change sandbox or approval policy. AWM does not apply a broad
+permission bypass or simulated trust-dialog keystrokes to Claude Code.
 
 Relevant errors all derive from `TerminalSessionError`:
 
