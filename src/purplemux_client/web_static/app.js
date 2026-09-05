@@ -138,7 +138,7 @@ function runningFaviconHref() {
         return response.text();
       })
       .then((source) => {
-        const badge = '<circle id="running-badge" cx="25" cy="25" r="5" fill="#ef4444" stroke="#fff" stroke-width="2"/>';
+        const badge = '<circle id="running-badge" cx="25" cy="25" r="4" fill="#ff596b" stroke="#fff" stroke-width="1.5"/>';
         return `data:image/svg+xml,${encodeURIComponent(source.replace("</svg>", `${badge}</svg>`))}`;
       });
   }
