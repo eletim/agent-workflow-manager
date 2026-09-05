@@ -4,6 +4,7 @@ import codecs
 import json
 import logging
 import os
+import secrets
 import signal
 import stat
 import subprocess
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
 from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
+from purplemux_client.correlation import RUN_IDENTITY_ENV
 from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.execution_context import (
     PENDING_REPOSITORY_CONTEXT_ENV,
@@ -429,6 +431,7 @@ class PythonRunner:
         self._validation_lock = threading.Lock()
         self._runs: dict[int, _RunRecord] = {}
         self._next_run_id = 1
+        self._correlation_instance = secrets.token_hex(16)
         self._notifier = notifier
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
@@ -741,6 +744,7 @@ class PythonRunner:
                     child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
                         asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
                     )
+                    child_env[RUN_IDENTITY_ENV] = self._run_identity(run.run_id)
                     process, script_path, progress_read_fd, resource_ack_fd = (
                         self._spawn_process(
                             code,
@@ -802,15 +806,17 @@ class PythonRunner:
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
     ) -> int:
+        run_id = self._next_run_id
+        self._next_run_id += 1
+        run_environment = dict(child_env)
+        run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
         process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
             code,
             run_cwd=run_cwd,
             run_args=run_args,
-            child_env=child_env,
+            child_env=run_environment,
         )
 
-        run_id = self._next_run_id
-        self._next_run_id += 1
         run = _RunRecord(
             run_id=run_id,
             cwd=prompt.cwd if prompt is not None else str(run_cwd),
@@ -831,6 +837,9 @@ class PythonRunner:
         )
         self._mark_changed()
         return run_id
+
+    def _run_identity(self, run_id: int) -> str:
+        return f"{self._correlation_instance}-{run_id}"
 
     @staticmethod
     def _spawn_process(

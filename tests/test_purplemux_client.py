@@ -21,6 +21,7 @@ from purplemux_client import (
     WorkerInterrupted,
     WorkerNeedsInput,
 )
+from purplemux_client.correlation import RUN_IDENTITY_ENV
 
 
 def completed(data: object, *, returncode: int = 0, stderr: str = ""):
@@ -129,6 +130,24 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
+def test_named_session_derives_run_scoped_correlation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(RUN_IDENTITY_ENV, "runner-run-12")
+    runner = FakeRunner([completed({"tabId": "tab-named"})])
+
+    session = client(runner).create_session(
+        CreateSessionRequest(
+            "codex", "/workspace/project", "codex", name="Issue 89 implementer"
+        )
+    )
+
+    assert session == "tab-named"
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    name = create[create.index("-n") + 1]
+    assert name.startswith("Issue 89 implementer [awm:Issue-89-implementer-")
+
+
 @pytest.mark.parametrize(
     ("worker", "command"),
     [("claude-code", "claude"), ("unknown", "claude")],
@@ -187,10 +206,12 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
         "-w",
         "ws-test",
         "-n",
-        "Run 12: tests",
+        create[6],
         "-t",
         "terminal",
     ]
+    assert create[6].startswith("Run 12: tests [awm:Run-12-tests-")
+    assert create[6].endswith("]")
     wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
     assert f"cd -- {tmp_path}" in wrapper
     assert "bash -lc" in wrapper

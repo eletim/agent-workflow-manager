@@ -30,6 +30,7 @@ from purplemux_client import (
     emit_finding,
     emit_step,
     resume_checkpoint,
+    run_correlation,
     save_checkpoint,
 )
 
@@ -255,16 +256,15 @@ def ensure_workspace(
     if recovery.workspace is None:
         if recovery.phase == "workspace_create_pending":
             raise MutationOutcomeUnknown(
-                "workspace creation may have completed; inspect its saved correlation"
+                "workspace creation may have completed; inspect the run-correlated "
+                "workspace before any new mutation"
             )
         recovery.phase = "workspace_create_pending"
-        recovery.correlation_id = f"workspace-{config.signature}"
         recovery.checkpoint(config)
         workspace = runtime.create_workspace(
             CreateWorkspaceRequest(
                 str(config.repo),
                 f"{config.slug} {config.integration_branch}",
-                recovery.correlation_id,
             )
         )
         recovery.workspace = workspace.id
@@ -274,16 +274,13 @@ def ensure_workspace(
     return runtime.workspace(recovery.workspace)
 
 
-def create_agent(
-    client: PurpleMuxCLIClient, config: Config, *, name: str, correlation_id: str
-) -> str:
+def create_agent(client: PurpleMuxCLIClient, config: Config, *, name: str) -> str:
     return client.create_session(
         CreateSessionRequest(
             "codex",
             str(config.repo),
             "codex",
             name=name,
-            correlation_id=correlation_id,
         )
     )
 
@@ -388,7 +385,7 @@ def ensure_issue_pr(
         if recovery.prepared_base_sha is None:
             raise WorkerFailure("prepared Issue checkpoint lacks its base SHA")
         recovery.phase = "issue_pr_create_pending"
-        recovery.correlation_id = f"issue-{issue.number}-pr-{config.signature}"
+        recovery.correlation_id = run_correlation(f"issue-{issue.number}-pr")
         recovery.checkpoint(config)
         pr = github.create_draft_pr(
             head=issue.branch,
@@ -647,7 +644,6 @@ def process_issue(
             client,
             config,
             name=f"Issue {issue.number} implementer",
-            correlation_id=f"issue-{issue.number}-implementer-{config.signature}",
         )
         recovery.phase = "issue_implementer_ready"
         recovery.checkpoint(config)
@@ -659,7 +655,6 @@ def process_issue(
             client,
             config,
             name=f"Issue {issue.number} reviewer",
-            correlation_id=f"issue-{issue.number}-reviewer-{config.signature}",
         )
         recovery.phase = "issue_sessions_ready"
         recovery.checkpoint(config)
@@ -951,7 +946,7 @@ clean, discard, push, change PR state, merge, or start another review.""",
         raise WorkerFailure("integration or main remote branch is missing")
     pr = inspect_integration_pr_topology(github, config, recovery)
     if pr is None:
-        correlation = recovery.correlation_id or f"integration-{config.signature}"
+        correlation = recovery.correlation_id or run_correlation("integration-pr")
         recovery.correlation_id = correlation
         recovery.phase = "integration_pr_create_pending"
         recovery.checkpoint(config)
@@ -983,7 +978,6 @@ clean, discard, push, change PR state, merge, or start another review.""",
             client,
             config,
             name="Whole-version fixer",
-            correlation_id=f"integration-fixer-{config.signature}",
         )
         recovery.phase = "integration_fixer_ready"
         recovery.checkpoint(config)
@@ -995,7 +989,6 @@ clean, discard, push, change PR state, merge, or start another review.""",
             client,
             config,
             name="Whole-version reviewer",
-            correlation_id=f"integration-reviewer-{config.signature}",
         )
         recovery.phase = "integration_sessions_ready"
         recovery.checkpoint(config)
@@ -1138,8 +1131,8 @@ def main() -> None:
     recovery = load_recovery(config, resume_checkpoint())
     if recovery.phase == "workspace_create_pending":
         raise MutationOutcomeUnknown(
-            "workspace creation may have completed; reconcile the saved correlation "
-            "before any further mutation"
+            "workspace creation may have completed; reconcile the run-correlated "
+            "workspace before any further mutation"
         )
     runtime = PurpleMuxRuntime(
         command_timeout_seconds=COMMAND_TIMEOUT, owned_by_run=True

@@ -97,6 +97,17 @@ def test_direct_sample_has_no_raw_topology_or_workspace_subprocess_layer() -> No
     assert "GitHubRepository.open" in source
 
 
+def test_direct_sample_uses_run_scoped_resource_correlations() -> None:
+    source = SAMPLE.read_text(encoding="utf-8")
+
+    assert "uuid.uuid4" not in source
+    assert "RUN_TOKEN" not in source
+    assert "run_correlation" in source
+    assert "-implementer-{config.signature}" not in source
+    assert "-reviewer-{config.signature}" not in source
+    assert "workspace-{config.signature}" not in source
+
+
 def test_topology_gate_rejects_before_git_or_runtime_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

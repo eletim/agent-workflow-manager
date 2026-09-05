@@ -160,6 +160,16 @@ structured identities are confirmed by complete public listings. All first-party
 runtime mutations participate in the same first-mutation boundary used by whole-
 program Dry Run.
 
+Named workspace, agent-session, and managed-shell creation derives a valid
+correlation identity from the Runner's Run and the supplied logical `name`.
+Repeated use of that name within one Run is stable, while another Run gets a
+different identity even when an older resource is retained. Direct Python use
+outside the Runner falls back to one process-stable random namespace. The public
+`run_correlation(name)` helper is available for APIs such as correlated PR
+creation that still need an explicit value. Correlations identify creation and
+reconciliation; Cleanup ownership continues to use returned concrete workspace,
+tab, and filesystem identities.
+
 Static Validation reports Dry Run eligibility separately. Eligible trusted
 workflows declare `WORKFLOW_DRY_RUN = 1`; Dry Run executes that same Python program
 through real inspections and stops before the first reachable mutation. The Runner

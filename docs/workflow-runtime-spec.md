@@ -48,6 +48,16 @@ authoritative identity; it does not decide control flow. The Runner's explicit
 Cleanup action operates only on that generic inventory through PurpleMux's
 authenticated runtime interfaces and never operates tmux directly.
 
+Each Runner Run ID is combined with one process-instance namespace and supplied
+to the workflow subprocess as its correlation namespace. Public named
+workspace/session/shell creation derives a short stable mutation correlation
+from that Run identity and the logical resource name. A resumed attempt keeps
+the same namespace; a different Run, including one after a Runner restart, does
+not reuse it. Direct Python execution uses a process-stable random fallback.
+This identity is only for creation and reconciliation. Run-owned resource
+inventory remains authoritative only after concrete workspace, tab, result
+directory, or worktree identities are returned and registered.
+
 ## Manual recovery and resume contract
 
 Resume is an explicit user action on the same in-memory run; it is never an

@@ -18,6 +18,7 @@ from purplemux_client import (
     WorkerFailure,
     WorkspaceState,
 )
+from purplemux_client.correlation import RUN_IDENTITY_ENV
 
 
 class RuntimeRunner:
@@ -493,6 +494,29 @@ def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) ->
         len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
         == 1
     )
+
+
+def test_new_run_does_not_collide_with_retained_logical_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = RuntimeRunner()
+    runtime = PurpleMuxRuntime(runner=runner)
+    monkeypatch.setenv(RUN_IDENTITY_ENV, "run-one")
+    first = runtime.create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version workflow")
+    )
+    retained = runner.workspaces.pop(first.id)
+    retained["id"] = "ws-retained"
+    runner.workspaces["ws-retained"] = retained
+
+    monkeypatch.setenv(RUN_IDENTITY_ENV, "run-two")
+    second = runtime.create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version workflow")
+    )
+
+    assert second.id == "ws-new"
+    assert retained["name"] != second.name
+    assert len(runner.workspaces) == 2
 
 
 def test_workspace_nonzero_after_apply_reconciles_without_retry(
