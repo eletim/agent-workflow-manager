@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from purplemux_client import MutationOutcomeUnknown
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -51,8 +54,14 @@ def test_valid_json_preserves_issue_order() -> None:
         (json.dumps(payload(issues=[90, 90])), "$.issues[1]"),
         (json.dumps(payload(max_reviews=0)), "$.max_reviews"),
         (json.dumps(payload(integration_branch="bad..branch")), "$.integration_branch"),
-        (json.dumps(payload(integration_branch="foo.lock/bar")), "$.integration_branch"),
-        (json.dumps(payload(integration_branch="bad\u007fbranch")), "$.integration_branch"),
+        (
+            json.dumps(payload(integration_branch="foo.lock/bar")),
+            "$.integration_branch",
+        ),
+        (
+            json.dumps(payload(integration_branch="bad\u007fbranch")),
+            "$.integration_branch",
+        ),
         (json.dumps(payload(merge_final="false")), "$.merge_final"),
         (json.dumps(payload(extra=True)), "$.extra"),
         ('{"repository":"a","repository":"b"}', "$.repository"),
@@ -106,8 +115,37 @@ def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() 
     assert "run_correlation(" in code
     assert "uuid" not in code
     assert "RUN_TOKEN" not in code
+    assert "[awm:" not in code
     assert "CreateSessionRequest(" in code
-    assert "name=f\"Issue {issue.number} implementer\"" in code
+    assert 'name=f"Issue {issue.number} implementer"' in code
+
+
+@pytest.mark.parametrize("visible_pr", [False, True])
+def test_review_disabled_resume_never_retries_pending_pr_creation(
+    visible_pr: bool,
+) -> None:
+    code = generate_issue_driven_workflow(parse(payload(final_review=False)))
+    module = ModuleType("generated_issue_driven_test")
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(code, "<generated>", "exec"), module.__dict__)
+    finally:
+        sys.modules.pop(module.__name__, None)
+
+    class UnexpectedGitHub:
+        called = False
+
+        def find_pr(self, **_kwargs: object) -> object | None:
+            self.called = True
+            return object() if visible_pr else None
+
+    recovery = SimpleNamespace(phase="integration_pr_create_pending")
+    github = UnexpectedGitHub()
+    with pytest.raises(MutationOutcomeUnknown):
+        module.integration_delivery_without_review(
+            object(), object(), object(), github, recovery
+        )
+    assert github.called is False
 
 
 def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
@@ -125,7 +163,10 @@ def test_final_review_policy_selects_the_generated_control_flow() -> None:
     reviewed = generate_issue_driven_workflow(parse(payload(final_review=True)))
     skipped = generate_issue_driven_workflow(parse(payload(final_review=False)))
 
-    assert "ready = integration_review(config, runtime, repo, github, recovery)" in reviewed
+    assert (
+        "ready = integration_review(config, runtime, repo, github, recovery)"
+        in reviewed
+    )
     assert "def integration_review(" in reviewed
     assert "def integration_review(" not in skipped
     assert "review-disabled-policy" in skipped
