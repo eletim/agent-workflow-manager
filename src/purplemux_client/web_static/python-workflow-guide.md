@@ -202,7 +202,6 @@ session_id = client.create_session(
         command="codex",
         metadata={},
         name="Issue 123 implementer",
-        correlation_id="issue-123-implementer-ab12",
     )
 )
 status = client.read_status(session_id)
@@ -301,15 +300,18 @@ workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd="/absolute/repo",
         name="owner/project dev/v1.2.3",
-        correlation_id="version-development-ab12",
     )
 )
 client = runtime.workspace(workspace.id)
 ```
 
-The adapter captures a complete workspace listing, creates exactly once with the
-saved non-secret correlation, and confirms any response ID against a new matching
-workspace in a second authoritative listing. Unknown outcomes are never retried.
+The adapter derives a stable correlation from the Runner's run identity and the
+logical `name`, captures a complete workspace listing, creates exactly once, and
+confirms any response ID against a new matching workspace in a second
+authoritative listing. The same logical name is stable within one Run and differs
+between Runs. Direct execution outside the Runner uses one process-stable random
+namespace. Pass an explicit `correlation_id` only for compatibility or special
+reconciliation needs. Unknown outcomes are never retried.
 `list_sessions()` provides the corresponding complete structured tab discovery.
 No screen or tmux state participates in identity.
 
@@ -669,7 +671,6 @@ workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd=str(REPO),
         name="Issue 123 workflow",
-        correlation_id="issue-123-workspace",
     )
 )
 workspace_id = workspace.id  # Do not retry automatically on an unknown outcome.
@@ -687,7 +688,6 @@ try:
             cwd=str(REPO),
             command="codex",
             name="Issue 123 implementer",
-            correlation_id="issue-123-implementer",
         )
     )
     session_ids.append(implementer)
@@ -705,7 +705,6 @@ try:
             cwd=str(REPO),
             command="codex",
             name="Issue 123 reviewer",
-            correlation_id="issue-123-reviewer",
         )
     )
     session_ids.append(reviewer)

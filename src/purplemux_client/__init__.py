@@ -15,6 +15,7 @@ from purplemux_client.client import (
     WorkerNeedsInput,
     WorkspaceState,
 )
+from purplemux_client.correlation import run_correlation
 from purplemux_client.errors import TerminalSessionError
 from purplemux_client.execution_context import (
     RepositoryExecutionContext,
@@ -81,6 +82,7 @@ __all__ = [
     "inspect_run_repository",
     "prepare_run_repository",
     "register_run_resource",
+    "run_correlation",
     "resume_checkpoint",
     "save_checkpoint",
     "suspend_run",

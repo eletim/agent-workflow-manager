@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
+from purplemux_client.correlation import run_correlation
 from purplemux_client.errors import (
     MutationOutcomeUnknown,
     ResultNotReady,
@@ -38,7 +39,8 @@ class CreateSessionRequest:
 
     PurpleMux owns provider launch commands and the workspace directory. `worker`
     selects the provider; `cwd`, `command`, and `metadata` describe caller intent and
-    are retained for generated-workflow APIs.
+    are retained for generated-workflow APIs. A supplied `name` is also the logical
+    resource name used for automatic run-scoped correlation.
     """
 
     worker: str
@@ -51,9 +53,11 @@ class CreateSessionRequest:
 
 @dataclass(frozen=True)
 class CreateWorkspaceRequest:
+    """Describe a workspace whose display name is its logical correlation name."""
+
     cwd: str
     name: str
-    correlation_id: str
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,11 +106,12 @@ class AgentReadinessCleanupUnknown(MutationOutcomeUnknown):
 
 @dataclass(frozen=True)
 class ShellCommandRequest:
-    """Describe one observable Bash command in a named PurpleMux terminal."""
+    """Describe one observable command with a logical/display terminal name."""
 
     command: str
     cwd: str
     name: str
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -242,10 +247,11 @@ class PurpleMuxRuntime:
         cwd = os.path.abspath(os.path.expanduser(request.cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"workspace directory is not a directory: {cwd}")
-        _validate_correlation(request.correlation_id)
         if not request.name.strip() or "\0" in request.name:
             raise ValueError("workspace name must be non-empty and contain no nulls")
-        correlated_name = f"{request.name} [awm:{request.correlation_id}]"
+        correlation_id = request.correlation_id or run_correlation(request.name)
+        _validate_correlation(correlation_id)
+        correlated_name = f"{request.name} [awm:{correlation_id}]"
         before = self.list_workspaces()
         before_ids = {item.id for item in before}
         if any(item.name == correlated_name for item in before):
@@ -313,7 +319,7 @@ class PurpleMuxRuntime:
                 {
                     "name": workspace.name,
                     "directories": "\n".join(workspace.directories),
-                    "correlation_id": request.correlation_id,
+                    "correlation_id": correlation_id,
                 },
             )
         return workspace
@@ -576,7 +582,11 @@ class PurpleMuxCLIClient:
                 f"unsupported PurpleMux worker {request.worker!r}; "
                 "expected codex or claude-code"
             )
-        correlation_id = request.correlation_id or secrets.token_hex(8)
+        correlation_id = request.correlation_id or (
+            run_correlation(request.name)
+            if request.name is not None
+            else secrets.token_hex(8)
+        )
         _validate_correlation(correlation_id)
         name = request.name or f"awm-{panel_type}-{correlation_id}"
         if request.name is not None and correlation_id not in name:
@@ -695,8 +705,14 @@ class PurpleMuxCLIClient:
         if not os.path.isdir(cwd):
             raise ValueError(f"shell working directory is not a directory: {cwd}")
 
+        correlation_id = request.correlation_id or run_correlation(request.name)
+        _validate_correlation(correlation_id)
+        name = request.name
+        if correlation_id not in name:
+            name = f"{name} [awm:{correlation_id}]"
+
         tab = self._create_correlated_tab(
-            panel_type="terminal", provider=None, name=request.name
+            panel_type="terminal", provider=None, name=name
         )
         if self.owned_by_run:
             self._register_owned_tab(tab)

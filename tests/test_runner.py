@@ -87,6 +87,86 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     assert result.exit_code == 0
 
 
+def test_runner_correlation_is_stable_within_run_and_unique_across_runs(
+    runner: PythonRunner,
+) -> None:
+    code = """
+from purplemux_client import run_correlation
+print(run_correlation("workspace"))
+print(run_correlation("workspace"))
+"""
+    first_id = runner.start(code)
+    first = wait_for(
+        runner, lambda snapshot: snapshot.state != "running", run_id=first_id
+    )
+    second_id = runner.start(code)
+    second = wait_for(
+        runner, lambda snapshot: snapshot.state != "running", run_id=second_id
+    )
+
+    first_values = first.stdout.splitlines()
+    second_values = second.stdout.splitlines()
+    assert first_values[0] == first_values[1]
+    assert second_values[0] == second_values[1]
+    assert first_values[0] != second_values[0]
+
+
+def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
+    first_runner = PythonRunner(stop_timeout=0.5)
+    second_runner = PythonRunner(stop_timeout=0.5)
+    code = 'from purplemux_client import run_correlation; print(run_correlation("workspace"))'
+    try:
+        first_id = first_runner.start(code)
+        second_id = second_runner.start(code)
+        first = wait_for(
+            first_runner,
+            lambda snapshot: snapshot.state != "running",
+            run_id=first_id,
+        )
+        second = wait_for(
+            second_runner,
+            lambda snapshot: snapshot.state != "running",
+            run_id=second_id,
+        )
+    finally:
+        first_runner.close()
+        second_runner.close()
+
+    assert first.stdout != second.stdout
+
+
+def test_resume_reuses_original_run_correlation_namespace(
+    runner: PythonRunner,
+) -> None:
+    code = """
+from purplemux_client import resume_checkpoint, run_correlation, save_checkpoint
+print("CORRELATION=" + run_correlation("workspace"))
+if resume_checkpoint() is None:
+    save_checkpoint("retry")
+    raise SystemExit(2)
+"""
+    run_id = runner.start(code)
+    failed = wait_for(
+        runner, lambda snapshot: snapshot.state == "failed", run_id=run_id
+    )
+    runner.resume(run_id)
+    resumed = wait_for(
+        runner, lambda snapshot: snapshot.state == "success", run_id=run_id
+    )
+
+    first = next(
+        line.removeprefix("CORRELATION=")
+        for line in failed.stdout.splitlines()
+        if line.startswith("CORRELATION=")
+    )
+    values = [
+        line.removeprefix("CORRELATION=")
+        for line in resumed.stdout.splitlines()
+        if line.startswith("CORRELATION=")
+    ]
+    assert values == [first, first]
+
+
 def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
     tmp_path: Path,
 ) -> None:
