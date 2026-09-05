@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from purplemux_client import BranchState, GitHubRepository, GitRepository
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -104,6 +108,150 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "github.create_draft_pr(" in code
     assert "reviewer requested changes, but implementer re-evaluated" in code
     assert "leave the working tree clean" in code
+
+
+def test_generated_post_merge_path_starts_next_issue() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[107, 108])))
+    module_name = "generated_issue_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-issue-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    workflow = module.__dict__
+    issue_type = workflow["Issue"]
+    config_type = workflow["Config"]
+    merge_pr_and_advance = workflow["merge_pr_and_advance"]
+    prepare_issue = workflow["prepare_issue"]
+    assert callable(issue_type)
+    assert callable(config_type)
+    assert callable(merge_pr_and_advance)
+    assert callable(prepare_issue)
+
+    base_sha = "1" * 40
+    reviewed_head = "2" * 40
+    merge_sha = "3" * 40
+    integration_branch = "dev/v0.2.1"
+    first_branch = "feature/issue-107"
+    next_branch = "feature/issue-108"
+    events: list[str] = []
+
+    class Repository:
+        def __init__(self) -> None:
+            self.current = first_branch
+            self.integration_sha = base_sha
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == integration_branch
+            events.append(f"synchronize:{self.current}->{branch}")
+            self.current = branch
+            return BranchState(branch, self.integration_sha, self.integration_sha, True)
+
+        def advance_after_merge(
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            merge_commit_sha: str,
+            required_commit_sha: str,
+        ) -> BranchState:
+            events.append("advance")
+            assert self.current == branch == integration_branch
+            assert self.integration_sha == previous_sha == base_sha
+            assert merge_commit_sha == merge_sha
+            assert required_commit_sha == reviewed_head
+            self.integration_sha = merge_sha
+            return BranchState(branch, merge_sha, merge_sha, True)
+
+        def require_clean(self) -> None:
+            events.append("require_clean")
+
+        def recover_feature_branch(
+            self, branch: str, *, base: str, expected_base_sha: str
+        ) -> SimpleNamespace:
+            events.append(f"recover:{branch}")
+            assert self.current == base == integration_branch
+            assert expected_base_sha == self.integration_sha == merge_sha
+            self.current = branch
+            return SimpleNamespace(
+                branch=BranchState(branch, merge_sha, None, True),
+                reused_existing_work=False,
+            )
+
+    repository = Repository()
+
+    class GitHub:
+        def merge_pr(self, number: int, **kwargs: object) -> SimpleNamespace:
+            events.append("merge")
+            assert repository.current == integration_branch
+            assert number == 107
+            assert kwargs == {
+                "expected_head": first_branch,
+                "expected_head_sha": reviewed_head,
+                "expected_base": integration_branch,
+                "expected_base_sha": base_sha,
+            }
+            return SimpleNamespace(
+                merge_commit_sha=merge_sha,
+                pr=SimpleNamespace(url="https://example.test/pull/107"),
+            )
+
+        def find_pr(self, *, head: str, base: str, state: str) -> None:
+            assert (head, base) == (next_branch, integration_branch)
+            assert state in {"OPEN", "MERGED"}
+            return None
+
+    github = GitHub()
+    merge_pr_and_advance(
+        repository,
+        github,
+        number=107,
+        head=first_branch,
+        head_sha=reviewed_head,
+        base=integration_branch,
+        base_sha=base_sha,
+    )
+    config = config_type(
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        integration_branch,
+        "main",
+        (),
+        "true",
+    )
+    prepared = prepare_issue(repository, github, issue_type(108, next_branch), config)
+
+    assert prepared is not None
+    assert repository.current == next_branch
+    assert events[:3] == [
+        f"synchronize:{first_branch}->{integration_branch}",
+        "merge",
+        "advance",
+    ]
+    assert f"synchronize:{integration_branch}->{integration_branch}" in events
+    assert f"recover:{next_branch}" in events
+    for unsafe in ("git reset", "git rebase", "git stash", "--force", "-f HEAD:"):
+        assert unsafe not in code
+
+
+def test_generated_repository_calls_match_public_helper_signatures() -> None:
+    tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
+    contracts = {"repo": GitRepository, "github": GitHubRepository}
+
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Attribute):
+            continue
+        receiver = call.func.value
+        if not isinstance(receiver, ast.Name) or receiver.id not in contracts:
+            continue
+        method = getattr(contracts[receiver.id], call.func.attr)
+        assert all(keyword.arg is not None for keyword in call.keywords)
+        inspect.signature(method).bind(
+            None,
+            *(None for _ in call.args),
+            **{keyword.arg: None for keyword in call.keywords if keyword.arg},
+        )
 
 
 def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() -> None:

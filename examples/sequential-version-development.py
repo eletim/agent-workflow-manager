@@ -17,6 +17,7 @@ from purplemux_client import (
     CreateWorkspaceRequest,
     GitHubRepository,
     GitRepository,
+    MergeResult,
     PullRequestState,
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
@@ -309,6 +310,36 @@ def ensure_issue_pr(
     )
 
 
+def merge_pr_and_advance(
+    repo: GitRepository,
+    github: GitHubRepository,
+    *,
+    number: int,
+    head: str,
+    head_sha: str,
+    base: str,
+    base_sha: str,
+) -> MergeResult:
+    """Merge exact reviewed topology from a synchronized local base."""
+    synchronized = repo.synchronize_branch(base)
+    if synchronized.local_sha != base_sha:
+        raise WorkerFailure(f"base branch {base!r} changed before approved merge")
+    merged = github.merge_pr(
+        number,
+        expected_head=head,
+        expected_head_sha=head_sha,
+        expected_base=base,
+        expected_base_sha=base_sha,
+    )
+    repo.advance_after_merge(
+        base,
+        previous_sha=base_sha,
+        merge_commit_sha=merged.merge_commit_sha,
+        required_commit_sha=head_sha,
+    )
+    return merged
+
+
 def process_issue(
     issue: Issue,
     config: Config,
@@ -338,21 +369,14 @@ def process_issue(
                 flush=True,
             )
             return
-        integration = repo.synchronize_branch(config.integration_branch)
-        if integration.local_sha != approved.base_sha:
-            raise WorkerFailure("Ready Issue PR base changed before recovery merge")
-        merged = github.merge_pr(
-            approved.number,
-            expected_head=issue.branch,
-            expected_head_sha=approved.head_sha,
-            expected_base=config.integration_branch,
-            expected_base_sha=approved.base_sha,
-        )
-        repo.advance_after_merge(
-            config.integration_branch,
-            previous_sha=approved.base_sha,
-            merge_commit_sha=merged.merge_commit_sha,
-            required_commit_sha=approved.head_sha,
+        merged = merge_pr_and_advance(
+            repo,
+            github,
+            number=approved.number,
+            head=issue.branch,
+            head_sha=approved.head_sha,
+            base=config.integration_branch,
+            base_sha=approved.base_sha,
         )
         print(f"Merged already-approved Issue #{issue.number} PR: {merged.pr.url}")
         return
@@ -456,21 +480,14 @@ explain why; do not create an empty commit.\n\n{result}""",
     if not MERGE_TO_INTEGRATION:
         print(f"Approved Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
         return
-    integration = repo.synchronize_branch(config.integration_branch)
-    if integration.local_sha != approved_base:
-        raise WorkerFailure("integration branch changed before approved merge")
-    merged = github.merge_pr(
-        pr.number,
-        expected_head=issue.branch,
-        expected_head_sha=approved_head,
-        expected_base=config.integration_branch,
-        expected_base_sha=approved_base,
-    )
-    repo.advance_after_merge(
-        config.integration_branch,
-        previous_sha=approved_base,
-        merge_commit_sha=merged.merge_commit_sha,
-        required_commit_sha=approved_head,
+    merged = merge_pr_and_advance(
+        repo,
+        github,
+        number=pr.number,
+        head=issue.branch,
+        head_sha=approved_head,
+        base=config.integration_branch,
+        base_sha=approved_base,
     )
     print(f"Merged approved Issue #{issue.number} PR: {merged.pr.url}", flush=True)
 
@@ -555,21 +572,14 @@ def integration_delivery(
         )
         if not MERGE_FINAL:
             return ready
-        final_base = repo.synchronize_branch(config.main_branch)
-        if final_base.local_sha != ready.base_sha:
-            raise WorkerFailure("Ready final PR base changed before recovery merge")
-        merged = github.merge_pr(
-            ready.number,
-            expected_head=config.integration_branch,
-            expected_head_sha=ready.head_sha,
-            expected_base=config.main_branch,
-            expected_base_sha=ready.base_sha,
-        )
-        repo.advance_after_merge(
-            config.main_branch,
-            previous_sha=ready.base_sha,
-            merge_commit_sha=merged.merge_commit_sha,
-            required_commit_sha=ready.head_sha,
+        merged = merge_pr_and_advance(
+            repo,
+            github,
+            number=ready.number,
+            head=config.integration_branch,
+            head_sha=ready.head_sha,
+            base=config.main_branch,
+            base_sha=ready.base_sha,
         )
         return merged.pr
     pr = github.require_pr(
@@ -656,21 +666,14 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
     )
     if not MERGE_FINAL:
         return ready
-    final_base = repo.synchronize_branch(config.main_branch)
-    if final_base.local_sha != ready.base_sha:
-        raise WorkerFailure("final branch changed before approved merge")
-    merged = github.merge_pr(
-        ready.number,
-        expected_head=config.integration_branch,
-        expected_head_sha=ready.head_sha,
-        expected_base=config.main_branch,
-        expected_base_sha=ready.base_sha,
-    )
-    repo.advance_after_merge(
-        config.main_branch,
-        previous_sha=ready.base_sha,
-        merge_commit_sha=merged.merge_commit_sha,
-        required_commit_sha=ready.head_sha,
+    merged = merge_pr_and_advance(
+        repo,
+        github,
+        number=ready.number,
+        head=config.integration_branch,
+        head_sha=ready.head_sha,
+        base=config.main_branch,
+        base_sha=ready.base_sha,
     )
     return merged.pr
 
