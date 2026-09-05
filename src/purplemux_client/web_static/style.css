@@ -259,8 +259,24 @@ a { color: #bcaaff; }
 .progress-marker { color: #ffd66b; line-height: 1.4; text-align: center; }
 .progress-item.completed .progress-marker { color: #75e2a8; }
 .progress-item.failed .progress-marker { color: #ff9ca8; }
+.progress-details {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  column-gap: 12px;
+  min-width: 0;
+}
 .progress-label { font-size: 14px; line-height: 1.4; }
-.progress-note, .progress-reference { color: #9ba3b5; font-size: 12px; }
+.progress-time {
+  color: #9ba3b5;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.progress-note, .progress-reference {
+  grid-column: 1 / -1;
+  color: #9ba3b5;
+  font-size: 12px;
+}
 .progress-item.failed .progress-note { color: #ffb3bc; }
 
 .output-section { margin-top: 14px; }
