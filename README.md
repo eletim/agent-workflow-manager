@@ -51,6 +51,35 @@ runtime dependency and none of its workflow framework is included here.
 - PurpleMux is an agent runtime.
 - The local runner executes, observes, and stops Python processes.
 
+## Issue Driven mode
+
+The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts
+only a small JSON configuration, validates it separately from Python, and
+deterministically expands it into the canonical sequential plain-Python workflow.
+The generated Python is visible for inspection and is then passed unchanged to the
+existing Static Validation, Dry Run, and Run path. JSON is configuration, not an
+executable DSL, and there is no Issue Driven runtime or UI-side control-flow model.
+
+```json
+{
+  "mode": "issue-driven",
+  "repository": "~/DevEnv/project",
+  "integration_branch": "dev/v0.2.0",
+  "final_branch": "main",
+  "issues": [90, 89],
+  "max_reviews": 8,
+  "merge_to_integration": true,
+  "final_review": true,
+  "merge_final": false
+}
+```
+
+All fields except the optional, fixed `mode` discriminator are required. Issue
+numbers are positive, unique, and retain their array order. Unknown fields are
+rejected so generic actions, conditions, loops, and nested executable blocks cannot
+grow into a second workflow language. With `merge_final: false`, the generated
+final control flow makes the integration PR Ready but contains no final merge call.
+
 ## Git and GitHub topology operations
 
 Plain Python workflows can enforce repository and pull-request structure through
@@ -103,6 +132,10 @@ pull_request = github.require_pr(
     expected_head_sha=feature.remote_sha,
 )
 ```
+
+When a workflow does not already know the repository slug, omitting
+`expected_github_slug` derives and pins it from the validated GitHub origin. The
+origin is still rechecked on every topology operation.
 
 The Workflow similarly creates or reuses the exact Draft PR when the agent did
 not create one, then verifies its head, base, SHAs, and Draft state before

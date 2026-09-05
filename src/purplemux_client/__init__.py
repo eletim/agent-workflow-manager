@@ -36,6 +36,13 @@ from purplemux_client.github import (
     PullRequestState,
     PullRequestTopologyError,
 )
+from purplemux_client.issue_driven import (
+    IssueDrivenConfig,
+    IssueDrivenFinding,
+    IssueDrivenValidationError,
+    generate_issue_driven_workflow,
+    parse_issue_driven_json,
+)
 from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
     ResumeCheckpoint,
@@ -56,6 +63,9 @@ __all__ = [
     "GitHubRepository",
     "GitRepository",
     "IncompletePullRequestEnumeration",
+    "IssueDrivenConfig",
+    "IssueDrivenFinding",
+    "IssueDrivenValidationError",
     "MergeResult",
     "MutationConflict",
     "MutationOutcomeUnknown",
@@ -80,6 +90,8 @@ __all__ = [
     "emit_step",
     "emit_finding",
     "inspect_run_repository",
+    "generate_issue_driven_workflow",
+    "parse_issue_driven_json",
     "prepare_run_repository",
     "register_run_resource",
     "run_correlation",

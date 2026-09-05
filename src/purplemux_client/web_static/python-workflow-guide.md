@@ -16,6 +16,23 @@ security, and cross-feature behavior may appear only after approved changes are
 combined. The final PR becomes Ready only after that review approves it and is
 never merged into `main` automatically.
 
+## Issue Driven generation
+
+Issue Driven mode is a deterministic authoring aid in front of this same contract.
+It validates a deliberately small JSON object (repository, integration/final
+branches, ordered Issue numbers, bounded review count, and merge/review policies),
+then displays a complete generated plain-Python workflow. Static Validation, Dry
+Run, and Run operate on that generated Python through the existing Runner path.
+The JSON is never interpreted as runtime control flow, and it has no generic
+actions, conditions, loops, graph edges, or executable nesting.
+
+The generated workflow uses the canonical commit-and-clean CodingAgent
+postcondition, fills safe push/Draft-PR gaps before independent review, and uses
+Runner-scoped correlation through named PurpleMux resources and
+`run_correlation()`. It does not generate UUIDs or correlation tokens. With
+`merge_final: false`, it generates no final-branch merge call. The displayed
+Python remains the sole execution and control-flow source of truth.
+
 ## Architecture and responsibility
 
 ```text
