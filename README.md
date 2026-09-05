@@ -112,16 +112,18 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Capture the pre-turn SHA before invoking the CodingAgent. Its hard
-# postcondition is a new commit on the expected branch and a clean worktree.
+# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told
+# to commit, push, create or update one exact Draft PR, and leave a clean
+# worktree. The Workflow independently verifies each delivery postcondition.
 turn_start_sha = feature.local_sha
 # ... run the CodingAgent ...
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
 )
-# Push is orchestration-owned gap absorption. This only creates the exact
-# remote branch or fast-forwards it; remote-ahead/diverged states fail closed.
+# Push is also orchestration-owned gap absorption if the agent omitted it. This
+# only creates the exact remote branch or fast-forwards it; remote-ahead or
+# diverged states fail closed.
 feature = repo.ensure_pushed(
     "feature/issue-123",
     expected_local_sha=feature.local_sha,
@@ -143,6 +145,17 @@ review. A dirty agent result cannot advance. A review-fix turn normally has the
 same new-commit/clean contract; if the implementer explicitly re-evaluates a
 finding and returns clean without a commit, the Workflow records a WARN policy
 outcome rather than pretending that the reviewer approved it.
+
+At a required clean-worktree boundary, a dirty state receives one focused
+CodingAgent remediation turn before failure. That turn may commit intended
+source, test, or configuration work, add narrow ignores for generated artifacts,
+or remove only clearly disposable generated files. It cannot push, change PR
+state, merge, start a review, reset, stash, rebase, force, or discard uncertain
+work. The Workflow re-inspects the worktree and reports remaining paths when the
+state cannot be resolved safely; an already-clean path does not invoke cleanup.
+If review or final checks introduce a commit, the Workflow pushes and rebinds the
+exact Draft PR, invalidates the prior approval, and repeats review and checks
+before making the PR Ready.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,
