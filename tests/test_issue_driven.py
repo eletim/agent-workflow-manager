@@ -51,6 +51,8 @@ def test_valid_json_preserves_issue_order() -> None:
         (json.dumps(payload(issues=[90, 90])), "$.issues[1]"),
         (json.dumps(payload(max_reviews=0)), "$.max_reviews"),
         (json.dumps(payload(integration_branch="bad..branch")), "$.integration_branch"),
+        (json.dumps(payload(integration_branch="foo.lock/bar")), "$.integration_branch"),
+        (json.dumps(payload(integration_branch="bad\u007fbranch")), "$.integration_branch"),
         (json.dumps(payload(merge_final="false")), "$.merge_final"),
         (json.dumps(payload(extra=True)), "$.extra"),
         ('{"repository":"a","repository":"b"}', "$.repository"),

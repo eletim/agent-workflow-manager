@@ -431,6 +431,41 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.deepEqual(outlineLabels(elements), ["generated"]);
 });
 
+test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {
+  const first = deferred();
+  const second = deferred();
+  let requestNumber = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/issue-driven/generate") return undefined;
+      requestNumber += 1;
+      return requestNumber === 1 ? first.promise : second.promise;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[90]}';
+  const firstGeneration = elements["issue-driven-generate"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[91]}';
+  const secondGeneration = elements["issue-driven-generate"].dispatch("click");
+  second.resolve(response({
+    generatedCode: "# generated for 91",
+    issueDrivenValidation: [],
+  }));
+  await secondGeneration;
+  first.resolve(response({
+    generatedCode: "# generated for 90",
+    issueDrivenValidation: [],
+  }));
+  await firstGeneration;
+
+  assert.equal(elements["issue-driven-json"].value, '{"issues":[91]}');
+  assert.equal(elements["issue-driven-python"].value, "# generated for 91");
+});
+
 test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async () => {
   const generatedCode = "WORKFLOW_DRY_RUN = 1\nprint('generated')";
   const submissions = [];

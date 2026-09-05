@@ -62,14 +62,22 @@ _ALLOWED_FIELDS = _REQUIRED_FIELDS | {"mode"}
 
 def _valid_branch_name(value: str) -> bool:
     forbidden = set(" ~^:?*[\\")
+    components = value.split("/")
     return not (
-        value.startswith(("-", ".", "/"))
+        value == "@"
+        or value.startswith(("-", ".", "/"))
         or value.endswith((".", "/", ".lock"))
         or ".." in value
         or "@{" in value
         or "//" in value
-        or any(character in forbidden or ord(character) < 32 for character in value)
-        or any(component.startswith(".") for component in value.split("/"))
+        or any(
+            character in forbidden or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+        or any(
+            component.startswith(".") or component.endswith(".lock")
+            for component in components
+        )
     )
 
 

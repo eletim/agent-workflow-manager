@@ -119,6 +119,7 @@ let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
+let issueDrivenRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
@@ -860,18 +861,36 @@ function renderIssueDrivenValidation(findings) {
 }
 
 async function generateIssueDrivenCode() {
+  const requestGeneration = ++issueDrivenRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
+  const source = issueDrivenJson.value;
   try {
     const result = await request("/api/issue-driven/generate", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({json: issueDrivenJson.value}),
+      body: JSON.stringify({json: source}),
     });
-    issueDrivenPython.value = result.generatedCode;
-    issueDrivenDraft = {json: issueDrivenJson.value, code: result.generatedCode};
-    renderIssueDrivenValidation(result.issueDrivenValidation || []);
+    if (
+      requestGeneration === issueDrivenRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
+      && currentMode === "issue-driven"
+      && issueDrivenJson.value === source
+    ) {
+      issueDrivenPython.value = result.generatedCode;
+      issueDrivenDraft = {json: source, code: result.generatedCode};
+      renderIssueDrivenValidation(result.issueDrivenValidation || []);
+    }
     return result.generatedCode;
   } catch (error) {
-    if (Array.isArray(error.result?.issueDrivenValidation)) {
+    if (
+      requestGeneration === issueDrivenRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null
+      && currentMode === "issue-driven"
+      && issueDrivenJson.value === source
+      && Array.isArray(error.result?.issueDrivenValidation)
+    ) {
       renderIssueDrivenValidation(error.result.issueDrivenValidation);
     }
     throw error;
