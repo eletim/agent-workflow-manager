@@ -13,6 +13,11 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 from purplemux_client.errors import TerminalSessionError
+from purplemux_client.issue_driven import (
+    IssueDrivenValidationError,
+    generate_issue_driven_workflow,
+    parse_issue_driven_json,
+)
 from purplemux_client.notification_settings import (
     NotificationSettings,
     SettingsError,
@@ -381,6 +386,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/run",
             "/api/validate",
             "/api/dry-run",
+            "/api/issue-driven/generate",
             "/api/readiness/probe",
             "/api/readiness/reconcile",
             "/api/settings/notifications",
@@ -448,6 +454,40 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.ACCEPTED,
                 {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
+            )
+            return
+        if path == "/api/issue-driven/generate":
+            payload = self._read_json()
+            if payload is None:
+                return
+            source = payload.get("json")
+            if not isinstance(source, str) or set(payload) != {"json"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain only a JSON source string"},
+                )
+                return
+            try:
+                config = parse_issue_driven_json(source)
+                code = generate_issue_driven_workflow(config)
+            except IssueDrivenValidationError as exc:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": str(exc),
+                        "issueDrivenValidation": [
+                            finding.as_json() for finding in exc.findings
+                        ],
+                    },
+                )
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "config": config.as_json(),
+                    "generatedCode": code,
+                    "issueDrivenValidation": [],
+                },
             )
             return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:

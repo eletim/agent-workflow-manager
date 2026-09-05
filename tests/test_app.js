@@ -196,7 +196,9 @@ async function loadApp({
   clipboardOverride = null,
 }) {
   const ids = [
-    "code", "run-arguments", "prompt-mode", "workflow-mode", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
+    "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
+    "issue-driven-success", "issue-driven-validation",
     "workflow-fields", "prompt-agent", "prompt-cwd", "prompt-text",
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
@@ -389,6 +391,124 @@ test("Prompt mode shows only one-shot inputs and submits them directly", async (
   assert.match(elements["active-context"].textContent, /Prompt Run #1/);
   assert.equal(elements["prompt-text"].readOnly, true);
   assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+});
+
+test("Issue Driven mode generates Python before existing Static Validation", async () => {
+  const generatedCode = "WORKFLOW_OUTLINE = ['generated']\nprint('ok')";
+  let generatedSource = null;
+  let validatedPayload = null;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {validation: [], outline: ["generated"]}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/issue-driven/generate") {
+        generatedSource = JSON.parse(options.body).json;
+        return response({
+          config: {mode: "issue-driven"},
+          generatedCode,
+          issueDrivenValidation: [],
+        });
+      }
+      if (url === "/api/validate") {
+        validatedPayload = JSON.parse(options.body);
+        return response({validation: [], outline: ["generated"]});
+      }
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[90,89]}';
+  await elements.validate.dispatch("click");
+
+  assert.equal(elements["issue-driven-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(generatedSource, '{"issues":[90,89]}');
+  assert.equal(elements["issue-driven-python"].value, generatedCode);
+  assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
+  assert.equal(elements["issue-driven-success"].hidden, false);
+  assert.deepEqual(outlineLabels(elements), ["generated"]);
+});
+
+test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {
+  const first = deferred();
+  const second = deferred();
+  let requestNumber = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/issue-driven/generate") return undefined;
+      requestNumber += 1;
+      return requestNumber === 1 ? first.promise : second.promise;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[90]}';
+  const firstGeneration = elements["issue-driven-generate"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[91]}';
+  const secondGeneration = elements["issue-driven-generate"].dispatch("click");
+  second.resolve(response({
+    generatedCode: "# generated for 91",
+    issueDrivenValidation: [],
+  }));
+  await secondGeneration;
+  first.resolve(response({
+    generatedCode: "# generated for 90",
+    issueDrivenValidation: [],
+  }));
+  await firstGeneration;
+
+  assert.equal(elements["issue-driven-json"].value, '{"issues":[91]}');
+  assert.equal(elements["issue-driven-python"].value, "# generated for 91");
+});
+
+test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async () => {
+  const generatedCode = "WORKFLOW_DRY_RUN = 1\nprint('generated')";
+  const submissions = [];
+  const started = snapshot({
+    runId: 12,
+    state: "running",
+    stdout: "",
+    code: generatedCode,
+  });
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode, issueDrivenValidation: []});
+      }
+      if (url === "/api/dry-run") {
+        submissions.push([url, JSON.parse(options.body)]);
+        return response({
+          validation: [],
+          outline: [],
+          dryRun: {status: "complete", findings: [], nextMutation: null},
+        });
+      }
+      if (url === "/api/run") {
+        submissions.push([url, JSON.parse(options.body)]);
+        return response(started, 202);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = "{}";
+  await elements["dry-run"].dispatch("click");
+  await elements.run.dispatch("click");
+
+  assert.deepEqual(submissions, [
+    ["/api/dry-run", {code: generatedCode, args: []}],
+    ["/api/run", {code: generatedCode, args: []}],
+  ]);
+  assert.match(elements["active-context"].textContent, /Workflow Run #12/);
 });
 
 test("Prompt directory picker navigates and selects its resolved current path", async () => {

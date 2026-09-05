@@ -114,6 +114,18 @@ def open_repo(work: Path, runner: RecordingGitRunner) -> GitRepository:
     return GitRepository.open(work, expected_github_slug="acme/project", runner=runner)
 
 
+def test_open_can_pin_identity_from_the_validated_github_origin(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    runner = RecordingGitRunner("acme/inferred")
+
+    repository = GitRepository.open(work, runner=runner)
+
+    assert repository.expected_github_slug == "acme/inferred"
+    assert runner.calls.count(["git", "remote", "get-url", "origin"]) >= 2
+
+
 def test_safe_synchronize_prepare_and_read_only_require_pushed(
     repositories: tuple[Path, Path, Path],
 ) -> None:

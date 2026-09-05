@@ -121,18 +121,33 @@ class GitRepository:
         path: str | Path,
         *,
         remote: str = "origin",
-        expected_github_slug: str,
+        expected_github_slug: str | None = None,
         command_timeout_seconds: float = 30.0,
         runner: GitCommandRunner = subprocess.run,
     ) -> GitRepository:
         if not remote or "\0" in remote or remote.startswith("-"):
             raise ValueError("remote must be a non-empty name")
-        _require_slug(expected_github_slug)
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
         root = Path(path).expanduser().resolve()
         if not root.is_dir():
             raise WorkerFailure(f"repository directory does not exist: {root}")
+        if expected_github_slug is None:
+            completed = runner(
+                ["git", "remote", "get-url", remote],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout_seconds,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise WorkerFailure(
+                    f"could not read Git remote {remote!r}: {detail or 'git failed'}"
+                )
+            expected_github_slug = github_origin_slug(completed.stdout.strip())
+        _require_slug(expected_github_slug)
         repository = cls(
             root=root,
             remote=remote,

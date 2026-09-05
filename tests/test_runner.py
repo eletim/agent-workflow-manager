@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import http.client
 import json
 import os
@@ -2219,6 +2220,7 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
     assert response.status == 200
     for element_id in (
         "prompt-mode",
+        "issue-driven-mode",
         "workflow-mode",
         "prompt-agent",
         "prompt-cwd",
@@ -2228,8 +2230,54 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         "directory-picker-path",
         "directory-picker-parent",
         "directory-picker-select",
+        "issue-driven-fields",
+        "issue-driven-json",
+        "issue-driven-python",
+        "issue-driven-generate",
     ):
         assert f'id="{element_id}"' in page
+
+
+def test_issue_driven_generation_api_is_distinct_from_python_validation(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    source = json.dumps(
+        {
+            "repository": "/tmp/example",
+            "integration_branch": "dev/v0.2.0",
+            "final_branch": "main",
+            "issues": [90, 89],
+            "max_reviews": 8,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
+
+    status, generated = request(
+        address,
+        "POST",
+        "/api/issue-driven/generate",
+        json.dumps({"json": source}),
+        token=token,
+    )
+
+    assert status == 200
+    assert generated["issueDrivenValidation"] == []
+    assert generated["config"]["mode"] == "issue-driven"
+    ast.parse(generated["generatedCode"])
+
+    status, rejected = request(
+        address,
+        "POST",
+        "/api/issue-driven/generate",
+        json.dumps({"json": "{}"}),
+        token=token,
+    )
+    assert status == 422
+    assert rejected["error"] == "issue-driven JSON validation failed"
+    assert rejected["issueDrivenValidation"]
 
 
 def test_runner_page_exposes_agent_workflow_manager_favicon(

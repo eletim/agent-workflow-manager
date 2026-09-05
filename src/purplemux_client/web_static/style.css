@@ -136,6 +136,15 @@ textarea {
 }
 .prompt-fields { margin-top: 6px; }
 #prompt-text { min-height: 220px; }
+#issue-driven-json { min-height: 260px; }
+#issue-driven-python { min-height: 330px; margin-top: 8px; }
+.generated-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
 .prompt-cwd-control { display: flex; gap: 7px; }
 .prompt-cwd-control input { flex: 1; }
 #directory-picker-open { flex: 0 0 auto; padding: 8px 11px; }
