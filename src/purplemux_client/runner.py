@@ -193,6 +193,10 @@ class RunCleanupInProgressError(RuntimeError):
     """Raised when cleanup is already active for the selected run."""
 
 
+class RunStopUncertainError(RuntimeError):
+    """Raised when PurpleMux cannot prove that a stopped Workflow terminated."""
+
+
 @dataclass(frozen=True)
 class RunResource:
     kind: str
@@ -877,6 +881,20 @@ class PythonRunner:
                 f"Workflow {run_id}: Python [awm:{correlation}]",
             )
         except BaseException as exc:
+            if (
+                client is not None
+                and workspace_id is not None
+                and created_tab_id is not None
+                and result_path is not None
+            ):
+                self._attach_managed_shell(
+                    run,
+                    client,
+                    workspace_id,
+                    created_tab_id,
+                    result_path,
+                    f"Workflow {run_id}: Python [awm:{correlation}]",
+                )
             self._fail_managed_launch(run, exc)
             return run_id
         wait_thread = threading.Thread(
@@ -1188,12 +1206,17 @@ class PythonRunner:
             managed_tab_id = run.managed_tab_id
 
         if managed_client is not None and managed_tab_id is not None:
+            lifecycle_error: BaseException | None = None
             try:
                 managed_client.interrupt(managed_tab_id)
                 managed_client.wait_for_shell_completion(
                     managed_tab_id, self._stop_timeout
                 )
+                result = managed_client.read_shell_result(managed_tab_id)
+                self._finish_managed_workflow(run, result.exit_code)
+                return True
             except Exception as exc:
+                lifecycle_error = exc
                 logger.warning(
                     "Workflow tab %s did not publish a result after interrupt; "
                     "closing it: %s",
@@ -1202,8 +1225,17 @@ class PythonRunner:
                 )
                 try:
                     managed_client.close_session(managed_tab_id)
-                finally:
-                    self._finish_managed_workflow(run, 130, diagnostic=str(exc))
+                except Exception as close_exc:
+                    message = (
+                        f"Workflow termination is uncertain after interrupt/result "
+                        f"failure ({lifecycle_error}) and tab-close failure "
+                        f"({close_exc})"
+                    )
+                    self._record_managed_uncertainty(run, message)
+                    raise RunStopUncertainError(message) from close_exc
+                self._finish_managed_workflow(
+                    run, 130, diagnostic=f"Workflow tab closed after: {exc}"
+                )
             return True
         self._terminate_process_group(run)
         return True
@@ -2047,15 +2079,19 @@ class PythonRunner:
             )
             self._finish_managed_workflow(run, result.exit_code, diagnostic=diagnostic)
         except Exception as exc:
-            self._finish_managed_workflow(
-                run, 130 if run.stop_requested else 1, diagnostic=str(exc)
+            self._record_managed_uncertainty(
+                run, f"Workflow result observation is uncertain: {exc}"
             )
         finally:
-            run.script_path.unlink(missing_ok=True)
-            if run.credential_path is not None:
-                run.credential_path.unlink(missing_ok=True)
             with self._lock:
                 self._wait_threads.discard(threading.current_thread())
+
+    def _record_managed_uncertainty(self, run: _RunRecord, diagnostic: str) -> None:
+        with self._lock:
+            if run.state != "running":
+                return
+            self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
+            self._mark_changed()
 
     def _finish_managed_workflow(
         self, run: _RunRecord, exit_code: int, *, diagnostic: str | None = None
@@ -2082,6 +2118,9 @@ class PythonRunner:
             )
             terminal_state = run.state
             self._mark_changed()
+        run.script_path.unlink(missing_ok=True)
+        if run.credential_path is not None:
+            run.credential_path.unlink(missing_ok=True)
         self._notify_terminal(
             run_id=run.run_id, state=terminal_state, exit_code=exit_code
         )

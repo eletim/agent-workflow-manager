@@ -37,6 +37,7 @@ from purplemux_client.runner import (
     RunCleanupInProgressError,
     RunCleanupNotAllowedError,
     RunNotFoundError,
+    RunStopUncertainError,
     WorkflowDryRunError,
     WorkflowValidationError,
 )
@@ -635,7 +636,18 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"probe": result.as_json()})
             return
         if path == "/api/stop":
-            stopped = self.server.runner.stop()
+            try:
+                stopped = self.server.runner.stop()
+            except RunStopUncertainError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": str(exc),
+                        "stopped": False,
+                        **self.server.runner.snapshot().as_json(),
+                    },
+                )
+                return
             self._send_json(
                 HTTPStatus.ACCEPTED if stopped else HTTPStatus.CONFLICT,
                 {
@@ -652,6 +664,16 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 snapshot = self.server.runner.snapshot(run_id)
             except RunNotFoundError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except RunStopUncertainError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": str(exc),
+                        "stopped": False,
+                        **self.server.runner.snapshot(run_id).as_json(),
+                    },
+                )
                 return
             self._send_json(
                 HTTPStatus.ACCEPTED if stopped else HTTPStatus.CONFLICT,

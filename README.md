@@ -287,7 +287,9 @@ idle/running/success/failed/stopped/validation_failed state. Validate remains a
 side-effect-free static check and Dry Run remains a pre-execution local
 inspection. Run performs preflight before creating the PurpleMux workspace and
 tab. Stop uses the public PurpleMux interrupt/result lifecycle, closing the tab
-only if needed to reach a deterministic stopped state.
+only if needed to reach a deterministic stopped state. If neither structured
+completion nor tab closure can be confirmed, AWM reports the uncertainty and
+keeps the run non-terminal so events remain accepted and Cleanup stays disabled.
 
 Failed and stopped runs remain available for inspection, including their output
 and run-owned resources, but are never continued in place. Recovery starts a new

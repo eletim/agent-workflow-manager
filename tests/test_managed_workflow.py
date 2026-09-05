@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import http.client
+import json
+import shutil
 import tempfile
 import threading
 import time
@@ -17,6 +20,7 @@ from purplemux_client.client import (
     TabState,
     WorkspaceState,
 )
+from purplemux_client.errors import MutationOutcomeUnknown, WorkerFailure
 from purplemux_client.progress import (
     EVENT_TOKEN_ENV,
     EVENT_URL_ENV,
@@ -33,12 +37,17 @@ class _ManagedClient:
         self.exit_code = 0
         self.request: ShellCommandRequest | None = None
         self.interrupted = False
+        self.start_error: BaseException | None = None
+        self.wait_error: BaseException | None = None
+        self.close_error: BaseException | None = None
 
     def start_shell(self, request, *, on_created=None):  # type: ignore[no-untyped-def]
         self.request = request
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         if on_created is not None:
             on_created("tab-workflow", str(Path(result_dir) / "result.json"))
+        if self.start_error is not None:
+            raise self.start_error
         return "tab-workflow"
 
     def list_sessions(self) -> tuple[TabState, ...]:
@@ -57,6 +66,8 @@ class _ManagedClient:
         self, session_id: str, timeout_seconds: float
     ) -> None:
         assert session_id == "tab-workflow"
+        if self.wait_error is not None:
+            raise self.wait_error
         assert self.release.wait(timeout=3)
 
     def read_shell_result(self, session_id: str) -> ShellResult:
@@ -71,6 +82,8 @@ class _ManagedClient:
 
     def close_session(self, session_id: str) -> None:
         assert session_id == "tab-workflow"
+        if self.close_error is not None:
+            raise self.close_error
         self.release.set()
 
 
@@ -202,4 +215,83 @@ def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) 
         assert client.interrupted is True
         assert stopped.exit_code == 130
     finally:
+        runner.close()
+
+
+def test_uncertain_stop_stays_running_and_http_reports_error(tmp_path: Path) -> None:
+    client = _ManagedClient()
+    client.wait_error = WorkerFailure("result unavailable")
+    client.close_error = MutationOutcomeUnknown("close outcome unknown")
+    runtime = _ManagedRuntime(client)
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        runtime_factory=lambda: runtime,  # type: ignore[arg-type]
+    )
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        run_id = runner.start("print('possibly still running')")
+        connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+        connection.request(
+            "POST",
+            f"/api/runs/{run_id}/stop",
+            body=b"",
+            headers={"X-Python-Runner-Token": server.request_token},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        connection.close()
+
+        assert response.status == 502
+        assert payload["stopped"] is False
+        assert payload["state"] == "running"
+        assert payload["cleanupAvailable"] is False
+        assert "termination is uncertain" in payload["error"]
+        snapshot = runner.snapshot(run_id)
+        assert snapshot.state == "running"
+        assert snapshot.exit_code is None
+        assert snapshot.attempts == ()
+        run = runner._runs[run_id]
+        assert run.credential_path is not None and run.credential_path.exists()
+
+        client.wait_error = None
+        client.close_error = None
+        client.exit_code = 130
+        client.release.set()
+        assert runner.stop(run_id) is True
+        assert _wait_for_state(runner, "stopped").exit_code == 130
+        assert not run.credential_path.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_authoritative_start_failure_tracks_created_tab_and_result(
+    tmp_path: Path,
+) -> None:
+    client = _ManagedClient()
+    client.start_error = WorkerFailure("command was rejected")
+    runtime = _ManagedRuntime(client)
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        runtime_factory=lambda: runtime,  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    try:
+        run_id = runner.start("print('not started')")
+        failed = runner.snapshot(run_id)
+
+        assert failed.state == "failed"
+        assert [resource.kind for resource in failed.resources] == [
+            "purplemux_workspace",
+            "purplemux_tab",
+            "managed_shell_result",
+        ]
+        assert failed.as_json()["cleanupAvailable"] is True
+    finally:
+        snapshot = runner.snapshot()
+        if len(snapshot.resources) >= 3:
+            shutil.rmtree(snapshot.resources[2].identity, ignore_errors=True)
         runner.close()
