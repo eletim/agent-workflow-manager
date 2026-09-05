@@ -58,6 +58,8 @@ _REQUIRED_FIELDS = {
     "merge_final",
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | {"mode"}
+# Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
+_MAX_WORKFLOW_OUTLINE_ITEMS = 100
 
 
 def _valid_branch_name(value: str) -> bool:
@@ -140,6 +142,16 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     if not isinstance(issues, list) or not issues:
         findings.append(IssueDrivenFinding("$.issues", "must be a non-empty array"))
     else:
+        reserved_outline_items = 2 if value.get("final_review") is True else 1
+        max_issues = _MAX_WORKFLOW_OUTLINE_ITEMS - reserved_outline_items
+        if len(issues) > max_issues:
+            findings.append(
+                IssueDrivenFinding(
+                    "$.issues",
+                    f"must contain at most {max_issues} items when "
+                    f"final_review is {value.get('final_review')!r}",
+                )
+            )
         seen: set[int] = set()
         for index, issue in enumerate(issues):
             if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:

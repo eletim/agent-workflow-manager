@@ -15,7 +15,7 @@ from purplemux_client.issue_driven import (
     generate_issue_driven_workflow,
     parse_issue_driven_json,
 )
-from purplemux_client.preflight import WorkflowValidator
+from purplemux_client.preflight import MAX_OUTLINE_ITEMS, WorkflowValidator
 
 
 def payload(**overrides: object) -> dict[str, object]:
@@ -43,6 +43,35 @@ def test_valid_json_preserves_issue_order() -> None:
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+
+
+@pytest.mark.parametrize(
+    ("final_review", "maximum"),
+    [(True, MAX_OUTLINE_ITEMS - 2), (False, MAX_OUTLINE_ITEMS - 1)],
+)
+def test_issue_count_reserves_final_outline_entries(
+    final_review: bool, maximum: int
+) -> None:
+    accepted = parse(
+        payload(issues=list(range(1, maximum + 1)), final_review=final_review)
+    )
+
+    assert len(accepted.issues) == maximum
+    result = WorkflowValidator(check_timeout=10).validate(
+        generate_issue_driven_workflow(accepted)
+    )
+    assert result.valid, result.issues
+    assert len(result.outline) == MAX_OUTLINE_ITEMS
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(issues=list(range(1, maximum + 2)), final_review=final_review))
+
+    expected_message = (
+        f"must contain at most {maximum} items when final_review is {final_review!r}"
+    )
+    assert ("$.issues", expected_message) in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
 
 
 @pytest.mark.parametrize("key", ["integration_branch", "final_branch"])
