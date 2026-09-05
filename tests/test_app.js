@@ -93,8 +93,6 @@ function snapshot({
   stderrEntries = [],
   outline = [],
   progress = null,
-  resumable = false,
-  checkpoint = null,
   attempts = [],
   cwd = `/work/run-${runId}`,
   args = [],
@@ -108,20 +106,17 @@ function snapshot({
   const result = {
     args,
     attempts,
-    checkpoint,
     code,
     cwd,
     exitCode: state === "running" ? null : 1,
     outline,
     progress: progress || [{name: `step-${runId}`, status: "completed"}],
-    resumable,
     runId,
     state,
     stderr: `stderr-${runId}`,
     stderrEntries,
     stdout,
     stdoutEntries,
-    suspensionReason: null,
     validation: [],
     dryRun: null,
     dryRunEligible: true,
@@ -204,7 +199,7 @@ async function loadApp({
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
     "active-context", "run-list",
-    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
+    "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
@@ -215,7 +210,7 @@ async function loadApp({
     "refresh-readiness", "readiness-summary", "readiness-details",
     "readiness-result-provider", "readiness-identity", "readiness-tab", "readiness-state",
     "readiness-cleanup", "readiness-guidance",
-    "guide-open", "guide-close", "guide-copy",
+    "guide-open", "guide-close", "guide-copy", "guide-title", "guide-raw",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
@@ -378,7 +373,6 @@ test("Prompt mode shows only one-shot inputs and submits them directly", async (
   assert.equal(elements["workflow-fields"].hidden, true);
   assert.equal(elements.validate.hidden, true);
   assert.equal(elements["dry-run"].hidden, true);
-  assert.equal(elements.resume.hidden, true);
   assert.equal(elements.cleanup.hidden, true);
   assert.equal(elements["guide-open"].hidden, true);
 
@@ -429,6 +423,66 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
   assert.equal(elements["issue-driven-success"].hidden, false);
   assert.deepEqual(outlineLabels(elements), ["generated"]);
+});
+
+test("Issue Driven mode opens and copies its dedicated guide", async () => {
+  const clipboard = {
+    writes: [],
+    async writeText(text) { this.writes.push(text); },
+  };
+  const {elements, calls} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    clipboardOverride: clipboard,
+    fetchOverride(url) {
+      if (url === "/issue-driven-guide.md") return response("issue guide");
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Issue Driven Guide");
+  await elements["guide-open"].dispatch("click");
+
+  assert.equal(elements["guide-title"].textContent, "Issue Driven Guide");
+  assert.equal(elements["guide-raw"].href, "/issue-driven-guide.md");
+  assert.equal(elements["guide-content"].textContent, "issue guide");
+  assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
+    ["/issue-driven-guide.md", "GET"],
+  ]);
+
+  await elements["guide-copy"].dispatch("click");
+  assert.deepEqual(clipboard.writes, ["issue guide"]);
+});
+
+test("stale guide failure cannot replace the active guide", async () => {
+  const workflowGuide = deferred();
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/python-workflow-guide.md") return workflowGuide.promise;
+      if (url === "/issue-driven-guide.md") return response("issue guide");
+      return undefined;
+    },
+  });
+
+  const staleRequest = elements["guide-open"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  await elements["guide-open"].dispatch("click");
+
+  assert.equal(elements["guide-content"].textContent, "issue guide");
+  assert.equal(elements["guide-copy"].disabled, false);
+
+  workflowGuide.resolve(response("failed", 500));
+  await staleRequest;
+
+  assert.equal(elements["guide-title"].textContent, "Issue Driven Guide");
+  assert.equal(elements["guide-raw"].href, "/issue-driven-guide.md");
+  assert.equal(elements["guide-content"].textContent, "issue guide");
+  assert.equal(elements["guide-copy"].disabled, false);
 });
 
 test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {
@@ -874,7 +928,6 @@ test("run rows render independent decorative indicators from textual states", as
     {runId: 2, state: "success", cwd: "/work/run-2"},
     {runId: 3, state: "failed", cwd: "/work/run-3"},
     {runId: 4, state: "stopped", cwd: "/work/run-4"},
-    {runId: 5, state: "suspended", cwd: "/work/run-5"},
   ];
   const details = Object.fromEntries(runs.map((run) => [
     run.runId,
@@ -910,7 +963,7 @@ test("state changes and selection update independently", async () => {
   await runItem(elements, 1).dispatch("click");
   assert.ok(runItem(elements, 1).className.includes("selected"));
 
-  for (const state of ["success", "failed", "stopped", "suspended"]) {
+  for (const state of ["success", "failed", "stopped"]) {
     runs[0] = {...runs[0], state};
     details[1] = {...details[1], state};
     eventSource.emit("runner-change");
@@ -922,7 +975,7 @@ test("state changes and selection update independently", async () => {
 
   await runItem(elements, 2).dispatch("click");
   assert.ok(runItem(elements, 2).className.includes("selected"));
-  assert.equal(markerState(elements, 1), "suspended");
+  assert.equal(markerState(elements, 1), "stopped");
   assert.equal(markerState(elements, 2), "success");
 });
 
@@ -978,18 +1031,21 @@ test("initial state loads through read APIs before any SSE event", async () => {
 });
 
 test("execution outline reflects matching progress and keeps dynamic progress", async () => {
+  const completedAt = "2026-09-05T01:02:03.123456+00:00";
+  const startedAt = "2026-09-05T01:03:04.123456+00:00";
+  const failedAt = "2026-09-05T01:04:05.123456+00:00";
   const current = snapshot({
     runId: 1,
     state: "running",
     stdout: "",
     outline: ["prepare", "implement", "review", "ready PR"],
     progress: [
-      {name: "prepare", status: "completed"},
-      {name: "implement", status: "started"},
-      {name: "dynamic check", status: "failed"},
+      {name: "prepare", status: "completed", observedAt: completedAt},
+      {name: "implement", status: "started", observedAt: startedAt},
+      {name: "dynamic check", status: "failed", observedAt: failedAt},
     ],
   });
-  const {elements} = await loadApp({
+  const {elements, logDisplay} = await loadApp({
     runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
     details: {1: current},
     validation: {status: 200, body: {validation: []}},
@@ -1009,6 +1065,20 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
   assert.deepEqual(
     elements.progress.children.map((item) => item.children[1].children[0].textContent),
     ["prepare", "implement", "dynamic check"],
+  );
+  assert.deepEqual(
+    elements.progress.children.map(
+      (item) => item.children[1].children[1].textContent,
+    ),
+    [completedAt, startedAt, failedAt].map(
+      (value) => logDisplay.formatObservedAt(value),
+    ),
+  );
+  assert.deepEqual(
+    elements.progress.children.map(
+      (item) => item.children[1].children[1].getAttribute("datetime"),
+    ),
+    [completedAt, startedAt, failedAt],
   );
 });
 
@@ -1168,11 +1238,17 @@ test("EventSource reconnect reconciles authoritative state", async () => {
 
 test("EventSource reconnect preserves authoritative historical timestamps", async () => {
   const observedAt = "2026-08-31T00:10:00.000000+00:00";
+  const progressObservedAt = "2026-08-31T00:09:30.123456+00:00";
   const run = snapshot({
     runId: 1,
     state: "running",
     stdout: "recorded earlier\n",
     stdoutEntries: [{observedAt, text: "recorded earlier\n"}],
+    progress: [{
+      name: "historical step",
+      status: "completed",
+      observedAt: progressObservedAt,
+    }],
   });
   const {calls, elements, eventSource, logDisplay} = await loadApp({
     runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
@@ -1180,6 +1256,8 @@ test("EventSource reconnect preserves authoritative historical timestamps", asyn
     validation: {status: 200, body: {validation: []}},
   });
   const renderedBeforeReconnect = elements.stdout.textContent;
+  const progressBeforeReconnect = elements.progress.children[0]
+    .children[1].children[1].textContent;
   const callsBeforeReconnect = calls.length;
 
   eventSource.emit("open");
@@ -1190,6 +1268,18 @@ test("EventSource reconnect preserves authoritative historical timestamps", asyn
     `${logDisplay.formatObservedAt(observedAt)}  recorded earlier\n`,
   );
   assert.equal(elements.stdout.textContent, renderedBeforeReconnect);
+  assert.equal(
+    progressBeforeReconnect,
+    logDisplay.formatObservedAt(progressObservedAt),
+  );
+  assert.equal(
+    elements.progress.children[0].children[1].children[1].textContent,
+    progressBeforeReconnect,
+  );
+  assert.equal(
+    elements.progress.children[0].children[1].children[1].getAttribute("datetime"),
+    progressObservedAt,
+  );
 });
 
 test("successful validation is explicit when no run exists", async () => {
@@ -1237,14 +1327,12 @@ test("validation issues replace success feedback", async () => {
   assert.equal(elements.validation.children[0].textContent, "Line 3: fix this import");
 });
 
-test("validation preserves a selected failed resumable run through refresh", async () => {
+test("validation preserves a selected failed run through refresh", async () => {
   const failed = snapshot({
     runId: 2,
     state: "failed",
     stdout: "failed run output",
-    resumable: true,
-    checkpoint: {name: "safe-step"},
-    attempts: [{number: 1, state: "failed", exitCode: 1, resumedFrom: null}],
+    attempts: [{number: 1, state: "failed", exitCode: 1}],
   });
   const {elements} = await loadApp({
     runs: [
@@ -1263,7 +1351,6 @@ test("validation preserves a selected failed resumable run through refresh", asy
 
   assert.match(selectedRun(elements).textContent, /^#2/);
   assert.equal(elements.stdout.textContent, "failed run output");
-  assert.equal(elements.resume.disabled, false);
   assert.equal(elements["recovery-panel"].hidden, false);
   // Viewing an existing run: Validate is a draft-only action, blocked until
   // "New run" is clicked, so it can never submit this run's own snapshot.
@@ -1280,7 +1367,6 @@ test("validation preserves a selected failed resumable run through refresh", asy
 
   assert.match(selectedRun(elements).textContent, /^#2/);
   assert.equal(elements.stdout.textContent, "failed run output");
-  assert.equal(elements.resume.disabled, false);
   assert.equal(elements["recovery-panel"].hidden, false);
   // Validation state is independent of run selection: it survives switching
   // through the draft and back to the run without being cleared or applied.
@@ -1373,7 +1459,6 @@ test("slow SSE refresh cannot replace a newly selected run", async () => {
   assert.equal(elements.stdout.textContent, "run one output");
   assert.deepEqual(outlineLabels(elements), ["run one plan"]);
   assert.equal(elements.stop.disabled, false);
-  assert.equal(elements.resume.disabled, true);
 });
 
 test("slow run action cannot replace a newly selected run", async () => {
@@ -1382,8 +1467,6 @@ test("slow run action cannot replace a newly selected run", async () => {
     runId: 1,
     state: "failed",
     stdout: "selected failed run",
-    resumable: true,
-    checkpoint: {name: "safe-step"},
   });
   const runTwo = snapshot({runId: 2, state: "running", stdout: "stopping run"});
   const {elements} = await loadApp({
@@ -1417,7 +1500,6 @@ test("slow run action cannot replace a newly selected run", async () => {
   assert.equal(elements.status.textContent, "failed");
   assert.equal(elements.stdout.textContent, "selected failed run");
   assert.equal(elements.stop.disabled, true);
-  assert.equal(elements.resume.disabled, false);
 });
 
 test("slow validation response cannot replace a newer validation result", async () => {
@@ -1679,7 +1761,6 @@ test("selecting a run never calls a mutating endpoint", async () => {
   const runA = snapshot({runId: 1, state: "success", stdout: "A"});
   const runB = snapshot({
     runId: 2, state: "failed", stdout: "B",
-    resumable: true, checkpoint: {name: "step"},
   });
   const {calls, elements} = await loadApp({
     runs: [
@@ -1724,10 +1805,7 @@ test("Run submission after returning to New run uses the draft, not a viewed run
         cwd: "/tmp/draft-dir",
         args: ["draft-arg"],
         code: "print('draft')",
-        checkpoint: null,
         attempts: [],
-        suspensionReason: null,
-        resumable: false,
       });
     },
   });

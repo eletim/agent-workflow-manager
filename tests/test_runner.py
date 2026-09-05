@@ -38,7 +38,6 @@ from purplemux_client.runner import (
     RunCleanupNotAllowedError,
     RunnerClosedError,
     RunnerSnapshot,
-    RunNotResumableError,
     RunResource,
 )
 from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
@@ -46,7 +45,7 @@ from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
 
 @pytest.fixture
 def runner() -> Iterator[PythonRunner]:
-    instance = PythonRunner(stop_timeout=0.5)
+    instance = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     yield instance
     instance.close()
 
@@ -81,6 +80,31 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     assert result.state == "success"
     assert result.stdout == "HELLO_RUNNER\n"
     assert result.stderr == ""
+
+
+def test_obsolete_recovery_metadata_is_ignored(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "PURPLEMUX_RUNNER_RESUME_CHECKPOINT",
+        '{"name":"old","data":{"workspace":"ws-old"}}',
+    )
+    code = """\
+import os
+print(os.environ.get("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", "ignored"))
+"""
+
+    run_id = runner.start(code)
+    result = wait_until_finished(runner)
+
+    assert result.run_id == run_id
+    assert result.state == "success"
+    assert result.stdout == "ignored\n"
+    assert not hasattr(runner, "resume")
+    assert (
+        PythonRunner._parse_runner_event('{"type":"checkpoint","name":"old","data":{}}')
+        is None
+    )
     assert "".join(entry.text for entry in result.stdout_entries) == result.stdout
     assert result.stderr_entries == ()
     observed_at = datetime.fromisoformat(result.stdout_entries[0].observed_at)
@@ -113,8 +137,8 @@ print(run_correlation("workspace"))
 
 
 def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
-    first_runner = PythonRunner(stop_timeout=0.5)
-    second_runner = PythonRunner(stop_timeout=0.5)
+    first_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    second_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     code = 'from purplemux_client import run_correlation; print(run_correlation("workspace"))'
     try:
         first_id = first_runner.start(code)
@@ -134,38 +158,6 @@ def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
         second_runner.close()
 
     assert first.stdout != second.stdout
-
-
-def test_resume_reuses_original_run_correlation_namespace(
-    runner: PythonRunner,
-) -> None:
-    code = """
-from purplemux_client import resume_checkpoint, run_correlation, save_checkpoint
-print("CORRELATION=" + run_correlation("workspace"))
-if resume_checkpoint() is None:
-    save_checkpoint("retry")
-    raise SystemExit(2)
-"""
-    run_id = runner.start(code)
-    failed = wait_for(
-        runner, lambda snapshot: snapshot.state == "failed", run_id=run_id
-    )
-    runner.resume(run_id)
-    resumed = wait_for(
-        runner, lambda snapshot: snapshot.state == "success", run_id=run_id
-    )
-
-    first = next(
-        line.removeprefix("CORRELATION=")
-        for line in failed.stdout.splitlines()
-        if line.startswith("CORRELATION=")
-    )
-    values = [
-        line.removeprefix("CORRELATION=")
-        for line in resumed.stdout.splitlines()
-        if line.startswith("CORRELATION=")
-    ]
-    assert values == [first, first]
 
 
 def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
@@ -375,51 +367,6 @@ def test_cleanup_rejects_running_workflow(runner: PythonRunner) -> None:
         runner.cleanup(run_id)
 
     assert runner.stop(run_id)
-
-
-def test_cleanup_serializes_resume_and_server_rejects_resume_after_cleanup(
-    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_id = runner.start(
-        """
-from purplemux_client import register_run_resource, save_checkpoint
-register_run_resource("managed_shell_result", "/tmp/awm-shell-owned", {
-    "result_path": "/tmp/awm-shell-owned/result.json", "tab_id": "tab-1"
-})
-save_checkpoint("resource ready", {"tab": "tab-1"})
-raise RuntimeError("repair first")
-"""
-    )
-    wait_until_finished(runner)
-    cleanup_started = threading.Event()
-    allow_cleanup = threading.Event()
-
-    def cleanup_resource(_resource: RunResource) -> None:
-        cleanup_started.set()
-        assert allow_cleanup.wait(2)
-
-    monkeypatch.setattr(runner, "_cleanup_resource", cleanup_resource)
-    cleanup_thread = threading.Thread(target=lambda: runner.cleanup(run_id))
-    resume_errors: list[BaseException] = []
-    resume_thread = threading.Thread(
-        target=lambda: _capture_exception(lambda: runner.resume(run_id), resume_errors)
-    )
-
-    cleanup_thread.start()
-    assert cleanup_started.wait(2)
-    resume_thread.start()
-    time.sleep(0.05)
-    assert resume_thread.is_alive()
-    allow_cleanup.set()
-    cleanup_thread.join(2)
-    resume_thread.join(2)
-
-    assert not cleanup_thread.is_alive()
-    assert not resume_thread.is_alive()
-    assert len(resume_errors) == 1
-    assert isinstance(resume_errors[0], RunNotResumableError)
-    assert "entered cleanup" in str(resume_errors[0])
-    assert runner.snapshot(run_id).state == "failed"
 
 
 def _capture_exception(
@@ -766,7 +713,7 @@ def test_empty_code(runner: PythonRunner) -> None:
 
 
 def test_run_uses_runner_controlled_cwd_and_records_args(tmp_path: Path) -> None:
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     runner.start(
         "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
         args=("--repo", "path with spaces"),
@@ -793,7 +740,7 @@ def test_runner_controlled_cwd_preserves_runner_environment(
         "PATH", os.pathsep.join((str(manager_venv / "bin"), str(target_bin)))
     )
 
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     runner.start(
         "import json, os; print(json.dumps([os.environ.get('VIRTUAL_ENV'), "
         "os.environ.get('PATH')]))"
@@ -823,13 +770,13 @@ def test_runner_rejects_non_directory_workflow_cwd(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
 
     with pytest.raises(InvalidExecutionContextError, match="not a directory"):
-        PythonRunner(workflow_cwd=missing)
+        PythonRunner(managed_workflows=False, workflow_cwd=missing)
 
 
 def test_preflight_resolves_relative_paths_from_runner_cwd(tmp_path: Path) -> None:
     (tmp_path / "input.txt").write_text("input", encoding="utf-8")
 
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     result = runner.validate("WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}")
     runner.close()
 
@@ -862,7 +809,7 @@ def test_change_revision_tracks_authoritative_observable_state(
     code = """\
 import time
 from pathlib import Path
-from purplemux_client import emit_step, save_checkpoint
+from purplemux_client import emit_step
 
 def wait_for(name):
     while not Path(name).exists():
@@ -872,8 +819,6 @@ wait_for("output")
 print("visible", flush=True)
 wait_for("progress")
 emit_step("observed", "completed")
-wait_for("checkpoint")
-save_checkpoint("safe", {"workspace": "ws-1"})
 wait_for("finish")
 """
     runner._workflow_cwd = tmp_path
@@ -890,21 +835,21 @@ wait_for("finish")
     changed = runner.wait_for_change(revision, timeout=2)
     assert changed is not None
     revision = changed
-    assert runner.snapshot(run_id).progress[-1].name == "observed"
-
-    (tmp_path / "checkpoint").touch()
-    changed = runner.wait_for_change(revision, timeout=2)
-    assert changed is not None
-    revision = changed
-    checkpoint = runner.snapshot(run_id).checkpoint
-    assert checkpoint is not None
-    assert checkpoint.name == "safe"
-    assert checkpoint.data == {"workspace": "ws-1"}
+    progress_snapshot = runner.snapshot(run_id)
+    progress_event = progress_snapshot.progress[-1]
+    assert progress_event.name == "observed"
+    assert progress_event.observed_at is not None
+    assert datetime.fromisoformat(progress_event.observed_at).tzinfo is not None
+    serialized_progress = progress_snapshot.as_json()["progress"]
+    assert isinstance(serialized_progress, list)
+    assert serialized_progress[-1]["observedAt"] == progress_event.observed_at
 
     (tmp_path / "finish").touch()
     changed = runner.wait_for_change(revision, timeout=2)
     assert changed is not None
-    assert runner.snapshot(run_id).state == "success"
+    historical_snapshot = runner.snapshot(run_id)
+    assert historical_snapshot.state == "success"
+    assert historical_snapshot.progress[-1].observed_at == progress_event.observed_at
 
 
 def test_shell_failure_diagnostic_survives_real_progress_event_encoding(
@@ -945,6 +890,8 @@ if result.exit_code != 0:
     assert event.status == "failed"
     assert event.workspace == "ws-test"
     assert event.tab == "tab-test"
+    assert event.observed_at is not None
+    assert datetime.fromisoformat(event.observed_at).tzinfo is not None
     assert event.error is not None
     assert event.error.startswith(
         "sync and verify main failed (exit code 2)\n"
@@ -955,7 +902,7 @@ if result.exit_code != 0:
 
 
 def test_output_is_bounded_and_reports_truncation() -> None:
-    runner = PythonRunner(max_output_chars=20)
+    runner = PythonRunner(managed_workflows=False, max_output_chars=20)
     try:
         runner.start('print("x" * 50, end="")')
         result = wait_until_finished(runner)
@@ -970,7 +917,9 @@ def test_runner_rejects_non_posix_platform(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(os, "name", "nt")
 
     with pytest.raises(RuntimeError, match="requires a POSIX"):
-        PythonRunner()
+        PythonRunner(
+            managed_workflows=False,
+        )
 
 
 def test_runs_execute_concurrently_with_independent_output(
@@ -1024,7 +973,7 @@ def test_stopping_one_run_does_not_affect_another(runner: PythonRunner) -> None:
 
 
 def test_concurrent_targeted_stops_have_independent_grace_periods() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     stubborn_code = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -1105,179 +1054,10 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
     assert result.state == "success"
 
 
-def test_resume_reuses_same_run_from_explicit_checkpoint_without_replaying_side_effect(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
-    code = """\
-WORKFLOW_OUTLINE = ["repair", "continue"]
-
-from pathlib import Path
-from purplemux_client import resume_checkpoint, save_checkpoint
-
-side_effect = Path("side-effect.txt")
-checkpoint = resume_checkpoint()
-if checkpoint is None:
-    side_effect.write_text("created once")
-    save_checkpoint("resource created", {"resource": str(side_effect.resolve())})
-else:
-    assert checkpoint.name == "resource created"
-    assert Path(checkpoint.data["resource"]).read_text() == "manually repaired"
-if not Path("repair.complete").exists():
-    raise RuntimeError("manual repair required")
-print("continued safely")
-"""
-    runner._workflow_cwd = tmp_path
-    run_id = runner.start(code)
-    first = wait_until_finished(runner)
-    assert first.state == "failed"
-    assert first.checkpoint is not None
-    assert first.checkpoint.name == "resource created"
-    assert first.outline == ("repair", "continue")
-    assert first.attempts[0].state == "failed"
-    first_stdout_entries = first.stdout_entries
-    first_observed_at = [entry.observed_at for entry in first_stdout_entries]
-
-    (tmp_path / "side-effect.txt").write_text("manually repaired", encoding="utf-8")
-    (tmp_path / "repair.complete").touch()
-    runner.resume(run_id)
-    resumed = wait_until_finished(runner)
-
-    assert resumed.run_id == run_id
-    assert resumed.state == "success"
-    assert resumed.outline == first.outline
-    assert (tmp_path / "side-effect.txt").read_text() == "manually repaired"
-    assert "[resume attempt 2 from checkpoint 'resource created']" in resumed.stdout
-    assert resumed.stdout.endswith("continued safely\n")
-    assert resumed.stdout_entries[: len(first_stdout_entries)] == first_stdout_entries
-    assert [
-        entry.observed_at
-        for entry in resumed.stdout_entries[: len(first_stdout_entries)]
-    ] == first_observed_at
-    assert len(resumed.stdout_entries) > len(first_stdout_entries)
-    assert [(attempt.state, attempt.resumed_from) for attempt in resumed.attempts] == [
-        ("failed", None),
-        ("success", "resource created"),
-    ]
-
-
-def test_default_cwd_resume_preserves_environment_and_preflight(
-    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    manager_venv = tmp_path / "manager-venv"
-    manager_bin = manager_venv / "bin"
-    manager_bin.mkdir(parents=True)
-    required_command = manager_bin / "legacy-tool"
-    required_command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    required_command.chmod(0o755)
-    inherited_path = os.pathsep.join((str(manager_bin), os.environ.get("PATH", "")))
-    monkeypatch.setenv("VIRTUAL_ENV", str(manager_venv))
-    monkeypatch.setenv("PATH", inherited_path)
-    monkeypatch.chdir(tmp_path)
-    code = """\
-WORKFLOW_PREFLIGHT = {
-    "commands": ["legacy-tool"],
-    "environment": ["VIRTUAL_ENV"],
-}
-import json
-import os
-from purplemux_client import resume_checkpoint, save_checkpoint
-
-checkpoint = resume_checkpoint()
-print(json.dumps({"virtualEnv": os.environ.get("VIRTUAL_ENV"), "path": os.environ.get("PATH")}))
-if checkpoint is None:
-    save_checkpoint("legacy boundary", {"ready": "yes"})
-    raise RuntimeError("manual repair required")
-assert checkpoint.name == "legacy boundary"
-"""
-
-    run_id = runner.start(code)
-    first = wait_until_finished(runner)
-    assert first.state == "failed"
-    assert first.checkpoint is not None
-
-    runner.resume(run_id)
-    resumed = wait_until_finished(runner)
-
-    environments = [
-        json.loads(line) for line in resumed.stdout.splitlines() if line.startswith("{")
-    ]
-    assert resumed.state == "success"
-    assert environments == [
-        {"virtualEnv": str(manager_venv), "path": inherited_path},
-        {"virtualEnv": str(manager_venv), "path": inherited_path},
-    ]
-
-
-def test_resume_rejects_failure_without_safe_checkpoint(runner: PythonRunner) -> None:
-    run_id = runner.start("raise RuntimeError('unsafe to replay')")
-    wait_until_finished(runner)
-
-    with pytest.raises(RunNotResumableError, match="no safe checkpoint"):
-        runner.resume(run_id)
-
-
-def test_suspended_run_is_distinct_and_resumable(runner: PythonRunner) -> None:
-    code = """\
-from purplemux_client import resume_checkpoint, save_checkpoint, suspend_run
-checkpoint = resume_checkpoint()
-if checkpoint is None:
-    save_checkpoint("agent waiting", {"tab": "tab-1"})
-    suspend_run("reply in tab-1 before continuing")
-print("continued after input")
-"""
-    run_id = runner.start(code)
-    suspended = wait_until_finished(runner)
-
-    assert suspended.state == "suspended"
-    assert suspended.suspension_reason == "reply in tab-1 before continuing"
-    runner.resume(run_id)
-    resumed = wait_until_finished(runner)
-    assert resumed.state == "success"
-    assert [attempt.state for attempt in resumed.attempts] == ["suspended", "success"]
-
-
-def test_repeated_manual_recovery_uses_latest_safe_checkpoint(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
-    code = """\
-from pathlib import Path
-from purplemux_client import resume_checkpoint, save_checkpoint
-checkpoint = resume_checkpoint()
-if checkpoint is None:
-    save_checkpoint("phase one", {"workspace": "ws-1"})
-    raise RuntimeError("first repair")
-if checkpoint.name == "phase one":
-    assert Path("first-fixed").exists()
-    save_checkpoint("phase two", {"workspace": checkpoint.data["workspace"], "tab": "tab-2"})
-    raise RuntimeError("second repair")
-assert checkpoint.name == "phase two"
-assert Path("second-fixed").exists()
-print(checkpoint.data["workspace"], checkpoint.data["tab"])
-"""
-    runner._workflow_cwd = tmp_path
-    run_id = runner.start(code)
-    wait_until_finished(runner)
-    (tmp_path / "first-fixed").touch()
-    runner.resume(run_id)
-    second = wait_until_finished(runner)
-    assert second.state == "failed"
-    assert second.checkpoint is not None
-    assert second.checkpoint.name == "phase two"
-
-    (tmp_path / "second-fixed").touch()
-    runner.resume(run_id)
-    final = wait_until_finished(runner)
-    assert final.state == "success"
-    assert final.stdout.endswith("ws-1 tab-2\n")
-    assert [attempt.resumed_from for attempt in final.attempts] == [
-        None,
-        "phase one",
-        "phase two",
-    ]
-
-
 def test_start_after_close_is_rejected() -> None:
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     runner.close()
 
     with pytest.raises(RunnerClosedError, match="Runner is closed"):
@@ -1298,7 +1078,7 @@ def test_close_cannot_miss_concurrent_start_registration(
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
 
     monkeypatch.setattr(subprocess, "Popen", blocking_popen)
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     start_errors: list[BaseException] = []
 
     def start_run() -> None:
@@ -1325,7 +1105,7 @@ def test_close_cannot_miss_concurrent_start_registration(
 
 
 def test_close_stops_process_group() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     runner.start(
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
@@ -1345,7 +1125,7 @@ def test_close_stops_process_group() -> None:
 
 
 def test_close_cleans_up_stubborn_runs_with_one_bounded_grace_period() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     stubborn_code = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -1393,7 +1173,7 @@ def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:
 
 
 def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> None:
-    runner = PythonRunner(stop_timeout=0.2)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.2)
     child_pid: int | None = None
     try:
         run_id = runner.start(
@@ -1429,7 +1209,7 @@ def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> N
 
 
 def test_stop_rejects_exited_main_with_detached_child_output() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     child_pid: int | None = None
     try:
         run_id = runner.start(
@@ -1506,7 +1286,9 @@ def test_popen_uses_current_interpreter_without_shell(
 
 @pytest.fixture
 def web_server() -> Iterator[tuple[tuple[str, int], str]]:
-    server = RunnerHTTPServer(("127.0.0.1", 0), PythonRunner(stop_timeout=0.5))
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0), PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -1576,7 +1358,7 @@ def settings_web_server(
         notifier=notifier,
         environment={},
     )
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1683,18 +1465,14 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "cwd": str(Path.cwd()),
         "args": [],
-        "checkpoint": None,
         "attempts": [
             {
                 "number": 1,
                 "state": "success",
                 "exitCode": 0,
-                "resumedFrom": None,
             }
         ],
         "code": 'print("HTTP_OK")',
-        "suspensionReason": None,
-        "resumable": False,
         "resources": [],
         "resourceCleanupStatus": "cleaned",
         "cleanupAvailable": True,
@@ -1923,6 +1701,7 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/stop")[0] == 403
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
+    assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
 
 
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(
@@ -1951,108 +1730,6 @@ def test_run_api_exposes_explicit_cleanup_without_deleting_history(
     assert cleaned["state"] == "success"
     assert cleaned["resourceCleanupStatus"] == "cleaned"
     assert request(address, "GET", f"/api/runs/{run_id}")[0] == 200
-
-
-def test_resume_api_rejects_run_after_its_resources_enter_cleanup(
-    web_server: tuple[tuple[str, int], str],
-) -> None:
-    address, token = web_server
-    code = """
-from purplemux_client import register_run_resource, save_checkpoint
-register_run_resource("managed_shell_result", "/tmp/awm-shell-absent", {
-    "result_path": "/tmp/awm-shell-absent/result.json", "tab_id": "tab-1"
-})
-save_checkpoint("resource created", {"tab": "tab-1"})
-raise RuntimeError("repair")
-"""
-    status, started = request(
-        address,
-        "POST",
-        "/api/run",
-        json.dumps({"code": code}),
-        token=token,
-    )
-    assert status == 202
-    run_id = int(started["runId"])
-    deadline = time.monotonic() + 5
-    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
-
-    assert (
-        request(address, "POST", f"/api/runs/{run_id}/cleanup", token=token)[0] == 200
-    )
-    status, refusal = request(
-        address, "POST", f"/api/runs/{run_id}/resume", token=token
-    )
-
-    assert status == 409
-    assert "entered cleanup" in str(refusal["error"])
-
-
-def test_run_api_resumes_same_run_and_rejects_unsafe_replay(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
-) -> None:
-    address, token = web_server
-    fixed = tmp_path / "fixed"
-    code = f"""\
-from pathlib import Path
-from purplemux_client import resume_checkpoint, save_checkpoint
-if resume_checkpoint() is None:
-    save_checkpoint("before repair", {{"workspace": "ws-1", "tab": "tab-1"}})
-if not Path({str(fixed)!r}).exists():
-    raise RuntimeError("fix required")
-print("resumed")
-"""
-    status, started = request(
-        address,
-        "POST",
-        "/api/run",
-        json.dumps({"code": code}),
-        token=token,
-    )
-    assert status == 202
-    run_id = int(started["runId"])
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        _, failed = request(address, "GET", f"/api/runs/{run_id}")
-        if failed["state"] != "running":
-            break
-        time.sleep(0.02)
-    assert failed["state"] == "failed"
-    assert failed["resumable"] is True
-    assert failed["checkpoint"] == {
-        "name": "before repair",
-        "data": {"workspace": "ws-1", "tab": "tab-1"},
-    }
-
-    fixed.touch()
-    status, resumed = request(
-        address, "POST", f"/api/runs/{run_id}/resume", token=token
-    )
-    assert status == 202
-    assert resumed["runId"] == run_id
-
-    unsafe_status, unsafe = request(
-        address,
-        "POST",
-        "/api/run",
-        json.dumps({"code": "raise RuntimeError('no checkpoint')"}),
-        token=token,
-    )
-    assert unsafe_status == 202
-    unsafe_id = int(unsafe["runId"])
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        _, unsafe = request(address, "GET", f"/api/runs/{unsafe_id}")
-        if unsafe["state"] != "running":
-            break
-        time.sleep(0.02)
-    status, refusal = request(
-        address, "POST", f"/api/runs/{unsafe_id}/resume", token=token
-    )
-    assert status == 409
-    assert "no safe checkpoint" in str(refusal["error"])
 
 
 def test_run_api_uses_runner_cwd_and_passes_arguments(
@@ -2236,6 +1913,7 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         "issue-driven-generate",
     ):
         assert f'id="{element_id}"' in page
+    assert 'id="resume"' not in page
 
 
 def test_issue_driven_generation_api_is_distinct_from_python_validation(
@@ -2248,7 +1926,7 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
             "integration_branch": "dev/v0.2.0",
             "final_branch": "main",
             "issues": [90, 89],
-            "max_reviews": 8,
+            "max_reviews": 5,
             "merge_to_integration": True,
             "final_review": True,
             "merge_final": False,
@@ -2317,6 +1995,7 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
     script = documents["/app.js"]
     assert 'id="output-copy"' in index
     assert 'id="guide-copy"' in index
+    assert 'id="guide-raw"' in index
     assert '<script src="/log-display.js"></script>' in index
     assert "formatOutputEntries" in log_display
     assert "writeText" in helper
@@ -2325,6 +2004,21 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
     assert 'guideCopy.textContent = "Copy manually"' in script
     assert 'outputCopy.textContent = "Copy manually"' in script
     assert 'id="manual-copy-dialog"' in index
+
+
+def test_runner_serves_issue_driven_guide(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/issue-driven-guide.md")
+    response = connection.getresponse()
+    guide = response.read().decode()
+    connection.close()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/markdown; charset=utf-8"
+    assert guide.startswith("# Issue Driven Guide")
 
 
 def test_copy_browser_logic() -> None:
@@ -2503,7 +2197,7 @@ class BlockedReadinessAPIService(ReadinessAPIService):
 
 
 def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     readiness = ReadinessAPIService()
     server = RunnerHTTPServer(
         ("127.0.0.1", 0),
@@ -2548,7 +2242,7 @@ def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
 
 
 def test_agent_readiness_api_blocks_retry_until_explicit_reconciliation() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     readiness = BlockedReadinessAPIService()
     server = RunnerHTTPServer(
         ("127.0.0.1", 0),
@@ -2644,7 +2338,7 @@ def test_notification_settings_api_honors_environment_only_credential(
             "NOTIFY_TOKEN": "tk_environment_api_secret",
         },
     )
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -3003,7 +2697,7 @@ def test_run_rejects_matching_origin_with_empty_delimiter(
 
 
 def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.2", 0), runner)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -3119,7 +2813,7 @@ def test_web_cli_rejects_invalid_hostname_aliases(aliases: str) -> None:
 
 
 def test_configured_hostname_alias_accepts_get_and_protected_post() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(
         ("127.0.0.1", 0),
         runner,
@@ -3200,7 +2894,7 @@ def test_server_allows_explicitly_requested_hostname() -> None:
 
 
 def test_web_server_close_stops_running_process() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner)
     runner.start("import time; time.sleep(60)")
 

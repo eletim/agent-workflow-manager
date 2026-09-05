@@ -27,7 +27,6 @@ const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
 const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
-const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
 const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
@@ -74,6 +73,8 @@ const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
 const guideCopy = document.querySelector("#guide-copy");
 const guideContent = document.querySelector("#guide-content");
+const guideTitle = document.querySelector("#guide-title");
+const guideRaw = document.querySelector("#guide-raw");
 const manualCopyDialog = document.querySelector("#manual-copy-dialog");
 const manualCopyContent = document.querySelector("#manual-copy-content");
 const manualCopyClose = document.querySelector("#manual-copy-close");
@@ -93,7 +94,8 @@ const favicon = document.querySelector("#favicon");
 
 let requestToken = null;
 let eventSource = null;
-let guideText = null;
+const guideTexts = {};
+let activeGuide = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
@@ -184,9 +186,9 @@ function applyModeVisibility() {
   workflowFields.hidden = promptMode || issueDrivenMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
-  resumeButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
+  guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
   dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
   outlinePanel.hidden = promptMode || outlinePanel.hidden;
@@ -241,7 +243,6 @@ function renderRun(result) {
   );
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
-  resumeButton.disabled = activeRunId === null || !result.resumable;
   cleanupButton.disabled = activeRunId === null
     || !result.cleanupAvailable
     || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
@@ -303,7 +304,6 @@ async function enterDraftMode(mode = currentMode) {
   }
   showDraftLabel();
   stopButton.disabled = true;
-  resumeButton.disabled = true;
   cleanupButton.disabled = true;
   renderOutline([], []);
   applyFieldMode();
@@ -333,22 +333,12 @@ function renderResources(result) {
 
 function renderRecovery(result) {
   const attempts = result.attempts || [];
-  recoveryPanel.hidden = !["failed", "suspended"].includes(result.state)
-    && result.checkpoint == null && attempts.length < 2;
-  if (result.checkpoint) {
-    recoverySummary.textContent = `Safe checkpoint: ${result.checkpoint.name}. Manual fixes are preserved; the Python workflow decides how continuation validates and uses this checkpoint.`;
-  } else if (result.state === "failed") {
-    recoverySummary.textContent = "No safe checkpoint was published. This run cannot be resumed without risking replay of completed side effects.";
-  } else {
-    recoverySummary.textContent = result.suspensionReason || "";
-  }
-  if (result.suspensionReason) {
-    recoverySummary.textContent += ` Suspended: ${result.suspensionReason}`;
-  }
+  recoveryPanel.hidden = !["failed", "stopped"].includes(result.state);
+  recoverySummary.textContent = "Inspect this run and its retained resources, then start a new run to recover. The new workflow must verify authoritative Git, GitHub, and PurpleMux state before mutating it.";
   attemptHistory.replaceChildren();
   for (const attempt of attempts) {
     const item = document.createElement("li");
-    item.textContent = `Attempt ${attempt.number}: ${attempt.state} (exit ${attempt.exitCode})${attempt.resumedFrom ? `, resumed from ${attempt.resumedFrom}` : ""}`;
+    item.textContent = `Attempt ${attempt.number}: ${attempt.state} (exit ${attempt.exitCode})`;
     attemptHistory.append(item);
   }
 }
@@ -554,11 +544,20 @@ function renderProgress(events) {
     marker.textContent = {started: "▶", completed: "✓", failed: "✕"}[event.status];
 
     const details = document.createElement("div");
+    details.className = "progress-details";
     const label = document.createElement("div");
     label.className = "progress-label";
     const number = event.iteration ?? event.attempt;
     label.textContent = `${event.name}${number == null ? "" : ` #${number}`}`;
-    details.append(label);
+
+    const timestamp = document.createElement("time");
+    timestamp.className = "progress-time";
+    timestamp.textContent = runnerLogDisplay.formatObservedAt(event.observedAt);
+    if (typeof event.observedAt === "string") {
+      timestamp.setAttribute("datetime", event.observedAt);
+      timestamp.setAttribute("title", event.observedAt);
+    }
+    details.append(label, timestamp);
 
     const noteText = event.error || event.message;
     if (noteText) {
@@ -579,14 +578,28 @@ function renderProgress(events) {
   }
 }
 
-async function loadGuide() {
-  if (guideText !== null) return guideText;
-  const response = await fetch("/python-workflow-guide.md");
+function selectedGuide() {
+  if (currentMode === "issue-driven") {
+    return {
+      key: "issue-driven",
+      path: "/issue-driven-guide.md",
+      title: "Issue Driven Guide",
+    };
+  }
+  return {
+    key: "workflow",
+    path: "/python-workflow-guide.md",
+    title: "Workflow Guide",
+  };
+}
+
+async function loadGuide(guide) {
+  if (guideTexts[guide.key] !== undefined) return guideTexts[guide.key];
+  const response = await fetch(guide.path);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  guideText = await response.text();
-  guideContent.textContent = guideText;
-  guideCopy.disabled = false;
-  return guideText;
+  const text = await response.text();
+  guideTexts[guide.key] = text;
+  return text;
 }
 
 function showManualCopy(text) {
@@ -600,11 +613,21 @@ function showManualCopy(text) {
 manualCopyClose.addEventListener("click", () => manualCopyDialog.close());
 
 guideOpen.addEventListener("click", async () => {
+  const requestedGuide = selectedGuide();
+  activeGuide = requestedGuide;
+  guideTitle.textContent = requestedGuide.title;
+  guideRaw.href = requestedGuide.path;
+  guideContent.textContent = "Loading…";
+  guideCopy.disabled = true;
   guideDialog.showModal();
   try {
-    await loadGuide();
+    const text = await loadGuide(requestedGuide);
+    if (activeGuide !== requestedGuide) return;
+    guideContent.textContent = text;
+    guideCopy.disabled = false;
   } catch (error) {
-    guideContent.textContent = `Could not load Workflow Guide: ${error}`;
+    if (activeGuide !== requestedGuide) return;
+    guideContent.textContent = `Could not load ${requestedGuide.title}: ${error}`;
   }
 });
 
@@ -615,7 +638,7 @@ guideCopy.addEventListener("click", async () => {
     window.clearTimeout(guideCopyResetTimer);
   }
   try {
-    const text = await loadGuide();
+    const text = await loadGuide(activeGuide || selectedGuide());
     await runnerOutputClipboard.writeText(
       text,
       navigator.clipboard,
@@ -624,7 +647,9 @@ guideCopy.addEventListener("click", async () => {
     guideCopy.textContent = "Copied";
   } catch (error) {
     guideCopy.textContent = "Copy manually";
-    showManualCopy(guideText || guideContent.textContent);
+    showManualCopy(
+      (activeGuide && guideTexts[activeGuide.key]) || guideContent.textContent,
+    );
   }
   guideCopyResetTimer = window.setTimeout(() => {
     guideCopy.textContent = "Copy";
@@ -1141,35 +1166,6 @@ cleanupButton.addEventListener("click", async () => {
       targetRunId === activeRunId
       && selectionGeneration === activeRunGeneration
     ) stderr.textContent = String(error);
-  }
-});
-
-resumeButton.addEventListener("click", async () => {
-  if (activeRunId === null) return;
-  const targetRunId = activeRunId;
-  const selectionGeneration = ++activeRunGeneration;
-  const validationGeneration = ++validationRequestGeneration;
-  resumeButton.disabled = true;
-  try {
-    const result = await request(`/api/runs/${targetRunId}/resume`, {method: "POST"});
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) {
-      activeRunGeneration += 1;
-      renderRun(result);
-    }
-    await refresh();
-  } catch (error) {
-    if (Array.isArray(error.result?.validation)) {
-      if (validationGeneration === validationRequestGeneration) {
-        renderValidation(error.result.validation);
-      }
-    } else if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) stderr.textContent = String(error);
-    await refresh();
   }
 });
 

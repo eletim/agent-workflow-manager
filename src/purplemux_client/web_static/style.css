@@ -66,15 +66,10 @@ h2, label { font-size: 14px; font-weight: 650; }
   border-color: #ff9ca8;
   background: #ff9ca8;
 }
-.run-item[data-state="suspended"] .run-state-marker {
-  border-color: #ffd66b;
-  background: #ffd66b;
-}
 .run-item.selected { border-color: #9b83ef; background: #34295a; }
 .run-item[data-state="running"] { color: #ffd66b; }
 .run-item[data-state="success"] { color: #75e2a8; }
 .run-item[data-state="failed"], .run-item[data-state="stopped"] { color: #ff9ca8; }
-.run-item[data-state="suspended"] { color: #ffd66b; }
 
 textarea, pre, select, input[type="text"], input[type="url"], input[type="password"] {
   width: 100%;
@@ -181,7 +176,6 @@ a { color: #bcaaff; }
 .status.running { background: #513d12; color: #ffd66b; }
 .status.success { background: #163f2b; color: #75e2a8; }
 .status.failed, .status.stopped, .status.validation_failed { background: #4b252b; color: #ff9ca8; }
-.status.suspended { background: #513d12; color: #ffd66b; }
 
 .recovery-panel { margin-top: 14px; border-color: #6c5a2c; }
 .recovery-panel h2 { margin: 0 0 8px; }
@@ -265,8 +259,24 @@ a { color: #bcaaff; }
 .progress-marker { color: #ffd66b; line-height: 1.4; text-align: center; }
 .progress-item.completed .progress-marker { color: #75e2a8; }
 .progress-item.failed .progress-marker { color: #ff9ca8; }
+.progress-details {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  column-gap: 12px;
+  min-width: 0;
+}
 .progress-label { font-size: 14px; line-height: 1.4; }
-.progress-note, .progress-reference { color: #9ba3b5; font-size: 12px; }
+.progress-time {
+  color: #9ba3b5;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.progress-note, .progress-reference {
+  grid-column: 1 / -1;
+  color: #9ba3b5;
+  font-size: 12px;
+}
 .progress-item.failed .progress-note { color: #ffb3bc; }
 
 .output-section { margin-top: 14px; }

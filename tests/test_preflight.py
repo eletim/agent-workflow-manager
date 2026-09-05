@@ -283,7 +283,7 @@ def test_validation_never_executes_top_level_side_effects(tmp_path: Path) -> Non
 
 
 def test_runner_does_not_start_process_when_validation_fails(tmp_path: Path) -> None:
-    runner = PythonRunner(validator=validator(tmp_path))
+    runner = PythonRunner(managed_workflows=False, validator=validator(tmp_path))
     try:
         with pytest.raises(WorkflowValidationError):
             runner.start("import dependency_that_does_not_exist")
@@ -376,7 +376,7 @@ def test_stalled_checks_do_not_block_runner_observation_or_close(
     monkeypatch.setattr(
         validator, "_worker_command", lambda: stalling_worker_command(pid_log)
     )
-    runner = PythonRunner(validator=validator)
+    runner = PythonRunner(managed_workflows=False, validator=validator)
     errors: list[BaseException] = []
 
     def start() -> None:
@@ -421,7 +421,7 @@ def test_close_prevents_helper_registration_that_has_not_started(
     monkeypatch.setattr(
         validator, "_worker_command", lambda: stalling_worker_command(pid_log)
     )
-    runner = PythonRunner(validator=validator)
+    runner = PythonRunner(managed_workflows=False, validator=validator)
     errors: list[BaseException] = []
 
     def start() -> None:

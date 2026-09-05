@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -8,7 +9,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from purplemux_client import MutationOutcomeUnknown
+from purplemux_client import BranchState, GitHubRepository, GitRepository
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -24,7 +25,7 @@ def payload(**overrides: object) -> dict[str, object]:
         "integration_branch": "dev/v0.2.0",
         "final_branch": "main",
         "issues": [90, 89, 91],
-        "max_reviews": 8,
+        "max_reviews": 5,
         "merge_to_integration": True,
         "final_review": True,
         "merge_final": False,
@@ -42,6 +43,37 @@ def test_valid_json_preserves_issue_order() -> None:
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+
+
+@pytest.mark.parametrize("key", ["integration_branch", "final_branch"])
+def test_delivery_branches_cannot_collide_with_generated_issue_branch(
+    key: str,
+) -> None:
+    value = payload(issues=[90, 91])
+    value[key] = "feature/issue-91"
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (f"$.{key}", "must differ from every generated Issue branch") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
+
+
+@pytest.mark.parametrize("key", ["integration_branch", "final_branch"])
+@pytest.mark.parametrize("branch", [[], {}])
+def test_delivery_branch_containers_report_structured_validation(
+    key: str, branch: object
+) -> None:
+    value = payload()
+    value[key] = branch
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (f"$.{key}", "must be a non-empty trimmed string") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
 
 
 @pytest.mark.parametrize(
@@ -87,7 +119,7 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
         for number in config.issues
     ]
     assert positions == sorted(positions)
-    assert "MAX_REVIEWS = 8" in first
+    assert "MAX_REVIEWS = 5" in first
 
 
 def test_generated_workflow_passes_supported_static_validation() -> None:
@@ -109,6 +141,150 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "leave the working tree clean" in code
 
 
+def test_generated_post_merge_path_starts_next_issue() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[107, 108])))
+    module_name = "generated_issue_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-issue-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    workflow = module.__dict__
+    issue_type = workflow["Issue"]
+    config_type = workflow["Config"]
+    merge_pr_and_advance = workflow["merge_pr_and_advance"]
+    prepare_issue = workflow["prepare_issue"]
+    assert callable(issue_type)
+    assert callable(config_type)
+    assert callable(merge_pr_and_advance)
+    assert callable(prepare_issue)
+
+    base_sha = "1" * 40
+    reviewed_head = "2" * 40
+    merge_sha = "3" * 40
+    integration_branch = "dev/v0.2.1"
+    first_branch = "feature/issue-107"
+    next_branch = "feature/issue-108"
+    events: list[str] = []
+
+    class Repository:
+        def __init__(self) -> None:
+            self.current = first_branch
+            self.integration_sha = base_sha
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == integration_branch
+            events.append(f"synchronize:{self.current}->{branch}")
+            self.current = branch
+            return BranchState(branch, self.integration_sha, self.integration_sha, True)
+
+        def advance_after_merge(
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            merge_commit_sha: str,
+            required_commit_sha: str,
+        ) -> BranchState:
+            events.append("advance")
+            assert self.current == branch == integration_branch
+            assert self.integration_sha == previous_sha == base_sha
+            assert merge_commit_sha == merge_sha
+            assert required_commit_sha == reviewed_head
+            self.integration_sha = merge_sha
+            return BranchState(branch, merge_sha, merge_sha, True)
+
+        def require_clean(self) -> None:
+            events.append("require_clean")
+
+        def recover_feature_branch(
+            self, branch: str, *, base: str, expected_base_sha: str
+        ) -> SimpleNamespace:
+            events.append(f"recover:{branch}")
+            assert self.current == base == integration_branch
+            assert expected_base_sha == self.integration_sha == merge_sha
+            self.current = branch
+            return SimpleNamespace(
+                branch=BranchState(branch, merge_sha, None, True),
+                reused_existing_work=False,
+            )
+
+    repository = Repository()
+
+    class GitHub:
+        def merge_pr(self, number: int, **kwargs: object) -> SimpleNamespace:
+            events.append("merge")
+            assert repository.current == integration_branch
+            assert number == 107
+            assert kwargs == {
+                "expected_head": first_branch,
+                "expected_head_sha": reviewed_head,
+                "expected_base": integration_branch,
+                "expected_base_sha": base_sha,
+            }
+            return SimpleNamespace(
+                merge_commit_sha=merge_sha,
+                pr=SimpleNamespace(url="https://example.test/pull/107"),
+            )
+
+        def find_pr(self, *, head: str, base: str, state: str) -> None:
+            assert (head, base) == (next_branch, integration_branch)
+            assert state in {"OPEN", "MERGED"}
+            return None
+
+    github = GitHub()
+    merge_pr_and_advance(
+        repository,
+        github,
+        number=107,
+        head=first_branch,
+        head_sha=reviewed_head,
+        base=integration_branch,
+        base_sha=base_sha,
+    )
+    config = config_type(
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        integration_branch,
+        "main",
+        (),
+        "true",
+    )
+    prepared = prepare_issue(repository, github, issue_type(108, next_branch), config)
+
+    assert prepared is not None
+    assert repository.current == next_branch
+    assert events[:3] == [
+        f"synchronize:{first_branch}->{integration_branch}",
+        "merge",
+        "advance",
+    ]
+    assert f"synchronize:{integration_branch}->{integration_branch}" in events
+    assert f"recover:{next_branch}" in events
+    for unsafe in ("git reset", "git rebase", "git stash", "--force", "-f HEAD:"):
+        assert unsafe not in code
+
+
+def test_generated_repository_calls_match_public_helper_signatures() -> None:
+    tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
+    contracts = {"repo": GitRepository, "github": GitHubRepository}
+
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Attribute):
+            continue
+        receiver = call.func.value
+        if not isinstance(receiver, ast.Name) or receiver.id not in contracts:
+            continue
+        method = getattr(contracts[receiver.id], call.func.attr)
+        assert all(keyword.arg is not None for keyword in call.keywords)
+        inspect.signature(method).bind(
+            None,
+            *(None for _ in call.args),
+            **{keyword.arg: None for keyword in call.keywords if keyword.arg},
+        )
+
+
 def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() -> None:
     code = generate_issue_driven_workflow(parse(payload()))
 
@@ -120,32 +296,14 @@ def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() 
     assert 'name=f"Issue {issue.number} implementer"' in code
 
 
-@pytest.mark.parametrize("visible_pr", [False, True])
-def test_review_disabled_resume_never_retries_pending_pr_creation(
-    visible_pr: bool,
-) -> None:
-    code = generate_issue_driven_workflow(parse(payload(final_review=False)))
-    module = ModuleType("generated_issue_driven_test")
-    sys.modules[module.__name__] = module
-    try:
-        exec(compile(code, "<generated>", "exec"), module.__dict__)
-    finally:
-        sys.modules.pop(module.__name__, None)
+def test_generated_workflow_has_no_in_place_recovery_state() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
 
-    class UnexpectedGitHub:
-        called = False
-
-        def find_pr(self, **_kwargs: object) -> object | None:
-            self.called = True
-            return object() if visible_pr else None
-
-    recovery = SimpleNamespace(phase="integration_pr_create_pending")
-    github = UnexpectedGitHub()
-    with pytest.raises(MutationOutcomeUnknown):
-        module.integration_delivery_without_review(
-            object(), object(), object(), github, recovery
-        )
-    assert github.called is False
+    assert "save_checkpoint" not in code
+    assert "resume_checkpoint" not in code
+    assert "resume_shell" not in code
+    assert "_pending" not in code
+    assert "inspect_feature_preparation(" in code
 
 
 def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
@@ -154,8 +312,8 @@ def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
         parse(payload(merge_to_integration=False))
     )
 
-    assert merging.count("github.merge_pr(") == 1
-    assert ready_only.count("github.merge_pr(") == 0
+    assert "MERGE_TO_INTEGRATION = True" in merging
+    assert "MERGE_TO_INTEGRATION = False" in ready_only
     assert "Approved Issue #{issue.number} PR is Ready" in ready_only
 
 
@@ -163,23 +321,15 @@ def test_final_review_policy_selects_the_generated_control_flow() -> None:
     reviewed = generate_issue_driven_workflow(parse(payload(final_review=True)))
     skipped = generate_issue_driven_workflow(parse(payload(final_review=False)))
 
-    assert (
-        "ready = integration_review(config, runtime, repo, github, recovery)"
-        in reviewed
-    )
-    assert "def integration_review(" in reviewed
-    assert "def integration_review(" not in skipped
-    assert "review-disabled-policy" in skipped
-    assert "ready = integration_delivery_without_review(" in skipped
+    assert "FINAL_REVIEW = True" in reviewed
+    assert "FINAL_REVIEW = False" in skipped
+    assert "if FINAL_REVIEW:" in reviewed
 
 
 def test_merge_final_false_has_no_final_merge_path() -> None:
     ready_only = generate_issue_driven_workflow(parse(payload(merge_final=False)))
     merging = generate_issue_driven_workflow(parse(payload(merge_final=True)))
 
-    ready_main = ready_only[ready_only.index("def main() -> None:") :]
-    merging_main = merging[merging.index("def main() -> None:") :]
-    assert "github.merge_pr(" not in ready_main
-    assert "not merged" in ready_main
-    assert "github.merge_pr(" in merging_main
-    assert "Merged final integration PR" in merging_main
+    assert "MERGE_FINAL = False" in ready_only
+    assert "MERGE_FINAL = True" in merging
+    assert "if not MERGE_FINAL:" in ready_only

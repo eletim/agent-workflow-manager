@@ -174,6 +174,7 @@ _RESULT_STATUSES = {
 }
 _SHELL_DIAGNOSTIC_MAX_LINES = 40
 _SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
+WORKFLOW_HOST_WORKSPACE_ENV = "AGENT_WORKFLOW_MANAGER_HOST_WORKSPACE_ID"
 
 
 def _filesystem_identity(path: str) -> str:
@@ -249,6 +250,24 @@ class PurpleMuxRuntime:
             raise ValueError(f"workspace directory is not a directory: {cwd}")
         if not request.name.strip() or "\0" in request.name:
             raise ValueError("workspace name must be non-empty and contain no nulls")
+        host_workspace_id = os.environ.get(WORKFLOW_HOST_WORKSPACE_ENV)
+        if host_workspace_id:
+            host_workspace = next(
+                (
+                    workspace
+                    for workspace in self.list_workspaces()
+                    if workspace.id == host_workspace_id
+                ),
+                None,
+            )
+            if host_workspace is None:
+                raise WorkerFailure(
+                    "the run-owned Workflow host workspace no longer exists"
+                )
+            if cwd in {
+                os.path.abspath(directory) for directory in host_workspace.directories
+            }:
+                return host_workspace
         correlation_id = request.correlation_id or run_correlation(request.name)
         _validate_correlation(correlation_id)
         correlated_name = f"{request.name} [awm:{correlation_id}]"
@@ -759,46 +778,6 @@ class PurpleMuxCLIClient:
                 "panel_type": tab.panel_type or "",
                 "provider": tab.provider or "",
             },
-        )
-
-    def resume_shell(
-        self, session_id: str, result_path: str, *, cwd: str | None = None
-    ) -> None:
-        """Reattach a checkpointed managed shell without sending its command again."""
-        resolved_cwd = (
-            os.path.abspath(os.path.expanduser(cwd)) if cwd is not None else None
-        )
-        if resolved_cwd is not None and not os.path.isdir(resolved_cwd):
-            raise ValueError(
-                f"shell working directory is not a directory: {resolved_cwd}"
-            )
-        if session_id in self._shell_runs:
-            if self._shell_runs[session_id].result_path != result_path:
-                raise WorkerFailure(f"session {session_id} shell identity conflicts")
-            if (
-                resolved_cwd is not None
-                and self._shell_runs[session_id].cwd != resolved_cwd
-            ):
-                raise WorkerFailure(f"session {session_id} shell cwd conflicts")
-            return
-        normalized = os.path.abspath(result_path)
-        parent = os.path.dirname(normalized)
-        if os.path.basename(normalized) != "result.json" or not os.path.basename(
-            parent
-        ).startswith("awm-shell-"):
-            raise WorkerFailure("checkpointed shell result path is invalid")
-        tabs = self.list_sessions()
-        tab = next((item for item in tabs if item.id == session_id), None)
-        if tab is None and not os.path.isfile(normalized):
-            raise MutationOutcomeUnknown(
-                f"checkpointed shell {session_id} and its result are not observable"
-            )
-        if tab is not None and tab.panel_type != "terminal":
-            raise MutationConflict(
-                f"checkpointed shell {session_id} is no longer a terminal"
-            )
-        self._shell_runs[session_id] = _ShellRun(
-            result_path=normalized, cwd=resolved_cwd
         )
 
     def wait_for_shell_completion(

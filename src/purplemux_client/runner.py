@@ -4,7 +4,9 @@ import codecs
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
 import signal
 import stat
 import subprocess
@@ -13,19 +15,22 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
-from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
+from purplemux_client.client import (
+    WORKFLOW_HOST_WORKSPACE_ENV,
+    CreateWorkspaceRequest,
+    PurpleMuxCLIClient,
+    PurpleMuxRuntime,
+    ShellCommandRequest,
+    WorkspaceState,
+)
 from purplemux_client.correlation import RUN_IDENTITY_ENV
 from purplemux_client.errors import MutationOutcomeUnknown
-from purplemux_client.execution_context import (
-    PENDING_REPOSITORY_CONTEXT_ENV,
-    REPOSITORY_CONTEXT_ENV,
-)
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -34,12 +39,11 @@ from purplemux_client.preflight import (
     WorkflowValidator,
 )
 from purplemux_client.progress import (
+    EVENT_TOKEN_ENV,
+    EVENT_URL_ENV,
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
     RESOURCE_ACK_FD_ENV,
-    RESUME_CHECKPOINT_ENV,
-    SUSPENDED_EXIT_CODE,
-    ResumeCheckpoint,
     StepStatus,
 )
 from purplemux_client.prompt import PromptExecution
@@ -49,7 +53,6 @@ RunnerState = Literal[
     "running",
     "success",
     "failed",
-    "suspended",
     "stopped",
     "validation_failed",
 ]
@@ -60,7 +63,10 @@ ResourceCleanupStatus = Literal[
     "retained", "cleaning", "partially_cleaned", "cleaned", "blocked"
 ]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
+_MANAGED_OBSERVATION_RETRY_INITIAL_SECONDS = 0.25
+_MANAGED_OBSERVATION_RETRY_MAX_SECONDS = 5.0
 logger = logging.getLogger(__name__)
+_SHELL_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 @dataclass(frozen=True)
@@ -122,6 +128,7 @@ class ProgressEvent:
     error: str | None = None
     workspace: str | None = None
     tab: str | None = None
+    observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,7 @@ class TopologyFinding:
     category: Literal["runtime", "git", "github"]
     status: Literal["passed", "failed", "info"]
     message: str
+    observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,7 +152,7 @@ class DryRunResult:
             "status": self.status,
             "stdout": self.stdout,
             "stderr": self.stderr,
-            "findings": [asdict(item) for item in self.findings],
+            "findings": [_finding_json(item) for item in self.findings],
             "nextMutation": dict(self.next_mutation) if self.next_mutation else None,
         }
 
@@ -179,16 +187,16 @@ class RunNotFoundError(LookupError):
     """Raised when a requested run identifier does not exist."""
 
 
-class RunNotResumableError(RuntimeError):
-    """Raised when a run has no workflow-proven safe continuation point."""
-
-
 class RunCleanupNotAllowedError(RuntimeError):
     """Raised when explicit cleanup is unsafe for the selected run."""
 
 
 class RunCleanupInProgressError(RuntimeError):
     """Raised when cleanup is already active for the selected run."""
+
+
+class RunStopUncertainError(RuntimeError):
+    """Raised when PurpleMux cannot prove that a stopped Workflow terminated."""
 
 
 @dataclass(frozen=True)
@@ -230,15 +238,30 @@ def _is_verified_repository_context(resource: RunResource) -> bool:
 @dataclass(frozen=True)
 class RunAttempt:
     number: int
-    state: Literal["success", "failed", "suspended", "stopped"]
+    state: Literal["success", "failed", "stopped"]
     exit_code: int
-    resumed_from: str | None = None
 
 
 @dataclass(frozen=True)
 class OutputEntry:
     observed_at: str
     text: str
+
+
+def _progress_json(event: ProgressEvent) -> dict[str, object]:
+    payload = asdict(event)
+    observed_at = payload.pop("observed_at")
+    if observed_at is not None:
+        payload["observedAt"] = observed_at
+    return payload
+
+
+def _finding_json(finding: TopologyFinding) -> dict[str, object]:
+    payload = asdict(finding)
+    observed_at = payload.pop("observed_at")
+    if observed_at is not None:
+        payload["observedAt"] = observed_at
+    return payload
 
 
 @dataclass(frozen=True)
@@ -256,9 +279,7 @@ class RunnerSnapshot:
     dry_run_issues: tuple[ValidationIssue, ...]
     cwd: str
     args: tuple[str, ...]
-    checkpoint: ResumeCheckpoint | None
     attempts: tuple[RunAttempt, ...]
-    suspension_reason: str | None
     findings: tuple[TopologyFinding, ...]
     dry_run: DryRunResult | None
     resources: tuple[RunResource, ...] = ()
@@ -279,7 +300,6 @@ class RunnerSnapshot:
             payload["prompt"] = prompt
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
-        payload["suspensionReason"] = payload.pop("suspension_reason")
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -290,8 +310,8 @@ class RunnerSnapshot:
         ]
         payload.pop("stdout_entries")
         payload.pop("stderr_entries")
-        payload["progress"] = [asdict(event) for event in self.progress]
-        payload["findings"] = [asdict(item) for item in self.findings]
+        payload["progress"] = [_progress_json(event) for event in self.progress]
+        payload["findings"] = [_finding_json(item) for item in self.findings]
         payload["dryRun"] = self.dry_run.as_json() if self.dry_run else None
         payload.pop("dry_run")
         payload["validation"] = [issue.as_json() for issue in self.validation]
@@ -303,7 +323,6 @@ class RunnerSnapshot:
                 "number": attempt.number,
                 "state": attempt.state,
                 "exitCode": attempt.exit_code,
-                "resumedFrom": attempt.resumed_from,
             }
             for attempt in self.attempts
         ]
@@ -314,12 +333,6 @@ class RunnerSnapshot:
             "idle",
             "running",
             "validation_failed",
-        )
-        payload["resumable"] = (
-            self.prompt is None
-            and self.state in ("failed", "suspended")
-            and self.checkpoint is not None
-            and all(resource.cleanup_state == "retained" for resource in self.resources)
         )
         return payload
 
@@ -333,14 +346,7 @@ class RunnerSnapshot:
             "cwd": self.cwd,
             "executionContext": execution_context,
             "args": list(self.args),
-            "checkpoint": asdict(self.checkpoint) if self.checkpoint else None,
             "attempts": len(self.attempts),
-            "resumable": self.prompt is None
-            and self.state in ("failed", "suspended")
-            and self.checkpoint is not None
-            and all(
-                resource.cleanup_state == "retained" for resource in self.resources
-            ),
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
         }
@@ -374,8 +380,8 @@ class _RunRecord:
     run_id: int
     cwd: str
     args: tuple[str, ...]
-    process: subprocess.Popen[bytes]
-    process_group_id: int
+    process: subprocess.Popen[bytes] | None
+    process_group_id: int | None
     script_path: Path
     code: str
     outline: tuple[str, ...]
@@ -391,12 +397,14 @@ class _RunRecord:
     progress: deque[ProgressEvent] = field(default_factory=deque)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    checkpoint: ResumeCheckpoint | None = None
-    resumed_from: str | None = None
     attempts: list[RunAttempt] = field(default_factory=list)
-    suspension_reason: str | None = None
     resources: list[RunResource] = field(default_factory=list)
     prompt: PromptExecution | None = None
+    managed_client: PurpleMuxCLIClient | None = None
+    managed_tab_id: str | None = None
+    managed_tab_name: str | None = None
+    credential_path: Path | None = None
+    event_token: str | None = None
 
 
 class PythonRunner:
@@ -412,6 +420,8 @@ class PythonRunner:
         notifier: TerminalNotifier | None = None,
         validator: WorkflowValidator | None = None,
         workflow_cwd: str | os.PathLike[str] | None = None,
+        runtime_factory: Callable[[], PurpleMuxRuntime] = PurpleMuxRuntime,
+        managed_workflows: bool = True,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -433,6 +443,11 @@ class PythonRunner:
         self._next_run_id = 1
         self._correlation_instance = secrets.token_hex(16)
         self._notifier = notifier
+        self._runtime_factory = runtime_factory
+        # The local process host remains only as an explicit deterministic test
+        # harness. Production Workflow runs use the PurpleMux host.
+        self.managed_workflows = managed_workflows
+        self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
         try:
@@ -463,13 +478,22 @@ class PythonRunner:
             dry_run_issues=(),
             cwd=str(self._workflow_cwd),
             args=(),
-            checkpoint=None,
             attempts=(),
-            suspension_reason=None,
             findings=(),
             dry_run=None,
         )
         self._validator = validator or WorkflowValidator()
+
+    def configure_event_endpoint(self, base_url: str) -> None:
+        """Enable PurpleMux-hosted Workflow execution for an attached HTTP server."""
+        if not base_url.startswith("http://") or "\0" in base_url:
+            raise ValueError("event endpoint must be a local HTTP URL")
+        with self._lock:
+            if self._runs:
+                raise RuntimeError(
+                    "event endpoint must be configured before runs start"
+                )
+            self._event_base_url = base_url.rstrip("/")
 
     def validate(
         self,
@@ -526,9 +550,7 @@ class PythonRunner:
                     dry_run_issues=validation.dry_run_issues,
                     cwd=str(run_cwd),
                     args=run_args,
-                    checkpoint=None,
                     attempts=(),
-                    suspension_reason=None,
                     findings=result.findings,
                     dry_run=result,
                 )
@@ -684,118 +706,6 @@ class PythonRunner:
                     prompt=prompt,
                 )
 
-    def resume(self, run_id: int) -> None:
-        """Explicitly continue a failed run from its latest workflow checkpoint."""
-        with self._validation_lock:
-            with self._lock:
-                self._ensure_open()
-                run = self._get_run(run_id)
-                lifecycle_lock = run.cleanup_lock
-            with lifecycle_lock:
-                with self._lock:
-                    self._ensure_open()
-                    run = self._get_run(run_id)
-                    self._ensure_resumable(run)
-                    code = run.code
-                    checkpoint = run.checkpoint
-                    args = run.args
-                run_cwd, run_args, child_env = self._execution_context(args)
-                for resource in run.resources:
-                    if _is_verified_repository_context(resource):
-                        child_env[REPOSITORY_CONTEXT_ENV] = json.dumps(
-                            {
-                                **resource.metadata,
-                                "execution_root": resource.identity,
-                            },
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        break
-                else:
-                    for resource in run.resources:
-                        if (
-                            resource.kind == "git_worktree"
-                            and resource.metadata.get("registration_state") == "pending"
-                            and resource.cleanup_state == "retained"
-                        ):
-                            child_env[PENDING_REPOSITORY_CONTEXT_ENV] = json.dumps(
-                                {
-                                    **resource.metadata,
-                                    "execution_root": resource.identity,
-                                },
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
-                            break
-                validation = self._validator.validate(
-                    code, cwd=run_cwd, environment=child_env
-                )
-                with self._lock:
-                    self._ensure_open()
-                    run = self._get_run(run_id)
-                    self._ensure_resumable(run)
-                    if run.checkpoint != checkpoint:
-                        raise RunNotResumableError(
-                            f"run {run_id} checkpoint changed while resume was prepared"
-                        )
-                    if not validation.valid:
-                        raise WorkflowValidationError(validation)
-                    assert checkpoint is not None
-                    child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
-                        asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
-                    )
-                    child_env[RUN_IDENTITY_ENV] = self._run_identity(run.run_id)
-                    process, script_path, progress_read_fd, resource_ack_fd = (
-                        self._spawn_process(
-                            code,
-                            run_cwd=run_cwd,
-                            run_args=run_args,
-                            child_env=child_env,
-                        )
-                    )
-                    self._append_output(
-                        run,
-                        "stdout",
-                        f"\n[resume attempt {len(run.attempts) + 1} "
-                        f"from checkpoint {checkpoint.name!r}]\n",
-                        lock_held=True,
-                    )
-                    self._append_output(
-                        run,
-                        "stderr",
-                        f"\n[resume attempt {len(run.attempts) + 1} "
-                        f"from checkpoint {checkpoint.name!r}]\n",
-                        lock_held=True,
-                    )
-                    run.process = process
-                    run.process_group_id = process.pid
-                    run.script_path = script_path
-                    run.state = "running"
-                    run.exit_code = None
-                    run.stop_requested = False
-                    run.resumed_from = checkpoint.name
-                    run.suspension_reason = None
-                    self._start_attempt_threads(
-                        run, process, script_path, progress_read_fd, resource_ack_fd
-                    )
-                    self._mark_changed()
-
-    @staticmethod
-    def _ensure_resumable(run: _RunRecord) -> None:
-        if run.state not in ("failed", "suspended"):
-            raise RunNotResumableError(
-                f"run {run.run_id} is {run.state}; only failed or suspended runs can resume"
-            )
-        if run.checkpoint is None:
-            raise RunNotResumableError(
-                f"run {run.run_id} has no safe checkpoint; start a new run or update "
-                "the workflow to call save_checkpoint() after completed side effects"
-            )
-        if any(resource.cleanup_state != "retained" for resource in run.resources):
-            raise RunNotResumableError(
-                f"run {run.run_id} resources entered cleanup; Resume is no longer safe"
-            )
-
     def _start_validated(
         self,
         code: str,
@@ -808,6 +718,19 @@ class PythonRunner:
     ) -> int:
         run_id = self._next_run_id
         self._next_run_id += 1
+        if prompt is None and self.managed_workflows:
+            if self._event_base_url is None:
+                raise RuntimeError(
+                    "managed Workflow execution requires an attached event endpoint"
+                )
+            return self._start_managed_workflow(
+                run_id,
+                code,
+                outline=outline,
+                run_cwd=run_cwd,
+                run_args=run_args,
+                child_env=child_env,
+            )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
         process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
@@ -837,6 +760,224 @@ class PythonRunner:
         )
         self._mark_changed()
         return run_id
+
+    def _start_managed_workflow(
+        self,
+        run_id: int,
+        code: str,
+        *,
+        outline: tuple[str, ...],
+        run_cwd: Path,
+        run_args: tuple[str, ...],
+        child_env: Mapping[str, str],
+    ) -> int:
+        script = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", encoding="utf-8", delete=False
+        )
+        try:
+            script.write(code)
+        finally:
+            script.close()
+        script_path = Path(script.name)
+        event_token = secrets.token_urlsafe(32)
+        credential = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".env", encoding="utf-8", delete=False
+        )
+        event_url = f"{self._event_base_url}/api/runs/{run_id}/events"
+        managed_env = dict(child_env)
+        managed_env.pop(PROGRESS_FD_ENV, None)
+        managed_env.pop(RESOURCE_ACK_FD_ENV, None)
+        managed_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
+        managed_env[EVENT_URL_ENV] = event_url
+        managed_env[EVENT_TOKEN_ENV] = event_token
+        managed_env[RUN_IDENTITY_ENV] = self._run_identity(run_id)
+        try:
+            for name, value in sorted(managed_env.items()):
+                if _SHELL_ENV_NAME.fullmatch(name):
+                    credential.write(f"export {name}={shlex.quote(value)}\n")
+            credential.write(f"unset {PROGRESS_FD_ENV} {RESOURCE_ACK_FD_ENV}\n")
+        finally:
+            credential.close()
+        credential_path = Path(credential.name)
+        credential_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        run = _RunRecord(
+            run_id=run_id,
+            cwd=str(run_cwd),
+            args=run_args,
+            process=None,
+            process_group_id=None,
+            script_path=script_path,
+            code=code,
+            outline=outline,
+            progress=deque(maxlen=self._max_progress_events),
+            findings=deque(maxlen=self._max_progress_events),
+            credential_path=credential_path,
+            event_token=event_token,
+        )
+        self._runs[run_id] = run
+        correlation = self._run_identity(run_id)
+        client: PurpleMuxCLIClient | None = None
+        workspace_id: str | None = None
+        created_tab_id: str | None = None
+        result_path: str | None = None
+        try:
+            runtime = self._runtime_factory()
+            workspace = runtime.create_workspace(
+                CreateWorkspaceRequest(
+                    cwd=str(run_cwd),
+                    name=f"Workflow {run_id}",
+                    correlation_id=correlation,
+                )
+            )
+            workspace_id = workspace.id
+            self._register_managed_workspace(run, workspace, correlation)
+            with credential_path.open("a", encoding="utf-8") as credential_stream:
+                credential_stream.write(
+                    f"export {WORKFLOW_HOST_WORKSPACE_ENV}="
+                    f"{shlex.quote(workspace_id)}\n"
+                )
+            client = runtime.workspace(workspace.id)
+
+            def created(tab_id: str, path: str) -> None:
+                nonlocal created_tab_id, result_path
+                created_tab_id = tab_id
+                result_path = path
+
+            command = (
+                f"source {shlex.quote(str(credential_path))} && exec "
+                f"{shlex.join([sys.executable, str(script_path), *run_args])}"
+            )
+            tab_name = f"Workflow {run_id}: Python"
+            created_tab_id = client.start_shell(
+                ShellCommandRequest(
+                    command=command,
+                    cwd=str(run_cwd),
+                    name=tab_name,
+                    correlation_id=correlation,
+                ),
+                on_created=created,
+            )
+            self._attach_managed_shell(
+                run,
+                client,
+                workspace_id,
+                created_tab_id,
+                result_path,
+                f"{tab_name} [awm:{correlation}]",
+            )
+        except MutationOutcomeUnknown as exc:
+            if (
+                client is None
+                or workspace_id is None
+                or created_tab_id is None
+                or result_path is None
+            ):
+                self._fail_managed_launch(run, exc)
+                return run_id
+            self._attach_managed_shell(
+                run,
+                client,
+                workspace_id,
+                created_tab_id,
+                result_path,
+                f"Workflow {run_id}: Python [awm:{correlation}]",
+            )
+        except BaseException as exc:
+            if (
+                client is not None
+                and workspace_id is not None
+                and created_tab_id is not None
+                and result_path is not None
+            ):
+                self._attach_managed_shell(
+                    run,
+                    client,
+                    workspace_id,
+                    created_tab_id,
+                    result_path,
+                    f"Workflow {run_id}: Python [awm:{correlation}]",
+                )
+            self._fail_managed_launch(run, exc)
+            return run_id
+        wait_thread = threading.Thread(
+            target=self._wait_for_managed_workflow,
+            args=(run,),
+            name=f"python-runner-managed-wait-{run_id}",
+            daemon=True,
+        )
+        self._wait_threads.add(wait_thread)
+        wait_thread.start()
+        self._mark_changed()
+        return run_id
+
+    def _fail_managed_launch(self, run: _RunRecord, exc: BaseException) -> None:
+        run.script_path.unlink(missing_ok=True)
+        if run.credential_path is not None:
+            run.credential_path.unlink(missing_ok=True)
+        run.exit_code = 1
+        run.state = "failed"
+        self._append_output(
+            run, "stderr", f"Workflow launch failed: {exc}\n", lock_held=True
+        )
+        run.attempts.append(RunAttempt(1, "failed", 1))
+        self._mark_changed()
+
+    def _attach_managed_shell(
+        self,
+        run: _RunRecord,
+        client: PurpleMuxCLIClient,
+        workspace_id: str,
+        tab_id: str,
+        result_path: str | None,
+        tab_name: str,
+    ) -> None:
+        if result_path is None:
+            raise RuntimeError("managed shell did not identify its result path")
+        run.managed_client = client
+        run.managed_tab_id = tab_id
+        run.managed_tab_name = tab_name
+        self._register_resource(
+            run,
+            RunResource(
+                "purplemux_tab",
+                tab_id,
+                {
+                    "workspace_id": workspace_id,
+                    "name": tab_name,
+                    "panel_type": "terminal",
+                    "provider": "",
+                },
+            ),
+        )
+        result_dir = Path(result_path).parent
+        self._register_resource(
+            run,
+            RunResource(
+                "managed_shell_result",
+                str(result_dir),
+                {
+                    "result_path": result_path,
+                    "tab_id": tab_id,
+                    "directory_identity": _path_identity(result_dir),
+                },
+            ),
+        )
+
+    def _register_managed_workspace(
+        self, run: _RunRecord, workspace: WorkspaceState, correlation: str
+    ) -> None:
+        self._register_resource(
+            run,
+            RunResource(
+                "purplemux_workspace",
+                workspace.id,
+                {
+                    "name": workspace.name,
+                    "directories": "\n".join(workspace.directories),
+                    "correlation_id": correlation,
+                },
+            ),
+        )
 
     def _run_identity(self, run_id: int) -> str:
         return f"{self._correlation_instance}-{run_id}"
@@ -946,9 +1087,7 @@ class PythonRunner:
             dry_run_issues=result.dry_run_issues,
             cwd=str(run_cwd),
             args=run_args,
-            checkpoint=None,
             attempts=(),
-            suspension_reason=None,
             findings=(),
             dry_run=None,
         )
@@ -1008,9 +1147,7 @@ class PythonRunner:
             dry_run_issues=(),
             cwd=run.cwd,
             args=run.args,
-            checkpoint=run.checkpoint,
             attempts=tuple(run.attempts),
-            suspension_reason=run.suspension_reason,
             findings=tuple(run.findings),
             dry_run=None,
             code=None if run.prompt is not None else run.code,
@@ -1042,9 +1179,12 @@ class PythonRunner:
             raise InvalidExecutionContextError("args must not contain null bytes")
 
         child_env = os.environ.copy()
-        child_env.pop(RESUME_CHECKPOINT_ENV, None)
-        child_env.pop(REPOSITORY_CONTEXT_ENV, None)
-        child_env.pop(PENDING_REPOSITORY_CONTEXT_ENV, None)
+        # An obsolete value inherited from a pre-0.2.1 Runner must never cause
+        # an old workflow checkpoint to be replayed by a newly started run.
+        child_env.pop("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", None)
+        child_env.pop("PURPLEMUX_RUNNER_REPOSITORY_CONTEXT", None)
+        child_env.pop("PURPLEMUX_RUNNER_PENDING_REPOSITORY_CONTEXT", None)
+        child_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
         return run_cwd, run_args, child_env
 
     def _ensure_open(self) -> None:
@@ -1059,10 +1199,46 @@ class PythonRunner:
                 run = self._runs[next(reversed(self._runs))]
             else:
                 run = self._get_run(run_id)
-            if run.state != "running" or run.process.poll() is not None:
+            if run.state != "running" or (
+                run.process is not None and run.process.poll() is not None
+            ):
                 return False
             run.stop_requested = True
+            managed_client = run.managed_client
+            managed_tab_id = run.managed_tab_id
 
+        if managed_client is not None and managed_tab_id is not None:
+            lifecycle_error: BaseException | None = None
+            try:
+                managed_client.interrupt(managed_tab_id)
+                managed_client.wait_for_shell_completion(
+                    managed_tab_id, self._stop_timeout
+                )
+                result = managed_client.read_shell_result(managed_tab_id)
+                self._finish_managed_workflow(run, result.exit_code)
+                return True
+            except Exception as exc:
+                lifecycle_error = exc
+                logger.warning(
+                    "Workflow tab %s did not publish a result after interrupt; "
+                    "closing it: %s",
+                    managed_tab_id,
+                    exc,
+                )
+                try:
+                    managed_client.close_session(managed_tab_id)
+                except Exception as close_exc:
+                    message = (
+                        f"Workflow termination is uncertain after interrupt/result "
+                        f"failure ({lifecycle_error}) and tab-close failure "
+                        f"({close_exc})"
+                    )
+                    self._record_managed_uncertainty(run, message)
+                    raise RunStopUncertainError(message) from close_exc
+                self._finish_managed_workflow(
+                    run, 130, diagnostic=f"Workflow tab closed after: {exc}"
+                )
+            return True
         self._terminate_process_group(run)
         return True
 
@@ -1481,15 +1657,16 @@ class PythonRunner:
             active_runs = tuple(
                 run
                 for run in self._runs.values()
-                if run.state == "running" and run.process.poll() is None
+                if run.state == "running"
+                and (run.process is None or run.process.poll() is None)
             )
             for run in active_runs:
                 run.stop_requested = True
         self._validator.close()
         cleanup_threads = tuple(
             threading.Thread(
-                target=self._terminate_process_group,
-                args=(run,),
+                target=self.stop,
+                args=(run.run_id,),
                 name=f"python-runner-cleanup-{run.run_id}",
                 daemon=True,
             )
@@ -1500,9 +1677,12 @@ class PythonRunner:
         for thread in cleanup_threads:
             thread.join()
         for run in active_runs:
+            if run.process is None:
+                continue
             try:
                 run.process.wait(timeout=self._stop_timeout + 1)
             except subprocess.TimeoutExpired:
+                assert run.process_group_id is not None
                 self._kill_process_group(run.process_group_id)
                 run.process.wait()
         notifier = self._notifier
@@ -1601,18 +1781,9 @@ class PythonRunner:
                     )
                     if value is not None:
                         with self._lock:
-                            event_type, event = value
-                            if event_type == "checkpoint":
-                                run.checkpoint = cast(ResumeCheckpoint, event)
-                            elif event_type == "suspended":
-                                run.suspension_reason = cast(str, event)
-                            elif event_type == "finding":
-                                run.findings.append(cast(TopologyFinding, event))
-                            elif event_type == "resource":
-                                self._register_resource(run, cast(RunResource, event))
-                            elif event_type == "resource_ownership":
-                                ownership = cast(_ResourceOwnershipEvent, event)
-                                accepted = self._register_owned_resource(run, ownership)
+                            accepted = self._accept_parsed_event(run, value)
+                            if value[0] == "resource_ownership":
+                                ownership = cast(_ResourceOwnershipEvent, value[1])
                                 acknowledgements.write(
                                     json.dumps(
                                         {
@@ -1623,12 +1794,53 @@ class PythonRunner:
                                     ).encode("utf-8")
                                     + b"\n"
                                 )
-                            else:
-                                assert isinstance(event, ProgressEvent)
-                                run.progress.append(event)
                             self._mark_changed()
         except OSError:
             return
+
+    def accept_event(self, run_id: int, token: str, payload: str) -> dict[str, object]:
+        """Accept one authenticated, observation-only event for a running run."""
+        with self._lock:
+            run = self._get_run(run_id)
+            if (
+                run.state != "running"
+                or run.event_token is None
+                or not secrets.compare_digest(token, run.event_token)
+            ):
+                raise PermissionError("run event credential is invalid")
+            parsed = self._parse_runner_event(payload)
+            if parsed is None:
+                raise ValueError("run event is invalid")
+            accepted = self._accept_parsed_event(run, parsed)
+            self._mark_changed()
+            if parsed[0] == "resource_ownership":
+                ownership = cast(_ResourceOwnershipEvent, parsed[1])
+                return {"token": ownership.token, "accepted": accepted}
+            return {"accepted": True}
+
+    @staticmethod
+    def _accepted_at() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+    def _accept_parsed_event(
+        self,
+        run: _RunRecord,
+        parsed: tuple[str, object],
+    ) -> bool:
+        event_type, event = parsed
+        if event_type == "finding":
+            finding = cast(TopologyFinding, event)
+            run.findings.append(replace(finding, observed_at=self._accepted_at()))
+        elif event_type == "resource":
+            self._register_resource(run, cast(RunResource, event))
+        elif event_type == "resource_ownership":
+            return self._register_owned_resource(
+                run, cast(_ResourceOwnershipEvent, event)
+            )
+        else:
+            progress = cast(ProgressEvent, event)
+            run.progress.append(replace(progress, observed_at=self._accepted_at()))
+        return True
 
     @staticmethod
     def _parse_runner_event(
@@ -1637,8 +1849,6 @@ class PythonRunner:
         tuple[
             Literal[
                 "progress",
-                "checkpoint",
-                "suspended",
                 "finding",
                 "resource",
                 "resource_ownership",
@@ -1654,25 +1864,6 @@ class PythonRunner:
         if not isinstance(value, dict):
             return None
         event_type = value.get("type")
-        if event_type == "checkpoint":
-            name = value.get("name")
-            data = value.get("data")
-            if (
-                not isinstance(name, str)
-                or not name.strip()
-                or not isinstance(data, dict)
-                or any(
-                    not isinstance(key, str) or not isinstance(item, str)
-                    for key, item in data.items()
-                )
-            ):
-                return None
-            return "checkpoint", ResumeCheckpoint(name=name, data=dict(data))
-        if event_type == "suspended":
-            reason = value.get("reason")
-            if isinstance(reason, str) and reason.strip():
-                return "suspended", reason
-            return None
         if event_type == "finding":
             category = value.get("category")
             status = value.get("status")
@@ -1775,8 +1966,8 @@ class PythonRunner:
                 existing.kind == resource.kind
                 and existing.identity == resource.identity
             ):
-                # Repeated registration across Resume is idempotent only when the
-                # ownership evidence remains exactly the same.
+                # Repeated registration is idempotent only when the ownership
+                # evidence remains exactly the same.
                 if existing.metadata != resource.metadata:
                     logger.warning(
                         "Ignored conflicting registration for run %s resource %s/%s",
@@ -1856,22 +2047,16 @@ class PythonRunner:
                 run.state = (
                     "stopped"
                     if run.stop_requested
-                    else "suspended"
-                    if exit_code == SUSPENDED_EXIT_CODE
-                    and run.suspension_reason is not None
                     else "success"
                     if exit_code == 0
                     else "failed"
                 )
-                if run.state != "suspended":
-                    run.suspension_reason = None
                 attempt_state = run.state
                 run.attempts.append(
                     RunAttempt(
                         number=len(run.attempts) + 1,
                         state=attempt_state,
                         exit_code=exit_code,
-                        resumed_from=run.resumed_from,
                     )
                 )
                 terminal_state = run.state
@@ -1884,6 +2069,86 @@ class PythonRunner:
             with self._lock:
                 self._wait_threads.discard(threading.current_thread())
 
+    def _wait_for_managed_workflow(self, run: _RunRecord) -> None:
+        client = run.managed_client
+        tab_id = run.managed_tab_id
+        assert client is not None and tab_id is not None
+        last_diagnostic: str | None = None
+        retry_delay = _MANAGED_OBSERVATION_RETRY_INITIAL_SECONDS
+        try:
+            while True:
+                with self._lock:
+                    if run.state != "running" or self._closed:
+                        return
+                try:
+                    client.wait_for_shell_completion(tab_id, 365 * 24 * 60 * 60)
+                    result = client.read_shell_result(tab_id)
+                except Exception as exc:
+                    diagnostic = f"Workflow result observation is uncertain: {exc}"
+                    if diagnostic != last_diagnostic:
+                        self._record_managed_uncertainty(run, diagnostic)
+                        last_diagnostic = diagnostic
+                    with self._changes:
+                        self._changes.wait_for(
+                            lambda: run.state != "running" or self._closed,
+                            timeout=retry_delay,
+                        )
+                    retry_delay = min(
+                        retry_delay * 2, _MANAGED_OBSERVATION_RETRY_MAX_SECONDS
+                    )
+                    continue
+                diagnostic = (
+                    result.failure_message("Workflow")
+                    if result.exit_code != 0
+                    else None
+                )
+                self._finish_managed_workflow(
+                    run, result.exit_code, diagnostic=diagnostic
+                )
+                return
+        finally:
+            with self._lock:
+                self._wait_threads.discard(threading.current_thread())
+
+    def _record_managed_uncertainty(self, run: _RunRecord, diagnostic: str) -> None:
+        with self._lock:
+            if run.state != "running":
+                return
+            self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
+            self._mark_changed()
+
+    def _finish_managed_workflow(
+        self, run: _RunRecord, exit_code: int, *, diagnostic: str | None = None
+    ) -> None:
+        with self._lock:
+            if run.state != "running":
+                return
+            run.exit_code = exit_code
+            run.state = (
+                "stopped"
+                if run.stop_requested
+                else "success"
+                if exit_code == 0
+                else "failed"
+            )
+            if diagnostic:
+                self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
+            run.attempts.append(
+                RunAttempt(
+                    number=len(run.attempts) + 1,
+                    state=run.state,
+                    exit_code=exit_code,
+                )
+            )
+            terminal_state = run.state
+            self._mark_changed()
+        run.script_path.unlink(missing_ok=True)
+        if run.credential_path is not None:
+            run.credential_path.unlink(missing_ok=True)
+        self._notify_terminal(
+            run_id=run.run_id, state=terminal_state, exit_code=exit_code
+        )
+
     def _notify_terminal(
         self, *, run_id: int | None, state: RunnerState, exit_code: int
     ) -> None:
@@ -1895,7 +2160,6 @@ class PythonRunner:
             not in (
                 "success",
                 "failed",
-                "suspended",
                 "stopped",
             )
         ):
@@ -1921,6 +2185,8 @@ class PythonRunner:
 
     def _terminate_process_group(self, run: _RunRecord) -> None:
         process_group_id = run.process_group_id
+        if process_group_id is None:
+            return
         with run.cleanup_lock:
             if not self._process_group_exists(process_group_id):
                 return

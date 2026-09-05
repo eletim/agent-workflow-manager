@@ -67,7 +67,7 @@
   "integration_branch": "dev/v0.2.0",
   "final_branch": "main",
   "issues": [90, 89],
-  "max_reviews": 8,
+  "max_reviews": 5,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -98,7 +98,6 @@ emit_step("workspace create", "completed")</textarea>
           <button id="validate">Validate</button>
           <button id="dry-run">Dry Run</button>
           <button id="run" class="primary">Run</button>
-          <button id="resume" disabled>Continue after fix</button>
           <button id="stop" disabled>Stop</button>
           <button id="cleanup" disabled>Cleanup</button>
           <span id="exit-code">Exit code: —</span>
@@ -228,7 +227,7 @@ emit_step("workspace create", "completed")</textarea>
       <div class="guide-toolbar">
         <h2 id="guide-title">Workflow Guide</h2>
         <div class="guide-actions">
-          <a href="/python-workflow-guide.md" target="_blank" rel="noopener">Raw</a>
+          <a id="guide-raw" href="/python-workflow-guide.md" target="_blank" rel="noopener">Raw</a>
           <button id="guide-copy" aria-live="polite" disabled>Copy</button>
           <button id="guide-close">Close</button>
         </div>
