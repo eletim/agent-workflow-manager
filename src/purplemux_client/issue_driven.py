@@ -233,6 +233,15 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
 """
 
 
+def _workflow_outline(config: IssueDrivenConfig) -> str:
+    labels = [f"Issue #{number}" for number in config.issues]
+    if config.final_review:
+        labels.append("Whole-version review")
+    labels.append("Final integration PR")
+    entries = "\n".join(f"    {label!r}," for label in labels)
+    return f"WORKFLOW_OUTLINE = [\n{entries}\n]"
+
+
 def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     """Generate a deterministic plain-Python workflow using new-run recovery."""
     source = _canonical_source()
@@ -241,6 +250,9 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
         "    PurpleMuxRuntime,\n    prepare_run_repository,\n",
         1,
     )
+    outline_start = source.index("WORKFLOW_OUTLINE = [\n")
+    outline_end = source.index("\n]", outline_start) + len("\n]")
+    source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]
     source = source.replace("MAX_REVIEWS = 5", f"MAX_REVIEWS = {config.max_reviews}", 1)
     source = source.replace(
         "MERGE_TO_INTEGRATION = True",

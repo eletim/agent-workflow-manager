@@ -172,6 +172,18 @@ def run_turn(
     return result
 
 
+def run_outline_step(name: str, action):
+    """Run one concrete outline unit while retaining detailed nested progress."""
+    emit_step(name, "started")
+    try:
+        result = action()
+    except BaseException as exc:
+        emit_step(name, "failed", error=short_error(exc))
+        raise
+    emit_step(name, "completed")
+    return result
+
+
 def decision(result: str) -> str:
     verdict = next((line.strip() for line in result.splitlines() if line.strip()), "")
     if verdict not in {"APPROVED", "CHANGES_REQUESTED"}:
@@ -635,6 +647,17 @@ def integration_delivery(
             f"final delivery already merged as #{merged_pr.number} at "
             f"{integration.remote_sha}",
         )
+        if FINAL_REVIEW:
+            emit_step(
+                "Whole-version review",
+                "completed",
+                message=f"delivery already merged as PR #{merged_pr.number}",
+            )
+        emit_step(
+            "Final integration PR",
+            "completed",
+            message=f"already merged as PR #{merged_pr.number}",
+        )
         return merged_pr
     if pr is None:
         pr = github.create_draft_pr(
@@ -828,26 +851,29 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             raise WorkerFailure("final checks kept changing the integration branch")
         approved_head, approved_base = pr.head_sha, pr.base_sha
     assert approved_head is not None and approved_base is not None
-    ready = github.set_draft(
-        pr.number,
-        draft=False,
-        expected_head=config.integration_branch,
-        expected_head_sha=approved_head,
-        expected_base=config.main_branch,
-        expected_base_sha=approved_base,
-    )
-    if not MERGE_FINAL:
-        return ready
-    merged = merge_pr_and_advance(
-        repo,
-        github,
-        number=ready.number,
-        head=config.integration_branch,
-        head_sha=ready.head_sha,
-        base=config.main_branch,
-        base_sha=ready.base_sha,
-    )
-    return merged.pr
+    def finalize() -> PullRequestState:
+        ready = github.set_draft(
+            pr.number,
+            draft=False,
+            expected_head=config.integration_branch,
+            expected_head_sha=approved_head,
+            expected_base=config.main_branch,
+            expected_base_sha=approved_base,
+        )
+        if not MERGE_FINAL:
+            return ready
+        merged = merge_pr_and_advance(
+            repo,
+            github,
+            number=ready.number,
+            head=config.integration_branch,
+            head_sha=ready.head_sha,
+            base=config.main_branch,
+            base_sha=ready.base_sha,
+        )
+        return merged.pr
+
+    return run_outline_step("Final integration PR", finalize)
 
 
 def main() -> None:
@@ -860,7 +886,10 @@ def main() -> None:
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
     for issue in config.issues:
-        process_issue(issue, config, client, repo, github)
+        run_outline_step(
+            f"Issue #{issue.number}",
+            lambda issue=issue: process_issue(issue, config, client, repo, github),
+        )
     ready = integration_delivery(config, client, repo, github)
     outcome = "Merged" if ready.state == "MERGED" else "Ready (not merged)"
     print(f"Whole-version PR is {outcome}: {ready.url}", flush=True)
