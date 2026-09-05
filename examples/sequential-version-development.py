@@ -226,7 +226,7 @@ def prepare_issue(
     github: GitHubRepository,
     issue: Issue,
     config: Config,
-) -> tuple[PullRequestState | None, str] | None:
+) -> tuple[PullRequestState | None, str, bool] | None:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
@@ -242,13 +242,16 @@ def prepare_issue(
     integration = repo.synchronize_branch(config.integration_branch)
     assert integration.remote_sha is not None
     if open_pr is None:
-        feature = repo.prepare_feature_branch(
+        recovery = repo.recover_feature_branch(
             issue.branch,
             base=config.integration_branch,
             expected_base_sha=integration.remote_sha,
         )
+        feature = recovery.branch
+        reused_existing_work = recovery.reused_existing_work
     else:
         feature = repo.synchronize_branch(issue.branch)
+        reused_existing_work = True
         prepared = repo.inspect_feature_preparation(
             issue.branch,
             base=config.integration_branch,
@@ -273,7 +276,7 @@ def prepare_issue(
         "git",
         f"{issue.branch} contains {config.integration_branch} @ {integration.remote_sha}",
     )
-    return open_pr, feature.local_sha
+    return open_pr, feature.local_sha, reused_existing_work
 
 
 def ensure_issue_pr(
@@ -321,7 +324,7 @@ def process_issue(
     if prepared is None:
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
         return
-    existing_pr, start_sha = prepared
+    existing_pr, start_sha, reused_existing_work = prepared
     implementer = create_agent(client, config, name=f"Issue {issue.number} implementer")
     reviewer = create_agent(client, config, name=f"Issue {issue.number} reviewer")
     implementation_prompt, review_prompt = issue_prompts(issue, config)
@@ -337,7 +340,7 @@ def process_issue(
         implementer,
         issue.branch,
         start_sha,
-        allow_unchanged=existing_pr is not None,
+        allow_unchanged=existing_pr is not None or reused_existing_work,
     )
     integration = repo.inspect_branch(config.integration_branch)
     if integration.remote_sha is None:

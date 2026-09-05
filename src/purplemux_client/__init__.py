@@ -26,6 +26,7 @@ from purplemux_client.execution_context import (
 from purplemux_client.git import (
     BranchState,
     FeaturePreparationState,
+    FeatureRecoveryState,
     GitRepository,
     WorktreeState,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "CreateWorkspaceRequest",
     "BranchState",
     "FeaturePreparationState",
+    "FeatureRecoveryState",
     "GitHubRepository",
     "GitRepository",
     "IncompletePullRequestEnumeration",

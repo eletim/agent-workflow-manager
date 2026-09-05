@@ -98,18 +98,20 @@ PurpleMux workspace creation, shell steps, and agent `cwd` values. The original
 checkout is never switched, reset, stashed, or cleaned.
 
 The validated topology layer accepts that clean detached root as the exact base
-for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sha)`.
+for `GitRepository.recover_feature_branch(..., expected_base_sha=context.base_sha)`.
 This keeps branch preparation inside the isolated worktree even when the source
 checkout already has the configured base branch checked out. If the logical
 feature branch is also checked out in another worktree, the topology layer uses
-a unique `awm-run/...` local branch. Record the prepared SHA before an agent
-turn, then require the CodingAgent's new commit and clean worktree with
-`require_committed_result()`. Use `ensure_pushed()` to complete delivery through
-the logical remote branch name. It creates an absent branch or fast-forwards a
-behind branch only; remote-ahead and divergence fail closed. The Workflow must
-then create or reuse and verify the exact Draft PR before starting review. Push
-and PR creation may be agent conveniences, but are not CodingAgent hard
-postconditions.
+a unique `awm-run/...` local branch. Recovery inspects logical and prior-run
+private refs, selects their single furthest descendant of the exact authoritative
+base, and fails closed if safe candidates diverge. A recovered commit can satisfy
+an unchanged agent turn; otherwise require the CodingAgent's new commit and clean
+worktree with `require_committed_result()`. Use `ensure_pushed()` to complete
+delivery through the logical remote branch name. It creates an absent branch or
+fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
+Workflow must then create or reuse and verify the exact Draft PR before starting
+review. Push and PR creation may be agent conveniences, but are not CodingAgent
+hard postconditions.
 
 The workflow subprocess itself runs from a stable Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put

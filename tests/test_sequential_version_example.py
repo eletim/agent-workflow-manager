@@ -23,11 +23,13 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert "inspect_feature_preparation(" in source
+    assert "repo.recover_feature_branch(" in source
     assert "github.require_pr(" in source
     assert "repo.require_committed_result(" in source
     assert "repo.ensure_pushed(" in source
     assert "run_correlation(" in source
     assert "MutationOutcomeUnknown" not in source  # helpers raise it internally
+    assert "existing_pr is not None or reused_existing_work" in source
 
 
 def test_example_passes_static_validation() -> None:
