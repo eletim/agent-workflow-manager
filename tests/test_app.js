@@ -456,6 +456,35 @@ test("Issue Driven mode opens and copies its dedicated guide", async () => {
   assert.deepEqual(clipboard.writes, ["issue guide"]);
 });
 
+test("stale guide failure cannot replace the active guide", async () => {
+  const workflowGuide = deferred();
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/python-workflow-guide.md") return workflowGuide.promise;
+      if (url === "/issue-driven-guide.md") return response("issue guide");
+      return undefined;
+    },
+  });
+
+  const staleRequest = elements["guide-open"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  await elements["guide-open"].dispatch("click");
+
+  assert.equal(elements["guide-content"].textContent, "issue guide");
+  assert.equal(elements["guide-copy"].disabled, false);
+
+  workflowGuide.resolve(response("failed", 500));
+  await staleRequest;
+
+  assert.equal(elements["guide-title"].textContent, "Issue Driven Guide");
+  assert.equal(elements["guide-raw"].href, "/issue-driven-guide.md");
+  assert.equal(elements["guide-content"].textContent, "issue guide");
+  assert.equal(elements["guide-copy"].disabled, false);
+});
+
 test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {
   const first = deferred();
   const second = deferred();

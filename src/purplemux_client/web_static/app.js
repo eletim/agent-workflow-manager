@@ -594,17 +594,11 @@ function selectedGuide() {
 }
 
 async function loadGuide(guide) {
-  if (guideTexts[guide.key] !== undefined) {
-    guideContent.textContent = guideTexts[guide.key];
-    guideCopy.disabled = false;
-    return guideTexts[guide.key];
-  }
+  if (guideTexts[guide.key] !== undefined) return guideTexts[guide.key];
   const response = await fetch(guide.path);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const text = await response.text();
   guideTexts[guide.key] = text;
-  if (activeGuide?.key === guide.key) guideContent.textContent = text;
-  guideCopy.disabled = false;
   return text;
 }
 
@@ -619,16 +613,21 @@ function showManualCopy(text) {
 manualCopyClose.addEventListener("click", () => manualCopyDialog.close());
 
 guideOpen.addEventListener("click", async () => {
-  activeGuide = selectedGuide();
-  guideTitle.textContent = activeGuide.title;
-  guideRaw.href = activeGuide.path;
+  const requestedGuide = selectedGuide();
+  activeGuide = requestedGuide;
+  guideTitle.textContent = requestedGuide.title;
+  guideRaw.href = requestedGuide.path;
   guideContent.textContent = "Loading…";
   guideCopy.disabled = true;
   guideDialog.showModal();
   try {
-    await loadGuide(activeGuide);
+    const text = await loadGuide(requestedGuide);
+    if (activeGuide !== requestedGuide) return;
+    guideContent.textContent = text;
+    guideCopy.disabled = false;
   } catch (error) {
-    guideContent.textContent = `Could not load ${activeGuide.title}: ${error}`;
+    if (activeGuide !== requestedGuide) return;
+    guideContent.textContent = `Could not load ${requestedGuide.title}: ${error}`;
   }
 });
 
