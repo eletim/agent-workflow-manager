@@ -230,7 +230,7 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
         "    PurpleMuxRuntime,\n    prepare_run_repository,\n",
         1,
     )
-    source = source.replace("MAX_REVIEWS = 4", f"MAX_REVIEWS = {config.max_reviews}", 1)
+    source = source.replace("MAX_REVIEWS = 5", f"MAX_REVIEWS = {config.max_reviews}", 1)
     source = source.replace(
         "MERGE_TO_INTEGRATION = True",
         f"MERGE_TO_INTEGRATION = {config.merge_to_integration}",

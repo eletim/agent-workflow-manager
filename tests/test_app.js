@@ -210,7 +210,7 @@ async function loadApp({
     "refresh-readiness", "readiness-summary", "readiness-details",
     "readiness-result-provider", "readiness-identity", "readiness-tab", "readiness-state",
     "readiness-cleanup", "readiness-guidance",
-    "guide-open", "guide-close", "guide-copy",
+    "guide-open", "guide-close", "guide-copy", "guide-title", "guide-raw",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
@@ -423,6 +423,37 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
   assert.equal(elements["issue-driven-success"].hidden, false);
   assert.deepEqual(outlineLabels(elements), ["generated"]);
+});
+
+test("Issue Driven mode opens and copies its dedicated guide", async () => {
+  const clipboard = {
+    writes: [],
+    async writeText(text) { this.writes.push(text); },
+  };
+  const {elements, calls} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    clipboardOverride: clipboard,
+    fetchOverride(url) {
+      if (url === "/issue-driven-guide.md") return response("issue guide");
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Issue Driven Guide");
+  await elements["guide-open"].dispatch("click");
+
+  assert.equal(elements["guide-title"].textContent, "Issue Driven Guide");
+  assert.equal(elements["guide-raw"].href, "/issue-driven-guide.md");
+  assert.equal(elements["guide-content"].textContent, "issue guide");
+  assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
+    ["/issue-driven-guide.md", "GET"],
+  ]);
+
+  await elements["guide-copy"].dispatch("click");
+  assert.deepEqual(clipboard.writes, ["issue guide"]);
 });
 
 test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {

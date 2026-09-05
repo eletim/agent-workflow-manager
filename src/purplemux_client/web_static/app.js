@@ -73,6 +73,8 @@ const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
 const guideCopy = document.querySelector("#guide-copy");
 const guideContent = document.querySelector("#guide-content");
+const guideTitle = document.querySelector("#guide-title");
+const guideRaw = document.querySelector("#guide-raw");
 const manualCopyDialog = document.querySelector("#manual-copy-dialog");
 const manualCopyContent = document.querySelector("#manual-copy-content");
 const manualCopyClose = document.querySelector("#manual-copy-close");
@@ -92,7 +94,8 @@ const favicon = document.querySelector("#favicon");
 
 let requestToken = null;
 let eventSource = null;
-let guideText = null;
+const guideTexts = {};
+let activeGuide = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
@@ -185,6 +188,7 @@ function applyModeVisibility() {
   dryRunButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
+  guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
   dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
   outlinePanel.hidden = promptMode || outlinePanel.hidden;
@@ -574,14 +578,34 @@ function renderProgress(events) {
   }
 }
 
-async function loadGuide() {
-  if (guideText !== null) return guideText;
-  const response = await fetch("/python-workflow-guide.md");
+function selectedGuide() {
+  if (currentMode === "issue-driven") {
+    return {
+      key: "issue-driven",
+      path: "/issue-driven-guide.md",
+      title: "Issue Driven Guide",
+    };
+  }
+  return {
+    key: "workflow",
+    path: "/python-workflow-guide.md",
+    title: "Workflow Guide",
+  };
+}
+
+async function loadGuide(guide) {
+  if (guideTexts[guide.key] !== undefined) {
+    guideContent.textContent = guideTexts[guide.key];
+    guideCopy.disabled = false;
+    return guideTexts[guide.key];
+  }
+  const response = await fetch(guide.path);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  guideText = await response.text();
-  guideContent.textContent = guideText;
+  const text = await response.text();
+  guideTexts[guide.key] = text;
+  if (activeGuide?.key === guide.key) guideContent.textContent = text;
   guideCopy.disabled = false;
-  return guideText;
+  return text;
 }
 
 function showManualCopy(text) {
@@ -595,11 +619,16 @@ function showManualCopy(text) {
 manualCopyClose.addEventListener("click", () => manualCopyDialog.close());
 
 guideOpen.addEventListener("click", async () => {
+  activeGuide = selectedGuide();
+  guideTitle.textContent = activeGuide.title;
+  guideRaw.href = activeGuide.path;
+  guideContent.textContent = "Loading…";
+  guideCopy.disabled = true;
   guideDialog.showModal();
   try {
-    await loadGuide();
+    await loadGuide(activeGuide);
   } catch (error) {
-    guideContent.textContent = `Could not load Workflow Guide: ${error}`;
+    guideContent.textContent = `Could not load ${activeGuide.title}: ${error}`;
   }
 });
 
@@ -610,7 +639,7 @@ guideCopy.addEventListener("click", async () => {
     window.clearTimeout(guideCopyResetTimer);
   }
   try {
-    const text = await loadGuide();
+    const text = await loadGuide(activeGuide || selectedGuide());
     await runnerOutputClipboard.writeText(
       text,
       navigator.clipboard,
@@ -619,7 +648,9 @@ guideCopy.addEventListener("click", async () => {
     guideCopy.textContent = "Copied";
   } catch (error) {
     guideCopy.textContent = "Copy manually";
-    showManualCopy(guideText || guideContent.textContent);
+    showManualCopy(
+      (activeGuide && guideTexts[activeGuide.key]) || guideContent.textContent,
+    );
   }
   guideCopyResetTimer = window.setTimeout(() => {
     guideCopy.textContent = "Copy";
