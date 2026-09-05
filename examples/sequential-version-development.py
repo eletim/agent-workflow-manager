@@ -36,7 +36,7 @@ WORKFLOW_OUTLINE = [
     "Deliver the exact approved Issue topology",
     "Review and deliver the whole version",
 ]
-MAX_REVIEWS = 4
+MAX_REVIEWS = 5
 READY_TIMEOUT = 120
 TURN_TIMEOUT = 3600
 SHELL_TIMEOUT = 1800

@@ -1926,7 +1926,7 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
             "integration_branch": "dev/v0.2.0",
             "final_branch": "main",
             "issues": [90, 89],
-            "max_reviews": 8,
+            "max_reviews": 5,
             "merge_to_integration": True,
             "final_review": True,
             "merge_final": False,
@@ -1995,6 +1995,7 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
     script = documents["/app.js"]
     assert 'id="output-copy"' in index
     assert 'id="guide-copy"' in index
+    assert 'id="guide-raw"' in index
     assert '<script src="/log-display.js"></script>' in index
     assert "formatOutputEntries" in log_display
     assert "writeText" in helper
@@ -2003,6 +2004,21 @@ def test_runner_page_exposes_copy_actions_and_shared_helper(
     assert 'guideCopy.textContent = "Copy manually"' in script
     assert 'outputCopy.textContent = "Copy manually"' in script
     assert 'id="manual-copy-dialog"' in index
+
+
+def test_runner_serves_issue_driven_guide(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/issue-driven-guide.md")
+    response = connection.getresponse()
+    guide = response.read().decode()
+    connection.close()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/markdown; charset=utf-8"
+    assert guide.startswith("# Issue Driven Guide")
 
 
 def test_copy_browser_logic() -> None:

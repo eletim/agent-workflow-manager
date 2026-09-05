@@ -67,7 +67,7 @@ executable DSL, and there is no Issue Driven runtime or UI-side control-flow mod
   "integration_branch": "dev/v0.2.0",
   "final_branch": "main",
   "issues": [90, 89],
-  "max_reviews": 8,
+  "max_reviews": 5,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false

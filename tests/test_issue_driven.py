@@ -21,7 +21,7 @@ def payload(**overrides: object) -> dict[str, object]:
         "integration_branch": "dev/v0.2.0",
         "final_branch": "main",
         "issues": [90, 89, 91],
-        "max_reviews": 8,
+        "max_reviews": 5,
         "merge_to_integration": True,
         "final_review": True,
         "merge_final": False,
@@ -84,7 +84,7 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
         for number in config.issues
     ]
     assert positions == sorted(positions)
-    assert "MAX_REVIEWS = 8" in first
+    assert "MAX_REVIEWS = 5" in first
 
 
 def test_generated_workflow_passes_supported_static_validation() -> None:
