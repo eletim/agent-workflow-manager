@@ -1211,7 +1211,7 @@ def test_close_cannot_miss_concurrent_start_registration(
     allow_popen = threading.Event()
 
     def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-        if kwargs.get("start_new_session") is True:
+        if kwargs.get("start_new_session") is True and "cwd" in kwargs:
             popen_entered.set()
             assert allow_popen.wait(timeout=3)
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
@@ -1414,7 +1414,7 @@ def test_popen_uses_current_interpreter_without_shell(
     command, options = next(
         (command, options)
         for command, options in calls
-        if options.get("start_new_session") is True
+        if options.get("start_new_session") is True and "cwd" in options
     )
     assert isinstance(command, list)
     assert command[0] == sys.executable

@@ -5,6 +5,7 @@ import importlib.machinery
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -113,8 +114,7 @@ class WorkflowValidator:
             self._closed = True
             workers = tuple(self._workers)
         for worker in workers:
-            if worker.poll() is None:
-                worker.kill()
+            self._kill_worker_process_group(worker)
         for worker in workers:
             worker.wait()
         with self._worker_lock:
@@ -155,6 +155,7 @@ class WorkflowValidator:
                     stderr=subprocess.PIPE,
                     text=True,
                     shell=False,
+                    start_new_session=True,
                 )
                 self._workers.add(worker)
         except Exception as exc:
@@ -172,7 +173,7 @@ class WorkflowValidator:
                     payload, timeout=self._check_timeout
                 )
             except subprocess.TimeoutExpired:
-                worker.kill()
+                self._kill_worker_process_group(worker)
                 worker.communicate()
                 return ValidationResult(
                     (
@@ -182,6 +183,10 @@ class WorkflowValidator:
                         ),
                     )
                 )
+            except BaseException:
+                self._kill_worker_process_group(worker)
+                worker.communicate()
+                raise
         finally:
             with self._worker_lock:
                 self._workers.discard(worker)
@@ -214,6 +219,13 @@ class WorkflowValidator:
                 )
             )
         return ValidationResult(issues, outline, dry_run_issues)
+
+    @staticmethod
+    def _kill_worker_process_group(worker: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     @staticmethod
     def _worker_command() -> list[str]:
