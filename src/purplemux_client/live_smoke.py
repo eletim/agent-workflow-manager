@@ -8,6 +8,7 @@ from typing import Any
 from purplemux_client import (
     CreateSessionRequest,
     PurpleMuxCLIClient,
+    PurpleMuxRuntime,
     TerminalSessionError,
     WorkerFailure,
 )
@@ -79,7 +80,7 @@ def main() -> None:
     parser.add_argument("--turn-timeout", type=float, default=180.0)
     args = parser.parse_args()
 
-    client = PurpleMuxCLIClient(args.workspace, poll_interval_seconds=1.0)
+    client = PurpleMuxRuntime().workspace(args.workspace)
     try:
         lifecycle_smoke(client, args.cwd, args.ready_timeout, args.turn_timeout)
     except TerminalSessionError as exc:

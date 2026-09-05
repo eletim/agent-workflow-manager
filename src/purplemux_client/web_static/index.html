@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Agent Workflow Manager</title>
-    <link id="favicon" rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link id="favicon" rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
@@ -82,17 +82,20 @@
         </div>
 
         <div id="workflow-fields">
-          <div class="execution-context">
-            <div class="context-field context-args">
-              <label for="run-arguments">Arguments <span>(one per line)</span></label>
-              <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
-            </div>
-          </div>
           <label for="code">Python</label>
           <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
 emit_step("workspace create", "started")
 emit_step("workspace create", "completed")</textarea>
+          <details class="advanced-options">
+            <summary>Advanced options</summary>
+            <div class="execution-context">
+              <div class="context-field context-args">
+                <label for="run-arguments">Arguments <span>(one per line)</span></label>
+                <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
+              </div>
+            </div>
+          </details>
         </div>
         <div class="controls">
           <button id="validate">Validate</button>
@@ -133,36 +136,6 @@ emit_step("workspace create", "completed")</textarea>
         <pre id="next-mutation">No reachable mutation.</pre>
       </section>
 
-      <section class="panel readiness-panel" aria-live="polite">
-        <div class="readiness-heading">
-          <div>
-            <h2>Agent readiness</h2>
-            <p>Explicit mutating probe: creates one provider tab in the selected existing workspace, waits for structured readiness, then closes that tab once.</p>
-          </div>
-          <button id="refresh-readiness" type="button">Refresh workspaces</button>
-        </div>
-        <div class="readiness-controls">
-          <label for="readiness-workspace">Workspace</label>
-          <select id="readiness-workspace"></select>
-          <label for="readiness-provider">Provider</label>
-          <select id="readiness-provider">
-            <option value="codex">Codex</option>
-            <option value="claude-code">Claude Code</option>
-          </select>
-          <button id="run-readiness" type="button" class="primary">Run mutating probe</button>
-          <button id="reconcile-readiness" type="button" hidden>Reconcile unresolved probe</button>
-        </div>
-        <p id="readiness-summary" class="readiness-summary">Loading existing PurpleMux workspaces…</p>
-        <dl id="readiness-details" class="readiness-details" hidden>
-          <dt>Provider</dt><dd id="readiness-result-provider"></dd>
-          <dt>Probe identity</dt><dd id="readiness-identity"></dd>
-          <dt>Created tab</dt><dd id="readiness-tab"></dd>
-          <dt>Readiness</dt><dd id="readiness-state"></dd>
-          <dt>Cleanup</dt><dd id="readiness-cleanup"></dd>
-          <dt>Recovery</dt><dd id="readiness-guidance"></dd>
-        </dl>
-      </section>
-
       <section id="outline-panel" class="panel outline-panel" aria-live="polite" hidden>
         <h2>Execution outline</h2>
         <ol id="outline" class="outline-list"></ol>
@@ -189,6 +162,39 @@ emit_step("workspace create", "completed")</textarea>
           </div>
         </div>
       </section>
+
+      <details id="diagnostics-panel" class="panel settings-panel diagnostics-panel">
+        <summary>Diagnostics</summary>
+        <section class="readiness-panel" aria-live="polite">
+          <div class="readiness-heading">
+            <div>
+              <h2>Agent readiness</h2>
+              <p>Explicit mutating probe: creates one provider tab in the selected existing workspace, waits for structured readiness, then closes that tab once.</p>
+            </div>
+            <button id="refresh-readiness" type="button">Refresh workspaces</button>
+          </div>
+          <div class="readiness-controls">
+            <label for="readiness-workspace">Workspace</label>
+            <select id="readiness-workspace"></select>
+            <label for="readiness-provider">Provider</label>
+            <select id="readiness-provider">
+              <option value="codex">Codex</option>
+              <option value="claude-code">Claude Code</option>
+            </select>
+            <button id="run-readiness" type="button" class="primary">Run mutating probe</button>
+            <button id="reconcile-readiness" type="button" hidden>Reconcile unresolved probe</button>
+          </div>
+          <p id="readiness-summary" class="readiness-summary">Loading existing PurpleMux workspaces…</p>
+          <dl id="readiness-details" class="readiness-details" hidden>
+            <dt>Provider</dt><dd id="readiness-result-provider"></dd>
+            <dt>Probe identity</dt><dd id="readiness-identity"></dd>
+            <dt>Created tab</dt><dd id="readiness-tab"></dd>
+            <dt>Readiness</dt><dd id="readiness-state"></dd>
+            <dt>Cleanup</dt><dd id="readiness-cleanup"></dd>
+            <dt>Recovery</dt><dd id="readiness-guidance"></dd>
+          </dl>
+        </section>
+      </details>
 
       <details class="panel settings-panel">
         <summary>Settings</summary>

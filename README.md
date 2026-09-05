@@ -112,16 +112,18 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Capture the pre-turn SHA before invoking the CodingAgent. Its hard
-# postcondition is a new commit on the expected branch and a clean worktree.
+# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told
+# to commit, push, create or update one exact Draft PR, and leave a clean
+# worktree. The Workflow independently verifies each delivery postcondition.
 turn_start_sha = feature.local_sha
 # ... run the CodingAgent ...
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
 )
-# Push is orchestration-owned gap absorption. This only creates the exact
-# remote branch or fast-forwards it; remote-ahead/diverged states fail closed.
+# Push is also orchestration-owned gap absorption if the agent omitted it. This
+# only creates the exact remote branch or fast-forwards it; remote-ahead or
+# diverged states fail closed.
 feature = repo.ensure_pushed(
     "feature/issue-123",
     expected_local_sha=feature.local_sha,
@@ -143,6 +145,17 @@ review. A dirty agent result cannot advance. A review-fix turn normally has the
 same new-commit/clean contract; if the implementer explicitly re-evaluates a
 finding and returns clean without a commit, the Workflow records a WARN policy
 outcome rather than pretending that the reviewer approved it.
+
+At a required clean-worktree boundary, a dirty state receives one focused
+CodingAgent remediation turn before failure. That turn may commit intended
+source, test, or configuration work, add narrow ignores for generated artifacts,
+or remove only clearly disposable generated files. It cannot push, change PR
+state, merge, start a review, reset, stash, rebase, force, or discard uncertain
+work. The Workflow re-inspects the worktree and reports remaining paths when the
+state cannot be resolved safely; an already-clean path does not invoke cleanup.
+If review or final checks introduce a commit, the Workflow pushes and rebinds the
+exact Draft PR, invalidates the prior approval, and repeats review and checks
+before making the PR Ready.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,
@@ -232,9 +245,9 @@ the workflow explicitly closes it, which lets failed commands remain available
 for inspection.
 
 ```python
-from purplemux_client import CreateSessionRequest, PurpleMuxCLIClient
+from purplemux_client import CreateSessionRequest, PurpleMuxRuntime
 
-client = PurpleMuxCLIClient("ws-example")
+client = PurpleMuxRuntime().workspace("ws-example")
 session_id = client.create_session(
     CreateSessionRequest(worker="codex", cwd="/workspace/project", command="codex")
 )
@@ -267,6 +280,20 @@ client.close_session(shell_tab)
 
 PurpleMux owns provider launch commands and the workspace directory. The
 adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
+Before creating a Codex tab, the adapter canonicalizes the requested working
+directory, re-reads the selected workspace, and requires it to match the
+workspace's current first directory—the directory PurpleMux actually launches.
+It marks only that path trusted through Codex's supported app-server
+`config/batchWrite` API. It reads the effective Codex configuration back before
+launch and fails immediately if trust cannot be confirmed. This also covers
+fresh run worktrees, whose new paths do not inherit trust from their source
+repositories. The operation does not change Codex sandbox or approval settings
+and does not trust a parent, secondary, or unrelated path.
+
+Claude Code has no equivalent narrow path-trust mutation in the integration
+used here. AWM does not use a broad permission bypass or terminal keystroke
+automation for Claude; its provider-specific trust behavior remains owned by
+Claude Code and PurpleMux.
 
 ## Local Python Runner UI
 
@@ -290,6 +317,9 @@ tab. Stop uses the public PurpleMux interrupt/result lifecycle, closing the tab
 only if needed to reach a deterministic stopped state. If neither structured
 completion nor tab closure can be confirmed, AWM reports the uncertainty and
 keeps the run non-terminal so events remain accepted and Cleanup stays disabled.
+The primary workflow surface keeps Python and its execution controls visible;
+optional arguments are under **Advanced options**, while the explicit mutating
+agent-readiness probe is under **Diagnostics** near **Settings**.
 
 Failed and stopped runs remain available for inspection, including their output
 and run-owned resources, but are never continued in place. Recovery starts a new
@@ -579,4 +609,13 @@ waits for a fresh structured result, verifies it, and closes the session:
 
 ```bash
 make live-smoke ARGS="lifecycle --workspace ws-example --cwd /workspace/project"
+```
+
+The opt-in Codex trust integration test creates a fresh linked worktree and
+PurpleMux workspace, proves the first real Codex turn completes without an
+interactive trust prompt, then repeats the launch for the already-trusted path:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_TRUST=1 \
+  uv run pytest tests/test_live_codex_trust.py
 ```

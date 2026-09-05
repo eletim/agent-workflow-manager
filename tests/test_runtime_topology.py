@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -163,6 +164,32 @@ def request() -> CreateSessionRequest:
     )
 
 
+def topology_client(runner: RuntimeRunner) -> PurpleMuxCLIClient:
+    runner.workspaces.setdefault(
+        "ws-test", {"id": "ws-test", "name": "Test", "directories": ["/repo"]}
+    )
+    return PurpleMuxCLIClient(
+        "ws-test",
+        runner=runner,
+        codex_project_truster=lambda path: path,
+    )
+
+
+def probe_client(
+    runner: RuntimeRunner, *, monotonic: Callable[[], float] = time.monotonic
+) -> PurpleMuxCLIClient:
+    runner.workspaces.setdefault(
+        "ws-test", {"id": "ws-test", "name": "Test", "directories": ["/repo"]}
+    )
+    return PurpleMuxCLIClient(
+        "ws-test",
+        runner=runner,
+        poll_interval_seconds=0,
+        codex_project_truster=lambda path: path,
+        monotonic=monotonic,
+    )
+
+
 def test_authoritative_tab_listing_rejects_incomplete_response() -> None:
     with pytest.raises(WorkerFailure, match="incomplete"):
         PurpleMuxCLIClient(
@@ -172,7 +199,7 @@ def test_authoritative_tab_listing_rejects_incomplete_response() -> None:
 
 def test_lost_create_response_reconciles_one_exact_new_tab_without_retry() -> None:
     runner = RuntimeRunner("timeout-after-apply")
-    tab = PurpleMuxCLIClient("ws-test", runner=runner).create_session(request())
+    tab = topology_client(runner).create_session(request())
 
     assert tab == "tab-response"
     assert len([call for call in runner.calls if call[1:3] == ["tab", "create"]]) == 1
@@ -188,9 +215,7 @@ def test_concurrent_unrelated_tab_does_not_corrupt_exact_create_correlation() ->
         "agentProviderId": None,
     }
 
-    assert PurpleMuxCLIClient("ws-test", runner=runner).create_session(request()) == (
-        "tab-response"
-    )
+    assert topology_client(runner).create_session(request()) == ("tab-response")
     assert set(runner.tabs) == {"unrelated", "tab-response"}
 
 
@@ -200,16 +225,14 @@ def test_concurrent_unrelated_tab_does_not_corrupt_exact_create_correlation() ->
 def test_create_ambiguity_or_possible_late_completion_is_unknown(mode: str) -> None:
     runner = RuntimeRunner(mode)
     with pytest.raises(MutationOutcomeUnknown):
-        PurpleMuxCLIClient("ws-test", runner=runner).create_session(request())
+        topology_client(runner).create_session(request())
     assert len([call for call in runner.calls if call[1:3] == ["tab", "create"]]) == 1
 
 
 def test_nonzero_create_after_apply_reconciles_without_retry() -> None:
     runner = RuntimeRunner("create-nonzero-after-apply")
 
-    assert PurpleMuxCLIClient("ws-test", runner=runner).create_session(request()) == (
-        "tab-response"
-    )
+    assert topology_client(runner).create_session(request()) == ("tab-response")
     assert len([call for call in runner.calls if call[1:3] == ["tab", "create"]]) == 1
 
 
@@ -249,7 +272,7 @@ def test_probe_uses_saved_preexisting_set_structured_readiness_and_exact_cleanup
         "panelType": "terminal",
         "agentProviderId": None,
     }
-    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    client = probe_client(runner)
     result = client.probe_agent_readiness(
         provider="codex",
         probe_name="readiness-corr-1",
@@ -263,6 +286,32 @@ def test_probe_uses_saved_preexisting_set_structured_readiness_and_exact_cleanup
     assert not any(call[1:3] == ["tab", "capture"] for call in runner.calls)
 
 
+def test_probe_trusts_only_current_first_workspace_directory() -> None:
+    runner = RuntimeRunner()
+    runner.workspaces["ws-test"] = {
+        "id": "ws-test",
+        "name": "Test",
+        "directories": ["/repo", "/secondary"],
+    }
+    trusted: list[str] = []
+    client = PurpleMuxCLIClient(
+        "ws-test",
+        runner=runner,
+        poll_interval_seconds=0,
+        codex_project_truster=lambda path: trusted.append(path) or path,
+    )
+
+    client.probe_agent_readiness(
+        provider="codex",
+        probe_name="readiness-corr-1",
+        correlation_id="corr-1",
+        preexisting_tab_ids=(),
+        timeout_seconds=1,
+    )
+
+    assert trusted == ["/repo"]
+
+
 def test_probe_rejects_stale_preexisting_set_before_creation() -> None:
     runner = RuntimeRunner()
     runner.tabs["concurrent"] = {
@@ -273,7 +322,7 @@ def test_probe_rejects_stale_preexisting_set_before_creation() -> None:
         "agentProviderId": None,
     }
     with pytest.raises(WorkerFailure, match="not authoritative"):
-        PurpleMuxCLIClient("ws-test", runner=runner).probe_agent_readiness(
+        probe_client(runner).probe_agent_readiness(
             provider="codex",
             probe_name="readiness-corr-1",
             correlation_id="corr-1",
@@ -285,7 +334,7 @@ def test_probe_rejects_stale_preexisting_set_before_creation() -> None:
 
 def test_probe_close_uncertainty_retains_exact_tab_identity() -> None:
     runner = RuntimeRunner("close-timeout")
-    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    client = probe_client(runner)
     with pytest.raises(MutationOutcomeUnknown, match="tab-response.*retained"):
         client.probe_agent_readiness(
             provider="codex",
@@ -300,7 +349,7 @@ def test_probe_close_uncertainty_retains_exact_tab_identity() -> None:
 
 def test_probe_refuses_to_close_a_changed_tab_identity() -> None:
     runner = RuntimeRunner()
-    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    client = probe_client(runner)
     original_status = runner.__call__
 
     def replace_when_ready(
@@ -338,7 +387,7 @@ def test_probe_refuses_to_close_a_changed_tab_identity() -> None:
 
 def test_probe_cleanup_ignores_readiness_state_changes() -> None:
     runner = RuntimeRunner()
-    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    client = probe_client(runner)
     original_status = runner.__call__
 
     def become_ready(
@@ -377,12 +426,7 @@ def test_probe_cleanup_ignores_readiness_state_changes() -> None:
 
 def test_probe_readiness_failure_still_closes_the_exact_probe() -> None:
     runner = RuntimeRunner()
-    client = PurpleMuxCLIClient(
-        "ws-test",
-        runner=runner,
-        poll_interval_seconds=0,
-        monotonic=lambda: 1,
-    )
+    client = probe_client(runner, monotonic=lambda: 1)
     original_status = runner.__call__
 
     def never_ready(
@@ -424,7 +468,7 @@ def test_probe_readiness_interruption_still_closes_the_exact_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = RuntimeRunner()
-    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    client = probe_client(runner)
 
     def interrupt_readiness(session_id: str, timeout_seconds: float) -> None:
         raise KeyboardInterrupt
@@ -447,7 +491,7 @@ def test_probe_cleanup_interruption_is_unknown_with_exact_retained_tab(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = RuntimeRunner()
-    client = PurpleMuxCLIClient("ws-test", runner=runner, poll_interval_seconds=0)
+    client = probe_client(runner)
 
     def interrupt_cleanup(
         session_id: str, *, expected_state: TabState | None = None
