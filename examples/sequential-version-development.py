@@ -510,7 +510,28 @@ def integration_delivery(
     if merged_pr is not None:
         if pr is not None:
             raise WorkerFailure("merged final delivery also has an open same-head PR")
-        emit_finding("github", f"final delivery already merged as #{merged_pr.number}")
+        if merged_pr.head_sha != integration.remote_sha:
+            raise WorkerFailure(
+                f"historical merged final PR #{merged_pr.number} has head "
+                f"{merged_pr.head_sha}, but current {config.integration_branch} "
+                f"is {integration.remote_sha}"
+            )
+        merged_pr = github.require_pr(
+            number=merged_pr.number,
+            head=config.integration_branch,
+            base=config.main_branch,
+            state="MERGED",
+            expected_head_sha=integration.remote_sha,
+        )
+        final_branch = repo.synchronize_branch(config.main_branch)
+        if final_branch.remote_sha is None:
+            raise WorkerFailure("final remote branch disappeared during recovery")
+        repo.require_contains(config.main_branch, integration.remote_sha)
+        emit_finding(
+            "github",
+            f"final delivery already merged as #{merged_pr.number} at "
+            f"{integration.remote_sha}",
+        )
         return merged_pr
     if pr is None:
         pr = github.create_draft_pr(

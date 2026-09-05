@@ -704,9 +704,11 @@ records its own phase label:
   absence. The Runner's Cleanup stops before dependent parents when that proof
   is unavailable.
 - **Terminal state:** an already merged Issue PR, an already Ready final PR when
-  policy says not to merge it, or an already merged final PR is success to
-  inspect and return. A recovery run must not re-run the approval/final-check
-  turns that produced that state.
+  policy says not to merge it, or a final PR whose merged head is the exact
+  current integration head and is contained by the final branch is success to
+  inspect and return. A historical merged PR for an older integration head is
+  not terminal delivery. A recovery run must not re-run the approval/final-check
+  turns that produced a verified terminal state.
 
 Thus a durable phase marker is useful only when all earlier side effects have
 authoritative postconditions and re-entering from that phase performs inspection
