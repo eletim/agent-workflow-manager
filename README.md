@@ -153,6 +153,9 @@ or remove only clearly disposable generated files. It cannot push, change PR
 state, merge, start a review, reset, stash, rebase, force, or discard uncertain
 work. The Workflow re-inspects the worktree and reports remaining paths when the
 state cannot be resolved safely; an already-clean path does not invoke cleanup.
+If review or final checks introduce a commit, the Workflow pushes and rebinds the
+exact Draft PR, invalidates the prior approval, and repeats review and checks
+before making the PR Ready.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,

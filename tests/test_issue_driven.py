@@ -163,6 +163,7 @@ def test_generated_workflow_has_focused_dirty_worktree_recovery() -> None:
     assert "Do not reinterpret or reimplement the original Issue" in code
     assert "Do not push, modify PR state, merge, start a review" in code
     assert "cleanup turn could not safely resolve the worktree" in code
+    assert "approval invalidated" in code
 
 
 def test_generated_post_merge_path_starts_next_issue() -> None:
