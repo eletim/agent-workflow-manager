@@ -618,6 +618,72 @@ def test_ready_final_pr_repeats_review_and_checks(
     ]
 
 
+def test_unchanged_whole_version_fixer_still_runs_checks_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["integration_delivery"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    draft = open_pr(
+        head=config.integration_branch, base=config.main_branch, draft=True
+    )
+    events: list[str] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.base_sha, draft.base_sha, False)
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return draft if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            events.append("require_pr")
+            return draft
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            events.append("ready")
+            return replace(draft, is_draft=False)
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        name = str(args[2])
+        events.append(name)
+        return "CHANGES_REQUESTED\nNo source change is actually warranted."
+
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (draft.head_sha, False),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "run_final_checks",
+        lambda *args: events.append("final checks"),
+    )
+
+    result = workflow["integration_delivery"](
+        config, object(), Repository(), GitHub()
+    )
+
+    assert result.is_draft is False
+    assert events.count("Whole-version review") == 1
+    assert events.count("Whole-version fixes") == 1
+    assert events.count("final checks") == 1
+    assert events.index("Whole-version fixes") < events.index("final checks")
+    assert events.index("final checks") < events.index("ready")
+
+
 def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -714,9 +714,18 @@ def integration_delivery(
                     f"approval invalidated at {reviewed_sha}",
                 )
                 continue
-            if decision(result) == "APPROVED":
-                run_final_checks(client, config)
-                checked_sha, checks_changed = require_agent_result(
+            if decision(result) == "CHANGES_REQUESTED":
+                if review_number == MAX_REVIEWS:
+                    break
+                run_turn(
+                    client,
+                    fixer,
+                    "Whole-version fixes",
+                    f"""Re-evaluate every finding. If warranted, fix, test, commit,
+and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                    iteration=review_number,
+                )
+                fixed_sha, changed = require_agent_result(
                     repo,
                     client,
                     fixer,
@@ -725,9 +734,9 @@ def integration_delivery(
                     allow_unchanged=True,
                     iteration=review_number,
                 )
-                if checks_changed:
+                if changed:
                     pushed = repo.ensure_pushed(
-                        config.integration_branch, expected_local_sha=checked_sha
+                        config.integration_branch, expected_local_sha=fixed_sha
                     )
                     assert pushed.remote_sha is not None
                     pr = github.require_pr(
@@ -739,25 +748,9 @@ def integration_delivery(
                         expected_base_sha=current.base_sha,
                         draft=True,
                     )
-                    emit_finding(
-                        "git",
-                        "final checks changed the integration branch; approval "
-                        f"invalidated at {checked_sha}",
-                    )
                     continue
-                approved_head, approved_base = current.head_sha, current.base_sha
-                break
-            if review_number == MAX_REVIEWS:
-                break
-            run_turn(
-                client,
-                fixer,
-                "Whole-version fixes",
-                f"""Re-evaluate every finding. If warranted, fix, test, commit,
-and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
-                iteration=review_number,
-            )
-            fixed_sha, changed = require_agent_result(
+            run_final_checks(client, config)
+            checked_sha, checks_changed = require_agent_result(
                 repo,
                 client,
                 fixer,
@@ -766,22 +759,28 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 allow_unchanged=True,
                 iteration=review_number,
             )
-            if not changed:
-                approved_head, approved_base = current.head_sha, current.base_sha
-                break
-            pushed = repo.ensure_pushed(
-                config.integration_branch, expected_local_sha=fixed_sha
-            )
-            assert pushed.remote_sha is not None
-            pr = github.require_pr(
-                number=pr.number,
-                head=config.integration_branch,
-                base=config.main_branch,
-                state="OPEN",
-                expected_head_sha=pushed.remote_sha,
-                expected_base_sha=current.base_sha,
-                draft=True,
-            )
+            if checks_changed:
+                pushed = repo.ensure_pushed(
+                    config.integration_branch, expected_local_sha=checked_sha
+                )
+                assert pushed.remote_sha is not None
+                pr = github.require_pr(
+                    number=pr.number,
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="OPEN",
+                    expected_head_sha=pushed.remote_sha,
+                    expected_base_sha=current.base_sha,
+                    draft=True,
+                )
+                emit_finding(
+                    "git",
+                    "final checks changed the integration branch; approval "
+                    f"invalidated at {checked_sha}",
+                )
+                continue
+            approved_head, approved_base = current.head_sha, current.base_sha
+            break
         if approved_head is None or approved_base is None:
             raise WorkerFailure("whole-version review ended without approval")
     else:
