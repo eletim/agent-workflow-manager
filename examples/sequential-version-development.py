@@ -399,6 +399,12 @@ def ensure_issue_pr(
             body=f"Sequential implementation of Issue #{issue.number}.",
             correlation_id=recovery.correlation_id,
         )
+    accepted_ready = (
+        not pr.is_draft
+        and recovery.review_outcome in {"approved", "no-change-policy"}
+        and recovery.approved_sha == feature.remote_sha
+        and recovery.approved_base_sha == recovery.prepared_base_sha
+    )
     pr = github.require_pr(
         number=number if number is not None else pr.number,
         head=issue.branch,
@@ -406,7 +412,7 @@ def ensure_issue_pr(
         state="OPEN",
         expected_head_sha=feature.remote_sha,
         expected_base_sha=recovery.prepared_base_sha,
-        draft=True,
+        draft=False if accepted_ready else True,
     )
     recovery.phase = "issue_delivery_done"
     recovery.checkpoint(config)
@@ -841,6 +847,8 @@ and explain why; do not create an empty commit.\n\n{result}""",
             expected_base=config.integration_branch,
             expected_base_sha=recovery.approved_base_sha or "",
         )
+        recovery.phase = "issue_ready"
+        recovery.checkpoint(config)
     merged = github.merge_pr(
         pr.number,
         expected_head=issue.branch,

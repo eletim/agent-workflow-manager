@@ -271,6 +271,84 @@ def test_issue_delivery_pushes_and_creates_exact_draft_pr(
     assert state.phase == "issue_delivery_done"
 
 
+def test_issue_delivery_accepts_checkpointed_exact_ready_pr_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready_pr = replace(pr(), is_draft=False)
+    state = SAMPLE_MODULE.Recovery(
+        prepared_base_sha=ready_pr.base_sha,
+        approved_sha=ready_pr.head_sha,
+        approved_base_sha=ready_pr.base_sha,
+        review_outcome="approved",
+        phase="issue_ready",
+    )
+    required: list[dict[str, object]] = []
+    monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
+
+    class Repo:
+        def require_current_branch(self, branch: str):
+            return purplemux_client.BranchState(
+                branch, ready_pr.head_sha, ready_pr.head_sha, True
+            )
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str):
+            return purplemux_client.BranchState(
+                branch, expected_local_sha, expected_local_sha, True
+            )
+
+    class GitHub:
+        def find_pr(self, **_kwargs: object):
+            return ready_pr
+
+        def create_draft_pr(self, **_kwargs: object):
+            pytest.fail("checkpointed Ready PR was replaced")
+
+        def require_pr(self, **kwargs: object):
+            required.append(kwargs)
+            return ready_pr
+
+    delivered = SAMPLE_MODULE.ensure_issue_pr(
+        Repo(), GitHub(), config(tmp_path).issues[0], config(tmp_path), state, 10
+    )
+
+    assert delivered == ready_pr
+    assert required[0]["draft"] is False
+
+
+def test_issue_delivery_rejects_unapproved_ready_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready_pr = replace(pr(), is_draft=False)
+    state = SAMPLE_MODULE.Recovery(prepared_base_sha=ready_pr.base_sha)
+    monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
+
+    class Repo:
+        def require_current_branch(self, branch: str):
+            return purplemux_client.BranchState(
+                branch, ready_pr.head_sha, ready_pr.head_sha, True
+            )
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str):
+            return purplemux_client.BranchState(
+                branch, expected_local_sha, expected_local_sha, True
+            )
+
+    class GitHub:
+        def find_pr(self, **_kwargs: object):
+            return ready_pr
+
+        def require_pr(self, **kwargs: object):
+            assert kwargs["draft"] is True
+            raise purplemux_client.PullRequestTopologyError("PR is unexpectedly Ready")
+
+    with pytest.raises(
+        purplemux_client.PullRequestTopologyError, match="unexpectedly Ready"
+    ):
+        SAMPLE_MODULE.ensure_issue_pr(
+            Repo(), GitHub(), config(tmp_path).issues[0], config(tmp_path), state
+        )
+
+
 def test_no_change_policy_is_explicit_and_not_reviewer_approval(
     tmp_path: Path,
 ) -> None:
