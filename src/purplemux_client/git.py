@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import signal
@@ -241,9 +242,16 @@ class GitRepository:
             raise WorkerFailure(f"remote branch {branch!r} does not exist")
         self._fetch_branch(branch, authoritative_sha)
         state = self._inspect_branch_from_tracking(branch, authoritative_sha)
+        checkout_branch = self._checkout_branch(branch)
         if state.local_sha is None:
             self._git_mutation(
-                ["switch", "--track", "-c", branch, self._tracking_ref(branch)],
+                [
+                    "switch",
+                    "--track",
+                    "-c",
+                    checkout_branch,
+                    self._tracking_ref(branch),
+                ],
                 operation="create tracking branch",
                 target=branch,
                 pre_state=state,
@@ -266,14 +274,14 @@ class GitRepository:
                     )
             if not state.current:
                 self._git_mutation(
-                    ["switch", branch],
+                    ["switch", checkout_branch],
                     operation="switch branch",
                     target=branch,
                     pre_state=state,
                     observe=lambda: self._inspect_branch_from_tracking(
                         branch, authoritative_sha
                     ),
-                    desired=lambda: self._current_branch() == branch,
+                    desired=lambda: self._branch_is_current(branch),
                 )
             if state.local_sha != authoritative_sha:
                 before = self._inspect_branch_from_tracking(branch, authoritative_sha)
@@ -314,9 +322,17 @@ class GitRepository:
                 f"remote base {base!r} changed: expected {expected_base_sha}, "
                 f"found {base_state.remote_sha}"
             )
-        if base_state.local_sha != expected_base_sha or not base_state.current:
+        detached_at_base = (
+            self._current_branch() is None
+            and self._read(["rev-parse", "HEAD"]) == expected_base_sha
+        )
+        if (
+            not (base_state.local_sha == expected_base_sha and base_state.current)
+            and not detached_at_base
+        ):
             raise WorkerFailure(
-                f"base {base!r} must be synchronized at {expected_base_sha} first"
+                f"base {base!r} must be synchronized at {expected_base_sha}, or "
+                "the worktree must be detached at that exact commit"
             )
         feature_remote = self._remote_sha(branch)
 
@@ -335,9 +351,10 @@ class GitRepository:
                 pre_dispatch=recheck_authoritative_refs,
             )
         state = self._inspect_branch_from_tracking(branch, feature_remote)
+        checkout_branch = self._checkout_branch(branch)
         if state.local_sha is None and feature_remote is None:
             self._git_mutation(
-                ["switch", "-c", branch, expected_base_sha],
+                ["switch", "-c", checkout_branch, expected_base_sha],
                 operation="create feature branch",
                 target=branch,
                 pre_state=state,
@@ -353,7 +370,13 @@ class GitRepository:
                     f"{expected_base_sha}"
                 )
             self._git_mutation(
-                ["switch", "--track", "-c", branch, self._tracking_ref(branch)],
+                [
+                    "switch",
+                    "--track",
+                    "-c",
+                    checkout_branch,
+                    self._tracking_ref(branch),
+                ],
                 operation="create tracking feature branch",
                 target=branch,
                 pre_state=state,
@@ -384,14 +407,14 @@ class GitRepository:
                 )
             if not state.current:
                 self._git_mutation(
-                    ["switch", branch],
+                    ["switch", checkout_branch],
                     operation="switch feature branch",
                     target=branch,
                     pre_state=state,
                     observe=lambda: self._inspect_branch_from_tracking(
                         branch, feature_remote
                     ),
-                    desired=lambda: self._current_branch() == branch,
+                    desired=lambda: self._branch_is_current(branch),
                     pre_dispatch=recheck_authoritative_refs,
                 )
             if needs_fast_forward:
@@ -514,9 +537,9 @@ class GitRepository:
     def _inspect_branch(self, branch: str) -> BranchState:
         return BranchState(
             name=branch,
-            local_sha=self._local_sha(branch),
+            local_sha=self._checkout_sha(branch),
             remote_sha=self._remote_sha(branch),
-            current=self._current_branch() == branch,
+            current=self._branch_is_current(branch),
         )
 
     def _inspect_branch_from_tracking(
@@ -530,10 +553,41 @@ class GitRepository:
             )
         return BranchState(
             branch,
-            self._local_sha(branch),
+            self._checkout_sha(branch),
             authoritative_sha,
-            self._current_branch() == branch,
+            self._branch_is_current(branch),
         )
+
+    def _checkout_branch(self, branch: str) -> str:
+        private = self._private_branch(branch)
+        current = self._current_branch()
+        if current == private:
+            return private
+        owner = self._branch_worktree(branch)
+        if owner is not None and owner != self.root:
+            return private
+        return branch
+
+    def _checkout_sha(self, branch: str) -> str | None:
+        return self._local_sha(self._checkout_branch(branch))
+
+    def _branch_is_current(self, branch: str) -> bool:
+        return self._current_branch() == self._checkout_branch(branch)
+
+    def _private_branch(self, branch: str) -> str:
+        run_identity = hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
+        return f"awm-run/{run_identity}/{branch}"
+
+    def _branch_worktree(self, branch: str) -> Path | None:
+        output = self._read(
+            [
+                "for-each-ref",
+                "--format=%(worktreepath)%00",
+                f"refs/heads/{branch}",
+            ]
+        )
+        path = output.split("\0", 1)[0]
+        return Path(path).resolve() if path else None
 
     def _local_sha(self, branch: str) -> str | None:
         return self._optional_ref_sha(f"refs/heads/{branch}")
@@ -627,8 +681,8 @@ class GitRepository:
             )
 
     def _branch_matches(self, branch: str, sha: str, current: bool) -> bool:
-        return self._local_sha(branch) == sha and (
-            not current or self._current_branch() == branch
+        return self._checkout_sha(branch) == sha and (
+            not current or self._branch_is_current(branch)
         )
 
     def _git_mutation(
@@ -727,37 +781,9 @@ class GitRepository:
     def _run_mutation_process_group(
         self, args: Sequence[str]
     ) -> subprocess.CompletedProcess[str]:
-        command = ["git", *args]
-        previous_mask = self._block_mutation_signals()
-        previous_handlers = self._install_mutation_signal_handlers()
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=self.root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-            try:
-                self._restore_signal_mask(previous_mask)
-                stdout, stderr = process.communicate(
-                    timeout=self.command_timeout_seconds
-                )
-            except subprocess.TimeoutExpired as exc:
-                self._quiesce_process_group(process, exc)
-                raise _QuiescentMutationTimeout(
-                    command, self.command_timeout_seconds
-                ) from exc
-            except BaseException as exc:
-                self._quiesce_process_group(process, exc)
-                raise _QuiescentMutationInterruption(command, exc) from exc
-            return subprocess.CompletedProcess(
-                command, process.returncode, stdout, stderr
-            )
-        finally:
-            self._restore_mutation_signal_handlers(previous_handlers)
-            self._restore_signal_mask(previous_mask)
+        return _run_git_mutation_process_group(
+            args, cwd=self.root, timeout=self.command_timeout_seconds
+        )
 
     @staticmethod
     def _mutation_signals() -> set[signal.Signals]:
@@ -875,3 +901,34 @@ class _MutationSignal(BaseException):
 
 def _raise_mutation_signal(signum: int, _frame: object) -> None:
     raise _MutationSignal(signum)
+
+
+def _run_git_mutation_process_group(
+    args: Sequence[str], *, cwd: Path, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """Run a mutating Git command and quiesce its whole process group on failure."""
+    command = ["git", *args]
+    previous_mask = GitRepository._block_mutation_signals()
+    previous_handlers = GitRepository._install_mutation_signal_handlers()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            GitRepository._restore_signal_mask(previous_mask)
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            GitRepository._quiesce_process_group(process, exc)
+            raise _QuiescentMutationTimeout(command, timeout) from exc
+        except BaseException as exc:
+            GitRepository._quiesce_process_group(process, exc)
+            raise _QuiescentMutationInterruption(command, exc) from exc
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        GitRepository._restore_mutation_signal_handlers(previous_handlers)
+        GitRepository._restore_signal_mask(previous_mask)

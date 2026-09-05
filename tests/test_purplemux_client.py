@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
+import purplemux_client.client as client_module
 from purplemux_client import (
     CreateSessionRequest,
     MutationOutcomeUnknown,
@@ -196,6 +198,45 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     cli.close_session(session_id)
 
 
+def test_run_ownership_is_opt_in_and_registers_shell_result_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registrations: list[tuple[str, str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        client_module,
+        "register_run_resource",
+        lambda kind, identity, metadata: registrations.append(
+            (kind, identity, metadata)
+        ),
+    )
+    ordinary_runner = FakeRunner([completed({"tabId": "tab-prompt"})])
+    client(ordinary_runner).create_session(request())
+    assert registrations == []
+
+    owned_runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    owned = client(owned_runner, owned_by_run=True)
+    tab = owned.start_shell(ShellCommandRequest("true", str(tmp_path), "Owned shell"))
+
+    assert [item[0] for item in registrations] == [
+        "purplemux_tab",
+        "managed_shell_result",
+    ]
+    result_directory = Path(registrations[1][1])
+    assert registrations[1][2] == {
+        "result_path": str(result_directory / "result.json"),
+        "tab_id": tab,
+        "directory_identity": _path_identity(result_directory),
+    }
+    owned._cleanup_shell_result(owned._shell_runs[tab])
+
+
+def _path_identity(path: Path) -> str:
+    state = path.stat(follow_symlinks=False)
+    return f"{state.st_dev}:{state.st_ino}"
+
+
 @pytest.mark.parametrize(
     "shell_request",
     [
@@ -271,6 +312,7 @@ def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> N
         [
             completed({"tabId": "tab-shell"}),
             completed({"status": "sent"}),
+            completed({"content": "expected branch main, got: feature/work"}),
             completed({"status": "closed"}),
         ]
     )
@@ -286,9 +328,21 @@ def test_shell_completion_uses_structured_sidecar_not_screen_text(tmp_path) -> N
 
     cli.wait_for_shell_completion(session_id, 1)
 
-    assert cli.read_shell_result(session_id).exit_code == 7
-    assert cli.read_shell_result(session_id).exit_code == 7
-    assert len([call for call in runner.calls if call[1:3] != ["tab", "list"]]) == 2
+    result = cli.read_shell_result(session_id)
+    assert result.exit_code == 7
+    assert result.diagnostic_output == "expected branch main, got: feature/work"
+    assert result.diagnostic_error is None
+    assert result.cwd == str(tmp_path)
+    assert result.workspace_id == "ws-test"
+    assert result.tab_id == "tab-shell"
+    assert result.failure_message("sync and verify main") == (
+        "sync and verify main failed (exit code 7)\n"
+        f"cwd: {tmp_path}\n"
+        "workspace/tab: ws-test / tab-shell\n"
+        "expected branch main, got: feature/work"
+    )
+    assert cli.read_shell_result(session_id) is result
+    assert len([call for call in runner.calls if call[1:3] != ["tab", "list"]]) == 3
     assert os.path.exists(result_path)
 
     cli.close_session(session_id)
@@ -328,6 +382,7 @@ def test_shell_commands_can_complete_independently(tmp_path) -> None:
             completed({"status": "sent"}),
             completed({"tabId": "tab-b"}),
             completed({"status": "sent"}),
+            completed({"content": "task-a failed"}),
         ]
     )
     cli = client(runner)
@@ -406,6 +461,7 @@ def test_failed_shell_terminal_is_retained_until_explicit_close(tmp_path) -> Non
         [
             completed({"tabId": "tab-shell"}),
             completed({"status": "sent"}),
+            completed({"content": "lint failed"}),
             completed({"status": "closed"}),
         ]
     )
@@ -418,11 +474,63 @@ def test_failed_shell_terminal_is_retained_until_explicit_close(tmp_path) -> Non
         json.dump({"exitCode": 1}, stream)
     cli.wait_for_shell_completion(session_id, 1)
 
-    assert runner.calls[-1][2] == "send"
+    assert runner.calls[-1][2] == "capture"
     assert cli.read_shell_result(session_id).exit_code == 1
 
     cli.close_session(session_id)
     assert any(call[1:3] == ["tab", "close"] for call in runner.calls)
+
+
+def test_failed_shell_diagnostic_is_bounded_by_lines_and_encoded_bytes(
+    tmp_path,
+) -> None:
+    capture = "\n".join([*(f"old line {number}" for number in range(50)), "界" * 2_000])
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed({"content": capture}),
+        ]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(command="false", cwd=str(tmp_path), name="checks")
+    )
+    with open(cli._shell_runs[session_id].result_path, "w", encoding="utf-8") as stream:
+        json.dump({"exitCode": 2}, stream)
+
+    result = cli.read_shell_result(session_id)
+
+    assert result.exit_code == 2
+    assert result.diagnostic_output is not None
+    assert len(result.diagnostic_output.encode()) <= 2_500
+    assert result.diagnostic_output.endswith("界" * 10)
+    assert "old line 0" not in result.diagnostic_output
+
+
+def test_capture_failure_is_secondary_to_structured_shell_failure(tmp_path) -> None:
+    runner = FakeRunner(
+        [
+            completed({"tabId": "tab-shell"}),
+            completed({"status": "sent"}),
+            completed({}, returncode=2, stderr="capture unavailable"),
+        ]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(command="false", cwd=str(tmp_path), name="checks")
+    )
+    with open(cli._shell_runs[session_id].result_path, "w", encoding="utf-8") as stream:
+        json.dump({"exitCode": 9}, stream)
+
+    result = cli.read_shell_result(session_id)
+
+    assert result.exit_code == 9
+    assert result.diagnostic_output is None
+    assert result.diagnostic_error is not None
+    assert "capture unavailable" in result.diagnostic_error
+    assert "failed (exit code 9)" in result.failure_message("checks")
+    assert "diagnostic capture failed" in result.failure_message("checks")
 
 
 def test_read_status_returns_structured_status() -> None:

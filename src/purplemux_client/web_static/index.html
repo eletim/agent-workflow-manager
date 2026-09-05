@@ -29,31 +29,55 @@
       </section>
 
       <section class="panel editor-panel">
+        <div class="mode-switch" role="group" aria-label="Execution mode">
+          <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
+          <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Workflow</button>
+        </div>
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
           <button id="new-run" type="button">New run</button>
         </div>
-        <div class="execution-context">
-          <div class="context-field context-cwd">
-            <label for="working-directory">Working directory</label>
-            <input id="working-directory" type="text" autocomplete="off" placeholder="Use Runner working directory">
+        <div id="prompt-fields" class="prompt-fields" hidden>
+          <div class="prompt-options">
+            <div class="context-field">
+              <label for="prompt-agent">Agent</label>
+              <select id="prompt-agent">
+                <option value="codex">Codex</option>
+                <option value="claude-code">Claude</option>
+              </select>
+            </div>
+            <div class="context-field prompt-cwd-field">
+              <label for="prompt-cwd">Working directory</label>
+              <div class="prompt-cwd-control">
+                <input id="prompt-cwd" type="text" autocomplete="off" placeholder="/path/to/project">
+                <button id="directory-picker-open" type="button" aria-label="Browse working directories" title="Browse working directories">📁</button>
+              </div>
+            </div>
           </div>
-          <div class="context-field context-args">
-            <label for="run-arguments">Arguments <span>(one per line)</span></label>
-            <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
-          </div>
+          <label for="prompt-text">Prompt</label>
+          <textarea id="prompt-text" spellcheck="true"></textarea>
         </div>
-        <label for="code">Python</label>
-        <textarea id="code" spellcheck="false">from purplemux_client import emit_step
+
+        <div id="workflow-fields">
+          <div class="execution-context">
+            <div class="context-field context-args">
+              <label for="run-arguments">Arguments <span>(one per line)</span></label>
+              <textarea id="run-arguments" spellcheck="false" aria-label="Workflow arguments, one per line"></textarea>
+            </div>
+          </div>
+          <label for="code">Python</label>
+          <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
 emit_step("workspace create", "started")
 emit_step("workspace create", "completed")</textarea>
+        </div>
         <div class="controls">
           <button id="validate">Validate</button>
           <button id="dry-run">Dry Run</button>
           <button id="run" class="primary">Run</button>
           <button id="resume" disabled>Continue after fix</button>
           <button id="stop" disabled>Stop</button>
+          <button id="cleanup" disabled>Cleanup</button>
           <span id="exit-code">Exit code: —</span>
         </div>
       </section>
@@ -62,6 +86,13 @@ emit_step("workspace create", "completed")</textarea>
         <h2>Recovery</h2>
         <p id="recovery-summary"></p>
         <ol id="attempt-history" class="attempt-history"></ol>
+      </section>
+
+      <section id="resources-panel" class="panel recovery-panel" aria-live="polite" hidden>
+        <h2>Owned resources</h2>
+        <p id="resources-summary"></p>
+        <p id="execution-context-details"></p>
+        <ol id="resources" class="attempt-history"></ol>
       </section>
 
       <section id="validation-panel" class="panel validation-panel" aria-live="polite" hidden>
@@ -180,6 +211,24 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </div>
       <pre id="guide-content">Loading…</pre>
+    </dialog>
+
+    <dialog id="directory-picker-dialog" class="directory-picker-dialog" aria-labelledby="directory-picker-title">
+      <div class="directory-picker-toolbar">
+        <div>
+          <h2 id="directory-picker-title">Choose working directory</h2>
+          <p id="directory-picker-path" class="directory-picker-path"></p>
+        </div>
+        <button id="directory-picker-close" type="button">Close</button>
+      </div>
+      <div class="directory-picker-navigation">
+        <button id="directory-picker-parent" type="button">Parent directory</button>
+        <span id="directory-picker-message" role="status" aria-live="polite"></span>
+      </div>
+      <div id="directory-picker-list" class="directory-picker-list" aria-label="Directories"></div>
+      <div class="directory-picker-actions">
+        <button id="directory-picker-select" type="button" class="primary">Select current directory</button>
+      </div>
     </dialog>
 
     <dialog id="manual-copy-dialog" aria-labelledby="manual-copy-title">

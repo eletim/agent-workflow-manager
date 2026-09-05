@@ -1,6 +1,20 @@
 const code = document.querySelector("#code");
-const workingDirectory = document.querySelector("#working-directory");
 const runArguments = document.querySelector("#run-arguments");
+const promptModeButton = document.querySelector("#prompt-mode");
+const workflowModeButton = document.querySelector("#workflow-mode");
+const promptFields = document.querySelector("#prompt-fields");
+const workflowFields = document.querySelector("#workflow-fields");
+const promptAgent = document.querySelector("#prompt-agent");
+const promptCwd = document.querySelector("#prompt-cwd");
+const promptText = document.querySelector("#prompt-text");
+const directoryPickerOpen = document.querySelector("#directory-picker-open");
+const directoryPickerDialog = document.querySelector("#directory-picker-dialog");
+const directoryPickerClose = document.querySelector("#directory-picker-close");
+const directoryPickerParent = document.querySelector("#directory-picker-parent");
+const directoryPickerPath = document.querySelector("#directory-picker-path");
+const directoryPickerMessage = document.querySelector("#directory-picker-message");
+const directoryPickerList = document.querySelector("#directory-picker-list");
+const directoryPickerSelect = document.querySelector("#directory-picker-select");
 const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
@@ -10,6 +24,7 @@ const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
 const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
+const cleanupButton = document.querySelector("#cleanup");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
 const stderr = document.querySelector("#stderr");
@@ -20,6 +35,10 @@ const progressEmpty = document.querySelector("#progress-empty");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
+const resourcesPanel = document.querySelector("#resources-panel");
+const resourcesSummary = document.querySelector("#resources-summary");
+const executionContextDetails = document.querySelector("#execution-context-details");
+const resourcesList = document.querySelector("#resources");
 const validationPanel = document.querySelector("#validation-panel");
 const validationSuccess = document.querySelector("#validation-success");
 const validation = document.querySelector("#validation");
@@ -71,16 +90,22 @@ let guideText = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
+let currentMode = "workflow";
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
 // run" (fields editable) vs. "viewing an existing run" (fields read-only,
 // sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
-// retains the new-run cwd/args/code independently of whichever run is
+// retains the new-run args/code independently of whichever run is
 // currently being viewed, so switching runs never loses it. `explicitNewRun`
 // suppresses the "auto-select the latest run" behavior in refresh() once the
 // user has explicitly asked to compose or submit a new run.
-let draft = {cwd: "", args: "", code: code.value};
+let draft = {args: "", code: code.value};
+let promptDraft = {
+  agent: promptAgent.value,
+  cwd: promptCwd.value,
+  prompt: promptText.value,
+};
 let explicitNewRun = false;
 let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
@@ -90,6 +115,9 @@ let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
 let runningFaviconHrefPromise = null;
+let directoryPickerCurrentPath = null;
+let directoryPickerParentPath = null;
+let directoryPickerRequestGeneration = 0;
 
 function runningFaviconHref() {
   if (runningFaviconHrefPromise === null) {
@@ -125,16 +153,40 @@ function renderFavicon(runs) {
 // for which mode is active.
 function applyFieldMode() {
   const drafting = activeRunId === null;
-  workingDirectory.readOnly = !drafting;
   runArguments.readOnly = !drafting;
   code.readOnly = !drafting;
+  promptAgent.disabled = !drafting;
+  promptCwd.readOnly = !drafting;
+  promptText.readOnly = !drafting;
+  directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
   dryRunButton.disabled = !drafting;
+  applyModeVisibility();
+}
+
+function applyModeVisibility() {
+  const promptMode = currentMode === "prompt";
+  promptFields.hidden = !promptMode;
+  workflowFields.hidden = promptMode;
+  validateButton.hidden = promptMode;
+  dryRunButton.hidden = promptMode;
+  resumeButton.hidden = promptMode;
+  cleanupButton.hidden = promptMode;
+  guideOpen.hidden = promptMode;
+  validationPanel.hidden = promptMode || validationPanel.hidden;
+  dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
+  outlinePanel.hidden = promptMode || outlinePanel.hidden;
+  recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
+  resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
+  promptModeButton.className = promptMode ? "selected" : "";
+  workflowModeButton.className = promptMode ? "" : "selected";
+  promptModeButton.setAttribute("aria-pressed", String(promptMode));
+  workflowModeButton.setAttribute("aria-pressed", String(!promptMode));
 }
 
 function showDraftLabel() {
-  activeContext.textContent = "New run (draft) — not yet submitted";
+  activeContext.textContent = `New ${currentMode === "prompt" ? "Prompt" : "Workflow"} run (draft) — not yet submitted`;
 }
 
 // Snapshot the fields into the retained draft only when they currently *are*
@@ -142,11 +194,20 @@ function showDraftLabel() {
 // them). Call this right before any transition away from drafting.
 function captureDraftIfEditing() {
   if (activeRunId === null) {
-    draft = {cwd: workingDirectory.value, args: runArguments.value, code: code.value};
+    if (currentMode === "prompt") {
+      promptDraft = {
+        agent: promptAgent.value,
+        cwd: promptCwd.value,
+        prompt: promptText.value,
+      };
+    } else {
+      draft = {args: runArguments.value, code: code.value};
+    }
   }
 }
 
 function renderRun(result) {
+  currentMode = result.mode === "prompt" ? "prompt" : "workflow";
   const running = result.state === "running";
   statusBadge.textContent = result.state;
   statusBadge.className = `status ${result.state}`;
@@ -163,18 +224,27 @@ function renderRun(result) {
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
   resumeButton.disabled = activeRunId === null || !result.resumable;
+  cleanupButton.disabled = activeRunId === null
+    || !result.cleanupAvailable
+    || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderRecovery(result);
+  renderResources(result);
   renderDryRun(result);
 
   // Only an authoritative snapshot for the run currently being viewed may
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
-    workingDirectory.value = result.cwd ?? "";
-    runArguments.value = (result.args || []).join("\n");
-    code.value = result.code ?? "";
-    activeContext.textContent = `Viewing Run #${result.runId} (read-only)`;
+    if (currentMode === "prompt") {
+      promptAgent.value = result.prompt?.agent || "codex";
+      promptCwd.value = result.prompt?.cwd || result.cwd || "";
+      promptText.value = result.prompt?.prompt || "";
+    } else {
+      runArguments.value = (result.args || []).join("\n");
+      code.value = result.code ?? "";
+    }
+    activeContext.textContent = `Viewing ${currentMode === "prompt" ? "Prompt" : "Workflow"} Run #${result.runId} (read-only)`;
   } else if (activeRunId === null) {
     showDraftLabel();
   }
@@ -186,8 +256,9 @@ function renderRun(result) {
   }
 }
 
-async function enterDraftMode() {
+async function enterDraftMode(mode = currentMode) {
   const wasViewingRun = activeRunId !== null;
+  const changedMode = mode !== currentMode;
   // A New-run click is an explicit selection even if the fields are already
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
@@ -197,18 +268,46 @@ async function enterDraftMode() {
   // viewed (harmless reference) until a run is selected or started again.
   activeRunGeneration += 1;
   activeRunId = null;
+  currentMode = mode;
   explicitNewRun = true;
-  if (wasViewingRun) {
-    workingDirectory.value = draft.cwd;
-    runArguments.value = draft.args;
-    code.value = draft.code;
+  if (wasViewingRun || changedMode) {
+    if (currentMode === "prompt") {
+      promptAgent.value = promptDraft.agent;
+      promptCwd.value = promptDraft.cwd;
+      promptText.value = promptDraft.prompt;
+    } else {
+      runArguments.value = draft.args;
+      code.value = draft.code;
+    }
   }
   showDraftLabel();
   stopButton.disabled = true;
   resumeButton.disabled = true;
+  cleanupButton.disabled = true;
   renderOutline([], []);
   applyFieldMode();
   await refresh();
+}
+
+function renderResources(result) {
+  const resources = result.resources || [];
+  resourcesPanel.hidden = result.runId == null;
+  const status = result.resourceCleanupStatus || "cleaned";
+  resourcesSummary.textContent = resources.length === 0
+    ? "No run-owned resources were registered."
+    : `${resources.length} registered — ${status.replaceAll("_", " ")}.`;
+  const context = result.executionContext;
+  executionContextDetails.hidden = context == null;
+  executionContextDetails.textContent = context == null
+    ? ""
+    : `Execution root: ${context.executionRoot} — ${context.baseRef} @ ${context.baseSha}`;
+  resourcesList.replaceChildren();
+  for (const resource of resources) {
+    const item = document.createElement("li");
+    const error = resource.cleanupError ? ` — ${resource.cleanupError}` : "";
+    item.textContent = `${resource.kind}: ${resource.identity} — ${resource.cleanupState}${error}`;
+    resourcesList.append(item);
+  }
 }
 
 function renderRecovery(result) {
@@ -242,7 +341,11 @@ function renderRunList(runs) {
     button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
     button.dataset.state = run.state;
     button.dataset.runId = String(run.runId);
-    button.textContent = `#${run.runId}  ${run.state}  ${run.cwd}`;
+    const mode = run.mode === "prompt" ? "Prompt" : "Workflow";
+    const executionRoot = run.mode === "prompt"
+      ? run.prompt?.cwd || run.cwd
+      : run.executionContext?.executionRoot || "execution context pending";
+    button.textContent = `#${run.runId}  ${mode}  ${run.state}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -550,6 +653,80 @@ async function request(path, options = {}) {
   return result;
 }
 
+async function browseDirectory(path) {
+  const requestGeneration = ++directoryPickerRequestGeneration;
+  directoryPickerMessage.textContent = "Loading…";
+  directoryPickerParent.disabled = true;
+  directoryPickerSelect.disabled = true;
+  try {
+    const listing = await request("/api/directories", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path}),
+    });
+    if (requestGeneration !== directoryPickerRequestGeneration) return;
+    directoryPickerCurrentPath = listing.path;
+    directoryPickerParentPath = listing.parent;
+    directoryPickerPath.textContent = listing.path;
+    directoryPickerPath.setAttribute("title", listing.path);
+    directoryPickerMessage.textContent = "";
+    directoryPickerParent.disabled = listing.parent === null;
+    directoryPickerSelect.disabled = false;
+    directoryPickerList.replaceChildren();
+    if (listing.directories.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "directory-picker-empty";
+      empty.textContent = "No subdirectories.";
+      directoryPickerList.append(empty);
+    }
+    for (const directory of listing.directories) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = `📁 ${directory.name}`;
+      button.setAttribute("title", directory.path);
+      button.addEventListener("click", () => {
+        void browseDirectory(directory.path);
+      });
+      directoryPickerList.append(button);
+    }
+  } catch (error) {
+    if (requestGeneration !== directoryPickerRequestGeneration) return;
+    directoryPickerMessage.textContent = String(error);
+    directoryPickerSelect.disabled = directoryPickerCurrentPath === null;
+    directoryPickerParent.disabled = directoryPickerParentPath === null;
+  }
+}
+
+directoryPickerOpen.addEventListener("click", () => {
+  if (activeRunId !== null) return;
+  directoryPickerCurrentPath = null;
+  directoryPickerParentPath = null;
+  directoryPickerPath.textContent = "";
+  directoryPickerList.replaceChildren();
+  directoryPickerDialog.showModal();
+  void browseDirectory(promptCwd.value || "~");
+});
+
+directoryPickerClose.addEventListener("click", () => {
+  directoryPickerRequestGeneration += 1;
+  directoryPickerDialog.close();
+});
+
+directoryPickerParent.addEventListener("click", () => {
+  if (directoryPickerParentPath !== null) {
+    void browseDirectory(directoryPickerParentPath);
+  }
+});
+
+directoryPickerSelect.addEventListener("click", () => {
+  if (directoryPickerCurrentPath === null || activeRunId !== null) return;
+  promptCwd.value = directoryPickerCurrentPath;
+  promptDraft.cwd = directoryPickerCurrentPath;
+  directoryPickerRequestGeneration += 1;
+  directoryPickerDialog.close();
+  promptCwd.focus();
+});
+
 async function refresh() {
   const requestGeneration = ++refreshRequestGeneration;
   let selectionGeneration = activeRunGeneration;
@@ -647,7 +824,6 @@ function settingsPayload() {
 
 function executionContextPayload() {
   return {
-    cwd: workingDirectory.value.trim() || null,
     args: runArguments.value === "" ? [] : runArguments.value.split("\n"),
   };
 }
@@ -655,14 +831,23 @@ function executionContextPayload() {
 runButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // must explicitly start a New run first
   captureDraftIfEditing();
+  const submittedMode = currentMode;
   const selectionGeneration = ++activeRunGeneration;
   explicitNewRun = true;
   const validationGeneration = ++validationRequestGeneration;
   try {
-    const result = await request("/api/run", {
+    const requestPath = submittedMode === "prompt" ? "/api/prompt" : "/api/run";
+    const payload = submittedMode === "prompt"
+      ? {
+        agent: promptAgent.value,
+        cwd: promptCwd.value,
+        prompt: promptText.value,
+      }
+      : {code: code.value, ...executionContextPayload()};
+    const result = await request(requestPath, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code: code.value, ...executionContextPayload()}),
+      body: JSON.stringify(payload),
     });
     if (selectionGeneration === activeRunGeneration) {
       // The fields remain editable while the request is pending. Retain any
@@ -672,7 +857,10 @@ runButton.addEventListener("click", async () => {
       activeRunId = result.runId;
       activeRunGeneration += 1;
       explicitNewRun = false;
-      if (validationGeneration === validationRequestGeneration) {
+      if (
+        submittedMode === "workflow"
+        && validationGeneration === validationRequestGeneration
+      ) {
         renderValidation(result.validation || []);
       }
       renderRun(result);
@@ -696,6 +884,14 @@ runButton.addEventListener("click", async () => {
 
 newRunButton.addEventListener("click", async () => {
   await enterDraftMode();
+});
+
+promptModeButton.addEventListener("click", async () => {
+  await enterDraftMode("prompt");
+});
+
+workflowModeButton.addEventListener("click", async () => {
+  await enterDraftMode("workflow");
 });
 
 validateButton.addEventListener("click", async () => {
@@ -816,6 +1012,29 @@ stopButton.addEventListener("click", async () => {
   const selectionGeneration = ++activeRunGeneration;
   try {
     const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) {
+      activeRunGeneration += 1;
+      renderRun(result);
+    }
+    await refresh();
+  } catch (error) {
+    if (
+      targetRunId === activeRunId
+      && selectionGeneration === activeRunGeneration
+    ) stderr.textContent = String(error);
+  }
+});
+
+cleanupButton.addEventListener("click", async () => {
+  if (activeRunId === null) return;
+  const targetRunId = activeRunId;
+  const selectionGeneration = ++activeRunGeneration;
+  cleanupButton.disabled = true;
+  try {
+    const result = await request(`/api/runs/${targetRunId}/cleanup`, {method: "POST"});
     if (
       targetRunId === activeRunId
       && selectionGeneration === activeRunGeneration

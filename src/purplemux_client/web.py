@@ -19,6 +19,7 @@ from purplemux_client.notification_settings import (
     SettingsValidationError,
 )
 from purplemux_client.notifier import NotifyCLI
+from purplemux_client.prompt import build_prompt_workflow, prepare_prompt_execution
 from purplemux_client.readiness import (
     AgentReadinessService,
     ReadinessProbeBusy,
@@ -28,6 +29,8 @@ from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
     PythonRunner,
+    RunCleanupInProgressError,
+    RunCleanupNotAllowedError,
     RunNotFoundError,
     RunNotResumableError,
     WorkflowDryRunError,
@@ -48,6 +51,43 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def list_directory(path: str) -> dict[str, object]:
+    """Describe one directory without reading or returning file entries."""
+    if not path or "\0" in path:
+        raise ValueError("path must be a non-empty directory path")
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"path could not be resolved: {exc}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"path is not a directory: {resolved}")
+
+    directories: list[dict[str, str]] = []
+    try:
+        with os.scandir(resolved) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        directories.append(
+                            {
+                                "name": entry.name,
+                                "path": str(Path(entry.path).resolve(strict=True)),
+                            }
+                        )
+                except (OSError, RuntimeError):
+                    # An entry may disappear or become inaccessible while listing.
+                    continue
+    except OSError as exc:
+        raise ValueError(f"directory could not be listed: {exc}") from exc
+    directories.sort(key=lambda item: (item["name"].casefold(), item["name"]))
+    parent = None if resolved.parent == resolved else str(resolved.parent)
+    return {
+        "path": str(resolved),
+        "parent": parent,
+        "directories": directories,
+    }
 
 
 def _parse_ipv4_number(value: str) -> int | None:
@@ -336,6 +376,8 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         json_paths = {
+            "/api/directories",
+            "/api/prompt",
             "/api/run",
             "/api/validate",
             "/api/dry-run",
@@ -347,6 +389,67 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
         if not self._is_trusted_request(require_json=path in json_paths):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
             return
+        if path == "/api/directories":
+            payload = self._read_json()
+            if payload is None:
+                return
+            directory_path = payload.get("path")
+            if not isinstance(directory_path, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": "path must be a string"}
+                )
+                return
+            if set(payload) != {"path"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "directory request must contain only path"},
+                )
+                return
+            try:
+                listing = list_directory(directory_path)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, listing)
+            return
+        if path == "/api/prompt":
+            payload = self._read_json()
+            if payload is None:
+                return
+            agent = payload.get("agent")
+            cwd = payload.get("cwd")
+            prompt = payload.get("prompt")
+            if not all(isinstance(value, str) for value in (agent, cwd, prompt)):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "agent, cwd, and prompt must be strings"},
+                )
+                return
+            try:
+                execution = prepare_prompt_execution(
+                    agent=cast(str, agent),
+                    cwd=cast(str, cwd),
+                    prompt=cast(str, prompt),
+                )
+                code = build_prompt_workflow(execution)
+                run_id = self.server.runner.start(code, prompt=execution)
+            except (InvalidExecutionContextError, ValueError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except WorkflowValidationError:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "generated Prompt execution failed validation"},
+                )
+                return
+            except AlreadyRunningError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
+            )
+            return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:
             payload = self._read_json()
             if payload is None:
@@ -357,13 +460,13 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, {"error": "code must be a string"}
                 )
                 return
-            cwd = payload.get("cwd")
-            if cwd == "":
-                cwd = None
-            if cwd is not None and not isinstance(cwd, str):
+            if "cwd" in payload:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "cwd must be a string or null"},
+                    {
+                        "error": "cwd is not a Workflow input; declare repository "
+                        "context with prepare_run_repository()"
+                    },
                 )
                 return
             args = payload.get("args", [])
@@ -377,7 +480,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 if path == "/api/validate":
-                    result = self.server.runner.validate(code, cwd=cwd, args=args)
+                    result = self.server.runner.validate(code, args=args)
                     self._send_json(
                         HTTPStatus.OK
                         if result.valid
@@ -386,7 +489,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
                 if path == "/api/dry-run":
-                    result = self.server.runner.dry_run(code, cwd=cwd, args=args)
+                    result = self.server.runner.dry_run(code, args=args)
                     status = (
                         HTTPStatus.OK
                         if result.status in {"frontier", "complete"}
@@ -396,7 +499,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         status, self.server.runner.validation_snapshot().as_json()
                     )
                     return
-                run_id = self.server.runner.start(code, cwd=cwd, args=args)
+                run_id = self.server.runner.start(code, args=args)
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -528,6 +631,19 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(HTTPStatus.ACCEPTED, snapshot.as_json())
+            return
+        cleanup_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/cleanup", path)
+        if cleanup_match is not None:
+            run_id = int(cleanup_match.group(1))
+            try:
+                snapshot = self.server.runner.cleanup(run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except (RunCleanupInProgressError, RunCleanupNotAllowedError) as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, snapshot.as_json())
             return
         if path == "/api/settings/notifications":
             payload = self._read_json()

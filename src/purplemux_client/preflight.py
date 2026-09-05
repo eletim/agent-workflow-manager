@@ -5,6 +5,7 @@ import importlib.machinery
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
+from purplemux_client.execution_context import _inspect_repository_declaration
 
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
 PREFLIGHT_KEYS = frozenset({"commands", "imports", "environment", "paths"})
@@ -112,8 +114,7 @@ class WorkflowValidator:
             self._closed = True
             workers = tuple(self._workers)
         for worker in workers:
-            if worker.poll() is None:
-                worker.kill()
+            self._kill_worker_process_group(worker)
         for worker in workers:
             worker.wait()
         with self._worker_lock:
@@ -154,6 +155,7 @@ class WorkflowValidator:
                     stderr=subprocess.PIPE,
                     text=True,
                     shell=False,
+                    start_new_session=True,
                 )
                 self._workers.add(worker)
         except Exception as exc:
@@ -171,7 +173,7 @@ class WorkflowValidator:
                     payload, timeout=self._check_timeout
                 )
             except subprocess.TimeoutExpired:
-                worker.kill()
+                self._kill_worker_process_group(worker)
                 worker.communicate()
                 return ValidationResult(
                     (
@@ -181,6 +183,10 @@ class WorkflowValidator:
                         ),
                     )
                 )
+            except BaseException:
+                self._kill_worker_process_group(worker)
+                worker.communicate()
+                raise
         finally:
             with self._worker_lock:
                 self._workers.discard(worker)
@@ -215,6 +221,13 @@ class WorkflowValidator:
         return ValidationResult(issues, outline, dry_run_issues)
 
     @staticmethod
+    def _kill_worker_process_group(worker: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
     def _worker_command() -> list[str]:
         return [sys.executable, "-m", "purplemux_client.preflight", "--check-worker"]
 
@@ -227,10 +240,114 @@ class WorkflowValidator:
     ]:
         issues: list[ValidationIssue] = []
         self._validate_imports(tree, issues)
+        self._validate_repository_preparations(tree, issues)
         self._validate_required_environment(tree, issues)
         self._validate_metadata(tree, issues)
         outline = self._validate_outline(tree, issues)
         return tuple(issues), outline, self._validate_dry_run(tree)
+
+    def _validate_repository_preparations(
+        self, tree: ast.Module, issues: list[ValidationIssue]
+    ) -> None:
+        aliases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".", 1)[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module == "purplemux_client":
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = (
+                        f"purplemux_client.{alias.name}"
+                    )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = self._qualified_name(node.func)
+            if name:
+                root, separator, remainder = name.partition(".")
+                name = aliases.get(root, root) + (
+                    separator + remainder if separator else ""
+                )
+            if name != "purplemux_client.prepare_run_repository":
+                continue
+            if node.args:
+                issues.append(
+                    ValidationIssue(
+                        "execution_context",
+                        "prepare_run_repository arguments must be explicit keywords",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+                continue
+            values: dict[str, object] = {}
+            malformed = False
+            allowed = {
+                "repo",
+                "base_branch",
+                "remote",
+                "worktree_root",
+                "command_timeout_seconds",
+            }
+            for keyword in node.keywords:
+                if keyword.arg is None or keyword.arg not in allowed:
+                    malformed = True
+                    break
+                try:
+                    values[keyword.arg] = ast.literal_eval(keyword.value)
+                except (ValueError, TypeError):
+                    malformed = True
+                    break
+            if malformed or not {"repo", "base_branch"}.issubset(values):
+                issues.append(
+                    ValidationIssue(
+                        "execution_context",
+                        "prepare_run_repository requires literal repo and base_branch keywords",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+                continue
+            repo = values["repo"]
+            base_branch = values["base_branch"]
+            remote = values.get("remote", "origin")
+            worktree_root = values.get("worktree_root")
+            timeout = values.get("command_timeout_seconds", 30.0)
+            if (
+                not isinstance(repo, str)
+                or not isinstance(base_branch, str)
+                or not isinstance(remote, str)
+                or (worktree_root is not None and not isinstance(worktree_root, str))
+                or isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "execution_context",
+                        "prepare_run_repository repository settings have invalid literal types",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+                continue
+            try:
+                _inspect_repository_declaration(
+                    repo=repo,
+                    base_branch=base_branch,
+                    remote=remote,
+                    command_timeout_seconds=float(timeout),
+                    cwd=self._cwd,
+                )
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                issues.append(
+                    ValidationIssue(
+                        "execution_context",
+                        f"repository preparation is invalid: {exc}",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
 
     def _validate_dry_run(self, tree: ast.Module) -> tuple[ValidationIssue, ...]:
         issues: list[ValidationIssue] = []

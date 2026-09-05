@@ -16,6 +16,12 @@ from purplemux_client.client import (
     WorkspaceState,
 )
 from purplemux_client.errors import TerminalSessionError
+from purplemux_client.execution_context import (
+    RepositoryExecutionContext,
+    RepositoryPreparation,
+    inspect_run_repository,
+    prepare_run_repository,
+)
 from purplemux_client.git import (
     BranchState,
     FeaturePreparationState,
@@ -34,6 +40,7 @@ from purplemux_client.progress import (
     ResumeCheckpoint,
     emit_finding,
     emit_step,
+    register_run_resource,
     resume_checkpoint,
     save_checkpoint,
     suspend_run,
@@ -56,6 +63,8 @@ __all__ = [
     "PullRequestState",
     "PullRequestTopologyError",
     "ResultNotReady",
+    "RepositoryExecutionContext",
+    "RepositoryPreparation",
     "ResumeCheckpoint",
     "SessionReadyTimeout",
     "ShellCommandRequest",
@@ -69,6 +78,9 @@ __all__ = [
     "WorktreeState",
     "emit_step",
     "emit_finding",
+    "inspect_run_repository",
+    "prepare_run_repository",
+    "register_run_resource",
     "resume_checkpoint",
     "save_checkpoint",
     "suspend_run",

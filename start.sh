@@ -12,7 +12,10 @@ if [[ $PWD != "$repo_root" ]]; then
     exit 1
 fi
 
-export PATH="$HOME/.local/bin:$PATH"
+case :$PATH: in
+    *:"$HOME/.local/bin":*) ;;
+    *) export PATH="$PATH:$HOME/.local/bin" ;;
+esac
 config_file=${AGENT_WORKFLOW_MANAGER_CONFIG_FILE:-$repo_root/config.sh}
 sample_config_file="$repo_root/sample_config.sh"
 host_override_set=${AGENT_WORKFLOW_MANAGER_HOST+x}
@@ -77,6 +80,7 @@ validate_purplemux() {
     for required_contract in \
         'workspaces' \
         'workspace create --cwd PATH' \
+        'workspace delete -w WS --if-empty' \
         'tab create -w WS [-n NAME] [-t TYPE]' \
         'tab send -w WS TAB_ID' \
         'tab interrupt -w WS TAB_ID' \

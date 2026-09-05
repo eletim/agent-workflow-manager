@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -14,8 +15,18 @@ from pathlib import Path
 
 import pytest
 
+import purplemux_client.runner as runner_module
+import purplemux_client.web as web_module
+from purplemux_client import WorkspaceState
+from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
+from purplemux_client.preflight import WorkflowValidator
+from purplemux_client.prompt import (
+    PromptExecution,
+    build_prompt_workflow,
+    prepare_prompt_execution,
+)
 from purplemux_client.readiness import (
     AgentReadinessStatus,
     ReadinessReconciliationRequired,
@@ -23,11 +34,13 @@ from purplemux_client.readiness import (
 from purplemux_client.runner import (
     InvalidExecutionContextError,
     PythonRunner,
+    RunCleanupNotAllowedError,
     RunnerClosedError,
     RunnerSnapshot,
     RunNotResumableError,
+    RunResource,
 )
-from purplemux_client.web import RunnerHTTPServer, build_parser
+from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
 
 
 @pytest.fixture
@@ -72,6 +85,538 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     observed_at = datetime.fromisoformat(result.stdout_entries[0].observed_at)
     assert observed_at.tzinfo is not None
     assert result.exit_code == 0
+
+
+def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
+    tmp_path: Path,
+) -> None:
+    execution = prepare_prompt_execution(
+        agent="claude-code", cwd=str(tmp_path), prompt='Review "this".\nBe concise.'
+    )
+
+    code = build_prompt_workflow(execution)
+
+    assert "runtime = PurpleMuxRuntime()" in code
+    assert "owned_by_run" not in code
+    assert "runtime.create_workspace(" in code
+    assert "client = runtime.workspace(workspace.id)" in code
+    assert "client.create_session(" in code
+    assert "client.wait_for_turn_completion(tab, 3600)" in code
+    assert "result = client.read_result(tab)" in code
+    assert "client.interrupt(tab)" in code
+    assert "capture_screen" not in code
+    assert "close_session" not in code
+    assert "delete_workspace" not in code
+    assert json.dumps(execution.cwd) in code
+    assert json.dumps(execution.prompt) in code
+    validation = WorkflowValidator().validate(code)
+    assert validation.valid
+    assert validation.outline == ("Prompt",)
+
+
+@pytest.mark.parametrize(
+    ("agent", "cwd", "prompt", "message"),
+    [
+        ("other", ".", "work", "agent must be"),
+        ("codex", "", "work", "cwd must be"),
+        ("codex", ".", "  ", "prompt must not be empty"),
+    ],
+)
+def test_prompt_input_validation(
+    agent: str, cwd: str, prompt: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        prepare_prompt_execution(agent=agent, cwd=cwd, prompt=prompt)
+
+
+def test_prompt_run_hides_generated_code_and_rejects_workflow_cleanup(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    execution = PromptExecution("codex", str(tmp_path), "answer")
+    run_id = runner.start("print('structured answer')", prompt=execution)
+    result = wait_for(
+        runner, lambda snapshot: snapshot.state == "success", run_id=run_id
+    )
+
+    payload = result.as_json()
+    assert payload["mode"] == "prompt"
+    assert payload["prompt"] == execution.as_json()
+    assert payload["code"] is None
+    assert payload["cwd"] == str(tmp_path)
+    assert payload["resources"] == []
+    assert payload["cleanupAvailable"] is False
+    summary = result.as_summary_json()
+    assert summary["mode"] == "prompt"
+    assert summary["prompt"] == {"agent": "codex", "cwd": str(tmp_path)}
+    with pytest.raises(RunCleanupNotAllowedError, match="Prompt run"):
+        runner.cleanup(run_id)
+
+
+def test_run_owned_resources_are_retained_structurally_after_success(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {
+    "workspace_id": "ws-1", "name": "Agent", "panel_type": "codex-cli"
+})
+register_run_resource("purplemux_tab", "tab-1", {
+    "workspace_id": "ws-1", "name": "Agent", "panel_type": "codex-cli"
+})
+"""
+    )
+
+    result = wait_until_finished(runner)
+
+    assert result.state == "success"
+    assert [(item.kind, item.identity) for item in result.resources] == [
+        ("purplemux_workspace", "ws-1"),
+        ("purplemux_tab", "tab-1"),
+    ]
+    assert result.resources[1].metadata["workspace_id"] == "ws-1"
+    assert result.resources[1].cleanup_state == "retained"
+    assert result.as_json()["resourceCleanupStatus"] == "retained"
+
+
+def test_explicit_cleanup_uses_dependency_order_and_keeps_run_history(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
+register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo"})
+"""
+    )
+    result = wait_until_finished(runner)
+    cleaned: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_resource",
+        lambda resource: cleaned.append((resource.kind, resource.identity)),
+    )
+
+    after = runner.cleanup(result.run_id or 0)
+
+    assert cleaned == [
+        ("purplemux_tab", "tab-2"),
+        ("purplemux_tab", "tab-1"),
+        ("purplemux_workspace", "ws-1"),
+        ("git_worktree", "/tmp/worktree"),
+    ]
+    assert all(item.cleanup_state == "cleaned" for item in after.resources)
+    assert after.as_json()["resourceCleanupStatus"] == "cleaned"
+    assert runner.snapshot(result.run_id).state == "success"
+
+
+def test_cleanup_aggregates_sibling_failures_and_blocks_parent_resources(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
+"""
+    )
+    result = wait_until_finished(runner)
+    attempted: list[str] = []
+
+    def cleanup(resource: object) -> None:
+        identity = resource.identity  # type: ignore[attr-defined]
+        attempted.append(identity)
+        if identity == "tab-1":
+            raise MutationOutcomeUnknown("close outcome could not be confirmed")
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+    after = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-2", "tab-1"]
+    states = {item.identity: item.cleanup_state for item in after.resources}
+    assert states == {"ws-1": "retained", "tab-1": "blocked", "tab-2": "cleaned"}
+    assert after.as_json()["resourceCleanupStatus"] == "blocked"
+    assert "could not be confirmed" in str(after.resources[1].cleanup_error)
+    monkeypatch.setattr(runner, "_resource_is_absent", lambda _resource: False)
+    reconciled = runner.cleanup(result.run_id or 0)
+    assert reconciled.as_json()["resourceCleanupStatus"] == "blocked"
+    assert attempted == ["tab-2", "tab-1"]
+
+
+def test_cleanup_retries_precondition_failure_after_remediation(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
+    result = wait_until_finished(runner)
+    precondition_satisfied = False
+    attempted: list[str] = []
+
+    def cleanup(resource: RunResource) -> None:
+        attempted.append(resource.identity)
+        if resource.identity == "tab-1" and not precondition_satisfied:
+            raise OSError("tab identity changed; refusing cleanup")
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+    blocked = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-1"]
+    assert [item.cleanup_state for item in blocked.resources] == [
+        "retained",
+        "cleanup_retryable",
+    ]
+    assert blocked.as_json()["resourceCleanupStatus"] == "blocked"
+    assert "identity changed" in str(blocked.resources[1].cleanup_error)
+
+    precondition_satisfied = True
+    cleaned = runner.cleanup(result.run_id or 0)
+
+    assert attempted == ["tab-1", "tab-1", "ws-1"]
+    assert all(item.cleanup_state == "cleaned" for item in cleaned.resources)
+    assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
+
+
+def test_cleanup_rejects_running_workflow(runner: PythonRunner) -> None:
+    run_id = runner.start("import time; time.sleep(60)")
+
+    with pytest.raises(RunCleanupNotAllowedError, match="non-running"):
+        runner.cleanup(run_id)
+
+    assert runner.stop(run_id)
+
+
+def test_cleanup_serializes_resume_and_server_rejects_resume_after_cleanup(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start(
+        """
+from purplemux_client import register_run_resource, save_checkpoint
+register_run_resource("managed_shell_result", "/tmp/awm-shell-owned", {
+    "result_path": "/tmp/awm-shell-owned/result.json", "tab_id": "tab-1"
+})
+save_checkpoint("resource ready", {"tab": "tab-1"})
+raise RuntimeError("repair first")
+"""
+    )
+    wait_until_finished(runner)
+    cleanup_started = threading.Event()
+    allow_cleanup = threading.Event()
+
+    def cleanup_resource(_resource: RunResource) -> None:
+        cleanup_started.set()
+        assert allow_cleanup.wait(2)
+
+    monkeypatch.setattr(runner, "_cleanup_resource", cleanup_resource)
+    cleanup_thread = threading.Thread(target=lambda: runner.cleanup(run_id))
+    resume_errors: list[BaseException] = []
+    resume_thread = threading.Thread(
+        target=lambda: _capture_exception(lambda: runner.resume(run_id), resume_errors)
+    )
+
+    cleanup_thread.start()
+    assert cleanup_started.wait(2)
+    resume_thread.start()
+    time.sleep(0.05)
+    assert resume_thread.is_alive()
+    allow_cleanup.set()
+    cleanup_thread.join(2)
+    resume_thread.join(2)
+
+    assert not cleanup_thread.is_alive()
+    assert not resume_thread.is_alive()
+    assert len(resume_errors) == 1
+    assert isinstance(resume_errors[0], RunNotResumableError)
+    assert "entered cleanup" in str(resume_errors[0])
+    assert runner.snapshot(run_id).state == "failed"
+
+
+def _capture_exception(
+    action: Callable[[], object], errors: list[BaseException]
+) -> None:
+    try:
+        action()
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def test_managed_shell_result_cleanup_removes_only_expected_temp_directory(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    result.write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    runner._cleanup_resource(resource)
+
+    assert not directory.exists()
+
+
+def test_managed_shell_result_cleanup_removes_wrapper_owned_pending_sidecar(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    (directory / "result.json.pending").write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    runner._cleanup_resource(resource)
+
+    assert not directory.exists()
+
+
+def test_managed_shell_result_cleanup_rejects_non_regular_pending_sidecar(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    pending = directory / "result.json.pending"
+    pending.mkdir()
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    with pytest.raises(OSError, match="not a regular file"):
+        runner._cleanup_resource(resource)
+
+    assert pending.is_dir()
+
+
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_managed_shell_result_cleanup_rejects_replaced_directory_without_unlinking(
+    runner: PythonRunner, tmp_path: Path, replacement_kind: str
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    result.write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+    result.unlink()
+    directory.rmdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    replacement_result = replacement / "result.json"
+    replacement_result.write_text("replacement", encoding="utf-8")
+    if replacement_kind == "directory":
+        directory.mkdir()
+        (directory / "result.json").write_text("replacement", encoding="utf-8")
+        protected_result = directory / "result.json"
+    else:
+        directory.symlink_to(replacement, target_is_directory=True)
+        protected_result = replacement_result
+
+    with pytest.raises(OSError, match="owned directory|identity changed"):
+        runner._cleanup_resource(resource)
+
+    assert protected_result.read_text(encoding="utf-8") == "replacement"
+
+
+def test_workspace_cleanup_releases_verified_empty_workspace(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = WorkspaceState("ws-owned", "Owned", ("/repo",))
+    deleted: list[tuple[str, WorkspaceState]] = []
+
+    class Runtime:
+        def list_workspaces(self) -> tuple[WorkspaceState, ...]:
+            return (workspace,)
+
+        def delete_workspace(
+            self, workspace_id: str, *, expected_state: WorkspaceState
+        ) -> None:
+            deleted.append((workspace_id, expected_state))
+
+    class Client:
+        def list_sessions(self) -> tuple[object, ...]:
+            return ()
+
+    monkeypatch.setattr(runner_module, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        runner_module, "PurpleMuxCLIClient", lambda _workspace: Client()
+    )
+
+    runner._cleanup_resource(
+        RunResource(
+            "purplemux_workspace",
+            "ws-owned",
+            {"name": "Owned", "directories": "/repo"},
+        )
+    )
+
+    assert deleted == [("ws-owned", workspace)]
+
+
+def test_git_worktree_cleanup_rejects_replacement_at_owned_path(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "owned-worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    (repository / "tracked").write_text("one", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "initial"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-qb",
+            "feature",
+            str(worktree),
+        ],
+        check=True,
+    )
+
+    def output(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    metadata = {
+        "repository": str(repository),
+        "path_identity": _test_path_identity(worktree),
+        "git_file_identity": _test_path_identity(worktree / ".git", ctime=True),
+        "git_dir": output("rev-parse", "--absolute-git-dir"),
+        "head": output("rev-parse", "HEAD"),
+        "branch": output("rev-parse", "--symbolic-full-name", "HEAD"),
+    }
+    subprocess.run(
+        ["git", "-C", str(repository), "worktree", "remove", str(worktree)],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-q",
+            str(worktree),
+            "feature",
+        ],
+        check=True,
+    )
+
+    with pytest.raises(OSError, match="identity changed"):
+        runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
+
+    assert worktree.is_dir()
+
+
+def test_git_worktree_cleanup_allows_branch_and_head_to_change_after_registration(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "owned-worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    (repository / "tracked").write_text("one", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-qm", "initial"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        capture_output=True,
+    )
+
+    def output(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    metadata = {
+        "repository": str(repository),
+        "path_identity": _test_path_identity(worktree),
+        "git_file_identity": _test_path_identity(worktree / ".git", ctime=True),
+        "git_dir": output("rev-parse", "--absolute-git-dir"),
+        "head": output("rev-parse", "HEAD"),
+        "branch": output("rev-parse", "--symbolic-full-name", "HEAD"),
+    }
+    subprocess.run(["git", "-C", str(worktree), "switch", "-c", "feature"], check=True)
+    (worktree / "tracked").write_text("two", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "tracked"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-qm", "implementation"],
+        check=True,
+    )
+
+    runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
+
+    assert not worktree.exists()
+
+
+def _test_path_identity(path: Path, *, ctime: bool = False) -> str:
+    state = path.stat(follow_symlinks=False)
+    suffix = f":{state.st_ctime_ns}" if ctime else ""
+    return f"{state.st_dev}:{state.st_ino}{suffix}"
 
 
 def test_stderr(runner: PythonRunner) -> None:
@@ -139,16 +684,15 @@ def test_empty_code(runner: PythonRunner) -> None:
     assert result.exit_code == 0
 
 
-def test_run_uses_and_records_explicit_cwd_and_args(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
+def test_run_uses_runner_controlled_cwd_and_records_args(tmp_path: Path) -> None:
+    runner = PythonRunner(workflow_cwd=tmp_path)
     runner.start(
         "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
-        cwd=tmp_path,
         args=("--repo", "path with spaces"),
     )
 
     result = wait_until_finished(runner)
+    runner.close()
 
     assert json.loads(result.stdout) == [
         str(tmp_path),
@@ -158,8 +702,8 @@ def test_run_uses_and_records_explicit_cwd_and_args(
     assert result.args == ("--repo", "path with spaces")
 
 
-def test_explicit_cwd_removes_runner_virtualenv_from_child_environment(
-    runner: PythonRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_runner_controlled_cwd_preserves_runner_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager_venv = tmp_path / "manager-venv"
     target_bin = tmp_path / "target-bin"
@@ -168,14 +712,18 @@ def test_explicit_cwd_removes_runner_virtualenv_from_child_environment(
         "PATH", os.pathsep.join((str(manager_venv / "bin"), str(target_bin)))
     )
 
+    runner = PythonRunner(workflow_cwd=tmp_path)
     runner.start(
         "import json, os; print(json.dumps([os.environ.get('VIRTUAL_ENV'), "
-        "os.environ.get('PATH')]))",
-        cwd=tmp_path,
+        "os.environ.get('PATH')]))"
     )
     result = wait_until_finished(runner)
+    runner.close()
 
-    assert json.loads(result.stdout) == [None, str(target_bin)]
+    assert json.loads(result.stdout) == [
+        str(manager_venv),
+        os.pathsep.join((str(manager_venv / "bin"), str(target_bin))),
+    ]
 
 
 def test_implicit_cwd_preserves_existing_environment(
@@ -190,23 +738,19 @@ def test_implicit_cwd_preserves_existing_environment(
     assert result.stdout == f"{manager_venv}\n"
 
 
-def test_execution_context_rejects_non_directory(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
+def test_runner_rejects_non_directory_workflow_cwd(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
 
     with pytest.raises(InvalidExecutionContextError, match="not a directory"):
-        runner.start("", cwd=missing)
+        PythonRunner(workflow_cwd=missing)
 
 
-def test_preflight_resolves_relative_paths_from_explicit_cwd(
-    runner: PythonRunner, tmp_path: Path
-) -> None:
+def test_preflight_resolves_relative_paths_from_runner_cwd(tmp_path: Path) -> None:
     (tmp_path / "input.txt").write_text("input", encoding="utf-8")
 
-    result = runner.validate(
-        "WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}", cwd=tmp_path
-    )
+    runner = PythonRunner(workflow_cwd=tmp_path)
+    result = runner.validate("WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}")
+    runner.close()
 
     assert result.valid
     assert runner.snapshot().cwd == str(tmp_path)
@@ -251,7 +795,8 @@ wait_for("checkpoint")
 save_checkpoint("safe", {"workspace": "ws-1"})
 wait_for("finish")
 """
-    run_id = runner.start(code, cwd=tmp_path)
+    runner._workflow_cwd = tmp_path
+    run_id = runner.start(code)
     revision = runner.change_revision()
 
     (tmp_path / "output").touch()
@@ -279,6 +824,53 @@ wait_for("finish")
     changed = runner.wait_for_change(revision, timeout=2)
     assert changed is not None
     assert runner.snapshot(run_id).state == "success"
+
+
+def test_shell_failure_diagnostic_survives_real_progress_event_encoding(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    diagnostic = '"\\' * 1_250
+    code = f"""\
+from purplemux_client import ShellResult, emit_step
+
+result = ShellResult(
+    2,
+    diagnostic_output={diagnostic!r},
+    cwd={str(tmp_path)!r},
+    workspace_id="ws-test",
+    tab_id="tab-test",
+)
+if result.exit_code != 0:
+    failure = result.failure_message("sync and verify main")
+    emit_step(
+        "sync and verify main",
+        "failed",
+        error=failure,
+        workspace=result.workspace_id,
+        tab=result.tab_id,
+    )
+    raise SystemExit(result.exit_code)
+"""
+
+    run_id = runner.start(code)
+    snapshot = wait_until_finished(runner)
+
+    assert snapshot.run_id == run_id
+    assert snapshot.state == "failed"
+    assert snapshot.exit_code == 2
+    assert len(snapshot.progress) == 1
+    event = snapshot.progress[0]
+    assert event.name == "sync and verify main"
+    assert event.status == "failed"
+    assert event.workspace == "ws-test"
+    assert event.tab == "tab-test"
+    assert event.error is not None
+    assert event.error.startswith(
+        "sync and verify main failed (exit code 2)\n"
+        f"cwd: {tmp_path}\n"
+        "workspace/tab: ws-test / tab-test\n"
+    )
+    assert event.error.endswith("\n[error truncated]")
 
 
 def test_output_is_bounded_and_reports_truncation() -> None:
@@ -453,7 +1045,8 @@ if not Path("repair.complete").exists():
     raise RuntimeError("manual repair required")
 print("continued safely")
 """
-    run_id = runner.start(code, cwd=tmp_path)
+    runner._workflow_cwd = tmp_path
+    run_id = runner.start(code)
     first = wait_until_finished(runner)
     assert first.state == "failed"
     assert first.checkpoint is not None
@@ -580,7 +1173,8 @@ assert checkpoint.name == "phase two"
 assert Path("second-fixed").exists()
 print(checkpoint.data["workspace"], checkpoint.data["tab"])
 """
-    run_id = runner.start(code, cwd=tmp_path)
+    runner._workflow_cwd = tmp_path
+    run_id = runner.start(code)
     wait_until_finished(runner)
     (tmp_path / "first-fixed").touch()
     runner.resume(run_id)
@@ -617,7 +1211,7 @@ def test_close_cannot_miss_concurrent_start_registration(
     allow_popen = threading.Event()
 
     def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-        if kwargs.get("start_new_session") is True:
+        if kwargs.get("start_new_session") is True and "cwd" in kwargs:
             popen_entered.set()
             assert allow_popen.wait(timeout=3)
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
@@ -820,7 +1414,7 @@ def test_popen_uses_current_interpreter_without_shell(
     command, options = next(
         (command, options)
         for command, options in calls
-        if options.get("start_new_session") is True
+        if options.get("start_new_session") is True and "cwd" in options
     )
     assert isinstance(command, list)
     assert command[0] == sys.executable
@@ -992,6 +1586,7 @@ def test_runner_http_lifecycle(
     assert datetime.fromisoformat(stdout_entries[0]["observedAt"]).tzinfo is not None
     assert stderr_entries == []
     assert result == {
+        "mode": "workflow",
         "state": "success",
         "stdout": "HTTP_OK\n",
         "stderr": "",
@@ -1001,6 +1596,7 @@ def test_runner_http_lifecycle(
         "dryRun": None,
         "dryRunEligible": True,
         "dryRunIssues": [],
+        "executionContext": None,
         "findings": [],
         "exitCode": 0,
         "runId": 1,
@@ -1018,7 +1614,121 @@ def test_runner_http_lifecycle(
         "code": 'print("HTTP_OK")',
         "suspensionReason": None,
         "resumable": False,
+        "resources": [],
+        "resourceCleanupStatus": "cleaned",
+        "cleanupAvailable": True,
     }
+
+
+def test_prompt_api_starts_shared_run_with_authoritative_cwd(
+    web_server: tuple[tuple[str, int], str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    address, token = web_server
+    monkeypatch.setattr(
+        web_module,
+        "build_prompt_workflow",
+        lambda _execution: "print('PROMPT_RESULT')",
+    )
+
+    status, started = request(
+        address,
+        "POST",
+        "/api/prompt",
+        json.dumps({"agent": "codex", "cwd": str(tmp_path), "prompt": "Do the work"}),
+        token=token,
+    )
+
+    assert status == 202
+    assert started["mode"] == "prompt"
+    assert started["prompt"] == {
+        "agent": "codex",
+        "cwd": str(tmp_path.resolve()),
+        "prompt": "Do the work",
+    }
+    assert started["cwd"] == str(tmp_path.resolve())
+    assert started["code"] is None
+    assert started["resources"] == []
+    assert started["cleanupAvailable"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"agent": "codex", "cwd": ".", "prompt": 1},
+        {"agent": "unknown", "cwd": ".", "prompt": "work"},
+        {"agent": "codex", "cwd": "/definitely/missing", "prompt": "work"},
+    ],
+)
+def test_prompt_api_rejects_invalid_inputs(
+    web_server: tuple[tuple[str, int], str], payload: dict[str, object]
+) -> None:
+    address, token = web_server
+
+    status, result = request(
+        address,
+        "POST",
+        "/api/prompt",
+        json.dumps(payload),
+        token=token,
+    )
+
+    assert status == 400
+    assert isinstance(result["error"], str)
+
+
+def test_list_directory_returns_only_sorted_directories(tmp_path: Path) -> None:
+    (tmp_path / "zeta").mkdir()
+    (tmp_path / "Alpha").mkdir()
+    (tmp_path / "notes.txt").write_text("not exposed", encoding="utf-8")
+
+    listing = list_directory(str(tmp_path))
+
+    assert listing == {
+        "path": str(tmp_path.resolve()),
+        "parent": str(tmp_path.resolve().parent),
+        "directories": [
+            {"name": "Alpha", "path": str((tmp_path / "Alpha").resolve())},
+            {"name": "zeta", "path": str((tmp_path / "zeta").resolve())},
+        ],
+    }
+
+
+def test_directory_api_navigates_and_validates_paths(
+    web_server: tuple[tuple[str, int], str], tmp_path: Path
+) -> None:
+    address, token = web_server
+    child = tmp_path / "child"
+    child.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("secret", encoding="utf-8")
+
+    status, listing = request(
+        address,
+        "POST",
+        "/api/directories",
+        json.dumps({"path": str(tmp_path)}),
+        token=token,
+    )
+
+    assert status == 200
+    assert listing["path"] == str(tmp_path.resolve())
+    assert listing["parent"] == str(tmp_path.resolve().parent)
+    assert listing["directories"] == [{"name": "child", "path": str(child.resolve())}]
+    assert "file.txt" not in json.dumps(listing)
+
+    for invalid_path in (str(file_path), str(tmp_path / "missing"), ""):
+        status, payload = request(
+            address,
+            "POST",
+            "/api/directories",
+            json.dumps({"path": invalid_path}),
+            token=token,
+        )
+        assert status == 400
+        assert isinstance(payload["error"], str)
 
 
 def test_events_endpoint_streams_runner_change_notifications(
@@ -1068,13 +1778,9 @@ def test_events_endpoint_rejects_untrusted_host(
 
 
 def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
+    web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, token = web_server
-    first_cwd = tmp_path / "first"
-    second_cwd = tmp_path / "second"
-    first_cwd.mkdir()
-    second_cwd.mkdir()
 
     status, first = request(
         address,
@@ -1083,7 +1789,6 @@ def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
         json.dumps(
             {
                 "code": "import time; print('first', flush=True); time.sleep(60)",
-                "cwd": str(first_cwd),
                 "args": ["--first"],
             }
         ),
@@ -1097,7 +1802,6 @@ def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
         json.dumps(
             {
                 "code": "import time; print('second', flush=True); time.sleep(60)",
-                "cwd": str(second_cwd),
                 "args": ["--second"],
             }
         ),
@@ -1110,8 +1814,8 @@ def test_run_api_lists_selects_and_stops_concurrent_runs_independently(
     status, listed = request(address, "GET", "/api/runs")
     assert status == 200
     assert [(run["runId"], run["cwd"], run["args"]) for run in listed["runs"]] == [
-        (first_id, str(first_cwd), ["--first"]),
-        (second_id, str(second_cwd), ["--second"]),
+        (first_id, str(Path.cwd()), ["--first"]),
+        (second_id, str(Path.cwd()), ["--second"]),
     ]
 
     status, stopped = request(
@@ -1137,18 +1841,85 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "GET", "/api/runs/999")[0] == 404
     assert request(address, "POST", "/api/runs/999/stop")[0] == 403
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
+    assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
+
+
+def test_run_api_exposes_explicit_cleanup_without_deleting_history(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "print('done')"}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, cleaned = request(
+        address, "POST", f"/api/runs/{run_id}/cleanup", token=token
+    )
+
+    assert status == 200
+    assert cleaned["state"] == "success"
+    assert cleaned["resourceCleanupStatus"] == "cleaned"
+    assert request(address, "GET", f"/api/runs/{run_id}")[0] == 200
+
+
+def test_resume_api_rejects_run_after_its_resources_enter_cleanup(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    code = """
+from purplemux_client import register_run_resource, save_checkpoint
+register_run_resource("managed_shell_result", "/tmp/awm-shell-absent", {
+    "result_path": "/tmp/awm-shell-absent/result.json", "tab_id": "tab-1"
+})
+save_checkpoint("resource created", {"tab": "tab-1"})
+raise RuntimeError("repair")
+"""
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": code}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    assert (
+        request(address, "POST", f"/api/runs/{run_id}/cleanup", token=token)[0] == 200
+    )
+    status, refusal = request(
+        address, "POST", f"/api/runs/{run_id}/resume", token=token
+    )
+
+    assert status == 409
+    assert "entered cleanup" in str(refusal["error"])
 
 
 def test_run_api_resumes_same_run_and_rejects_unsafe_replay(
     web_server: tuple[tuple[str, int], str], tmp_path: Path
 ) -> None:
     address, token = web_server
-    code = """\
+    fixed = tmp_path / "fixed"
+    code = f"""\
 from pathlib import Path
 from purplemux_client import resume_checkpoint, save_checkpoint
 if resume_checkpoint() is None:
-    save_checkpoint("before repair", {"workspace": "ws-1", "tab": "tab-1"})
-if not Path("fixed").exists():
+    save_checkpoint("before repair", {{"workspace": "ws-1", "tab": "tab-1"}})
+if not Path({str(fixed)!r}).exists():
     raise RuntimeError("fix required")
 print("resumed")
 """
@@ -1156,7 +1927,7 @@ print("resumed")
         address,
         "POST",
         "/api/run",
-        json.dumps({"code": code, "cwd": str(tmp_path)}),
+        json.dumps({"code": code}),
         token=token,
     )
     assert status == 202
@@ -1174,7 +1945,7 @@ print("resumed")
         "data": {"workspace": "ws-1", "tab": "tab-1"},
     }
 
-    (tmp_path / "fixed").touch()
+    fixed.touch()
     status, resumed = request(
         address, "POST", f"/api/runs/{run_id}/resume", token=token
     )
@@ -1203,47 +1974,8 @@ print("resumed")
     assert "no safe checkpoint" in str(refusal["error"])
 
 
-def test_resume_api_reports_removed_working_directory_without_mutating_run(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
-) -> None:
-    address, token = web_server
-    run_cwd = tmp_path / "removed-after-failure"
-    run_cwd.mkdir()
-    code = """\
-from purplemux_client import save_checkpoint
-save_checkpoint("safe boundary", {"workspace": "ws-1"})
-raise RuntimeError("manual repair required")
-"""
-    status, started = request(
-        address,
-        "POST",
-        "/api/run",
-        json.dumps({"code": code, "cwd": str(run_cwd)}),
-        token=token,
-    )
-    assert status == 202
-    run_id = int(started["runId"])
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        _, before = request(address, "GET", f"/api/runs/{run_id}")
-        if before["state"] != "running":
-            break
-        time.sleep(0.02)
-    assert before["state"] == "failed"
-    run_cwd.rmdir()
-
-    status, refusal = request(
-        address, "POST", f"/api/runs/{run_id}/resume", token=token
-    )
-
-    assert status == 400
-    assert refusal == {"error": f"working directory is not a directory: {run_cwd}"}
-    _, after = request(address, "GET", f"/api/runs/{run_id}")
-    assert after == before
-
-
-def test_run_api_passes_run_scoped_execution_context(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
+def test_run_api_uses_runner_cwd_and_passes_arguments(
+    web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, token = web_server
     status, started = request(
@@ -1253,7 +1985,6 @@ def test_run_api_passes_run_scoped_execution_context(
         json.dumps(
             {
                 "code": "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
-                "cwd": str(tmp_path),
                 "args": ["--repo", "target repo"],
             }
         ),
@@ -1261,7 +1992,7 @@ def test_run_api_passes_run_scoped_execution_context(
     )
 
     assert status == 202
-    assert started["cwd"] == str(tmp_path)
+    assert started["cwd"] == str(Path.cwd())
     assert started["args"] == ["--repo", "target repo"]
 
     deadline = time.monotonic() + 5
@@ -1271,22 +2002,18 @@ def test_run_api_passes_run_scoped_execution_context(
             break
         time.sleep(0.02)
     assert json.loads(str(result["stdout"])) == [
-        str(tmp_path),
+        str(Path.cwd()),
         ["--repo", "target repo"],
     ]
 
 
 def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
-    web_server: tuple[tuple[str, int], str], tmp_path: Path
+    web_server: tuple[tuple[str, int], str],
 ) -> None:
     """Issue #45: /api/runs/{id} must return each run's own submitted code,
     unaffected by other runs starting, while /api/runs list summaries stay
     lightweight (no full source)."""
     address, token = web_server
-    first_cwd = tmp_path / "first"
-    second_cwd = tmp_path / "second"
-    first_cwd.mkdir()
-    second_cwd.mkdir()
     first_code = "print('RUN=A')"
     second_code = "print('RUN=B')"
 
@@ -1294,7 +2021,7 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
         address,
         "POST",
         "/api/run",
-        json.dumps({"code": first_code, "cwd": str(first_cwd), "args": ["A-ARG"]}),
+        json.dumps({"code": first_code, "args": ["A-ARG"]}),
         token=token,
     )
     assert status == 202
@@ -1309,7 +2036,7 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
         address,
         "POST",
         "/api/run",
-        json.dumps({"code": second_code, "cwd": str(second_cwd), "args": ["B-ARG"]}),
+        json.dumps({"code": second_code, "args": ["B-ARG"]}),
         token=token,
     )
     assert status == 202
@@ -1317,17 +2044,17 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
     assert second["code"] == second_code
 
     # The first run's own snapshot must be unaffected by the second run
-    # starting and executing with a different cwd/args/code.
+    # starting and executing with different args/code.
     status, after = request(address, "GET", f"/api/runs/{first_id}")
     assert status == 200
     assert after["code"] == before["code"] == first_code
-    assert after["cwd"] == before["cwd"] == str(first_cwd)
+    assert after["cwd"] == before["cwd"] == str(Path.cwd())
     assert after["args"] == before["args"] == ["A-ARG"]
 
     status, second_detail = request(address, "GET", f"/api/runs/{second_id}")
     assert status == 200
     assert second_detail["code"] == second_code
-    assert second_detail["cwd"] == str(second_cwd)
+    assert second_detail["cwd"] == str(Path.cwd())
 
     # The list summary intentionally omits the full source.
     status, listed = request(address, "GET", "/api/runs")
@@ -1339,7 +2066,10 @@ def test_run_api_exposes_submitted_code_in_detail_but_not_in_list_summary(
 @pytest.mark.parametrize(
     ("context", "error"),
     [
-        ({"cwd": 42}, "cwd must be a string or null"),
+        (
+            {"cwd": 42},
+            "cwd is not a Workflow input; declare repository context with prepare_run_repository()",
+        ),
         ({"args": "--repo target"}, "args must be an array of strings"),
         ({"args": ["--repo", 42]}, "args must be an array of strings"),
     ],
@@ -1363,7 +2093,7 @@ def test_run_api_rejects_invalid_execution_context_shape(
     assert payload == {"error": error}
 
 
-def test_run_api_rejects_missing_working_directory(
+def test_run_api_rejects_workflow_cwd_input(
     web_server: tuple[tuple[str, int], str], tmp_path: Path
 ) -> None:
     address, token = web_server
@@ -1377,10 +2107,10 @@ def test_run_api_rejects_missing_working_directory(
     )
 
     assert status == 400
-    assert "working directory is not a directory" in str(payload["error"])
+    assert "cwd is not a Workflow input" in str(payload["error"])
 
 
-def test_runner_page_exposes_execution_context_inputs(
+def test_runner_page_keeps_repository_context_in_python(
     web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, _ = web_server
@@ -1391,9 +2121,35 @@ def test_runner_page_exposes_execution_context_inputs(
     connection.close()
 
     assert response.status == 200
-    assert 'id="working-directory"' in page
+    assert 'id="working-directory"' not in page
     assert 'id="run-arguments"' in page
     assert 'id="run-list"' in page
+
+
+def test_runner_page_exposes_prompt_and_workflow_modes(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, _ = web_server
+    connection = http.client.HTTPConnection(*address, timeout=3)
+    connection.request("GET", "/")
+    response = connection.getresponse()
+    page = response.read().decode()
+    connection.close()
+
+    assert response.status == 200
+    for element_id in (
+        "prompt-mode",
+        "workflow-mode",
+        "prompt-agent",
+        "prompt-cwd",
+        "prompt-text",
+        "directory-picker-open",
+        "directory-picker-dialog",
+        "directory-picker-path",
+        "directory-picker-parent",
+        "directory-picker-select",
+    ):
+        assert f'id="{element_id}"' in page
 
 
 def test_runner_page_exposes_agent_workflow_manager_favicon(
@@ -2049,6 +2805,8 @@ def test_notification_settings_mutation_rejects_untrusted_request(
     [
         (path, token, origin)
         for path in (
+            "/api/directories",
+            "/api/prompt",
             "/api/run",
             "/api/validate",
             "/api/dry-run",

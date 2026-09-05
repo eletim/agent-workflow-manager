@@ -4,8 +4,11 @@ Use this file as the contract when generating a workflow script. The generated
 plain Python script is the source of truth. Do not create a workflow framework,
 graph, DSL, state machine, or UI-side copy of its control flow.
 
-**Canonical version-development sample:**
+**Lower-level direct-execution sample:**
 [sequential multi-Issue implementation and review](../../../examples/sequential-version-development.py).
+That configurable CLI sample intentionally operates on its explicit repository
+path. For normal repository-modifying Workflow mode, use the isolated preparation
+pattern documented below.
 It is the primary adaptable reference for sequential Issue PRs, independent
 per-Issue review/fix loops, safe resume, and a final version PR. Its separate
 whole-version review is mandatory because defects in shared state, lifecycle,
@@ -56,17 +59,41 @@ runtime and Git/GitHub facts reached before that frontier.
 
 ## Run execution context
 
-Choose the target repository in the Runner's **Working directory** field. Put
-each workflow argument on its own line in **Arguments**; spaces within a line
-belong to that single argument. The resolved directory and argument list are
-shown with the run and apply to both preflight and execution. They are not
-global workflow configuration.
+The Python workflow is the source of truth for repository execution context.
+Declare the source repository and remote base with literal keyword values so
+Static Validation and Dry Run can inspect them without guessing path variables:
 
-Selecting a working directory prevents the workflow child from inheriting
-Agent Workflow Manager's `VIRTUAL_ENV` and matching virtualenv `bin` path. It
-does not activate the target repository's environment. Commands that require a
-project environment should make it explicit, such as `uv run --project
-/absolute/repo python -m package.module` or an absolute interpreter path.
+```python
+from purplemux_client import prepare_run_repository
+
+context = prepare_run_repository(
+    repo="~/DevEnv/project",
+    base_branch="main",
+)
+REPO = context.execution_root
+```
+
+The helper resolves the source repository and exact current remote base SHA,
+creates and verifies a fresh detached run worktree under the AWM-owned data
+directory, registers it for explicit Cleanup, and returns both source and
+execution identities. Use `context.execution_root` for Git/GitHub operations,
+PurpleMux workspace creation, shell steps, and agent `cwd` values. The original
+checkout is never switched, reset, stashed, or cleaned.
+
+The validated topology layer accepts that clean detached root as the exact base
+for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sha)`.
+This keeps branch preparation inside the isolated worktree even when the source
+checkout already has the configured base branch checked out. If the logical
+feature branch is also checked out in another worktree, the topology layer uses
+a unique `awm-run/...` local branch. Always push the isolated checkout explicitly
+with `git push origin HEAD:refs/heads/<logical-feature-branch>`; topology and PR
+checks continue to use the logical remote branch name.
+
+The workflow subprocess itself runs from a stable Runner-controlled directory;
+that directory is not the project and is not editable in Workflow mode. Put
+each workflow argument on its own line in **Arguments**. Lower-level PurpleMux
+workspace/session APIs still accept an explicit `cwd` for direct execution and
+Prompt mode.
 
 ## Preflight requirements
 
@@ -87,7 +114,7 @@ WORKFLOW_PREFLIGHT = {
 ```
 
 All keys are optional lists of non-empty strings. Relative paths resolve from
-the selected run working directory. Keep these checks deterministic and
+the Runner-controlled subprocess directory. Keep these checks deterministic and
 side-effect-free; do not use metadata as a workflow DSL. Read-only discovery is
 bounded and reports a validation timeout if a lookup stalls. Preflight is
 best-effort and cannot prove that dynamic code or later external operations will
@@ -205,17 +232,15 @@ emit_step(
 client.wait_for_shell_completion(shell_tab, timeout_seconds=900)
 shell_result = client.read_shell_result(shell_tab)
 if shell_result.exit_code != 0:
+    failure = shell_result.failure_message("focused tests")
     emit_step(
         "focused tests",
         "failed",
-        error=f"exit code {shell_result.exit_code}",
+        error=failure,
         workspace=workspace_id,
         tab=shell_tab,
     )
-    raise WorkerFailure(
-        f"focused tests failed with exit code {shell_result.exit_code}; "
-        f"inspect {workspace_id} / {shell_tab}"
-    )
+    raise WorkerFailure(failure)
 emit_step(
     "focused tests",
     "completed",
@@ -236,7 +261,11 @@ written by the command wrapper. It never parses pane text and cannot miss a fast
 command that runs between status polls. `read_shell_result()` raises
 `ResultNotReady` before completion. A nonzero exit code is an explicit result,
 not an automatic cleanup decision; plain Python decides whether to fail, retry,
-or retain the tab.
+or retain the tab. For a nonzero result, the client also attempts a diagnostic-only
+screen capture and retains a bounded tail on `ShellResult`. `failure_message()`
+formats that tail with the resolved cwd and workspace/tab references for Runner
+display. Capture text is never parsed for completion or workflow control, and a
+capture error is reported as secondary context without replacing the exit code.
 
 `worker` selects `codex-cli` or `claude-code`; recognized aliases are `codex`,
 `codex-cli`, `claude`, and `claude-code`. If `worker` is unrecognized, the
@@ -262,7 +291,7 @@ Relevant errors all derive from `TerminalSessionError`:
 Use the inspection-aware runtime adapter rather than a raw subprocess:
 
 ```python
-runtime = PurpleMuxRuntime()
+runtime = PurpleMuxRuntime(owned_by_run=True)
 workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd="/absolute/repo",
@@ -332,16 +361,37 @@ The script—not an agent prompt and not the UI—owns this loop and its limit.
 
 ## Cleanup policy
 
-Recommended default:
+Workflow runs opt into automatic PurpleMux resource registration:
 
-```text
-SUCCESS -> close every created session once
-FAILURE -> keep sessions open and print workspace/tab references for inspection
+```python
+runtime = PurpleMuxRuntime(owned_by_run=True)
+workspace = runtime.create_workspace(request)
+client = runtime.workspace(workspace.id)
 ```
 
-Do not retry a timed-out close blindly. There is currently no workspace deletion
-method in `purplemux_client`; do not invent one. A workflow may use
-`capture_screen` after failure for diagnostics, without parsing it as a result.
+The default `owned_by_run=False` path is intentionally registration-free for
+Prompt mode and other direct adapter use. Git worktree registration must include
+the repository and immutable ownership evidence: the absolute Git directory and
+filesystem identities for both the worktree path and its `.git` administrative
+file. Registration-time HEAD and branch may be retained as diagnostics, but
+Cleanup does not require them to remain fixed because normal branch preparation
+and commits change both after a detached worktree is created.
+
+Do not automatically close a Workflow run's tabs on success or failure. The
+Runner retains the structured inventory on the run record and exposes one manual
+Cleanup action after execution ends. Cleanup verifies identities, closes child
+tabs in reverse deterministic order, removes managed-shell result directories,
+deletes an identity-verified empty workspace through PurpleMux's public atomic
+`workspace delete -w ID --if-empty` contract, and then handles the Git worktree.
+Startup rejects PurpleMux versions without that contract. Only its structured
+`not-empty` response proves rejection; transport errors and other nonzero exits
+remain uncertain until authoritative workspace listing reconciles them.
+Managed-shell directories are registered with their no-follow filesystem
+identity. Cleanup stops before dependent parent resources when an outcome is
+blocked. A workflow may use `capture_screen` for diagnostics, without parsing it
+as a result. Prompt mode does not use this Workflow resource model. Cleanup and
+Resume are mutually exclusive, and cleanup permanently disables Resume for that
+run.
 
 ## Explicit checkpoints and manual recovery
 
@@ -374,8 +424,11 @@ It may leave a checkpoint active only when every operation from that point to
 the next checkpoint is safe/idempotent to re-enter after an arbitrary failure.
 Checkpoint values are exposed in the UI/API, so store only short non-secret
 strings. A checkpoint event over 4 KiB is rejected. On each Resume click the
-Runner re-runs preflight and the same saved script, cwd, and arguments under the
-same run ID; output and terminal attempt history are appended. It never edits
+Runner re-runs preflight and the same saved script and arguments from the
+Runner-controlled directory under the same run ID. The retained repository
+execution context is supplied back to `prepare_run_repository()`, so it verifies
+and reuses the registered worktree rather than creating another. Output and
+terminal attempt history are appended. The Runner never edits
 or restores repository files, so manual changes are preserved unless the
 workflow itself overwrites them.
 
@@ -507,27 +560,31 @@ Do not:
 
 ## Complete example: implement, review, fix, and ready a PR
 
-This example creates a workspace and separate Codex sessions, asks the
+This example prepares an isolated worktree, creates a workspace and separate Codex sessions, asks the
 implementer to create a Draft PR, performs at most four independent reviews,
-routes actionable findings back to the implementer, marks the PR ready after
-approval, closes sessions on success, and keeps them for inspection on failure.
+routes actionable findings back to the implementer, and marks the PR ready after
+approval. All owned resources remain available until explicit Cleanup.
 
 ```python
 from __future__ import annotations
 
-from pathlib import Path
-
 from purplemux_client import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
+    GitRepository,
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
     TerminalSessionError,
     WorkerFailure,
     emit_step,
+    prepare_run_repository,
 )
 
-REPO = Path("/absolute/path/to/repository").resolve()
+context = prepare_run_repository(
+    repo="/absolute/path/to/repository",
+    base_branch="dev/v0.1.0",
+)
+REPO = context.execution_root
 ISSUE_URL = "https://github.com/OWNER/REPO/issues/123"
 BASE_BRANCH = "dev/v0.1.0"
 FEATURE_BRANCH = "feature/issue-123"
@@ -535,6 +592,16 @@ MAX_REVIEWS = 4
 READY_TIMEOUT = 60
 TURN_TIMEOUT = 900
 WORKFLOW_DRY_RUN = 1
+
+repository = GitRepository.open(
+    REPO,
+    expected_github_slug="OWNER/REPO",
+)
+repository.prepare_feature_branch(
+    FEATURE_BRANCH,
+    base=BASE_BRANCH,
+    expected_base_sha=context.base_sha,
+)
 
 
 def short_error(exc: BaseException) -> str:
@@ -591,7 +658,7 @@ def review_decision(result: str) -> str:
 
 
 emit_step("workspace create", "started")
-runtime = PurpleMuxRuntime()
+runtime = PurpleMuxRuntime(owned_by_run=True)
 workspace = runtime.create_workspace(
     CreateWorkspaceRequest(
         cwd=str(REPO),
@@ -643,9 +710,11 @@ try:
         implementer,
         "implementation",
         f"""Implement {ISSUE_URL}. Treat the Issue body as Source of Truth.
-Use the existing branch {FEATURE_BRANCH}, based on {BASE_BRANCH}; create no other branch.
+Work in the prepared checkout based on {BASE_BRANCH}; publish its HEAD to the
+logical branch {FEATURE_BRANCH} and create no other branch yourself.
 Run required format/lint/typecheck/tests and git diff --check.
-Commit, push, and create a Draft PR targeting {BASE_BRANCH}.
+Commit, push with `git push origin HEAD:refs/heads/{FEATURE_BRANCH}`, and create a
+Draft PR targeting {BASE_BRANCH}.
 Do not merge main or {BASE_BRANCH}. Do not start a review yourself.
 Return a concise implementation and verification summary.""",
     )
@@ -675,7 +744,8 @@ Otherwise return CHANGES_REQUESTED on the first non-empty line, followed by spec
             "fix",
             f"""Fix only the actionable review findings below for {ISSUE_URL}.
 Keep branch {FEATURE_BRANCH}; do not create another branch or merge anything.
-Run required checks, commit, and push to the existing Draft PR.
+Run required checks, commit, and push with
+`git push origin HEAD:refs/heads/{FEATURE_BRANCH}` to the existing Draft PR.
 Do not start a review yourself.
 
 REVIEW FINDINGS:
@@ -712,23 +782,8 @@ except BaseException as exc:
         else:
             print(f"Diagnostic capture for {session_id}:\n{diagnostic}")
     raise
-finally:
-    if workflow_succeeded:
-        emit_step("cleanup", "started", workspace=workspace_id)
-        cleanup_errors: list[str] = []
-        for session_id in reversed(session_ids):
-            try:
-                client.close_session(session_id)  # One attempt; never blind retry.
-            except TerminalSessionError as exc:
-                cleanup_errors.append(f"{session_id}: {exc}")
-        if cleanup_errors:
-            message = "; ".join(cleanup_errors)
-            emit_step("cleanup", "failed", error=message[:500], workspace=workspace_id)
-            raise WorkerFailure(f"session cleanup failed: {message}")
-        emit_step("cleanup", "completed", workspace=workspace_id)
-        emit_step("workflow", "completed", workspace=workspace_id)
 ```
 
 Replace constants and prompts for the requested Issue, but keep orchestration,
-review separation, bounded attempts, mutation handling, and cleanup explicit in
-plain Python.
+review separation, bounded attempts, and mutation handling explicit in plain
+Python. Resource destruction is the separate, explicit run Cleanup action.

@@ -60,23 +60,33 @@ permit branch creation/tracking/switching and fast-forward Git changes. They nev
 reset, rebase, force-push, delete branches, stash changes, or resolve conflicts.
 
 ```python
-from purplemux_client import GitHubRepository, GitRepository
+from purplemux_client import (
+    GitHubRepository,
+    GitRepository,
+    prepare_run_repository,
+)
+
+context = prepare_run_repository(
+    repo="~/DevEnv/project",
+    base_branch="dev/v1.2.3",
+)
 
 repo = GitRepository.open(
-    "/workspace/project",
+    context.execution_root,
     expected_github_slug="owner/project",
 )
 github = GitHubRepository.open("owner/project")
 
-integration = repo.synchronize_branch("dev/v1.2.3")
-assert integration.remote_sha is not None
 feature = repo.prepare_feature_branch(
     "feature/issue-123",
     base="dev/v1.2.3",
-    expected_base_sha=integration.remote_sha,
+    expected_base_sha=context.base_sha,
 )
 
-# Agent code still owns editing, testing, committing, and pushing.
+# Agent code still owns editing, testing, committing, and pushing. Push HEAD to
+# the logical branch explicitly because an occupied branch uses a run-private
+# local checkout.
+# git push origin HEAD:refs/heads/feature/issue-123
 feature = repo.require_pushed("feature/issue-123")
 pull_request = github.require_pr(
     head="feature/issue-123",
@@ -201,7 +211,16 @@ adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI executes arbitrary Python with the current Python
+The trusted local Runner UI has two explicit modes. **Prompt** accepts an agent,
+an existing working directory, and one prompt. It generates a single-step plain
+Python execution that creates a PurpleMux workspace rooted at that exact directory,
+creates the selected provider tab, and observes its structured turn result. Prompt
+resources stay directly available in PurpleMux; they are not registered as
+Workflow-owned resources and have no automatic or explicit Workflow cleanup path.
+The generated Python remains an implementation detail rather than an editable or
+historical UI field.
+
+**Workflow** executes arbitrary Python with the current Python
 interpreter and shows stdout, stderr, exit code, and the
 idle/running/success/failed/suspended/stopped/validation_failed state. Validate
 performs side-effect-free, best-effort static checks, and Run performs the same
@@ -219,34 +238,47 @@ same recovery path and diagnostic sessions. Resume history is retained with
 the run for the lifetime of the Runner process.
 
 Runs are independent and may execute concurrently. The UI lists every run and
-lets the operator select its state, output, progress, execution context, and
-Stop action without changing another run. `GET /api/runs` lists compact summaries,
+lets the operator select its state, output, progress, execution context, Stop,
+and explicit Cleanup action without changing another run. Workflow-owned
+resources remain inspectable after every terminal result and are registered on
+the existing run record rather than a separate lifecycle store. Canonical
+Workflow runtimes opt into ownership registration; direct/Prompt adapter use is
+registration-free by default. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
-from its latest safe checkpoint. The original `/api/status`,
-`/api/output`, and `/api/stop` routes remain available and address the most
-recently created run. `GET /api/events` streams revision-only SSE change
+from its latest safe checkpoint. `POST /api/runs/{runId}/cleanup` releases
+registered resources without deleting run history. Workspace release requires
+PurpleMux's public atomic `workspace delete -w ID --if-empty` CLI contract;
+startup rejects unsupported versions so canonical Cleanup cannot be stranded
+behind an incompatible runtime. The original
+`/api/status`, `/api/output`, and `/api/stop` routes remain available and address
+the most recently created run. `GET /api/events` streams revision-only SSE change
 notifications; initial load, notifications, and reconnects all reconcile through
 the authoritative read APIs rather than treating the stream as workflow state.
 
-Each Run or Validate request owns its execution context. The UI exposes an
-explicit working directory and zero or more arguments (one argument per line),
-and every run snapshot keeps the resolved `cwd` and `args` visible with that
-run. The HTTP form is `{"code": "...", "cwd": "/absolute/repo", "args":
-["--repo", "/absolute/repo"]}`. Omitting `cwd` preserves the original behavior
-of using the Runner process directory; an explicit relative path is resolved
-against that directory before launch.
+Workflow subprocesses use one stable Runner-controlled directory; it is not a
+project selector and is not a Workflow form input. Repository-modifying
+workflows declare their source and base in Python. `prepare_run_repository()`
+validates the remote base, resolves its exact commit, creates a fresh detached
+worktree under `~/.local/share/agent-workflow-manager/worktrees/`, registers it
+with the current run, and returns its structured execution identity:
 
-When `cwd` is explicit, the child still receives the Runner's ordinary
-environment, but it does not inherit `VIRTUAL_ENV` or matching virtualenv `bin`
-entries from Agent Workflow Manager. This prevents subprocesses in a target
-repository from accidentally selecting the manager's Python environment. The
-workflow itself still starts with the Runner interpreter so the public
-`purplemux_client` API is available. Target-project commands should select
-their environment explicitly, for example `uv run --project /absolute/repo
-python -m package.module`; choosing a directory does not automatically activate
-that repository's virtualenv.
+```python
+from purplemux_client import prepare_run_repository
+
+context = prepare_run_repository(
+    repo="~/DevEnv/project",
+    base_branch="main",
+)
+```
+
+Use `context.execution_root` explicitly for Git/GitHub operations, PurpleMux
+workspace creation, shells, and agents. Run details expose the source
+repository, configured remote/base ref, exact base SHA, and execution root.
+The HTTP Workflow form is `{"code": "...", "args": ["value"]}`; `cwd` is
+rejected. Lower-level PurpleMux workspace/session `cwd` parameters remain
+available for direct execution and Prompt mode.
 
 Preflight always checks syntax. It also checks direct module-level imports,
 direct module-level `os.environ["NAME"]` access, and names imported directly from

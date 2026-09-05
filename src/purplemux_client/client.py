@@ -15,11 +15,13 @@ from purplemux_client.errors import (
     MutationOutcomeUnknown,
     ResultNotReady,
     SessionReadyTimeout,
+    TerminalSessionError,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
 )
 from purplemux_client.operations import (
+    AuthoritativeMutationRejection,
     MutationConflict,
     MutationResolution,
     PossibleDispatchFailure,
@@ -27,6 +29,7 @@ from purplemux_client.operations import (
     Reconciliation,
     execute_mutation,
 )
+from purplemux_client.progress import register_run_resource
 
 
 @dataclass(frozen=True)
@@ -108,14 +111,33 @@ class ShellCommandRequest:
 
 @dataclass(frozen=True)
 class ShellResult:
-    """Structured completion result for a PurpleMux-backed shell command."""
+    """Structured completion plus display-only failure diagnostics."""
 
     exit_code: int
+    diagnostic_output: str | None = None
+    diagnostic_error: str | None = None
+    cwd: str | None = None
+    workspace_id: str | None = None
+    tab_id: str | None = None
+
+    def failure_message(self, step_name: str) -> str:
+        """Format a failed step for display without deriving its outcome from text."""
+        lines = [f"{step_name} failed (exit code {self.exit_code})"]
+        if self.cwd:
+            lines.append(f"cwd: {self.cwd}")
+        if self.workspace_id and self.tab_id:
+            lines.append(f"workspace/tab: {self.workspace_id} / {self.tab_id}")
+        if self.diagnostic_output:
+            lines.append(self.diagnostic_output)
+        if self.diagnostic_error:
+            lines.append(f"diagnostic capture failed: {self.diagnostic_error}")
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
 class _ShellRun:
     result_path: str
+    cwd: str | None
 
 
 class SubprocessRunner(Protocol):
@@ -145,6 +167,13 @@ _RESULT_STATUSES = {
     "not-applicable",
     "unavailable",
 }
+_SHELL_DIAGNOSTIC_MAX_LINES = 40
+_SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
+
+
+def _filesystem_identity(path: str) -> str:
+    state = os.stat(path, follow_symlinks=False)
+    return f"{state.st_dev}:{state.st_ino}"
 
 
 @dataclass(frozen=True)
@@ -165,6 +194,8 @@ class PurpleMuxRuntime:
         command_timeout_seconds: float = 30.0,
         read_timeout_retries: int = 1,
         runner: SubprocessRunner = subprocess.run,
+        owned_by_run: bool = False,
+        workspace_deleter: Callable[[str], bool | None] | None = None,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
@@ -174,6 +205,8 @@ class PurpleMuxRuntime:
         self.command_timeout_seconds = command_timeout_seconds
         self.read_timeout_retries = read_timeout_retries
         self._runner = runner
+        self.owned_by_run = owned_by_run
+        self._workspace_deleter = workspace_deleter or self._delete_empty_workspace
 
     def list_workspaces(self) -> tuple[WorkspaceState, ...]:
         data = self._read_json(["workspaces"], "list workspaces")
@@ -265,13 +298,130 @@ class PurpleMuxRuntime:
                 MutationResolution.UNKNOWN, detail="workspace may appear later"
             )
 
-        return execute_mutation(
+        workspace = execute_mutation(
             operation="create PurpleMux workspace",
             target=correlated_name,
             pre_state=before,
             dispatch=dispatch,
             reconcile=reconcile,
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
+        )
+        if self.owned_by_run:
+            register_run_resource(
+                "purplemux_workspace",
+                workspace.id,
+                {
+                    "name": workspace.name,
+                    "directories": "\n".join(workspace.directories),
+                    "correlation_id": request.correlation_id,
+                },
+            )
+        return workspace
+
+    def delete_workspace(
+        self, workspace_id: str, *, expected_state: WorkspaceState
+    ) -> None:
+        """Delete one empty, identity-verified workspace with reconciliation."""
+        before = self.list_workspaces()
+        selected = next((item for item in before if item.id == workspace_id), None)
+        if selected is None:
+            return
+        if selected != expected_state:
+            raise MutationConflict(
+                f"workspace {workspace_id} identity changed before cleanup"
+            )
+
+        def desired() -> bool:
+            return all(item.id != workspace_id for item in self.list_workspaces())
+
+        def dispatch() -> None:
+            authoritative_absence = self._workspace_deleter(workspace_id)
+            if authoritative_absence is True:
+                return
+            try:
+                deleted = desired()
+            except WorkerFailure as exc:
+                raise PossibleDispatchFailure(
+                    "workspace deletion was dispatched but could not be observed"
+                ) from exc
+            if not deleted:
+                raise PossibleDispatchFailure(
+                    "workspace deletion response lacked its postcondition"
+                )
+
+        def reconcile(quiescent: bool) -> Reconciliation[None]:
+            current = self.list_workspaces()
+            if all(item.id != workspace_id for item in current):
+                return Reconciliation(MutationResolution.DESIRED)
+            unchanged = any(item == selected for item in current)
+            if quiescent and unchanged:
+                return Reconciliation(MutationResolution.REJECTED)
+            if quiescent:
+                return Reconciliation(MutationResolution.CONFLICT)
+            return Reconciliation(MutationResolution.UNKNOWN)
+
+        execute_mutation(
+            operation="delete PurpleMux workspace",
+            target=workspace_id,
+            pre_state=selected,
+            dispatch=dispatch,
+            reconcile=reconcile,
+            plan={"kind": "delete_workspace", "workspace": workspace_id},
+        )
+
+    def _delete_empty_workspace(self, workspace_id: str) -> bool:
+        """Use PurpleMux's public, atomic empty-workspace deletion contract."""
+        try:
+            completed = self._runner(
+                [
+                    self.executable,
+                    "workspace",
+                    "delete",
+                    "-w",
+                    workspace_id,
+                    "--if-empty",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.command_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion timed out"
+            ) from exc
+        except InterruptedError as exc:
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion was interrupted"
+            ) from exc
+        except OSError as exc:
+            raise PreDispatchFailure(
+                f"could not execute PurpleMux empty workspace deletion: {exc}"
+            ) from exc
+        except KeyboardInterrupt as exc:
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion was interrupted"
+            ) from exc
+        try:
+            response = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            response = None
+        if isinstance(response, dict) and response.get("workspaceId") == workspace_id:
+            status = response.get("status")
+            if status in ("deleted", "already-absent"):
+                return True
+            if status == "not-empty":
+                raise AuthoritativeMutationRejection(
+                    "PurpleMux atomically refused non-empty workspace deletion"
+                )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+            raise PossibleDispatchFailure(
+                "PurpleMux empty workspace deletion failed with exit code "
+                f"{completed.returncode}: {detail}"
+            )
+        raise PossibleDispatchFailure(
+            "PurpleMux empty workspace deletion returned an invalid response"
         )
 
     def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
@@ -283,6 +433,7 @@ class PurpleMuxRuntime:
             command_timeout_seconds=self.command_timeout_seconds,
             read_timeout_retries=self.read_timeout_retries,
             runner=self._runner,
+            owned_by_run=self.owned_by_run,
         )
 
     def _read_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
@@ -391,6 +542,7 @@ class PurpleMuxCLIClient:
         runner: SubprocessRunner = subprocess.run,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        owned_by_run: bool = False,
     ) -> None:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
@@ -408,6 +560,7 @@ class PurpleMuxCLIClient:
         self._runner = runner
         self._sleep = sleep
         self._monotonic = monotonic
+        self.owned_by_run = owned_by_run
         self._turn_baselines: dict[str, _TurnBaseline] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
         self._shell_runs: dict[str, _ShellRun] = {}
@@ -428,11 +581,14 @@ class PurpleMuxCLIClient:
         name = request.name or f"awm-{panel_type}-{correlation_id}"
         if request.name is not None and correlation_id not in name:
             name = f"{name} [awm:{correlation_id}]"
-        return self._create_correlated_tab(
+        tab = self._create_correlated_tab(
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",
             name=name,
-        ).id
+        )
+        if self.owned_by_run:
+            self._register_owned_tab(tab)
+        return tab.id
 
     def list_sessions(self) -> tuple[TabState, ...]:
         """Return one complete structured tab listing for this workspace."""
@@ -539,13 +695,26 @@ class PurpleMuxCLIClient:
         if not os.path.isdir(cwd):
             raise ValueError(f"shell working directory is not a directory: {cwd}")
 
-        session_id = self._create_correlated_tab(
+        tab = self._create_correlated_tab(
             panel_type="terminal", provider=None, name=request.name
-        ).id
+        )
+        if self.owned_by_run:
+            self._register_owned_tab(tab)
+        session_id = tab.id
 
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
-        self._shell_runs[session_id] = _ShellRun(result_path=result_path)
+        if self.owned_by_run:
+            register_run_resource(
+                "managed_shell_result",
+                result_dir,
+                {
+                    "result_path": result_path,
+                    "tab_id": session_id,
+                    "directory_identity": _filesystem_identity(result_dir),
+                },
+            )
+        self._shell_runs[session_id] = _ShellRun(result_path=result_path, cwd=cwd)
         if on_created is not None:
             on_created(session_id, result_path)
         wrapper = self._shell_wrapper(request.command, cwd, result_path)
@@ -563,11 +732,38 @@ class PurpleMuxCLIClient:
             ) from exc
         return session_id
 
-    def resume_shell(self, session_id: str, result_path: str) -> None:
+    @staticmethod
+    def _register_owned_tab(tab: TabState) -> None:
+        register_run_resource(
+            "purplemux_tab",
+            tab.id,
+            {
+                "workspace_id": tab.workspace_id,
+                "name": tab.name,
+                "panel_type": tab.panel_type or "",
+                "provider": tab.provider or "",
+            },
+        )
+
+    def resume_shell(
+        self, session_id: str, result_path: str, *, cwd: str | None = None
+    ) -> None:
         """Reattach a checkpointed managed shell without sending its command again."""
+        resolved_cwd = (
+            os.path.abspath(os.path.expanduser(cwd)) if cwd is not None else None
+        )
+        if resolved_cwd is not None and not os.path.isdir(resolved_cwd):
+            raise ValueError(
+                f"shell working directory is not a directory: {resolved_cwd}"
+            )
         if session_id in self._shell_runs:
             if self._shell_runs[session_id].result_path != result_path:
                 raise WorkerFailure(f"session {session_id} shell identity conflicts")
+            if (
+                resolved_cwd is not None
+                and self._shell_runs[session_id].cwd != resolved_cwd
+            ):
+                raise WorkerFailure(f"session {session_id} shell cwd conflicts")
             return
         normalized = os.path.abspath(result_path)
         parent = os.path.dirname(normalized)
@@ -585,7 +781,9 @@ class PurpleMuxCLIClient:
             raise MutationConflict(
                 f"checkpointed shell {session_id} is no longer a terminal"
             )
-        self._shell_runs[session_id] = _ShellRun(result_path=normalized)
+        self._shell_runs[session_id] = _ShellRun(
+            result_path=normalized, cwd=resolved_cwd
+        )
 
     def wait_for_shell_completion(
         self, session_id: str, timeout_seconds: float
@@ -598,7 +796,9 @@ class PurpleMuxCLIClient:
         while True:
             result = self._read_shell_result_file(session_id)
             if result is not None:
-                self._completed_shell_runs[session_id] = result
+                self._completed_shell_runs[session_id] = self._with_shell_diagnostic(
+                    session_id, result
+                )
                 return
             status = self._status(session_id)
             panel_type = status.get("panelType")
@@ -632,8 +832,9 @@ class PurpleMuxCLIClient:
             result = self._read_shell_result_file(session_id)
         if result is None:
             raise ResultNotReady(f"shell terminal {session_id} result is not ready")
-        self._completed_shell_runs[session_id] = result
-        return result
+        completed = self._with_shell_diagnostic(session_id, result)
+        self._completed_shell_runs[session_id] = completed
+        return completed
 
     def read_status(self, session_id: str) -> dict[str, Any]:
         """Read authoritative agent state from PurpleMux StatusManager output."""
@@ -840,6 +1041,37 @@ class PurpleMuxCLIClient:
         if not isinstance(content, str):
             raise WorkerFailure("PurpleMux capture did not return text content")
         return content
+
+    def _with_shell_diagnostic(
+        self, session_id: str, result: ShellResult
+    ) -> ShellResult:
+        """Attach bounded pane text to failures without using it as control state."""
+        if result.exit_code == 0 or result.tab_id is not None:
+            return result
+        output: str | None = None
+        error: str | None = None
+        try:
+            output = self._bounded_shell_diagnostic(self.capture_screen(session_id))
+        except TerminalSessionError as exc:
+            error = str(exc)
+        shell_run = self._shell_runs[session_id]
+        return ShellResult(
+            exit_code=result.exit_code,
+            diagnostic_output=output,
+            diagnostic_error=error,
+            cwd=shell_run.cwd,
+            workspace_id=self.workspace_id,
+            tab_id=session_id,
+        )
+
+    @staticmethod
+    def _bounded_shell_diagnostic(content: str) -> str | None:
+        lines = content.strip().splitlines()[-_SHELL_DIAGNOSTIC_MAX_LINES:]
+        tail = "\n".join(lines)
+        encoded = tail.encode()
+        if len(encoded) > _SHELL_DIAGNOSTIC_MAX_BYTES:
+            tail = encoded[-_SHELL_DIAGNOSTIC_MAX_BYTES:].decode(errors="ignore")
+        return tail or None
 
     @staticmethod
     def _shell_wrapper(command: str, cwd: str, result_path: str) -> str:

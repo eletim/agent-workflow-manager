@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -41,6 +42,30 @@ def stalling_worker_command(pid_log: Path) -> list[str]:
     return [sys.executable, "-c", code]
 
 
+def stalled_remote_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "remote", "add", "origin", "stall::remote"],
+        check=True,
+    )
+    helper_directory = tmp_path / "bin"
+    helper_directory.mkdir()
+    helper = helper_directory / "git-remote-stall"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "sleep 60 &\n"
+        "child=$!\n"
+        f'printf \'%s\\n%s\\n\' "$$" "$child" > {str(tmp_path / "remote-pids")!r}\n'
+        'wait "$child"\n',
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{helper_directory}:{os.environ['PATH']}")
+    return repository
+
+
 def wait_for_pids(pid_log: Path, count: int) -> list[int]:
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -60,6 +85,16 @@ def process_is_live(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def wait_for_processes_to_exit(pids: list[int]) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if all(not process_is_live(pid) for pid in pids):
+            return
+        time.sleep(0.01)
+    live = [pid for pid in pids if process_is_live(pid)]
+    raise AssertionError(f"processes did not exit: {live}")
 
 
 def test_valid_script_passes_preflight(tmp_path: Path) -> None:
@@ -285,6 +320,52 @@ def test_repeated_timeouts_reap_validation_workers(
     assert not any(
         thread.name == "workflow-preflight-checks" for thread in threading.enumerate()
     )
+
+
+def test_validation_timeout_kills_stalled_remote_helper_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = stalled_remote_repository(tmp_path, monkeypatch)
+    pid_log = tmp_path / "remote-pids"
+    validator = WorkflowValidator(cwd=tmp_path, check_timeout=0.2)
+    code = (
+        "from purplemux_client import prepare_run_repository\n"
+        f"prepare_run_repository(repo={str(repository)!r}, base_branch='main')\n"
+    )
+
+    result = validator.validate(code)
+    pids = wait_for_pids(pid_log, 2)
+    validator.close()
+
+    assert not result.valid
+    assert result.issues[0].kind == "timeout"
+    wait_for_processes_to_exit(pids)
+
+
+def test_validator_close_kills_stalled_remote_helper_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = stalled_remote_repository(tmp_path, monkeypatch)
+    pid_log = tmp_path / "remote-pids"
+    validator = WorkflowValidator(cwd=tmp_path, check_timeout=10)
+    code = (
+        "from purplemux_client import prepare_run_repository\n"
+        f"prepare_run_repository(repo={str(repository)!r}, base_branch='main')\n"
+    )
+    results: list[ValidationResult] = []
+    validation_thread = threading.Thread(
+        target=lambda: results.append(validator.validate(code))
+    )
+    validation_thread.start()
+    pids = wait_for_pids(pid_log, 2)
+
+    validator.close()
+    validation_thread.join(timeout=1)
+
+    assert not validation_thread.is_alive()
+    assert len(results) == 1
+    assert not results[0].valid
+    wait_for_processes_to_exit(pids)
 
 
 def test_stalled_checks_do_not_block_runner_observation_or_close(

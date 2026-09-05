@@ -11,6 +11,10 @@ from pathlib import Path
 import pytest
 
 from purplemux_client import GitRepository, MutationOutcomeUnknown, WorkerFailure
+from purplemux_client.git import (
+    _QuiescentMutationTimeout,
+    _run_git_mutation_process_group,
+)
 
 
 class RecordingGitRunner:
@@ -134,6 +138,84 @@ def test_safe_synchronize_prepare_and_read_only_require_pushed(
         for call in runner.calls
         for forbidden in ("reset", "rebase", "checkout", "--force", "-f")
     )
+
+
+def test_prepare_feature_from_detached_exact_base_without_switching_source(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    isolated = tmp_path / "awm-run-isolated"
+    git(work, "worktree", "add", "--detach", str(isolated), base_sha)
+    repo = open_repo(isolated, RecordingGitRunner())
+
+    feature = repo.prepare_feature_branch(
+        "feature/isolated", base="main", expected_base_sha=base_sha
+    )
+
+    assert feature.current
+    assert feature.local_sha == base_sha
+    assert git(isolated, "branch", "--show-current") == "feature/isolated"
+    assert git(work, "branch", "--show-current") == "main"
+
+
+def test_synchronize_uses_run_private_branch_when_base_is_occupied(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    isolated = tmp_path / "awm-run-isolated"
+    git(work, "worktree", "add", "--detach", str(isolated), base_sha)
+    repo = open_repo(isolated, RecordingGitRunner())
+
+    synchronized = repo.synchronize_branch("main")
+
+    assert synchronized.current
+    assert synchronized.local_sha == base_sha
+    assert git(isolated, "branch", "--show-current").startswith("awm-run/")
+    assert git(work, "branch", "--show-current") == "main"
+    assert git(work, "rev-parse", "HEAD") == base_sha
+
+
+@pytest.mark.parametrize("feature_owner", ["source", "retained"])
+def test_prepare_feature_uses_run_private_branch_when_logical_branch_is_occupied(
+    repositories: tuple[Path, Path, Path],
+    tmp_path: Path,
+    feature_owner: str,
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    branch = "feature/occupied"
+    holder = work
+    if feature_owner == "source":
+        git(work, "switch", "-c", branch)
+    else:
+        holder = tmp_path / "retained-run"
+        git(work, "branch", branch)
+        git(work, "worktree", "add", str(holder), branch)
+    git(work, "push", "-u", "origin", branch)
+    isolated = tmp_path / "new-run"
+    git(work, "worktree", "add", "--detach", str(isolated), base_sha)
+    repo = open_repo(isolated, RecordingGitRunner())
+
+    feature = repo.prepare_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    private_branch = git(isolated, "branch", "--show-current")
+    git(isolated, "commit", "--allow-empty", "-m", "isolated change")
+
+    assert feature.current
+    assert feature.local_sha == base_sha
+    assert private_branch.startswith("awm-run/")
+    assert private_branch.endswith(f"/{branch}")
+    assert git(holder, "branch", "--show-current") == branch
+    assert git(holder, "rev-parse", "HEAD") == base_sha
+    assert git(work, "rev-parse", branch) == base_sha
+
+    git(isolated, "push", "origin", f"HEAD:refs/heads/{branch}")
+    pushed = repo.require_pushed(branch)
+    assert pushed.current
+    assert pushed.local_sha == pushed.remote_sha
 
 
 def test_synchronize_fast_forwards_but_rejects_ahead_and_dirty(
@@ -331,6 +413,25 @@ def test_local_mutation_timeout_kills_process_group_before_confirming_rejection(
 
     assert not isinstance(raised.value, MutationOutcomeUnknown)
     assert time.monotonic() - started < 2
+
+
+def test_shared_git_mutation_timeout_kills_surviving_descendant(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    marker = tmp_path / "descendant-survived"
+    git(
+        work,
+        "config",
+        "alias.descendant",
+        f"!sh -c '(sleep 0.4; touch {marker}) & wait'",
+    )
+
+    with pytest.raises(_QuiescentMutationTimeout):
+        _run_git_mutation_process_group(["descendant"], cwd=work, timeout=0.05)
+
+    time.sleep(0.5)
+    assert not marker.exists()
 
 
 def test_unproven_local_timeout_with_unchanged_state_is_unknown(

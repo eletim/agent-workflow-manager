@@ -99,8 +99,13 @@ function snapshot({
   cwd = `/work/run-${runId}`,
   args = [],
   code = `print("run-${runId}")`,
+  resources = [],
+  resourceCleanupStatus = resources.length ? "retained" : "cleaned",
+  executionContext = null,
+  mode = undefined,
+  prompt = undefined,
 }) {
-  return {
+  const result = {
     args,
     attempts,
     checkpoint,
@@ -122,8 +127,43 @@ function snapshot({
     dryRunEligible: true,
     dryRunIssues: [],
     findings: [],
+    resources,
+    resourceCleanupStatus,
+    executionContext,
+    cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
   };
+  if (mode !== undefined) result.mode = mode;
+  if (prompt !== undefined) result.prompt = prompt;
+  return result;
 }
+
+test("run details show structured repository execution identity", async () => {
+  const executionContext = {
+    sourceRepository: "/source/repository",
+    remote: "origin",
+    baseBranch: "main",
+    baseRef: "origin/main",
+    baseSha: "a".repeat(40),
+    executionRoot: "/managed/awm-run-repository-123",
+  };
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    executionContext,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", executionContext}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.match(
+    elements["execution-context-details"].textContent,
+    /origin\/main @ a{40}/,
+  );
+  assert.match(selectedRun(elements).textContent, /awm-run-repository-123/);
+});
 
 function response(body, status = 200) {
   return {
@@ -156,10 +196,16 @@ async function loadApp({
   clipboardOverride = null,
 }) {
   const ids = [
-    "code", "working-directory", "run-arguments", "active-context", "run-list",
-    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "status", "stdout",
+    "code", "run-arguments", "prompt-mode", "workflow-mode", "prompt-fields",
+    "workflow-fields", "prompt-agent", "prompt-cwd", "prompt-text",
+    "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
+    "directory-picker-parent", "directory-picker-path", "directory-picker-message",
+    "directory-picker-list", "directory-picker-select",
+    "active-context", "run-list",
+    "runs-empty", "new-run", "run", "resume", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
-    "recovery-panel", "recovery-summary", "attempt-history", "validation-panel",
+    "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
+    "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
@@ -181,6 +227,7 @@ async function loadApp({
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
   elements["readiness-provider"].value = "codex";
+  elements["prompt-agent"].value = "codex";
   const calls = [];
   const eventSources = [];
   const document = {
@@ -304,6 +351,155 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Prompt mode shows only one-shot inputs and submits them directly", async () => {
+  let submitted = null;
+  const prompt = {agent: "claude-code", cwd: "/work/project", prompt: "Fix it"};
+  const result = {
+    ...snapshot({runId: 1, state: "running", stdout: "", mode: "prompt", prompt}),
+    code: null,
+    cleanupAvailable: false,
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/prompt") return undefined;
+      submitted = JSON.parse(options.body);
+      return response(result, 202);
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  assert.equal(elements["prompt-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements.validate.hidden, true);
+  assert.equal(elements["dry-run"].hidden, true);
+  assert.equal(elements.resume.hidden, true);
+  assert.equal(elements.cleanup.hidden, true);
+  assert.equal(elements["guide-open"].hidden, true);
+
+  elements["prompt-agent"].value = prompt.agent;
+  elements["prompt-cwd"].value = prompt.cwd;
+  elements["prompt-text"].value = prompt.prompt;
+  await elements.run.dispatch("click");
+
+  assert.deepEqual(submitted, prompt);
+  assert.match(elements["active-context"].textContent, /Prompt Run #1/);
+  assert.equal(elements["prompt-text"].readOnly, true);
+  assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+});
+
+test("Prompt directory picker navigates and selects its resolved current path", async () => {
+  const listings = {
+    "/typed/project": {
+      path: "/typed/project",
+      parent: "/typed",
+      directories: [{name: "source", path: "/typed/project/source"}],
+    },
+    "/typed": {
+      path: "/typed",
+      parent: "/",
+      directories: [{name: "project", path: "/typed/project"}],
+    },
+    "/typed/project/source": {
+      path: "/typed/project/source",
+      parent: "/typed/project",
+      directories: [],
+    },
+  };
+  const requestedPaths = [];
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/directories") return undefined;
+      const requestedPath = JSON.parse(options.body).path;
+      requestedPaths.push(requestedPath);
+      return response(listings[requestedPath]);
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  elements["prompt-cwd"].value = "/typed/project";
+  await elements["directory-picker-open"].dispatch("click");
+  await waitFor(() => elements["directory-picker-list"].children.length === 1);
+
+  assert.equal(elements["directory-picker-path"].textContent, "/typed/project");
+  assert.equal(elements["directory-picker-list"].children[0].textContent, "📁 source");
+  await elements["directory-picker-parent"].dispatch("click");
+  await waitFor(() => elements["directory-picker-path"].textContent === "/typed");
+  await elements["directory-picker-list"].children[0].dispatch("click");
+  await waitFor(() => elements["directory-picker-path"].textContent === "/typed/project");
+  await elements["directory-picker-list"].children[0].dispatch("click");
+  await waitFor(() => elements["directory-picker-path"].textContent.endsWith("/source"));
+  assert.match(
+    elements["directory-picker-list"].children[0].textContent,
+    /No subdirectories/,
+  );
+
+  await elements["directory-picker-select"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/typed/project/source");
+  assert.deepEqual(requestedPaths, [
+    "/typed/project", "/typed", "/typed/project", "/typed/project/source",
+  ]);
+});
+
+test("Prompt directory picker reports invalid manual paths without replacing them", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") {
+        return response({error: "path is not a directory"}, 400);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  elements["prompt-cwd"].value = "/missing";
+  await elements["directory-picker-open"].dispatch("click");
+  await waitFor(() => elements["directory-picker-message"].textContent !== "Loading…");
+
+  assert.match(elements["directory-picker-message"].textContent, /not a directory/);
+  assert.equal(elements["prompt-cwd"].value, "/missing");
+  assert.equal(elements["directory-picker-select"].disabled, true);
+});
+
+test("Prompt history restores Prompt fields without exposing generated Python", async () => {
+  const prompt = {agent: "codex", cwd: "/selected/project", prompt: "Summarize"};
+  const detail = {
+    ...snapshot({runId: 4, state: "success", stdout: "done", mode: "prompt", prompt}),
+    code: null,
+    cleanupAvailable: false,
+  };
+  const summary = {
+    runId: 4,
+    state: "success",
+    cwd: prompt.cwd,
+    mode: "prompt",
+    prompt,
+    executionContext: null,
+  };
+
+  const {elements} = await loadApp({
+    runs: [summary],
+    details: {4: detail},
+    validation: {body: {}, status: 200},
+  });
+
+  assert.equal(elements["prompt-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements["prompt-agent"].value, "codex");
+  assert.equal(elements["prompt-cwd"].value, prompt.cwd);
+  assert.equal(elements["prompt-text"].value, prompt.prompt);
+  assert.match(selectedRun(elements).textContent, /Prompt.*selected\/project/);
+  assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+});
 
 test("Dry Run renders topology findings and the first mutation frontier", async () => {
   const dryRunResult = {
@@ -1222,11 +1418,11 @@ test("manual output copy preserves the payload attempted before a run switch", a
   );
 });
 
-// Issue #45: Working directory / Arguments / Python must always reflect the
+// Issue #45: Arguments / Python must always reflect the
 // currently selected run's own immutable snapshot, never another run's
 // values and never the new-run draft.
 
-test("selecting a run renders its own cwd/args/code, never another run's values", async () => {
+test("selecting a run renders its own args/code, never another run's values", async () => {
   const runA = snapshot({
     runId: 1,
     state: "success",
@@ -1253,25 +1449,20 @@ test("selecting a run renders its own cwd/args/code, never another run's values"
   });
 
   // The most recent run (B) is auto-selected and shown read-only on load.
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-b");
   assert.equal(elements["run-arguments"].value, "B-ARG-1");
   assert.equal(elements.code.value, "print('RUN=B')");
-  assert.equal(elements["working-directory"].readOnly, true);
   assert.equal(elements["run-arguments"].readOnly, true);
   assert.equal(elements.code.readOnly, true);
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
   assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
   assert.equal(elements.code.value, "print('RUN=A')");
 
   await runItem(elements, 2).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-b");
   assert.equal(elements["run-arguments"].value, "B-ARG-1");
   assert.equal(elements.code.value, "print('RUN=B')");
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/tmp/awm-run-a");
   assert.equal(elements["run-arguments"].value, "A-ARG-1\nA-ARG-2");
   assert.equal(elements.code.value, "print('RUN=A')");
 });
@@ -1342,33 +1533,26 @@ test("New run restores the retained draft unchanged after switching between runs
   });
 
   await elements["new-run"].dispatch("click");
-  assert.equal(elements["working-directory"].readOnly, false);
   assert.equal(elements["outline-panel"].hidden, true);
-  elements["working-directory"].value = "/tmp/draft-dir";
   elements["run-arguments"].value = "draft-arg-1\ndraft-arg-2";
   elements.code.value = "print('draft')";
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/work/run-1");
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
 
   await runItem(elements, 2).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/work/run-2");
 
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/draft-dir");
   assert.equal(elements["run-arguments"].value, "draft-arg-1\ndraft-arg-2");
   assert.equal(elements.code.value, "print('draft')");
   assert.equal(elements["outline-panel"].hidden, true);
 
-  assert.equal(elements["working-directory"].readOnly, false);
   assert.equal(elements.run.disabled, false);
   assert.equal(selectedRun(elements), undefined);
 
   await runItem(elements, 1).dispatch("click");
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
-  assert.equal(elements["working-directory"].readOnly, true);
 });
 
 test("selecting a run never calls a mutating endpoint", async () => {
@@ -1432,7 +1616,6 @@ test("Run submission after returning to New run uses the draft, not a viewed run
   assert.equal(elements.run.disabled, true);
 
   await elements["new-run"].dispatch("click");
-  elements["working-directory"].value = "/tmp/draft-dir";
   elements["run-arguments"].value = "draft-arg";
   elements.code.value = "print('draft')";
 
@@ -1440,7 +1623,6 @@ test("Run submission after returning to New run uses the draft, not a viewed run
 
   assert.deepEqual(runRequestBody, {
     code: "print('draft')",
-    cwd: "/tmp/draft-dir",
     args: ["draft-arg"],
   });
 });
@@ -1474,7 +1656,6 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   await new Promise((resolve) => setImmediate(resolve));
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements["working-directory"].value, "/work/run-1");
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
 
@@ -1482,7 +1663,6 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.match(selectedRun(elements).textContent, /^#1/);
-  assert.equal(elements["working-directory"].value, "/work/run-1");
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
 });
@@ -1494,13 +1674,11 @@ test("New run while already drafting never discards in-progress edits", async ()
     validation: {status: 200, body: {validation: []}},
   });
 
-  elements["working-directory"].value = "/tmp/still-typing";
   elements["run-arguments"].value = "still-typing-arg";
   elements.code.value = "print('still typing')";
 
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/still-typing");
   assert.equal(elements["run-arguments"].value, "still-typing-arg");
   assert.equal(elements.code.value, "print('still typing')");
 });
@@ -1514,7 +1692,6 @@ test("New run while drafting prevents a later SSE run from taking the selection"
     validation: {status: 200, body: {validation: []}},
   });
 
-  elements["working-directory"].value = "/tmp/explicit-draft";
   elements.code.value = "print('explicit draft')";
   await elements["new-run"].dispatch("click");
 
@@ -1524,7 +1701,6 @@ test("New run while drafting prevents a later SSE run from taking the selection"
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(selectedRun(elements), undefined);
-  assert.equal(elements["working-directory"].value, "/tmp/explicit-draft");
   assert.equal(elements.code.value, "print('explicit draft')");
 });
 
@@ -1613,12 +1789,10 @@ test("edits made while Run is pending remain in the retained draft", async () =>
     },
   });
 
-  elements["working-directory"].value = "/tmp/before";
   elements["run-arguments"].value = "before";
   elements.code.value = "print('before')";
   const submission = elements.run.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
-  elements["working-directory"].value = "/tmp/after";
   elements["run-arguments"].value = "after";
   elements.code.value = "print('after')";
 
@@ -1628,28 +1802,8 @@ test("edits made while Run is pending remain in the retained draft", async () =>
   await submission;
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/after");
   assert.equal(elements["run-arguments"].value, "after");
   assert.equal(elements.code.value, "print('after')");
-});
-
-test("an existing run's status cwd does not seed the New-run draft", async () => {
-  const existing = snapshot({
-    runId: 1, state: "success", stdout: "done", cwd: "/persisted/run-cwd",
-  });
-  const {elements} = await loadApp({
-    runs: [{runId: 1, state: "success", cwd: existing.cwd}],
-    details: {1: existing},
-    validation: {status: 200, body: {validation: []}},
-    fetchOverride(url) {
-      if (url === "/api/status") return response(existing);
-      return undefined;
-    },
-  });
-
-  await elements["new-run"].dispatch("click");
-
-  assert.equal(elements["working-directory"].value, "");
 });
 
 test("a run auto-selected via SSE while drafting captures in-progress edits first", async () => {
@@ -1662,7 +1816,6 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   });
 
   // No runs exist yet, so the fields hold an untouched draft nobody submitted.
-  elements["working-directory"].value = "/tmp/in-progress-draft";
   elements["run-arguments"].value = "in-progress-arg";
   elements.code.value = "print('in progress')";
 
@@ -1677,11 +1830,51 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   eventSource.emit("runner-change");
   await waitFor(() => selectedRun(elements) !== undefined);
 
-  assert.equal(elements["working-directory"].value, "/work/run-9");
-
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["working-directory"].value, "/tmp/in-progress-draft");
   assert.equal(elements["run-arguments"].value, "in-progress-arg");
   assert.equal(elements.code.value, "print('in progress')");
+});
+
+test("completed Workflow runs expose explicit Cleanup and retain their history", async () => {
+  const retained = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    resources: [{
+      kind: "purplemux_tab",
+      identity: "tab-1",
+      metadata: {workspace_id: "ws-1"},
+      cleanupState: "retained",
+      cleanupError: null,
+    }],
+  });
+  const cleaned = snapshot({
+    ...retained,
+    resources: [{...retained.resources[0], cleanupState: "cleaned"}],
+    resourceCleanupStatus: "cleaned",
+  });
+  const runs = [{runId: 1, state: "success", cwd: retained.cwd}];
+  const details = {1: retained};
+  const {calls, elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/runs/1/cleanup" && options.method === "POST") {
+        details[1] = cleaned;
+        return response(cleaned);
+      }
+      return undefined;
+    },
+  });
+
+  assert.equal(elements.cleanup.disabled, false);
+  assert.match(elements["resources-summary"].textContent, /retained/);
+  await elements.cleanup.dispatch("click");
+
+  assert.ok(calls.some(([url, method]) => url === "/api/runs/1/cleanup" && method === "POST"));
+  assert.equal(runs.length, 1);
+  assert.equal(elements.cleanup.disabled, true);
+  assert.match(elements["resources-summary"].textContent, /cleaned/);
 });
