@@ -180,23 +180,84 @@ Import the public names from `purplemux_client`:
 
 ```python
 from purplemux_client import (
+    AgentReadinessProbeResult,
+    BranchState,
     CreateSessionRequest,
     CreateWorkspaceRequest,
+    FeaturePreparationState,
+    FeatureRecoveryState,
+    GitHubRepository,
+    GitRepository,
+    IncompletePullRequestEnumeration,
+    MergeResult,
+    MutationConflict,
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
+    PullRequestState,
+    PullRequestTopologyError,
     ResultNotReady,
+    RepositoryExecutionContext,
+    RepositoryPreparation,
     ShellCommandRequest,
     ShellResult,
     SessionReadyTimeout,
     TerminalSessionError,
+    TabState,
     WorkerFailure,
     WorkerInterrupted,
     WorkerNeedsInput,
+    WorkspaceState,
+    WorktreeState,
     emit_step,
     emit_finding,
+    inspect_run_repository,
+    prepare_run_repository,
+    register_run_resource,
+    run_correlation,
 )
 ```
+
+These are the workflow-facing exports. `IssueDrivenConfig`,
+`IssueDrivenFinding`, `IssueDrivenValidationError`,
+`parse_issue_driven_json()`, and `generate_issue_driven_workflow()` are also
+public, but they author workflows before execution; generated workflows do not
+use them as runtime orchestration primitives. Names from package submodules that
+are absent from `purplemux_client.__all__` are private implementation details.
+There is no public checkpoint, `ResumeCheckpoint`, `save_checkpoint()`,
+`resume_checkpoint()`, or `resume_shell()` API.
+
+The request and returned-state shapes used by workflow code are:
+
+```python
+CreateWorkspaceRequest(cwd, name, correlation_id=None)
+CreateSessionRequest(worker, cwd, command, metadata={}, name=None,
+                     correlation_id=None)
+ShellCommandRequest(command, cwd, name, correlation_id=None)
+
+WorkspaceState(id, name, directories)
+TabState(id, workspace_id, name, panel_type, provider, alive=None,
+         cli_state=None)
+ShellResult(exit_code, diagnostic_output=None, diagnostic_error=None, cwd=None,
+            workspace_id=None, tab_id=None)
+BranchState(name, local_sha, remote_sha, current)
+WorktreeState(root, current_branch, dirty, status)
+FeaturePreparationState(branch, base, expected_base_sha, base_is_ancestor,
+                        action)
+FeatureRecoveryState(branch, reused_existing_work)
+PullRequestState(number, url, state, is_draft, head_repository, head_branch,
+                 head_sha, base_repository, base_branch, base_sha,
+                 merge_commit_sha, auto_merge_enabled, merge_queue_entry,
+                 node_id, body)
+MergeResult(pr, merge_commit_sha, reconciled=False)
+RepositoryPreparation(source_repository, remote, base_branch, base_ref, base_sha)
+RepositoryExecutionContext(source_repository, remote, base_branch, base_ref,
+                           base_sha, execution_root)
+```
+
+Treat returned state as immutable observations. Re-read authoritative state
+after another actor could have changed it; do not edit these values to represent
+a desired result.
 
 Construct a client for an existing workspace:
 
@@ -209,7 +270,7 @@ client = PurpleMuxCLIClient(
 )
 ```
 
-The public session operations are:
+The public session operations and their exact workflow-facing signatures are:
 
 ```python
 session_id = client.create_session(
@@ -231,6 +292,27 @@ diagnostic_text = client.capture_screen(session_id)
 client.close_session(session_id)
 ```
 
+In full, the less commonly used inspection/cleanup signatures are:
+
+```python
+tabs = client.list_sessions()
+probe = client.probe_agent_readiness(
+    provider="codex",
+    probe_name="preflight [awm:CORRELATION]",
+    correlation_id="CORRELATION",
+    preexisting_tab_ids=tuple(tab.id for tab in tabs),
+    timeout_seconds=60,
+    on_identified=None,  # Callable[[TabState], None] | None
+)
+client.close_session(session_id, expected_state=tab_state)
+```
+
+`probe_agent_readiness()` is a specialized create/inspect/close preflight. Its
+input tab IDs must be a complete current listing, its name must contain the
+correlation ID, and it returns `AgentReadinessProbeResult`. Prefer ordinary
+session creation in workflow bodies. Pass `expected_state` when explicitly
+closing an identified tab so cleanup fails on an identity mismatch.
+
 Shell operations are separate from agent turn operations:
 
 ```python
@@ -239,7 +321,8 @@ shell_tab = client.start_shell(
         command="uv run pytest tests/test_feature.py",
         cwd="/absolute/repo",
         name="Issue 123 run: focused tests",
-    )
+    ),
+    on_created=None,  # Callable[[tab_id, result_path], None] | None
 )
 emit_step(
     "focused tests",
@@ -269,6 +352,29 @@ emit_step(
     tab=shell_tab,
 )
 ```
+
+The exact lifecycle signatures are:
+
+```python
+shell_tab = client.start_shell(request, on_created=callback)
+client.wait_for_shell_completion(shell_tab, timeout_seconds=900)
+result = client.read_shell_result(shell_tab)
+```
+
+`start_shell()` first creates and authoritatively identifies the terminal, then
+registers its tab and managed-result directory when `owned_by_run=True`, records
+their in-process association, calls `on_created(tab_id, result_path)` if supplied,
+and only then sends the command wrapper. The callback is therefore the supported
+hook for a caller that must durably record both identities before command
+dispatch. It must return normally; if it raises, the identified tab and result
+path are deliberately retained. For normal Runner workflows, use
+`owned_by_run=True`: automatic resource registration already provides that
+durable cleanup inventory, so no callback is needed.
+
+The callback does not create a resumable shell handle. `read_shell_result()` and
+`wait_for_shell_completion()` require the same live client object's in-memory
+association. A terminated workflow must be recovered as a new run; there is no
+`resume_shell()` operation.
 
 The non-empty `name` is the PurpleMux UI label; include the logical run and task
 so an operator can find the tab. `cwd` is resolved and validated before the tab
@@ -307,6 +413,117 @@ Relevant errors all derive from `TerminalSessionError`:
 - `ResultNotReady`: no fresh structured result is ready.
 - `MutationOutcomeUnknown`: a mutation timed out and may have happened remotely.
 
+`MutationConflict` reports a quiescent but conflicting post-state.
+`PullRequestTopologyError` reports unsafe or ambiguous PR topology, and
+`IncompletePullRequestEnumeration` means a bounded GitHub listing could not
+prove it was exhaustive. These derive from `WorkerFailure`.
+
+## Repository and GitHub API
+
+Open pinned repository adapters with:
+
+```python
+repo = GitRepository.open(
+    path,
+    remote="origin",
+    expected_github_slug="OWNER/REPO",
+    command_timeout_seconds=30.0,
+)
+github = GitHubRepository.open(
+    "OWNER/REPO",
+    executable="gh",
+    command_timeout_seconds=30.0,
+    read_timeout_retries=1,
+    page_size=100,
+    max_pages=10,
+)
+```
+
+The supported Git inspection and assertion methods are:
+
+```python
+repo.inspect_worktree() -> WorktreeState
+repo.inspect_branch(branch) -> BranchState
+repo.inspect_feature_preparation(
+    branch, *, base, expected_base_sha=None
+) -> FeaturePreparationState
+repo.require_clean() -> None
+repo.require_current_branch(branch) -> BranchState
+repo.require_pushed(branch) -> BranchState
+repo.require_committed_result(
+    branch, *, previous_sha, allow_unchanged=False
+) -> BranchState
+repo.require_contains(branch, commit_sha) -> None
+```
+
+The inspection-aware Git operations that may mutate are:
+
+```python
+repo.ensure_pushed(branch, *, expected_local_sha) -> BranchState
+repo.synchronize_branch(branch) -> BranchState
+repo.prepare_feature_branch(
+    branch, *, base, expected_base_sha
+) -> BranchState
+repo.recover_feature_branch(
+    branch, *, base, expected_base_sha
+) -> FeatureRecoveryState
+repo.advance_after_merge(
+    branch, *, previous_sha, merge_commit_sha, required_commit_sha
+) -> BranchState
+```
+
+They validate repository identity, cleanliness, exact SHAs, ancestry, and
+fast-forward-only topology. They may return without mutation when the desired
+state already exists. They never reset, force-push, or hide divergence.
+
+The supported GitHub inspections and mutations are:
+
+```python
+github.find_pr(*, head, base, state) -> PullRequestState | None
+github.require_pr(
+    *, head, base, number=None, state="OPEN", expected_head_sha=None,
+    expected_base_sha=None, draft=None
+) -> PullRequestState
+github.create_draft_pr(
+    *, head, base, expected_head_sha, expected_base_sha, title, body,
+    correlation_id
+) -> PullRequestState
+github.set_draft(
+    pr, *, draft, expected_head, expected_head_sha, expected_base,
+    expected_base_sha
+) -> PullRequestState
+github.merge_pr(
+    pr, *, expected_head, expected_head_sha, expected_base, expected_base_sha,
+    method="merge"
+) -> MergeResult
+```
+
+`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
+the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
+state fail closed. `create_draft_pr()` embeds the required correlation marker.
+`merge_pr()` supports only an immediate merge commit and verifies its parents
+and the resulting base ref; it never queues, squashes, rebases, or enables
+auto-merge.
+
+The repository execution helpers are:
+
+```python
+inspect_run_repository(
+    *, repo, base_branch, remote="origin", command_timeout_seconds=30.0
+) -> RepositoryPreparation
+prepare_run_repository(
+    *, repo, base_branch, remote="origin", worktree_root=None,
+    command_timeout_seconds=30.0
+) -> RepositoryExecutionContext
+run_correlation(logical_name) -> str
+```
+
+`inspect_run_repository()` is read-only. `prepare_run_repository()` is an
+inspection-aware mutation that creates and registers an isolated worktree, or
+reconciles the exact correlated worktree if the mutation outcome was uncertain.
+`run_correlation()` is deterministic within one Runner run (and process-stable
+outside it); use it for logical resource names, never as a secret.
+
 ## Workspace creation
 
 Use the inspection-aware runtime adapter rather than a raw subprocess:
@@ -322,6 +539,19 @@ workspace = runtime.create_workspace(
 client = runtime.workspace(workspace.id)
 ```
 
+The exact workspace-level signatures are:
+
+```python
+runtime.list_workspaces() -> tuple[WorkspaceState, ...]
+runtime.create_workspace(request) -> WorkspaceState
+runtime.workspace(workspace_id) -> PurpleMuxCLIClient
+runtime.delete_workspace(workspace_id, *, expected_state) -> None
+```
+
+Explicit deletion is an identity-checked, empty-workspace-only cleanup primitive.
+Normal Workflow code must leave owned resources for the Runner's manual Cleanup
+action instead of calling it during success or failure handling.
+
 The adapter derives a stable correlation from the Runner's run identity and the
 logical `name`, captures a complete workspace listing, creates exactly once, and
 confirms any response ID against a new matching workspace in a second
@@ -334,17 +564,40 @@ No screen or tmux state participates in identity.
 
 ## Mutation and read semantics
 
-Mutations are workspace creation, `create_session`, `start_shell` (tab creation
-and one send), `send_input`, `interrupt`, and `close_session`. The adapter
-attempts each mutation once. If one times out, it raises
-`MutationOutcomeUnknown`: the remote side may have applied it. Do not catch that
-exception and immediately repeat the mutation. A shell-start failure after tab
-creation includes the tab ID in the error so it can be inspected. Preserve the
-workspace/session references and reconcile the remote state first.
+The following categories are normative:
 
-Read-only operations (`read_status`, result/status polling used by completion,
-and `capture_screen`) may retry command timeouts according to
-`read_timeout_retries`. This retry policy does not make mutations retryable.
+- **Read-only:** runtime/session listings; status, result, completion, and screen
+  reads; repository and PR `inspect_*`, `find_*`, and `require_*` operations;
+  `inspect_run_repository()`; and correlation/progress metadata. These may retry
+  read timeouts according to the adapter's `read_timeout_retries`.
+- **Inspection-aware, reconciliation-capable mutation:**
+  `prepare_run_repository()`; workspace/tab creation and identity-checked
+  deletion/close; `interrupt()`; every Git mutation listed above; and
+  `create_draft_pr()`, `set_draft()`, and `merge_pr()`. Each captures exact
+  preconditions, dispatches at most once, and inspects an authoritative
+  postcondition. It can return the confirmed desired result, report a proven
+  rejection/conflict, or raise `MutationOutcomeUnknown` if inspection still
+  cannot distinguish the outcome. Reconciliation is not a promise of success.
+- **Unknown-outcome mutation without a sufficient remote postcondition:**
+  `send_input()`. A successful synchronous response is accepted, but a timeout
+  cannot prove whether the prompt was delivered. Do not retry it. `start_shell()`
+  is compound: tab creation is correlated and reconcilable, while its command
+  send has the same unknown-outcome rule. An error after creation includes the
+  tab ID; retain it for inspection.
+
+All supported mutation helpers call the common Dry Run boundary immediately
+before each actual dispatch. Dry Run performs the same identity/topology reads
+and no-op checks as Run. If the desired state already exists, a higher-level
+helper may return normally and execution can reach a later boundary. If a
+mutation is required, Dry Run reports that exact planned operation and exits
+without dispatching it, running callbacks, or fabricating a result. Raw
+subprocess/CLI mutation calls are not inspection-aware and make Static
+Validation mark the workflow Dry-Run-ineligible.
+
+Never catch `MutationOutcomeUnknown` and immediately repeat the operation. A
+later run may invoke a high-level reconciliation-capable helper only after its
+ordinary authoritative preflight proves whether work remains. There is no such
+safe retry for an ambiguously delivered agent prompt or shell command.
 
 ## Turn completion and results
 
@@ -429,6 +682,38 @@ before reusing external work or making a new mutation. Keep mutation-once and
 from authoritative state and never retry it blindly. This recovery model does
 not add a graph, state machine, durable execution store, or automatic retry.
 
+Use these examples when reasoning about resumability, even if an external caller
+records its own phase label:
+
+- **Safe after completed side effects:** a committed clean agent result plus its
+  exact SHA, or a pushed branch plus an exact verified Draft PR, can be observed
+  by a new run. Re-enter through `recover_feature_branch()`, `ensure_pushed()`,
+  and `require_pr()`; do not replay the completed agent prompt.
+- **Unsafe before a non-idempotent mutation:** a label such as `send_pending` or
+  `merge_pending` says only that an operation may have happened. It is not a
+  resumable checkpoint. A merge can be reconciled from exact PR/base state; an
+  ambiguously delivered prompt cannot, so the run must fail for operator
+  inspection rather than send it again.
+- **Completed agent turn:** waiting is not enough. The workflow must read the
+  fresh structured result, validate the expected committed/clean Git
+  postcondition, and retain the exact resulting SHA in authoritative Git before
+  treating that work as recoverable. Screen text, a progress event, or a local
+  `turn_completed` flag cannot prove the result belongs to that prompt.
+- **Cleanup/close uncertainty:** never mark a resource cleaned merely because a
+  close was requested. Retain its identity until authoritative listing proves
+  absence. The Runner's Cleanup stops before dependent parents when that proof
+  is unavailable.
+- **Terminal state:** an already merged Issue PR, an already Ready final PR when
+  policy says not to merge it, or a final PR whose merged head is the exact
+  current integration head and is contained by the final branch is success to
+  inspect and return. A historical merged PR for an older integration head is
+  not terminal delivery. A recovery run must not re-run the approval/final-check
+  turns that produced a verified terminal state.
+
+Thus a durable phase marker is useful only when all earlier side effects have
+authoritative postconditions and re-entering from that phase performs inspection
+before any new mutation. A `*_pending` marker alone never satisfies that rule.
+
 ## Progress instrumentation
 
 Progress is optional observation, not control flow:
@@ -465,6 +750,25 @@ emit_step(
 Outside the Runner it is a no-op. Inside the Runner, encoded events over 4 KiB
 are dropped and only the latest 200 events are retained. Do not use events to
 drive the workflow, add statuses, or build decorators/state machines around it.
+
+Findings and advanced resource registration use:
+
+```python
+emit_finding(
+    category,                # "runtime", "git", or "github"
+    message,
+    *,
+    status="passed",        # "passed", "failed", or "info"
+)
+register_run_resource(kind, identity, metadata=None)
+```
+
+`emit_finding()` is observational like `emit_step()`. `register_run_resource()`
+accepts `purplemux_tab`, `managed_shell_result`, `purplemux_workspace`, or
+`git_worktree` plus string metadata. Runtime/worktree helpers register their own
+resources when run ownership is enabled; call this advanced hook only when a
+documented lifecycle requires it. Registration records an already identified
+resource and is not proof that its creating mutation succeeded.
 
 ## Inspect a running workflow agent
 
