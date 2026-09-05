@@ -45,13 +45,9 @@ from purplemux_client.issue_driven import (
 )
 from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
-    ResumeCheckpoint,
     emit_finding,
     emit_step,
     register_run_resource,
-    resume_checkpoint,
-    save_checkpoint,
-    suspend_run,
 )
 
 __all__ = [
@@ -76,7 +72,6 @@ __all__ = [
     "ResultNotReady",
     "RepositoryExecutionContext",
     "RepositoryPreparation",
-    "ResumeCheckpoint",
     "SessionReadyTimeout",
     "ShellCommandRequest",
     "ShellResult",
@@ -95,7 +90,4 @@ __all__ = [
     "prepare_run_repository",
     "register_run_resource",
     "run_correlation",
-    "resume_checkpoint",
-    "save_checkpoint",
-    "suspend_run",
 ]

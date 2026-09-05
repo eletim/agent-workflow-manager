@@ -10,7 +10,7 @@ That configurable CLI sample intentionally operates on its explicit repository
 path. For normal repository-modifying Workflow mode, use the isolated preparation
 pattern documented below.
 It is the primary adaptable reference for sequential Issue PRs, independent
-per-Issue review/fix loops, safe resume, and a final version PR. Its separate
+per-Issue review/fix loops, explicit new-run recovery, and a final version PR. Its separate
 whole-version review is mandatory because defects in shared state, lifecycle,
 security, and cross-feature behavior may appear only after approved changes are
 combined. The final PR becomes Ready only after that review approves it and is
@@ -166,7 +166,7 @@ The Runner snapshots the outline with the submitted run. A matching
 `emit_step()` name may update its display from pending to running, completed, or
 failed. Dynamic or unmatched progress remains visible in the Progress panel.
 The outline is observation metadata only: it must never drive sequencing,
-branching, retries, cleanup, Resume, or any other workflow decision. Keep all
+branching, retries, cleanup, or any other workflow decision. Keep all
 control flow in plain Python; do not encode graphs, dependencies, or conditions
 in the outline.
 
@@ -182,7 +182,6 @@ from purplemux_client import (
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
     ResultNotReady,
-    ResumeCheckpoint,
     ShellCommandRequest,
     ShellResult,
     SessionReadyTimeout,
@@ -192,9 +191,6 @@ from purplemux_client import (
     WorkerNeedsInput,
     emit_step,
     emit_finding,
-    resume_checkpoint,
-    save_checkpoint,
-    suspend_run,
 )
 ```
 
@@ -300,9 +296,9 @@ Relevant errors all derive from `TerminalSessionError`:
 - `SessionReadyTimeout`: the session did not become ready in time.
 - `WorkerFailure`: CLI failure, invalid state/result, turn timeout, or another
   worker failure.
-- `WorkerNeedsInput`: the agent needs additional input. Unlike hard worker
-  failure, this derives directly from `TerminalSessionError` so a workflow can
-  suspend for a human response explicitly.
+- `WorkerNeedsInput`: the agent needs additional input. This derives directly
+  from `TerminalSessionError`; the current run fails and retains diagnostics so
+  the operator can answer or inspect before starting a new run.
 - `WorkerInterrupted`: the current turn was interrupted.
 - `ResultNotReady`: no fresh structured result is ready.
 - `MutationOutcomeUnknown`: a mutation timed out and may have happened remotely.
@@ -413,67 +409,21 @@ remain uncertain until authoritative workspace listing reconciles them.
 Managed-shell directories are registered with their no-follow filesystem
 identity. Cleanup stops before dependent parent resources when an outcome is
 blocked. A workflow may use `capture_screen` for diagnostics, without parsing it
-as a result. Prompt mode does not use this Workflow resource model. Cleanup and
-Resume are mutually exclusive, and cleanup permanently disables Resume for that
-run.
+as a result. Prompt mode does not use this Workflow resource model. Cleanup is
+explicit and does not delete the historical run record.
 
-## Explicit checkpoints and manual recovery
+## Manual recovery through a new run
 
-The Runner resumes only a failed or suspended run that published a safe
-checkpoint. Checkpoints are execution metadata, not progress and not a workflow
-graph. Save one only after preceding side effects have completed:
+Checkpoint and in-place Resume are not supported Workflow APIs. Failed and
+stopped runs remain inspectable, including output and owned PurpleMux resources,
+but their terminated Python processes are not reconstructed.
 
-```python
-checkpoint = resume_checkpoint()
-if checkpoint is None:
-    workspace_id = create_workspace()
-    client = PurpleMuxCLIClient(workspace_id)
-    implementer = client.create_session(...)
-    save_checkpoint(
-        "sessions ready",
-        {"workspace": workspace_id, "implementer": implementer},
-    )
-else:
-    if checkpoint.name != "sessions ready":
-        raise WorkerFailure(f"unsupported checkpoint: {checkpoint.name}")
-    workspace_id = checkpoint.data["workspace"]
-    implementer = checkpoint.data["implementer"]
-    client = PurpleMuxCLIClient(workspace_id)
-    # Validate the retained tab/repository/manual repair before continuing.
-```
-
-The workflow must branch before any completed non-idempotent action, reuse
-checkpoint IDs, and validate assumptions that manual repair could change.
-It may leave a checkpoint active only when every operation from that point to
-the next checkpoint is safe/idempotent to re-enter after an arbitrary failure.
-Checkpoint values are exposed in the UI/API, so store only short non-secret
-strings. A checkpoint event over 4 KiB is rejected. On each Resume click the
-Runner re-runs preflight and the same saved script and arguments from the
-Runner-controlled directory under the same run ID. The retained repository
-execution context is supplied back to `prepare_run_repository()`, so it verifies
-and reuses the registered worktree rather than creating another. Output and
-terminal attempt history are appended. The Runner never edits
-or restores repository files, so manual changes are preserved unless the
-workflow itself overwrites them.
-
-For an agent question, save a safe checkpoint and convert the typed condition
-to a suspended run while leaving the PurpleMux tab open:
-
-```python
-try:
-    client.wait_for_turn_completion(implementer, TURN_TIMEOUT)
-except WorkerNeedsInput as exc:
-    save_checkpoint(
-        "implementer needs input",
-        {"workspace": workspace_id, "implementer": implementer},
-    )
-    suspend_run(str(exc))
-```
-
-If safe continuation cannot be represented this way, do not publish a
-checkpoint. The UI will explain that the run cannot be resumed, and the user
-must start a new workflow-specific recovery path. Resume state lasts only for
-the current Runner process; this is deliberately not a persistence framework.
+Start a new run to recover. Its ordinary Python code should inspect exact Git
+branches and commits, GitHub PR topology, and any relevant PurpleMux resources
+before reusing external work or making a new mutation. Keep mutation-once and
+`MutationOutcomeUnknown` protections: reconcile a possibly dispatched mutation
+from authoritative state and never retry it blindly. This recovery model does
+not add a graph, state machine, durable execution store, or automatic retry.
 
 ## Progress instrumentation
 
@@ -579,8 +529,7 @@ Do not:
 - let the UI decide the next step;
 - ask an implementer to self-review when an independent review is required;
 - run observable/parallel Bash work as an invisible local subprocess;
-- invent additional checkpoint/graph semantics or missing APIs beyond the
-  explicit `save_checkpoint()` / `resume_checkpoint()` contract.
+- invent a checkpoint, graph, state-machine, or durable-execution abstraction.
 
 ## Complete example: implement, review, fix, and ready a PR
 

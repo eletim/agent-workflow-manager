@@ -281,20 +281,16 @@ historical UI field.
 
 **Workflow** executes arbitrary Python with the current Python
 interpreter and shows stdout, stderr, exit code, and the
-idle/running/success/failed/suspended/stopped/validation_failed state. Validate
+idle/running/success/failed/stopped/validation_failed state. Validate
 performs side-effect-free, best-effort static checks, and Run performs the same
 preflight before creating a process. Stop and server shutdown clean up the
 script's POSIX process group, including child processes.
 
-Failed work can be continued explicitly when the plain Python workflow has
-published a replay-safe boundary with `save_checkpoint()`. The Runner keeps the
-latest non-secret string metadata and supplies it to the same script through
-`resume_checkpoint()` only after the operator selects **Continue after fix**.
-The workflow owns validation, branching, and reuse of PurpleMux workspace/tab
-IDs; runs without a proven checkpoint are not resumed. `suspend_run()` records
-a human-needs-input state separately from hard failure while preserving the
-same recovery path and diagnostic sessions. Resume history is retained with
-the run for the lifetime of the Runner process.
+Failed and stopped runs remain available for inspection, including their output
+and run-owned resources, but are never continued in place. Recovery starts a new
+run. Its ordinary Python logic must explicitly inspect and reuse authoritative
+Git, GitHub, or PurpleMux state where appropriate. The Runner does not expose a
+workflow checkpoint API or reconstruct terminated Python control flow.
 
 Runs are independent and may execute concurrently. The UI lists every run and
 lets the operator select its state, output, progress, execution context, Stop,
@@ -305,9 +301,8 @@ Workflow runtimes opt into ownership registration; direct/Prompt adapter use is
 registration-free by default. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
-`POST /api/runs/{runId}/resume` explicitly continues a failed/suspended run
-from its latest safe checkpoint. `POST /api/runs/{runId}/cleanup` releases
-registered resources without deleting run history. Workspace release requires
+`POST /api/runs/{runId}/cleanup` releases registered resources without deleting
+run history. Workspace release requires
 PurpleMux's public atomic `workspace delete -w ID --if-empty` CLI contract;
 startup rejects unsupported versions so canonical Cleanup cannot be stranded
 behind an incompatible runtime. The original

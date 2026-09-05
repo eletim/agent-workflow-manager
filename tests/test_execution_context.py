@@ -349,139 +349,6 @@ prepare_run_repository(
         runner.close()
 
 
-def test_resume_adopts_matching_pending_worktree_without_repeating_mutation(
-    tmp_path: Path,
-) -> None:
-    repository, original_sha = repository_with_remote(tmp_path)
-    worktree_root = tmp_path / "managed-worktrees"
-    code = f"""
-import purplemux_client.execution_context as execution_context
-from purplemux_client import prepare_run_repository, resume_checkpoint, save_checkpoint
-checkpoint = resume_checkpoint()
-if checkpoint is None:
-    save_checkpoint("before repository preparation")
-    def fail_identity(path):
-        raise RuntimeError("pre-verification failure")
-    execution_context._path_identity = fail_identity
-context = prepare_run_repository(
-    repo={str(repository)!r},
-    base_branch="main",
-    worktree_root={str(worktree_root)!r},
-)
-print(context.execution_root)
-"""
-    runner = PythonRunner()
-    try:
-        run_id = runner.start(code)
-        failed = wait_until_finished(runner)
-        assert failed.state == "failed"
-        assert failed.as_json()["resumable"] is True
-        assert failed.as_json()["executionContext"] is None
-        assert failed.resources[0].metadata["registration_state"] == "pending"
-        pending_root = failed.resources[0].identity
-
-        publisher = tmp_path / "publisher"
-        subprocess.run(
-            ["git", "clone", "-q", str(tmp_path / "remote.git"), str(publisher)],
-            check=True,
-        )
-        git(publisher, "config", "user.email", "test@example.com")
-        git(publisher, "config", "user.name", "Test")
-        git(publisher, "switch", "-q", "main")
-        (publisher / "tracked").write_text("advanced\n", encoding="utf-8")
-        git(publisher, "commit", "-qam", "advance while pending")
-        git(publisher, "push", "-q", "origin", "main")
-        assert git(publisher, "rev-parse", "HEAD") != original_sha
-
-        runner.resume(run_id)
-        resumed = wait_until_finished(runner)
-
-        assert resumed.state == "success"
-        assert len(resumed.resources) == 1
-        assert resumed.resources[0].identity == pending_root
-        assert resumed.resources[0].metadata["registration_state"] == "verified"
-        assert resumed.resources[0].metadata["base_sha"] == original_sha
-        worktrees = git(repository, "worktree", "list", "--porcelain").splitlines()
-        assert sum(line.startswith("worktree ") for line in worktrees) == 2
-        assert resumed.as_json()["executionContext"] == {
-            "sourceRepository": str(repository.resolve()),
-            "remote": "origin",
-            "baseBranch": "main",
-            "baseRef": "origin/main",
-            "baseSha": original_sha,
-            "executionRoot": pending_root,
-        }
-
-        cleaned = runner.cleanup(run_id)
-        assert all(
-            resource.cleanup_state == "cleaned" for resource in cleaned.resources
-        )
-        assert all(
-            not Path(resource.identity).exists() for resource in cleaned.resources
-        )
-    finally:
-        runner.close()
-
-
-def test_resume_retries_absent_pending_worktree_at_reserved_identity(
-    tmp_path: Path,
-) -> None:
-    repository, original_sha = repository_with_remote(tmp_path)
-    worktree_root = tmp_path / "managed-worktrees"
-    code = f"""
-import purplemux_client.execution_context as execution_context
-from purplemux_client import prepare_run_repository, resume_checkpoint, save_checkpoint
-checkpoint = resume_checkpoint()
-if checkpoint is None:
-    save_checkpoint("before repository preparation")
-    run_git = execution_context._run_git_mutation_process_group
-    def reject_first_add(args, *, cwd, timeout):
-        if args[0] == "worktree":
-            raise execution_context._QuiescentMutationTimeout(["git", *args], timeout)
-        return run_git(args, cwd=cwd, timeout=timeout)
-    execution_context._run_git_mutation_process_group = reject_first_add
-context = prepare_run_repository(
-    repo={str(repository)!r},
-    base_branch="main",
-    worktree_root={str(worktree_root)!r},
-)
-print(context.execution_root)
-"""
-    runner = PythonRunner()
-    try:
-        run_id = runner.start(code)
-        failed = wait_until_finished(runner)
-        assert failed.state == "failed"
-        assert len(failed.resources) == 1
-        reserved_root = failed.resources[0].identity
-        assert not Path(reserved_root).exists()
-
-        publisher = tmp_path / "publisher"
-        subprocess.run(
-            ["git", "clone", "-q", str(tmp_path / "remote.git"), str(publisher)],
-            check=True,
-        )
-        git(publisher, "config", "user.email", "test@example.com")
-        git(publisher, "config", "user.name", "Test")
-        git(publisher, "switch", "-q", "main")
-        (publisher / "tracked").write_text("advanced\n", encoding="utf-8")
-        git(publisher, "commit", "-qam", "advance before retry")
-        git(publisher, "push", "-q", "origin", "main")
-        assert git(publisher, "rev-parse", "HEAD") != original_sha
-
-        runner.resume(run_id)
-        resumed = wait_until_finished(runner)
-
-        assert resumed.state == "success"
-        assert len(resumed.resources) == 1
-        assert resumed.resources[0].identity == reserved_root
-        assert resumed.resources[0].metadata["registration_state"] == "verified"
-        assert resumed.resources[0].metadata["base_sha"] == original_sha
-        runner.cleanup(run_id)
-    finally:
-        runner.close()
-
-
 def test_cleanup_blocks_for_unregistered_partial_worktree_path(
     tmp_path: Path,
 ) -> None:
@@ -490,8 +357,7 @@ def test_cleanup_blocks_for_unregistered_partial_worktree_path(
     code = f"""
 from pathlib import Path
 import purplemux_client.execution_context as execution_context
-from purplemux_client import prepare_run_repository, save_checkpoint
-save_checkpoint("before repository preparation")
+from purplemux_client import prepare_run_repository
 run_git = execution_context._run_git_mutation_process_group
 def interrupt_worktree_add(args, *, cwd, timeout):
     if args[0] == "worktree":
@@ -518,12 +384,6 @@ prepare_run_repository(
             f"worktree {partial_path}"
             not in git(repository, "worktree", "list", "--porcelain").splitlines()
         )
-
-        runner.resume(run_id)
-        conflicted = wait_until_finished(runner)
-        assert conflicted.state == "failed"
-        assert "pending worktree reservation conflicts" in conflicted.stderr
-        assert len(conflicted.resources) == 1
 
         cleanup = runner.cleanup(run_id)
 
@@ -563,39 +423,3 @@ prepare_run_repository(
     assert not result.resources
     worktrees = git(repository, "worktree", "list", "--porcelain").splitlines()
     assert sum(line.startswith("worktree ") for line in worktrees) == 1
-
-
-def test_resume_reuses_the_run_owned_worktree(tmp_path: Path) -> None:
-    repository, _sha = repository_with_remote(tmp_path)
-    worktree_root = tmp_path / "managed-worktrees"
-    repaired = tmp_path / "repaired"
-    code = f"""
-from pathlib import Path
-from purplemux_client import prepare_run_repository, save_checkpoint
-context = prepare_run_repository(
-    repo={str(repository)!r},
-    base_branch="main",
-    worktree_root={str(worktree_root)!r},
-)
-save_checkpoint("repository prepared", {{"root": str(context.execution_root)}})
-if not Path({str(repaired)!r}).exists():
-    raise RuntimeError("repair required")
-"""
-    runner = PythonRunner()
-    try:
-        run_id = runner.start(code)
-        first = wait_until_finished(runner)
-        assert first.state == "failed"
-        assert len(first.resources) == 1
-        first_root = first.resources[0].identity
-
-        repaired.touch()
-        runner.resume(run_id)
-        resumed = wait_until_finished(runner)
-
-        assert resumed.state == "success"
-        assert len(resumed.resources) == 1
-        assert resumed.resources[0].identity == first_root
-        runner.cleanup(run_id)
-    finally:
-        runner.close()

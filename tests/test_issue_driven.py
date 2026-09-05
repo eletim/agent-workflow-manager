@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
-import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from purplemux_client import MutationOutcomeUnknown
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -120,32 +117,14 @@ def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() 
     assert 'name=f"Issue {issue.number} implementer"' in code
 
 
-@pytest.mark.parametrize("visible_pr", [False, True])
-def test_review_disabled_resume_never_retries_pending_pr_creation(
-    visible_pr: bool,
-) -> None:
-    code = generate_issue_driven_workflow(parse(payload(final_review=False)))
-    module = ModuleType("generated_issue_driven_test")
-    sys.modules[module.__name__] = module
-    try:
-        exec(compile(code, "<generated>", "exec"), module.__dict__)
-    finally:
-        sys.modules.pop(module.__name__, None)
+def test_generated_workflow_has_no_in_place_recovery_state() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
 
-    class UnexpectedGitHub:
-        called = False
-
-        def find_pr(self, **_kwargs: object) -> object | None:
-            self.called = True
-            return object() if visible_pr else None
-
-    recovery = SimpleNamespace(phase="integration_pr_create_pending")
-    github = UnexpectedGitHub()
-    with pytest.raises(MutationOutcomeUnknown):
-        module.integration_delivery_without_review(
-            object(), object(), object(), github, recovery
-        )
-    assert github.called is False
+    assert "save_checkpoint" not in code
+    assert "resume_checkpoint" not in code
+    assert "resume_shell" not in code
+    assert "_pending" not in code
+    assert "inspect_feature_preparation(" in code
 
 
 def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
@@ -154,8 +133,8 @@ def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
         parse(payload(merge_to_integration=False))
     )
 
-    assert merging.count("github.merge_pr(") == 1
-    assert ready_only.count("github.merge_pr(") == 0
+    assert "MERGE_TO_INTEGRATION = True" in merging
+    assert "MERGE_TO_INTEGRATION = False" in ready_only
     assert "Approved Issue #{issue.number} PR is Ready" in ready_only
 
 
@@ -163,23 +142,15 @@ def test_final_review_policy_selects_the_generated_control_flow() -> None:
     reviewed = generate_issue_driven_workflow(parse(payload(final_review=True)))
     skipped = generate_issue_driven_workflow(parse(payload(final_review=False)))
 
-    assert (
-        "ready = integration_review(config, runtime, repo, github, recovery)"
-        in reviewed
-    )
-    assert "def integration_review(" in reviewed
-    assert "def integration_review(" not in skipped
-    assert "review-disabled-policy" in skipped
-    assert "ready = integration_delivery_without_review(" in skipped
+    assert "FINAL_REVIEW = True" in reviewed
+    assert "FINAL_REVIEW = False" in skipped
+    assert "if FINAL_REVIEW:" in reviewed
 
 
 def test_merge_final_false_has_no_final_merge_path() -> None:
     ready_only = generate_issue_driven_workflow(parse(payload(merge_final=False)))
     merging = generate_issue_driven_workflow(parse(payload(merge_final=True)))
 
-    ready_main = ready_only[ready_only.index("def main() -> None:") :]
-    merging_main = merging[merging.index("def main() -> None:") :]
-    assert "github.merge_pr(" not in ready_main
-    assert "not merged" in ready_main
-    assert "github.merge_pr(" in merging_main
-    assert "Merged final integration PR" in merging_main
+    assert "MERGE_FINAL = False" in ready_only
+    assert "MERGE_FINAL = True" in merging
+    assert "if not MERGE_FINAL:" in ready_only

@@ -27,7 +27,6 @@ const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
 const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
-const resumeButton = document.querySelector("#resume");
 const validateButton = document.querySelector("#validate");
 const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
@@ -184,7 +183,6 @@ function applyModeVisibility() {
   workflowFields.hidden = promptMode || issueDrivenMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
-  resumeButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
   validationPanel.hidden = promptMode || validationPanel.hidden;
@@ -241,7 +239,6 @@ function renderRun(result) {
   );
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
-  resumeButton.disabled = activeRunId === null || !result.resumable;
   cleanupButton.disabled = activeRunId === null
     || !result.cleanupAvailable
     || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
@@ -303,7 +300,6 @@ async function enterDraftMode(mode = currentMode) {
   }
   showDraftLabel();
   stopButton.disabled = true;
-  resumeButton.disabled = true;
   cleanupButton.disabled = true;
   renderOutline([], []);
   applyFieldMode();
@@ -333,22 +329,12 @@ function renderResources(result) {
 
 function renderRecovery(result) {
   const attempts = result.attempts || [];
-  recoveryPanel.hidden = !["failed", "suspended"].includes(result.state)
-    && result.checkpoint == null && attempts.length < 2;
-  if (result.checkpoint) {
-    recoverySummary.textContent = `Safe checkpoint: ${result.checkpoint.name}. Manual fixes are preserved; the Python workflow decides how continuation validates and uses this checkpoint.`;
-  } else if (result.state === "failed") {
-    recoverySummary.textContent = "No safe checkpoint was published. This run cannot be resumed without risking replay of completed side effects.";
-  } else {
-    recoverySummary.textContent = result.suspensionReason || "";
-  }
-  if (result.suspensionReason) {
-    recoverySummary.textContent += ` Suspended: ${result.suspensionReason}`;
-  }
+  recoveryPanel.hidden = !["failed", "stopped"].includes(result.state);
+  recoverySummary.textContent = "Inspect this run and its retained resources, then start a new run to recover. The new workflow must verify authoritative Git, GitHub, and PurpleMux state before mutating it.";
   attemptHistory.replaceChildren();
   for (const attempt of attempts) {
     const item = document.createElement("li");
-    item.textContent = `Attempt ${attempt.number}: ${attempt.state} (exit ${attempt.exitCode})${attempt.resumedFrom ? `, resumed from ${attempt.resumedFrom}` : ""}`;
+    item.textContent = `Attempt ${attempt.number}: ${attempt.state} (exit ${attempt.exitCode})`;
     attemptHistory.append(item);
   }
 }
@@ -1141,35 +1127,6 @@ cleanupButton.addEventListener("click", async () => {
       targetRunId === activeRunId
       && selectionGeneration === activeRunGeneration
     ) stderr.textContent = String(error);
-  }
-});
-
-resumeButton.addEventListener("click", async () => {
-  if (activeRunId === null) return;
-  const targetRunId = activeRunId;
-  const selectionGeneration = ++activeRunGeneration;
-  const validationGeneration = ++validationRequestGeneration;
-  resumeButton.disabled = true;
-  try {
-    const result = await request(`/api/runs/${targetRunId}/resume`, {method: "POST"});
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) {
-      activeRunGeneration += 1;
-      renderRun(result);
-    }
-    await refresh();
-  } catch (error) {
-    if (Array.isArray(error.result?.validation)) {
-      if (validationGeneration === validationRequestGeneration) {
-        renderValidation(error.result.validation);
-      }
-    } else if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) stderr.textContent = String(error);
-    await refresh();
   }
 });
 

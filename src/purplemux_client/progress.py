@@ -5,7 +5,6 @@ import os
 import threading
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Literal
 
 StepStatus = Literal["started", "completed", "failed"]
@@ -20,19 +19,9 @@ RunResourceKind = Literal[
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESOURCE_ACK_FD_ENV = "PURPLEMUX_RUNNER_RESOURCE_ACK_FD"
-RESUME_CHECKPOINT_ENV = "PURPLEMUX_RUNNER_RESUME_CHECKPOINT"
 MAX_PROGRESS_EVENT_BYTES = 4096
-SUSPENDED_EXIT_CODE = 75
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
-
-
-@dataclass(frozen=True)
-class ResumeCheckpoint:
-    """A workflow-defined safe boundary supplied to an explicit resumed attempt."""
-
-    name: str
-    data: dict[str, str]
 
 
 def emit_step(
@@ -99,7 +88,7 @@ def register_run_resource(
     """Register an authoritatively identified resource with the current run.
 
     Registration is observational and does not mutate the resource. Outside the
-    Runner it is a no-op, like progress and checkpoint events.
+    Runner it is a no-op, like progress events.
     """
     if kind not in (
         "purplemux_tab",
@@ -207,65 +196,6 @@ def acknowledge_run_resource(
             ) from exc
         if acknowledgement != {"token": token, "accepted": True}:
             raise RuntimeError("Runner rejected resource ownership evidence")
-
-
-def save_checkpoint(name: str, data: Mapping[str, str] | None = None) -> None:
-    """Publish a safe resume boundary after its side effects are complete.
-
-    The workflow remains responsible for using :func:`resume_checkpoint` to skip
-    completed work and for validating any external state before continuing. The
-    continuation from this point must remain replay-safe until another checkpoint
-    replaces it.
-    """
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("checkpoint name must be a non-empty string")
-    checkpoint_data = dict(data or {})
-    if any(
-        not isinstance(key, str)
-        or not key
-        or not isinstance(value, str)
-        or "\0" in key
-        or "\0" in value
-        for key, value in checkpoint_data.items()
-    ):
-        raise TypeError(
-            "checkpoint data must contain non-empty string keys and string values"
-        )
-    _write_event({"type": "checkpoint", "name": name, "data": checkpoint_data})
-
-
-def resume_checkpoint() -> ResumeCheckpoint | None:
-    """Return the explicit checkpoint for this attempt, if it is a resume."""
-    value = os.environ.get(RESUME_CHECKPOINT_ENV)
-    if value is None:
-        return None
-    try:
-        payload = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Runner supplied an invalid resume checkpoint") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Runner supplied an invalid resume checkpoint")
-    name = payload.get("name")
-    data = payload.get("data")
-    if (
-        not isinstance(name, str)
-        or not name
-        or not isinstance(data, dict)
-        or any(
-            not isinstance(key, str) or not isinstance(item, str)
-            for key, item in data.items()
-        )
-    ):
-        raise RuntimeError("Runner supplied an invalid resume checkpoint")
-    return ResumeCheckpoint(name=name, data=dict(data))
-
-
-def suspend_run(reason: str) -> None:
-    """End this attempt as human-suspended while preserving its checkpoint."""
-    if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("suspension reason must be a non-empty string")
-    _write_event({"type": "suspended", "reason": reason})
-    raise SystemExit(SUSPENDED_EXIT_CODE)
 
 
 def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -> None:
