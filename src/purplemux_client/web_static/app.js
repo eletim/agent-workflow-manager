@@ -540,11 +540,20 @@ function renderProgress(events) {
     marker.textContent = {started: "▶", completed: "✓", failed: "✕"}[event.status];
 
     const details = document.createElement("div");
+    details.className = "progress-details";
     const label = document.createElement("div");
     label.className = "progress-label";
     const number = event.iteration ?? event.attempt;
     label.textContent = `${event.name}${number == null ? "" : ` #${number}`}`;
-    details.append(label);
+
+    const timestamp = document.createElement("time");
+    timestamp.className = "progress-time";
+    timestamp.textContent = runnerLogDisplay.formatObservedAt(event.observedAt);
+    if (typeof event.observedAt === "string") {
+      timestamp.setAttribute("datetime", event.observedAt);
+      timestamp.setAttribute("title", event.observedAt);
+    }
+    details.append(label, timestamp);
 
     const noteText = event.error || event.message;
     if (noteText) {

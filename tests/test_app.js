@@ -971,18 +971,21 @@ test("initial state loads through read APIs before any SSE event", async () => {
 });
 
 test("execution outline reflects matching progress and keeps dynamic progress", async () => {
+  const completedAt = "2026-09-05T01:02:03.123456+00:00";
+  const startedAt = "2026-09-05T01:03:04.123456+00:00";
+  const failedAt = "2026-09-05T01:04:05.123456+00:00";
   const current = snapshot({
     runId: 1,
     state: "running",
     stdout: "",
     outline: ["prepare", "implement", "review", "ready PR"],
     progress: [
-      {name: "prepare", status: "completed"},
-      {name: "implement", status: "started"},
-      {name: "dynamic check", status: "failed"},
+      {name: "prepare", status: "completed", observedAt: completedAt},
+      {name: "implement", status: "started", observedAt: startedAt},
+      {name: "dynamic check", status: "failed", observedAt: failedAt},
     ],
   });
-  const {elements} = await loadApp({
+  const {elements, logDisplay} = await loadApp({
     runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
     details: {1: current},
     validation: {status: 200, body: {validation: []}},
@@ -1002,6 +1005,20 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
   assert.deepEqual(
     elements.progress.children.map((item) => item.children[1].children[0].textContent),
     ["prepare", "implement", "dynamic check"],
+  );
+  assert.deepEqual(
+    elements.progress.children.map(
+      (item) => item.children[1].children[1].textContent,
+    ),
+    [completedAt, startedAt, failedAt].map(
+      (value) => logDisplay.formatObservedAt(value),
+    ),
+  );
+  assert.deepEqual(
+    elements.progress.children.map(
+      (item) => item.children[1].children[1].getAttribute("datetime"),
+    ),
+    [completedAt, startedAt, failedAt],
   );
 });
 
@@ -1161,11 +1178,17 @@ test("EventSource reconnect reconciles authoritative state", async () => {
 
 test("EventSource reconnect preserves authoritative historical timestamps", async () => {
   const observedAt = "2026-08-31T00:10:00.000000+00:00";
+  const progressObservedAt = "2026-08-31T00:09:30.123456+00:00";
   const run = snapshot({
     runId: 1,
     state: "running",
     stdout: "recorded earlier\n",
     stdoutEntries: [{observedAt, text: "recorded earlier\n"}],
+    progress: [{
+      name: "historical step",
+      status: "completed",
+      observedAt: progressObservedAt,
+    }],
   });
   const {calls, elements, eventSource, logDisplay} = await loadApp({
     runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
@@ -1173,6 +1196,8 @@ test("EventSource reconnect preserves authoritative historical timestamps", asyn
     validation: {status: 200, body: {validation: []}},
   });
   const renderedBeforeReconnect = elements.stdout.textContent;
+  const progressBeforeReconnect = elements.progress.children[0]
+    .children[1].children[1].textContent;
   const callsBeforeReconnect = calls.length;
 
   eventSource.emit("open");
@@ -1183,6 +1208,18 @@ test("EventSource reconnect preserves authoritative historical timestamps", asyn
     `${logDisplay.formatObservedAt(observedAt)}  recorded earlier\n`,
   );
   assert.equal(elements.stdout.textContent, renderedBeforeReconnect);
+  assert.equal(
+    progressBeforeReconnect,
+    logDisplay.formatObservedAt(progressObservedAt),
+  );
+  assert.equal(
+    elements.progress.children[0].children[1].children[1].textContent,
+    progressBeforeReconnect,
+  );
+  assert.equal(
+    elements.progress.children[0].children[1].children[1].getAttribute("datetime"),
+    progressObservedAt,
+  );
 });
 
 test("successful validation is explicit when no run exists", async () => {

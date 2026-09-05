@@ -835,12 +835,21 @@ wait_for("finish")
     changed = runner.wait_for_change(revision, timeout=2)
     assert changed is not None
     revision = changed
-    assert runner.snapshot(run_id).progress[-1].name == "observed"
+    progress_snapshot = runner.snapshot(run_id)
+    progress_event = progress_snapshot.progress[-1]
+    assert progress_event.name == "observed"
+    assert progress_event.observed_at is not None
+    assert datetime.fromisoformat(progress_event.observed_at).tzinfo is not None
+    serialized_progress = progress_snapshot.as_json()["progress"]
+    assert isinstance(serialized_progress, list)
+    assert serialized_progress[-1]["observedAt"] == progress_event.observed_at
 
     (tmp_path / "finish").touch()
     changed = runner.wait_for_change(revision, timeout=2)
     assert changed is not None
-    assert runner.snapshot(run_id).state == "success"
+    historical_snapshot = runner.snapshot(run_id)
+    assert historical_snapshot.state == "success"
+    assert historical_snapshot.progress[-1].observed_at == progress_event.observed_at
 
 
 def test_shell_failure_diagnostic_survives_real_progress_event_encoding(
@@ -881,6 +890,8 @@ if result.exit_code != 0:
     assert event.status == "failed"
     assert event.workspace == "ws-test"
     assert event.tab == "tab-test"
+    assert event.observed_at is not None
+    assert datetime.fromisoformat(event.observed_at).tzinfo is not None
     assert event.error is not None
     assert event.error.startswith(
         "sync and verify main failed (exit code 2)\n"
