@@ -317,6 +317,9 @@ tab. Stop uses the public PurpleMux interrupt/result lifecycle, closing the tab
 only if needed to reach a deterministic stopped state. If neither structured
 completion nor tab closure can be confirmed, AWM reports the uncertainty and
 keeps the run non-terminal so events remain accepted and Cleanup stays disabled.
+The primary workflow surface keeps Python and its execution controls visible;
+optional arguments are under **Advanced options**, while the explicit mutating
+agent-readiness probe is under **Diagnostics** near **Settings**.
 
 Failed and stopped runs remain available for inspection, including their output
 and run-owned resources, but are never continued in place. Recovery starts a new
