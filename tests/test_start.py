@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -185,6 +186,51 @@ def test_start_rejects_incompatible_upstream_purplemux_cli(tmp_path: Path) -> No
     assert "uv run python -m purplemux_client.web" not in call_log.read_text(
         encoding="utf-8"
     )
+
+
+def test_start_uses_supported_purplemux_already_selected_by_path(
+    tmp_path: Path,
+) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    supported_cli = tmp_path / "bin" / "purplemux"
+    original = supported_cli.read_text(encoding="utf-8")
+    supported_cli.write_text(
+        original.replace(
+            "if [[ ${1-} == help ]]; then",
+            "if [[ ${1-} == --version ]]; then\n    printf '%s\\n' 0.4.6\n"
+            "elif [[ ${1-} == help ]]; then",
+        ),
+        encoding="utf-8",
+    )
+    legacy_bin = Path(environment["HOME"]) / ".local" / "bin"
+    legacy_bin.mkdir(parents=True)
+    _executable(
+        legacy_bin / "purplemux",
+        """
+if [[ ${1-} == help ]]; then
+    printf '%s\n' 'purplemux CLI' 'workspaces' 'workspace create --cwd PATH'
+else
+    exit 2
+fi
+""",
+    )
+
+    selected_cli = shutil.which("purplemux", path=environment["PATH"])
+    version = subprocess.run(
+        [str(selected_cli), "--version"],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    completed = _run_start(environment)
+
+    assert selected_cli == str(supported_cli)
+    assert version.stdout.strip() == "0.4.6"
+    assert completed.returncode == 0
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls[1].startswith("uv run --no-sync python -c import json, sys;")
+    assert calls[2].startswith("uv run python -m purplemux_client.web")
 
 
 def test_start_reports_purplemux_help_cli_failure(tmp_path: Path) -> None:
