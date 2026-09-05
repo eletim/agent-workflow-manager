@@ -611,7 +611,7 @@ def test_ready_final_pr_repeats_review_and_checks(
     assert events == [
         "set_draft:True",
         "require_review_head",
-        "Whole-version review",
+        "Whole-version reviewer turn",
         "require_review_head",
         "final checks",
         "set_draft:False",
@@ -677,7 +677,7 @@ def test_unchanged_whole_version_fixer_still_runs_checks_before_ready(
     )
 
     assert result.is_draft is False
-    assert events.count("Whole-version review") == 1
+    assert events.count("Whole-version reviewer turn") == 1
     assert events.count("Whole-version fixes") == 1
     assert events.count("final checks") == 1
     assert events.index("Whole-version fixes") < events.index("final checks")
@@ -767,12 +767,13 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
 
     review_count = 0
     check_count = 0
+    outline_events: list[tuple[str, str]] = []
 
     def run_turn(*args: object, **kwargs: object) -> str:
         nonlocal review_count
         name = str(args[2])
         events.append(name)
-        if name == "Whole-version review":
+        if name == "Whole-version reviewer turn":
             review_count += 1
             return "APPROVED"
         if name == "Clean worktree":
@@ -795,6 +796,11 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
     monkeypatch.setitem(workflow_globals, "run_final_checks", final_checks)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_step",
+        lambda name, status, **kwargs: outline_events.append((name, status)),
+    )
 
     ready = workflow["integration_delivery"](
         config, object(), repository, GitHub()
@@ -803,8 +809,75 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     assert ready.is_draft is False
     assert review_count == 2
     assert check_count == 2
+    assert outline_events == [
+        ("Whole-version review", "started"),
+        ("Whole-version review", "completed"),
+        ("Final integration PR", "started"),
+        ("Final integration PR", "completed"),
+    ]
     assert f"push:{cleanup_sha}" in events
     assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
+
+
+def test_whole_version_outline_fails_when_final_checks_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["integration_delivery"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    draft = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    outline_events: list[tuple[str, str]] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.base_sha, draft.base_sha, False)
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return draft if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return draft
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            pytest.fail("failed review must not ready the final PR")
+
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(
+        workflow_globals, "run_turn", lambda *args, **kwargs: "APPROVED"
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (draft.head_sha, False),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "run_final_checks",
+        lambda *args: (_ for _ in ()).throw(WorkerFailure("checks failed")),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_step",
+        lambda name, status, **kwargs: outline_events.append((name, status)),
+    )
+
+    with pytest.raises(WorkerFailure, match="checks failed"):
+        workflow["integration_delivery"](config, object(), Repository(), GitHub())
+
+    assert outline_events == [
+        ("Whole-version review", "started"),
+        ("Whole-version review", "failed"),
+    ]
 
 
 def test_historical_merged_final_pr_cannot_complete_newer_delivery() -> None:

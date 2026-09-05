@@ -15,7 +15,7 @@ from purplemux_client.issue_driven import (
     generate_issue_driven_workflow,
     parse_issue_driven_json,
 )
-from purplemux_client.preflight import WorkflowValidator
+from purplemux_client.preflight import MAX_OUTLINE_ITEMS, WorkflowValidator
 
 
 def payload(**overrides: object) -> dict[str, object]:
@@ -43,6 +43,35 @@ def test_valid_json_preserves_issue_order() -> None:
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+
+
+@pytest.mark.parametrize(
+    ("final_review", "maximum"),
+    [(True, MAX_OUTLINE_ITEMS - 2), (False, MAX_OUTLINE_ITEMS - 1)],
+)
+def test_issue_count_reserves_final_outline_entries(
+    final_review: bool, maximum: int
+) -> None:
+    accepted = parse(
+        payload(issues=list(range(1, maximum + 1)), final_review=final_review)
+    )
+
+    assert len(accepted.issues) == maximum
+    result = WorkflowValidator(check_timeout=10).validate(
+        generate_issue_driven_workflow(accepted)
+    )
+    assert result.valid, result.issues
+    assert len(result.outline) == MAX_OUTLINE_ITEMS
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(issues=list(range(1, maximum + 2)), final_review=final_review))
+
+    expected_message = (
+        f"must contain at most {maximum} items when final_review is {final_review!r}"
+    )
+    assert ("$.issues", expected_message) in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
 
 
 @pytest.mark.parametrize("key", ["integration_branch", "final_branch"])
@@ -120,6 +149,69 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     ]
     assert positions == sorted(positions)
     assert "MAX_REVIEWS = 5" in first
+
+
+@pytest.mark.parametrize(
+    ("final_review", "expected"),
+    [
+        (
+            True,
+            (
+                "Issue #91",
+                "Issue #90",
+                "Issue #89",
+                "Whole-version review",
+                "Final integration PR",
+            ),
+        ),
+        (
+            False,
+            ("Issue #91", "Issue #90", "Issue #89", "Final integration PR"),
+        ),
+    ],
+)
+def test_generated_outline_uses_concrete_run_units(
+    final_review: bool, expected: tuple[str, ...]
+) -> None:
+    code = generate_issue_driven_workflow(
+        parse(payload(issues=[91, 90, 89], final_review=final_review))
+    )
+
+    result = WorkflowValidator(check_timeout=10).validate(code)
+
+    assert result.valid, result.issues
+    assert result.outline == expected
+    assert "Inspect authoritative Issue topology" not in code
+    assert "Prepare or reuse the feature branch" not in code
+    assert "Implement and independently review" not in code
+
+
+def test_generated_outline_step_reports_completed_skipped_issue_and_failures() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[114])))
+    module_name = "generated_issue_outline_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-issue-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    events: list[tuple[str, str]] = []
+    module.__dict__["emit_step"] = lambda name, status, **kwargs: events.append(
+        (name, status)
+    )
+
+    assert module.__dict__["run_outline_step"]("Issue #114", lambda: None) is None
+    with pytest.raises(RuntimeError, match="boom"):
+        module.__dict__["run_outline_step"](
+            "Final integration PR", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+    assert events == [
+        ("Issue #114", "started"),
+        ("Issue #114", "completed"),
+        ("Final integration PR", "started"),
+        ("Final integration PR", "failed"),
+    ]
 
 
 def test_generated_workflow_passes_supported_static_validation() -> None:
