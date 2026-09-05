@@ -35,10 +35,13 @@ class FakeRunner:
         outcomes: Sequence[
             subprocess.CompletedProcess[str] | subprocess.TimeoutExpired | OSError
         ],
+        *,
+        workspace_directories: Sequence[str] | None = ("/workspace/project",),
     ) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[list[str]] = []
         self.tabs: dict[str, dict[str, object]] = {}
+        self.workspace_directories = workspace_directories
 
     def __call__(
         self,
@@ -56,6 +59,20 @@ class FakeRunner:
         self.calls.append(command)
         if command[1:3] == ["tab", "list"]:
             return completed({"tabs": list(self.tabs.values())})
+        if command[1:] == ["workspaces"]:
+            if self.workspace_directories is None:
+                return completed({"workspaces": []})
+            return completed(
+                {
+                    "workspaces": [
+                        {
+                            "id": "ws-test",
+                            "name": "Test workspace",
+                            "directories": list(self.workspace_directories),
+                        }
+                    ]
+                }
+            )
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -136,7 +153,7 @@ def test_codex_project_is_trusted_before_tab_creation() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
 
     def trust(path: str) -> str:
-        assert runner.calls == []
+        assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
         events.append(path)
         return path
 
@@ -144,6 +161,7 @@ def test_codex_project_is_trusted_before_tab_creation() -> None:
     cli.create_session(request())
 
     assert events == ["/workspace/project"]
+    assert runner.calls[0][1:] == ["workspaces"]
 
 
 def test_codex_trust_failure_prevents_tab_creation() -> None:
@@ -155,23 +173,43 @@ def test_codex_trust_failure_prevents_tab_creation() -> None:
     with pytest.raises(WorkerFailure, match="trust unavailable"):
         client(runner, codex_project_truster=fail).create_session(request())
 
-    assert runner.calls == []
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
 def test_codex_trust_is_limited_to_an_exact_workspace_directory() -> None:
     runner = FakeRunner([])
     trusted: list[str] = []
     cli = client(
-        runner,
-        workspace_directories=("/workspace/selected",),
-        codex_project_truster=lambda path: trusted.append(path) or path,
+        runner, codex_project_truster=lambda path: trusted.append(path) or path
+    )
+
+    unrelated = CreateSessionRequest(
+        worker="codex", cwd="/workspace/unrelated", command="codex"
     )
 
     with pytest.raises(WorkerFailure, match="not an exact directory"):
-        cli.create_session(request())
+        cli.create_session(unrelated)
 
     assert trusted == []
-    assert runner.calls == []
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_direct_client_requires_selected_workspace_to_exist() -> None:
+    runner = FakeRunner([], workspace_directories=None)
+
+    with pytest.raises(WorkerFailure, match="was not found before Codex project trust"):
+        client(runner).create_session(request())
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_direct_client_rejects_workspace_without_directories() -> None:
+    runner = FakeRunner([], workspace_directories=())
+
+    with pytest.raises(WorkerFailure, match="has no directory"):
+        client(runner).create_session(request())
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
 def test_claude_session_does_not_change_codex_trust() -> None:
@@ -1398,7 +1436,9 @@ def test_mutation_timeout_is_not_retried(operation: str) -> None:
         else:
             cli.close_session("tab-1")
 
-    mutation_calls = [call for call in runner.calls if call[2] == operation]
+    mutation_calls = [
+        call for call in runner.calls if len(call) > 2 and call[2] == operation
+    ]
     assert len(mutation_calls) == 1
 
 

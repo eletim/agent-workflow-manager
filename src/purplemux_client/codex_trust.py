@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import queue
+import stat
 import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any, cast
 
@@ -32,6 +36,11 @@ def ensure_codex_project_trust(
         raise WorkerFailure(f"Codex project trust path is not a directory: {canonical}")
 
     deadline = time.monotonic() + timeout_seconds
+    with _trust_mutation_lock(deadline):
+        return _write_and_verify_trust(canonical, executable, deadline)
+
+
+def _write_and_verify_trust(canonical: Path, executable: str, deadline: float) -> str:
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
         try:
             process = subprocess.Popen(
@@ -127,6 +136,48 @@ def ensure_codex_project_trust(
             _stop(process, deadline)
             if "reader" in locals():
                 reader.join(timeout=1.0)
+
+
+@contextmanager
+def _trust_mutation_lock(deadline: float) -> Iterator[None]:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    descriptor: int | None = None
+    try:
+        codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = codex_home / ".agent-workflow-manager-project-trust.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
+            os.close(descriptor)
+            raise WorkerFailure("Codex project trust lock is not a safe user file")
+        os.fchmod(descriptor, 0o600)
+    except WorkerFailure:
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise WorkerFailure(f"could not open Codex project trust lock: {exc}") from exc
+
+    assert descriptor is not None
+    try:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise WorkerFailure(
+                        "Codex project trust configuration timed out waiting for lock"
+                    )
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _send(stream: IO[str], message: Mapping[str, Any]) -> None:

@@ -232,9 +232,9 @@ the workflow explicitly closes it, which lets failed commands remain available
 for inspection.
 
 ```python
-from purplemux_client import CreateSessionRequest, PurpleMuxCLIClient
+from purplemux_client import CreateSessionRequest, PurpleMuxRuntime
 
-client = PurpleMuxCLIClient("ws-example")
+client = PurpleMuxRuntime().workspace("ws-example")
 session_id = client.create_session(
     CreateSessionRequest(worker="codex", cwd="/workspace/project", command="codex")
 )
@@ -592,4 +592,13 @@ waits for a fresh structured result, verifies it, and closes the session:
 
 ```bash
 make live-smoke ARGS="lifecycle --workspace ws-example --cwd /workspace/project"
+```
+
+The opt-in Codex trust integration test creates a fresh linked worktree and
+PurpleMux workspace, proves the first real Codex turn completes without an
+interactive trust prompt, then repeats the launch for the already-trusted path:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_TRUST=1 \
+  uv run pytest tests/test_live_codex_trust.py
 ```

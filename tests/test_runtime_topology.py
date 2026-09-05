@@ -166,7 +166,10 @@ def request() -> CreateSessionRequest:
 
 def topology_client(runner: RuntimeRunner) -> PurpleMuxCLIClient:
     return PurpleMuxCLIClient(
-        "ws-test", runner=runner, codex_project_truster=lambda path: path
+        "ws-test",
+        runner=runner,
+        workspace_directories=("/repo",),
+        codex_project_truster=lambda path: path,
     )
 
 
