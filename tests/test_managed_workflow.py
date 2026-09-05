@@ -40,6 +40,8 @@ class _ManagedClient:
         self.start_error: BaseException | None = None
         self.wait_error: BaseException | None = None
         self.close_error: BaseException | None = None
+        self.read_errors: list[BaseException] = []
+        self.read_calls = 0
 
     def start_shell(self, request, *, on_created=None):  # type: ignore[no-untyped-def]
         self.request = request
@@ -72,6 +74,9 @@ class _ManagedClient:
 
     def read_shell_result(self, session_id: str) -> ShellResult:
         assert session_id == "tab-workflow"
+        self.read_calls += 1
+        if self.read_errors:
+            raise self.read_errors.pop(0)
         return ShellResult(self.exit_code)
 
     def interrupt(self, session_id: str) -> None:
@@ -214,6 +219,31 @@ def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) 
         stopped = _wait_for_state(runner, "stopped")
         assert client.interrupted is True
         assert stopped.exit_code == 130
+    finally:
+        runner.close()
+
+
+def test_transient_result_error_is_retried_without_stop(tmp_path: Path) -> None:
+    client = _ManagedClient()
+    client.read_errors.append(WorkerFailure("transient result read failure"))
+    client.release.set()
+    runtime = _ManagedRuntime(client)
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        runtime_factory=lambda: runtime,  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    try:
+        run_id = runner.start("print('completed')")
+
+        finished = _wait_for_state(runner, "success")
+
+        assert finished.run_id == run_id
+        assert finished.exit_code == 0
+        assert finished.attempts[0].state == "success"
+        assert client.read_calls == 2
+        assert "result observation is uncertain" in finished.stderr
+        assert client.interrupted is False
     finally:
         runner.close()
 

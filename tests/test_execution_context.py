@@ -349,7 +349,18 @@ prepare_run_repository(
                         text=True,
                         check=False,
                     )
-                    if observed.returncode == 0 and observed.stdout.strip() == _sha:
+                    status = subprocess.run(
+                        ["git", "-C", str(worktree), "status", "--porcelain"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if (
+                        observed.returncode == 0
+                        and observed.stdout.strip() == _sha
+                        and status.returncode == 0
+                        and not status.stdout
+                    ):
                         break
             time.sleep(0.02)
         else:

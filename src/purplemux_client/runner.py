@@ -63,6 +63,8 @@ ResourceCleanupStatus = Literal[
     "retained", "cleaning", "partially_cleaned", "cleaned", "blocked"
 ]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
+_MANAGED_OBSERVATION_RETRY_INITIAL_SECONDS = 0.25
+_MANAGED_OBSERVATION_RETRY_MAX_SECONDS = 5.0
 logger = logging.getLogger(__name__)
 _SHELL_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -2071,17 +2073,39 @@ class PythonRunner:
         client = run.managed_client
         tab_id = run.managed_tab_id
         assert client is not None and tab_id is not None
+        last_diagnostic: str | None = None
+        retry_delay = _MANAGED_OBSERVATION_RETRY_INITIAL_SECONDS
         try:
-            client.wait_for_shell_completion(tab_id, 365 * 24 * 60 * 60)
-            result = client.read_shell_result(tab_id)
-            diagnostic = (
-                result.failure_message("Workflow") if result.exit_code != 0 else None
-            )
-            self._finish_managed_workflow(run, result.exit_code, diagnostic=diagnostic)
-        except Exception as exc:
-            self._record_managed_uncertainty(
-                run, f"Workflow result observation is uncertain: {exc}"
-            )
+            while True:
+                with self._lock:
+                    if run.state != "running" or self._closed:
+                        return
+                try:
+                    client.wait_for_shell_completion(tab_id, 365 * 24 * 60 * 60)
+                    result = client.read_shell_result(tab_id)
+                except Exception as exc:
+                    diagnostic = f"Workflow result observation is uncertain: {exc}"
+                    if diagnostic != last_diagnostic:
+                        self._record_managed_uncertainty(run, diagnostic)
+                        last_diagnostic = diagnostic
+                    with self._changes:
+                        self._changes.wait_for(
+                            lambda: run.state != "running" or self._closed,
+                            timeout=retry_delay,
+                        )
+                    retry_delay = min(
+                        retry_delay * 2, _MANAGED_OBSERVATION_RETRY_MAX_SECONDS
+                    )
+                    continue
+                diagnostic = (
+                    result.failure_message("Workflow")
+                    if result.exit_code != 0
+                    else None
+                )
+                self._finish_managed_workflow(
+                    run, result.exit_code, diagnostic=diagnostic
+                )
+                return
         finally:
             with self._lock:
                 self._wait_threads.discard(threading.current_thread())
