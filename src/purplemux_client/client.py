@@ -195,7 +195,7 @@ class PurpleMuxRuntime:
         read_timeout_retries: int = 1,
         runner: SubprocessRunner = subprocess.run,
         owned_by_run: bool = False,
-        workspace_deleter: Callable[[str], None] | None = None,
+        workspace_deleter: Callable[[str], bool | None] | None = None,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
@@ -335,7 +335,9 @@ class PurpleMuxRuntime:
             return all(item.id != workspace_id for item in self.list_workspaces())
 
         def dispatch() -> None:
-            self._workspace_deleter(workspace_id)
+            authoritative_absence = self._workspace_deleter(workspace_id)
+            if authoritative_absence is True:
+                return
             try:
                 deleted = desired()
             except WorkerFailure as exc:
@@ -367,7 +369,7 @@ class PurpleMuxRuntime:
             plan={"kind": "delete_workspace", "workspace": workspace_id},
         )
 
-    def _delete_empty_workspace(self, workspace_id: str) -> None:
+    def _delete_empty_workspace(self, workspace_id: str) -> bool:
         """Use PurpleMux's public, atomic empty-workspace deletion contract."""
         try:
             completed = self._runner(
@@ -400,35 +402,27 @@ class PurpleMuxRuntime:
             raise PossibleDispatchFailure(
                 "PurpleMux empty workspace deletion was interrupted"
             ) from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
-            try:
-                rejection = json.loads(completed.stdout)
-            except (json.JSONDecodeError, TypeError):
-                rejection = None
-            if (
-                isinstance(rejection, dict)
-                and rejection.get("status") == "not-empty"
-                and rejection.get("workspaceId") == workspace_id
-            ):
+        try:
+            response = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            response = None
+        if isinstance(response, dict) and response.get("workspaceId") == workspace_id:
+            status = response.get("status")
+            if status in ("deleted", "already-absent"):
+                return True
+            if status == "not-empty":
                 raise AuthoritativeMutationRejection(
                     "PurpleMux atomically refused non-empty workspace deletion"
                 )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
             raise PossibleDispatchFailure(
                 "PurpleMux empty workspace deletion failed with exit code "
                 f"{completed.returncode}: {detail}"
             )
-        try:
-            response = _parse_json_object(completed.stdout, "delete empty workspace")
-        except WorkerFailure as exc:
-            raise PossibleDispatchFailure(str(exc)) from exc
-        if (
-            response.get("status") != "deleted"
-            or response.get("workspaceId") != workspace_id
-        ):
-            raise PossibleDispatchFailure(
-                "PurpleMux empty workspace deletion returned an invalid response"
-            )
+        raise PossibleDispatchFailure(
+            "PurpleMux empty workspace deletion returned an invalid response"
+        )
 
     def workspace(self, workspace_id: str) -> PurpleMuxCLIClient:
         if workspace_id not in {item.id for item in self.list_workspaces()}:

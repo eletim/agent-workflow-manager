@@ -371,6 +371,50 @@ def test_managed_shell_result_cleanup_removes_only_expected_temp_directory(
     assert not directory.exists()
 
 
+def test_managed_shell_result_cleanup_removes_wrapper_owned_pending_sidecar(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    (directory / "result.json.pending").write_text('{"exitCode":0}', encoding="utf-8")
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    runner._cleanup_resource(resource)
+
+    assert not directory.exists()
+
+
+def test_managed_shell_result_cleanup_rejects_non_regular_pending_sidecar(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    pending = directory / "result.json.pending"
+    pending.mkdir()
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    with pytest.raises(OSError, match="not a regular file"):
+        runner._cleanup_resource(resource)
+
+    assert pending.is_dir()
+
+
 @pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
 def test_managed_shell_result_cleanup_rejects_replaced_directory_without_unlinking(
     runner: PythonRunner, tmp_path: Path, replacement_kind: str

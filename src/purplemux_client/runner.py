@@ -1304,20 +1304,21 @@ class PythonRunner:
                     "managed shell result directory identity changed; refusing cleanup"
                 )
             entries = os.listdir(descriptor)
-            if any(name != "result.json" for name in entries):
+            owned_entries = ("result.json", "result.json.pending")
+            if any(name not in owned_entries for name in entries):
                 raise OSError(
                     "managed shell result directory contains unexpected files"
                 )
-            if "result.json" in entries:
-                result_state = os.stat(
-                    "result.json", dir_fd=descriptor, follow_symlinks=False
-                )
+            for entry in owned_entries:
+                if entry not in entries:
+                    continue
+                result_state = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
                 if not stat.S_ISREG(result_state.st_mode):
                     raise OSError(
                         "managed shell result entry is not a regular file; "
                         "refusing cleanup"
                     )
-                os.unlink("result.json", dir_fd=descriptor)
+                os.unlink(entry, dir_fd=descriptor)
             current = os.stat(directory, follow_symlinks=False)
             current_identity = f"{current.st_dev}:{current.st_ino}"
             if (

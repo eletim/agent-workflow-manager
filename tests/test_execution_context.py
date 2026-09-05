@@ -188,6 +188,38 @@ prepare_run_repository(repo="source", base_branch="main")
     assert repository == workflow_cwd / "source"
 
 
+def test_static_validation_resolves_remote_base_without_cached_tracking_ref(
+    tmp_path: Path,
+) -> None:
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "update-ref", "-d", "refs/remotes/origin/main")
+    source = f"""
+from purplemux_client import prepare_run_repository
+WORKFLOW_DRY_RUN = 1
+prepare_run_repository(repo={str(repository)!r}, base_branch="main")
+"""
+
+    result = WorkflowValidator().validate(source)
+
+    assert result.valid
+    assert git(repository, "ls-remote", "origin", "refs/heads/main").startswith(sha)
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/main",
+            ],
+            check=False,
+        ).returncode
+        == 1
+    )
+
+
 def test_dry_run_reports_worktree_plan_without_creating_it(tmp_path: Path) -> None:
     repository, sha = repository_with_remote(tmp_path)
     worktree_root = tmp_path / "managed-worktrees"

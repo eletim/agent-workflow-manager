@@ -83,6 +83,19 @@ class RuntimeRunner:
                 )
             if self.mode == "workspace-delete-generic-nonzero":
                 return self.failed("server failure")
+            if self.mode in {
+                "workspace-delete-already-absent",
+                "workspace-delete-already-absent-nonzero",
+            }:
+                self.workspaces.pop(workspace_id, None)
+                return subprocess.CompletedProcess(
+                    [],
+                    0 if self.mode == "workspace-delete-already-absent" else 1,
+                    json.dumps(
+                        {"status": "already-absent", "workspaceId": workspace_id}
+                    ),
+                    "",
+                )
             if self.workspaces.pop(workspace_id, None) is None:
                 return self.failed("workspace not found")
             if self.mode == "workspace-delete-timeout-after-apply":
@@ -551,6 +564,30 @@ def test_workspace_delete_uses_public_atomic_empty_workspace_cli_contract(
         ]
     ]
     assert runtime.list_workspaces() == ()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["workspace-delete-already-absent", "workspace-delete-already-absent-nonzero"],
+)
+def test_workspace_delete_accepts_authoritative_already_absent_outcome(
+    tmp_path: Path, mode: str
+) -> None:
+    runner = RuntimeRunner(mode)
+    runner.workspaces["ws-owned"] = {
+        "id": "ws-owned",
+        "name": "Owned",
+        "directories": [str(tmp_path)],
+    }
+    runtime = PurpleMuxRuntime(runner=runner)
+
+    runtime.delete_workspace(
+        "ws-owned",
+        expected_state=WorkspaceState("ws-owned", "Owned", (str(tmp_path),)),
+    )
+
+    assert "ws-owned" not in runner.workspaces
+    assert len([call for call in runner.calls if call[1:] == ["workspaces"]]) == 1
 
 
 def test_workspace_delete_atomically_refuses_tab_created_after_preinspection(

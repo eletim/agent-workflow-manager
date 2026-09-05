@@ -85,14 +85,14 @@ def _inspect_repository_declaration(
     command_timeout_seconds: float = 30.0,
     cwd: Path | None = None,
 ) -> RepositoryPreparation:
-    """Validate static declarations without contacting an arbitrary remote."""
+    """Validate static declarations with an authoritative read-only remote lookup."""
 
     return _inspect_run_repository(
         repo=repo,
         base_branch=base_branch,
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
-        live_remote=False,
+        live_remote=True,
         resolution_base=cwd,
     )
 
