@@ -85,9 +85,14 @@ for `GitRepository.prepare_feature_branch(..., expected_base_sha=context.base_sh
 This keeps branch preparation inside the isolated worktree even when the source
 checkout already has the configured base branch checked out. If the logical
 feature branch is also checked out in another worktree, the topology layer uses
-a unique `awm-run/...` local branch. Always push the isolated checkout explicitly
-with `git push origin HEAD:refs/heads/<logical-feature-branch>`; topology and PR
-checks continue to use the logical remote branch name.
+a unique `awm-run/...` local branch. Record the prepared SHA before an agent
+turn, then require the CodingAgent's new commit and clean worktree with
+`require_committed_result()`. Use `ensure_pushed()` to complete delivery through
+the logical remote branch name. It creates an absent branch or fast-forwards a
+behind branch only; remote-ahead and divergence fail closed. The Workflow must
+then create or reuse and verify the exact Draft PR before starting review. Push
+and PR creation may be agent conveniences, but are not CodingAgent hard
+postconditions.
 
 The workflow subprocess itself runs from a stable Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put
@@ -560,10 +565,11 @@ Do not:
 
 ## Complete example: implement, review, fix, and ready a PR
 
-This example prepares an isolated worktree, creates a workspace and separate Codex sessions, asks the
-implementer to create a Draft PR, performs at most four independent reviews,
-routes actionable findings back to the implementer, and marks the PR ready after
-approval. All owned resources remain available until explicit Cleanup.
+This lower-level example focuses on agent turn orchestration. Production
+repository workflows should combine it with the commit/clean and delivery gates
+above; the canonical `examples/sequential-version-development.py` shows safe
+push and exact Draft-PR gap absorption. All owned resources remain available
+until explicit Cleanup.
 
 ```python
 from __future__ import annotations

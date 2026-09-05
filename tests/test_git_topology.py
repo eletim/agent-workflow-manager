@@ -140,6 +140,83 @@ def test_safe_synchronize_prepare_and_read_only_require_pushed(
     )
 
 
+def test_committed_result_and_delivery_push_absent_or_behind_remote(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    repo.prepare_feature_branch("feature/delivery", base="main", expected_base_sha=base)
+
+    git(work, "commit", "--allow-empty", "-m", "first result")
+    first = git(work, "rev-parse", "HEAD")
+    committed = repo.require_committed_result("feature/delivery", previous_sha=base)
+    assert committed.local_sha == first
+    assert committed.remote_sha is None
+    assert (
+        repo.ensure_pushed("feature/delivery", expected_local_sha=first).remote_sha
+        == first
+    )
+
+    git(work, "commit", "--allow-empty", "-m", "fix result")
+    second = git(work, "rev-parse", "HEAD")
+    repo.require_committed_result("feature/delivery", previous_sha=first)
+    delivered = repo.ensure_pushed("feature/delivery", expected_local_sha=second)
+
+    assert delivered.local_sha == second
+    assert delivered.remote_sha == second
+    assert (
+        git(work, "ls-remote", "origin", "refs/heads/feature/delivery").split()[0]
+        == second
+    )
+
+
+def test_committed_result_requires_new_commit_and_clean_worktree(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    repo.prepare_feature_branch(
+        "feature/postcondition", base="main", expected_base_sha=base
+    )
+
+    with pytest.raises(WorkerFailure, match="no new commit"):
+        repo.require_committed_result("feature/postcondition", previous_sha=base)
+    unchanged = repo.require_committed_result(
+        "feature/postcondition", previous_sha=base, allow_unchanged=True
+    )
+    assert unchanged.local_sha == base
+
+    (work / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(WorkerFailure, match="clean"):
+        repo.require_committed_result(
+            "feature/postcondition", previous_sha=base, allow_unchanged=True
+        )
+
+
+@pytest.mark.parametrize("remote_relationship", ["ahead", "diverged"])
+def test_delivery_refuses_remote_ahead_or_diverged(
+    repositories: tuple[Path, Path, Path], remote_relationship: str
+) -> None:
+    _remote, seed, work = repositories
+    branch = "feature/unsafe-delivery"
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "push", "-u", "origin", branch)
+
+    git(seed, "switch", "-c", branch)
+    git(seed, "commit", "--allow-empty", "-m", "remote result")
+    git(seed, "push", "origin", branch)
+    if remote_relationship == "diverged":
+        git(work, "commit", "--allow-empty", "-m", "local result")
+    local_sha = git(work, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkerFailure, match=remote_relationship):
+        repo.ensure_pushed(branch, expected_local_sha=local_sha)
+
+
 def test_prepare_feature_from_detached_exact_base_without_switching_source(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:

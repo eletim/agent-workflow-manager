@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Lower-level direct plain-Python sequential version-development workflow.
 
-AWM owns structural Git/GitHub/runtime safety. Agents own edits, project checks,
-commits, and pushes. Dry Run executes this program to its first mutation. This
+AWM owns structural Git/GitHub/runtime safety and delivery gap absorption.
+Agents own edits, project checks, commits, and a clean worktree. Dry Run executes
+this program to its first mutation. This
 configurable CLI example intentionally uses the direct repository path; normal
 repository-modifying Workflow mode should use ``prepare_run_repository()``.
 """
@@ -86,6 +87,8 @@ class Recovery:
     reviews_used: int = 0
     approved_sha: str | None = None
     approved_base_sha: str | None = None
+    review_outcome: str | None = None
+    agent_turn_start_sha: str | None = None
     turn_sha: str | None = None
     turn_base_sha: str | None = None
     prepared_base_sha: str | None = None
@@ -106,6 +109,8 @@ class Recovery:
             "reviewer": self.reviewer,
             "approved_sha": self.approved_sha,
             "approved_base_sha": self.approved_base_sha,
+            "review_outcome": self.review_outcome,
+            "agent_turn_start_sha": self.agent_turn_start_sha,
             "turn_sha": self.turn_sha,
             "turn_base_sha": self.turn_base_sha,
             "prepared_base_sha": self.prepared_base_sha,
@@ -168,6 +173,8 @@ def load_recovery(config: Config, checkpoint: ResumeCheckpoint | None) -> Recove
             reviews_used=int(data.get("reviews_used", "0")),
             approved_sha=data.get("approved_sha"),
             approved_base_sha=data.get("approved_base_sha"),
+            review_outcome=data.get("review_outcome"),
+            agent_turn_start_sha=data.get("agent_turn_start_sha"),
             turn_sha=data.get("turn_sha"),
             turn_base_sha=data.get("turn_base_sha"),
             prepared_base_sha=data.get("prepared_base_sha"),
@@ -180,6 +187,7 @@ def load_recovery(config: Config, checkpoint: ResumeCheckpoint | None) -> Recove
     if (
         checkpoint.name != recovery.phase
         or not 0 <= recovery.reviews_used <= MAX_REVIEWS
+        or recovery.review_outcome not in {None, "approved", "no-change-policy"}
     ):
         raise WorkerFailure("checkpoint phase or review count is invalid")
     return recovery
@@ -336,6 +344,7 @@ def reopen_if_topology_drifted(
     ):
         return False
     recovery.approved_sha = recovery.approved_base_sha = None
+    recovery.review_outcome = None
     recovery.turn_sha = recovery.turn_base_sha = None
     recovery.phase = phase
     recovery.checkpoint(config)
@@ -345,8 +354,12 @@ def reopen_if_topology_drifted(
 def require_reviewed_topology(
     github: GitHubRepository, pr: PullRequestState, recovery: Recovery
 ) -> PullRequestState:
-    if recovery.approved_sha is None or recovery.approved_base_sha is None:
-        raise WorkerFailure("approval checkpoint lacks reviewed head/base SHAs")
+    if (
+        recovery.approved_sha is None
+        or recovery.approved_base_sha is None
+        or recovery.review_outcome not in {"approved", "no-change-policy"}
+    ):
+        raise WorkerFailure("review checkpoint lacks an accepted exact topology")
     return github.require_pr(
         number=pr.number,
         head=pr.head_branch,
@@ -357,26 +370,100 @@ def require_reviewed_topology(
     )
 
 
-def require_issue_pr(
+def ensure_issue_pr(
     repo: GitRepository,
     github: GitHubRepository,
     issue: Issue,
     config: Config,
+    recovery: Recovery,
     number: int | None = None,
 ) -> PullRequestState:
-    feature = repo.require_pushed(issue.branch)
+    local = repo.require_current_branch(issue.branch)
+    if local.local_sha is None:
+        raise WorkerFailure(f"local branch {issue.branch!r} does not exist")
+    feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
     assert feature.remote_sha is not None
+    pr = github.find_pr(head=issue.branch, base=config.integration_branch, state="OPEN")
+    if pr is None:
+        if recovery.prepared_base_sha is None:
+            raise WorkerFailure("prepared Issue checkpoint lacks its base SHA")
+        recovery.phase = "issue_pr_create_pending"
+        recovery.correlation_id = f"issue-{issue.number}-pr-{config.signature}"
+        recovery.checkpoint(config)
+        pr = github.create_draft_pr(
+            head=issue.branch,
+            base=config.integration_branch,
+            expected_head_sha=feature.remote_sha,
+            expected_base_sha=recovery.prepared_base_sha,
+            title=f"Issue #{issue.number}",
+            body=f"Sequential implementation of Issue #{issue.number}.",
+            correlation_id=recovery.correlation_id,
+        )
+    accepted_ready = (
+        not pr.is_draft
+        and recovery.review_outcome in {"approved", "no-change-policy"}
+        and recovery.approved_sha == feature.remote_sha
+        and recovery.approved_base_sha == recovery.prepared_base_sha
+    )
     pr = github.require_pr(
-        number=number,
+        number=number if number is not None else pr.number,
         head=issue.branch,
         base=config.integration_branch,
         state="OPEN",
         expected_head_sha=feature.remote_sha,
+        expected_base_sha=recovery.prepared_base_sha,
+        draft=False if accepted_ready else True,
     )
+    recovery.phase = "issue_delivery_done"
+    recovery.checkpoint(config)
     emit_finding(
         "git", f"{issue.branch} pushed at {feature.remote_sha}; base {pr.base_sha}"
     )
     return pr
+
+
+def require_agent_result(
+    repo: GitRepository,
+    client: PurpleMuxCLIClient,
+    tab: str,
+    issue: Issue,
+    recovery: Recovery,
+    config: Config,
+    *,
+    allow_unchanged: bool,
+    pending_phase: str,
+    completed_phase: str,
+    iteration: int | None = None,
+) -> tuple[str, bool]:
+    if recovery.agent_turn_start_sha is None:
+        raise WorkerFailure("agent turn checkpoint lacks its starting commit")
+    repo.require_current_branch(issue.branch)
+    if repo.inspect_worktree().dirty:
+        run_turn(
+            client,
+            tab,
+            f"Issue #{issue.number} postcondition recovery",
+            f"""The worktree for {issue.branch} is dirty. Commit every intended
+change from your completed turn and leave the working tree clean. Do not reset,
+stash, clean, discard, push, create a PR, merge, or start another review.""",
+            recovery,
+            config,
+            pending_phase,
+            completed_phase,
+            iteration=iteration,
+        )
+    result = repo.require_committed_result(
+        issue.branch,
+        previous_sha=recovery.agent_turn_start_sha,
+        allow_unchanged=allow_unchanged,
+    )
+    assert result.local_sha is not None
+    changed = result.local_sha != recovery.agent_turn_start_sha
+    emit_finding(
+        "git",
+        f"{issue.branch} is clean at committed result {result.local_sha}",
+    )
+    return result.local_sha, changed
 
 
 def run_final_checks(
@@ -439,6 +526,7 @@ def run_final_checks(
             raise WorkerFailure(failure)
         recovery.phase = "integration_checks_complete"
         recovery.checkpoint(config)
+
 
 def prepare_issue(
     repo: GitRepository,
@@ -504,8 +592,9 @@ def prepare_issue(
 def issue_prompts(issue: Issue, config: Config) -> tuple[str, str]:
     implementation = f"""Implement Issue #{issue.number} in {config.slug} on the existing
 branch {issue.branch}, based on {config.integration_branch}. Read the Issue with gh.
-Edit, test, commit, and push. Create exactly one Draft PR to
-{config.integration_branch}. Never reset, force-push, merge, or target
+Edit, test, and commit the result. Leave the working tree clean. You may push and
+create one Draft PR to {config.integration_branch}, but the Workflow will safely
+complete either omitted delivery step. Never reset, force-push, merge, or target
 {config.main_branch}. Return a concise summary."""
     review = f"""Independently review Issue #{issue.number} and its PR from
 {issue.branch} to {config.integration_branch}. Do not mutate files or PR state.
@@ -547,6 +636,8 @@ def process_issue(
         recovery.implementer = recovery.reviewer = None
         recovery.reviews_used = 0
         recovery.approved_sha = recovery.approved_base_sha = None
+        recovery.review_outcome = None
+        recovery.agent_turn_start_sha = None
         recovery.checkpoint(config)
     if recovery.implementer is None:
         inspect_issue_pr_topology(github, issue, config)
@@ -575,6 +666,11 @@ def process_issue(
     assert recovery.implementer and recovery.reviewer
     implementation_prompt, review_prompt = issue_prompts(issue, config)
     if recovery.phase in {"issue_implementer_ready", "issue_sessions_ready"}:
+        start = repo.require_current_branch(issue.branch)
+        if start.local_sha is None:
+            raise WorkerFailure(f"local branch {issue.branch!r} does not exist")
+        recovery.agent_turn_start_sha = start.local_sha
+        recovery.checkpoint(config)
         run_turn(
             client,
             recovery.implementer,
@@ -585,15 +681,77 @@ def process_issue(
             "issue_implementation_turn_pending",
             "issue_implementation_done",
         )
-    pr = require_issue_pr(
-        repo, github, issue, config, existing.number if existing else None
+    if recovery.phase in {
+        "issue_implementation_done",
+        "issue_implementation_postcondition_done",
+    }:
+        implementation_sha, _ = require_agent_result(
+            repo,
+            client,
+            recovery.implementer,
+            issue,
+            recovery,
+            config,
+            allow_unchanged=False,
+            pending_phase="issue_implementation_postcondition_turn_pending",
+            completed_phase="issue_implementation_postcondition_done",
+        )
+        recovery.phase = "issue_implementation_verified"
+        recovery.checkpoint(config)
+    else:
+        implementation = repo.require_current_branch(issue.branch)
+        if implementation.local_sha is None:
+            raise WorkerFailure(f"local branch {issue.branch!r} does not exist")
+        implementation_sha = implementation.local_sha
+
+    if recovery.phase in {"issue_fix_done", "issue_fix_postcondition_done"}:
+        fix_sha, changed = require_agent_result(
+            repo,
+            client,
+            recovery.implementer,
+            issue,
+            recovery,
+            config,
+            allow_unchanged=True,
+            pending_phase="issue_fix_postcondition_turn_pending",
+            completed_phase="issue_fix_postcondition_done",
+            iteration=recovery.reviews_used,
+        )
+        if not changed:
+            if recovery.turn_sha is None or recovery.turn_base_sha is None:
+                raise WorkerFailure("no-change continuation lacks reviewed topology")
+            warning = (
+                "WARN: reviewer requested changes, but implementer re-evaluated "
+                "the finding and produced no code changes. Continuing by workflow "
+                "policy."
+            )
+            print(warning, flush=True)
+            emit_finding("git", warning, status="info")
+            recovery.approved_sha = recovery.turn_sha
+            recovery.approved_base_sha = recovery.turn_base_sha
+            recovery.review_outcome = "no-change-policy"
+            recovery.phase = "issue_no_change_policy"
+        else:
+            implementation_sha = fix_sha
+            recovery.phase = "issue_fix_verified"
+        recovery.checkpoint(config)
+    pr = ensure_issue_pr(
+        repo,
+        github,
+        issue,
+        config,
+        recovery,
+        existing.number if existing else None,
     )
-    approved = recovery.phase == "issue_approved" and not reopen_if_topology_drifted(
-        pr, recovery, "issue_fix_done", config
-    )
+    if pr.head_sha != implementation_sha:
+        raise WorkerFailure("delivered PR head does not match the committed result")
+    approved = recovery.review_outcome in {
+        "approved",
+        "no-change-policy",
+    } and not reopen_if_topology_drifted(pr, recovery, "issue_delivery_done", config)
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
-        pr = require_issue_pr(repo, github, issue, config, pr.number)
+        pr = ensure_issue_pr(repo, github, issue, config, recovery, pr.number)
         recovery.turn_sha, recovery.turn_base_sha = pr.head_sha, pr.base_sha
         result = run_turn(
             client,
@@ -620,25 +778,62 @@ def process_issue(
                 current.head_sha,
                 current.base_sha,
             )
+            recovery.review_outcome = "approved"
             recovery.phase = "issue_approved"
             recovery.checkpoint(config)
             approved = True
             break
         if review_number == MAX_REVIEWS:
             break
+        recovery.agent_turn_start_sha = current.head_sha
+        recovery.reviews_used = review_number
+        recovery.checkpoint(config)
         run_turn(
             client,
             recovery.implementer,
             f"Issue #{issue.number} fixes",
-            f"Fix all findings, test, commit, and push.\n\n{result}",
+            f"""Re-evaluate every finding below. If changes are warranted, fix,
+test, commit, and leave the working tree clean. Push is optional because the
+Workflow completes delivery. If no change is warranted, leave the tree clean
+and explain why; do not create an empty commit.\n\n{result}""",
             recovery,
             config,
             "issue_fix_turn_pending",
             "issue_fix_done",
             iteration=review_number,
         )
-        recovery.reviews_used = review_number
+        fix_sha, changed = require_agent_result(
+            repo,
+            client,
+            recovery.implementer,
+            issue,
+            recovery,
+            config,
+            allow_unchanged=True,
+            pending_phase="issue_fix_postcondition_turn_pending",
+            completed_phase="issue_fix_postcondition_done",
+            iteration=review_number,
+        )
         recovery.approved_sha = recovery.approved_base_sha = None
+        recovery.review_outcome = None
+        if not changed:
+            warning = (
+                "WARN: reviewer requested changes, but implementer re-evaluated "
+                "the finding and produced no code changes. Continuing by workflow "
+                "policy."
+            )
+            print(warning, flush=True)
+            emit_finding("git", warning, status="info")
+            recovery.approved_sha = current.head_sha
+            recovery.approved_base_sha = current.base_sha
+            recovery.review_outcome = "no-change-policy"
+            recovery.phase = "issue_no_change_policy"
+            recovery.checkpoint(config)
+            approved = True
+            break
+        if fix_sha == current.head_sha:
+            raise WorkerFailure("fix commit did not advance the PR head")
+        recovery.phase = "issue_fix_verified"
         recovery.checkpoint(config)
     if not approved:
         raise WorkerFailure(f"Issue #{issue.number} ended without approval")
@@ -652,6 +847,8 @@ def process_issue(
             expected_base=config.integration_branch,
             expected_base_sha=recovery.approved_base_sha or "",
         )
+        recovery.phase = "issue_ready"
+        recovery.checkpoint(config)
     merged = github.merge_pr(
         pr.number,
         expected_head=issue.branch,
@@ -698,6 +895,56 @@ def integration_review(
             "inspect its saved identity and do not retry"
         )
     pr = inspect_integration_pr_topology(github, config, recovery)
+    if recovery.phase in {
+        "integration_fix_done",
+        "integration_fix_postcondition_done",
+    }:
+        if pr is None or recovery.implementer is None:
+            raise WorkerFailure("integration fix recovery lacks PR or fixer identity")
+        if recovery.agent_turn_start_sha is None:
+            raise WorkerFailure("integration fix lacks its starting commit")
+        client = ensure_workspace(runtime, config, recovery)
+        repo.require_current_branch(config.integration_branch)
+        if repo.inspect_worktree().dirty:
+            run_turn(
+                client,
+                recovery.implementer,
+                "Whole-version postcondition recovery",
+                f"""The worktree for {config.integration_branch} is dirty. Commit
+every intended change and leave the working tree clean. Do not reset, stash,
+clean, discard, push, change PR state, merge, or start another review.""",
+                recovery,
+                config,
+                "integration_fix_postcondition_turn_pending",
+                "integration_fix_postcondition_done",
+                iteration=recovery.reviews_used,
+            )
+        result = repo.require_committed_result(
+            config.integration_branch,
+            previous_sha=recovery.agent_turn_start_sha,
+            allow_unchanged=True,
+        )
+        assert result.local_sha is not None
+        if result.local_sha == recovery.agent_turn_start_sha:
+            warning = (
+                "WARN: reviewer requested changes, but implementer re-evaluated "
+                "the finding and produced no code changes. Continuing by workflow "
+                "policy."
+            )
+            print(warning, flush=True)
+            emit_finding("git", warning, status="info")
+            recovery.approved_sha = pr.head_sha
+            recovery.approved_base_sha = pr.base_sha
+            recovery.review_outcome = "no-change-policy"
+            recovery.phase = "integration_no_change_policy"
+        else:
+            repo.ensure_pushed(
+                config.integration_branch, expected_local_sha=result.local_sha
+            )
+            recovery.approved_sha = recovery.approved_base_sha = None
+            recovery.review_outcome = None
+            recovery.phase = "integration_fix_verified"
+        recovery.checkpoint(config)
     integration = repo.synchronize_branch(config.integration_branch)
     main = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or main.remote_sha is None:
@@ -763,11 +1010,11 @@ def integration_review(
             )
         approved = True
     else:
-        approved = (
-            recovery.phase == "integration_approved"
-            and not reopen_if_topology_drifted(
-                pr, recovery, "integration_fix_done", config
-            )
+        approved = recovery.review_outcome in {
+            "approved",
+            "no-change-policy",
+        } and not reopen_if_topology_drifted(
+            pr, recovery, "integration_fix_verified", config
         )
     while not approved and recovery.reviews_used < MAX_REVIEWS:
         review_number = recovery.reviews_used + 1
@@ -802,27 +1049,72 @@ def integration_review(
         if decision(result) == "APPROVED":
             recovery.reviews_used = review_number
             recovery.approved_sha, recovery.approved_base_sha = pr.head_sha, pr.base_sha
+            recovery.review_outcome = "approved"
             recovery.phase = "integration_approved"
             recovery.checkpoint(config)
             approved = True
             break
         if review_number == MAX_REVIEWS:
             break
+        recovery.agent_turn_start_sha = pr.head_sha
+        recovery.reviews_used = review_number
+        recovery.checkpoint(config)
         run_turn(
             client,
             recovery.implementer,
             "Whole-version fixes",
-            f"Fix findings, test, commit, and push.\n\n{result}",
+            f"""Re-evaluate every finding. If changes are warranted, fix, test,
+commit, and leave the working tree clean; push is optional. If no change is
+warranted, leave the tree clean and explain why without an empty commit.\n\n{result}""",
             recovery,
             config,
             "integration_fix_turn_pending",
             "integration_fix_done",
             iteration=review_number,
         )
-        integration = repo.require_pushed(config.integration_branch)
-        assert integration.remote_sha is not None
-        recovery.reviews_used = review_number
+        repo.require_current_branch(config.integration_branch)
+        if repo.inspect_worktree().dirty:
+            run_turn(
+                client,
+                recovery.implementer,
+                "Whole-version postcondition recovery",
+                f"""The worktree for {config.integration_branch} is dirty. Commit
+every intended change and leave the working tree clean. Do not reset, stash,
+clean, discard, push, change PR state, merge, or start another review.""",
+                recovery,
+                config,
+                "integration_fix_postcondition_turn_pending",
+                "integration_fix_postcondition_done",
+                iteration=review_number,
+            )
+        fixed = repo.require_committed_result(
+            config.integration_branch,
+            previous_sha=recovery.agent_turn_start_sha,
+            allow_unchanged=True,
+        )
+        assert fixed.local_sha is not None
         recovery.approved_sha = recovery.approved_base_sha = None
+        recovery.review_outcome = None
+        if fixed.local_sha == recovery.agent_turn_start_sha:
+            warning = (
+                "WARN: reviewer requested changes, but implementer re-evaluated "
+                "the finding and produced no code changes. Continuing by workflow "
+                "policy."
+            )
+            print(warning, flush=True)
+            emit_finding("git", warning, status="info")
+            recovery.approved_sha = pr.head_sha
+            recovery.approved_base_sha = pr.base_sha
+            recovery.review_outcome = "no-change-policy"
+            recovery.phase = "integration_no_change_policy"
+            recovery.checkpoint(config)
+            approved = True
+            break
+        integration = repo.ensure_pushed(
+            config.integration_branch, expected_local_sha=fixed.local_sha
+        )
+        assert integration.remote_sha is not None
+        recovery.phase = "integration_fix_verified"
         recovery.checkpoint(config)
     if not approved:
         raise WorkerFailure("whole-version review ended without approval")
