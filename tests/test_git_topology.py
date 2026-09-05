@@ -307,6 +307,95 @@ def test_prepare_feature_uses_run_private_branch_when_logical_branch_is_occupied
     assert pushed.local_sha == pushed.remote_sha
 
 
+def test_recover_feature_finds_local_commit_in_retained_run_worktree(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    branch = "feature/local-recovery"
+    git(work, "switch", "-c", branch)
+    retained = tmp_path / "retained-run"
+    git(work, "worktree", "add", "--detach", str(retained), base_sha)
+    retained_repo = open_repo(retained, RecordingGitRunner())
+    retained_repo.prepare_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    assert git(retained, "branch", "--show-current").startswith("awm-run/")
+    git(retained, "commit", "--allow-empty", "-m", "implementation")
+    implementation_sha = git(retained, "rev-parse", "HEAD")
+
+    new_run = tmp_path / "new-run"
+    git(work, "worktree", "add", "--detach", str(new_run), base_sha)
+    new_repo = open_repo(new_run, RecordingGitRunner())
+    recovered = new_repo.recover_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    unchanged = new_repo.require_committed_result(
+        branch,
+        previous_sha=implementation_sha,
+        allow_unchanged=recovered.reused_existing_work,
+    )
+
+    assert recovered.reused_existing_work
+    assert recovered.branch.current
+    assert recovered.branch.local_sha == implementation_sha
+    assert recovered.branch.remote_sha is None
+    assert unchanged.local_sha == implementation_sha
+    assert git(retained, "rev-parse", "HEAD") == implementation_sha
+
+
+def test_recover_feature_reuses_pushed_commit_without_pull_request(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    branch = "feature/pushed-recovery"
+    git(work, "switch", "-c", branch)
+    git(work, "commit", "--allow-empty", "-m", "implementation")
+    implementation_sha = git(work, "rev-parse", "HEAD")
+    git(work, "push", "origin", branch)
+
+    new_run = tmp_path / "new-run"
+    git(work, "worktree", "add", "--detach", str(new_run), base_sha)
+    new_repo = open_repo(new_run, RecordingGitRunner())
+    recovered = new_repo.recover_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    unchanged = new_repo.require_committed_result(
+        branch,
+        previous_sha=implementation_sha,
+        allow_unchanged=recovered.reused_existing_work,
+    )
+
+    assert recovered.reused_existing_work
+    assert recovered.branch.current
+    assert recovered.branch.local_sha == implementation_sha
+    assert recovered.branch.remote_sha == implementation_sha
+    assert unchanged.local_sha == implementation_sha
+
+
+def test_recover_feature_rejects_unreconciled_prior_run_commit(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, seed, work = repositories
+    old_base = git(work, "rev-parse", "HEAD")
+    branch = "feature/stale-recovery"
+    git(work, "switch", "-c", branch)
+    git(work, "commit", "--allow-empty", "-m", "old implementation")
+    git(seed, "commit", "--allow-empty", "-m", "advanced base")
+    git(seed, "push", "origin", "main")
+    new_base = git(seed, "rev-parse", "HEAD")
+    assert old_base != new_base
+    git(work, "fetch", "origin", "main")
+
+    new_run = tmp_path / "new-run"
+    git(work, "worktree", "add", "--detach", str(new_run), new_base)
+    with pytest.raises(WorkerFailure, match="do not contain authoritative base"):
+        open_repo(new_run, RecordingGitRunner()).recover_feature_branch(
+            branch, base="main", expected_base_sha=new_base
+        )
+
+
 def test_synchronize_fast_forwards_but_rejects_ahead_and_dirty(
     repositories: tuple[Path, Path, Path],
 ) -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import stat
@@ -25,8 +24,6 @@ from purplemux_client.operations import (
 from purplemux_client.progress import acknowledge_run_resource, emit_finding
 
 DEFAULT_WORKTREE_ROOT = Path("~/.local/share/agent-workflow-manager/worktrees")
-REPOSITORY_CONTEXT_ENV = "PURPLEMUX_RUNNER_REPOSITORY_CONTEXT"
-PENDING_REPOSITORY_CONTEXT_ENV = "PURPLEMUX_RUNNER_PENDING_REPOSITORY_CONTEXT"
 _OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 
 
@@ -51,12 +48,6 @@ class RepositoryPreparation:
     base_branch: str
     base_ref: str
     base_sha: str
-
-
-@dataclass(frozen=True)
-class _PendingRepositoryPreparation:
-    preparation: RepositoryPreparation
-    execution_root: Path
 
 
 def inspect_run_repository(
@@ -201,41 +192,18 @@ def prepare_run_repository(
     Dry Run stops at the worktree-add mutation through the shared mutation protocol.
     """
 
-    resumed = _resume_context(
-        repo=repo,
-        base_branch=base_branch,
-        remote=remote,
-        command_timeout_seconds=command_timeout_seconds,
-    )
-    if resumed is not None:
-        return resumed
-
     if worktree_root is not None and not isinstance(worktree_root, (str, os.PathLike)):
         raise TypeError("worktree_root must be a path or None")
     root_value = DEFAULT_WORKTREE_ROOT if worktree_root is None else worktree_root
     root = Path(root_value).expanduser().resolve()
-    pending = _resume_pending_preparation(
+    preparation = inspect_run_repository(
         repo=repo,
         base_branch=base_branch,
         remote=remote,
-        worktree_root=root,
         command_timeout_seconds=command_timeout_seconds,
     )
-    if isinstance(pending, RepositoryExecutionContext):
-        return pending
-    reserved_retry = pending is not None
-    if pending is None:
-        preparation = inspect_run_repository(
-            repo=repo,
-            base_branch=base_branch,
-            remote=remote,
-            command_timeout_seconds=command_timeout_seconds,
-        )
-        repository_name = _safe_name(preparation.source_repository.name)
-        execution_root = root / (f"awm-run-{repository_name}-{uuid.uuid4().hex[:12]}")
-    else:
-        preparation = pending.preparation
-        execution_root = pending.execution_root
+    repository_name = _safe_name(preparation.source_repository.name)
+    execution_root = root / (f"awm-run-{repository_name}-{uuid.uuid4().hex[:12]}")
     before = _inspect_candidate(
         preparation.source_repository,
         execution_root,
@@ -282,9 +250,7 @@ def prepare_run_repository(
                 )
             try:
                 verification_ref = (
-                    preparation.base_sha
-                    if reserved_retry
-                    else f"refs/remotes/{preparation.remote}/{preparation.base_branch}"
+                    f"refs/remotes/{preparation.remote}/{preparation.base_branch}"
                 )
                 fetched_sha = _git_read(
                     preparation.source_repository,
@@ -399,101 +365,6 @@ def prepare_run_repository(
     )
 
 
-def _resume_pending_preparation(
-    *,
-    repo: str | os.PathLike[str],
-    base_branch: str,
-    remote: str,
-    worktree_root: Path,
-    command_timeout_seconds: float,
-) -> RepositoryExecutionContext | _PendingRepositoryPreparation | None:
-    encoded = os.environ.get(PENDING_REPOSITORY_CONTEXT_ENV)
-    if encoded is None:
-        return None
-    try:
-        value = json.loads(encoded)
-    except json.JSONDecodeError as exc:
-        raise WorkerFailure(
-            "Runner supplied an invalid pending repository context"
-        ) from exc
-    required = {
-        "registration_state",
-        "repository",
-        "source_repository",
-        "remote",
-        "base_branch",
-        "base_ref",
-        "base_sha",
-        "execution_root",
-    }
-    if (
-        not isinstance(value, dict)
-        or any(
-            not isinstance(key, str) or not isinstance(item, str)
-            for key, item in value.items()
-        )
-        or not required.issubset(value)
-        or value["registration_state"] != "pending"
-        or not _OBJECT_ID_RE.fullmatch(value["base_sha"])
-    ):
-        raise WorkerFailure("Runner supplied an invalid pending repository context")
-
-    requested = Path(repo).expanduser().resolve()
-    source = Path(value["repository"])
-    execution_root = Path(value["execution_root"])
-    requested_source = Path(
-        _git_read(
-            requested,
-            ["rev-parse", "--show-toplevel"],
-            command_timeout_seconds,
-        )
-    ).resolve()
-    if (
-        requested_source != source
-        or value["source_repository"] != value["repository"]
-        or remote != value["remote"]
-        or base_branch != value["base_branch"]
-        or value["base_ref"] != f"{remote}/{base_branch}"
-        or not execution_root.is_absolute()
-        or execution_root.parent != worktree_root
-    ):
-        raise WorkerFailure(
-            "repository preparation conflicts with the pending run reservation"
-        )
-    preparation = RepositoryPreparation(
-        source_repository=source,
-        remote=remote,
-        base_branch=base_branch,
-        base_ref=value["base_ref"],
-        base_sha=value["base_sha"],
-    )
-    state = _inspect_candidate(
-        source,
-        execution_root,
-        remote,
-        base_branch,
-        command_timeout_seconds,
-    )
-    desired = (
-        state["registered"] is True
-        and state["path_exists"] is True
-        and state["head"] == preparation.base_sha
-        and state["branch"] == "HEAD"
-    )
-    if desired:
-        return _finalize_preparation(
-            preparation,
-            execution_root,
-            command_timeout_seconds,
-            finding="reconciled pending",
-        )
-    if state["registered"] is False and state["path_exists"] is False:
-        return _PendingRepositoryPreparation(preparation, execution_root)
-    raise WorkerFailure(
-        f"pending worktree reservation conflicts with observed state: {state!r}"
-    )
-
-
 def _finalize_preparation(
     preparation: RepositoryPreparation,
     execution_root: Path,
@@ -532,86 +403,6 @@ def _finalize_preparation(
         base_branch=preparation.base_branch,
         base_ref=preparation.base_ref,
         base_sha=preparation.base_sha,
-        execution_root=execution_root,
-    )
-
-
-def _resume_context(
-    *,
-    repo: str | os.PathLike[str],
-    base_branch: str,
-    remote: str,
-    command_timeout_seconds: float,
-) -> RepositoryExecutionContext | None:
-    encoded = os.environ.get(REPOSITORY_CONTEXT_ENV)
-    if encoded is None:
-        return None
-    try:
-        value = json.loads(encoded)
-    except json.JSONDecodeError as exc:
-        raise WorkerFailure("Runner supplied an invalid repository context") from exc
-    if not isinstance(value, dict) or any(
-        not isinstance(key, str) or not isinstance(item, str)
-        for key, item in value.items()
-    ):
-        raise WorkerFailure("Runner supplied an invalid repository context")
-    required = {
-        "repository",
-        "remote",
-        "base_branch",
-        "base_ref",
-        "base_sha",
-        "execution_root",
-        "path_identity",
-        "git_file_identity",
-        "git_dir",
-    }
-    if not required.issubset(value):
-        raise WorkerFailure("Runner supplied an incomplete repository context")
-    requested = Path(repo).expanduser().resolve()
-    source = Path(value["repository"])
-    execution_root = Path(value["execution_root"])
-    requested_source = Path(
-        _git_read(
-            requested,
-            ["rev-parse", "--show-toplevel"],
-            command_timeout_seconds,
-        )
-    ).resolve()
-    if (
-        requested_source != source
-        or remote != value["remote"]
-        or base_branch != value["base_branch"]
-    ):
-        raise WorkerFailure(
-            "repository preparation conflicts with the retained run context"
-        )
-    if _path_identity(execution_root) != value["path_identity"]:
-        raise WorkerFailure("retained worktree path identity changed")
-    if _administrative_identity(execution_root / ".git") != value["git_file_identity"]:
-        raise WorkerFailure("retained worktree administrative identity changed")
-    listed = _git_read(
-        source, ["worktree", "list", "--porcelain"], command_timeout_seconds
-    )
-    if not any(line == f"worktree {execution_root}" for line in listed.splitlines()):
-        raise WorkerFailure("retained worktree is no longer registered")
-    git_dir = _git_read(
-        execution_root,
-        ["rev-parse", "--absolute-git-dir"],
-        command_timeout_seconds,
-    )
-    if git_dir != value["git_dir"]:
-        raise WorkerFailure("retained worktree Git identity changed")
-    emit_finding(
-        "git",
-        f"reused retained execution worktree {execution_root} from {value['base_sha']}",
-    )
-    return RepositoryExecutionContext(
-        source_repository=source,
-        remote=value["remote"],
-        base_branch=value["base_branch"],
-        base_ref=value["base_ref"],
-        base_sha=value["base_sha"],
         execution_root=execution_root,
     )
 

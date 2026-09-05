@@ -8,15 +8,10 @@ import pytest
 from purplemux_client import (
     emit_step,
     register_run_resource,
-    resume_checkpoint,
-    save_checkpoint,
-    suspend_run,
 )
 from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
-    RESUME_CHECKPOINT_ENV,
-    SUSPENDED_EXIT_CODE,
 )
 
 
@@ -113,31 +108,6 @@ def test_emit_step_requires_positive_counters(field: str) -> None:
         emit_step("step", "started", **{field: 0})  # type: ignore[arg-type]
 
 
-def test_checkpoint_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
-    read_fd, write_fd = os.pipe()
-    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
-    try:
-        save_checkpoint("sessions ready", {"workspace": "ws-1", "tab": "tab-1"})
-    finally:
-        os.close(write_fd)
-
-    with os.fdopen(read_fd, encoding="utf-8") as stream:
-        event = json.loads(stream.read())
-    assert event == {
-        "type": "checkpoint",
-        "name": "sessions ready",
-        "data": {"workspace": "ws-1", "tab": "tab-1"},
-    }
-
-    monkeypatch.setenv(
-        RESUME_CHECKPOINT_ENV,
-        json.dumps({"name": event["name"], "data": event["data"]}),
-    )
-    assert resume_checkpoint() is not None
-    assert resume_checkpoint().name == "sessions ready"  # type: ignore[union-attr]
-    assert resume_checkpoint().data["workspace"] == "ws-1"  # type: ignore[union-attr]
-
-
 def test_register_run_resource_writes_structured_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -160,22 +130,3 @@ def test_register_run_resource_writes_structured_event(
         "identity": "tab-1",
         "metadata": {"workspace_id": "ws-1", "panel_type": "codex-cli"},
     }
-
-
-def test_suspend_run_publishes_reason_and_uses_distinct_exit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    read_fd, write_fd = os.pipe()
-    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
-    try:
-        with pytest.raises(SystemExit) as raised:
-            suspend_run("answer the agent question")
-    finally:
-        os.close(write_fd)
-
-    assert raised.value.code == SUSPENDED_EXIT_CODE
-    with os.fdopen(read_fd, encoding="utf-8") as stream:
-        assert json.loads(stream.read()) == {
-            "type": "suspended",
-            "reason": "answer the agent question",
-        }

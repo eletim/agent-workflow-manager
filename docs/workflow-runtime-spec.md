@@ -37,8 +37,6 @@ terminal state is determined solely by the Python process:
 
 - exit code zero becomes `success`;
 - a nonzero exit becomes `failed`;
-- the reserved suspension exit with a matching `suspend_run()` event becomes
-  `suspended`;
 - a process terminated after a Runner stop request becomes `stopped`.
 
 Progress events are observational. They do not decide terminal state and must
@@ -51,48 +49,27 @@ authenticated runtime interfaces and never operates tmux directly.
 Each Runner Run ID is combined with one process-instance namespace and supplied
 to the workflow subprocess as its correlation namespace. Public named
 workspace/session/shell creation derives a short stable mutation correlation
-from that Run identity and the logical resource name. A resumed attempt keeps
-the same namespace; a different Run, including one after a Runner restart, does
-not reuse it. Direct Python execution uses a process-stable random fallback.
+from that Run identity and the logical resource name. A different Run, including
+a recovery run or one after a Runner restart, does not reuse it. Direct Python
+execution uses a process-stable random fallback.
 This identity is only for creation and reconciliation. Run-owned resource
 inventory remains authoritative only after concrete workspace, tab, result
 directory, or worktree identities are returned and registered.
 
-## Manual recovery and resume contract
+## Manual recovery contract
 
-Resume is an explicit user action on the same in-memory run; it is never an
-automatic retry. A workflow proves that replay can be avoided by calling
-`save_checkpoint(name, data)` only after a set of side effects is complete.
-The data is a small string map (normally PurpleMux workspace/tab IDs and other
-non-secret correlation values). The Runner retains only the latest checkpoint,
-the original output, and each terminal attempt in run history. It keeps the
-same code, Runner-controlled subprocess directory, arguments, run ID, and
-run-owned resources. Repository workflows retain the structured source/base
-identity and isolated execution worktree registered by
-`prepare_run_repository()`.
-Publishing a checkpoint is also the workflow author's assertion that restarting
-from it remains safe until a newer checkpoint replaces it; otherwise the
-workflow must not publish one.
+Checkpoint and in-place Resume are not part of the Workflow contract. A failed
+or stopped Python process is not reconstructed or replayed. Its run record,
+output, findings, and owned resources remain inspectable until explicit Cleanup.
 
-On resume, the Runner re-runs preflight and starts the same plain Python script
-with that checkpoint available through `resume_checkpoint()`. The script is the
-sole owner of branching: it must recognize the checkpoint, validate manually
-repaired external state, reuse retained resource IDs, and skip every completed
-non-idempotent side effect. Publishing a checkpoint does not cause the Runner
-to infer or execute a next step. If a failed/suspended run has no checkpoint,
-the resume API rejects it instead of starting the script blindly. Checkpoint
-data must not contain credentials because it is returned by the run API/UI.
-Resume and Cleanup share a per-run lifecycle lock. Once any owned resource has
-entered cleanup, Resume is rejected server-side even if the workflow previously
-published a checkpoint.
-
-`suspend_run(reason)` lets a workflow distinguish a human-needs-input boundary
-from a hard failure after it has saved a safe checkpoint. The process exits and
-the run becomes `suspended`; PurpleMux sessions remain open. After the operator
-answers or repairs the external state, the same explicit Resume action applies.
-Repeated fail/suspend → repair → resume cycles use the newest checkpoint. This
-small contract is process-memory scoped: restarting the Runner loses its run
-registry and requires a new run with workflow-specific recovery inputs.
+Recovery starts a new run. The new workflow uses normal Python inspection of
+authoritative Git, GitHub, and PurpleMux state before deciding whether existing
+external work can be reused. Mutation helpers retain their mutation-once,
+postcondition reconciliation, and `MutationOutcomeUnknown` behavior; an unknown
+outcome is inspected and must never be blindly retried. This is not a durable
+workflow engine, graph, state machine, or automatic retry facility. Obsolete
+checkpoint fields from older data or inherited environments are ignored and
+must never trigger replay.
 
 PurpleMux owns agent and managed-terminal runtime. `purplemux_client` uses
 PurpleMux's public CLI contract and does not replace its runtime or access tmux
@@ -102,7 +79,7 @@ machine-readable exit-code sidecar written by the command wrapper; pane text is
 diagnostic only, and `terminalStatus` is optional status context rather than an
 inferred command result. The optional field is consumed when available and the
 tab's structured `alive` lifecycle remains authoritative. Tabs remain open after
-success, failure, suspension, and stop until the operator invokes the run's
+success, failure, and stop until the operator invokes the run's
 explicit Cleanup action, so completed commands remain available for inspection.
 Workflow code opts into registration with `PurpleMuxRuntime(owned_by_run=True)`;
 the default direct adapter path does not register resources and remains suitable
@@ -215,7 +192,6 @@ not drive workflow control flow and do not participate in orchestration.
 | --- | --- | --- |
 | `success` | `Workflow completed` | Includes the run ID and `success` state. |
 | `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
-| `suspended` | `Workflow needs attention` | Says that the run is suspended for manual input or recovery. |
 | `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
 
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
@@ -225,10 +201,6 @@ notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,
 success and failure default on, and stopped defaults off. In `config.sh`, the
 first setting is expressed as `auto`, `enabled`, or `disabled`; `start.sh`
 resolves it to the runtime boolean after notify setup.
-Suspension is an operator-attention condition rather than a hard failure and is
-therefore sent whenever notifications are globally enabled; it does not use the
-failure policy or failure wording.
-
 Each enabled terminal notification has one attempt, an outer bounded timeout,
 and no retry loop. The CLI runs in its own process group, which is terminated
 and reaped as a unit if that outer timeout expires. Missing or disabled

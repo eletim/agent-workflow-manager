@@ -62,6 +62,12 @@ class FeaturePreparationState:
     action: str
 
 
+@dataclass(frozen=True)
+class FeatureRecoveryState:
+    branch: BranchState
+    reused_existing_work: bool
+
+
 def github_origin_slug(origin: str) -> str:
     path: str
     if origin.startswith("git@github.com:"):
@@ -551,6 +557,105 @@ class GitRepository:
         self.require_clean()
         return result
 
+    def recover_feature_branch(
+        self,
+        branch: str,
+        *,
+        base: str,
+        expected_base_sha: str,
+    ) -> FeatureRecoveryState:
+        """Prepare a feature branch and recover the furthest safe prior-run head."""
+        prepared = self.prepare_feature_branch(
+            branch, base=base, expected_base_sha=expected_base_sha
+        )
+        assert prepared.local_sha is not None
+        expected_feature_sha = prepared.remote_sha
+        refs_before = self._feature_recovery_refs(branch)
+        all_candidates = set(refs_before.values())
+        candidates = {
+            sha for sha in all_candidates if self._is_ancestor(expected_base_sha, sha)
+        }
+        candidates.add(prepared.local_sha)
+        unreconciled = {
+            sha
+            for sha in all_candidates - candidates
+            if not self._is_ancestor(sha, expected_base_sha)
+            and not any(self._is_ancestor(sha, candidate) for candidate in candidates)
+        }
+        if unreconciled:
+            raise WorkerFailure(
+                f"recovered feature refs for {branch!r} do not contain "
+                f"authoritative base {expected_base_sha}; reconcile them before "
+                "starting a new run"
+            )
+        maximal = {
+            candidate
+            for candidate in candidates
+            if not any(
+                candidate != other and self._is_ancestor(candidate, other)
+                for other in candidates
+            )
+        }
+        if len(maximal) != 1:
+            raise WorkerFailure(
+                f"recovered feature refs for {branch!r} diverge; reconcile them "
+                "before starting a new run"
+            )
+        recovered_sha = maximal.pop()
+        if prepared.local_sha != recovered_sha:
+            if not self._is_ancestor(prepared.local_sha, recovered_sha):
+                raise WorkerFailure(
+                    f"prepared feature {branch!r} cannot fast-forward to recovered "
+                    f"commit {recovered_sha}"
+                )
+
+            def recheck_recovery_refs() -> None:
+                self.require_clean()
+                current = self.require_current_branch(branch)
+                if current.local_sha != prepared.local_sha:
+                    raise WorkerFailure(
+                        f"local {branch!r} changed before recovery: expected "
+                        f"{prepared.local_sha}, found {current.local_sha}"
+                    )
+                if self._feature_recovery_refs(branch) != refs_before:
+                    raise WorkerFailure(
+                        f"feature refs for {branch!r} changed before recovery"
+                    )
+                if self._remote_sha(base) != expected_base_sha:
+                    raise WorkerFailure(
+                        f"remote base {base!r} changed before feature recovery"
+                    )
+                if self._remote_sha(branch) != expected_feature_sha:
+                    raise WorkerFailure(
+                        f"remote feature {branch!r} changed before recovery"
+                    )
+
+            before = self.inspect_branch(branch)
+            self._git_mutation(
+                ["merge", "--ff-only", recovered_sha],
+                operation="recover feature branch",
+                target=branch,
+                pre_state=before,
+                observe=lambda: self.inspect_branch(branch),
+                desired=lambda: self._branch_matches(branch, recovered_sha, True),
+                pre_dispatch=recheck_recovery_refs,
+            )
+        result = self.inspect_branch(branch)
+        if result.local_sha != recovered_sha or not result.current:
+            raise WorkerFailure(f"feature branch {branch!r} recovery failed")
+        if result.remote_sha != expected_feature_sha:
+            raise WorkerFailure(f"remote feature {branch!r} changed during recovery")
+        if not self._is_ancestor(expected_base_sha, recovered_sha):
+            raise WorkerFailure(
+                f"recovered feature {branch!r} does not contain base "
+                f"{expected_base_sha}"
+            )
+        self.require_clean()
+        return FeatureRecoveryState(
+            branch=result,
+            reused_existing_work=recovered_sha != expected_base_sha,
+        )
+
     def advance_after_merge(
         self,
         branch: str,
@@ -694,6 +799,32 @@ class GitRepository:
 
     def _local_sha(self, branch: str) -> str | None:
         return self._optional_ref_sha(f"refs/heads/{branch}")
+
+    def _feature_recovery_refs(self, branch: str) -> dict[str, str]:
+        logical_ref = f"refs/heads/{branch}"
+        private_prefix = "refs/heads/awm-run/"
+        output = self._read(
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]
+        )
+        refs: dict[str, str] = {}
+        for line in output.splitlines():
+            ref, separator, sha = line.partition(" ")
+            if not separator or not _OBJECT_ID_RE.fullmatch(sha):
+                raise WorkerFailure("unexpected local branch enumeration result")
+            private_identity = ""
+            private_branch = ""
+            private_separator = ""
+            if ref.startswith(private_prefix):
+                private_identity, private_separator, private_branch = ref.removeprefix(
+                    private_prefix
+                ).partition("/")
+            if ref == logical_ref or (
+                bool(private_separator)
+                and re.fullmatch(r"[0-9a-f]{12}", private_identity) is not None
+                and private_branch == branch
+            ):
+                refs[ref] = sha
+        return refs
 
     def _tracking_sha(self, branch: str) -> str | None:
         return self._optional_ref_sha(f"refs/remotes/{self.remote}/{branch}")

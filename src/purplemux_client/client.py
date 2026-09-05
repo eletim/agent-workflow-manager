@@ -761,46 +761,6 @@ class PurpleMuxCLIClient:
             },
         )
 
-    def resume_shell(
-        self, session_id: str, result_path: str, *, cwd: str | None = None
-    ) -> None:
-        """Reattach a checkpointed managed shell without sending its command again."""
-        resolved_cwd = (
-            os.path.abspath(os.path.expanduser(cwd)) if cwd is not None else None
-        )
-        if resolved_cwd is not None and not os.path.isdir(resolved_cwd):
-            raise ValueError(
-                f"shell working directory is not a directory: {resolved_cwd}"
-            )
-        if session_id in self._shell_runs:
-            if self._shell_runs[session_id].result_path != result_path:
-                raise WorkerFailure(f"session {session_id} shell identity conflicts")
-            if (
-                resolved_cwd is not None
-                and self._shell_runs[session_id].cwd != resolved_cwd
-            ):
-                raise WorkerFailure(f"session {session_id} shell cwd conflicts")
-            return
-        normalized = os.path.abspath(result_path)
-        parent = os.path.dirname(normalized)
-        if os.path.basename(normalized) != "result.json" or not os.path.basename(
-            parent
-        ).startswith("awm-shell-"):
-            raise WorkerFailure("checkpointed shell result path is invalid")
-        tabs = self.list_sessions()
-        tab = next((item for item in tabs if item.id == session_id), None)
-        if tab is None and not os.path.isfile(normalized):
-            raise MutationOutcomeUnknown(
-                f"checkpointed shell {session_id} and its result are not observable"
-            )
-        if tab is not None and tab.panel_type != "terminal":
-            raise MutationConflict(
-                f"checkpointed shell {session_id} is no longer a terminal"
-            )
-        self._shell_runs[session_id] = _ShellRun(
-            result_path=normalized, cwd=resolved_cwd
-        )
-
     def wait_for_shell_completion(
         self, session_id: str, timeout_seconds: float
     ) -> None:

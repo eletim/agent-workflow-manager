@@ -22,10 +22,6 @@ from typing import IO, Literal, Protocol, cast
 from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
 from purplemux_client.correlation import RUN_IDENTITY_ENV
 from purplemux_client.errors import MutationOutcomeUnknown
-from purplemux_client.execution_context import (
-    PENDING_REPOSITORY_CONTEXT_ENV,
-    REPOSITORY_CONTEXT_ENV,
-)
 from purplemux_client.notifier import NotificationResult, TerminalState
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
@@ -37,9 +33,6 @@ from purplemux_client.progress import (
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
     RESOURCE_ACK_FD_ENV,
-    RESUME_CHECKPOINT_ENV,
-    SUSPENDED_EXIT_CODE,
-    ResumeCheckpoint,
     StepStatus,
 )
 from purplemux_client.prompt import PromptExecution
@@ -49,7 +42,6 @@ RunnerState = Literal[
     "running",
     "success",
     "failed",
-    "suspended",
     "stopped",
     "validation_failed",
 ]
@@ -179,10 +171,6 @@ class RunNotFoundError(LookupError):
     """Raised when a requested run identifier does not exist."""
 
 
-class RunNotResumableError(RuntimeError):
-    """Raised when a run has no workflow-proven safe continuation point."""
-
-
 class RunCleanupNotAllowedError(RuntimeError):
     """Raised when explicit cleanup is unsafe for the selected run."""
 
@@ -230,9 +218,8 @@ def _is_verified_repository_context(resource: RunResource) -> bool:
 @dataclass(frozen=True)
 class RunAttempt:
     number: int
-    state: Literal["success", "failed", "suspended", "stopped"]
+    state: Literal["success", "failed", "stopped"]
     exit_code: int
-    resumed_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -256,9 +243,7 @@ class RunnerSnapshot:
     dry_run_issues: tuple[ValidationIssue, ...]
     cwd: str
     args: tuple[str, ...]
-    checkpoint: ResumeCheckpoint | None
     attempts: tuple[RunAttempt, ...]
-    suspension_reason: str | None
     findings: tuple[TopologyFinding, ...]
     dry_run: DryRunResult | None
     resources: tuple[RunResource, ...] = ()
@@ -279,7 +264,6 @@ class RunnerSnapshot:
             payload["prompt"] = prompt
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
-        payload["suspensionReason"] = payload.pop("suspension_reason")
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -303,7 +287,6 @@ class RunnerSnapshot:
                 "number": attempt.number,
                 "state": attempt.state,
                 "exitCode": attempt.exit_code,
-                "resumedFrom": attempt.resumed_from,
             }
             for attempt in self.attempts
         ]
@@ -314,12 +297,6 @@ class RunnerSnapshot:
             "idle",
             "running",
             "validation_failed",
-        )
-        payload["resumable"] = (
-            self.prompt is None
-            and self.state in ("failed", "suspended")
-            and self.checkpoint is not None
-            and all(resource.cleanup_state == "retained" for resource in self.resources)
         )
         return payload
 
@@ -333,14 +310,7 @@ class RunnerSnapshot:
             "cwd": self.cwd,
             "executionContext": execution_context,
             "args": list(self.args),
-            "checkpoint": asdict(self.checkpoint) if self.checkpoint else None,
             "attempts": len(self.attempts),
-            "resumable": self.prompt is None
-            and self.state in ("failed", "suspended")
-            and self.checkpoint is not None
-            and all(
-                resource.cleanup_state == "retained" for resource in self.resources
-            ),
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
         }
@@ -391,10 +361,7 @@ class _RunRecord:
     progress: deque[ProgressEvent] = field(default_factory=deque)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    checkpoint: ResumeCheckpoint | None = None
-    resumed_from: str | None = None
     attempts: list[RunAttempt] = field(default_factory=list)
-    suspension_reason: str | None = None
     resources: list[RunResource] = field(default_factory=list)
     prompt: PromptExecution | None = None
 
@@ -463,9 +430,7 @@ class PythonRunner:
             dry_run_issues=(),
             cwd=str(self._workflow_cwd),
             args=(),
-            checkpoint=None,
             attempts=(),
-            suspension_reason=None,
             findings=(),
             dry_run=None,
         )
@@ -526,9 +491,7 @@ class PythonRunner:
                     dry_run_issues=validation.dry_run_issues,
                     cwd=str(run_cwd),
                     args=run_args,
-                    checkpoint=None,
                     attempts=(),
-                    suspension_reason=None,
                     findings=result.findings,
                     dry_run=result,
                 )
@@ -684,118 +647,6 @@ class PythonRunner:
                     prompt=prompt,
                 )
 
-    def resume(self, run_id: int) -> None:
-        """Explicitly continue a failed run from its latest workflow checkpoint."""
-        with self._validation_lock:
-            with self._lock:
-                self._ensure_open()
-                run = self._get_run(run_id)
-                lifecycle_lock = run.cleanup_lock
-            with lifecycle_lock:
-                with self._lock:
-                    self._ensure_open()
-                    run = self._get_run(run_id)
-                    self._ensure_resumable(run)
-                    code = run.code
-                    checkpoint = run.checkpoint
-                    args = run.args
-                run_cwd, run_args, child_env = self._execution_context(args)
-                for resource in run.resources:
-                    if _is_verified_repository_context(resource):
-                        child_env[REPOSITORY_CONTEXT_ENV] = json.dumps(
-                            {
-                                **resource.metadata,
-                                "execution_root": resource.identity,
-                            },
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        break
-                else:
-                    for resource in run.resources:
-                        if (
-                            resource.kind == "git_worktree"
-                            and resource.metadata.get("registration_state") == "pending"
-                            and resource.cleanup_state == "retained"
-                        ):
-                            child_env[PENDING_REPOSITORY_CONTEXT_ENV] = json.dumps(
-                                {
-                                    **resource.metadata,
-                                    "execution_root": resource.identity,
-                                },
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
-                            break
-                validation = self._validator.validate(
-                    code, cwd=run_cwd, environment=child_env
-                )
-                with self._lock:
-                    self._ensure_open()
-                    run = self._get_run(run_id)
-                    self._ensure_resumable(run)
-                    if run.checkpoint != checkpoint:
-                        raise RunNotResumableError(
-                            f"run {run_id} checkpoint changed while resume was prepared"
-                        )
-                    if not validation.valid:
-                        raise WorkflowValidationError(validation)
-                    assert checkpoint is not None
-                    child_env[RESUME_CHECKPOINT_ENV] = json.dumps(
-                        asdict(checkpoint), ensure_ascii=False, separators=(",", ":")
-                    )
-                    child_env[RUN_IDENTITY_ENV] = self._run_identity(run.run_id)
-                    process, script_path, progress_read_fd, resource_ack_fd = (
-                        self._spawn_process(
-                            code,
-                            run_cwd=run_cwd,
-                            run_args=run_args,
-                            child_env=child_env,
-                        )
-                    )
-                    self._append_output(
-                        run,
-                        "stdout",
-                        f"\n[resume attempt {len(run.attempts) + 1} "
-                        f"from checkpoint {checkpoint.name!r}]\n",
-                        lock_held=True,
-                    )
-                    self._append_output(
-                        run,
-                        "stderr",
-                        f"\n[resume attempt {len(run.attempts) + 1} "
-                        f"from checkpoint {checkpoint.name!r}]\n",
-                        lock_held=True,
-                    )
-                    run.process = process
-                    run.process_group_id = process.pid
-                    run.script_path = script_path
-                    run.state = "running"
-                    run.exit_code = None
-                    run.stop_requested = False
-                    run.resumed_from = checkpoint.name
-                    run.suspension_reason = None
-                    self._start_attempt_threads(
-                        run, process, script_path, progress_read_fd, resource_ack_fd
-                    )
-                    self._mark_changed()
-
-    @staticmethod
-    def _ensure_resumable(run: _RunRecord) -> None:
-        if run.state not in ("failed", "suspended"):
-            raise RunNotResumableError(
-                f"run {run.run_id} is {run.state}; only failed or suspended runs can resume"
-            )
-        if run.checkpoint is None:
-            raise RunNotResumableError(
-                f"run {run.run_id} has no safe checkpoint; start a new run or update "
-                "the workflow to call save_checkpoint() after completed side effects"
-            )
-        if any(resource.cleanup_state != "retained" for resource in run.resources):
-            raise RunNotResumableError(
-                f"run {run.run_id} resources entered cleanup; Resume is no longer safe"
-            )
-
     def _start_validated(
         self,
         code: str,
@@ -946,9 +797,7 @@ class PythonRunner:
             dry_run_issues=result.dry_run_issues,
             cwd=str(run_cwd),
             args=run_args,
-            checkpoint=None,
             attempts=(),
-            suspension_reason=None,
             findings=(),
             dry_run=None,
         )
@@ -1008,9 +857,7 @@ class PythonRunner:
             dry_run_issues=(),
             cwd=run.cwd,
             args=run.args,
-            checkpoint=run.checkpoint,
             attempts=tuple(run.attempts),
-            suspension_reason=run.suspension_reason,
             findings=tuple(run.findings),
             dry_run=None,
             code=None if run.prompt is not None else run.code,
@@ -1042,9 +889,11 @@ class PythonRunner:
             raise InvalidExecutionContextError("args must not contain null bytes")
 
         child_env = os.environ.copy()
-        child_env.pop(RESUME_CHECKPOINT_ENV, None)
-        child_env.pop(REPOSITORY_CONTEXT_ENV, None)
-        child_env.pop(PENDING_REPOSITORY_CONTEXT_ENV, None)
+        # An obsolete value inherited from a pre-0.2.1 Runner must never cause
+        # an old workflow checkpoint to be replayed by a newly started run.
+        child_env.pop("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", None)
+        child_env.pop("PURPLEMUX_RUNNER_REPOSITORY_CONTEXT", None)
+        child_env.pop("PURPLEMUX_RUNNER_PENDING_REPOSITORY_CONTEXT", None)
         return run_cwd, run_args, child_env
 
     def _ensure_open(self) -> None:
@@ -1602,11 +1451,7 @@ class PythonRunner:
                     if value is not None:
                         with self._lock:
                             event_type, event = value
-                            if event_type == "checkpoint":
-                                run.checkpoint = cast(ResumeCheckpoint, event)
-                            elif event_type == "suspended":
-                                run.suspension_reason = cast(str, event)
-                            elif event_type == "finding":
+                            if event_type == "finding":
                                 run.findings.append(cast(TopologyFinding, event))
                             elif event_type == "resource":
                                 self._register_resource(run, cast(RunResource, event))
@@ -1637,8 +1482,6 @@ class PythonRunner:
         tuple[
             Literal[
                 "progress",
-                "checkpoint",
-                "suspended",
                 "finding",
                 "resource",
                 "resource_ownership",
@@ -1654,25 +1497,6 @@ class PythonRunner:
         if not isinstance(value, dict):
             return None
         event_type = value.get("type")
-        if event_type == "checkpoint":
-            name = value.get("name")
-            data = value.get("data")
-            if (
-                not isinstance(name, str)
-                or not name.strip()
-                or not isinstance(data, dict)
-                or any(
-                    not isinstance(key, str) or not isinstance(item, str)
-                    for key, item in data.items()
-                )
-            ):
-                return None
-            return "checkpoint", ResumeCheckpoint(name=name, data=dict(data))
-        if event_type == "suspended":
-            reason = value.get("reason")
-            if isinstance(reason, str) and reason.strip():
-                return "suspended", reason
-            return None
         if event_type == "finding":
             category = value.get("category")
             status = value.get("status")
@@ -1775,8 +1599,8 @@ class PythonRunner:
                 existing.kind == resource.kind
                 and existing.identity == resource.identity
             ):
-                # Repeated registration across Resume is idempotent only when the
-                # ownership evidence remains exactly the same.
+                # Repeated registration is idempotent only when the ownership
+                # evidence remains exactly the same.
                 if existing.metadata != resource.metadata:
                     logger.warning(
                         "Ignored conflicting registration for run %s resource %s/%s",
@@ -1856,22 +1680,16 @@ class PythonRunner:
                 run.state = (
                     "stopped"
                     if run.stop_requested
-                    else "suspended"
-                    if exit_code == SUSPENDED_EXIT_CODE
-                    and run.suspension_reason is not None
                     else "success"
                     if exit_code == 0
                     else "failed"
                 )
-                if run.state != "suspended":
-                    run.suspension_reason = None
                 attempt_state = run.state
                 run.attempts.append(
                     RunAttempt(
                         number=len(run.attempts) + 1,
                         state=attempt_state,
                         exit_code=exit_code,
-                        resumed_from=run.resumed_from,
                     )
                 )
                 terminal_state = run.state
@@ -1895,7 +1713,6 @@ class PythonRunner:
             not in (
                 "success",
                 "failed",
-                "suspended",
                 "stopped",
             )
         ):
