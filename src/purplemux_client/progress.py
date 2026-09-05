@@ -6,6 +6,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from typing import Literal
+from urllib import error, request
 
 StepStatus = Literal["started", "completed", "failed"]
 FindingCategory = Literal["runtime", "git", "github"]
@@ -19,6 +20,8 @@ RunResourceKind = Literal[
 
 PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESOURCE_ACK_FD_ENV = "PURPLEMUX_RUNNER_RESOURCE_ACK_FD"
+EVENT_URL_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_URL"
+EVENT_TOKEN_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_TOKEN"
 MAX_PROGRESS_EVENT_BYTES = 4096
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
@@ -139,6 +142,25 @@ def acknowledge_run_resource(
     # manager; its mutation boundary exits before a resource can be created.
     if os.environ.get("AGENT_WORKFLOW_MANAGER_DRY_RUN_FD") is not None:
         return
+    event_url = os.environ.get(EVENT_URL_ENV)
+    event_token = os.environ.get(EVENT_TOKEN_ENV)
+    if event_url is not None or event_token is not None:
+        if event_url is None or event_token is None:
+            raise RuntimeError("Runner event endpoint is incomplete")
+        token = uuid.uuid4().hex
+        event = {
+            "type": "resource_ownership",
+            "phase": phase,
+            "token": token,
+            "kind": kind,
+            "identity": identity,
+            "metadata": dict(metadata),
+        }
+        acknowledgement = _post_event(event_url, event_token, event, required=True)
+        if acknowledgement != {"token": token, "accepted": True}:
+            raise RuntimeError("Runner rejected resource ownership evidence")
+        return
+
     progress_fd = os.environ.get(PROGRESS_FD_ENV)
     ack_fd = os.environ.get(RESOURCE_ACK_FD_ENV)
     if progress_fd is None and ack_fd is None:
@@ -199,6 +221,20 @@ def acknowledge_run_resource(
 
 
 def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -> None:
+    event_url = os.environ.get(EVENT_URL_ENV)
+    event_token = os.environ.get(EVENT_TOKEN_ENV)
+    if event_url is not None and event_token is not None:
+        encoded = _encode_event(event)
+        if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
+            if drop_oversized:
+                encoded = _truncate_event_error(event)
+                if encoded is None:
+                    return
+                event = json.loads(encoded)
+            else:
+                raise ValueError("Runner event exceeds 4096 encoded bytes")
+        _post_event(event_url, event_token, event, required=False)
+        return
     fd_text = os.environ.get(PROGRESS_FD_ENV)
     if fd_text is None:
         return
@@ -222,6 +258,46 @@ def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -
             except OSError:
                 return
             view = view[written:]
+
+
+def _post_event(
+    url: str,
+    token: str,
+    event: Mapping[str, object],
+    *,
+    required: bool,
+) -> object | None:
+    encoded = _encode_event(event)
+    if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
+        if required:
+            raise ValueError("Runner event exceeds 4096 encoded bytes")
+        return None
+    submitted = request.Request(
+        url,
+        data=encoded,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-AWM-Run-Token": token,
+        },
+    )
+    try:
+        with request.urlopen(submitted, timeout=5) as response:
+            payload = response.read(MAX_PROGRESS_EVENT_BYTES + 1)
+    except (error.URLError, OSError) as exc:
+        if required:
+            raise RuntimeError(
+                "Runner resource ownership event could not be delivered"
+            ) from exc
+        return None
+    if not required:
+        return None
+    try:
+        return json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "Runner resource ownership acknowledgement is invalid"
+        ) from exc
 
 
 def _encode_event(event: Mapping[str, object]) -> bytes:

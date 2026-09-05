@@ -232,7 +232,9 @@ prepare_run_repository(
     worktree_root={str(worktree_root)!r},
 )
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         result = runner.dry_run(code)
     finally:
@@ -261,7 +263,9 @@ context = prepare_run_repository(
 )
 print(context.execution_root)
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         runner.start(code)
         result = wait_until_finished(runner)
@@ -295,7 +299,9 @@ context = prepare_run_repository(
 )
 Path(context.execution_root, "uncommitted").write_text("retain for inspection")
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         run_id = runner.start(code)
         completed = wait_until_finished(runner)
@@ -326,14 +332,36 @@ prepare_run_repository(
     worktree_root={str(worktree_root)!r},
 )
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         run_id = runner.start(code)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             snapshot = runner.snapshot(run_id)
-            if snapshot.resources and Path(snapshot.resources[0].identity).exists():
-                break
+            if snapshot.resources:
+                worktree = Path(snapshot.resources[0].identity)
+                if worktree.exists():
+                    observed = subprocess.run(
+                        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    status = subprocess.run(
+                        ["git", "-C", str(worktree), "status", "--porcelain"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if (
+                        observed.returncode == 0
+                        and observed.stdout.strip() == _sha
+                        and status.returncode == 0
+                        and not status.stdout
+                    ):
+                        break
             time.sleep(0.02)
         else:
             raise AssertionError("worktree was not created before interruption")
@@ -371,7 +399,9 @@ prepare_run_repository(
     worktree_root={str(worktree_root)!r},
 )
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     partial_path: Path | None = None
     try:
         run_id = runner.start(code)
@@ -411,7 +441,9 @@ prepare_run_repository(
     worktree_root={oversized_root!r},
 )
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         runner.start(code)
         result = wait_until_finished(runner)

@@ -5,10 +5,12 @@
 ```text
 plain Python workflow
   -> purplemux_client
-  -> PurpleMux
+  -> PurpleMux-managed Bash tab
+       -> PurpleMux public CLI for child work
 
 Runner
-  -> execute / stop / observe
+  -> PurpleMux public CLI: execute / stop / observe structured result
+  -> authenticated run-scoped event receiver
   -> terminal notification side effect
 
 Agent Workflow Manager UI
@@ -31,9 +33,10 @@ creation/identification.
 Those decisions must not be copied into the Runner, encoded in progress
 events, or replaced by a workflow framework, graph, DSL, or state machine.
 
-The Runner owns only Python process execution and stop requests, stdout and
-stderr capture, process-derived state, and optional progress observation. Its
-terminal state is determined solely by the Python process:
+The Runner launches each real Workflow as a visible, retained PurpleMux managed
+Bash tab. It owns stop requests, structured result observation, bounded failure
+diagnostics, and Progress/Finding storage. PurpleMux's managed-shell exit result
+is the sole source of terminal state:
 
 - exit code zero becomes `success`;
 - a nonzero exit becomes `failed`;
@@ -47,10 +50,18 @@ Cleanup action operates only on that generic inventory through PurpleMux's
 authenticated runtime interfaces and never operates tmux directly.
 
 Each Runner Run ID is combined with one process-instance namespace and supplied
-to the workflow subprocess as its correlation namespace. Public named
-workspace/session/shell creation derives a short stable mutation correlation
-from that Run identity and the logical resource name. A different Run, including
-a recovery run or one after a Runner restart, does not reuse it. Direct Python
+to the workflow process as its correlation namespace. A mode-0600 temporary
+environment file also supplies a per-run event URL and credential without
+printing the credential in the terminal command. `emit_step()`,
+`emit_finding()`, and resource registration post bounded events to that local
+endpoint; the Runner assigns their accepted timestamps. The endpoint cannot
+control or complete the Workflow. Child work rooted at the Workflow directory
+reuses the host workspace. A child workspace is created only when its directory
+was produced dynamically after launch (for example, a new run worktree), because
+the public CLI cannot add that future directory to an existing workspace.
+Public named workspace/session/shell creation derives a short stable mutation
+correlation from that Run identity and the logical resource name. A different
+Run, including a recovery run or one after a Runner restart, does not reuse it. Direct Python
 execution uses a process-stable random fallback.
 This identity is only for creation and reconciliation. Run-owned resource
 inventory remains authoritative only after concrete workspace, tab, result
@@ -71,7 +82,8 @@ workflow engine, graph, state machine, or automatic retry facility. Obsolete
 checkpoint fields from older data or inherited environments are ignored and
 must never trigger replay.
 
-PurpleMux owns agent and managed-terminal runtime. `purplemux_client` uses
+PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
+`purplemux_client` uses
 PurpleMux's public CLI contract and does not replace its runtime or access tmux
 directly. Observable or parallel shell work is launched in a named PurpleMux
 `terminal` tab with an explicit working directory. Its completion comes from a
@@ -184,7 +196,7 @@ Runner is safe for public-Internet exposure.
 
 ## Terminal notification contract
 
-After a Python process reaches one terminal state, the Runner may invoke the
+After a managed Workflow reaches one terminal state, the Runner may invoke the
 public `notify send` CLI once as an observation side effect. Notifications do
 not drive workflow control flow and do not participate in orchestration.
 
@@ -207,7 +219,7 @@ and reaped as a unit if that outer timeout expires. Missing or disabled
 `notify`, timeout, process launch error, or nonzero CLI exit is recorded as a
 generic diagnostic. Notification stderr is not copied into Runner output or
 logs because an external command could include credentials there. Notification
-failure never mutates Runner state, the Python exit code, or the workflow
+failure never mutates Runner state, the managed-shell exit code, or the workflow
 result.
 
 Runner shutdown owns pending notification cleanup: it closes the notifier and
@@ -258,10 +270,10 @@ same trusted-request boundary as Run and Stop. Test delivery calls public
 cleanup as terminal delivery. CLI absence, invalid/missing config or token,
 timeout, and nonzero exit produce sanitized actionable messages; CLI output is
 discarded and never returned. A test notification never reads or mutates
-PythonRunner state. PythonRunner owns a run registry rather than one
-process-state singleton: process group, output, progress, terminal state, and
-execution context are stored per run. Stopping a run targets its identifier;
-server shutdown is the only operation that stops every active run.
+PythonRunner state. PythonRunner owns a run registry rather than one lifecycle
+singleton: managed workspace/tab/result identity, bounded diagnostics, progress,
+terminal state, and execution context are stored per run. Stopping a run targets
+its identifier; server shutdown is the only operation that stops every active run.
 
 ## Credentials and configuration
 

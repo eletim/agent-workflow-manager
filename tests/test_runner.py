@@ -45,7 +45,7 @@ from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
 
 @pytest.fixture
 def runner() -> Iterator[PythonRunner]:
-    instance = PythonRunner(stop_timeout=0.5)
+    instance = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     yield instance
     instance.close()
 
@@ -137,8 +137,8 @@ print(run_correlation("workspace"))
 
 
 def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
-    first_runner = PythonRunner(stop_timeout=0.5)
-    second_runner = PythonRunner(stop_timeout=0.5)
+    first_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    second_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     code = 'from purplemux_client import run_correlation; print(run_correlation("workspace"))'
     try:
         first_id = first_runner.start(code)
@@ -713,7 +713,7 @@ def test_empty_code(runner: PythonRunner) -> None:
 
 
 def test_run_uses_runner_controlled_cwd_and_records_args(tmp_path: Path) -> None:
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     runner.start(
         "import json, os, sys; print(json.dumps([os.getcwd(), sys.argv[1:]]))",
         args=("--repo", "path with spaces"),
@@ -740,7 +740,7 @@ def test_runner_controlled_cwd_preserves_runner_environment(
         "PATH", os.pathsep.join((str(manager_venv / "bin"), str(target_bin)))
     )
 
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     runner.start(
         "import json, os; print(json.dumps([os.environ.get('VIRTUAL_ENV'), "
         "os.environ.get('PATH')]))"
@@ -770,13 +770,13 @@ def test_runner_rejects_non_directory_workflow_cwd(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
 
     with pytest.raises(InvalidExecutionContextError, match="not a directory"):
-        PythonRunner(workflow_cwd=missing)
+        PythonRunner(managed_workflows=False, workflow_cwd=missing)
 
 
 def test_preflight_resolves_relative_paths_from_runner_cwd(tmp_path: Path) -> None:
     (tmp_path / "input.txt").write_text("input", encoding="utf-8")
 
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     result = runner.validate("WORKFLOW_PREFLIGHT = {'paths': ['input.txt']}")
     runner.close()
 
@@ -891,7 +891,7 @@ if result.exit_code != 0:
 
 
 def test_output_is_bounded_and_reports_truncation() -> None:
-    runner = PythonRunner(max_output_chars=20)
+    runner = PythonRunner(managed_workflows=False, max_output_chars=20)
     try:
         runner.start('print("x" * 50, end="")')
         result = wait_until_finished(runner)
@@ -906,7 +906,9 @@ def test_runner_rejects_non_posix_platform(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(os, "name", "nt")
 
     with pytest.raises(RuntimeError, match="requires a POSIX"):
-        PythonRunner()
+        PythonRunner(
+            managed_workflows=False,
+        )
 
 
 def test_runs_execute_concurrently_with_independent_output(
@@ -960,7 +962,7 @@ def test_stopping_one_run_does_not_affect_another(runner: PythonRunner) -> None:
 
 
 def test_concurrent_targeted_stops_have_independent_grace_periods() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     stubborn_code = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -1042,7 +1044,9 @@ def test_can_run_again_after_stop(runner: PythonRunner) -> None:
 
 
 def test_start_after_close_is_rejected() -> None:
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     runner.close()
 
     with pytest.raises(RunnerClosedError, match="Runner is closed"):
@@ -1063,7 +1067,7 @@ def test_close_cannot_miss_concurrent_start_registration(
         return real_popen(*args, **kwargs)  # type: ignore[call-overload,return-value]
 
     monkeypatch.setattr(subprocess, "Popen", blocking_popen)
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     start_errors: list[BaseException] = []
 
     def start_run() -> None:
@@ -1090,7 +1094,7 @@ def test_close_cannot_miss_concurrent_start_registration(
 
 
 def test_close_stops_process_group() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     runner.start(
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
@@ -1110,7 +1114,7 @@ def test_close_stops_process_group() -> None:
 
 
 def test_close_cleans_up_stubborn_runs_with_one_bounded_grace_period() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     stubborn_code = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -1158,7 +1162,7 @@ def test_stop_kills_child_that_ignores_sigterm(runner: PythonRunner) -> None:
 
 
 def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> None:
-    runner = PythonRunner(stop_timeout=0.2)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.2)
     child_pid: int | None = None
     try:
         run_id = runner.start(
@@ -1194,7 +1198,7 @@ def test_stop_and_close_are_bounded_when_detached_child_keeps_output_open() -> N
 
 
 def test_stop_rejects_exited_main_with_detached_child_output() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     child_pid: int | None = None
     try:
         run_id = runner.start(
@@ -1271,7 +1275,9 @@ def test_popen_uses_current_interpreter_without_shell(
 
 @pytest.fixture
 def web_server() -> Iterator[tuple[tuple[str, int], str]]:
-    server = RunnerHTTPServer(("127.0.0.1", 0), PythonRunner(stop_timeout=0.5))
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0), PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -1341,7 +1347,7 @@ def settings_web_server(
         notifier=notifier,
         environment={},
     )
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2164,7 +2170,7 @@ class BlockedReadinessAPIService(ReadinessAPIService):
 
 
 def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     readiness = ReadinessAPIService()
     server = RunnerHTTPServer(
         ("127.0.0.1", 0),
@@ -2209,7 +2215,7 @@ def test_agent_readiness_api_is_explicit_and_reports_separate_cleanup() -> None:
 
 
 def test_agent_readiness_api_blocks_retry_until_explicit_reconciliation() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     readiness = BlockedReadinessAPIService()
     server = RunnerHTTPServer(
         ("127.0.0.1", 0),
@@ -2305,7 +2311,7 @@ def test_notification_settings_api_honors_environment_only_credential(
             "NOTIFY_TOKEN": "tk_environment_api_secret",
         },
     )
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner, notification_settings=settings)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2664,7 +2670,7 @@ def test_run_rejects_matching_origin_with_empty_delimiter(
 
 
 def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.2", 0), runner)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2780,7 +2786,7 @@ def test_web_cli_rejects_invalid_hostname_aliases(aliases: str) -> None:
 
 
 def test_configured_hostname_alias_accepts_get_and_protected_post() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(
         ("127.0.0.1", 0),
         runner,
@@ -2861,7 +2867,7 @@ def test_server_allows_explicitly_requested_hostname() -> None:
 
 
 def test_web_server_close_stops_running_process() -> None:
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = RunnerHTTPServer(("127.0.0.1", 0), runner)
     runner.start("import time; time.sleep(60)")
 

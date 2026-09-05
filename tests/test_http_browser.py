@@ -34,7 +34,7 @@ def insecure_browser_server() -> Iterator[tuple[str, PythonRunner]]:
     host = _private_http_host()
     if host.startswith("127."):
         pytest.skip("a non-loopback HTTP interface is required")
-    runner = PythonRunner(stop_timeout=0.5)
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     runner.start(
         'import sys\nprint("HTTP_STDOUT")\nprint("HTTP_STDERR", file=sys.stderr)\n'
     )
