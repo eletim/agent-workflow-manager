@@ -60,13 +60,13 @@ def test_example_preserves_completed_approval_and_terminal_delivery() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert "already_approved" in source
-    assert 'draft=False' in source
+    assert "draft=False" in source
     assert "Skipping already-Ready Issue" in source
     assert "final delivery already merged" in source
     assert "if not MERGE_FINAL:\n            return ready" in source
     assert 'ready.state == "MERGED"' in source
-    assert "integration branch changed before approved merge" in source
-    assert "final branch changed before approved merge" in source
+    assert "base branch {base!r} changed before approved merge" in source
+    assert source.count("merge_pr_and_advance(") == 5
 
 
 def test_historical_merged_final_pr_cannot_complete_newer_delivery() -> None:
