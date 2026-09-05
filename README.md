@@ -83,17 +83,33 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Agent code still owns editing, testing, committing, and pushing. Push HEAD to
-# the logical branch explicitly because an occupied branch uses a run-private
-# local checkout.
-# git push origin HEAD:refs/heads/feature/issue-123
-feature = repo.require_pushed("feature/issue-123")
+# Capture the pre-turn SHA before invoking the CodingAgent. Its hard
+# postcondition is a new commit on the expected branch and a clean worktree.
+turn_start_sha = feature.local_sha
+# ... run the CodingAgent ...
+feature = repo.require_committed_result(
+    "feature/issue-123",
+    previous_sha=turn_start_sha,
+)
+# Push is orchestration-owned gap absorption. This only creates the exact
+# remote branch or fast-forwards it; remote-ahead/diverged states fail closed.
+feature = repo.ensure_pushed(
+    "feature/issue-123",
+    expected_local_sha=feature.local_sha,
+)
 pull_request = github.require_pr(
     head="feature/issue-123",
     base="dev/v1.2.3",
     expected_head_sha=feature.remote_sha,
 )
 ```
+
+The Workflow similarly creates or reuses the exact Draft PR when the agent did
+not create one, then verifies its head, base, SHAs, and Draft state before
+review. A dirty agent result cannot advance. A review-fix turn normally has the
+same new-commit/clean contract; if the implementer explicitly re-evaluates a
+finding and returns clean without a commit, the Workflow records a WARN policy
+outcome rather than pretending that the reviewer approved it.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,

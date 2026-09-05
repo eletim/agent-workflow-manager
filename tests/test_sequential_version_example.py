@@ -222,6 +222,79 @@ def test_review_approval_tracks_and_invalidates_both_shas(
     assert state.phase == "issue_fix_done"
 
 
+def test_issue_delivery_pushes_and_creates_exact_draft_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = SAMPLE_MODULE.Recovery(prepared_base_sha="b" * 40)
+    expected_pr = pr()
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(SAMPLE_MODULE, "save_checkpoint", lambda *_args: None)
+
+    class Repo:
+        def require_current_branch(self, branch: str):
+            events.append(("current", branch))
+            return purplemux_client.BranchState(branch, "a" * 40, None, True)
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str):
+            events.append(("push", (branch, expected_local_sha)))
+            return purplemux_client.BranchState(
+                branch, expected_local_sha, expected_local_sha, True
+            )
+
+    class GitHub:
+        def find_pr(self, **kwargs: object):
+            events.append(("find", kwargs))
+            return None
+
+        def create_draft_pr(self, **kwargs: object):
+            events.append(("create", kwargs))
+            return expected_pr
+
+        def require_pr(self, **kwargs: object):
+            events.append(("require", kwargs))
+            return expected_pr
+
+    delivered = SAMPLE_MODULE.ensure_issue_pr(
+        Repo(), GitHub(), config(tmp_path).issues[0], config(tmp_path), state
+    )
+
+    assert delivered == expected_pr
+    create = next(value for name, value in events if name == "create")
+    assert isinstance(create, dict)
+    assert create["head"] == "feature/issue-1"
+    assert create["base"] == "dev/v1.2.3"
+    assert create["expected_head_sha"] == "a" * 40
+    assert create["expected_base_sha"] == "b" * 40
+    required = next(value for name, value in events if name == "require")
+    assert isinstance(required, dict)
+    assert required["draft"] is True
+    assert state.phase == "issue_delivery_done"
+
+
+def test_no_change_policy_is_explicit_and_not_reviewer_approval(
+    tmp_path: Path,
+) -> None:
+    state = SAMPLE_MODULE.Recovery(
+        approved_sha="a" * 40,
+        approved_base_sha="b" * 40,
+        review_outcome="no-change-policy",
+    )
+    observed: list[dict[str, object]] = []
+
+    class GitHub:
+        def require_pr(self, **kwargs: object):
+            observed.append(kwargs)
+            return pr()
+
+    assert SAMPLE_MODULE.require_reviewed_topology(GitHub(), pr(), state) == pr()
+    assert observed[0]["expected_head_sha"] == "a" * 40
+    assert state.review_outcome != "approved"
+
+    state.review_outcome = None
+    with pytest.raises(purplemux_client.WorkerFailure, match="accepted exact"):
+        SAMPLE_MODULE.require_reviewed_topology(GitHub(), pr(), state)
+
+
 def test_final_path_only_makes_exact_integration_topology_ready() -> None:
     source = SAMPLE.read_text(encoding="utf-8")
     tree = ast.parse(source)
