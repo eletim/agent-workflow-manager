@@ -226,7 +226,7 @@ def prepare_issue(
     github: GitHubRepository,
     issue: Issue,
     config: Config,
-) -> tuple[PullRequestState | None, str, bool] | None:
+) -> tuple[PullRequestState | None, str, bool, bool] | None:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
@@ -262,21 +262,17 @@ def prepare_issue(
                 f"existing {issue.branch} does not contain authoritative base "
                 f"{integration.remote_sha}; reconcile it before starting a new run"
             )
-        if not open_pr.is_draft:
-            open_pr = github.set_draft(
-                open_pr.number,
-                draft=True,
-                expected_head=issue.branch,
-                expected_head_sha=open_pr.head_sha,
-                expected_base=config.integration_branch,
-                expected_base_sha=open_pr.base_sha,
-            )
     assert feature.local_sha is not None
     emit_finding(
         "git",
         f"{issue.branch} contains {config.integration_branch} @ {integration.remote_sha}",
     )
-    return open_pr, feature.local_sha, reused_existing_work
+    return (
+        open_pr,
+        feature.local_sha,
+        reused_existing_work,
+        open_pr is not None and not open_pr.is_draft,
+    )
 
 
 def ensure_issue_pr(
@@ -324,7 +320,42 @@ def process_issue(
     if prepared is None:
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
         return
-    existing_pr, start_sha, reused_existing_work = prepared
+    existing_pr, start_sha, reused_existing_work, already_approved = prepared
+    if already_approved:
+        assert existing_pr is not None
+        approved = github.require_pr(
+            number=existing_pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=existing_pr.head_sha,
+            expected_base_sha=existing_pr.base_sha,
+            draft=False,
+        )
+        if not MERGE_TO_INTEGRATION:
+            print(
+                f"Skipping already-Ready Issue #{issue.number} PR: {approved.url}",
+                flush=True,
+            )
+            return
+        integration = repo.synchronize_branch(config.integration_branch)
+        if integration.local_sha != approved.base_sha:
+            raise WorkerFailure("Ready Issue PR base changed before recovery merge")
+        merged = github.merge_pr(
+            approved.number,
+            expected_head=issue.branch,
+            expected_head_sha=approved.head_sha,
+            expected_base=config.integration_branch,
+            expected_base_sha=approved.base_sha,
+        )
+        repo.advance_after_merge(
+            config.integration_branch,
+            previous_sha=approved.base_sha,
+            merge_commit_sha=merged.merge_commit_sha,
+            required_commit_sha=approved.head_sha,
+        )
+        print(f"Merged already-approved Issue #{issue.number} PR: {merged.pr.url}")
+        return
     implementer = create_agent(client, config, name=f"Issue {issue.number} implementer")
     reviewer = create_agent(client, config, name=f"Issue {issue.number} reviewer")
     implementation_prompt, review_prompt = issue_prompts(issue, config)
@@ -425,6 +456,9 @@ explain why; do not create an empty commit.\n\n{result}""",
     if not MERGE_TO_INTEGRATION:
         print(f"Approved Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
         return
+    integration = repo.synchronize_branch(config.integration_branch)
+    if integration.local_sha != approved_base:
+        raise WorkerFailure("integration branch changed before approved merge")
     merged = github.merge_pr(
         pr.number,
         expected_head=issue.branch,
@@ -470,6 +504,14 @@ def integration_delivery(
     if integration.remote_sha is None or main.remote_sha is None:
         raise WorkerFailure("integration or final remote branch is missing")
     pr = inspect_pr(github, head=config.integration_branch, base=config.main_branch)
+    merged_pr = github.find_pr(
+        head=config.integration_branch, base=config.main_branch, state="MERGED"
+    )
+    if merged_pr is not None:
+        if pr is not None:
+            raise WorkerFailure("merged final delivery also has an open same-head PR")
+        emit_finding("github", f"final delivery already merged as #{merged_pr.number}")
+        return merged_pr
     if pr is None:
         pr = github.create_draft_pr(
             head=config.integration_branch,
@@ -481,14 +523,34 @@ def integration_delivery(
             correlation_id=run_correlation("integration-pr"),
         )
     elif not pr.is_draft:
-        pr = github.set_draft(
-            pr.number,
-            draft=True,
-            expected_head=config.integration_branch,
-            expected_head_sha=pr.head_sha,
-            expected_base=config.main_branch,
-            expected_base_sha=pr.base_sha,
+        ready = github.require_pr(
+            number=pr.number,
+            head=config.integration_branch,
+            base=config.main_branch,
+            state="OPEN",
+            expected_head_sha=integration.remote_sha,
+            expected_base_sha=main.remote_sha,
+            draft=False,
         )
+        if not MERGE_FINAL:
+            return ready
+        final_base = repo.synchronize_branch(config.main_branch)
+        if final_base.local_sha != ready.base_sha:
+            raise WorkerFailure("Ready final PR base changed before recovery merge")
+        merged = github.merge_pr(
+            ready.number,
+            expected_head=config.integration_branch,
+            expected_head_sha=ready.head_sha,
+            expected_base=config.main_branch,
+            expected_base_sha=ready.base_sha,
+        )
+        repo.advance_after_merge(
+            config.main_branch,
+            previous_sha=ready.base_sha,
+            merge_commit_sha=merged.merge_commit_sha,
+            required_commit_sha=ready.head_sha,
+        )
+        return merged.pr
     pr = github.require_pr(
         number=pr.number,
         head=config.integration_branch,
@@ -573,6 +635,9 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
     )
     if not MERGE_FINAL:
         return ready
+    final_base = repo.synchronize_branch(config.main_branch)
+    if final_base.local_sha != ready.base_sha:
+        raise WorkerFailure("final branch changed before approved merge")
     merged = github.merge_pr(
         ready.number,
         expected_head=config.integration_branch,
@@ -601,7 +666,7 @@ def main() -> None:
     for issue in config.issues:
         process_issue(issue, config, client, repo, github)
     ready = integration_delivery(config, client, repo, github)
-    outcome = "Merged" if MERGE_FINAL else "Ready (not merged)"
+    outcome = "Merged" if ready.state == "MERGED" else "Ready (not merged)"
     print(f"Whole-version PR is {outcome}: {ready.url}", flush=True)
 
 

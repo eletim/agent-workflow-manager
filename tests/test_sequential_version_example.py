@@ -32,6 +32,19 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
 
 
+def test_example_preserves_completed_approval_and_terminal_delivery() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert "already_approved" in source
+    assert 'draft=False' in source
+    assert "Skipping already-Ready Issue" in source
+    assert "final delivery already merged" in source
+    assert "if not MERGE_FINAL:\n            return ready" in source
+    assert 'ready.state == "MERGED"' in source
+    assert "integration branch changed before approved merge" in source
+    assert "final branch changed before approved merge" in source
+
+
 def test_example_passes_static_validation() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
