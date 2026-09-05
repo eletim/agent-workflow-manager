@@ -4,7 +4,9 @@ import codecs
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
 import signal
 import stat
 import subprocess
@@ -13,13 +15,20 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
-from purplemux_client.client import PurpleMuxCLIClient, PurpleMuxRuntime
+from purplemux_client.client import (
+    WORKFLOW_HOST_WORKSPACE_ENV,
+    CreateWorkspaceRequest,
+    PurpleMuxCLIClient,
+    PurpleMuxRuntime,
+    ShellCommandRequest,
+    WorkspaceState,
+)
 from purplemux_client.correlation import RUN_IDENTITY_ENV
 from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.notifier import NotificationResult, TerminalState
@@ -30,6 +39,8 @@ from purplemux_client.preflight import (
     WorkflowValidator,
 )
 from purplemux_client.progress import (
+    EVENT_TOKEN_ENV,
+    EVENT_URL_ENV,
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
     RESOURCE_ACK_FD_ENV,
@@ -53,6 +64,7 @@ ResourceCleanupStatus = Literal[
 ]
 DEFAULT_MAX_PROGRESS_EVENTS = 200
 logger = logging.getLogger(__name__)
+_SHELL_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 @dataclass(frozen=True)
@@ -114,6 +126,7 @@ class ProgressEvent:
     error: str | None = None
     workspace: str | None = None
     tab: str | None = None
+    observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +134,7 @@ class TopologyFinding:
     category: Literal["runtime", "git", "github"]
     status: Literal["passed", "failed", "info"]
     message: str
+    observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,7 +150,7 @@ class DryRunResult:
             "status": self.status,
             "stdout": self.stdout,
             "stderr": self.stderr,
-            "findings": [asdict(item) for item in self.findings],
+            "findings": [_finding_json(item) for item in self.findings],
             "nextMutation": dict(self.next_mutation) if self.next_mutation else None,
         }
 
@@ -228,6 +242,22 @@ class OutputEntry:
     text: str
 
 
+def _progress_json(event: ProgressEvent) -> dict[str, object]:
+    payload = asdict(event)
+    observed_at = payload.pop("observed_at")
+    if observed_at is not None:
+        payload["observedAt"] = observed_at
+    return payload
+
+
+def _finding_json(finding: TopologyFinding) -> dict[str, object]:
+    payload = asdict(finding)
+    observed_at = payload.pop("observed_at")
+    if observed_at is not None:
+        payload["observedAt"] = observed_at
+    return payload
+
+
 @dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
@@ -274,8 +304,8 @@ class RunnerSnapshot:
         ]
         payload.pop("stdout_entries")
         payload.pop("stderr_entries")
-        payload["progress"] = [asdict(event) for event in self.progress]
-        payload["findings"] = [asdict(item) for item in self.findings]
+        payload["progress"] = [_progress_json(event) for event in self.progress]
+        payload["findings"] = [_finding_json(item) for item in self.findings]
         payload["dryRun"] = self.dry_run.as_json() if self.dry_run else None
         payload.pop("dry_run")
         payload["validation"] = [issue.as_json() for issue in self.validation]
@@ -344,8 +374,8 @@ class _RunRecord:
     run_id: int
     cwd: str
     args: tuple[str, ...]
-    process: subprocess.Popen[bytes]
-    process_group_id: int
+    process: subprocess.Popen[bytes] | None
+    process_group_id: int | None
     script_path: Path
     code: str
     outline: tuple[str, ...]
@@ -364,6 +394,11 @@ class _RunRecord:
     attempts: list[RunAttempt] = field(default_factory=list)
     resources: list[RunResource] = field(default_factory=list)
     prompt: PromptExecution | None = None
+    managed_client: PurpleMuxCLIClient | None = None
+    managed_tab_id: str | None = None
+    managed_tab_name: str | None = None
+    credential_path: Path | None = None
+    event_token: str | None = None
 
 
 class PythonRunner:
@@ -379,6 +414,8 @@ class PythonRunner:
         notifier: TerminalNotifier | None = None,
         validator: WorkflowValidator | None = None,
         workflow_cwd: str | os.PathLike[str] | None = None,
+        runtime_factory: Callable[[], PurpleMuxRuntime] = PurpleMuxRuntime,
+        managed_workflows: bool = True,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -400,6 +437,11 @@ class PythonRunner:
         self._next_run_id = 1
         self._correlation_instance = secrets.token_hex(16)
         self._notifier = notifier
+        self._runtime_factory = runtime_factory
+        # The local process host remains only as an explicit deterministic test
+        # harness. Production Workflow runs use the PurpleMux host.
+        self.managed_workflows = managed_workflows
+        self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
         try:
@@ -435,6 +477,17 @@ class PythonRunner:
             dry_run=None,
         )
         self._validator = validator or WorkflowValidator()
+
+    def configure_event_endpoint(self, base_url: str) -> None:
+        """Enable PurpleMux-hosted Workflow execution for an attached HTTP server."""
+        if not base_url.startswith("http://") or "\0" in base_url:
+            raise ValueError("event endpoint must be a local HTTP URL")
+        with self._lock:
+            if self._runs:
+                raise RuntimeError(
+                    "event endpoint must be configured before runs start"
+                )
+            self._event_base_url = base_url.rstrip("/")
 
     def validate(
         self,
@@ -659,6 +712,19 @@ class PythonRunner:
     ) -> int:
         run_id = self._next_run_id
         self._next_run_id += 1
+        if prompt is None and self.managed_workflows:
+            if self._event_base_url is None:
+                raise RuntimeError(
+                    "managed Workflow execution requires an attached event endpoint"
+                )
+            return self._start_managed_workflow(
+                run_id,
+                code,
+                outline=outline,
+                run_cwd=run_cwd,
+                run_args=run_args,
+                child_env=child_env,
+            )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
         process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
@@ -688,6 +754,210 @@ class PythonRunner:
         )
         self._mark_changed()
         return run_id
+
+    def _start_managed_workflow(
+        self,
+        run_id: int,
+        code: str,
+        *,
+        outline: tuple[str, ...],
+        run_cwd: Path,
+        run_args: tuple[str, ...],
+        child_env: Mapping[str, str],
+    ) -> int:
+        script = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", encoding="utf-8", delete=False
+        )
+        try:
+            script.write(code)
+        finally:
+            script.close()
+        script_path = Path(script.name)
+        event_token = secrets.token_urlsafe(32)
+        credential = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".env", encoding="utf-8", delete=False
+        )
+        event_url = f"{self._event_base_url}/api/runs/{run_id}/events"
+        managed_env = dict(child_env)
+        managed_env.pop(PROGRESS_FD_ENV, None)
+        managed_env.pop(RESOURCE_ACK_FD_ENV, None)
+        managed_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
+        managed_env[EVENT_URL_ENV] = event_url
+        managed_env[EVENT_TOKEN_ENV] = event_token
+        managed_env[RUN_IDENTITY_ENV] = self._run_identity(run_id)
+        try:
+            for name, value in sorted(managed_env.items()):
+                if _SHELL_ENV_NAME.fullmatch(name):
+                    credential.write(f"export {name}={shlex.quote(value)}\n")
+            credential.write(f"unset {PROGRESS_FD_ENV} {RESOURCE_ACK_FD_ENV}\n")
+        finally:
+            credential.close()
+        credential_path = Path(credential.name)
+        credential_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        run = _RunRecord(
+            run_id=run_id,
+            cwd=str(run_cwd),
+            args=run_args,
+            process=None,
+            process_group_id=None,
+            script_path=script_path,
+            code=code,
+            outline=outline,
+            progress=deque(maxlen=self._max_progress_events),
+            findings=deque(maxlen=self._max_progress_events),
+            credential_path=credential_path,
+            event_token=event_token,
+        )
+        self._runs[run_id] = run
+        correlation = self._run_identity(run_id)
+        client: PurpleMuxCLIClient | None = None
+        workspace_id: str | None = None
+        created_tab_id: str | None = None
+        result_path: str | None = None
+        try:
+            runtime = self._runtime_factory()
+            workspace = runtime.create_workspace(
+                CreateWorkspaceRequest(
+                    cwd=str(run_cwd),
+                    name=f"Workflow {run_id}",
+                    correlation_id=correlation,
+                )
+            )
+            workspace_id = workspace.id
+            self._register_managed_workspace(run, workspace, correlation)
+            with credential_path.open("a", encoding="utf-8") as credential_stream:
+                credential_stream.write(
+                    f"export {WORKFLOW_HOST_WORKSPACE_ENV}="
+                    f"{shlex.quote(workspace_id)}\n"
+                )
+            client = runtime.workspace(workspace.id)
+
+            def created(tab_id: str, path: str) -> None:
+                nonlocal created_tab_id, result_path
+                created_tab_id = tab_id
+                result_path = path
+
+            command = (
+                f"source {shlex.quote(str(credential_path))} && exec "
+                f"{shlex.join([sys.executable, str(script_path), *run_args])}"
+            )
+            tab_name = f"Workflow {run_id}: Python"
+            created_tab_id = client.start_shell(
+                ShellCommandRequest(
+                    command=command,
+                    cwd=str(run_cwd),
+                    name=tab_name,
+                    correlation_id=correlation,
+                ),
+                on_created=created,
+            )
+            self._attach_managed_shell(
+                run,
+                client,
+                workspace_id,
+                created_tab_id,
+                result_path,
+                f"{tab_name} [awm:{correlation}]",
+            )
+        except MutationOutcomeUnknown as exc:
+            if (
+                client is None
+                or workspace_id is None
+                or created_tab_id is None
+                or result_path is None
+            ):
+                self._fail_managed_launch(run, exc)
+                return run_id
+            self._attach_managed_shell(
+                run,
+                client,
+                workspace_id,
+                created_tab_id,
+                result_path,
+                f"Workflow {run_id}: Python [awm:{correlation}]",
+            )
+        except BaseException as exc:
+            self._fail_managed_launch(run, exc)
+            return run_id
+        wait_thread = threading.Thread(
+            target=self._wait_for_managed_workflow,
+            args=(run,),
+            name=f"python-runner-managed-wait-{run_id}",
+            daemon=True,
+        )
+        self._wait_threads.add(wait_thread)
+        wait_thread.start()
+        self._mark_changed()
+        return run_id
+
+    def _fail_managed_launch(self, run: _RunRecord, exc: BaseException) -> None:
+        run.script_path.unlink(missing_ok=True)
+        if run.credential_path is not None:
+            run.credential_path.unlink(missing_ok=True)
+        run.exit_code = 1
+        run.state = "failed"
+        self._append_output(
+            run, "stderr", f"Workflow launch failed: {exc}\n", lock_held=True
+        )
+        run.attempts.append(RunAttempt(1, "failed", 1))
+        self._mark_changed()
+
+    def _attach_managed_shell(
+        self,
+        run: _RunRecord,
+        client: PurpleMuxCLIClient,
+        workspace_id: str,
+        tab_id: str,
+        result_path: str | None,
+        tab_name: str,
+    ) -> None:
+        if result_path is None:
+            raise RuntimeError("managed shell did not identify its result path")
+        run.managed_client = client
+        run.managed_tab_id = tab_id
+        run.managed_tab_name = tab_name
+        self._register_resource(
+            run,
+            RunResource(
+                "purplemux_tab",
+                tab_id,
+                {
+                    "workspace_id": workspace_id,
+                    "name": tab_name,
+                    "panel_type": "terminal",
+                    "provider": "",
+                },
+            ),
+        )
+        result_dir = Path(result_path).parent
+        self._register_resource(
+            run,
+            RunResource(
+                "managed_shell_result",
+                str(result_dir),
+                {
+                    "result_path": result_path,
+                    "tab_id": tab_id,
+                    "directory_identity": _path_identity(result_dir),
+                },
+            ),
+        )
+
+    def _register_managed_workspace(
+        self, run: _RunRecord, workspace: WorkspaceState, correlation: str
+    ) -> None:
+        self._register_resource(
+            run,
+            RunResource(
+                "purplemux_workspace",
+                workspace.id,
+                {
+                    "name": workspace.name,
+                    "directories": "\n".join(workspace.directories),
+                    "correlation_id": correlation,
+                },
+            ),
+        )
 
     def _run_identity(self, run_id: int) -> str:
         return f"{self._correlation_instance}-{run_id}"
@@ -894,6 +1164,7 @@ class PythonRunner:
         child_env.pop("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", None)
         child_env.pop("PURPLEMUX_RUNNER_REPOSITORY_CONTEXT", None)
         child_env.pop("PURPLEMUX_RUNNER_PENDING_REPOSITORY_CONTEXT", None)
+        child_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
         return run_cwd, run_args, child_env
 
     def _ensure_open(self) -> None:
@@ -908,10 +1179,32 @@ class PythonRunner:
                 run = self._runs[next(reversed(self._runs))]
             else:
                 run = self._get_run(run_id)
-            if run.state != "running" or run.process.poll() is not None:
+            if run.state != "running" or (
+                run.process is not None and run.process.poll() is not None
+            ):
                 return False
             run.stop_requested = True
+            managed_client = run.managed_client
+            managed_tab_id = run.managed_tab_id
 
+        if managed_client is not None and managed_tab_id is not None:
+            try:
+                managed_client.interrupt(managed_tab_id)
+                managed_client.wait_for_shell_completion(
+                    managed_tab_id, self._stop_timeout
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Workflow tab %s did not publish a result after interrupt; "
+                    "closing it: %s",
+                    managed_tab_id,
+                    exc,
+                )
+                try:
+                    managed_client.close_session(managed_tab_id)
+                finally:
+                    self._finish_managed_workflow(run, 130, diagnostic=str(exc))
+            return True
         self._terminate_process_group(run)
         return True
 
@@ -1330,15 +1623,16 @@ class PythonRunner:
             active_runs = tuple(
                 run
                 for run in self._runs.values()
-                if run.state == "running" and run.process.poll() is None
+                if run.state == "running"
+                and (run.process is None or run.process.poll() is None)
             )
             for run in active_runs:
                 run.stop_requested = True
         self._validator.close()
         cleanup_threads = tuple(
             threading.Thread(
-                target=self._terminate_process_group,
-                args=(run,),
+                target=self.stop,
+                args=(run.run_id,),
                 name=f"python-runner-cleanup-{run.run_id}",
                 daemon=True,
             )
@@ -1349,9 +1643,12 @@ class PythonRunner:
         for thread in cleanup_threads:
             thread.join()
         for run in active_runs:
+            if run.process is None:
+                continue
             try:
                 run.process.wait(timeout=self._stop_timeout + 1)
             except subprocess.TimeoutExpired:
+                assert run.process_group_id is not None
                 self._kill_process_group(run.process_group_id)
                 run.process.wait()
         notifier = self._notifier
@@ -1450,14 +1747,9 @@ class PythonRunner:
                     )
                     if value is not None:
                         with self._lock:
-                            event_type, event = value
-                            if event_type == "finding":
-                                run.findings.append(cast(TopologyFinding, event))
-                            elif event_type == "resource":
-                                self._register_resource(run, cast(RunResource, event))
-                            elif event_type == "resource_ownership":
-                                ownership = cast(_ResourceOwnershipEvent, event)
-                                accepted = self._register_owned_resource(run, ownership)
+                            accepted = self._accept_parsed_event(run, value)
+                            if value[0] == "resource_ownership":
+                                ownership = cast(_ResourceOwnershipEvent, value[1])
                                 acknowledgements.write(
                                     json.dumps(
                                         {
@@ -1468,12 +1760,53 @@ class PythonRunner:
                                     ).encode("utf-8")
                                     + b"\n"
                                 )
-                            else:
-                                assert isinstance(event, ProgressEvent)
-                                run.progress.append(event)
                             self._mark_changed()
         except OSError:
             return
+
+    def accept_event(self, run_id: int, token: str, payload: str) -> dict[str, object]:
+        """Accept one authenticated, observation-only event for a running run."""
+        with self._lock:
+            run = self._get_run(run_id)
+            if (
+                run.state != "running"
+                or run.event_token is None
+                or not secrets.compare_digest(token, run.event_token)
+            ):
+                raise PermissionError("run event credential is invalid")
+            parsed = self._parse_runner_event(payload)
+            if parsed is None:
+                raise ValueError("run event is invalid")
+            accepted = self._accept_parsed_event(run, parsed)
+            self._mark_changed()
+            if parsed[0] == "resource_ownership":
+                ownership = cast(_ResourceOwnershipEvent, parsed[1])
+                return {"token": ownership.token, "accepted": accepted}
+            return {"accepted": True}
+
+    @staticmethod
+    def _accepted_at() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+    def _accept_parsed_event(
+        self,
+        run: _RunRecord,
+        parsed: tuple[str, object],
+    ) -> bool:
+        event_type, event = parsed
+        if event_type == "finding":
+            finding = cast(TopologyFinding, event)
+            run.findings.append(replace(finding, observed_at=self._accepted_at()))
+        elif event_type == "resource":
+            self._register_resource(run, cast(RunResource, event))
+        elif event_type == "resource_ownership":
+            return self._register_owned_resource(
+                run, cast(_ResourceOwnershipEvent, event)
+            )
+        else:
+            progress = cast(ProgressEvent, event)
+            run.progress.append(replace(progress, observed_at=self._accepted_at()))
+        return True
 
     @staticmethod
     def _parse_runner_event(
@@ -1702,6 +2035,57 @@ class PythonRunner:
             with self._lock:
                 self._wait_threads.discard(threading.current_thread())
 
+    def _wait_for_managed_workflow(self, run: _RunRecord) -> None:
+        client = run.managed_client
+        tab_id = run.managed_tab_id
+        assert client is not None and tab_id is not None
+        try:
+            client.wait_for_shell_completion(tab_id, 365 * 24 * 60 * 60)
+            result = client.read_shell_result(tab_id)
+            diagnostic = (
+                result.failure_message("Workflow") if result.exit_code != 0 else None
+            )
+            self._finish_managed_workflow(run, result.exit_code, diagnostic=diagnostic)
+        except Exception as exc:
+            self._finish_managed_workflow(
+                run, 130 if run.stop_requested else 1, diagnostic=str(exc)
+            )
+        finally:
+            run.script_path.unlink(missing_ok=True)
+            if run.credential_path is not None:
+                run.credential_path.unlink(missing_ok=True)
+            with self._lock:
+                self._wait_threads.discard(threading.current_thread())
+
+    def _finish_managed_workflow(
+        self, run: _RunRecord, exit_code: int, *, diagnostic: str | None = None
+    ) -> None:
+        with self._lock:
+            if run.state != "running":
+                return
+            run.exit_code = exit_code
+            run.state = (
+                "stopped"
+                if run.stop_requested
+                else "success"
+                if exit_code == 0
+                else "failed"
+            )
+            if diagnostic:
+                self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
+            run.attempts.append(
+                RunAttempt(
+                    number=len(run.attempts) + 1,
+                    state=run.state,
+                    exit_code=exit_code,
+                )
+            )
+            terminal_state = run.state
+            self._mark_changed()
+        self._notify_terminal(
+            run_id=run.run_id, state=terminal_state, exit_code=exit_code
+        )
+
     def _notify_terminal(
         self, *, run_id: int | None, state: RunnerState, exit_code: int
     ) -> None:
@@ -1738,6 +2122,8 @@ class PythonRunner:
 
     def _terminate_process_group(self, run: _RunRecord) -> None:
         process_group_id = run.process_group_id
+        if process_group_id is None:
+            return
         with run.cleanup_lock:
             if not self._process_group_exists(process_group_id):
                 return

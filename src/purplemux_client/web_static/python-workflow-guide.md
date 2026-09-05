@@ -41,16 +41,17 @@ plain Python workflow
   -> PurpleMux public CLI/runtime
   -> Codex, Claude, or managed Bash terminal
 
-Runner UI = execute / stop / observe stdout, stderr, process state, and progress
-PurpleMux UI = runtime inspection and manual intervention
+Runner UI = execute / stop / observe state, Progress, Findings, and result
+PurpleMux UI = Workflow/child terminal output, runtime inspection, intervention
 ```
 
 - The Python script owns sequencing, branching, retry limits, prompts, Git
   constraints, success criteria, and cleanup policy.
 - `purplemux_client` is a thin adapter over public `purplemux` CLI commands.
 - PurpleMux owns agent runtime state, launch commands, and workspace directories.
-- The Runner executes one trusted Python process, can stop its process group, and
-  observes output and explicitly emitted progress. It is not a workflow engine.
+- The Runner launches one trusted Python Workflow in a visible PurpleMux Bash
+  tab, stops it through PurpleMux, and observes its structured exit result and
+  explicitly emitted progress. It is not a workflow engine.
 - Never operate tmux directly. Never infer completion or results from terminal
   screen text. Do not assume Graph, Node, Edge, LangGraph, or a workflow DSL.
 - Shell work that should be observable or run in parallel must use
@@ -113,7 +114,8 @@ Workflow must then create or reuse and verify the exact Draft PR before starting
 review. Push and PR creation may be agent conveniences, but are not CodingAgent
 hard postconditions.
 
-The workflow subprocess itself runs from a stable Runner-controlled directory;
+The workflow process itself runs in a PurpleMux Bash tab from a stable
+Runner-controlled directory;
 that directory is not the project and is not editable in Workflow mode. Put
 each workflow argument on its own line in **Arguments**. Lower-level PurpleMux
 workspace/session APIs still accept an explicit `cwd` for direct execution and

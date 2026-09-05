@@ -67,7 +67,7 @@ def test_terminal_result_attempts_exactly_one_notification(
     code: str, expected_state: str, expected_exit_code: int
 ) -> None:
     notifier = RecordingNotifier()
-    runner = PythonRunner(notifier=notifier)
+    runner = PythonRunner(managed_workflows=False, notifier=notifier)
     try:
         run_id = runner.start(code)
         result = _wait_until_finished(runner)
@@ -145,7 +145,7 @@ def test_notify_command_failure_does_not_change_runner_state(
     notifier = RecordingNotifier(
         NotificationResult(True, False, "notify exited with status 2")
     )
-    runner = PythonRunner(notifier=notifier)
+    runner = PythonRunner(managed_workflows=False, notifier=notifier)
     with caplog.at_level(logging.WARNING):
         try:
             runner.start('print("workflow result")')
@@ -191,7 +191,10 @@ def test_notify_failure_diagnostic_does_not_surface_secret(
         encoding="utf-8",
     )
     executable.chmod(0o755)
-    runner = PythonRunner(notifier=NotifyCLI(enabled=True, executable=str(executable)))
+    runner = PythonRunner(
+        managed_workflows=False,
+        notifier=NotifyCLI(enabled=True, executable=str(executable)),
+    )
 
     with caplog.at_level(logging.WARNING):
         try:
@@ -334,7 +337,8 @@ def test_runner_close_reaps_blocking_notification_tree(tmp_path: Path) -> None:
     )
     executable.chmod(0o755)
     runner = PythonRunner(
-        notifier=NotifyCLI(enabled=True, executable=str(executable), timeout=10)
+        managed_workflows=False,
+        notifier=NotifyCLI(enabled=True, executable=str(executable), timeout=10),
     )
     runner.start("")
     _wait_until_finished(runner)

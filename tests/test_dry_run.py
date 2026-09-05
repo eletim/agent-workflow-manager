@@ -47,7 +47,7 @@ def test_static_validation_rejects_raw_filesystem_mutation_facilities(
 def test_dry_run_rejects_raw_open_before_it_can_modify_files(
     tmp_path: Path, source: str
 ) -> None:
-    runner = PythonRunner(workflow_cwd=tmp_path)
+    runner = PythonRunner(managed_workflows=False, workflow_cwd=tmp_path)
     try:
         with pytest.raises(WorkflowDryRunError):
             runner.dry_run(f"WORKFLOW_DRY_RUN = 1\n{source}\n")
@@ -77,7 +77,9 @@ except BaseException:
 finally:
     print("FINALLY")
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         result = runner.dry_run(code)
     finally:
@@ -105,7 +107,9 @@ else:
     )
     print("fabricated future")
 """
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         complete = runner.dry_run(code, args=("read-only",))
         frontier = runner.dry_run(code, args=("mutating",))
@@ -118,7 +122,9 @@ else:
 
 
 def test_dry_run_rejects_ineligible_workflow_without_execution() -> None:
-    runner = PythonRunner()
+    runner = PythonRunner(
+        managed_workflows=False,
+    )
     try:
         with pytest.raises(WorkflowDryRunError):
             runner.dry_run("print('ran')")

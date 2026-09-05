@@ -279,12 +279,15 @@ Workflow-owned resources and have no automatic or explicit Workflow cleanup path
 The generated Python remains an implementation detail rather than an editable or
 historical UI field.
 
-**Workflow** executes arbitrary Python with the current Python
-interpreter and shows stdout, stderr, exit code, and the
-idle/running/success/failed/stopped/validation_failed state. Validate
-performs side-effect-free, best-effort static checks, and Run performs the same
-preflight before creating a process. Stop and server shutdown clean up the
-script's POSIX process group, including child processes.
+**Workflow** executes arbitrary Python with the current Python interpreter in a
+visible PurpleMux-managed Bash tab. PurpleMux terminal output is the detailed
+stdout/stderr inspection surface; AWM shows structured Progress, Findings,
+bounded failure diagnostics, the managed-shell exit code, and the
+idle/running/success/failed/stopped/validation_failed state. Validate remains a
+side-effect-free static check and Dry Run remains a pre-execution local
+inspection. Run performs preflight before creating the PurpleMux workspace and
+tab. Stop uses the public PurpleMux interrupt/result lifecycle, closing the tab
+only if needed to reach a deterministic stopped state.
 
 Failed and stopped runs remain available for inspection, including their output
 and run-owned resources, but are never continued in place. Recovery starts a new
@@ -311,7 +314,7 @@ the most recently created run. `GET /api/events` streams revision-only SSE chang
 notifications; initial load, notifications, and reconnects all reconcile through
 the authoritative read APIs rather than treating the stream as workflow state.
 
-Workflow subprocesses use one stable Runner-controlled directory; it is not a
+Workflow processes use one stable Runner-controlled directory; it is not a
 project selector and is not a Workflow form input. Repository-modifying
 workflows declare their source and base in Python. `prepare_run_repository()`
 validates the remote base, resolves its exact commit, creates a fresh detached

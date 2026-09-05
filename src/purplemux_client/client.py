@@ -174,6 +174,7 @@ _RESULT_STATUSES = {
 }
 _SHELL_DIAGNOSTIC_MAX_LINES = 40
 _SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
+WORKFLOW_HOST_WORKSPACE_ENV = "AGENT_WORKFLOW_MANAGER_HOST_WORKSPACE_ID"
 
 
 def _filesystem_identity(path: str) -> str:
@@ -249,6 +250,24 @@ class PurpleMuxRuntime:
             raise ValueError(f"workspace directory is not a directory: {cwd}")
         if not request.name.strip() or "\0" in request.name:
             raise ValueError("workspace name must be non-empty and contain no nulls")
+        host_workspace_id = os.environ.get(WORKFLOW_HOST_WORKSPACE_ENV)
+        if host_workspace_id:
+            host_workspace = next(
+                (
+                    workspace
+                    for workspace in self.list_workspaces()
+                    if workspace.id == host_workspace_id
+                ),
+                None,
+            )
+            if host_workspace is None:
+                raise WorkerFailure(
+                    "the run-owned Workflow host workspace no longer exists"
+                )
+            if cwd in {
+                os.path.abspath(directory) for directory in host_workspace.directories
+            }:
+                return host_workspace
         correlation_id = request.correlation_id or run_correlation(request.name)
         _validate_correlation(correlation_id)
         correlated_name = f"{request.name} [awm:{correlation_id}]"

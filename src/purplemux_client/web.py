@@ -188,7 +188,16 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             if runner is None or notification_settings is None
             else None
         )
-        self.runner = runner or PythonRunner(notifier=notifier)
+        self.runner = runner or PythonRunner(notifier=notifier, managed_workflows=True)
+        if self.runner.managed_workflows:
+            event_host = bound_event_host = cast(tuple[str, int], self.server_address)[
+                0
+            ]
+            if event_host == "0.0.0.0":
+                bound_event_host = "127.0.0.1"
+            self.runner.configure_event_endpoint(
+                f"http://{bound_event_host}:{self.server_address[1]}"
+            )
         self.notification_settings = notification_settings or NotificationSettings(
             runtime_config=Path(
                 os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")
@@ -379,6 +388,10 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        event_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/events", path)
+        if event_match is not None:
+            self._receive_run_event(int(event_match.group(1)))
+            return
         json_paths = {
             "/api/directories",
             "/api/prompt",
@@ -694,6 +707,38 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
+    def _receive_run_event(self, run_id: int) -> None:
+        if not self.server.is_allowed_host(self.headers.get("Host")):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted host"})
+            return
+        if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON is required"})
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            content_length = -1
+        if content_length < 1 or content_length > 4096:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid event size"})
+            return
+        try:
+            payload = self.rfile.read(content_length).decode("utf-8")
+            result = self.server.runner.accept_event(
+                run_id,
+                self.headers.get("X-AWM-Run-Token", ""),
+                payload,
+            )
+        except RunNotFoundError as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            return
+        except PermissionError:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "invalid run credential"})
+            return
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        self._send_json(HTTPStatus.ACCEPTED, result)
+
     def _is_trusted_request(self, *, require_json: bool) -> bool:
         host = self.headers.get("Host")
         if not self.server.is_allowed_host(host):
@@ -783,7 +828,7 @@ def main() -> None:
     )
     server = RunnerHTTPServer(
         (args.host, args.port),
-        runner=PythonRunner(notifier=notifier),
+        runner=PythonRunner(notifier=notifier, managed_workflows=True),
         notification_settings=notification_settings,
         host_aliases=args.host_aliases,
     )
