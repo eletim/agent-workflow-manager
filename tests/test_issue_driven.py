@@ -138,7 +138,31 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "repo.ensure_pushed(" in code
     assert "github.create_draft_pr(" in code
     assert "reviewer requested changes, but implementer re-evaluated" in code
-    assert "leave the working tree clean" in code
+    assert "Commit every intended source, test, and configuration" in code
+    assert "Push the exact feature branch" in code
+    assert "Create or update exactly one Draft PR" in code
+    assert "Finish with a clean worktree" in code
+    assert "commit SHA and PR number or URL" in code
+    assert "You may push" not in code
+    for prohibited in (
+        "reset, rebase, stash, force-push",
+        "merge the Issue PR",
+        "create unrelated PRs",
+        "discard ambiguous local work",
+    ):
+        assert prohibited in code
+
+
+def test_generated_workflow_has_focused_dirty_worktree_recovery() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
+
+    assert "Your only task is to make the current repository state clean" in code
+    assert "Preserve and commit all intended source, test, and" in code
+    assert ".gitignore entries" in code
+    assert "Remove only clearly disposable generated" in code
+    assert "Do not reinterpret or reimplement the original Issue" in code
+    assert "Do not push, modify PR state, merge, start a review" in code
+    assert "cleanup turn could not safely resolve the worktree" in code
 
 
 def test_generated_post_merge_path_starts_next_issue() -> None:

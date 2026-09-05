@@ -78,6 +78,97 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
 
 
+def test_clean_worktree_does_not_invoke_cleanup_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    require_clean_worktree = workflow["require_clean_worktree"]
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch="feature/issue-116")
+
+    monkeypatch.setitem(
+        require_clean_worktree.__globals__,
+        "run_turn",
+        lambda *args, **kwargs: pytest.fail("clean worktree invoked cleanup turn"),
+    )
+
+    require_clean_worktree(
+        Repository(), object(), "cleanup-tab", context="testing the clean path"
+    )
+
+
+def test_dirty_worktree_gets_focused_cleanup_and_is_rechecked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    require_clean_worktree = workflow["require_clean_worktree"]
+    states = iter(
+        (
+            SimpleNamespace(
+                dirty=True,
+                current_branch="feature/issue-116",
+                status=(" M src/feature.py", "?? build/output.js"),
+            ),
+            SimpleNamespace(
+                dirty=False, current_branch="feature/issue-116", status=()
+            ),
+        )
+    )
+    prompts: list[str] = []
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return next(states)
+
+    monkeypatch.setitem(
+        require_clean_worktree.__globals__,
+        "run_turn",
+        lambda *args, **kwargs: prompts.append(str(args[3])) or "cleaned",
+    )
+    monkeypatch.setitem(
+        require_clean_worktree.__globals__, "emit_finding", lambda *args, **kwargs: None
+    )
+
+    require_clean_worktree(
+        Repository(), object(), "cleanup-tab", context="verifying Issue #116"
+    )
+
+    assert len(prompts) == 1
+    assert "Preserve and commit all intended source, test" in prompts[0]
+    assert ".gitignore" in prompts[0]
+    assert "clearly disposable generated" in prompts[0]
+    assert "discard uncertain work" in prompts[0]
+
+
+def test_ambiguous_dirty_worktree_fails_with_remaining_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    require_clean_worktree = workflow["require_clean_worktree"]
+    dirty = SimpleNamespace(
+        dirty=True,
+        current_branch="feature/issue-116",
+        status=(" M src/feature.py", "?? uncertain.txt"),
+    )
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return dirty
+
+    monkeypatch.setitem(
+        require_clean_worktree.__globals__,
+        "run_turn",
+        lambda *args, **kwargs: "uncertain work preserved",
+    )
+
+    with pytest.raises(WorkerFailure, match=r"src/feature.py.*uncertain.txt"):
+        require_clean_worktree(
+            Repository(), object(), "cleanup-tab", context="verifying Issue #116"
+        )
+
+
 def test_example_revalidates_ready_prs_and_preserves_terminal_delivery() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
@@ -105,6 +196,9 @@ def test_ready_issue_pr_is_redrafted_and_independently_reviewed(
     events: list[str] = []
 
     class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
             return BranchState(branch, ready.base_sha, ready.base_sha, True)

@@ -179,6 +179,48 @@ def decision(result: str) -> str:
     return verdict
 
 
+def require_clean_worktree(
+    repo: GitRepository,
+    client: PurpleMuxCLIClient,
+    tab: str,
+    *,
+    context: str,
+    iteration: int | None = None,
+) -> None:
+    state = repo.inspect_worktree()
+    if not state.dirty:
+        return
+    branch = state.current_branch or "detached HEAD"
+    run_turn(
+        client,
+        tab,
+        "Clean worktree",
+        f"""Your only task is to make the current repository state clean and
+correct before {context}. The worktree is on {branch!r}. Inspect Git status and
+every existing diff first. Preserve and commit all intended source, test, and
+configuration changes. Add only narrow, appropriate .gitignore entries for
+generated build or cache artifacts. Remove only clearly disposable generated
+artifacts when safe. Do not reinterpret or reimplement the original Issue.
+
+Do not push, modify PR state, merge, start a review, reset, stash, rebase,
+force, or discard uncertain work. If any dirty path is ambiguous, preserve it
+and clearly explain why it cannot be resolved safely. Finish with a clean
+worktree when safe and return a concise summary of exactly what you committed,
+ignored, removed, or could not resolve.""",
+        iteration=iteration,
+    )
+    remaining = repo.inspect_worktree()
+    if remaining.dirty:
+        details = "; ".join(remaining.status[:10])
+        if len(remaining.status) > 10:
+            details += f"; ... ({len(remaining.status) - 10} more)"
+        raise WorkerFailure(
+            "cleanup turn could not safely resolve the worktree; "
+            f"remaining changes: {details}"
+        )
+    emit_finding("git", f"cleanup turn left {branch!r} clean before {context}")
+
+
 def require_agent_result(
     repo: GitRepository,
     client: PurpleMuxCLIClient,
@@ -190,16 +232,13 @@ def require_agent_result(
     iteration: int | None = None,
 ) -> tuple[str, bool]:
     repo.require_current_branch(branch)
-    if repo.inspect_worktree().dirty:
-        run_turn(
-            client,
-            tab,
-            "Commit agent result",
-            f"""The worktree for {branch} is dirty. Commit every intended change
-and leave it clean. Do not reset, stash, clean, discard, push, change a PR, merge,
-or start another review.""",
-            iteration=iteration,
-        )
+    require_clean_worktree(
+        repo,
+        client,
+        tab,
+        context=f"verifying the coding result on {branch!r}",
+        iteration=iteration,
+    )
     result = repo.require_committed_result(
         branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
     )
@@ -212,10 +251,16 @@ def issue_prompts(issue: Issue, config: Config) -> tuple[str, str]:
     implementation = f"""Implement Issue #{issue.number} in {config.slug} on the
 existing branch {issue.branch}, based on {config.integration_branch}. Read the
 Issue with gh. Inspect existing Git and GitHub state before editing because this
-may be a new recovery run. Edit, test, commit, and leave the working tree clean.
-You may push and create one Draft PR to {config.integration_branch},
-but the Workflow safely completes either omitted delivery step. Never reset,
-force-push, merge, or target {config.main_branch}. Return a concise summary."""
+may be a new recovery run. Implement only the requested Issue and run appropriate
+project tests and checks. Commit every intended source, test, and configuration
+change, leaving none uncommitted or untracked. Push the exact feature branch
+{issue.branch} after committing. Create or update exactly one Draft PR from
+{issue.branch} to {config.integration_branch}. Finish with a clean worktree.
+
+Never reset, rebase, stash, force-push, merge the Issue PR, target
+{config.main_branch}, create unrelated PRs, or discard ambiguous local work.
+Return a concise summary including the commit SHA and PR number or URL when
+available."""
     review = f"""Independently review Issue #{issue.number} and its PR from
 {issue.branch} to {config.integration_branch}. Do not mutate files or PR state.
 Return APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
@@ -370,6 +415,16 @@ def process_issue(
     repo: GitRepository,
     github: GitHubRepository,
 ) -> None:
+    if repo.inspect_worktree().dirty:
+        cleanup = create_agent(
+            client, config, name=f"Issue {issue.number} worktree cleanup"
+        )
+        require_clean_worktree(
+            repo,
+            client,
+            cleanup,
+            context=f"preparing Issue #{issue.number}",
+        )
     prepared = prepare_issue(repo, github, issue, config)
     if prepared is None:
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
