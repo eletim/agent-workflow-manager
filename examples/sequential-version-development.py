@@ -69,7 +69,7 @@ class Config:
 
 @dataclass(frozen=True)
 class ReviewDelivery:
-    outcome: Literal["approved", "continued_with_warning"]
+    outcome: Literal["approved", "continued_with_warning", "review_skipped"]
     head_sha: str
     base_sha: str
 
@@ -991,7 +991,6 @@ def integration_delivery(
         draft=True,
     )
     emit_run_pr(pr.number, pr.url)
-    delivery = ReviewDelivery("approved", pr.head_sha, pr.base_sha)
     if FINAL_REVIEW:
         pr, delivery = run_outline_step(
             "Whole-version review",
@@ -1045,7 +1044,7 @@ def integration_delivery(
             )
         else:
             raise WorkerFailure("final checks kept changing the integration branch")
-        delivery = ReviewDelivery("approved", pr.head_sha, pr.base_sha)
+        delivery = ReviewDelivery("review_skipped", pr.head_sha, pr.base_sha)
 
     def finalize() -> PullRequestState:
         if delivery.outcome == "continued_with_warning":

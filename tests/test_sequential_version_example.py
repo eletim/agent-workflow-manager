@@ -929,6 +929,71 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     )
 
 
+def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["integration_delivery"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    draft = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    outcomes: list[str] = []
+    events: list[str] = []
+    review_delivery = workflow["ReviewDelivery"]
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.base_sha, draft.base_sha, False)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def require_committed_result(
+            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+        ) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return draft if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return draft
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            events.append(f"ready:{kwargs['expected_head_sha']}")
+            return replace(draft, is_draft=False)
+
+    def record_delivery(outcome: str, head_sha: str, base_sha: str):
+        outcomes.append(outcome)
+        return review_delivery(outcome, head_sha, base_sha)
+
+    monkeypatch.setitem(workflow_globals, "FINAL_REVIEW", False)
+    monkeypatch.setitem(workflow_globals, "ReviewDelivery", record_delivery)
+    monkeypatch.setitem(
+        workflow_globals,
+        "run_final_checks",
+        lambda *args: events.append("final checks"),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "review_whole_version",
+        lambda *args: pytest.fail("disabled final review must not run"),
+    )
+
+    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+
+    assert result.is_draft is False
+    assert outcomes == ["review_skipped"]
+    assert events == ["final checks", f"ready:{draft.head_sha}"]
+
+
 def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
