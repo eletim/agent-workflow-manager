@@ -302,12 +302,16 @@ class NotificationSettings:
             validated = cls._server(value)
         except SettingsValidationError:
             return None
-        hostname = urlparse(validated).hostname
+        parsed = urlparse(validated)
+        hostname = parsed.hostname
         if hostname is None or "%" in hostname:
             return None
+        bracketed = parsed.netloc.startswith("[")
         try:
             ipaddress.ip_address(hostname)
         except ValueError:
+            if bracketed:
+                return None
             try:
                 ascii_hostname = hostname.encode("idna").decode("ascii")
             except UnicodeError:

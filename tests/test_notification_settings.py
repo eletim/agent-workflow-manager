@@ -301,6 +301,7 @@ def test_server_url_round_trip_rejects_backslash_and_supports_mapped_loopback(
         "https://user%40example.com",
         "https://bad host.example",
         "https://999.1.1.1",
+        "https://[v1.foo]",
     ],
 )
 def test_malformed_hostname_is_never_returned_as_a_server_link(
