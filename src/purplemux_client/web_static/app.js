@@ -915,12 +915,19 @@ function renderSettings(settings) {
 function renderNotifyServerLink() {
   let serverUrl = null;
   try {
-    const candidate = new URL(notifyServer.value);
+    const value = notifyServer.value;
+    const candidate = new URL(value);
     if (
-      ["http:", "https:"].includes(candidate.protocol)
+      value === value.trim()
+      && value.length <= 2048
+      && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value)
+      && ["http:", "https:"].includes(candidate.protocol)
       && candidate.hostname
       && !candidate.username
       && !candidate.password
+      && !candidate.search
+      && !candidate.hash
+      && (candidate.protocol === "https:" || isLoopbackHttpUrl(value, candidate))
     ) serverUrl = candidate.href;
   } catch (_) {
     // The editable value may be incomplete; the backend validates it on save.
@@ -928,6 +935,20 @@ function renderNotifyServerLink() {
   notifyServerLink.hidden = serverUrl === null;
   if (serverUrl === null) notifyServerLink.removeAttribute("href");
   else notifyServerLink.setAttribute("href", serverUrl);
+}
+
+function isLoopbackHttpUrl(value, candidate) {
+  const match = value.match(/^http:\/\/(\[[^\]]+\]|[^:/?#]+)(?::\d+)?(?:\/|$)/i);
+  if (!match) return false;
+  const hostname = match[1].toLowerCase();
+  if (hostname === "localhost") return true;
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return candidate.hostname === "[::1]";
+  }
+  const octets = hostname.split(".");
+  return octets.length === 4
+    && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255)
+    && Number(octets[0]) === 127;
 }
 
 function showSettingsMessage(message, isError = false) {

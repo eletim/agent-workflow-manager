@@ -396,10 +396,34 @@ test("Notify server link is exposed only for safe HTTP URLs", async () => {
   await server.dispatch("input");
   assert.equal(link.hidden, true);
   assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://notify.example/?token=secret";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://notify.example/#token=secret";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "http://notify.example";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
   server.value = "http://localhost:8080";
   await server.dispatch("input");
   assert.equal(link.hidden, false);
   assert.equal(link.getAttribute("href"), "http://localhost:8080/");
+  server.value = "http://127.0.0.2";
+  await server.dispatch("input");
+  assert.equal(link.hidden, false);
+  assert.equal(link.getAttribute("href"), "http://127.0.0.2/");
+  server.value = "http://127.1";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "http://[0:0:0:0:0:0:0:1]";
+  await server.dispatch("input");
+  assert.equal(link.hidden, false);
+  assert.equal(link.getAttribute("href"), "http://[::1]/");
 });
 
 test("Notifications save reuses the protected settings endpoint", async () => {
