@@ -418,6 +418,7 @@ def load_generated_workflow(**overrides: object) -> dict[str, object]:
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:
+    secret_check_command = "API_TOKEN=sentinel-secret pytest"
     workflow = load_generated_workflow(
         issues=[138], policy_issue=200, reviewer_agent="claude"
     )
@@ -428,7 +429,7 @@ def test_human_handoff_prompt_and_validation_contract() -> None:
         "dev/v0.2.4",
         "main",
         (issue,),
-        "pytest",
+        secret_check_command,
         200,
     )
     pr = PullRequestState(
@@ -457,6 +458,9 @@ def test_human_handoff_prompt_and_validation_contract() -> None:
     assert "gh issue view NUMBER" in prompt
     assert "Issue numbers: 138" in prompt
     assert "environment values, credentials, tokens, or secrets" in prompt
+    assert secret_check_command not in prompt
+    assert "sentinel-secret" not in prompt
+    assert "configured final checks passed on the exact head" in prompt
     assert "quickly answerable\nYes/No observation" in prompt
     assert "do not require terminal\ncommands" in prompt
     assert "state=Ready" in prompt

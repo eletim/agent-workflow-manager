@@ -382,7 +382,7 @@ Authoritative handoff context:
   {config.main_branch} @ {pr.base_sha}
 - Base PR: #{pr.number} {pr.url}; state={"Draft" if pr.is_draft else "Ready"}
 - whole review: outcome={delivery.outcome}, reviews={delivery.reviews}
-- automated verification: `{config.check_command}` passed on the exact head
+- automated verification: configured final checks passed on the exact head
 - {policy}
 - implementation results:
 {issue_lines}
