@@ -804,11 +804,17 @@ Do not infer either kind of PR metadata from output or labels. The workflow's
 structured GitHub result is the source of truth; `emit_run_pr()` and the optional
 `emit_step()` fields only expose that known identity to the current run.
 
+Generated Issue Driven workflows additionally use the specialized
+`emit_issue_driven_context()`, `emit_issue_result()`, and
+`emit_whole_review_result()` observation helpers. These retain narrow final
+facts for the terminal Summary without parsing Progress or stdout. They are not
+a general event store or a workflow control-flow API.
+
 Findings and advanced resource registration use:
 
 ```python
 emit_finding(
-    category,                # "runtime", "git", or "github"
+    category,                # "runtime", "git", "github", or "policy_issue"
     message,
     *,
     status="passed",        # "passed", "warning", "failed", or "info"

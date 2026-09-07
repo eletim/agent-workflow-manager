@@ -263,8 +263,22 @@ a { color: #bcaaff; }
 .outline-item.completed { color: #75e2a8; }
 .outline-item.failed { color: #ff9ca8; }
 
-.integration-pr-panel, .progress-panel { margin-top: 14px; }
+.integration-pr-panel, .issue-summary-panel, .progress-panel { margin-top: 14px; }
 .integration-pr-panel h2 { margin: 0 0 10px; }
+.issue-summary-panel h2 { margin: 0 0 10px; }
+.issue-summary-panel p { margin: 6px 0; overflow-wrap: anywhere; }
+.issue-summary-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 0;
+  list-style: none;
+}
+.issue-summary-item { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 6px; }
+.issue-summary-marker { color: #9ba3b5; text-align: center; }
+.issue-summary-item.approved .issue-summary-marker { color: #75e2a8; }
+.issue-summary-item.continued_with_warning .issue-summary-marker { color: #ffd66b; }
+.issue-summary-warning { margin-top: 3px; color: #ffd66b; font-size: 12px; overflow-wrap: anywhere; }
 .progress-panel h2 { margin: 0 0 10px; }
 .empty-progress { margin: 0; color: #737d91; font-size: 13px; }
 .progress-list {

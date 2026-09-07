@@ -26,8 +26,11 @@ from purplemux_client import (
     ShellCommandRequest,
     WorkerFailure,
     emit_finding,
+    emit_issue_driven_context,
+    emit_issue_result,
     emit_run_pr,
     emit_step,
+    emit_whole_review_result,
     run_correlation,
 )
 
@@ -75,9 +78,11 @@ class Config:
 
 @dataclass(frozen=True)
 class ReviewDelivery:
-    outcome: Literal["approved", "continued_with_warning", "review_skipped"]
+    outcome: Literal["approved", "continued_with_warning", "skipped"]
     head_sha: str
     base_sha: str
+    reviews: int = 0
+    warnings: tuple[str, ...] = ()
 
 
 def parse_args() -> Config:
@@ -292,6 +297,19 @@ def emit_policy_conflicts(
 def encoded_policy_conflict_marker(warning: str) -> str:
     encoded = base64.b64encode(warning.encode("utf-8")).decode("ascii")
     return f"<!-- {POLICY_CONFLICT_PR_MARKER}{encoded} -->"
+
+
+def summary_warnings(
+    issue_number: int | None, additional: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Keep the result event narrow while retaining its primary warnings."""
+    warnings = list(additional)
+    warnings.extend(
+        warning
+        for warning_issue, warning in POLICY_CONFLICT_WARNINGS
+        if warning_issue == issue_number
+    )
+    return tuple(dict.fromkeys(warnings))[:3]
 
 
 def rehydrate_policy_conflicts(
@@ -678,6 +696,14 @@ def process_issue(
     if isinstance(prepared, PullRequestState):
         rehydrate_policy_conflicts(prepared.body, config, issue_number=issue.number)
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
+        emit_issue_result(
+            issue.number,
+            "skipped",
+            0,
+            prepared.number,
+            prepared.url,
+            warnings=summary_warnings(issue.number),
+        )
         return prepared
     existing_pr, start_sha, reused_existing_work = prepared
     if existing_pr is not None:
@@ -797,7 +823,9 @@ def process_issue(
         )
         current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
         if decision(result) == "APPROVED":
-            delivery = ReviewDelivery("approved", current.head_sha, current.base_sha)
+            delivery = ReviewDelivery(
+                "approved", current.head_sha, current.base_sha, review_number
+            )
             break
         if review_number == MAX_REVIEWS:
             pr = require_warning_delivery(
@@ -816,7 +844,11 @@ def process_issue(
             print(f"WARN: {warning}", flush=True)
             emit_finding("github", warning, status="warning")
             delivery = ReviewDelivery(
-                "continued_with_warning", current.head_sha, current.base_sha
+                "continued_with_warning",
+                current.head_sha,
+                current.base_sha,
+                review_number,
+                (warning,),
             )
             break
         fix_result = run_turn(
@@ -864,7 +896,11 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             print(f"WARN: {warning}", flush=True)
             emit_finding("git", warning, status="warning")
             delivery = ReviewDelivery(
-                "continued_with_warning", current.head_sha, current.base_sha
+                "continued_with_warning",
+                current.head_sha,
+                current.base_sha,
+                review_number,
+                (warning,),
             )
             break
         pushed = repo.ensure_pushed(issue.branch, expected_local_sha=fixed_sha)
@@ -889,6 +925,7 @@ and leave the worktree clean. If no change is warranted, leave it clean and
         expected_base=config.integration_branch,
         expected_base_sha=delivery.base_sha,
     )
+    warnings = summary_warnings(issue.number, delivery.warnings)
     if not MERGE_TO_INTEGRATION:
         qualifier = (
             "Approved"
@@ -896,6 +933,14 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             else "Unapproved warning-continuation"
         )
         print(f"{qualifier} Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
+        emit_issue_result(
+            issue.number,
+            delivery.outcome,
+            delivery.reviews,
+            pr.number,
+            pr.url,
+            warnings=warnings,
+        )
         return pr
     merged = merge_pr_and_advance(
         repo,
@@ -908,6 +953,14 @@ and leave the worktree clean. If no change is warranted, leave it clean and
     )
     qualifier = "approved" if delivery.outcome == "approved" else "unapproved"
     print(f"Merged {qualifier} Issue #{issue.number} PR: {merged.pr.url}", flush=True)
+    emit_issue_result(
+        issue.number,
+        delivery.outcome,
+        delivery.reviews,
+        merged.pr.number,
+        merged.pr.url,
+        warnings=warnings,
+    )
     return merged.pr
 
 
@@ -1092,7 +1145,9 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             )
             continue
         if warning is None:
-            delivery = ReviewDelivery("approved", current.head_sha, current.base_sha)
+            delivery = ReviewDelivery(
+                "approved", current.head_sha, current.base_sha, review_number
+            )
         else:
             pr = require_warning_delivery(
                 repo,
@@ -1106,7 +1161,11 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             print(f"WARN: {warning}", flush=True)
             emit_finding("github", warning, status="warning")
             delivery = ReviewDelivery(
-                "continued_with_warning", current.head_sha, current.base_sha
+                "continued_with_warning",
+                current.head_sha,
+                current.base_sha,
+                review_number,
+                (warning,),
             )
         break
     if delivery is None:
@@ -1155,6 +1214,11 @@ def integration_delivery(
             f"{integration.remote_sha}",
         )
         emit_run_pr(merged_pr.number, merged_pr.url)
+        emit_whole_review_result(
+            "skipped",
+            0,
+            warnings=summary_warnings(None),
+        )
         if FINAL_REVIEW:
             emit_step(
                 "Whole-version review",
@@ -1253,7 +1317,13 @@ def integration_delivery(
             )
         else:
             raise WorkerFailure("final checks kept changing the integration branch")
-        delivery = ReviewDelivery("review_skipped", pr.head_sha, pr.base_sha)
+        delivery = ReviewDelivery("skipped", pr.head_sha, pr.base_sha, 0)
+
+    emit_whole_review_result(
+        delivery.outcome,
+        delivery.reviews,
+        warnings=summary_warnings(None, delivery.warnings),
+    )
 
     def finalize() -> PullRequestState:
         if delivery.outcome == "continued_with_warning":
@@ -1292,6 +1362,12 @@ def integration_delivery(
 
 def main() -> None:
     config = parse_args()
+    emit_issue_driven_context(
+        config.slug,
+        config.integration_branch,
+        config.main_branch,
+        policy_issue=config.policy_issue,
+    )
     repo = GitRepository.open(
         config.repo,
         expected_github_slug=config.slug,

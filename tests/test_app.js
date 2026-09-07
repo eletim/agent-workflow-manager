@@ -108,6 +108,7 @@ function snapshot({
   mode = undefined,
   prompt = undefined,
   integrationPr = null,
+  issueDrivenSummary = null,
   hasWarnings = false,
 }) {
   const result = {
@@ -135,6 +136,7 @@ function snapshot({
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
     integrationPr,
+    issueDrivenSummary,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -211,6 +213,9 @@ async function loadApp({
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
+    "issue-summary-panel", "issue-summary-context", "issue-summary-terminal",
+    "issue-summary-list", "issue-summary-whole", "issue-summary-base",
+    "issue-summary-policy", "issue-summary-warnings",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
@@ -241,6 +246,7 @@ async function loadApp({
   const document = {
     body: new Element(),
     createElement() { return new Element(); },
+    createTextNode(text) { return {textContent: text}; },
     execCommand() { return true; },
     querySelector(selector) { return elements[selector.slice(1)]; },
   };
@@ -1358,6 +1364,49 @@ test("selected run renders authoritative run and Progress PR links", async () =>
     elements.progress.children[1].children[1].children[0].children[1].textContent,
     "PR #132",
   );
+});
+
+test("terminal Issue Driven Summary renders structured outcomes and clears for New Run", async () => {
+  const issueDrivenSummary = {
+    repository: "acme/project",
+    integrationBranch: "dev/v1",
+    finalBranch: "main",
+    terminalResult: "success",
+    warningCount: 1,
+    policyIssue: 9,
+    issues: [
+      {
+        issue: 10,
+        outcome: "continued_with_warning",
+        reviews: 5,
+        pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+        warnings: ["review limit reached"],
+      },
+    ],
+    wholeReview: {outcome: "approved", reviews: 2, warnings: []},
+    basePr: {number: 50, url: "https://github.com/acme/project/pull/50"},
+  };
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    issueDrivenSummary,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["issue-summary-panel"].hidden, false);
+  assert.equal(elements["issue-summary-list"].children.length, 1);
+  assert.match(elements["issue-summary-whole"].textContent, /APPROVED \(2 reviews\)/);
+  assert.equal(elements["issue-summary-warnings"].textContent, "Warnings: 1");
+  assert.equal(elements["issue-summary-base"].children[1].textContent, "#50");
+  assert.equal(elements["issue-summary-policy"].children[1].textContent, "#9");
+
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["issue-summary-panel"].hidden, true);
 });
 
 test("validation displays a valid draft outline before execution", async () => {
