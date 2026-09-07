@@ -265,11 +265,26 @@ function renderCleanDraftState() {
   issueDrivenValidation.replaceChildren();
 }
 
+function runPresentation(run) {
+  if (run.state === "success" && run.hasWarnings) {
+    return {label: "⚠ Success with warnings", visualState: "success-with-warnings"};
+  }
+  const presentations = {
+    running: {label: "● Running", visualState: "running"},
+    success: {label: "✓ Success", visualState: "success"},
+    failed: {label: "✕ Failed", visualState: "failed"},
+    stopped: {label: "■ Stopped", visualState: "stopped"},
+  };
+  return presentations[run.state]
+    || {label: run.state.replaceAll("_", " "), visualState: run.state};
+}
+
 function renderRun(result) {
   currentMode = result.mode === "prompt" ? "prompt" : "workflow";
   const running = result.state === "running";
-  statusBadge.textContent = result.state;
-  statusBadge.className = `status ${result.state}`;
+  const presentation = runPresentation(result);
+  statusBadge.textContent = presentation.label;
+  statusBadge.className = `status ${presentation.visualState}`;
   rawStdout = result.stdout;
   rawStderr = result.stderr;
   stdout.textContent = runnerLogDisplay.formatOutputEntries(
@@ -389,13 +404,14 @@ function renderRunList(runs) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
-    button.dataset.state = run.state;
+    const presentation = runPresentation(run);
+    button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
     const mode = run.mode === "prompt" ? "Prompt" : "Workflow";
     const executionRoot = run.mode === "prompt"
       ? run.prompt?.cwd || run.cwd
       : run.executionContext?.executionRoot || "execution context pending";
-    button.textContent = `#${run.runId}  ${mode}  ${run.state}  ${executionRoot}`;
+    button.textContent = `#${run.runId}  ${mode}  ${presentation.label}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";

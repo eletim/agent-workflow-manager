@@ -981,6 +981,62 @@ def test_runner_parses_structured_warning_finding() -> None:
     assert finding == TopologyFinding("github", "warning", "review limit reached")
 
 
+def test_successful_run_aggregates_only_structured_warning_findings() -> None:
+    runner = PythonRunner(managed_workflows=False)
+    try:
+        warning_id = runner.start(
+            """from purplemux_client import emit_finding
+emit_finding("github", "human review required", status="warning")
+print("done")
+"""
+        )
+        warning_result = wait_until_finished(runner)
+        info_id = runner.start(
+            """from purplemux_client import emit_finding
+emit_finding("runtime", "WARN: informational text", status="info")
+print("WARN: stdout text")
+"""
+        )
+        info_result = wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert warning_result.run_id == warning_id
+    assert warning_result.state == "success"
+    assert warning_result.exit_code == 0
+    assert warning_result.has_warnings is True
+    assert warning_result.as_json()["hasWarnings"] is True
+    assert warning_result.as_summary_json()["hasWarnings"] is True
+    assert info_result.run_id == info_id
+    assert info_result.state == "success"
+    assert info_result.has_warnings is False
+    assert info_result.as_json()["hasWarnings"] is False
+    assert info_result.as_summary_json()["hasWarnings"] is False
+
+
+def test_warning_aggregate_survives_finding_eviction_and_run_switching() -> None:
+    runner = PythonRunner(managed_workflows=False, max_progress_events=1)
+    try:
+        warning_id = runner.start(
+            """from purplemux_client import emit_finding
+emit_finding("git", "review required", status="warning")
+emit_finding("git", "later fact", status="passed")
+"""
+        )
+        wait_until_finished(runner)
+        clean_id = runner.start('print("clean")')
+        wait_until_finished(runner)
+
+        warning_result = runner.snapshot(warning_id)
+        clean_result = runner.snapshot(clean_id)
+    finally:
+        runner.close()
+
+    assert [finding.status for finding in warning_result.findings] == ["passed"]
+    assert warning_result.has_warnings is True
+    assert clean_result.has_warnings is False
+
+
 def test_output_is_bounded_and_reports_truncation() -> None:
     runner = PythonRunner(managed_workflows=False, max_output_chars=20)
     try:
@@ -1541,6 +1597,7 @@ def test_runner_http_lifecycle(
         "dryRunIssues": [],
         "executionContext": None,
         "findings": [],
+        "hasWarnings": False,
         "exitCode": 0,
         "runId": 1,
         "integrationPr": None,
