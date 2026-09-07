@@ -1224,9 +1224,9 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
             events.append(f"ready:{kwargs['expected_head_sha']}")
             return replace(draft, is_draft=False)
 
-    def record_delivery(outcome: str, head_sha: str, base_sha: str):
+    def record_delivery(outcome: str, head_sha: str, base_sha: str, reviews: int = 0):
         outcomes.append(outcome)
-        return review_delivery(outcome, head_sha, base_sha)
+        return review_delivery(outcome, head_sha, base_sha, reviews)
 
     monkeypatch.setitem(workflow_globals, "FINAL_REVIEW", False)
     monkeypatch.setitem(workflow_globals, "ReviewDelivery", record_delivery)
@@ -1244,7 +1244,7 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
     result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
 
     assert result.is_draft is False
-    assert outcomes == ["review_skipped"]
+    assert outcomes == ["skipped"]
     assert events == ["final checks", f"ready:{draft.head_sha}"]
 
 

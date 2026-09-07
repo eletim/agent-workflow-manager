@@ -145,10 +145,34 @@ class PullRequestNavigation:
 
 @dataclass(frozen=True)
 class TopologyFinding:
-    category: Literal["runtime", "git", "github"]
+    category: Literal["runtime", "git", "github", "policy_issue"]
     status: Literal["passed", "warning", "failed", "info"]
     message: str
     observed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class IssueResult:
+    issue: int
+    outcome: Literal["approved", "continued_with_warning", "skipped"]
+    reviews: int
+    pr: PullRequestNavigation
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WholeReviewResult:
+    outcome: Literal["approved", "continued_with_warning", "skipped"]
+    reviews: int
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class IssueDrivenContext:
+    repository: str
+    integration_branch: str
+    final_branch: str
+    policy_issue: int | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +329,10 @@ class RunnerSnapshot:
     code: str | None = None
     prompt: PromptExecution | None = None
     integration_pr: PullRequestNavigation | None = None
+    warning_count: int = 0
+    issue_driven_context: IssueDrivenContext | None = None
+    issue_results: tuple[IssueResult, ...] = ()
+    whole_review_result: WholeReviewResult | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -316,6 +344,11 @@ class RunnerSnapshot:
         payload["runId"] = payload.pop("run_id")
         integration_pr = payload.pop("integration_pr")
         payload["integrationPr"] = integration_pr
+        payload["warningCount"] = payload.pop("warning_count")
+        payload.pop("issue_driven_context")
+        payload.pop("issue_results")
+        payload.pop("whole_review_result")
+        payload["issueDrivenSummary"] = self._issue_driven_summary_json()
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -353,6 +386,41 @@ class RunnerSnapshot:
         )
         return payload
 
+    def _issue_driven_summary_json(self) -> dict[str, object] | None:
+        context = self.issue_driven_context
+        if context is None or self.state in ("idle", "running", "validation_failed"):
+            return None
+        issues = [
+            {
+                "issue": result.issue,
+                "outcome": result.outcome,
+                "reviews": result.reviews,
+                "pr": result.pr.as_json(),
+                "warnings": list(result.warnings),
+            }
+            for result in self.issue_results
+        ]
+        whole_review = self.whole_review_result
+        return {
+            "repository": context.repository,
+            "integrationBranch": context.integration_branch,
+            "finalBranch": context.final_branch,
+            "terminalResult": self.state,
+            "warningCount": self.warning_count,
+            "policyIssue": context.policy_issue,
+            "issues": issues,
+            "wholeReview": (
+                {
+                    "outcome": whole_review.outcome,
+                    "reviews": whole_review.reviews,
+                    "warnings": list(whole_review.warnings),
+                }
+                if whole_review is not None
+                else None
+            ),
+            "basePr": self.integration_pr.as_json() if self.integration_pr else None,
+        }
+
     def as_summary_json(self) -> dict[str, object]:
         execution_context = self._execution_context_json()
         payload: dict[str, object] = {
@@ -365,6 +433,7 @@ class RunnerSnapshot:
             "args": list(self.args),
             "attempts": len(self.attempts),
             "hasWarnings": self.has_warnings,
+            "warningCount": self.warning_count,
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
         }
@@ -418,6 +487,7 @@ class _RunRecord:
     progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     has_warnings: bool = False
+    warning_count: int = 0
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     attempts: list[RunAttempt] = field(default_factory=list)
     resources: list[RunResource] = field(default_factory=list)
@@ -428,6 +498,9 @@ class _RunRecord:
     credential_path: Path | None = None
     event_token: str | None = None
     integration_pr: PullRequestNavigation | None = None
+    issue_driven_context: IssueDrivenContext | None = None
+    issue_results: dict[int, IssueResult] = field(default_factory=dict)
+    whole_review_result: WholeReviewResult | None = None
 
 
 class PythonRunner:
@@ -1192,6 +1265,10 @@ class PythonRunner:
             resources=tuple(run.resources),
             prompt=run.prompt,
             integration_pr=run.integration_pr,
+            warning_count=run.warning_count,
+            issue_driven_context=run.issue_driven_context,
+            issue_results=tuple(run.issue_results.values()),
+            whole_review_result=run.whole_review_result,
         )
 
     def _get_run(self, run_id: int) -> _RunRecord:
@@ -1872,6 +1949,7 @@ class PythonRunner:
             run.findings.append(replace(finding, observed_at=self._accepted_at()))
             if finding.status == "warning":
                 run.has_warnings = True
+                run.warning_count += 1
         elif event_type == "resource":
             self._register_resource(run, cast(RunResource, event))
         elif event_type == "resource_ownership":
@@ -1880,6 +1958,13 @@ class PythonRunner:
             )
         elif event_type == "run_pr":
             run.integration_pr = cast(PullRequestNavigation, event)
+        elif event_type == "issue_driven_context":
+            run.issue_driven_context = cast(IssueDrivenContext, event)
+        elif event_type == "issue_result":
+            issue_result = cast(IssueResult, event)
+            run.issue_results[issue_result.issue] = issue_result
+        elif event_type == "whole_review_result":
+            run.whole_review_result = cast(WholeReviewResult, event)
         else:
             progress = cast(ProgressEvent, event)
             accepted = replace(progress, observed_at=self._accepted_at())
@@ -1899,6 +1984,9 @@ class PythonRunner:
                 "resource",
                 "resource_ownership",
                 "run_pr",
+                "issue_driven_context",
+                "issue_result",
+                "whole_review_result",
             ],
             object,
         ]
@@ -1916,13 +2004,16 @@ class PythonRunner:
             status = value.get("status")
             message = value.get("message")
             if (
-                category in ("runtime", "git", "github")
+                category in ("runtime", "git", "github", "policy_issue")
                 and status in ("passed", "warning", "failed", "info")
                 and isinstance(message, str)
                 and message.strip()
             ):
                 return "finding", TopologyFinding(
-                    cast(Literal["runtime", "git", "github"], category),
+                    cast(
+                        Literal["runtime", "git", "github", "policy_issue"],
+                        category,
+                    ),
                     cast(Literal["passed", "warning", "failed", "info"], status),
                     message,
                 )
@@ -1980,6 +2071,69 @@ class PythonRunner:
             if not PythonRunner._valid_pr_navigation(pr_number, pr_url):
                 return None
             return "run_pr", PullRequestNavigation(pr_number, pr_url)
+        if event_type == "issue_driven_context":
+            repository = value.get("repository")
+            integration_branch = value.get("integration_branch")
+            final_branch = value.get("final_branch")
+            policy_issue = value.get("policy_issue")
+            if any(
+                not isinstance(item, str) or not item.strip()
+                for item in (repository, integration_branch, final_branch)
+            ) or (
+                policy_issue is not None
+                and (
+                    isinstance(policy_issue, bool)
+                    or not isinstance(policy_issue, int)
+                    or policy_issue < 1
+                )
+            ):
+                return None
+            return "issue_driven_context", IssueDrivenContext(
+                cast(str, repository),
+                cast(str, integration_branch),
+                cast(str, final_branch),
+                cast(int | None, policy_issue),
+            )
+        if event_type in ("issue_result", "whole_review_result"):
+            outcome = value.get("outcome")
+            reviews = value.get("reviews")
+            warnings = value.get("warnings", [])
+            if (
+                outcome not in ("approved", "continued_with_warning", "skipped")
+                or isinstance(reviews, bool)
+                or not isinstance(reviews, int)
+                or reviews < 0
+                or not isinstance(warnings, list)
+                or any(
+                    not isinstance(item, str) or not item.strip() for item in warnings
+                )
+            ):
+                return None
+            typed_outcome = cast(
+                Literal["approved", "continued_with_warning", "skipped"], outcome
+            )
+            typed_warnings = tuple(cast(list[str], warnings))
+            if event_type == "whole_review_result":
+                return "whole_review_result", WholeReviewResult(
+                    typed_outcome, reviews, typed_warnings
+                )
+            issue = value.get("issue")
+            pr_number = value.get("pr_number")
+            pr_url = value.get("pr_url")
+            if (
+                isinstance(issue, bool)
+                or not isinstance(issue, int)
+                or issue < 1
+                or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
+            ):
+                return None
+            return "issue_result", IssueResult(
+                issue,
+                typed_outcome,
+                reviews,
+                PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
+                typed_warnings,
+            )
         name = value.get("name")
         status = value.get("status")
         if not isinstance(name, str) or not name.strip():

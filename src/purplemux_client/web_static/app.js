@@ -40,6 +40,14 @@ const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
 const integrationPrPanel = document.querySelector("#integration-pr-panel");
 const integrationPr = document.querySelector("#integration-pr");
+const issueSummaryPanel = document.querySelector("#issue-summary-panel");
+const issueSummaryContext = document.querySelector("#issue-summary-context");
+const issueSummaryTerminal = document.querySelector("#issue-summary-terminal");
+const issueSummaryList = document.querySelector("#issue-summary-list");
+const issueSummaryWhole = document.querySelector("#issue-summary-whole");
+const issueSummaryBase = document.querySelector("#issue-summary-base");
+const issueSummaryPolicy = document.querySelector("#issue-summary-policy");
+const issueSummaryWarnings = document.querySelector("#issue-summary-warnings");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
@@ -247,6 +255,7 @@ function renderCleanDraftState() {
   renderOutline([], []);
   renderProgress([]);
   renderIntegrationPr(null);
+  renderIssueDrivenSummary(null);
   renderRecovery({state: "idle", attempts: []});
   renderResources({
     runId: null,
@@ -304,6 +313,7 @@ function renderRun(result) {
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderIntegrationPr(result.integrationPr || null);
+  renderIssueDrivenSummary(result.issueDrivenSummary || null);
   renderRecovery(result);
   renderResources(result);
   renderDryRun(result);
@@ -332,6 +342,73 @@ function renderRun(result) {
     stdout.scrollTop = stdout.scrollHeight;
     stderr.scrollTop = stderr.scrollHeight;
   }
+}
+
+function appendPrLink(container, pr, prefix = "PR ") {
+  container.append(document.createTextNode(prefix));
+  const link = document.createElement("a");
+  link.href = pr.url;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = `#${pr.number}`;
+  container.append(link);
+}
+
+function renderIssueDrivenSummary(summary) {
+  issueSummaryPanel.hidden = summary == null;
+  issueSummaryList.replaceChildren();
+  issueSummaryContext.textContent = "";
+  issueSummaryTerminal.textContent = "";
+  issueSummaryWhole.textContent = "";
+  issueSummaryBase.replaceChildren();
+  issueSummaryPolicy.replaceChildren();
+  issueSummaryWarnings.textContent = "";
+  if (summary == null) return;
+
+  issueSummaryContext.textContent = `${summary.repository} — ${summary.integrationBranch} → ${summary.finalBranch}`;
+  issueSummaryTerminal.textContent = `Run result: ${summary.terminalResult.replaceAll("_", " ")}`;
+  for (const result of summary.issues || []) {
+    const item = document.createElement("li");
+    item.className = `issue-summary-item ${result.outcome}`;
+    const marker = document.createElement("span");
+    marker.className = "issue-summary-marker";
+    marker.textContent = result.outcome === "approved"
+      ? "✓"
+      : (result.outcome === "continued_with_warning" ? "⚠" : "–");
+    const details = document.createElement("div");
+    const line = document.createElement("div");
+    line.append(document.createTextNode(`#${result.issue}  `));
+    appendPrLink(line, result.pr);
+    line.append(document.createTextNode(`  Review ${result.reviews}`));
+    if (result.outcome !== "approved") {
+      line.append(document.createTextNode(`  ${result.outcome.replaceAll("_", " ")}`));
+    }
+    details.append(line);
+    for (const warning of result.warnings || []) {
+      const note = document.createElement("div");
+      note.className = "issue-summary-warning";
+      note.textContent = warning;
+      details.append(note);
+    }
+    item.append(marker, details);
+    issueSummaryList.append(item);
+  }
+  const whole = summary.wholeReview;
+  issueSummaryWhole.textContent = whole == null
+    ? "Whole Review: no final result"
+    : `Whole Review: ${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
+  if (summary.basePr) appendPrLink(issueSummaryBase, summary.basePr, "Base PR: ");
+  else issueSummaryBase.textContent = "Base PR: not recorded";
+  if (summary.policyIssue != null) {
+    issueSummaryPolicy.append(document.createTextNode("Policy Issue: "));
+    const link = document.createElement("a");
+    link.href = `https://github.com/${summary.repository}/issues/${summary.policyIssue}`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = `#${summary.policyIssue}`;
+    issueSummaryPolicy.append(link);
+  }
+  issueSummaryWarnings.textContent = `Warnings: ${summary.warningCount}`;
 }
 
 async function enterDraftMode(mode = currentMode) {

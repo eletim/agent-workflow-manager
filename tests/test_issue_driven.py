@@ -384,6 +384,11 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code
     assert "emit_run_pr(pr.number, pr.url)" in code
+    assert "emit_issue_driven_context(" in code
+    assert "emit_issue_result(" in code
+    assert "emit_whole_review_result(" in code
+    assert '"continued_with_warning"' in code
+    assert '"skipped"' in code
     assert '{"pr_number": pr.number, "pr_url": pr.url}' in code
     assert "Finish with a clean worktree" in code
     assert "commit SHA and PR number or URL" in code

@@ -104,6 +104,15 @@ whole-version review reaches the limit with requested changes, the run may
 complete after exact clean/pushed PR topology checks, but the final PR stays
 Draft for human handoff.
 
+After a run reaches a terminal state, its detail view shows an Issue Driven
+Summary with the repository and branches, each Issue PR and exact completed
+review-turn count, whole-version review outcome, Base PR, policy Issue, and the
+number of structured warning Findings. The generated workflow publishes these
+facts through dedicated result events as they become final. The Runner retains
+them per run independently of the bounded Progress history; the Summary is an
+observation surface and never controls workflow execution. Running workflows
+and the New Run draft do not display a premature or previous-run Summary.
+
 ## Rules for AI authors
 
 - Use the existing source repository path, not a not-yet-created version worktree

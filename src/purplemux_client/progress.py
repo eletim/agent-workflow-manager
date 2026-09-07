@@ -10,8 +10,9 @@ from urllib import error, request
 from urllib.parse import urlparse
 
 StepStatus = Literal["started", "completed", "failed"]
-FindingCategory = Literal["runtime", "git", "github"]
+FindingCategory = Literal["runtime", "git", "github", "policy_issue"]
 FindingStatus = Literal["passed", "warning", "failed", "info"]
+IssueOutcome = Literal["approved", "continued_with_warning", "skipped"]
 RunResourceKind = Literal[
     "purplemux_tab",
     "managed_shell_result",
@@ -83,6 +84,104 @@ def emit_run_pr(pr_number: int, pr_url: str) -> None:
     )
 
 
+def emit_issue_result(
+    issue: int,
+    outcome: IssueOutcome,
+    reviews: int,
+    pr_number: int,
+    pr_url: str,
+    *,
+    warnings: tuple[str, ...] = (),
+) -> None:
+    """Publish one final, structured Issue outcome for the current run."""
+    _validate_positive_number("issue", issue)
+    _validate_outcome(outcome)
+    _validate_review_count(reviews)
+    _validate_pr("issue result", pr_number, pr_url)
+    _validate_warnings(warnings)
+    _write_event(
+        {
+            "type": "issue_result",
+            "issue": issue,
+            "outcome": outcome,
+            "reviews": reviews,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "warnings": list(warnings),
+        }
+    )
+
+
+def emit_whole_review_result(
+    outcome: IssueOutcome,
+    reviews: int,
+    *,
+    warnings: tuple[str, ...] = (),
+) -> None:
+    """Publish the final whole-version review outcome for the current run."""
+    _validate_outcome(outcome)
+    _validate_review_count(reviews)
+    _validate_warnings(warnings)
+    _write_event(
+        {
+            "type": "whole_review_result",
+            "outcome": outcome,
+            "reviews": reviews,
+            "warnings": list(warnings),
+        }
+    )
+
+
+def emit_issue_driven_context(
+    repository: str,
+    integration_branch: str,
+    final_branch: str,
+    *,
+    policy_issue: int | None = None,
+) -> None:
+    """Identify a run as Issue Driven without introducing workflow control state."""
+    for name, value in (
+        ("repository", repository),
+        ("integration_branch", integration_branch),
+        ("final_branch", final_branch),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+    if policy_issue is not None:
+        _validate_positive_number("policy_issue", policy_issue)
+    event: dict[str, str | int] = {
+        "type": "issue_driven_context",
+        "repository": repository,
+        "integration_branch": integration_branch,
+        "final_branch": final_branch,
+    }
+    if policy_issue is not None:
+        event["policy_issue"] = policy_issue
+    _write_event(event)
+
+
+def _validate_positive_number(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be positive")
+
+
+def _validate_outcome(outcome: str) -> None:
+    if outcome not in ("approved", "continued_with_warning", "skipped"):
+        raise ValueError("outcome must be approved, continued_with_warning, or skipped")
+
+
+def _validate_review_count(reviews: int) -> None:
+    if isinstance(reviews, bool) or not isinstance(reviews, int) or reviews < 0:
+        raise ValueError("reviews must be a non-negative integer")
+
+
+def _validate_warnings(warnings: tuple[str, ...]) -> None:
+    if not isinstance(warnings, tuple) or any(
+        not isinstance(item, str) or not item.strip() for item in warnings
+    ):
+        raise TypeError("warnings must be a tuple of non-empty strings")
+
+
 def _validate_pr(context: str, pr_number: int | None, pr_url: str | None) -> None:
     if (pr_number is None) != (pr_url is None):
         raise ValueError(f"{context} PR number and URL must be provided together")
@@ -101,8 +200,10 @@ def emit_finding(
     category: FindingCategory, message: str, *, status: FindingStatus = "passed"
 ) -> None:
     """Publish an observed readiness/topology fact without controlling execution."""
-    if category not in ("runtime", "git", "github"):
-        raise ValueError("finding category must be runtime, git, or github")
+    if category not in ("runtime", "git", "github", "policy_issue"):
+        raise ValueError(
+            "finding category must be runtime, git, github, or policy_issue"
+        )
     if status not in ("passed", "warning", "failed", "info"):
         raise ValueError("finding status must be passed, warning, failed, or info")
     if not isinstance(message, str) or not message.strip():
