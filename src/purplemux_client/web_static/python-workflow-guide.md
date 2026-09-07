@@ -536,8 +536,9 @@ github.merge_pr(
 `state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
-`update_pr_body()` preserves exact open Draft topology and rejects a concurrent
-body change. `merge_pr()` supports only an immediate merge commit and verifies
+`update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
+concurrent body or review-state change. `merge_pr()` supports only an immediate
+merge commit and verifies
 its parents and the resulting base ref; it never queues, squashes, rebases, or
 enables auto-merge.
 

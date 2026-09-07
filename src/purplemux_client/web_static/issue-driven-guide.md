@@ -104,6 +104,13 @@ whole-version review reaches the limit with requested changes, the run may
 complete after exact clean/pushed PR topology checks, but the final PR stays
 Draft for human handoff.
 
+After that delivery state is fixed, the selected reviewer agent gets one prose-only
+turn to create a concise Japanese overview, main-change summary, concrete human
+checklist, and automated-verification summary. A validated managed section is
+then added to the Base PR without changing Draft/Ready state or AWM correlation
+metadata. Agent/validation failures and confirmed-safe update failures are
+structured warnings; an unknown GitHub mutation outcome still fails closed.
+
 After a run reaches a terminal state, its detail view shows an Issue Driven
 Summary with the repository and branches, each Issue PR and exact completed
 review-turn count, whole-version review outcome, Base PR, policy Issue, and the

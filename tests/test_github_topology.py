@@ -7,6 +7,7 @@ from collections.abc import Sequence
 
 import pytest
 
+import purplemux_client.operations as operations
 from purplemux_client import (
     GitHubRepository,
     IncompletePullRequestEnumeration,
@@ -397,8 +398,9 @@ def test_correlated_creation_reconciles_and_concurrent_wrong_base_fails_closed()
         )
 
 
-def test_update_pr_body_preserves_exact_draft_topology() -> None:
-    runner = FakeGitHubRunner([pr_data(1, body="Old")])
+@pytest.mark.parametrize("draft", [True, False])
+def test_update_pr_body_preserves_exact_review_topology(draft: bool) -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old", draft=draft)])
     repo = repository(runner)
 
     updated = repo.update_pr_body(
@@ -411,7 +413,140 @@ def test_update_pr_body_preserves_exact_draft_topology() -> None:
     )
 
     assert updated.body == "New policy context"
+    assert updated.is_draft is draft
     assert any("PATCH" in call for call in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["timeout_after_apply", "malformed_after_apply", "nonzero_after_apply"],
+)
+def test_update_pr_body_reconciles_response_loss(outcome: str) -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old", draft=False)])
+    repo = repository(runner)
+    runner.mutation_outcome = outcome
+
+    updated = repo.update_pr_body(
+        1,
+        body="New handoff",
+        expected_head="feature/65",
+        expected_head_sha=HEAD_SHA,
+        expected_base="dev/v0.1.4",
+        expected_base_sha=BASE_SHA,
+    )
+
+    assert updated.body == "New handoff"
+    assert updated.is_draft is False
+    assert sum("PATCH" in call for call in runner.calls) == 1
+
+
+def test_unchanged_after_possible_body_update_is_unknown() -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old")])
+    repo = repository(runner)
+
+    def timeout_without_apply(
+        args: Sequence[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if "PATCH" in args:
+            raise subprocess.TimeoutExpired(["gh"], 30)
+        return runner(
+            args,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+        )
+
+    repo._runner = timeout_without_apply  # type: ignore[assignment]
+    with pytest.raises(MutationOutcomeUnknown, match="update PR body"):
+        repo.update_pr_body(
+            1,
+            body="New handoff",
+            expected_head="feature/65",
+            expected_head_sha=HEAD_SHA,
+            expected_base="dev/v0.1.4",
+            expected_base_sha=BASE_SHA,
+        )
+
+    assert runner.prs[0]["body"] == "Old"
+
+
+def test_authoritative_body_update_rejection_confirms_unchanged_state() -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old", draft=False)])
+    repo = repository(runner)
+
+    def reject_without_apply(
+        args: Sequence[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if "PATCH" in args:
+            return subprocess.CompletedProcess([], 1, "", "gh: rejected (HTTP 422)")
+        return runner(
+            args,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+        )
+
+    repo._runner = reject_without_apply
+    with pytest.raises(WorkerFailure, match="confirmed_rejected"):
+        repo.update_pr_body(
+            1,
+            body="New handoff",
+            expected_head="feature/65",
+            expected_head_sha=HEAD_SHA,
+            expected_base="dev/v0.1.4",
+            expected_base_sha=BASE_SHA,
+        )
+
+    assert runner.prs[0]["body"] == "Old"
+    assert runner.prs[0]["draft"] is False
+
+
+def test_body_update_honors_dry_run_boundary_without_exposing_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old")])
+    repo = repository(runner)
+    observed: dict[str, object] = {}
+
+    class BoundaryReached(RuntimeError):
+        pass
+
+    def boundary(operation: str, target: str, pre_state: object) -> None:
+        observed.update(operation=operation, target=target, plan=pre_state)
+        raise BoundaryReached
+
+    monkeypatch.setattr(operations, "dry_run_boundary", boundary)
+    with pytest.raises(BoundaryReached):
+        repo.update_pr_body(
+            1,
+            body="secret-free generated handoff",
+            expected_head="feature/65",
+            expected_head_sha=HEAD_SHA,
+            expected_base="dev/v0.1.4",
+            expected_base_sha=BASE_SHA,
+        )
+
+    assert observed["operation"] == "update PR body"
+    assert observed["plan"] == {
+        "kind": "update_pr_body",
+        "repository": "acme/project",
+        "number": 1,
+        "headSha": HEAD_SHA,
+        "baseSha": BASE_SHA,
+    }
+    assert not any("PATCH" in call for call in runner.calls)
 
 
 def test_merge_uses_immediate_endpoint_and_verifies_commit_topology() -> None:

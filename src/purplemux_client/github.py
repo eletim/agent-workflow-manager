@@ -370,7 +370,7 @@ class GitHubRepository:
         expected_base: str,
         expected_base_sha: str,
     ) -> PullRequestState:
-        """Update only an exact open Draft PR body with reconciliation."""
+        """Update only an exact open PR body while preserving its review state."""
         if "\0" in body:
             raise ValueError("PR body must not contain null bytes")
         current = self.require_pr(
@@ -380,7 +380,6 @@ class GitHubRepository:
             state="OPEN",
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
-            draft=True,
         )
         self._require_no_deferred_merge(current)
         if current.body == body:
@@ -394,7 +393,7 @@ class GitHubRepository:
                 state="OPEN",
                 expected_head_sha=expected_head_sha,
                 expected_base_sha=expected_base_sha,
-                draft=True,
+                draft=current.is_draft,
             )
             self._require_no_deferred_merge(latest)
             if latest.body != current.body:
@@ -410,7 +409,7 @@ class GitHubRepository:
                 state="OPEN",
                 expected_head_sha=expected_head_sha,
                 expected_base_sha=expected_base_sha,
-                draft=True,
+                draft=current.is_draft,
             )
             self._require_no_deferred_merge(updated)
             if updated.body != body:
