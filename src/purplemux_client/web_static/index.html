@@ -21,13 +21,14 @@
         </div>
       </header>
 
-      <section class="panel runs-panel" aria-label="Workflow runs">
-        <div class="runs-heading">
-          <h2>Runs</h2>
+      <details id="runs-panel" class="panel runs-panel" open>
+        <summary class="runs-heading">
+          <span class="runs-title">Runs</span>
           <span id="runs-empty">No runs yet.</span>
-        </div>
+          <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
+        </summary>
         <div id="run-list" class="run-list"></div>
-      </section>
+      </details>
 
       <section class="panel editor-panel">
         <div class="mode-switch" role="group" aria-label="Execution mode">

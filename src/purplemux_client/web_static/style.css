@@ -6,8 +6,9 @@
 }
 
 * { box-sizing: border-box; }
+html, body { max-width: 100%; overflow-x: hidden; overflow-x: clip; }
 body { margin: 0; }
-main { width: min(1100px, calc(100% - 40px)); margin: 32px auto; }
+main { width: min(1100px, calc(100% - 40px)); min-width: 0; margin: 32px auto; }
 
 header, .controls, .header-actions, .guide-toolbar, .guide-actions,
 .settings-heading, .settings-actions {
@@ -28,9 +29,17 @@ h2, label { font-size: 14px; font-weight: 650; }
   padding: 16px;
 }
 .runs-panel { margin-bottom: 14px; }
-.runs-heading { display: flex; align-items: center; gap: 12px; }
-.runs-heading h2 { margin: 0; }
+.runs-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+.runs-heading::-webkit-details-marker { display: none; }
+.runs-title { font-size: 14px; font-weight: 650; }
 #runs-empty { color: #737d91; font-size: 13px; }
+.runs-toggle-hint { margin-left: auto; color: #9ba3b5; font-size: 12px; }
 .run-list { display: grid; gap: 7px; margin-top: 10px; }
 .run-item {
   position: relative;
@@ -275,6 +284,7 @@ a { color: #bcaaff; }
   min-width: 0;
 }
 .progress-label { font-size: 14px; line-height: 1.4; }
+.progress-label, .progress-note, .progress-reference { overflow-wrap: anywhere; }
 .progress-pr-link { margin-left: 6px; white-space: nowrap; }
 .progress-time {
   color: #9ba3b5;
@@ -297,6 +307,7 @@ a { color: #bcaaff; }
   grid-template-columns: 1fr 1fr;
   gap: 14px;
 }
+.output-panel { min-width: 0; }
 .output-panel h2 { margin: 0 0 10px; }
 pre {
   min-height: 170px;
@@ -429,12 +440,37 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 
 @media (max-width: 760px) {
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
-  header { align-items: flex-start; }
-  .header-actions { flex-wrap: wrap; justify-content: flex-end; }
+  header { align-items: stretch; flex-direction: column; gap: 4px; }
+  h1 { margin-bottom: 8px; font-size: 24px; }
+  .header-actions { align-self: stretch; display: grid; grid-template-columns: 1fr 1fr; }
+  .header-actions .status { grid-column: 1 / -1; justify-self: start; }
+  .panel { min-width: 0; padding: 12px; }
+  .runs-panel { padding: 0; }
+  .runs-heading { min-height: 48px; padding: 10px 12px; }
+  .runs-panel[open] .runs-heading { border-bottom: 1px solid #303746; }
+  .run-list { max-height: 32vh; margin: 0; padding: 10px 12px; overflow-y: auto; }
+  .mode-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
+  .mode-switch button { min-width: 0; padding-inline: 6px; }
+  .editor-mode-bar { align-items: stretch; flex-direction: column; }
+  .editor-mode-bar #new-run { align-self: stretch; }
+  button, select, input[type="text"], input[type="url"], input[type="password"] { min-height: 44px; }
+  .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .controls button { width: 100%; padding-inline: 8px; }
+  #exit-code { grid-column: 1 / -1; margin-left: 0; }
   .outputs { grid-template-columns: 1fr; }
   .execution-context { grid-template-columns: 1fr; }
   .prompt-options { grid-template-columns: 1fr; }
   textarea { min-height: 330px; }
+  pre { min-height: 140px; max-width: 100%; }
+  .progress-details { grid-template-columns: minmax(0, 1fr); }
+  .progress-time { grid-row: 2; white-space: normal; }
+  .generated-heading { align-items: stretch; flex-direction: column; }
+  dialog { width: calc(100% - 16px); height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); }
+  .guide-toolbar, .directory-picker-toolbar { align-items: flex-start; }
+  .guide-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .directory-picker-navigation { align-items: stretch; flex-direction: column; }
+  .directory-picker-list { height: calc(100% - 220px); }
+  .directory-picker-actions button { width: 100%; }
   .settings-heading { align-items: flex-start; }
   .toggle-grid { grid-template-columns: 1fr 1fr; }
   .readiness-heading, .readiness-controls { align-items: stretch; flex-direction: column; }
@@ -443,4 +479,8 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .notify-server-control { align-items: stretch; flex-direction: column; gap: 8px; }
   .notify-server-control a { align-self: flex-start; padding: 4px 0; }
   .settings-actions { align-items: stretch; flex-direction: column; }
+}
+
+@media (hover: none), (pointer: coarse) {
+  button, summary, a { -webkit-tap-highlight-color: rgb(188 170 255 / 20%); }
 }
