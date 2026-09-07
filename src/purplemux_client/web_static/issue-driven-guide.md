@@ -44,8 +44,8 @@ Incorrect when that version worktree does not already exist:
 
 ## Supported schema
 
-Unknown fields are rejected. `mode`, `implementer_agent`, and `reviewer_agent` are
-optional; every other field is required.
+Unknown fields are rejected. `mode`, `policy_issue`, `implementer_agent`, and
+`reviewer_agent` are optional; every other field is required.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -53,6 +53,7 @@ optional; every other field is required.
 | `repository` | string | Existing source repository path. |
 | `integration_branch` | string | Existing remote/integration branch used as the development base. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
+| `policy_issue` | integer | Optional positive Issue number containing version-wide design context; it must not also appear in `issues`. |
 | `issues` | array of integers | Positive, unique Issue numbers, executed in the listed order. |
 | `max_reviews` | integer | Automatic review/fix iteration limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
@@ -71,6 +72,7 @@ Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
   "repository": "~/DevEnv/agent-workflow-manager",
   "integration_branch": "dev/v0.2.1",
   "final_branch": "main",
+  "policy_issue": 80,
   "issues": [86, 99, 87, 84],
   "max_reviews": 5,
   "implementer_agent": "codex",
@@ -87,6 +89,16 @@ marked Ready after approval and stays Draft after a warning continuation. The
 implementer and reviewer selections are independent. Omitting either agent field
 selects `codex` for that role.
 
+When `policy_issue` is present, implementation, Issue review/fix, and
+whole-version review/fix agents read it first as shared design context. It is not
+interpreted as workflow control or a DSL. A clear conflict with a listed
+implementation Issue is emitted as a structured warning and remains visible for
+human handoff; execution continues with the implementation Issue taking priority.
+The warning is persisted on its child PR (or on the Base PR for whole-version
+findings) and restored during recovery, so whole-version review and Base PR
+handoff retain it even when an already-merged Issue is skipped. The Base PR
+references the policy Issue.
+
 Reviewer approval and warning continuation remain distinct. When the final
 whole-version review reaches the limit with requested changes, the run may
 complete after exact clean/pushed PR topology checks, but the final PR stays
@@ -97,6 +109,8 @@ Draft for human handoff.
 - Use the existing source repository path, not a not-yet-created version worktree
   path.
 - Preserve Issue order exactly as requested.
+- Use `policy_issue` only for shared version design context, never for workflow
+  ordering or conditions, and never repeat it in `issues`.
 - Set `max_reviews` to 5 unless the user explicitly requests another value.
 - Use only `codex` or `claude` for either agent role. Omit an agent field to use
   its `codex` default.
