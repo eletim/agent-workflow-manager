@@ -1761,6 +1761,149 @@ test("New run restores the retained draft unchanged after switching between runs
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
 });
 
+test("New run immediately clears every run-owned surface without changing history", async () => {
+  const executionContext = {
+    executionRoot: "/managed/run-a",
+    baseRef: "origin/dev/v0.2.3",
+    baseSha: "a".repeat(40),
+  };
+  const runA = {
+    ...snapshot({
+      runId: 1,
+      state: "failed",
+      stdout: "A output",
+      attempts: [{number: 1, state: "failed", exitCode: 1}],
+      outline: ["A plan"],
+      progress: [{name: "A plan", status: "failed", error: "A failure"}],
+      resources: [{
+        kind: "purplemux_tab",
+        identity: "tab-a",
+        cleanupState: "retained",
+        cleanupError: null,
+      }],
+      executionContext,
+    }),
+    dryRun: {
+      status: "frontier",
+      findings: [{category: "git", status: "passed", message: "A finding"}],
+      nextMutation: {operation: "push", target: "origin/feature/a", preState: {}},
+    },
+  };
+  const runs = [{runId: 1, state: "failed", cwd: "/work/run-1"}];
+  const details = {1: runA};
+  const {calls, elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {
+      status: 422,
+      body: {
+        error: "workflow validation failed",
+        validation: [{line: 2, column: null, message: "draft failure"}],
+      },
+    },
+  });
+
+  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.stdout.textContent, "A output");
+  assert.equal(elements.progress.children.length, 1);
+  assert.equal(elements["recovery-panel"].hidden, false);
+  assert.equal(elements["resources-panel"].hidden, false);
+  assert.equal(elements["dry-run-panel"].hidden, false);
+
+  const callsBeforeNewRun = calls.length;
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.status.className, "status idle");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements.stderr.textContent, "");
+  assert.equal(elements["output-copy"].disabled, true);
+  assert.equal(elements["exit-code"].textContent, "Exit code: —");
+  assert.equal(elements.progress.children.length, 0);
+  assert.equal(elements["progress-empty"].hidden, false);
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["recovery-panel"].hidden, true);
+  assert.equal(elements["attempt-history"].children.length, 0);
+  assert.equal(elements["resources-panel"].hidden, true);
+  assert.equal(elements.resources.children.length, 0);
+  assert.equal(elements["execution-context-details"].textContent, "");
+  assert.equal(elements["dry-run-panel"].hidden, true);
+  assert.equal(elements["topology-findings"].children.length, 0);
+  assert.equal(elements["next-mutation"].textContent, "No Dry Run result yet.");
+  assert.equal(elements.stop.disabled, true);
+  assert.equal(elements.cleanup.disabled, true);
+  assert.equal(selectedRun(elements), undefined);
+  assert.ok(
+    calls.slice(callsBeforeNewRun)
+      .every(([, method]) => (method || "GET") === "GET"),
+  );
+
+  await elements.validate.dispatch("click");
+  assert.equal(elements["validation-panel"].hidden, false);
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["validation-panel"].hidden, true);
+  assert.equal(elements.validation.children.length, 0);
+
+  eventSource.emit("runner-change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.stdout.textContent, "A output");
+  assert.equal(elements["resources-panel"].hidden, false);
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("Workflow, Prompt, and Issue Driven drafts survive run selection independently", async () => {
+  const runs = [];
+  const details = {};
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  elements["run-arguments"].value = "workflow draft";
+  elements.code.value = "print('workflow draft')";
+  await elements["prompt-mode"].dispatch("click");
+  elements["prompt-agent"].value = "claude-code";
+  elements["prompt-cwd"].value = "/work/prompt-draft";
+  elements["prompt-text"].value = "prompt draft";
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[125]}';
+  elements["issue-driven-python"].value = "# generated issue draft";
+
+  runs.push({runId: 1, state: "success", cwd: "/work/run-1"});
+  details[1] = snapshot({runId: 1, state: "success", stdout: "historical"});
+  eventSource.emit("runner-change");
+  await waitFor(() => runItem(elements, 1) !== undefined);
+  await runItem(elements, 1).dispatch("click");
+
+  await elements["workflow-mode"].dispatch("click");
+  assert.equal(elements["run-arguments"].value, "workflow draft");
+  assert.equal(elements.code.value, "print('workflow draft')");
+  await runItem(elements, 1).dispatch("click");
+
+  await elements["prompt-mode"].dispatch("click");
+  assert.equal(elements["prompt-agent"].value, "claude-code");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-draft");
+  assert.equal(elements["prompt-text"].value, "prompt draft");
+  await runItem(elements, 1).dispatch("click");
+
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["issue-driven-json"].value, '{"issues":[125]}');
+  assert.equal(elements["issue-driven-python"].value, "# generated issue draft");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+});
+
 test("selecting a run never calls a mutating endpoint", async () => {
   const runA = snapshot({runId: 1, state: "success", stdout: "A"});
   const runB = snapshot({
@@ -1790,27 +1933,23 @@ test("Run submission after returning to New run uses the draft, not a viewed run
     runId: 1, state: "success", stdout: "A", cwd: "/work/run-1",
     args: ["a"], code: "print('A')",
   });
+  const runB = snapshot({
+    runId: 2, state: "running", stdout: "B only", cwd: "/tmp/draft-dir",
+    args: ["draft-arg"], code: "print('draft')",
+  });
+  const runs = [{runId: 1, state: "success", cwd: "/work/run-1"}];
+  const details = {1: runA};
   let runRequestBody = null;
   const {elements} = await loadApp({
-    runs: [{runId: 1, state: "success", cwd: "/work/run-1"}],
-    details: {1: runA},
+    runs,
+    details,
     validation: {status: 200, body: {validation: []}},
     fetchOverride(url, options) {
       if (url !== "/api/run") return undefined;
       runRequestBody = JSON.parse(options.body);
-      return response({
-        runId: 2,
-        state: "running",
-        stdout: "",
-        stderr: "",
-        exitCode: null,
-        progress: [],
-        validation: [],
-        cwd: "/tmp/draft-dir",
-        args: ["draft-arg"],
-        code: "print('draft')",
-        attempts: [],
-      });
+      runs.push({runId: 2, state: "running", cwd: runB.cwd});
+      details[2] = runB;
+      return response(runB);
     },
   });
 
@@ -1827,6 +1966,13 @@ test("Run submission after returning to New run uses the draft, not a viewed run
     code: "print('draft')",
     args: ["draft-arg"],
   });
+  assert.match(selectedRun(elements).textContent, /^#2/);
+  assert.equal(elements.stdout.textContent, "B only");
+  assert.equal(elements.code.value, "print('draft')");
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.stdout.textContent, "A");
+  assert.equal(elements.code.value, "print('A')");
 });
 
 test("a delayed run-detail response cannot overwrite fields belonging to a newer selection", async () => {
@@ -1867,6 +2013,42 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
+});
+
+test("a delayed run-detail response cannot repaint New run", async () => {
+  const delayedRun = deferred();
+  let delayRunOne = false;
+  const runOne = snapshot({
+    runId: 1, state: "failed", stdout: "stale A", outline: ["stale A plan"],
+  });
+  const runTwo = snapshot({runId: 2, state: "success", stdout: "run B"});
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "failed", cwd: "/work/run-1"},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: runOne, 2: runTwo},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunOne && url === "/api/runs/1") return delayedRun.promise;
+      return undefined;
+    },
+  });
+
+  delayRunOne = true;
+  const staleSelection = runItem(elements, 1).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+
+  delayedRun.resolve(response(runOne));
+  await staleSelection;
+
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(selectedRun(elements), undefined);
 });
 
 test("New run while already drafting never discards in-progress edits", async () => {
