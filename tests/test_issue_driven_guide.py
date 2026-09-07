@@ -36,6 +36,8 @@ def test_canonical_example_parses_and_uses_recommended_defaults() -> None:
     assert config.issues == (86, 99, 87, 84)
     assert config.max_reviews == 5
     assert config.merge_final is False
+    assert config.implementer_agent == "codex"
+    assert config.reviewer_agent == "claude"
 
 
 def test_documented_fields_exactly_match_the_parser_schema() -> None:
@@ -66,6 +68,8 @@ def test_starter_and_template_use_five_reviews_and_safe_final_delivery() -> None
     example = EXAMPLE.read_text(encoding="utf-8")
 
     assert '"max_reviews": 5' in index
+    assert '"implementer_agent": "codex"' in index
+    assert '"reviewer_agent": "codex"' in index
     assert '"merge_final": false' in index
     assert "MAX_REVIEWS = 5" in example
 

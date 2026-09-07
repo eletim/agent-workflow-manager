@@ -45,6 +45,65 @@ def test_valid_json_preserves_issue_order() -> None:
     assert config.merge_final is False
 
 
+def test_omitted_agents_default_to_codex_and_serialize_explicitly() -> None:
+    config = parse(payload())
+
+    assert config.implementer_agent == "codex"
+    assert config.reviewer_agent == "codex"
+    assert config.as_json()["implementer_agent"] == "codex"
+    assert config.as_json()["reviewer_agent"] == "codex"
+
+
+@pytest.mark.parametrize(
+    ("implementer", "reviewer"),
+    [
+        ("codex", "codex"),
+        ("codex", "claude"),
+        ("claude", "codex"),
+        ("claude", "claude"),
+    ],
+)
+def test_agent_role_combinations_round_trip(implementer: str, reviewer: str) -> None:
+    config = parse(payload(implementer_agent=implementer, reviewer_agent=reviewer))
+
+    assert config.implementer_agent == implementer
+    assert config.reviewer_agent == reviewer
+    assert parse(config.as_json()) == config
+
+
+@pytest.mark.parametrize(
+    ("omitted", "selected"),
+    [("implementer_agent", "reviewer_agent"), ("reviewer_agent", "implementer_agent")],
+)
+def test_each_agent_role_defaults_independently(omitted: str, selected: str) -> None:
+    value = payload()
+    value[selected] = "claude"
+
+    config = parse(value)
+
+    assert getattr(config, omitted) == "codex"
+    assert getattr(config, selected) == "claude"
+
+
+@pytest.mark.parametrize("key", ["implementer_agent", "reviewer_agent"])
+@pytest.mark.parametrize(
+    ("agent", "message"),
+    [("other", "must be one of: codex, claude"), (1, "must be a string")],
+)
+def test_invalid_agent_selection_reports_exact_field_path(
+    key: str, agent: object, message: str
+) -> None:
+    value = payload()
+    value[key] = agent
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        (f"$.{key}", message)
+    ]
+
+
 @pytest.mark.parametrize(
     ("final_review", "maximum"),
     [(True, MAX_OUTLINE_ITEMS - 2), (False, MAX_OUTLINE_ITEMS - 1)],
@@ -149,6 +208,57 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     ]
     assert positions == sorted(positions)
     assert "MAX_REVIEWS = 5" in first
+
+
+@pytest.mark.parametrize(
+    ("implementer", "reviewer"),
+    [
+        ("codex", "codex"),
+        ("codex", "claude"),
+        ("claude", "codex"),
+        ("claude", "claude"),
+    ],
+)
+def test_generated_workflow_selects_role_specific_agents(
+    implementer: str, reviewer: str
+) -> None:
+    code = generate_issue_driven_workflow(
+        parse(payload(implementer_agent=implementer, reviewer_agent=reviewer))
+    )
+
+    assert f"IMPLEMENTER_AGENT = {implementer!r}" in code
+    assert f"REVIEWER_AGENT = {reviewer!r}" in code
+    assert "CreateSessionRequest(agent_type, str(config.repo), agent_type" in code
+
+
+def test_generated_workflow_routes_every_agent_session_by_role() -> None:
+    tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
+    calls: dict[str, str] = {}
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != "create_agent":
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        name = keywords["name"]
+        agent_type = keywords["agent_type"]
+        assert isinstance(agent_type, ast.Name)
+        if isinstance(name, ast.Constant):
+            calls[str(name.value)] = agent_type.id
+        elif isinstance(name, ast.JoinedStr):
+            text = "".join(
+                str(value.value)
+                for value in name.values
+                if isinstance(value, ast.Constant)
+            )
+            calls[text] = agent_type.id
+
+    assert calls == {
+        "Issue  worktree cleanup": "IMPLEMENTER_AGENT",
+        "Issue  implementer": "IMPLEMENTER_AGENT",
+        "Issue  reviewer": "REVIEWER_AGENT",
+        "Whole-version fixer": "IMPLEMENTER_AGENT",
+        "Whole-version reviewer": "REVIEWER_AGENT",
+        "Whole-version cleanup": "IMPLEMENTER_AGENT",
+    }
 
 
 @pytest.mark.parametrize(

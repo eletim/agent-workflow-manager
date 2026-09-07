@@ -68,17 +68,22 @@ executable DSL, and there is no Issue Driven runtime or UI-side control-flow mod
   "final_branch": "main",
   "issues": [90, 89],
   "max_reviews": 5,
+  "implementer_agent": "codex",
+  "reviewer_agent": "claude",
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
 }
 ```
 
-All fields except the optional, fixed `mode` discriminator are required. Issue
-numbers are positive, unique, and retain their array order. Unknown fields are
-rejected so generic actions, conditions, loops, and nested executable blocks cannot
-grow into a second workflow language. With `merge_final: false`, the generated
-final control flow makes the integration PR Ready but contains no final merge call.
+The fixed `mode` discriminator and the two agent fields are optional; every other
+field is required. `implementer_agent` selects implementation, fix, and cleanup
+turns, while `reviewer_agent` selects Issue and whole-version review turns. Each
+accepts `codex` or `claude` and independently defaults to `codex`. Issue numbers
+are positive, unique, and retain their array order. Unknown fields are rejected so
+generic actions, conditions, loops, and nested executable blocks cannot grow into
+a second workflow language. With `merge_final: false`, the generated final control
+flow makes the integration PR Ready but contains no final merge call.
 
 ## Git and GitHub topology operations
 

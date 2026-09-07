@@ -1927,6 +1927,8 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
             "final_branch": "main",
             "issues": [90, 89],
             "max_reviews": 5,
+            "implementer_agent": "claude",
+            "reviewer_agent": "codex",
             "merge_to_integration": True,
             "final_review": True,
             "merge_final": False,
@@ -1944,6 +1946,8 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert status == 200
     assert generated["issueDrivenValidation"] == []
     assert generated["config"]["mode"] == "issue-driven"
+    assert generated["config"]["implementer_agent"] == "claude"
+    assert generated["config"]["reviewer_agent"] == "codex"
     ast.parse(generated["generatedCode"])
 
     status, rejected = request(
