@@ -641,6 +641,101 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     )
 
 
+def test_policy_conflict_from_fixer_is_persisted_after_pushed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](137, "feature/issue-137")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true", 200
+    )
+    base_sha = "integration-head"
+    initial_sha = "implementation-head"
+    fixed_sha = "fixed-head"
+    current_pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=initial_sha,
+        base_sha=base_sha,
+    )
+    persisted_heads: list[str] = []
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, base_sha, base_sha, False)
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert expected_local_sha == fixed_sha
+            return BranchState(branch, fixed_sha, fixed_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            assert number == current_pr.number
+            assert kwargs["expected_head_sha"] == current_pr.head_sha
+            body = str(kwargs["body"])
+            if "agent-workflow-manager:policy-conflict:" in body:
+                persisted_heads.append(current_pr.head_sha)
+            current_pr = replace(current_pr, body=body)
+            return current_pr
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            return replace(current_pr, is_draft=False)
+
+    results = iter(
+        (
+            (initial_sha, False),
+            (initial_sha, False),
+            (fixed_sha, True),
+            (fixed_sha, False),
+        )
+    )
+    review_count = 0
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        nonlocal review_count
+        name = str(args[2])
+        if name.endswith("review"):
+            review_count += 1
+            return "CHANGES_REQUESTED\nfix it" if review_count == 1 else "APPROVED"
+        if name.endswith("fixes"):
+            return "POLICY_CONFLICT: the child requires the legacy API"
+        return "implemented"
+
+    monkeypatch.setitem(
+        workflow_globals,
+        "prepare_issue",
+        lambda *args: (current_pr, initial_sha, True),
+    )
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(results),
+    )
+    monkeypatch.setitem(
+        workflow_globals, "ensure_issue_pr", lambda *args, **kwargs: current_pr
+    )
+    monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+
+    assert persisted_heads
+    assert set(persisted_heads) == {fixed_sha}
+
+
 def test_warning_delivery_fails_closed_when_exact_head_is_not_pushed() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     draft = open_pr(head="feature/issue-134", base="dev/v1", draft=True)

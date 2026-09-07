@@ -261,11 +261,12 @@ starting with {POLICY_CONFLICT_MARKER} that truthfully describes the conflict.
 
 
 def record_policy_conflict(issue_number: int | None, warning: str) -> None:
+    if any(existing == warning for _, existing in POLICY_CONFLICT_WARNINGS):
+        return
     record = (issue_number, warning)
-    if record not in POLICY_CONFLICT_WARNINGS:
-        POLICY_CONFLICT_WARNINGS.append(record)
-        print(f"WARN: {warning}", flush=True)
-        emit_finding("policy_issue", warning, status="warning")
+    POLICY_CONFLICT_WARNINGS.append(record)
+    print(f"WARN: {warning}", flush=True)
+    emit_finding("policy_issue", warning, status="warning")
 
 
 def emit_policy_conflicts(
@@ -293,7 +294,9 @@ def encoded_policy_conflict_marker(warning: str) -> str:
     return f"<!-- {POLICY_CONFLICT_PR_MARKER}{encoded} -->"
 
 
-def rehydrate_policy_conflicts(body: str, config: Config, *, issue_number: int) -> None:
+def rehydrate_policy_conflicts(
+    body: str, config: Config, *, issue_number: int | None
+) -> None:
     if config.policy_issue is None:
         return
     prefix = f"<!-- {POLICY_CONFLICT_PR_MARKER}"
@@ -339,7 +342,8 @@ def policy_pr_notes(config: Config) -> str:
         return ""
     reference = f"https://github.com/{config.slug}/issues/{config.policy_issue}"
     conflict_notes = "".join(
-        f"\n- {warning}" for _, warning in POLICY_CONFLICT_WARNINGS
+        f"\n- {warning}\n{encoded_policy_conflict_marker(warning)}"
+        for _, warning in POLICY_CONFLICT_WARNINGS
     )
     if conflict_notes:
         conflict_notes = f"\n\nPolicy conflict warnings:{conflict_notes}"
@@ -362,8 +366,11 @@ def ensure_base_pr_policy_notes(
         body = f"{body.rstrip()}{policy_pr_notes(config)}"
     else:
         for _, warning in POLICY_CONFLICT_WARNINGS:
-            if warning not in body:
-                body = f"{body.rstrip()}\n\nPolicy conflict warning: {warning}"
+            marker = encoded_policy_conflict_marker(warning)
+            if marker not in body:
+                body = (
+                    f"{body.rstrip()}\n\nPolicy conflict warning: {warning}\n{marker}"
+                )
     return github.update_pr_body(
         pr.number,
         body=body,
@@ -828,7 +835,6 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             scope=f"fixes for Issue #{issue.number}",
             issue_number=issue.number,
         )
-        current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
         fixed_sha, changed = require_agent_result(
             repo,
             client,
@@ -839,6 +845,7 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             iteration=review_number,
         )
         if not changed:
+            current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
             warning = (
                 f"Issue #{issue.number} reviewer requested changes, but the "
                 "implementer re-evaluated the finding and produced no code "
@@ -870,6 +877,7 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             expected_base_sha=current.base_sha,
             draft=True,
         )
+        pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
     if delivery is None:
         raise WorkerFailure(f"Issue #{issue.number} ended without a review outcome")
     pr = github.set_draft(
@@ -955,6 +963,7 @@ def review_whole_version(
             iteration=review_number,
         )
         emit_policy_conflicts(result, config, scope="the integrated version")
+        pr = ensure_base_pr_policy_notes(github, pr, config)
         current = github.require_pr(
             number=pr.number,
             head=config.integration_branch,
@@ -1036,7 +1045,9 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                         expected_base_sha=current.base_sha,
                         draft=True,
                     )
+                    pr = ensure_base_pr_policy_notes(github, pr, config)
                     continue
+                current = ensure_base_pr_policy_notes(github, current, config)
                 warning = (
                     "Whole-version reviewer requested changes, but the fixer "
                     "re-evaluated the findings and produced no code changes; "
@@ -1182,6 +1193,7 @@ def integration_delivery(
         expected_base_sha=main.remote_sha,
         draft=True,
     )
+    rehydrate_policy_conflicts(pr.body, config, issue_number=None)
     pr = ensure_base_pr_policy_notes(github, pr, config)
     emit_run_pr(pr.number, pr.url)
     if FINAL_REVIEW:

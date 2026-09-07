@@ -564,6 +564,135 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
     assert delivered_bodies and warning in delivered_bodies[-1]
 
 
+def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[90], policy_issue=200)))
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    first_run = load_run("generated_whole_policy_first_run")
+    first_config = first_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (),
+        "true",
+        200,
+    )
+    base_pr = PullRequestState(
+        200,
+        "https://example.test/pull/200",
+        "OPEN",
+        True,
+        first_config.slug,
+        first_config.integration_branch,
+        "integration-head",
+        first_config.slug,
+        first_config.main_branch,
+        "main-head",
+        None,
+        False,
+        None,
+        "PR_200",
+        "Sequential integration.",
+    )
+
+    class FirstGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == base_pr.number
+            return replace(base_pr, body=str(kwargs["body"]))
+
+    first_run["emit_finding"] = lambda *args, **kwargs: None
+    first_run["emit_policy_conflicts"](  # type: ignore[operator]
+        "APPROVED\nPOLICY_CONFLICT: integrated features disagree on ownership",
+        first_config,
+        scope="the integrated version",
+    )
+    persisted = first_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
+        FirstGitHub(), base_pr, first_config
+    )
+    assert "agent-workflow-manager:policy-conflict:" in persisted.body
+
+    # Simulate interruption immediately after persistence and start a fresh run.
+    second_run = load_run("generated_whole_policy_second_run")
+    second_config = second_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        first_config.slug,
+        first_config.integration_branch,
+        first_config.main_branch,
+        (),
+        "true",
+        200,
+    )
+    current = persisted
+    findings: list[tuple[str, str, str]] = []
+    reviewer_contexts: list[str] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == second_config.integration_branch
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == second_config.main_branch
+            return BranchState(branch, current.base_sha, current.base_sha, True)
+
+    class SecondGitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return current if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=str(kwargs["body"]))
+            return current
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            current = replace(current, is_draft=False)
+            return current
+
+    integration_globals = second_run["integration_delivery"].__globals__  # type: ignore[attr-defined]
+    integration_globals["emit_finding"] = lambda category, message, status="completed": (
+        findings.append((category, message, status))
+    )
+
+    def recovered_review(*args: object) -> tuple[PullRequestState, object]:
+        context = integration_globals["policy_context"](
+            second_config, scope="the whole-version review"
+        )
+        reviewer_contexts.append(context)
+        delivery = integration_globals["ReviewDelivery"](
+            "approved", current.head_sha, current.base_sha
+        )
+        return current, delivery
+
+    integration_globals["review_whole_version"] = recovered_review
+
+    delivered = second_run["integration_delivery"](  # type: ignore[operator]
+        second_config, object(), Repository(), SecondGitHub()
+    )
+
+    assert delivered.is_draft is False
+    warnings = [message for _, message, status in findings if status == "warning"]
+    assert len(warnings) == 1
+    warning = warnings[0]
+    assert reviewer_contexts and warning in reviewer_contexts[0]
+    assert warning in delivered.body
+
+
 def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
     code = generate_issue_driven_workflow(parse(payload()))
     module_name = "generated_without_policy_issue_workflow"
