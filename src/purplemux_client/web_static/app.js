@@ -38,6 +38,8 @@ const outputCopy = document.querySelector("#output-copy");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
+const integrationPrPanel = document.querySelector("#integration-pr-panel");
+const integrationPr = document.querySelector("#integration-pr");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
@@ -240,6 +242,7 @@ function renderCleanDraftState() {
 
   renderOutline([], []);
   renderProgress([]);
+  renderIntegrationPr(null);
   renderRecovery({state: "idle", attempts: []});
   renderResources({
     runId: null,
@@ -281,6 +284,7 @@ function renderRun(result) {
     || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
+  renderIntegrationPr(result.integrationPr || null);
   renderRecovery(result);
   renderResources(result);
   renderDryRun(result);
@@ -561,7 +565,12 @@ function renderProgress(events) {
   const latest = new Map();
   for (const event of events) {
     const key = JSON.stringify([event.name, event.iteration, event.attempt]);
-    latest.set(key, event);
+    const previous = latest.get(key);
+    latest.set(key, {
+      ...event,
+      pr_number: event.pr_number ?? previous?.pr_number,
+      pr_url: event.pr_url ?? previous?.pr_url,
+    });
   }
 
   progress.replaceChildren();
@@ -590,6 +599,16 @@ function renderProgress(events) {
     }
     details.append(label, timestamp);
 
+    if (event.pr_number && event.pr_url) {
+      const link = document.createElement("a");
+      link.className = "progress-pr-link";
+      link.href = event.pr_url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `PR #${event.pr_number}`;
+      label.append(" ", link);
+    }
+
     const noteText = event.error || event.message;
     if (noteText) {
       const note = document.createElement("div");
@@ -607,6 +626,13 @@ function renderProgress(events) {
     item.append(marker, details);
     progress.append(item);
   }
+}
+
+function renderIntegrationPr(pr) {
+  integrationPrPanel.hidden = !pr;
+  integrationPr.textContent = pr ? `PR #${pr.number}` : "";
+  if (pr) integrationPr.setAttribute("href", pr.url);
+  else integrationPr.removeAttribute("href");
 }
 
 function selectedGuide() {

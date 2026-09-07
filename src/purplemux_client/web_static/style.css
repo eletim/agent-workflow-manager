@@ -248,7 +248,8 @@ a { color: #bcaaff; }
 .outline-item.completed { color: #75e2a8; }
 .outline-item.failed { color: #ff9ca8; }
 
-.progress-panel { margin-top: 14px; }
+.integration-pr-panel, .progress-panel { margin-top: 14px; }
+.integration-pr-panel h2 { margin: 0 0 10px; }
 .progress-panel h2 { margin: 0 0 10px; }
 .empty-progress { margin: 0; color: #737d91; font-size: 13px; }
 .progress-list {
@@ -274,6 +275,7 @@ a { color: #bcaaff; }
   min-width: 0;
 }
 .progress-label { font-size: 14px; line-height: 1.4; }
+.progress-pr-link { margin-left: 6px; white-space: nowrap; }
 .progress-time {
   color: #9ba3b5;
   font-size: 12px;

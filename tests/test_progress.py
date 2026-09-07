@@ -6,6 +6,7 @@ import os
 import pytest
 
 from purplemux_client import (
+    emit_run_pr,
     emit_step,
     register_run_resource,
 )
@@ -28,6 +29,8 @@ def test_emit_step_writes_one_json_event(monkeypatch: pytest.MonkeyPatch) -> Non
             error="tests failed",
             workspace="ws-1",
             tab="tab-1",
+            pr_number=42,
+            pr_url="https://github.com/example/repo/pull/42",
         )
     finally:
         os.close(write_fd)
@@ -44,7 +47,40 @@ def test_emit_step_writes_one_json_event(monkeypatch: pytest.MonkeyPatch) -> Non
         "error": "tests failed",
         "workspace": "ws-1",
         "tab": "tab-1",
+        "pr_number": 42,
+        "pr_url": "https://github.com/example/repo/pull/42",
     }
+
+
+def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_run_pr(17, "https://github.com/example/repo/pull/17")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "run_pr",
+            "pr_number": 17,
+            "pr_url": "https://github.com/example/repo/pull/17",
+        }
+
+
+@pytest.mark.parametrize(
+    ("number", "url"),
+    [
+        (None, "https://github.com/example/repo/pull/1"),
+        (0, "https://github.com/example/repo/pull/0"),
+        (1, "javascript:alert(1)"),
+    ],
+)
+def test_emit_step_rejects_invalid_pr_navigation(
+    number: int | None, url: str | None
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="PR"):
+        emit_step("review", "started", pr_number=number, pr_url=url)
 
 
 def test_emit_step_is_noop_outside_runner(monkeypatch: pytest.MonkeyPatch) -> None:
