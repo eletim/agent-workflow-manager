@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 StepStatus = Literal["started", "completed", "failed"]
 FindingCategory = Literal["runtime", "git", "github"]
-FindingStatus = Literal["passed", "failed", "info"]
+FindingStatus = Literal["passed", "warning", "failed", "info"]
 RunResourceKind = Literal[
     "purplemux_tab",
     "managed_shell_result",
@@ -103,8 +103,8 @@ def emit_finding(
     """Publish an observed readiness/topology fact without controlling execution."""
     if category not in ("runtime", "git", "github"):
         raise ValueError("finding category must be runtime, git, or github")
-    if status not in ("passed", "failed", "info"):
-        raise ValueError("finding status must be passed, failed, or info")
+    if status not in ("passed", "warning", "failed", "info"):
+        raise ValueError("finding status must be passed, warning, failed, or info")
     if not isinstance(message, str) or not message.strip():
         raise ValueError("finding message must be non-empty")
     _write_event(

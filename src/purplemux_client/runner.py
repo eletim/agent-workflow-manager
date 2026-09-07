@@ -146,7 +146,7 @@ class PullRequestNavigation:
 @dataclass(frozen=True)
 class TopologyFinding:
     category: Literal["runtime", "git", "github"]
-    status: Literal["passed", "failed", "info"]
+    status: Literal["passed", "warning", "failed", "info"]
     message: str
     observed_at: str | None = None
 
@@ -1905,13 +1905,13 @@ class PythonRunner:
             message = value.get("message")
             if (
                 category in ("runtime", "git", "github")
-                and status in ("passed", "failed", "info")
+                and status in ("passed", "warning", "failed", "info")
                 and isinstance(message, str)
                 and message.strip()
             ):
                 return "finding", TopologyFinding(
                     cast(Literal["runtime", "git", "github"], category),
-                    cast(Literal["passed", "failed", "info"], status),
+                    cast(Literal["passed", "warning", "failed", "info"], status),
                     message,
                 )
             return None

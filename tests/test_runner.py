@@ -39,6 +39,7 @@ from purplemux_client.runner import (
     RunnerClosedError,
     RunnerSnapshot,
     RunResource,
+    TopologyFinding,
 )
 from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
 
@@ -960,6 +961,24 @@ if result.exit_code != 0:
         "workspace/tab: ws-test / tab-test\n"
     )
     assert event.error.endswith("\n[error truncated]")
+
+
+def test_runner_parses_structured_warning_finding() -> None:
+    parsed = PythonRunner._parse_runner_event(
+        json.dumps(
+            {
+                "type": "finding",
+                "category": "github",
+                "status": "warning",
+                "message": "review limit reached",
+            }
+        )
+    )
+
+    assert parsed is not None
+    kind, finding = parsed
+    assert kind == "finding"
+    assert finding == TopologyFinding("github", "warning", "review limit reached")
 
 
 def test_output_is_bounded_and_reports_truncation() -> None:

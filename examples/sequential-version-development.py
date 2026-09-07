@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -35,7 +36,7 @@ WORKFLOW_OUTLINE = [
     "Inspect authoritative Issue topology",
     "Prepare or reuse the feature branch",
     "Implement and independently review",
-    "Deliver the exact approved Issue topology",
+    "Deliver the exact Issue topology",
     "Review and deliver the whole version",
 ]
 MAX_REVIEWS = 5
@@ -64,6 +65,13 @@ class Config:
     main_branch: str
     issues: tuple[Issue, ...]
     check_command: str
+
+
+@dataclass(frozen=True)
+class ReviewDelivery:
+    outcome: Literal["approved", "continued_with_warning", "review_skipped"]
+    head_sha: str
+    base_sha: str
 
 
 def parse_args() -> Config:
@@ -280,6 +288,43 @@ def require_agent_result(
     assert result.local_sha is not None
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
     return result.local_sha, result.local_sha != previous_sha
+
+
+def require_warning_delivery(
+    repo: GitRepository,
+    github: GitHubRepository,
+    pr: PullRequestState,
+    *,
+    head: str,
+    base: str,
+    expected_head_sha: str,
+    expected_base_sha: str,
+) -> PullRequestState:
+    """Revalidate exact clean, pushed PR topology before unapproved delivery."""
+    pushed = repo.require_pushed(head)
+    if pushed.local_sha != expected_head_sha:
+        raise WorkerFailure(
+            f"warning delivery head changed: expected {expected_head_sha}, "
+            f"found {pushed.local_sha}"
+        )
+    current = github.require_pr(
+        number=pr.number,
+        head=head,
+        base=base,
+        state="OPEN",
+        expected_head_sha=expected_head_sha,
+        expected_base_sha=expected_base_sha,
+        draft=True,
+    )
+    if current.auto_merge_enabled:
+        raise WorkerFailure(
+            f"warning delivery PR #{current.number} has auto-merge enabled"
+        )
+    if current.merge_queue_entry is not None:
+        raise WorkerFailure(
+            f"warning delivery PR #{current.number} has a merge queue entry"
+        )
+    return current
 
 
 def issue_prompts(issue: Issue, config: Config) -> tuple[str, str]:
@@ -523,8 +568,7 @@ def process_issue(
         pr_number=pr.number,
         pr_url=pr.url,
     )
-    approved_head: str | None = None
-    approved_base: str | None = None
+    delivery: ReviewDelivery | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
         result = run_turn(
             client,
@@ -571,9 +615,27 @@ def process_issue(
             )
             continue
         if decision(result) == "APPROVED":
-            approved_head, approved_base = current.head_sha, current.base_sha
+            delivery = ReviewDelivery("approved", current.head_sha, current.base_sha)
             break
         if review_number == MAX_REVIEWS:
+            pr = require_warning_delivery(
+                repo,
+                github,
+                current,
+                head=issue.branch,
+                base=config.integration_branch,
+                expected_head_sha=current.head_sha,
+                expected_base_sha=current.base_sha,
+            )
+            warning = (
+                f"Issue #{issue.number} review limit {MAX_REVIEWS} reached with "
+                "CHANGES_REQUESTED; continuing without reviewer approval."
+            )
+            print(f"WARN: {warning}", flush=True)
+            emit_finding("github", warning, status="warning")
+            delivery = ReviewDelivery(
+                "continued_with_warning", current.head_sha, current.base_sha
+            )
             break
         run_turn(
             client,
@@ -596,12 +658,24 @@ and leave the worktree clean. If no change is warranted, leave it clean and
         )
         if not changed:
             warning = (
-                "WARN: reviewer requested changes, but implementer re-evaluated "
-                "the finding and produced no code changes. Continuing by policy."
+                f"Issue #{issue.number} reviewer requested changes, but the "
+                "implementer re-evaluated the finding and produced no code "
+                "changes; continuing without reviewer approval."
             )
-            print(warning, flush=True)
-            emit_finding("git", warning, status="info")
-            approved_head, approved_base = current.head_sha, current.base_sha
+            pr = require_warning_delivery(
+                repo,
+                github,
+                current,
+                head=issue.branch,
+                base=config.integration_branch,
+                expected_head_sha=current.head_sha,
+                expected_base_sha=current.base_sha,
+            )
+            print(f"WARN: {warning}", flush=True)
+            emit_finding("git", warning, status="warning")
+            delivery = ReviewDelivery(
+                "continued_with_warning", current.head_sha, current.base_sha
+            )
             break
         pushed = repo.ensure_pushed(issue.branch, expected_local_sha=fixed_sha)
         assert pushed.remote_sha is not None
@@ -614,29 +688,35 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             expected_base_sha=current.base_sha,
             draft=True,
         )
-    if approved_head is None or approved_base is None:
-        raise WorkerFailure(f"Issue #{issue.number} ended without approval")
+    if delivery is None:
+        raise WorkerFailure(f"Issue #{issue.number} ended without a review outcome")
     pr = github.set_draft(
         pr.number,
         draft=False,
         expected_head=issue.branch,
-        expected_head_sha=approved_head,
+        expected_head_sha=delivery.head_sha,
         expected_base=config.integration_branch,
-        expected_base_sha=approved_base,
+        expected_base_sha=delivery.base_sha,
     )
     if not MERGE_TO_INTEGRATION:
-        print(f"Approved Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
+        qualifier = (
+            "Approved"
+            if delivery.outcome == "approved"
+            else "Unapproved warning-continuation"
+        )
+        print(f"{qualifier} Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
         return pr
     merged = merge_pr_and_advance(
         repo,
         github,
         number=pr.number,
         head=issue.branch,
-        head_sha=approved_head,
+        head_sha=delivery.head_sha,
         base=config.integration_branch,
-        base_sha=approved_base,
+        base_sha=delivery.base_sha,
     )
-    print(f"Merged approved Issue #{issue.number} PR: {merged.pr.url}", flush=True)
+    qualifier = "approved" if delivery.outcome == "approved" else "unapproved"
+    print(f"Merged {qualifier} Issue #{issue.number} PR: {merged.pr.url}", flush=True)
     return merged.pr
 
 
@@ -664,7 +744,7 @@ def review_whole_version(
     repo: GitRepository,
     github: GitHubRepository,
     pr: PullRequestState,
-) -> tuple[PullRequestState, str, str]:
+) -> tuple[PullRequestState, ReviewDelivery]:
     """Review, fix, and check the whole version as one outline-level phase."""
     fixer = create_agent(
         client,
@@ -678,8 +758,7 @@ def review_whole_version(
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
     )
-    approved_head: str | None = None
-    approved_base: str | None = None
+    delivery: ReviewDelivery | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
         result = run_turn(
             client,
@@ -727,41 +806,54 @@ def review_whole_version(
                 f"approval invalidated at {reviewed_sha}",
             )
             continue
-        if decision(result) == "CHANGES_REQUESTED":
+        verdict = decision(result)
+        warning: str | None = None
+        if verdict == "CHANGES_REQUESTED":
             if review_number == MAX_REVIEWS:
-                break
-            run_turn(
-                client,
-                fixer,
-                "Whole-version fixes",
-                f"""Re-evaluate every finding. If warranted, fix, test, commit,
+                warning = (
+                    f"Whole-version review limit {MAX_REVIEWS} reached with "
+                    "CHANGES_REQUESTED; keeping the Base PR Draft and continuing "
+                    "without reviewer approval."
+                )
+            else:
+                run_turn(
+                    client,
+                    fixer,
+                    "Whole-version fixes",
+                    f"""Re-evaluate every finding. If warranted, fix, test, commit,
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
-                iteration=review_number,
-            )
-            fixed_sha, changed = require_agent_result(
-                repo,
-                client,
-                fixer,
-                config.integration_branch,
-                current.head_sha,
-                allow_unchanged=True,
-                iteration=review_number,
-            )
-            if changed:
-                pushed = repo.ensure_pushed(
-                    config.integration_branch, expected_local_sha=fixed_sha
+                    iteration=review_number,
                 )
-                assert pushed.remote_sha is not None
-                pr = github.require_pr(
-                    number=pr.number,
-                    head=config.integration_branch,
-                    base=config.main_branch,
-                    state="OPEN",
-                    expected_head_sha=pushed.remote_sha,
-                    expected_base_sha=current.base_sha,
-                    draft=True,
+                fixed_sha, changed = require_agent_result(
+                    repo,
+                    client,
+                    fixer,
+                    config.integration_branch,
+                    current.head_sha,
+                    allow_unchanged=True,
+                    iteration=review_number,
                 )
-                continue
+                if changed:
+                    pushed = repo.ensure_pushed(
+                        config.integration_branch, expected_local_sha=fixed_sha
+                    )
+                    assert pushed.remote_sha is not None
+                    pr = github.require_pr(
+                        number=pr.number,
+                        head=config.integration_branch,
+                        base=config.main_branch,
+                        state="OPEN",
+                        expected_head_sha=pushed.remote_sha,
+                        expected_base_sha=current.base_sha,
+                        draft=True,
+                    )
+                    continue
+                warning = (
+                    "Whole-version reviewer requested changes, but the fixer "
+                    "re-evaluated the findings and produced no code changes; "
+                    "keeping the Base PR Draft and continuing without reviewer "
+                    "approval."
+                )
         run_final_checks(client, config)
         checked_sha, checks_changed = require_agent_result(
             repo,
@@ -773,6 +865,11 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             iteration=review_number,
         )
         if checks_changed:
+            if review_number == MAX_REVIEWS:
+                raise WorkerFailure(
+                    "final checks changed the integration branch at the review "
+                    "limit; refusing unreviewed delivery"
+                )
             pushed = repo.ensure_pushed(
                 config.integration_branch, expected_local_sha=checked_sha
             )
@@ -792,11 +889,27 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 f"invalidated at {checked_sha}",
             )
             continue
-        approved_head, approved_base = current.head_sha, current.base_sha
+        if warning is None:
+            delivery = ReviewDelivery("approved", current.head_sha, current.base_sha)
+        else:
+            pr = require_warning_delivery(
+                repo,
+                github,
+                current,
+                head=config.integration_branch,
+                base=config.main_branch,
+                expected_head_sha=current.head_sha,
+                expected_base_sha=current.base_sha,
+            )
+            print(f"WARN: {warning}", flush=True)
+            emit_finding("github", warning, status="warning")
+            delivery = ReviewDelivery(
+                "continued_with_warning", current.head_sha, current.base_sha
+            )
         break
-    if approved_head is None or approved_base is None:
-        raise WorkerFailure("whole-version review ended without approval")
-    return pr, approved_head, approved_base
+    if delivery is None:
+        raise WorkerFailure("whole-version review ended without a review outcome")
+    return pr, delivery
 
 
 def integration_delivery(
@@ -878,9 +991,8 @@ def integration_delivery(
         draft=True,
     )
     emit_run_pr(pr.number, pr.url)
-    approved_head, approved_base = pr.head_sha, pr.base_sha
     if FINAL_REVIEW:
-        pr, approved_head, approved_base = run_outline_step(
+        pr, delivery = run_outline_step(
             "Whole-version review",
             lambda: review_whole_version(config, client, repo, github, pr),
         )
@@ -932,17 +1044,26 @@ def integration_delivery(
             )
         else:
             raise WorkerFailure("final checks kept changing the integration branch")
-        approved_head, approved_base = pr.head_sha, pr.base_sha
-    assert approved_head is not None and approved_base is not None
+        delivery = ReviewDelivery("review_skipped", pr.head_sha, pr.base_sha)
 
     def finalize() -> PullRequestState:
+        if delivery.outcome == "continued_with_warning":
+            return require_warning_delivery(
+                repo,
+                github,
+                pr,
+                head=config.integration_branch,
+                base=config.main_branch,
+                expected_head_sha=delivery.head_sha,
+                expected_base_sha=delivery.base_sha,
+            )
         ready = github.set_draft(
             pr.number,
             draft=False,
             expected_head=config.integration_branch,
-            expected_head_sha=approved_head,
+            expected_head_sha=delivery.head_sha,
             expected_base=config.main_branch,
-            expected_base_sha=approved_base,
+            expected_base_sha=delivery.base_sha,
         )
         if not MERGE_FINAL:
             return ready
@@ -975,7 +1096,12 @@ def main() -> None:
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
     ready = integration_delivery(config, client, repo, github)
-    outcome = "Merged" if ready.state == "MERGED" else "Ready (not merged)"
+    if ready.state == "MERGED":
+        outcome = "Merged"
+    elif ready.is_draft:
+        outcome = "Draft (warning continuation)"
+    else:
+        outcome = "Ready (not merged)"
     print(f"Whole-version PR is {outcome}: {ready.url}", flush=True)
 
 

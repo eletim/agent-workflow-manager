@@ -805,7 +805,7 @@ emit_finding(
     category,                # "runtime", "git", or "github"
     message,
     *,
-    status="passed",        # "passed", "failed", or "info"
+    status="passed",        # "passed", "warning", "failed", or "info"
 )
 register_run_resource(kind, identity, metadata=None)
 ```
