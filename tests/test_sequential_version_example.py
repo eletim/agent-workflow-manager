@@ -90,7 +90,7 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "repo.require_committed_result(" in source
     assert "repo.ensure_pushed(" in source
     assert "run_correlation(" in source
-    assert "MutationOutcomeUnknown" not in source  # helpers raise it internally
+    assert "except MutationOutcomeUnknown:" in source
     assert "existing_pr is not None or reused_existing_work" in source
     assert '"Deliver the exact Issue topology"' in source
     assert "Deliver the exact approved Issue topology" not in source
@@ -952,6 +952,7 @@ def test_ready_final_pr_repeats_review_and_checks(
         "require_review_head",
         "final checks",
         "set_draft:False",
+        "Base PR human handoff",
     ]
 
 

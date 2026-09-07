@@ -14,7 +14,9 @@ from purplemux_client import (
     BranchState,
     GitHubRepository,
     GitRepository,
+    MutationOutcomeUnknown,
     PullRequestState,
+    WorkerFailure,
 )
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
@@ -296,6 +298,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
+        "Base PR human handoff writer": "REVIEWER_AGENT",
     }
 
 
@@ -400,6 +403,267 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
         "discard ambiguous local work",
     ):
         assert prohibited in code
+
+
+def load_generated_workflow(**overrides: object) -> dict[str, object]:
+    code = generate_issue_driven_workflow(parse(payload(**overrides)))
+    module_name = f"generated_handoff_workflow_{len(sys.modules)}"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-handoff-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    return module.__dict__
+
+
+def test_human_handoff_prompt_and_validation_contract() -> None:
+    secret_check_command = "API_TOKEN=sentinel-secret pytest"
+    workflow = load_generated_workflow(
+        issues=[138], policy_issue=200, reviewer_agent="claude"
+    )
+    issue = workflow["Issue"](138, "feature/issue-138")  # type: ignore[operator]
+    config = workflow["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.4",
+        "main",
+        (issue,),
+        secret_check_command,
+        200,
+    )
+    pr = PullRequestState(
+        201,
+        "https://github.com/eletim/agent-workflow-manager/pull/201",
+        "OPEN",
+        False,
+        config.slug,
+        config.integration_branch,
+        "h" * 40,
+        config.slug,
+        config.main_branch,
+        "b" * 40,
+        None,
+        False,
+        None,
+        "PR_201",
+        "existing",
+    )
+    delivery = workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha, 2)  # type: ignore[operator]
+    prompt = workflow["human_handoff_prompt"](  # type: ignore[operator]
+        config, pr, delivery, ()
+    )
+
+    assert "Reviewer role Agent selected by reviewer_agent" in prompt
+    assert "gh issue view NUMBER" in prompt
+    assert "Issue numbers: 138" in prompt
+    assert "environment values, credentials, tokens, or secrets" in prompt
+    assert secret_check_command not in prompt
+    assert "sentinel-secret" not in prompt
+    assert "configured final checks passed on the exact head" in prompt
+    assert "quickly answerable\nYes/No observation" in prompt
+    assert "do not require terminal\ncommands" in prompt
+    assert "state=Ready" in prompt
+
+    markdown = """## 概要
+
+変更内容を短く説明します。
+
+## 主な変更
+
+- 引き渡し本文を生成します。
+
+## 人間による確認
+
+- [ ] ブラウザでBase PRを開くと日本語の概要が表示される
+
+## 自動検証
+
+- pytest: passed
+
+方針: https://github.com/eletim/agent-workflow-manager/issues/200"""
+    validated = workflow["validate_human_handoff"](  # type: ignore[operator]
+        markdown, config, has_warnings=False
+    )
+    assert validated == markdown
+
+    with pytest.raises(WorkerFailure, match="section contract"):
+        workflow["validate_human_handoff"](  # type: ignore[operator]
+            markdown + "\n\n## 余分", config, has_warnings=False
+        )
+
+    english = """## 概要
+
+Summary.
+
+## 主な変更
+
+- Change.
+
+## 人間による確認
+
+- [ ] The page opens
+
+## 自動検証
+
+- pytest: passed
+
+https://github.com/eletim/agent-workflow-manager/issues/200"""
+    with pytest.raises(WorkerFailure, match="Japanese"):
+        workflow["validate_human_handoff"](  # type: ignore[operator]
+            english, config, has_warnings=False
+        )
+
+
+def test_managed_handoff_replacement_preserves_existing_metadata() -> None:
+    workflow = load_generated_workflow(issues=[138])
+    start = workflow["HUMAN_HANDOFF_START"]
+    end = workflow["HUMAN_HANDOFF_END"]
+    existing = (
+        "Intro\n\n<!-- agent-workflow-manager:create-pr:run-1 -->\n\n"
+        f"{start}\nold handoff\n{end}\n\n"
+        "<!-- agent-workflow-manager:policy-conflict:c2FmZQ== -->"
+    )
+
+    updated = workflow["with_human_handoff"](existing, "new handoff")  # type: ignore[operator]
+
+    assert "old handoff" not in updated
+    assert updated.count(start) == updated.count(end) == 1
+    assert "create-pr:run-1" in updated
+    assert "policy-conflict:c2FmZQ==" in updated
+
+
+@pytest.mark.parametrize(
+    ("draft", "outcome"),
+    [(False, "approved"), (True, "continued_with_warning")],
+)
+def test_handoff_updates_ready_or_warning_draft_without_changing_state(
+    draft: bool, outcome: str
+) -> None:
+    workflow = load_generated_workflow(issues=[138])
+    issue = workflow["Issue"](138, "feature/issue-138")  # type: ignore[operator]
+    config = workflow["Config"](  # type: ignore[operator]
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "pytest"
+    )
+    pr = PullRequestState(
+        8,
+        "https://github.com/acme/project/pull/8",
+        "OPEN",
+        draft,
+        config.slug,
+        config.integration_branch,
+        "h" * 40,
+        config.slug,
+        config.main_branch,
+        "b" * 40,
+        None,
+        False,
+        None,
+        "PR_8",
+        "<!-- agent-workflow-manager:create-pr:run-8 -->",
+    )
+    warnings = ("レビュー警告があります。",) if draft else ()
+    delivery = workflow["ReviewDelivery"](  # type: ignore[operator]
+        outcome, pr.head_sha, pr.base_sha, 1, warnings
+    )
+    markdown = """## 概要
+
+変更の概要です。
+
+## 主な変更
+
+- Base PRの説明を改善します。
+
+## 人間による確認
+
+- [ ] ブラウザで説明が読みやすく表示される
+
+## 自動検証
+
+- pytest: passed"""
+    if draft:
+        markdown += "\n\n## 注意事項\n\n- レビュー警告があります。"
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: markdown
+
+    class GitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == pr.number
+            return replace(pr, body=str(kwargs["body"]))
+
+    updated = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
+        config, object(), GitHub(), pr, delivery
+    )
+
+    assert updated.is_draft is draft
+    assert "## 人間による確認" in updated.body
+    assert "create-pr:run-8" in updated.body
+
+
+def test_handoff_failure_warns_but_mutation_unknown_remains_fail_closed() -> None:
+    workflow = load_generated_workflow(issues=[138])
+    issue = workflow["Issue"](138, "feature/issue-138")  # type: ignore[operator]
+    config = workflow["Config"](  # type: ignore[operator]
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "pytest"
+    )
+    pr = PullRequestState(
+        8,
+        "https://github.com/acme/project/pull/8",
+        "OPEN",
+        False,
+        config.slug,
+        config.integration_branch,
+        "h" * 40,
+        config.slug,
+        config.main_branch,
+        "b" * 40,
+        None,
+        False,
+        None,
+        "PR_8",
+        "existing",
+    )
+    delivery = workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha)  # type: ignore[operator]
+    findings: list[tuple[str, str, str]] = []
+    workflow["emit_finding"] = lambda category, message, status="passed": (
+        findings.append((category, message, status))
+    )
+    workflow["create_agent"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        WorkerFailure("agent timed out")
+    )
+
+    unchanged = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
+        config, object(), object(), pr, delivery
+    )
+    assert unchanged is pr
+    assert findings[-1][2] == "warning"
+
+    valid = """## 概要
+
+概要です。
+
+## 主な変更
+
+- 変更です。
+
+## 人間による確認
+
+- [ ] ブラウザで表示を確認できる
+
+## 自動検証
+
+- pytest: passed"""
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: valid
+
+    class UnknownGitHub:
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            raise MutationOutcomeUnknown("response lost")
+
+    with pytest.raises(MutationOutcomeUnknown, match="response lost"):
+        workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
+            config, object(), UnknownGitHub(), pr, delivery
+        )
 
 
 def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() -> None:
@@ -685,6 +949,9 @@ def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() 
         return current, delivery
 
     integration_globals["review_whole_version"] = recovered_review
+    integration_globals["update_base_pr_human_handoff"] = (
+        lambda config, client, github, pr, delivery: pr
+    )
 
     delivered = second_run["integration_delivery"](  # type: ignore[operator]
         second_config, object(), Repository(), SecondGitHub()

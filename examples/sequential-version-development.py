@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,6 +21,7 @@ from purplemux_client import (
     GitHubRepository,
     GitRepository,
     MergeResult,
+    MutationOutcomeUnknown,
     PullRequestState,
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
@@ -57,6 +59,9 @@ MERGE_FINAL = False
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 POLICY_CONFLICT_WARNINGS: list[tuple[int | None, str]] = []
+HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
+HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
+MAX_HUMAN_HANDOFF_CHARS = 12_000
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,19 @@ class ReviewDelivery:
     base_sha: str
     reviews: int = 0
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class IssueHandoffResult:
+    issue: int
+    pr_number: int
+    pr_url: str
+    outcome: str
+    reviews: int
+    warnings: tuple[str, ...] = ()
+
+
+ISSUE_HANDOFF_RESULTS: list[IssueHandoffResult] = []
 
 
 def parse_args() -> Config:
@@ -310,6 +328,193 @@ def summary_warnings(
         if warning_issue == issue_number
     )
     return tuple(dict.fromkeys(warnings))[:3]
+
+
+def record_issue_handoff_result(
+    issue: int,
+    pr: PullRequestState,
+    outcome: str,
+    reviews: int,
+    warnings: tuple[str, ...],
+) -> None:
+    """Retain the same bounded facts emitted by the structured run summary."""
+    result = IssueHandoffResult(
+        issue, pr.number, pr.url, outcome, reviews, warnings
+    )
+    ISSUE_HANDOFF_RESULTS[:] = [
+        existing for existing in ISSUE_HANDOFF_RESULTS if existing.issue != issue
+    ]
+    ISSUE_HANDOFF_RESULTS.append(result)
+
+
+def human_handoff_prompt(
+    config: Config,
+    pr: PullRequestState,
+    delivery: ReviewDelivery,
+    warnings: tuple[str, ...],
+) -> str:
+    issue_lines = "\n".join(
+        f"- Issue #{item.issue}: PR #{item.pr_number} ({item.pr_url}), "
+        f"outcome={item.outcome}, reviews={item.reviews}, "
+        f"warning_count={len(item.warnings)}"
+        for item in ISSUE_HANDOFF_RESULTS
+    ) or "- No implementation Issue result was recorded in this run."
+    policy = (
+        f"Policy Issue: https://github.com/{config.slug}/issues/{config.policy_issue}"
+        if config.policy_issue is not None
+        else "Policy Issue: none"
+    )
+    warning_lines = "\n".join(f"- {item}" for item in warnings) or "- none"
+    issue_numbers = ", ".join(str(item.number) for item in config.issues)
+    return f"""Create the final human handoff Markdown for Base PR #{pr.number}.
+You are the Reviewer role Agent selected by reviewer_agent. This turn generates
+prose only and does not change any review verdict. Do not edit files, run GitHub
+mutations, or change Git/PR state.
+
+Before writing, read every implementation Issue body with `gh issue view NUMBER
+--repo {config.slug}` for Issue numbers: {issue_numbers}. If a Policy Issue is
+listed below, read it first in the same way. Inspect the PR diff when useful, but
+do not include raw logs, environment values, credentials, tokens, or secrets.
+
+Authoritative handoff context:
+- repository: {config.slug}
+- integration/final: {config.integration_branch} @ {pr.head_sha} ->
+  {config.main_branch} @ {pr.base_sha}
+- Base PR: #{pr.number} {pr.url}; state={"Draft" if pr.is_draft else "Ready"}
+- whole review: outcome={delivery.outcome}, reviews={delivery.reviews}
+- automated verification: configured final checks passed on the exact head
+- {policy}
+- implementation results:
+{issue_lines}
+- warnings:
+{warning_lines}
+
+Return only Japanese Markdown, with these headings exactly once and in order:
+## 概要
+## 主な変更
+## 人間による確認
+## 自動検証
+Add `## 注意事項` only when warnings are listed above. When a Policy Issue is
+listed, include its full URL in the prose. Under 人間による確認, use 1 to 12
+unchecked `- [ ]` items. Each item must describe one concrete, quickly answerable
+Yes/No observation, primarily in a browser or real environment. Do not ask a
+human to rerun checks already covered by automation and do not require terminal
+commands. Keep the entire response concise and under {MAX_HUMAN_HANDOFF_CHARS}
+characters. Do not emit HTML comments, code fences, prefaces, or extra headings."""
+
+
+def validate_human_handoff(
+    markdown: str, config: Config, *, has_warnings: bool
+) -> str:
+    """Validate the agent's prose before it can enter the Base PR body."""
+    value = markdown.strip().replace("\r\n", "\n").replace("\r", "\n")
+    if not value or len(value) > MAX_HUMAN_HANDOFF_CHARS or "\0" in value:
+        raise WorkerFailure("human handoff Markdown is empty or exceeds its bound")
+    if "<!--" in value or "-->" in value or "```" in value:
+        raise WorkerFailure("human handoff Markdown contains forbidden metadata")
+    headings = re.findall(r"(?m)^## .+$", value)
+    required = ["## 概要", "## 主な変更", "## 人間による確認", "## 自動検証"]
+    expected = required + (["## 注意事項"] if has_warnings else [])
+    if headings != expected:
+        raise WorkerFailure("human handoff Markdown has an invalid section contract")
+    prose = "\n".join(
+        line for line in value.splitlines() if not line.startswith("## ")
+    )
+    if not re.search(r"[ぁ-んァ-ヶ一-龠]", prose):
+        raise WorkerFailure("human handoff Markdown must be written in Japanese")
+    checklist_section = value.split("## 人間による確認\n", 1)[1].split(
+        "\n## 自動検証", 1
+    )[0]
+    checklist_lines = [
+        line for line in checklist_section.splitlines() if line.strip()
+    ]
+    checklist = [line[6:] for line in checklist_lines if line.startswith("- [ ] ")]
+    if (
+        not 1 <= len(checklist) <= 12
+        or len(checklist) != len(checklist_lines)
+        or any(not item.strip() for item in checklist)
+    ):
+        raise WorkerFailure("human handoff checklist must contain 1..12 items")
+    if config.policy_issue is not None:
+        reference = f"https://github.com/{config.slug}/issues/{config.policy_issue}"
+        if reference not in value:
+            raise WorkerFailure("human handoff Markdown lacks the Policy Issue URL")
+    return value
+
+
+def with_human_handoff(existing_body: str, handoff: str) -> str:
+    """Replace only AWM's managed section and preserve all other PR metadata."""
+    start_count = existing_body.count(HUMAN_HANDOFF_START)
+    end_count = existing_body.count(HUMAN_HANDOFF_END)
+    if start_count != end_count or start_count > 1:
+        raise WorkerFailure("Base PR has ambiguous human handoff markers")
+    managed = f"{HUMAN_HANDOFF_START}\n{handoff}\n{HUMAN_HANDOFF_END}"
+    if start_count == 0:
+        prefix = existing_body.rstrip()
+        return f"{prefix}\n\n{managed}" if prefix else managed
+    start = existing_body.index(HUMAN_HANDOFF_START)
+    end = existing_body.index(HUMAN_HANDOFF_END, start) + len(HUMAN_HANDOFF_END)
+    return f"{existing_body[:start]}{managed}{existing_body[end:]}"
+
+
+def warn_human_handoff(message: str) -> None:
+    warning = f"Base PR human handoff was not updated: {message}"
+    print(f"WARN: {warning}", flush=True)
+    emit_finding("github", warning, status="warning")
+
+
+def human_handoff_warnings(delivery: ReviewDelivery) -> tuple[str, ...]:
+    warnings = list(delivery.warnings)
+    for item in ISSUE_HANDOFF_RESULTS:
+        warnings.extend(item.warnings)
+    warnings.extend(warning for _, warning in POLICY_CONFLICT_WARNINGS)
+    return tuple(dict.fromkeys(warnings))[:12]
+
+
+def update_base_pr_human_handoff(
+    config: Config,
+    client: PurpleMuxCLIClient,
+    github: GitHubRepository,
+    pr: PullRequestState,
+    delivery: ReviewDelivery,
+) -> PullRequestState:
+    """Generate once, validate, then safely update without changing PR state."""
+    warnings = human_handoff_warnings(delivery)
+    try:
+        writer = create_agent(
+            client,
+            config,
+            agent_type=REVIEWER_AGENT,
+            name="Base PR human handoff writer",
+        )
+        result = run_turn(
+            client,
+            writer,
+            "Base PR human handoff",
+            human_handoff_prompt(config, pr, delivery, warnings),
+            pr=pr,
+        )
+        handoff = validate_human_handoff(
+            result, config, has_warnings=bool(warnings)
+        )
+        body = with_human_handoff(pr.body, handoff)
+    except Exception as exc:
+        warn_human_handoff(short_error(exc))
+        return pr
+    try:
+        return github.update_pr_body(
+            pr.number,
+            body=body,
+            expected_head=config.integration_branch,
+            expected_head_sha=pr.head_sha,
+            expected_base=config.main_branch,
+            expected_base_sha=pr.base_sha,
+        )
+    except MutationOutcomeUnknown:
+        raise
+    except WorkerFailure as exc:
+        warn_human_handoff(short_error(exc))
+        return pr
 
 
 def rehydrate_policy_conflicts(
@@ -696,13 +901,17 @@ def process_issue(
     if isinstance(prepared, PullRequestState):
         rehydrate_policy_conflicts(prepared.body, config, issue_number=issue.number)
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
+        warnings = summary_warnings(issue.number)
+        record_issue_handoff_result(
+            issue.number, prepared, "skipped", 0, warnings
+        )
         emit_issue_result(
             issue.number,
             "skipped",
             0,
             prepared.number,
             prepared.url,
-            warnings=summary_warnings(issue.number),
+            warnings=warnings,
         )
         return prepared
     existing_pr, start_sha, reused_existing_work = prepared
@@ -941,6 +1150,9 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             pr.url,
             warnings=warnings,
         )
+        record_issue_handoff_result(
+            issue.number, pr, delivery.outcome, delivery.reviews, warnings
+        )
         return pr
     merged = merge_pr_and_advance(
         repo,
@@ -960,6 +1172,9 @@ and leave the worktree clean. If no change is warranted, leave it clean and
         merged.pr.number,
         merged.pr.url,
         warnings=warnings,
+    )
+    record_issue_handoff_result(
+        issue.number, merged.pr, delivery.outcome, delivery.reviews, warnings
     )
     return merged.pr
 
@@ -1327,7 +1542,7 @@ def integration_delivery(
 
     def finalize() -> PullRequestState:
         if delivery.outcome == "continued_with_warning":
-            return require_warning_delivery(
+            delivered = require_warning_delivery(
                 repo,
                 github,
                 pr,
@@ -1336,24 +1551,30 @@ def integration_delivery(
                 expected_head_sha=delivery.head_sha,
                 expected_base_sha=delivery.base_sha,
             )
-        ready = github.set_draft(
-            pr.number,
-            draft=False,
-            expected_head=config.integration_branch,
-            expected_head_sha=delivery.head_sha,
-            expected_base=config.main_branch,
-            expected_base_sha=delivery.base_sha,
+        else:
+            delivered = github.set_draft(
+                pr.number,
+                draft=False,
+                expected_head=config.integration_branch,
+                expected_head_sha=delivery.head_sha,
+                expected_base=config.main_branch,
+                expected_base_sha=delivery.base_sha,
+            )
+        delivered = update_base_pr_human_handoff(
+            config, client, github, delivered, delivery
         )
+        if delivery.outcome == "continued_with_warning":
+            return delivered
         if not MERGE_FINAL:
-            return ready
+            return delivered
         merged = merge_pr_and_advance(
             repo,
             github,
-            number=ready.number,
+            number=delivered.number,
             head=config.integration_branch,
-            head_sha=ready.head_sha,
+            head_sha=delivered.head_sha,
             base=config.main_branch,
-            base_sha=ready.base_sha,
+            base_sha=delivered.base_sha,
         )
         return merged.pr
 
