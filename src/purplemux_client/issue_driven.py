@@ -32,6 +32,8 @@ class IssueDrivenConfig:
     merge_to_integration: bool
     final_review: bool
     merge_final: bool
+    implementer_agent: str = "codex"
+    reviewer_agent: str = "codex"
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -44,6 +46,8 @@ class IssueDrivenConfig:
             "merge_to_integration": self.merge_to_integration,
             "final_review": self.final_review,
             "merge_final": self.merge_final,
+            "implementer_agent": self.implementer_agent,
+            "reviewer_agent": self.reviewer_agent,
         }
 
 
@@ -57,7 +61,9 @@ _REQUIRED_FIELDS = {
     "final_review",
     "merge_final",
 }
-_ALLOWED_FIELDS = _REQUIRED_FIELDS | {"mode"}
+_OPTIONAL_FIELDS = {"mode", "implementer_agent", "reviewer_agent"}
+_ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
+_SUPPORTED_AGENTS = {"codex", "claude"}
 # Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
 _MAX_WORKFLOW_OUTLINE_ITEMS = 100
 
@@ -189,6 +195,14 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     for key in ("merge_to_integration", "final_review", "merge_final"):
         if not isinstance(value.get(key), bool):
             findings.append(IssueDrivenFinding(f"$.{key}", "must be a boolean"))
+    for key in ("implementer_agent", "reviewer_agent"):
+        agent = value.get(key, "codex")
+        if not isinstance(agent, str):
+            findings.append(IssueDrivenFinding(f"$.{key}", "must be a string"))
+        elif agent not in _SUPPORTED_AGENTS:
+            findings.append(
+                IssueDrivenFinding(f"$.{key}", "must be one of: codex, claude")
+            )
     if findings:
         raise IssueDrivenValidationError(findings)
     return IssueDrivenConfig(
@@ -200,6 +214,8 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         merge_to_integration=value["merge_to_integration"],
         final_review=value["final_review"],
         merge_final=value["merge_final"],
+        implementer_agent=value.get("implementer_agent", "codex"),
+        reviewer_agent=value.get("reviewer_agent", "codex"),
     )
 
 
@@ -266,6 +282,16 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     outline_end = source.index("\n]", outline_start) + len("\n]")
     source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]
     source = source.replace("MAX_REVIEWS = 5", f"MAX_REVIEWS = {config.max_reviews}", 1)
+    source = source.replace(
+        'IMPLEMENTER_AGENT = "codex"',
+        f"IMPLEMENTER_AGENT = {config.implementer_agent!r}",
+        1,
+    )
+    source = source.replace(
+        'REVIEWER_AGENT = "codex"',
+        f"REVIEWER_AGENT = {config.reviewer_agent!r}",
+        1,
+    )
     source = source.replace(
         "MERGE_TO_INTEGRATION = True",
         f"MERGE_TO_INTEGRATION = {config.merge_to_integration}",

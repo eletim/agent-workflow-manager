@@ -38,6 +38,8 @@ WORKFLOW_OUTLINE = [
     "Review and deliver the whole version",
 ]
 MAX_REVIEWS = 5
+IMPLEMENTER_AGENT = "codex"
+REVIEWER_AGENT = "codex"
 READY_TIMEOUT = 120
 TURN_TIMEOUT = 3600
 SHELL_TIMEOUT = 1800
@@ -134,9 +136,11 @@ def create_runtime(config: Config) -> PurpleMuxCLIClient:
     return runtime.workspace(workspace.id)
 
 
-def create_agent(client: PurpleMuxCLIClient, config: Config, *, name: str) -> str:
+def create_agent(
+    client: PurpleMuxCLIClient, config: Config, *, agent_type: str, name: str
+) -> str:
     return client.create_session(
-        CreateSessionRequest("codex", str(config.repo), "codex", name=name)
+        CreateSessionRequest(agent_type, str(config.repo), agent_type, name=name)
     )
 
 
@@ -429,7 +433,10 @@ def process_issue(
 ) -> None:
     if repo.inspect_worktree().dirty:
         cleanup = create_agent(
-            client, config, name=f"Issue {issue.number} worktree cleanup"
+            client,
+            config,
+            agent_type=IMPLEMENTER_AGENT,
+            name=f"Issue {issue.number} worktree cleanup",
         )
         require_clean_worktree(
             repo,
@@ -449,8 +456,18 @@ def process_issue(
             head=issue.branch,
             base=config.integration_branch,
         )
-    implementer = create_agent(client, config, name=f"Issue {issue.number} implementer")
-    reviewer = create_agent(client, config, name=f"Issue {issue.number} reviewer")
+    implementer = create_agent(
+        client,
+        config,
+        agent_type=IMPLEMENTER_AGENT,
+        name=f"Issue {issue.number} implementer",
+    )
+    reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name=f"Issue {issue.number} reviewer",
+    )
     implementation_prompt, review_prompt = issue_prompts(issue, config)
     run_turn(
         client,
@@ -616,8 +633,18 @@ def review_whole_version(
     pr: PullRequestState,
 ) -> tuple[PullRequestState, str, str]:
     """Review, fix, and check the whole version as one outline-level phase."""
-    fixer = create_agent(client, config, name="Whole-version fixer")
-    reviewer = create_agent(client, config, name="Whole-version reviewer")
+    fixer = create_agent(
+        client,
+        config,
+        agent_type=IMPLEMENTER_AGENT,
+        name="Whole-version fixer",
+    )
+    reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name="Whole-version reviewer",
+    )
     approved_head: str | None = None
     approved_base: str | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
@@ -828,7 +855,12 @@ def integration_delivery(
             run_final_checks(client, config)
             state = repo.inspect_worktree()
             if state.dirty and cleanup is None:
-                cleanup = create_agent(client, config, name="Whole-version cleanup")
+                cleanup = create_agent(
+                    client,
+                    config,
+                    agent_type=IMPLEMENTER_AGENT,
+                    name="Whole-version cleanup",
+                )
             if cleanup is None:
                 checked = repo.require_committed_result(
                     config.integration_branch,

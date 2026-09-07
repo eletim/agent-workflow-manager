@@ -44,7 +44,8 @@ Incorrect when that version worktree does not already exist:
 
 ## Supported schema
 
-Unknown fields are rejected. `mode` is optional; every other field is required.
+Unknown fields are rejected. `mode`, `implementer_agent`, and `reviewer_agent` are
+optional; every other field is required.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -54,6 +55,8 @@ Unknown fields are rejected. `mode` is optional; every other field is required.
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `issues` | array of integers | Positive, unique Issue numbers, executed in the listed order. |
 | `max_reviews` | integer | Review limit from 1 through 100; use 5 unless the user requests another value. |
+| `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
+| `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
 | `merge_to_integration` | boolean | Whether each approved Issue PR is merged into the integration branch. |
 | `final_review` | boolean | Whether the completed integration branch receives a final review. |
 | `merge_final` | boolean | Whether final delivery is automatically merged into `final_branch`. |
@@ -70,6 +73,8 @@ Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
   "final_branch": "main",
   "issues": [86, 99, 87, 84],
   "max_reviews": 5,
+  "implementer_agent": "codex",
+  "reviewer_agent": "claude",
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -78,7 +83,8 @@ Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
 
 Issue order is significant and must be preserved. Here, `merge_final: false`
 means the final PR is prepared and marked Ready, but `main` is not automatically
-merged.
+merged. The implementer and reviewer selections are independent. Omitting either
+agent field selects `codex` for that role.
 
 ## Rules for AI authors
 
@@ -86,6 +92,8 @@ merged.
   path.
 - Preserve Issue order exactly as requested.
 - Set `max_reviews` to 5 unless the user explicitly requests another value.
+- Use only `codex` or `claude` for either agent role. Omit an agent field to use
+  its `codex` default.
 - Set `merge_final` to false unless the user explicitly requests automatic final
   merging.
 - Do not invent unsupported JSON fields.
