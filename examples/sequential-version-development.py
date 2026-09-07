@@ -36,7 +36,7 @@ WORKFLOW_OUTLINE = [
     "Inspect authoritative Issue topology",
     "Prepare or reuse the feature branch",
     "Implement and independently review",
-    "Deliver the exact approved Issue topology",
+    "Deliver the exact Issue topology",
     "Review and deliver the whole version",
 ]
 MAX_REVIEWS = 5
@@ -307,7 +307,7 @@ def require_warning_delivery(
             f"warning delivery head changed: expected {expected_head_sha}, "
             f"found {pushed.local_sha}"
         )
-    return github.require_pr(
+    current = github.require_pr(
         number=pr.number,
         head=head,
         base=base,
@@ -316,6 +316,15 @@ def require_warning_delivery(
         expected_base_sha=expected_base_sha,
         draft=True,
     )
+    if current.auto_merge_enabled:
+        raise WorkerFailure(
+            f"warning delivery PR #{current.number} has auto-merge enabled"
+        )
+    if current.merge_queue_entry is not None:
+        raise WorkerFailure(
+            f"warning delivery PR #{current.number} has a merge queue entry"
+        )
+    return current
 
 
 def issue_prompts(issue: Issue, config: Config) -> tuple[str, str]:

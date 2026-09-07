@@ -92,6 +92,8 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "run_correlation(" in source
     assert "MutationOutcomeUnknown" not in source  # helpers raise it internally
     assert "existing_pr is not None or reused_existing_work" in source
+    assert '"Deliver the exact Issue topology"' in source
+    assert "Deliver the exact approved Issue topology" not in source
 
 
 def test_clean_worktree_does_not_invoke_cleanup_turn(
@@ -652,6 +654,42 @@ def test_warning_delivery_fails_closed_when_exact_head_is_not_pushed() -> None:
             pytest.fail("mismatched Git topology must fail before PR delivery")
 
     with pytest.raises(WorkerFailure, match="warning delivery head changed"):
+        workflow["require_warning_delivery"](
+            Repository(),
+            GitHub(),
+            draft,
+            head=draft.head_branch,
+            base=draft.base_branch,
+            expected_head_sha=draft.head_sha,
+            expected_base_sha=draft.base_sha,
+        )
+
+
+@pytest.mark.parametrize(
+    ("deferred_state", "error"),
+    [
+        ({"auto_merge_enabled": True}, "auto-merge enabled"),
+        ({"merge_queue_entry": "queue-entry"}, "merge queue entry"),
+    ],
+)
+def test_warning_delivery_rejects_deferred_pr_mutation_state(
+    deferred_state: dict[str, object], error: str
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    draft = replace(
+        open_pr(head="feature/issue-134", base="dev/v1", draft=True),
+        **deferred_state,
+    )
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return draft
+
+    with pytest.raises(WorkerFailure, match=error):
         workflow["require_warning_delivery"](
             Repository(),
             GitHub(),
