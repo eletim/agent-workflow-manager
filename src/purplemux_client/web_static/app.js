@@ -905,50 +905,18 @@ function renderSettings(settings) {
   notifyFailure.checked = settings.onFailure;
   notifyStopped.checked = settings.onStopped;
   notifyServer.value = settings.server;
-  renderNotifyServerLink();
+  renderNotifyServerLink(settings.serverUrl);
   notifyTopic.value = settings.topic;
   const configured = settings.credentialStatus === "configured";
   credentialStatus.textContent = `Credentials: ${configured ? "Configured" : "Missing"}`;
   credentialStatus.className = `credential ${configured ? "configured" : "missing"}`;
 }
 
-function renderNotifyServerLink() {
-  let serverUrl = null;
-  try {
-    const value = notifyServer.value;
-    const candidate = new URL(value);
-    if (
-      value === value.trim()
-      && value.length <= 2048
-      && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value)
-      && ["http:", "https:"].includes(candidate.protocol)
-      && candidate.hostname
-      && !candidate.username
-      && !candidate.password
-      && !candidate.search
-      && !candidate.hash
-      && (candidate.protocol === "https:" || isLoopbackHttpUrl(value, candidate))
-    ) serverUrl = candidate.href;
-  } catch (_) {
-    // The editable value may be incomplete; the backend validates it on save.
-  }
-  notifyServerLink.hidden = serverUrl === null;
-  if (serverUrl === null) notifyServerLink.removeAttribute("href");
+function renderNotifyServerLink(serverUrl) {
+  const available = typeof serverUrl === "string" && serverUrl !== "";
+  notifyServerLink.hidden = !available;
+  if (!available) notifyServerLink.removeAttribute("href");
   else notifyServerLink.setAttribute("href", serverUrl);
-}
-
-function isLoopbackHttpUrl(value, candidate) {
-  const match = value.match(/^http:\/\/(\[[^\]]+\]|[^:/?#]+)(?::\d+)?(?:\/|$)/i);
-  if (!match) return false;
-  const hostname = match[1].toLowerCase();
-  if (hostname === "localhost") return true;
-  if (hostname.startsWith("[") && hostname.endsWith("]")) {
-    return candidate.hostname === "[::1]";
-  }
-  const octets = hostname.split(".");
-  return octets.length === 4
-    && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255)
-    && Number(octets[0]) === 127;
 }
 
 function showSettingsMessage(message, isError = false) {
@@ -1278,7 +1246,7 @@ settingsClose.addEventListener("click", () => {
   settingsDialog.close();
 });
 
-notifyServer.addEventListener("input", renderNotifyServerLink);
+notifyServer.addEventListener("input", () => renderNotifyServerLink(null));
 
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();

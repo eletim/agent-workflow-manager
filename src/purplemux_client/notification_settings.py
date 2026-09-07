@@ -58,6 +58,7 @@ class NotificationSettingsSnapshot:
     on_failure: bool
     on_stopped: bool
     server: str
+    server_url: str | None
     topic: str
     credential_configured: bool
 
@@ -68,6 +69,7 @@ class NotificationSettingsSnapshot:
             "onFailure": self.on_failure,
             "onStopped": self.on_stopped,
             "server": self.server,
+            "serverUrl": self.server_url,
             "topic": self.topic,
             "credentialStatus": (
                 "configured" if self.credential_configured else "missing"
@@ -122,12 +124,14 @@ class NotificationSettings:
             )
             notify_values.update(self._environment_overrides)
             enabled, on_success, on_failure, on_stopped = self._notifier.policy()
+            server = notify_values.get("NOTIFY_SERVER", DEFAULT_NOTIFY_SERVER)
             return NotificationSettingsSnapshot(
                 enabled=enabled,
                 on_success=on_success,
                 on_failure=on_failure,
                 on_stopped=on_stopped,
-                server=notify_values.get("NOTIFY_SERVER", DEFAULT_NOTIFY_SERVER),
+                server=server,
+                server_url=self._validated_server_url(server),
                 topic=notify_values.get("NOTIFY_TOPIC", DEFAULT_NOTIFY_TOPIC),
                 credential_configured=bool(notify_values.get("NOTIFY_TOKEN")),
             )
@@ -208,6 +212,7 @@ class NotificationSettings:
             on_failure=on_failure,
             on_stopped=on_stopped,
             server=server,
+            server_url=server,
             topic=topic,
             credential_configured=bool(notify_values.get("NOTIFY_TOKEN")),
         )
@@ -257,6 +262,7 @@ class NotificationSettings:
             or value != value.strip()
             or len(value) > 2048
             or _has_unsafe_characters(value)
+            or "\\" in value
         ):
             raise SettingsValidationError("Notify server must be a valid HTTP(S) URL.")
         try:
@@ -288,6 +294,13 @@ class NotificationSettings:
                 "Notify server must use HTTPS (HTTP is allowed only for loopback)."
             )
         return value
+
+    @classmethod
+    def _validated_server_url(cls, value: str) -> str | None:
+        try:
+            return cls._server(value)
+        except SettingsValidationError:
+            return None
 
     @staticmethod
     def _topic(value: object) -> str:

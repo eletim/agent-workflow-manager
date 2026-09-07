@@ -95,6 +95,7 @@ def test_settings_read_reports_policy_transport_and_credential_status(
         "onFailure": True,
         "onStopped": False,
         "server": "https://notify.example",
+        "serverUrl": "https://notify.example",
         "topic": "runner_team",
         "credentialStatus": "configured",
         "restartRequired": False,
@@ -271,6 +272,26 @@ def test_settings_accepts_loopback_http_notify_server(tmp_path: Path) -> None:
     ).as_json()
 
     assert payload["server"] == "http://127.0.0.1:8080"
+    assert payload["serverUrl"] == "http://127.0.0.1:8080"
+
+
+def test_server_url_round_trip_rejects_backslash_and_supports_mapped_loopback(
+    tmp_path: Path,
+) -> None:
+    settings, runtime_config, notify_config, _ = _settings(tmp_path)
+
+    with pytest.raises(SettingsValidationError, match="valid HTTP"):
+        settings.update({"server": "https://exa\\mple.com", "topic": "agents"})
+
+    assert not runtime_config.exists()
+    assert not notify_config.exists()
+
+    mapped = "http://[::ffff:127.0.0.1]"
+    updated = settings.update({"server": mapped, "topic": "agents"}).as_json()
+    reread = settings.read().as_json()
+
+    assert updated["serverUrl"] == mapped
+    assert reread["serverUrl"] == mapped
 
 
 @pytest.mark.parametrize(

@@ -249,6 +249,7 @@ async function loadApp({
     onStopped: false,
     onSuccess: false,
     server: "https://example.invalid",
+    serverUrl: "https://example.invalid",
     topic: "test",
   };
   const initial = {
@@ -387,7 +388,7 @@ test("Notify server link is exposed only for safe HTTP URLs", async () => {
   const link = elements["notify-server-link"];
 
   assert.equal(link.hidden, false);
-  assert.equal(link.getAttribute("href"), "https://example.invalid/");
+  assert.equal(link.getAttribute("href"), "https://example.invalid");
   server.value = "ftp://example.invalid";
   await server.dispatch("input");
   assert.equal(link.hidden, true);
@@ -410,20 +411,38 @@ test("Notify server link is exposed only for safe HTTP URLs", async () => {
   assert.equal(link.getAttribute("href"), undefined);
   server.value = "http://localhost:8080";
   await server.dispatch("input");
-  assert.equal(link.hidden, false);
-  assert.equal(link.getAttribute("href"), "http://localhost:8080/");
-  server.value = "http://127.0.0.2";
-  await server.dispatch("input");
-  assert.equal(link.hidden, false);
-  assert.equal(link.getAttribute("href"), "http://127.0.0.2/");
-  server.value = "http://127.1";
-  await server.dispatch("input");
   assert.equal(link.hidden, true);
   assert.equal(link.getAttribute("href"), undefined);
-  server.value = "http://[0:0:0:0:0:0:0:1]";
-  await server.dispatch("input");
-  assert.equal(link.hidden, false);
-  assert.equal(link.getAttribute("href"), "http://[::1]/");
+});
+
+test("Notify server link uses the backend-validated round-trip URL", async () => {
+  const mapped = "http://[::ffff:127.0.0.1]";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method !== "POST") {
+        return undefined;
+      }
+      return response({
+        credentialStatus: "missing",
+        enabled: false,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: false,
+        server: mapped,
+        serverUrl: mapped,
+        topic: "test",
+      });
+    },
+  });
+
+  elements["notify-server"].value = mapped;
+  await elements["notification-settings"].dispatch("submit");
+
+  assert.equal(elements["notify-server-link"].hidden, false);
+  assert.equal(elements["notify-server-link"].getAttribute("href"), mapped);
 });
 
 test("Notifications save reuses the protected settings endpoint", async () => {
@@ -444,6 +463,7 @@ test("Notifications save reuses the protected settings endpoint", async () => {
         onStopped: false,
         onSuccess: true,
         server: "https://example.invalid",
+        serverUrl: "https://example.invalid",
         topic: "saved-topic",
       });
     },
