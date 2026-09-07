@@ -295,6 +295,28 @@ def test_server_url_round_trip_rejects_backslash_and_supports_mapped_loopback(
 
 
 @pytest.mark.parametrize(
+    "malformed",
+    [
+        "https://exa%5cmple.com",
+        "https://user%40example.com",
+        "https://bad host.example",
+        "https://999.1.1.1",
+    ],
+)
+def test_malformed_hostname_is_never_returned_as_a_server_link(
+    tmp_path: Path, malformed: str
+) -> None:
+    settings, _, _, _ = _settings(tmp_path)
+
+    updated = settings.update({"server": malformed, "topic": "agents"}).as_json()
+    reread = settings.read().as_json()
+
+    assert updated["server"] == malformed
+    assert updated["serverUrl"] is None
+    assert reread["serverUrl"] is None
+
+
+@pytest.mark.parametrize(
     "server",
     [
         "https://[",

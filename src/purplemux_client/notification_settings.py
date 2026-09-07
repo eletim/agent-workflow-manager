@@ -22,6 +22,7 @@ _ASSIGNMENT = re.compile(
     r"^(?P<indent>\s*)(?:export\s+)?(?P<key>[A-Z_][A-Z0-9_]*)=(?P<value>.*)$"
 )
 _TOPIC = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 class SettingsError(RuntimeError):
@@ -212,7 +213,7 @@ class NotificationSettings:
             on_failure=on_failure,
             on_stopped=on_stopped,
             server=server,
-            server_url=server,
+            server_url=self._validated_server_url(server),
             topic=topic,
             credential_configured=bool(notify_values.get("NOTIFY_TOKEN")),
         )
@@ -298,9 +299,29 @@ class NotificationSettings:
     @classmethod
     def _validated_server_url(cls, value: str) -> str | None:
         try:
-            return cls._server(value)
+            validated = cls._server(value)
         except SettingsValidationError:
             return None
+        hostname = urlparse(validated).hostname
+        if hostname is None or "%" in hostname:
+            return None
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            try:
+                ascii_hostname = hostname.encode("idna").decode("ascii")
+            except UnicodeError:
+                return None
+            unqualified = ascii_hostname.removesuffix(".")
+            labels = unqualified.split(".")
+            if (
+                not unqualified
+                or len(unqualified) > 253
+                or labels[-1].isdigit()
+                or any(_HOST_LABEL.fullmatch(label) is None for label in labels)
+            ):
+                return None
+        return validated
 
     @staticmethod
     def _topic(value: object) -> str:

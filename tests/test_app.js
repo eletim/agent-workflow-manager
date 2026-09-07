@@ -445,6 +445,34 @@ test("Notify server link uses the backend-validated round-trip URL", async () =>
   assert.equal(elements["notify-server-link"].getAttribute("href"), mapped);
 });
 
+test("Malformed configured hostname is editable but never linkable", async () => {
+  const malformed = "https://exa%5cmple.com";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method) {
+        return undefined;
+      }
+      return response({
+        credentialStatus: "missing",
+        enabled: false,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: false,
+        server: malformed,
+        serverUrl: null,
+        topic: "test",
+      });
+    },
+  });
+
+  assert.equal(elements["notify-server"].value, malformed);
+  assert.equal(elements["notify-server-link"].hidden, true);
+  assert.equal(elements["notify-server-link"].getAttribute("href"), undefined);
+});
+
 test("Notifications save reuses the protected settings endpoint", async () => {
   let savedRequest = null;
   const {elements} = await loadApp({
