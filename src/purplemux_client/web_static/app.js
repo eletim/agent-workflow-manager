@@ -80,12 +80,16 @@ const guideRaw = document.querySelector("#guide-raw");
 const manualCopyDialog = document.querySelector("#manual-copy-dialog");
 const manualCopyContent = document.querySelector("#manual-copy-content");
 const manualCopyClose = document.querySelector("#manual-copy-close");
+const settingsDialog = document.querySelector("#settings-dialog");
+const settingsOpen = document.querySelector("#settings-open");
+const settingsClose = document.querySelector("#settings-close");
 const settingsForm = document.querySelector("#notification-settings");
 const notificationsEnabled = document.querySelector("#notifications-enabled");
 const notifySuccess = document.querySelector("#notify-success");
 const notifyFailure = document.querySelector("#notify-failure");
 const notifyStopped = document.querySelector("#notify-stopped");
 const notifyServer = document.querySelector("#notify-server");
+const notifyServerLink = document.querySelector("#notify-server-link");
 const notifyTopic = document.querySelector("#notify-topic");
 const replacementToken = document.querySelector("#replacement-token");
 const credentialStatus = document.querySelector("#credential-status");
@@ -901,10 +905,29 @@ function renderSettings(settings) {
   notifyFailure.checked = settings.onFailure;
   notifyStopped.checked = settings.onStopped;
   notifyServer.value = settings.server;
+  renderNotifyServerLink();
   notifyTopic.value = settings.topic;
   const configured = settings.credentialStatus === "configured";
   credentialStatus.textContent = `Credentials: ${configured ? "Configured" : "Missing"}`;
   credentialStatus.className = `credential ${configured ? "configured" : "missing"}`;
+}
+
+function renderNotifyServerLink() {
+  let serverUrl = null;
+  try {
+    const candidate = new URL(notifyServer.value);
+    if (
+      ["http:", "https:"].includes(candidate.protocol)
+      && candidate.hostname
+      && !candidate.username
+      && !candidate.password
+    ) serverUrl = candidate.href;
+  } catch (_) {
+    // The editable value may be incomplete; the backend validates it on save.
+  }
+  notifyServerLink.hidden = serverUrl === null;
+  if (serverUrl === null) notifyServerLink.removeAttribute("href");
+  else notifyServerLink.setAttribute("href", serverUrl);
 }
 
 function showSettingsMessage(message, isError = false) {
@@ -1225,6 +1248,16 @@ cleanupButton.addEventListener("click", async () => {
     ) stderr.textContent = String(error);
   }
 });
+
+settingsOpen.addEventListener("click", () => {
+  settingsDialog.showModal();
+});
+
+settingsClose.addEventListener("click", () => {
+  settingsDialog.close();
+});
+
+notifyServer.addEventListener("input", renderNotifyServerLink);
 
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();

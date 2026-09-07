@@ -79,3 +79,17 @@ def test_agent_readiness_is_available_only_in_collapsed_diagnostics() -> None:
         and "open" not in attributes
         for tag, attributes in ancestors
     )
+
+
+def test_notifications_are_reached_from_the_header_settings_dialog() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    ancestors = _ancestors("notification-settings")
+
+    assert '<button id="settings-open" type="button">Settings</button>' in html
+    assert any(
+        tag == "dialog" and attributes.get("id") == "settings-dialog"
+        for tag, attributes in ancestors
+    )
+    assert '<label for="notify-server">Notify server URL</label>' in html
+    assert 'id="notify-server-link"' in html
+    assert 'rel="noopener noreferrer"' in html
