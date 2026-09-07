@@ -293,6 +293,7 @@ class RunnerSnapshot:
     args: tuple[str, ...]
     attempts: tuple[RunAttempt, ...]
     findings: tuple[TopologyFinding, ...]
+    has_warnings: bool
     dry_run: DryRunResult | None
     resources: tuple[RunResource, ...] = ()
     # Submitted Python source for this run's immutable execution snapshot.
@@ -327,6 +328,7 @@ class RunnerSnapshot:
         payload.pop("stderr_entries")
         payload["progress"] = [_progress_json(event) for event in self.progress]
         payload["findings"] = [_finding_json(item) for item in self.findings]
+        payload["hasWarnings"] = payload.pop("has_warnings")
         payload["dryRun"] = self.dry_run.as_json() if self.dry_run else None
         payload.pop("dry_run")
         payload["validation"] = [issue.as_json() for issue in self.validation]
@@ -362,6 +364,7 @@ class RunnerSnapshot:
             "executionContext": execution_context,
             "args": list(self.args),
             "attempts": len(self.attempts),
+            "hasWarnings": self.has_warnings,
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
         }
@@ -414,6 +417,7 @@ class _RunRecord:
     # the bounded diagnostic stream so historical Issue navigation remains.
     progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
+    has_warnings: bool = False
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     attempts: list[RunAttempt] = field(default_factory=list)
     resources: list[RunResource] = field(default_factory=list)
@@ -499,6 +503,7 @@ class PythonRunner:
             args=(),
             attempts=(),
             findings=(),
+            has_warnings=False,
             dry_run=None,
         )
         self._validator = validator or WorkflowValidator()
@@ -571,6 +576,9 @@ class PythonRunner:
                     args=run_args,
                     attempts=(),
                     findings=result.findings,
+                    has_warnings=any(
+                        finding.status == "warning" for finding in result.findings
+                    ),
                     dry_run=result,
                 )
                 self._mark_changed()
@@ -1108,6 +1116,7 @@ class PythonRunner:
             args=run_args,
             attempts=(),
             findings=(),
+            has_warnings=False,
             dry_run=None,
         )
         self._mark_changed()
@@ -1177,6 +1186,7 @@ class PythonRunner:
             args=run.args,
             attempts=tuple(run.attempts),
             findings=tuple(run.findings),
+            has_warnings=run.has_warnings,
             dry_run=None,
             code=None if run.prompt is not None else run.code,
             resources=tuple(run.resources),
@@ -1860,6 +1870,8 @@ class PythonRunner:
         if event_type == "finding":
             finding = cast(TopologyFinding, event)
             run.findings.append(replace(finding, observed_at=self._accepted_at()))
+            if finding.status == "warning":
+                run.has_warnings = True
         elif event_type == "resource":
             self._register_resource(run, cast(RunResource, event))
         elif event_type == "resource_ownership":

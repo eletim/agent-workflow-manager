@@ -88,6 +88,11 @@ def test_emit_finding_writes_structured_warning(
         }
 
 
+def test_emit_finding_rejects_unsupported_status() -> None:
+    with pytest.raises(ValueError, match="passed, warning, failed, or info"):
+        emit_finding("github", "review result", status="WARN")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("number", "url"),
     [
