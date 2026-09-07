@@ -130,14 +130,8 @@ def test_copy_actions_on_insecure_http_origin(
         editor.send_keys(Keys.CONTROL, "v")
         assert editor.get_attribute("value") == guide
 
-        driver.find_element(By.ID, "output-copy").click()
-        assert driver.find_element(By.ID, "output-copy").text == "Copied"
-        editor.click()
-        editor.send_keys(Keys.CONTROL, "a")
-        editor.send_keys(Keys.CONTROL, "v")
-        assert editor.get_attribute("value") == (
-            "stdout:\nHTTP_STDOUT\n\nstderr:\nHTTP_STDERR\n"
-        )
+        assert not driver.find_element(By.ID, "output-copy").is_enabled()
+        assert editor.get_attribute("value") == guide
 
         driver.find_element(By.ID, "guide-open").click()
         driver.execute_script("document.execCommand = () => false")

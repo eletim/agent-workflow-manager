@@ -226,6 +226,38 @@ function captureDraftIfEditing() {
   }
 }
 
+function renderCleanDraftState() {
+  statusBadge.textContent = "not started";
+  statusBadge.className = "status idle";
+  rawStdout = "";
+  rawStderr = "";
+  stdout.textContent = "";
+  stderr.textContent = "";
+  outputCopy.disabled = true;
+  exitCode.textContent = "Exit code: —";
+  stopButton.disabled = true;
+  cleanupButton.disabled = true;
+
+  renderOutline([], []);
+  renderProgress([]);
+  renderRecovery({state: "idle", attempts: []});
+  renderResources({
+    runId: null,
+    resources: [],
+    resourceCleanupStatus: "cleaned",
+    executionContext: null,
+  });
+  renderDryRun({dryRun: null, dryRunIssues: [], dryRunEligible: true});
+
+  validationPanel.hidden = true;
+  validationPanel.className = "panel validation-panel";
+  validationSuccess.hidden = true;
+  validation.hidden = false;
+  validation.replaceChildren();
+  issueDrivenSuccess.hidden = true;
+  issueDrivenValidation.replaceChildren();
+}
+
 function renderRun(result) {
   currentMode = result.mode === "prompt" ? "prompt" : "workflow";
   const running = result.state === "running";
@@ -241,6 +273,7 @@ function renderRun(result) {
     result.stderrEntries,
     rawStderr,
   );
+  outputCopy.disabled = result.runId == null;
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
   cleanupButton.disabled = activeRunId === null
@@ -285,9 +318,6 @@ async function enterDraftMode(mode = currentMode) {
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
   captureDraftIfEditing();
-  // Only the draft/editable fields and the run-scoped controls change here;
-  // the output/progress/recovery panels are left showing whatever was last
-  // viewed (harmless reference) until a run is selected or started again.
   activeRunGeneration += 1;
   activeRunId = null;
   currentMode = mode;
@@ -297,15 +327,16 @@ async function enterDraftMode(mode = currentMode) {
       promptAgent.value = promptDraft.agent;
       promptCwd.value = promptDraft.cwd;
       promptText.value = promptDraft.prompt;
+    } else if (currentMode === "issue-driven") {
+      issueDrivenJson.value = issueDrivenDraft.json;
+      issueDrivenPython.value = issueDrivenDraft.code;
     } else {
       runArguments.value = draft.args;
       code.value = draft.code;
     }
   }
+  renderCleanDraftState();
   showDraftLabel();
-  stopButton.disabled = true;
-  cleanupButton.disabled = true;
-  renderOutline([], []);
   applyFieldMode();
   await refresh();
 }
