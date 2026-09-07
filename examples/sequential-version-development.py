@@ -758,22 +758,12 @@ def process_issue(
             scope=f"review of Issue #{issue.number}",
             issue_number=issue.number,
         )
-        pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
-        current = github.require_pr(
-            number=pr.number,
-            head=issue.branch,
-            base=config.integration_branch,
-            state="OPEN",
-            expected_head_sha=pr.head_sha,
-            expected_base_sha=pr.base_sha,
-            draft=True,
-        )
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
             client,
             implementer,
             issue.branch,
-            current.head_sha,
+            pr.head_sha,
             allow_unchanged=True,
             iteration=review_number,
         )
@@ -786,15 +776,26 @@ def process_issue(
                 base=config.integration_branch,
                 state="OPEN",
                 expected_head_sha=pushed.remote_sha,
-                expected_base_sha=current.base_sha,
+                expected_base_sha=pr.base_sha,
                 draft=True,
             )
+            pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
             emit_finding(
                 "git",
                 f"review changed {issue.branch}; approval invalidated at "
                 f"{reviewed_sha}",
             )
             continue
+        current = github.require_pr(
+            number=pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+            draft=True,
+        )
+        current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
         if decision(result) == "APPROVED":
             delivery = ReviewDelivery("approved", current.head_sha, current.base_sha)
             break
@@ -963,22 +964,12 @@ def review_whole_version(
             iteration=review_number,
         )
         emit_policy_conflicts(result, config, scope="the integrated version")
-        pr = ensure_base_pr_policy_notes(github, pr, config)
-        current = github.require_pr(
-            number=pr.number,
-            head=config.integration_branch,
-            base=config.main_branch,
-            state="OPEN",
-            expected_head_sha=pr.head_sha,
-            expected_base_sha=pr.base_sha,
-            draft=True,
-        )
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
             client,
             fixer,
             config.integration_branch,
-            current.head_sha,
+            pr.head_sha,
             allow_unchanged=True,
             iteration=review_number,
         )
@@ -993,15 +984,26 @@ def review_whole_version(
                 base=config.main_branch,
                 state="OPEN",
                 expected_head_sha=pushed.remote_sha,
-                expected_base_sha=current.base_sha,
+                expected_base_sha=pr.base_sha,
                 draft=True,
             )
+            pr = ensure_base_pr_policy_notes(github, pr, config)
             emit_finding(
                 "git",
                 "whole-version review changed the integration branch; "
                 f"approval invalidated at {reviewed_sha}",
             )
             continue
+        current = github.require_pr(
+            number=pr.number,
+            head=config.integration_branch,
+            base=config.main_branch,
+            state="OPEN",
+            expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+            draft=True,
+        )
+        current = ensure_base_pr_policy_notes(github, current, config)
         verdict = decision(result)
         warning: str | None = None
         if verdict == "CHANGES_REQUESTED":
@@ -1142,6 +1144,7 @@ def integration_delivery(
             state="MERGED",
             expected_head_sha=integration.remote_sha,
         )
+        rehydrate_policy_conflicts(merged_pr.body, config, issue_number=None)
         final_branch = repo.synchronize_branch(config.main_branch)
         if final_branch.remote_sha is None:
             raise WorkerFailure("final remote branch disappeared during recovery")
