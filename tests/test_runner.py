@@ -1971,9 +1971,15 @@ def test_runner_page_exposes_agent_workflow_manager_favicon(
         connection.close()
         assert response.status == 200
 
-    assert '<link id="favicon" rel="icon" href="/favicon.svg"' in documents["/"][1]
+    assert (
+        '<link id="favicon" rel="icon" href="/favicon.svg" '
+        'type="image/svg+xml" sizes="any">'
+    ) in documents["/"][1]
     assert documents["/favicon.svg"][0] == "image/svg+xml"
-    assert documents["/favicon.svg"][1].startswith("<svg ")
+    assert documents["/favicon.svg"][1].startswith(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" '
+        'viewBox="0 0 32 32">'
+    )
 
 
 def test_runner_page_exposes_copy_actions_and_shared_helper(

@@ -58,6 +58,8 @@ _REQUIRED_FIELDS = {
     "merge_final",
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | {"mode"}
+# Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
+_MAX_WORKFLOW_OUTLINE_ITEMS = 100
 
 
 def _valid_branch_name(value: str) -> bool:
@@ -140,6 +142,16 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     if not isinstance(issues, list) or not issues:
         findings.append(IssueDrivenFinding("$.issues", "must be a non-empty array"))
     else:
+        reserved_outline_items = 2 if value.get("final_review") is True else 1
+        max_issues = _MAX_WORKFLOW_OUTLINE_ITEMS - reserved_outline_items
+        if len(issues) > max_issues:
+            findings.append(
+                IssueDrivenFinding(
+                    "$.issues",
+                    f"must contain at most {max_issues} items when "
+                    f"final_review is {value.get('final_review')!r}",
+                )
+            )
         seen: set[int] = set()
         for index, issue in enumerate(issues):
             if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
@@ -233,6 +245,15 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
 """
 
 
+def _workflow_outline(config: IssueDrivenConfig) -> str:
+    labels = [f"Issue #{number}" for number in config.issues]
+    if config.final_review:
+        labels.append("Whole-version review")
+    labels.append("Final integration PR")
+    entries = "\n".join(f"    {label!r}," for label in labels)
+    return f"WORKFLOW_OUTLINE = [\n{entries}\n]"
+
+
 def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     """Generate a deterministic plain-Python workflow using new-run recovery."""
     source = _canonical_source()
@@ -241,6 +262,9 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
         "    PurpleMuxRuntime,\n    prepare_run_repository,\n",
         1,
     )
+    outline_start = source.index("WORKFLOW_OUTLINE = [\n")
+    outline_end = source.index("\n]", outline_start) + len("\n]")
+    source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]
     source = source.replace("MAX_REVIEWS = 5", f"MAX_REVIEWS = {config.max_reviews}", 1)
     source = source.replace(
         "MERGE_TO_INTEGRATION = True",

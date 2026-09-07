@@ -40,3 +40,6 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 addopts = "--strict-markers --strict-config --durations=5 -vv"
+markers = [
+    "live: requires local authenticated Codex and PurpleMux services",
+]

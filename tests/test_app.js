@@ -896,6 +896,10 @@ test("favicon badge reflects any running run independently of selection", async 
 
   assert.ok(runItem(elements, 2).className.includes("selected"));
   assert.equal(faviconIsRunning(elements), true);
+  assert.ok(
+    decodeURIComponent(elements.favicon.getAttribute("href"))
+      .includes('fill="#ff596b"'),
+  );
 });
 
 test("favicon badge clears through SSE when the final running run stops", async () => {

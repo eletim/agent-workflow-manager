@@ -13,6 +13,7 @@ from purplemux_client import (
     CreateSessionRequest,
     MutationOutcomeUnknown,
     PurpleMuxCLIClient,
+    PurpleMuxRuntime,
     ResultNotReady,
     SessionReadyTimeout,
     ShellCommandRequest,
@@ -35,10 +36,13 @@ class FakeRunner:
         outcomes: Sequence[
             subprocess.CompletedProcess[str] | subprocess.TimeoutExpired | OSError
         ],
+        *,
+        workspace_directories: Sequence[str] | None = ("/workspace/project",),
     ) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[list[str]] = []
         self.tabs: dict[str, dict[str, object]] = {}
+        self.workspace_directories = workspace_directories
 
     def __call__(
         self,
@@ -56,6 +60,20 @@ class FakeRunner:
         self.calls.append(command)
         if command[1:3] == ["tab", "list"]:
             return completed({"tabs": list(self.tabs.values())})
+        if command[1:] == ["workspaces"]:
+            if self.workspace_directories is None:
+                return completed({"workspaces": []})
+            return completed(
+                {
+                    "workspaces": [
+                        {
+                            "id": "ws-test",
+                            "name": "Test workspace",
+                            "directories": list(self.workspace_directories),
+                        }
+                    ]
+                }
+            )
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -84,6 +102,7 @@ class FakeRunner:
 
 
 def client(runner: FakeRunner, **kwargs: object) -> PurpleMuxCLIClient:
+    kwargs.setdefault("codex_project_truster", lambda path: path)
     return PurpleMuxCLIClient(
         "ws-test",
         poll_interval_seconds=0,
@@ -128,6 +147,104 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
     assert create[-2:] == ["-t", "codex-cli"]
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
+
+
+def test_codex_project_is_trusted_before_tab_creation() -> None:
+    events: list[str] = []
+    runner = FakeRunner([completed({"tabId": "tab-123"})])
+
+    def trust(path: str) -> str:
+        assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+        events.append(path)
+        return path
+
+    cli = client(runner, codex_project_truster=trust)
+    cli.create_session(request())
+
+    assert events == ["/workspace/project"]
+    assert runner.calls[0][1:] == ["workspaces"]
+
+
+def test_codex_trust_failure_prevents_tab_creation() -> None:
+    runner = FakeRunner([])
+
+    def fail(_path: str) -> str:
+        raise WorkerFailure("trust unavailable")
+
+    with pytest.raises(WorkerFailure, match="trust unavailable"):
+        client(runner, codex_project_truster=fail).create_session(request())
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_codex_request_cwd_must_equal_first_workspace_directory() -> None:
+    runner = FakeRunner(
+        [], workspace_directories=("/workspace/project", "/workspace/secondary")
+    )
+    trusted: list[str] = []
+    cli = client(
+        runner, codex_project_truster=lambda path: trusted.append(path) or path
+    )
+
+    unrelated = CreateSessionRequest(
+        worker="codex", cwd="/workspace/secondary", command="codex"
+    )
+
+    with pytest.raises(WorkerFailure, match="does not match.*launch directory"):
+        cli.create_session(unrelated)
+
+    assert trusted == []
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_runtime_client_refreshes_reordered_workspace_before_codex_launch() -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-123"})],
+        workspace_directories=("/workspace/project", "/workspace/secondary"),
+    )
+    cli = PurpleMuxRuntime(runner=runner).workspace("ws-test")
+    trusted: list[str] = []
+    cli._codex_project_truster = lambda path: trusted.append(path) or path
+    runner.workspace_directories = ("/workspace/secondary", "/workspace/project")
+
+    session_id = cli.create_session(
+        CreateSessionRequest(
+            worker="codex", cwd="/workspace/secondary", command="codex"
+        )
+    )
+
+    assert session_id == "tab-123"
+    assert trusted == ["/workspace/secondary"]
+    assert sum(call[1:] == ["workspaces"] for call in runner.calls) == 2
+
+
+def test_direct_client_requires_selected_workspace_to_exist() -> None:
+    runner = FakeRunner([], workspace_directories=None)
+
+    with pytest.raises(WorkerFailure, match="was not found before Codex project trust"):
+        client(runner).create_session(request())
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_direct_client_rejects_workspace_without_directories() -> None:
+    runner = FakeRunner([], workspace_directories=())
+
+    with pytest.raises(WorkerFailure, match="has no directory"):
+        client(runner).create_session(request())
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
+
+
+def test_claude_session_does_not_change_codex_trust() -> None:
+    trusted: list[str] = []
+    runner = FakeRunner([completed({"tabId": "tab-claude"})])
+
+    client(
+        runner, codex_project_truster=lambda path: trusted.append(path) or path
+    ).create_session(request("claude-code", "claude"))
+
+    assert trusted == []
 
 
 def test_named_session_derives_run_scoped_correlation(
@@ -1343,7 +1460,9 @@ def test_mutation_timeout_is_not_retried(operation: str) -> None:
         else:
             cli.close_session("tab-1")
 
-    mutation_calls = [call for call in runner.calls if call[2] == operation]
+    mutation_calls = [
+        call for call in runner.calls if len(call) > 2 and call[2] == operation
+    ]
     assert len(mutation_calls) == 1
 
 

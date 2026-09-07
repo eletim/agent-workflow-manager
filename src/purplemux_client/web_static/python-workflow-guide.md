@@ -231,44 +231,64 @@ The request and returned-state shapes used by workflow code are:
 
 ```python
 CreateWorkspaceRequest(cwd, name, correlation_id=None)
-CreateSessionRequest(worker, cwd, command, metadata={}, name=None,
-                     correlation_id=None)
+CreateSessionRequest(worker, cwd, command, metadata={}, name=None, correlation_id=None)
 ShellCommandRequest(command, cwd, name, correlation_id=None)
 
 WorkspaceState(id, name, directories)
-TabState(id, workspace_id, name, panel_type, provider, alive=None,
-         cli_state=None)
-ShellResult(exit_code, diagnostic_output=None, diagnostic_error=None, cwd=None,
-            workspace_id=None, tab_id=None)
+TabState(id, workspace_id, name, panel_type, provider, alive=None, cli_state=None)
+ShellResult(
+    exit_code,
+    diagnostic_output=None,
+    diagnostic_error=None,
+    cwd=None,
+    workspace_id=None,
+    tab_id=None,
+)
 BranchState(name, local_sha, remote_sha, current)
 WorktreeState(root, current_branch, dirty, status)
-FeaturePreparationState(branch, base, expected_base_sha, base_is_ancestor,
-                        action)
+FeaturePreparationState(branch, base, expected_base_sha, base_is_ancestor, action)
 FeatureRecoveryState(branch, reused_existing_work)
-PullRequestState(number, url, state, is_draft, head_repository, head_branch,
-                 head_sha, base_repository, base_branch, base_sha,
-                 merge_commit_sha, auto_merge_enabled, merge_queue_entry,
-                 node_id, body)
+PullRequestState(
+    number,
+    url,
+    state,
+    is_draft,
+    head_repository,
+    head_branch,
+    head_sha,
+    base_repository,
+    base_branch,
+    base_sha,
+    merge_commit_sha,
+    auto_merge_enabled,
+    merge_queue_entry,
+    node_id,
+    body,
+)
 MergeResult(pr, merge_commit_sha, reconciled=False)
 RepositoryPreparation(source_repository, remote, base_branch, base_ref, base_sha)
-RepositoryExecutionContext(source_repository, remote, base_branch, base_ref,
-                           base_sha, execution_root)
+RepositoryExecutionContext(
+    source_repository, remote, base_branch, base_ref, base_sha, execution_root
+)
 ```
 
 Treat returned state as immutable observations. Re-read authoritative state
 after another actor could have changed it; do not edit these values to represent
 a desired result.
 
-Construct a client for an existing workspace:
+Construct a client for an existing workspace. Codex creation re-reads its
+authoritative directories immediately before every launch:
 
 ```python
-client = PurpleMuxCLIClient(
-    workspace_id,
-    poll_interval_seconds=1.0,
-    command_timeout_seconds=30.0,
-    read_timeout_retries=1,
-)
+runtime = PurpleMuxRuntime(command_timeout_seconds=30.0)
+client = runtime.workspace(workspace_id)
 ```
+
+Direct `PurpleMuxCLIClient(workspace_id)` construction remains compatible for
+inspection and cleanup. Before a direct client creates a Codex session, it
+authoritatively re-reads the selected workspace and requires
+`CreateSessionRequest.cwd` to equal its exact first directory, which is the
+directory PurpleMux launches for a CLI-created tab.
 
 The public session operations and their exact workflow-facing signatures are:
 
@@ -400,6 +420,17 @@ adapter checks `command` against the same aliases. The current adapter does not
 pass `cwd`, `command`, or `metadata` through as arbitrary launch configuration;
 PurpleMux owns provider launch and the workspace directory. Keep these request
 fields accurate, but do not claim they configure unsupported runtime behavior.
+For Codex, `create_session()` first canonicalizes `cwd`, re-reads the selected
+PurpleMux workspace immediately before launch, and requires `cwd` to equal its
+first directory because PurpleMux launches CLI-created tabs there. It
+establishes trust for only that current launch path through Codex's app-server
+configuration API. The effective trust value is read back before the tab is
+created, so an unavailable or overridden trust configuration fails early. Trust
+mutations are serialized through a user-local lock so concurrent Workflow
+processes cannot lose another worktree's configuration update.
+Fresh worktrees are handled independently from their source repository path.
+This does not change sandbox or approval policy. AWM does not apply a broad
+permission bypass or simulated trust-dialog keystrokes to Claude Code.
 
 Relevant errors all derive from `TerminalSessionError`:
 
