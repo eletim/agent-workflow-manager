@@ -882,6 +882,37 @@ emit_run_pr(131, "https://github.com/eletim/agent-workflow-manager/pull/131")
     assert runner.snapshot(second).as_json()["integrationPr"] is None
 
 
+def test_progress_pr_navigation_survives_bounded_event_eviction() -> None:
+    runner = PythonRunner(managed_workflows=False, max_progress_events=3)
+    try:
+        run_id = runner.start(
+            """\
+from purplemux_client import emit_step
+emit_step(
+    "Issue #1", "completed", pr_number=101,
+    pr_url="https://github.com/example/repo/pull/101",
+)
+for number in range(1, 6):
+    emit_step(f"later event {number}", "completed")
+"""
+        )
+        snapshot = wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert snapshot.run_id == run_id
+    assert [event.name for event in snapshot.progress] == [
+        "Issue #1",
+        "later event 3",
+        "later event 4",
+        "later event 5",
+    ]
+    issue_event = snapshot.progress[0]
+    assert issue_event.pr_number == 101
+    assert issue_event.pr_url == "https://github.com/example/repo/pull/101"
+    assert snapshot.as_json()["progress"][0]["pr_number"] == 101
+
+
 def test_shell_failure_diagnostic_survives_real_progress_event_encoding(
     runner: PythonRunner, tmp_path: Path
 ) -> None:

@@ -410,6 +410,9 @@ class _RunRecord:
     exit_code: int | None = None
     stop_requested: bool = False
     progress: deque[ProgressEvent] = field(default_factory=deque)
+    # One latest PR-bearing event per authoritative PR survives eviction from
+    # the bounded diagnostic stream so historical Issue navigation remains.
+    progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     attempts: list[RunAttempt] = field(default_factory=list)
@@ -1149,6 +1152,15 @@ class PythonRunner:
     def _snapshot_run(self, run: _RunRecord) -> RunnerSnapshot:
         stdout_entries = self._render_output_entries(run.stdout, run.stdout_truncated)
         stderr_entries = self._render_output_entries(run.stderr, run.stderr_truncated)
+        progress = tuple(run.progress)
+        visible_prs = {
+            event.pr_number for event in progress if event.pr_number is not None
+        }
+        durable_pr_progress = tuple(
+            event
+            for number, event in run.progress_prs.items()
+            if number not in visible_prs
+        )
         return RunnerSnapshot(
             state=run.state,
             stdout="".join(entry.text for entry in stdout_entries),
@@ -1158,7 +1170,7 @@ class PythonRunner:
             outline=run.outline,
             exit_code=run.exit_code,
             run_id=run.run_id,
-            progress=tuple(run.progress),
+            progress=durable_pr_progress + progress,
             validation=(),
             dry_run_issues=(),
             cwd=run.cwd,
@@ -1858,7 +1870,10 @@ class PythonRunner:
             run.integration_pr = cast(PullRequestNavigation, event)
         else:
             progress = cast(ProgressEvent, event)
-            run.progress.append(replace(progress, observed_at=self._accepted_at()))
+            accepted = replace(progress, observed_at=self._accepted_at())
+            run.progress.append(accepted)
+            if accepted.pr_number is not None:
+                run.progress_prs[accepted.pr_number] = accepted
         return True
 
     @staticmethod

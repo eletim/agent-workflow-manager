@@ -781,8 +781,10 @@ emit_step(
 ```
 
 Outside the Runner it is a no-op. Inside the Runner, encoded events over 4 KiB
-are dropped and only the latest 200 events are retained. Do not use events to
-drive the workflow, add statuses, or build decorators/state machines around it.
+are dropped and the diagnostic stream retains only the latest 200 events. The
+latest PR-bearing event for each observed PR is retained separately and included
+in snapshots if its diagnostic event is evicted. Do not use events to drive the
+workflow, add statuses, or build decorators/state machines around it.
 
 When GitHub inspection or creation has authoritatively identified a PR, pass
 `pr_number` and `pr_url` together to attach read-only navigation to that Progress
