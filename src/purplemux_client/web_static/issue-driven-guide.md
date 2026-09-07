@@ -54,10 +54,10 @@ optional; every other field is required.
 | `integration_branch` | string | Existing remote/integration branch used as the development base. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `issues` | array of integers | Positive, unique Issue numbers, executed in the listed order. |
-| `max_reviews` | integer | Review limit from 1 through 100; use 5 unless the user requests another value. |
+| `max_reviews` | integer | Automatic review/fix iteration limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
-| `merge_to_integration` | boolean | Whether each approved Issue PR is merged into the integration branch. |
+| `merge_to_integration` | boolean | Whether each safely deliverable Issue PR is merged into the integration branch, including explicit warning continuations. |
 | `final_review` | boolean | Whether the completed integration branch receives a final review. |
 | `merge_final` | boolean | Whether final delivery is automatically merged into `final_branch`. |
 
@@ -82,9 +82,15 @@ Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
 ```
 
 Issue order is significant and must be preserved. Here, `merge_final: false`
-means the final PR is prepared and marked Ready, but `main` is not automatically
-merged. The implementer and reviewer selections are independent. Omitting either
-agent field selects `codex` for that role.
+means the final PR is prepared but `main` is not automatically merged. It is
+marked Ready after approval and stays Draft after a warning continuation. The
+implementer and reviewer selections are independent. Omitting either agent field
+selects `codex` for that role.
+
+Reviewer approval and warning continuation remain distinct. When the final
+whole-version review reaches the limit with requested changes, the run may
+complete after exact clean/pushed PR topology checks, but the final PR stays
+Draft for human handoff.
 
 ## Rules for AI authors
 

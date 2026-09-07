@@ -339,7 +339,9 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "require_committed_result(" in code
     assert "repo.ensure_pushed(" in code
     assert "github.create_draft_pr(" in code
-    assert "reviewer requested changes, but implementer re-evaluated" in code
+    assert "reviewer requested changes, but the " in code
+    assert "continuing without reviewer approval" in code
+    assert 'status="warning"' in code
     assert "Commit every intended source, test, and configuration" in code
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code
@@ -543,7 +545,8 @@ def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
 
     assert "MERGE_TO_INTEGRATION = True" in merging
     assert "MERGE_TO_INTEGRATION = False" in ready_only
-    assert "Approved Issue #{issue.number} PR is Ready" in ready_only
+    assert "Issue #{issue.number} PR is Ready" in ready_only
+    assert 'delivery.outcome == "approved"' in ready_only
 
 
 def test_final_review_policy_selects_the_generated_control_flow() -> None:

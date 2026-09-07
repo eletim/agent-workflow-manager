@@ -6,6 +6,7 @@ import os
 import pytest
 
 from purplemux_client import (
+    emit_finding,
     emit_run_pr,
     emit_step,
     register_run_resource,
@@ -65,6 +66,25 @@ def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) ->
             "type": "run_pr",
             "pr_number": 17,
             "pr_url": "https://github.com/example/repo/pull/17",
+        }
+
+
+def test_emit_finding_writes_structured_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_finding("github", "review limit reached", status="warning")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "finding",
+            "category": "github",
+            "status": "warning",
+            "message": "review limit reached",
         }
 
 
