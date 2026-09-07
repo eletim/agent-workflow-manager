@@ -16,6 +16,7 @@
         </div>
         <div class="header-actions">
           <button id="guide-open">Workflow Guide</button>
+          <button id="settings-open" type="button">Settings</button>
           <span id="status" class="status idle">idle</span>
         </div>
       </header>
@@ -203,25 +204,36 @@ emit_step("workspace create", "completed")</textarea>
         </section>
       </details>
 
-      <details class="panel settings-panel">
-        <summary>Settings</summary>
+    </main>
+
+    <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+      <div class="settings-dialog-toolbar">
+        <div>
+          <p class="settings-path">Settings <span aria-hidden="true">›</span> Notifications</p>
+          <h2 id="settings-title">Notifications</h2>
+        </div>
+        <button id="settings-close" type="button">Close</button>
+      </div>
+      <div class="settings-dialog-content">
         <form id="notification-settings">
           <div class="settings-heading">
             <div>
-              <h2>Notifications</h2>
               <p>Terminal-state policy and notify CLI delivery settings.</p>
             </div>
             <span id="credential-status" class="credential missing">Credentials: Missing</span>
           </div>
           <div class="toggle-grid">
             <label><input id="notifications-enabled" type="checkbox"> Enabled</label>
-            <label><input id="notify-success" type="checkbox"> On success</label>
-            <label><input id="notify-failure" type="checkbox"> On failure</label>
-            <label><input id="notify-stopped" type="checkbox"> On stopped</label>
+            <label><input id="notify-success" type="checkbox"> Notify on success</label>
+            <label><input id="notify-failure" type="checkbox"> Notify on failure</label>
+            <label><input id="notify-stopped" type="checkbox"> Notify on stopped</label>
           </div>
           <div class="field-grid">
-            <label for="notify-server">Server</label>
-            <input id="notify-server" type="url" required autocomplete="url">
+            <label for="notify-server">Notify server URL</label>
+            <div class="notify-server-control">
+              <input id="notify-server" type="url" required autocomplete="url">
+              <a id="notify-server-link" target="_blank" rel="noopener noreferrer" hidden>Open server</a>
+            </div>
             <label for="notify-topic">Topic</label>
             <input id="notify-topic" type="text" required maxlength="64" pattern="[A-Za-z0-9_-]+">
             <label for="replacement-token">Replace token</label>
@@ -233,8 +245,8 @@ emit_step("workspace create", "completed")</textarea>
             <span id="settings-message" role="status" aria-live="polite"></span>
           </div>
         </form>
-      </details>
-    </main>
+      </div>
+    </dialog>
 
     <dialog id="guide-dialog" aria-labelledby="guide-title">
       <div class="guide-toolbar">

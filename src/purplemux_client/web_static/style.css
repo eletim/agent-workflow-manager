@@ -383,11 +383,20 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 #manual-copy-content { min-height: 220px; }
 .manual-copy-actions { display: flex; justify-content: flex-end; }
 
-.settings-panel { margin-top: 14px; }
-.settings-panel summary { cursor: pointer; font-weight: 650; }
-.settings-panel[open] summary { margin-bottom: 18px; }
+.settings-dialog { width: min(720px, calc(100% - 32px)); height: auto; max-height: calc(100% - 32px); }
+.settings-dialog-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid #303746;
+}
+.settings-dialog-toolbar h2 { margin: 4px 0 0; font-size: 20px; }
+.settings-path { margin: 0; color: #9ba3b5; font-size: 12px; }
+.settings-path span { margin: 0 4px; }
+.settings-dialog-content { padding: 18px; }
 .settings-heading { justify-content: space-between; }
-.settings-heading h2 { margin: 0 0 4px; }
 .settings-heading p { margin: 0; color: #9ba3b5; font-size: 13px; }
 .credential {
   padding: 4px 8px;
@@ -410,6 +419,9 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   align-items: center;
   gap: 10px 14px;
 }
+.notify-server-control { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.notify-server-control input { flex: 1; }
+.notify-server-control a { flex: 0 0 auto; font-size: 13px; white-space: nowrap; }
 .settings-actions { margin-top: 16px; }
 #settings-message { color: #aab0bf; font-size: 13px; }
 #settings-message.error { color: #ff9ca8; }
@@ -417,6 +429,8 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 
 @media (max-width: 760px) {
   main { width: min(100% - 24px, 1100px); margin: 18px auto; }
+  header { align-items: flex-start; }
+  .header-actions { flex-wrap: wrap; justify-content: flex-end; }
   .outputs { grid-template-columns: 1fr; }
   .execution-context { grid-template-columns: 1fr; }
   .prompt-options { grid-template-columns: 1fr; }
@@ -426,5 +440,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .readiness-heading, .readiness-controls { align-items: stretch; flex-direction: column; }
   .readiness-controls select { width: 100%; }
   .field-grid { grid-template-columns: 1fr; }
+  .notify-server-control { align-items: stretch; flex-direction: column; gap: 8px; }
+  .notify-server-control a { align-self: flex-start; padding: 4px 0; }
   .settings-actions { align-items: stretch; flex-direction: column; }
 }

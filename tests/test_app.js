@@ -32,6 +32,7 @@ class Element {
     this.dataset = {};
     this.disabled = false;
     this.hidden = false;
+    this.open = false;
     this.listeners = new Map();
     this.scrollHeight = 0;
     this.scrollTop = 0;
@@ -84,9 +85,9 @@ class Element {
     }
   }
 
-  showModal() {}
+  showModal() { this.open = true; }
 
-  close() {}
+  close() { this.open = false; }
 }
 
 function snapshot({
@@ -219,9 +220,10 @@ async function loadApp({
     "readiness-cleanup", "readiness-guidance",
     "guide-open", "guide-close", "guide-copy", "guide-title", "guide-raw",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
-    "manual-copy-close", "notification-settings", "notifications-enabled",
+    "manual-copy-close", "settings-dialog", "settings-open", "settings-close",
+    "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
-    "notify-topic", "replacement-token", "credential-status", "settings-message",
+    "notify-server-link", "notify-topic", "replacement-token", "credential-status", "settings-message",
     "save-settings", "test-notification",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
@@ -247,6 +249,7 @@ async function loadApp({
     onStopped: false,
     onSuccess: false,
     server: "https://example.invalid",
+    serverUrl: "https://example.invalid",
     topic: "test",
   };
   const initial = {
@@ -310,6 +313,7 @@ async function loadApp({
       setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
     },
+    URL,
   };
   vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
   vm.runInNewContext(appSource, context, {filename: "app.js"});
@@ -355,6 +359,183 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Settings opens Notifications repeatedly without losing form state", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+  });
+
+  assert.equal(elements["notify-server"].value, "https://example.invalid");
+  await elements["settings-open"].dispatch("click");
+  assert.equal(elements["settings-dialog"].open, true);
+  elements["notify-topic"].value = "edited-topic";
+  await elements["settings-close"].dispatch("click");
+  assert.equal(elements["settings-dialog"].open, false);
+  await elements["settings-open"].dispatch("click");
+  assert.equal(elements["settings-dialog"].open, true);
+  assert.equal(elements["notify-topic"].value, "edited-topic");
+});
+
+test("Notify server link is exposed only for safe HTTP URLs", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+  });
+  const server = elements["notify-server"];
+  const link = elements["notify-server-link"];
+
+  assert.equal(link.hidden, false);
+  assert.equal(link.getAttribute("href"), "https://example.invalid");
+  server.value = "ftp://example.invalid";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://secret@example.invalid";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://notify.example/?token=secret";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://notify.example/#token=secret";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "http://notify.example";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "http://localhost:8080";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+});
+
+test("Notify server link uses the backend-validated round-trip URL", async () => {
+  const mapped = "http://[::ffff:127.0.0.1]";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method !== "POST") {
+        return undefined;
+      }
+      return response({
+        credentialStatus: "missing",
+        enabled: false,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: false,
+        server: mapped,
+        serverUrl: mapped,
+        topic: "test",
+      });
+    },
+  });
+
+  elements["notify-server"].value = mapped;
+  await elements["notification-settings"].dispatch("submit");
+
+  assert.equal(elements["notify-server-link"].hidden, false);
+  assert.equal(elements["notify-server-link"].getAttribute("href"), mapped);
+});
+
+test("Malformed configured hostname is editable but never linkable", async () => {
+  const malformed = "https://exa%5cmple.com";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method) {
+        return undefined;
+      }
+      return response({
+        credentialStatus: "missing",
+        enabled: false,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: false,
+        server: malformed,
+        serverUrl: null,
+        topic: "test",
+      });
+    },
+  });
+
+  assert.equal(elements["notify-server"].value, malformed);
+  assert.equal(elements["notify-server-link"].hidden, true);
+  assert.equal(elements["notify-server-link"].getAttribute("href"), undefined);
+});
+
+test("Notifications save reuses the protected settings endpoint", async () => {
+  let savedRequest = null;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method !== "POST") {
+        return undefined;
+      }
+      savedRequest = options;
+      return response({
+        credentialStatus: "missing",
+        enabled: true,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: true,
+        server: "https://example.invalid",
+        serverUrl: "https://example.invalid",
+        topic: "saved-topic",
+      });
+    },
+  });
+  elements["notifications-enabled"].checked = true;
+  elements["notify-success"].checked = true;
+  elements["notify-topic"].value = "saved-topic";
+
+  await elements["notification-settings"].dispatch("submit");
+
+  assert.ok(savedRequest);
+  assert.equal(savedRequest.headers["X-Python-Runner-Token"], "request-token");
+  assert.deepEqual(JSON.parse(savedRequest.body), {
+    enabled: true,
+    onSuccess: true,
+    onFailure: false,
+    onStopped: false,
+    server: "https://example.invalid",
+    topic: "saved-topic",
+  });
+  assert.equal(elements["settings-message"].textContent, "Settings saved. Changes apply immediately.");
+});
+
+test("Test notification shows backend success and sanitized failure feedback", async () => {
+  let testResponse = response({message: "Test notification sent."});
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/settings/notifications/test") return testResponse;
+      return undefined;
+    },
+  });
+
+  await elements["test-notification"].dispatch("click");
+  assert.equal(elements["settings-message"].textContent, "Test notification sent.");
+  assert.equal(elements["settings-message"].className, "success-message");
+
+  testResponse = response({error: "Check the notify server and network."}, 502);
+  await elements["test-notification"].dispatch("click");
+  assert.equal(elements["settings-message"].textContent, "Error: Check the notify server and network.");
+  assert.equal(elements["settings-message"].className, "error");
+});
 
 test("Prompt mode shows only one-shot inputs and submits them directly", async () => {
   let submitted = null;
