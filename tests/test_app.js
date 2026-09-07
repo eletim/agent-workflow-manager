@@ -65,6 +65,10 @@ class Element {
     return this.attributes[name];
   }
 
+  removeAttribute(name) {
+    delete this.attributes[name];
+  }
+
   focus() {}
 
   select() {}
@@ -102,6 +106,7 @@ function snapshot({
   executionContext = null,
   mode = undefined,
   prompt = undefined,
+  integrationPr = null,
 }) {
   const result = {
     args,
@@ -126,6 +131,7 @@ function snapshot({
     resourceCleanupStatus,
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
+    integrationPr,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -201,6 +207,7 @@ async function loadApp({
     "active-context", "run-list",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
+    "integration-pr-panel", "integration-pr",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
@@ -1086,6 +1093,38 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
   );
 });
 
+test("selected run renders authoritative run and Progress PR links", async () => {
+  const issueUrl = "https://github.com/eletim/agent-workflow-manager/pull/130";
+  const integrationUrl = "https://github.com/eletim/agent-workflow-manager/pull/131";
+  const current = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    integrationPr: {number: 131, url: integrationUrl},
+    progress: [
+      {name: "Issue #127", status: "started", pr_number: 130, pr_url: issueUrl},
+      {name: "Issue #127", status: "completed"},
+      {name: "Issue #128", status: "started", pr_number: 132, pr_url: `${issueUrl}2`},
+    ],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+    details: {1: current},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["integration-pr-panel"].hidden, false);
+  assert.equal(elements["integration-pr"].textContent, "PR #131");
+  assert.equal(elements["integration-pr"].getAttribute("href"), integrationUrl);
+  const issueLink = elements.progress.children[0].children[1].children[0].children[1];
+  assert.equal(issueLink.textContent, "PR #130");
+  assert.equal(issueLink.href, issueUrl);
+  assert.equal(
+    elements.progress.children[1].children[1].children[0].children[1].textContent,
+    "PR #132",
+  );
+});
+
 test("validation displays a valid draft outline before execution", async () => {
   const {elements} = await loadApp({
     runs: [],
@@ -1775,6 +1814,10 @@ test("New run immediately clears every run-owned surface without changing histor
       attempts: [{number: 1, state: "failed", exitCode: 1}],
       outline: ["A plan"],
       progress: [{name: "A plan", status: "failed", error: "A failure"}],
+      integrationPr: {
+        number: 140,
+        url: "https://github.com/eletim/agent-workflow-manager/pull/140",
+      },
       resources: [{
         kind: "purplemux_tab",
         identity: "tab-a",
@@ -1806,6 +1849,7 @@ test("New run immediately clears every run-owned surface without changing histor
   assert.equal(elements.status.textContent, "failed");
   assert.equal(elements.stdout.textContent, "A output");
   assert.equal(elements.progress.children.length, 1);
+  assert.equal(elements["integration-pr-panel"].hidden, false);
   assert.equal(elements["recovery-panel"].hidden, false);
   assert.equal(elements["resources-panel"].hidden, false);
   assert.equal(elements["dry-run-panel"].hidden, false);
@@ -1820,6 +1864,8 @@ test("New run immediately clears every run-owned surface without changing histor
   assert.equal(elements["output-copy"].disabled, true);
   assert.equal(elements["exit-code"].textContent, "Exit code: —");
   assert.equal(elements.progress.children.length, 0);
+  assert.equal(elements["integration-pr-panel"].hidden, true);
+  assert.equal(elements["integration-pr"].getAttribute("href"), undefined);
   assert.equal(elements["progress-empty"].hidden, false);
   assert.equal(elements["outline-panel"].hidden, true);
   assert.equal(elements["recovery-panel"].hidden, true);

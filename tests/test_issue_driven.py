@@ -343,6 +343,8 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "Commit every intended source, test, and configuration" in code
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code
+    assert "emit_run_pr(pr.number, pr.url)" in code
+    assert '{"pr_number": pr.number, "pr_url": pr.url}' in code
     assert "Finish with a clean worktree" in code
     assert "commit SHA and PR number or URL" in code
     assert "You may push" not in code

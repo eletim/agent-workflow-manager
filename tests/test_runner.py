@@ -852,6 +852,36 @@ wait_for("finish")
     assert historical_snapshot.progress[-1].observed_at == progress_event.observed_at
 
 
+def test_pr_navigation_is_scoped_to_and_retained_by_each_run(
+    runner: PythonRunner,
+) -> None:
+    first = runner.start(
+        """\
+from purplemux_client import emit_run_pr, emit_step
+emit_step(
+    "Issue #127 review", "completed", pr_number=130,
+    pr_url="https://github.com/eletim/agent-workflow-manager/pull/130",
+)
+emit_run_pr(131, "https://github.com/eletim/agent-workflow-manager/pull/131")
+"""
+    )
+    wait_until_finished(runner)
+    second = runner.start('print("no PR")')
+    wait_until_finished(runner)
+
+    first_snapshot = runner.snapshot(first)
+    assert first_snapshot.progress[0].pr_number == 130
+    progress_json = first_snapshot.as_json()["progress"]
+    assert isinstance(progress_json, list)
+    assert progress_json[0]["pr_url"].endswith("/130")
+    assert first_snapshot.as_json()["integrationPr"] == {
+        "number": 131,
+        "url": "https://github.com/eletim/agent-workflow-manager/pull/131",
+    }
+    assert runner.snapshot(second).integration_pr is None
+    assert runner.snapshot(second).as_json()["integrationPr"] is None
+
+
 def test_shell_failure_diagnostic_survives_real_progress_event_encoding(
     runner: PythonRunner, tmp_path: Path
 ) -> None:
@@ -1463,6 +1493,7 @@ def test_runner_http_lifecycle(
         "findings": [],
         "exitCode": 0,
         "runId": 1,
+        "integrationPr": None,
         "cwd": str(Path.cwd()),
         "args": [],
         "attempts": [

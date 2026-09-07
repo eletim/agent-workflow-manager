@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Mapping
 from typing import Literal
 from urllib import error, request
+from urllib.parse import urlparse
 
 StepStatus = Literal["started", "completed", "failed"]
 FindingCategory = Literal["runtime", "git", "github"]
@@ -37,6 +38,8 @@ def emit_step(
     error: str | None = None,
     workspace: str | None = None,
     tab: str | None = None,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
 ) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("step name must be a non-empty string")
@@ -44,11 +47,13 @@ def emit_step(
         raise ValueError("status must be started, completed, or failed")
     _validate_number("iteration", iteration)
     _validate_number("attempt", attempt)
+    _validate_pr("step", pr_number, pr_url)
     for field_name, value in (
         ("message", message),
         ("error", error),
         ("workspace", workspace),
         ("tab", tab),
+        ("pr_url", pr_url),
     ):
         if value is not None and not isinstance(value, str):
             raise TypeError(f"{field_name} must be a string or None")
@@ -61,10 +66,35 @@ def emit_step(
         ("error", error),
         ("workspace", workspace),
         ("tab", tab),
+        ("pr_number", pr_number),
+        ("pr_url", pr_url),
     ):
         if value is not None:
             event[key] = value
     _write_event(event, drop_oversized=True)
+
+
+def emit_run_pr(pr_number: int, pr_url: str) -> None:
+    """Publish the authoritative Base/Integration PR for the current run."""
+    _validate_pr("run", pr_number, pr_url)
+    _write_event(
+        {"type": "run_pr", "pr_number": pr_number, "pr_url": pr_url},
+        drop_oversized=True,
+    )
+
+
+def _validate_pr(context: str, pr_number: int | None, pr_url: str | None) -> None:
+    if (pr_number is None) != (pr_url is None):
+        raise ValueError(f"{context} PR number and URL must be provided together")
+    if pr_number is None:
+        return
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1:
+        raise ValueError(f"{context} PR number must be positive")
+    if not isinstance(pr_url, str):
+        raise TypeError(f"{context} PR URL must be a string")
+    parsed = urlparse(pr_url)
+    if parsed.scheme != "https" or not parsed.netloc or not parsed.path:
+        raise ValueError(f"{context} PR URL must be an absolute HTTPS URL")
 
 
 def emit_finding(
