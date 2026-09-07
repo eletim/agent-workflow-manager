@@ -175,6 +175,15 @@ class FakeGitHubRunner:
             if self.concurrent_wrong_base:
                 self.prs.append(pr_data(int(created["number"]) + 1, base="main"))
             return self._mutation_result(created)
+        if len(command) >= 5 and command[1:4] == ["api", "--method", "PATCH"]:
+            number = int(command[4].rsplit("/", 1)[1])
+            item = self._find(number)
+            item["body"] = next(
+                command[index + 1].split("=", 1)[1]
+                for index, value in enumerate(command)
+                if value == "-f" and command[index + 1].startswith("body=")
+            )
+            return self._mutation_result(item)
         raise AssertionError(f"unexpected command: {command}")
 
     def _mutation_result(self, data: object) -> subprocess.CompletedProcess[str]:
@@ -386,6 +395,23 @@ def test_correlated_creation_reconciles_and_concurrent_wrong_base_fails_closed()
             body="Body",
             correlation_id="run-concurrent",
         )
+
+
+def test_update_pr_body_preserves_exact_draft_topology() -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old")])
+    repo = repository(runner)
+
+    updated = repo.update_pr_body(
+        1,
+        body="New policy context",
+        expected_head="feature/65",
+        expected_head_sha=HEAD_SHA,
+        expected_base="dev/v0.1.4",
+        expected_base_sha=BASE_SHA,
+    )
+
+    assert updated.body == "New policy context"
+    assert any("PATCH" in call for call in runner.calls)
 
 
 def test_merge_uses_immediate_endpoint_and_verifies_commit_topology() -> None:

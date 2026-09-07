@@ -34,9 +34,10 @@ class IssueDrivenConfig:
     merge_final: bool
     implementer_agent: str = "codex"
     reviewer_agent: str = "codex"
+    policy_issue: int | None = None
 
     def as_json(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "mode": "issue-driven",
             "repository": self.repository,
             "integration_branch": self.integration_branch,
@@ -49,6 +50,9 @@ class IssueDrivenConfig:
             "implementer_agent": self.implementer_agent,
             "reviewer_agent": self.reviewer_agent,
         }
+        if self.policy_issue is not None:
+            result["policy_issue"] = self.policy_issue
+        return result
 
 
 _REQUIRED_FIELDS = {
@@ -61,7 +65,7 @@ _REQUIRED_FIELDS = {
     "final_review",
     "merge_final",
 }
-_OPTIONAL_FIELDS = {"mode", "implementer_agent", "reviewer_agent"}
+_OPTIONAL_FIELDS = {"mode", "implementer_agent", "reviewer_agent", "policy_issue"}
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
 # Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
@@ -183,6 +187,22 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                         f"$.{key}", "must differ from every generated Issue branch"
                     )
                 )
+    policy_issue = value.get("policy_issue")
+    if "policy_issue" in value:
+        if (
+            isinstance(policy_issue, bool)
+            or not isinstance(policy_issue, int)
+            or policy_issue < 1
+        ):
+            findings.append(
+                IssueDrivenFinding("$.policy_issue", "must be a positive integer")
+            )
+        elif isinstance(issues, list) and policy_issue in issues:
+            findings.append(
+                IssueDrivenFinding(
+                    "$.policy_issue", "must differ from every implementation Issue"
+                )
+            )
     max_reviews = value.get("max_reviews")
     if (
         isinstance(max_reviews, bool)
@@ -216,6 +236,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         merge_final=value["merge_final"],
         implementer_agent=value.get("implementer_agent", "codex"),
         reviewer_agent=value.get("reviewer_agent", "codex"),
+        policy_issue=value.get("policy_issue"),
     )
 
 
@@ -255,6 +276,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         {issues},
         ),
         "git diff --check",
+        WORKFLOW_POLICY_ISSUE,
     )
 
 
@@ -290,6 +312,11 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     source = source.replace(
         'REVIEWER_AGENT = "codex"',
         f"REVIEWER_AGENT = {config.reviewer_agent!r}",
+        1,
+    )
+    source = source.replace(
+        "WORKFLOW_POLICY_ISSUE = None",
+        f"WORKFLOW_POLICY_ISSUE = {config.policy_issue!r}",
         1,
     )
     source = source.replace(

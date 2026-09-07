@@ -43,6 +43,38 @@ def test_valid_json_preserves_issue_order() -> None:
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+    assert config.policy_issue is None
+
+
+def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
+    config = parse(payload(policy_issue=200))
+
+    assert config.policy_issue == 200
+    assert config.as_json()["policy_issue"] == 200
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+    assert first == second
+    assert "WORKFLOW_POLICY_ISSUE = 200" in first
+    assert '"git diff --check",\n        WORKFLOW_POLICY_ISSUE,' in first
+
+
+@pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])
+def test_policy_issue_must_be_a_positive_integer(policy_issue: object) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(policy_issue=policy_issue))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.policy_issue", "must be a positive integer")
+    ]
+
+
+def test_policy_issue_must_differ_from_implementation_issues() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(policy_issue=89))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.policy_issue", "must differ from every implementation Issue")
+    ]
 
 
 def test_omitted_agents_default_to_codex_and_serialize_explicitly() -> None:
@@ -357,6 +389,82 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
         "discard ambiguous local work",
     ):
         assert prohibited in code
+
+
+def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() -> None:
+    code = generate_issue_driven_workflow(parse(payload(policy_issue=200)))
+
+    assert "Before doing anything else, run `gh issue view" in code
+    assert 'policy_context(config, scope=f"Issue #{issue.number}")' in code
+    assert 'policy_context(config, scope=f"fixes for Issue #{issue.number}")' in code
+    assert 'policy_context(config, scope="the whole-version review")' in code
+    assert 'policy_context(config, scope="whole-version fixes")' in code
+    assert "https://github.com/{config.slug}/issues/{config.policy_issue}" in code
+    assert "ensure_base_pr_policy_notes(github, pr, config)" in code
+    assert "github.update_pr_body(" in code
+
+
+def test_policy_conflict_marker_emits_warning_and_preserves_child_precedence() -> None:
+    code = generate_issue_driven_workflow(parse(payload(policy_issue=200)))
+    module_name = "generated_policy_issue_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    findings: list[tuple[str, str, str]] = []
+    module.__dict__["emit_finding"] = lambda category, message, status="completed": (
+        findings.append((category, message, status))
+    )
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (),
+        "true",
+        200,
+    )
+
+    module.__dict__["emit_policy_conflicts"](
+        "APPROVED\nPOLICY_CONFLICT: child explicitly chooses the other API",
+        config,
+        scope="review of Issue #90",
+    )
+
+    assert len(findings) == 1
+    assert findings[0][0] == "policy_issue"
+    assert findings[0][2] == "warning"
+    assert "child explicitly chooses the other API" in findings[0][1]
+    assert "implementation Issue as the primary requirement" in findings[0][1]
+
+
+def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
+    module_name = "generated_without_policy_issue_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (),
+        "true",
+    )
+    issue = module.__dict__["Issue"](90, "feature/issue-90")
+
+    implementation, review = module.__dict__["issue_prompts"](issue, config)
+
+    assert implementation.startswith("Implement Issue #90")
+    assert review.startswith("Independently review Issue #90")
+    assert "policy Issue" not in implementation
+    assert "POLICY_CONFLICT" not in review
 
 
 def test_generated_workflow_has_focused_dirty_worktree_recovery() -> None:

@@ -523,6 +523,10 @@ github.set_draft(
     pr, *, draft, expected_head, expected_head_sha, expected_base,
     expected_base_sha
 ) -> PullRequestState
+github.update_pr_body(
+    pr, *, body, expected_head, expected_head_sha, expected_base,
+    expected_base_sha
+) -> PullRequestState
 github.merge_pr(
     pr, *, expected_head, expected_head_sha, expected_base, expected_base_sha,
     method="merge"
@@ -532,9 +536,10 @@ github.merge_pr(
 `state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
-`merge_pr()` supports only an immediate merge commit and verifies its parents
-and the resulting base ref; it never queues, squashes, rebases, or enables
-auto-merge.
+`update_pr_body()` preserves exact open Draft topology and rejects a concurrent
+body change. `merge_pr()` supports only an immediate merge commit and verifies
+its parents and the resulting base ref; it never queues, squashes, rebases, or
+enables auto-merge.
 
 The repository execution helpers are:
 
@@ -604,11 +609,12 @@ The following categories are normative:
 - **Inspection-aware, reconciliation-capable mutation:**
   `prepare_run_repository()`; workspace/tab creation and identity-checked
   deletion/close; `interrupt()`; every Git mutation listed above; and
-  `create_draft_pr()`, `set_draft()`, and `merge_pr()`. Each captures exact
-  preconditions, dispatches at most once, and inspects an authoritative
-  postcondition. It can return the confirmed desired result, report a proven
-  rejection/conflict, or raise `MutationOutcomeUnknown` if inspection still
-  cannot distinguish the outcome. Reconciliation is not a promise of success.
+  `create_draft_pr()`, `set_draft()`, `update_pr_body()`, and `merge_pr()`. Each
+  captures exact preconditions, dispatches at most once, and inspects an
+  authoritative postcondition. It can return the confirmed desired result,
+  report a proven rejection/conflict, or raise `MutationOutcomeUnknown` if
+  inspection still cannot distinguish the outcome. Reconciliation is not a
+  promise of success.
 - **Unknown-outcome mutation without a sufficient remote postcondition:**
   `send_input()`. A successful synchronous response is accepted, but a timeout
   cannot prove whether the prompt was delivered. Do not retry it. `start_shell()`
