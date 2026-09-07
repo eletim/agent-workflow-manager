@@ -82,8 +82,10 @@ optional; every other field is required. When set, `policy_issue` is a positive
 Issue number that supplies version-wide design context to every implementation,
 review, and fix turn and is referenced by the Base PR. It cannot also appear in
 `issues`. Clear conflicts produce structured warnings while the implementation
-Issue remains authoritative. `implementer_agent` selects implementation, fix,
-and cleanup turns, while `reviewer_agent` selects Issue and whole-version review turns. Each
+Issue remains authoritative. Conflict records are persisted on child PRs so a
+recovery run can restore them for whole-version review, Summary, and Base PR
+handoff. `implementer_agent` selects implementation, fix, and cleanup turns,
+while `reviewer_agent` selects Issue and whole-version review turns. Each
 accepts `codex` or `claude` and independently defaults to `codex`. Issue numbers
 are positive, unique, and retain their array order. Unknown fields are rejected so
 generic actions, conditions, loops, and nested executable blocks cannot grow into

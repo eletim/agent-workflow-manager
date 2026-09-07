@@ -94,7 +94,9 @@ whole-version review/fix agents read it first as shared design context. It is no
 interpreted as workflow control or a DSL. A clear conflict with a listed
 implementation Issue is emitted as a structured warning and remains visible for
 human handoff; execution continues with the implementation Issue taking priority.
-The Base PR references the policy Issue.
+The warning is persisted on its child PR and restored when recovery skips an
+already-merged Issue, so whole-version review and Base PR handoff retain it. The
+Base PR references the policy Issue.
 
 Reviewer approval and warning continuation remain distinct. When the final
 whole-version review reaches the limit with requested changes, the run may

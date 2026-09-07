@@ -9,6 +9,7 @@ a new run and creates new runtime resources.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -51,7 +52,8 @@ MERGE_TO_INTEGRATION = True
 FINAL_REVIEW = True
 MERGE_FINAL = False
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
-POLICY_CONFLICT_WARNINGS: list[str] = []
+POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
+POLICY_CONFLICT_WARNINGS: list[tuple[int | None, str]] = []
 
 
 @dataclass(frozen=True)
@@ -238,6 +240,14 @@ def policy_context(config: Config, *, scope: str) -> str:
     """Return agent guidance without changing prompts when no policy is set."""
     if config.policy_issue is None:
         return ""
+    known_conflicts = "".join(
+        f"\n- {warning}" for _, warning in POLICY_CONFLICT_WARNINGS
+    )
+    if known_conflicts:
+        known_conflicts = (
+            "\nKnown policy conflicts recovered or detected earlier in this workflow:"
+            f"{known_conflicts}\n"
+        )
     return f"""Before doing anything else, run `gh issue view {config.policy_issue}
 --repo {config.slug}` and read policy Issue #{config.policy_issue}. Treat it as
 the version-wide design context for {scope},
@@ -245,11 +255,26 @@ not as a workflow DSL or a source of ordering, retry, or merge behavior. The
 implementation Issue remains the primary requirement. If you find a clear
 conflict, continue by following the implementation Issue and include a line
 starting with {POLICY_CONFLICT_MARKER} that truthfully describes the conflict.
+{known_conflicts}
 
 """
 
 
-def emit_policy_conflicts(result: str, config: Config, *, scope: str) -> None:
+def record_policy_conflict(issue_number: int | None, warning: str) -> None:
+    record = (issue_number, warning)
+    if record not in POLICY_CONFLICT_WARNINGS:
+        POLICY_CONFLICT_WARNINGS.append(record)
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("policy_issue", warning, status="warning")
+
+
+def emit_policy_conflicts(
+    result: str,
+    config: Config,
+    *,
+    scope: str,
+    issue_number: int | None = None,
+) -> None:
     if config.policy_issue is None:
         return
     for line in result.splitlines():
@@ -260,17 +285,62 @@ def emit_policy_conflicts(result: str, config: Config, *, scope: str) -> None:
                 f"{detail.strip()[:500]}; continuing with the implementation "
                 "Issue as the primary requirement."
             )
-            if warning not in POLICY_CONFLICT_WARNINGS:
-                POLICY_CONFLICT_WARNINGS.append(warning)
-                print(f"WARN: {warning}", flush=True)
-                emit_finding("policy_issue", warning, status="warning")
+            record_policy_conflict(issue_number, warning)
+
+
+def encoded_policy_conflict_marker(warning: str) -> str:
+    encoded = base64.b64encode(warning.encode("utf-8")).decode("ascii")
+    return f"<!-- {POLICY_CONFLICT_PR_MARKER}{encoded} -->"
+
+
+def rehydrate_policy_conflicts(body: str, config: Config, *, issue_number: int) -> None:
+    if config.policy_issue is None:
+        return
+    prefix = f"<!-- {POLICY_CONFLICT_PR_MARKER}"
+    for line in body.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith(prefix) or not candidate.endswith(" -->"):
+            continue
+        encoded = candidate[len(prefix) : -len(" -->")]
+        try:
+            warning = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (UnicodeError, ValueError):
+            continue
+        record_policy_conflict(issue_number, warning)
+
+
+def ensure_issue_pr_policy_conflicts(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    issue: Issue,
+    config: Config,
+) -> PullRequestState:
+    if config.policy_issue is None:
+        return pr
+    body = pr.body
+    for issue_number, warning in POLICY_CONFLICT_WARNINGS:
+        if issue_number != issue.number:
+            continue
+        marker = encoded_policy_conflict_marker(warning)
+        if marker not in body:
+            body = f"{body.rstrip()}\n\nPolicy conflict warning: {warning}\n{marker}"
+    return github.update_pr_body(
+        pr.number,
+        body=body,
+        expected_head=issue.branch,
+        expected_head_sha=pr.head_sha,
+        expected_base=config.integration_branch,
+        expected_base_sha=pr.base_sha,
+    )
 
 
 def policy_pr_notes(config: Config) -> str:
     if config.policy_issue is None:
         return ""
     reference = f"https://github.com/{config.slug}/issues/{config.policy_issue}"
-    conflict_notes = "".join(f"\n- {warning}" for warning in POLICY_CONFLICT_WARNINGS)
+    conflict_notes = "".join(
+        f"\n- {warning}" for _, warning in POLICY_CONFLICT_WARNINGS
+    )
     if conflict_notes:
         conflict_notes = f"\n\nPolicy conflict warnings:{conflict_notes}"
     return (
@@ -291,7 +361,7 @@ def ensure_base_pr_policy_notes(
     if reference not in body:
         body = f"{body.rstrip()}{policy_pr_notes(config)}"
     else:
-        for warning in POLICY_CONFLICT_WARNINGS:
+        for _, warning in POLICY_CONFLICT_WARNINGS:
             if warning not in body:
                 body = f"{body.rstrip()}\n\nPolicy conflict warning: {warning}"
     return github.update_pr_body(
@@ -599,6 +669,7 @@ def process_issue(
         )
     prepared = prepare_issue(repo, github, issue, config)
     if isinstance(prepared, PullRequestState):
+        rehydrate_policy_conflicts(prepared.body, config, issue_number=issue.number)
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
         return prepared
     existing_pr, start_sha, reused_existing_work = prepared
@@ -636,7 +707,10 @@ def process_issue(
         pr=existing_pr,
     )
     emit_policy_conflicts(
-        implementation_result, config, scope=f"implementation Issue #{issue.number}"
+        implementation_result,
+        config,
+        scope=f"implementation Issue #{issue.number}",
+        issue_number=issue.number,
     )
     implementation_sha, _ = require_agent_result(
         repo,
@@ -652,6 +726,7 @@ def process_issue(
     pr = ensure_issue_pr(
         repo, github, issue, config, expected_base_sha=integration.remote_sha
     )
+    pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
     if pr.head_sha != implementation_sha:
         raise WorkerFailure("delivered PR head does not match committed result")
     emit_step(
@@ -670,7 +745,13 @@ def process_issue(
             iteration=review_number,
             pr=pr,
         )
-        emit_policy_conflicts(result, config, scope=f"review of Issue #{issue.number}")
+        emit_policy_conflicts(
+            result,
+            config,
+            scope=f"review of Issue #{issue.number}",
+            issue_number=issue.number,
+        )
+        pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
         current = github.require_pr(
             number=pr.number,
             head=issue.branch,
@@ -742,8 +823,12 @@ and leave the worktree clean. If no change is warranted, leave it clean and
             pr=pr,
         )
         emit_policy_conflicts(
-            fix_result, config, scope=f"fixes for Issue #{issue.number}"
+            fix_result,
+            config,
+            scope=f"fixes for Issue #{issue.number}",
+            issue_number=issue.number,
         )
+        current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
         fixed_sha, changed = require_agent_result(
             repo,
             client,

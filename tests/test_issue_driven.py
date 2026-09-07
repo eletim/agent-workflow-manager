@@ -4,12 +4,18 @@ import ast
 import inspect
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from purplemux_client import BranchState, GitHubRepository, GitRepository
+from purplemux_client import (
+    BranchState,
+    GitHubRepository,
+    GitRepository,
+    PullRequestState,
+)
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -438,6 +444,124 @@ def test_policy_conflict_marker_emits_warning_and_preserves_child_precedence() -
     assert findings[0][2] == "warning"
     assert "child explicitly chooses the other API" in findings[0][1]
     assert "implementation Issue as the primary requirement" in findings[0][1]
+
+
+def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[90], policy_issue=200)))
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    first_run = load_run("generated_policy_first_run")
+    issue = first_run["Issue"](90, "feature/issue-90")  # type: ignore[operator]
+    config = first_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (issue,),
+        "true",
+        200,
+    )
+    child_pr = PullRequestState(
+        90,
+        "https://example.test/pull/90",
+        "OPEN",
+        True,
+        config.slug,
+        issue.branch,
+        "child-head",
+        config.slug,
+        config.integration_branch,
+        "integration-head",
+        None,
+        False,
+        None,
+        "PR_90",
+        "Sequential implementation of Issue #90.",
+    )
+
+    class ChildGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == child_pr.number
+            return replace(child_pr, body=str(kwargs["body"]))
+
+    first_run["emit_finding"] = lambda *args, **kwargs: None
+    first_run["emit_policy_conflicts"](  # type: ignore[operator]
+        "POLICY_CONFLICT: child requires the legacy API",
+        config,
+        scope="implementation Issue #90",
+        issue_number=90,
+    )
+    persisted = first_run["ensure_issue_pr_policy_conflicts"](  # type: ignore[operator]
+        ChildGitHub(), child_pr, issue, config
+    )
+    assert "agent-workflow-manager:policy-conflict:" in persisted.body
+
+    # A new module models recovery after interruption; no process-local warning
+    # state crosses this boundary and the already-merged Issue is skipped.
+    second_run = load_run("generated_policy_second_run")
+    recovered_issue = second_run["Issue"](90, "feature/issue-90")  # type: ignore[operator]
+    recovered_config = second_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        config.slug,
+        config.integration_branch,
+        config.main_branch,
+        (recovered_issue,),
+        "true",
+        200,
+    )
+    merged = replace(persisted, state="MERGED", is_draft=False)
+    findings: list[tuple[str, str, str]] = []
+    process_globals = second_run["process_issue"].__globals__  # type: ignore[attr-defined]
+    process_globals["prepare_issue"] = lambda *args: merged
+    process_globals["emit_finding"] = lambda category, message, status="completed": (
+        findings.append((category, message, status))
+    )
+
+    class CleanRepository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+    recovered = second_run["process_issue"](  # type: ignore[operator]
+        recovered_issue, recovered_config, object(), CleanRepository(), object()
+    )
+
+    assert recovered is merged
+    assert findings and findings[0][2] == "warning"
+    warning = findings[0][1]
+    whole_review_context = second_run["policy_context"](  # type: ignore[operator]
+        recovered_config, scope="the whole-version review"
+    )
+    assert warning in whole_review_context
+
+    base_pr = replace(
+        child_pr,
+        number=200,
+        head_branch=recovered_config.integration_branch,
+        head_sha="integration-head",
+        base_branch=recovered_config.main_branch,
+        base_sha="main-head",
+        body="Sequential integration.",
+    )
+    delivered_bodies: list[str] = []
+
+    class BaseGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == base_pr.number
+            delivered_bodies.append(str(kwargs["body"]))
+            return replace(base_pr, body=delivered_bodies[-1])
+
+    second_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
+        BaseGitHub(), base_pr, recovered_config
+    )
+    assert delivered_bodies and warning in delivered_bodies[-1]
 
 
 def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
