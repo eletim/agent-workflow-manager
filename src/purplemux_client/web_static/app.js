@@ -123,6 +123,10 @@ let promptDraft = {
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
 let explicitNewRun = false;
+// The last detail response accepted for the selected run. This is the only
+// source used when carrying a reusable folder into a new-run draft; list
+// summaries and rendered text are intentionally insufficient.
+let activeRunSnapshot = null;
 let activeRunGeneration = 0;
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
@@ -232,6 +236,36 @@ function captureDraftIfEditing() {
   }
 }
 
+function reusableFolder(snapshot) {
+  if (snapshot?.mode === "prompt") {
+    return snapshot.prompt?.cwd || snapshot.cwd || null;
+  }
+  return snapshot?.executionContext?.sourceRepository || null;
+}
+
+function inheritFolderIntoDraft(snapshot, mode) {
+  const folder = reusableFolder(snapshot);
+  if (typeof folder !== "string" || folder === "") return;
+  if (mode === "prompt") {
+    promptDraft = {...promptDraft, cwd: folder};
+    return;
+  }
+  if (mode !== "issue-driven") return;
+  try {
+    const config = JSON.parse(issueDrivenDraft.json);
+    if (config === null || Array.isArray(config) || typeof config !== "object") return;
+    config.repository = folder;
+    issueDrivenDraft = {
+      ...issueDrivenDraft,
+      json: JSON.stringify(config, null, 2),
+      code: "",
+    };
+  } catch {
+    // Preserve invalid in-progress JSON exactly; normal validation will show
+    // the user what needs fixing.
+  }
+}
+
 function renderCleanDraftState() {
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
@@ -296,6 +330,7 @@ function renderRun(result) {
   // Only an authoritative snapshot for the run currently being viewed may
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
+    activeRunSnapshot = result;
     if (currentMode === "prompt") {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
@@ -326,8 +361,10 @@ async function enterDraftMode(mode = currentMode) {
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
   captureDraftIfEditing();
+  if (wasViewingRun) inheritFolderIntoDraft(activeRunSnapshot, mode);
   activeRunGeneration += 1;
   activeRunId = null;
+  activeRunSnapshot = null;
   currentMode = mode;
   explicitNewRun = true;
   if (wasViewingRun || changedMode) {
@@ -404,6 +441,7 @@ function renderRunList(runs) {
     button.addEventListener("click", async () => {
       captureDraftIfEditing();
       activeRunId = run.runId;
+      activeRunSnapshot = null;
       activeRunGeneration += 1;
       explicitNewRun = false;
       await refresh();
@@ -846,6 +884,7 @@ async function refresh() {
       // auto-selecting, exactly as an explicit run-list click would.
       captureDraftIfEditing();
       activeRunId = runs[runs.length - 1].runId;
+      activeRunSnapshot = null;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;
     }
