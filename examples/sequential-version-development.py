@@ -1727,7 +1727,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> bool:
     if not complete and not candidate.remaining:
         raise WorkerFailure("planner must add work or complete an empty plan")
     candidate.finalized = complete
-    serialized_work_item_plan(candidate)
+    validate_work_item_plan_capacity(candidate)
     plan.items = candidate.items
     plan.finalized = complete
     return complete
@@ -1742,22 +1742,45 @@ def plan_seed_fingerprint(config: Config) -> str:
     return hashlib.sha256(seed.encode()).hexdigest()
 
 
-def serialized_work_item_plan(plan: WorkItemPlan) -> str:
+def work_item_plan_source(
+    plan: WorkItemPlan, *, position: int, finalized: bool
+) -> str:
     payload = {
         "version": 1,
         "seed_sha256": plan_seed_fingerprint(plan.config),
         "items": [planner_work_item_json(issue) for issue in plan.items],
-        "position": plan.position,
-        "finalized": plan.finalized,
+        "position": position,
+        "finalized": finalized,
     }
-    source = json.dumps(
+    return json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def require_work_item_plan_size(source: str) -> None:
     if len(source.encode()) > MAX_PLAN_STATE_CHARS:
         raise WorkerFailure("work-item plan recovery state exceeds its size limit")
+
+
+def validate_work_item_plan_capacity(plan: WorkItemPlan) -> None:
+    source = work_item_plan_source(
+        plan,
+        position=len(plan.items),
+        finalized=False,
+    )
+    require_work_item_plan_size(source)
+
+
+def serialized_work_item_plan(plan: WorkItemPlan) -> str:
+    source = work_item_plan_source(
+        plan,
+        position=plan.position,
+        finalized=plan.finalized,
+    )
+    require_work_item_plan_size(source)
     encoded = base64.urlsafe_b64encode(source.encode()).decode()
     return f"<!-- {WORK_ITEM_PLAN_MARKER}{encoded} -->"
 

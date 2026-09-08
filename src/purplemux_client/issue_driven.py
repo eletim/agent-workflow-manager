@@ -479,7 +479,7 @@ def _work_item_plan_state_size(work_items: list[WorkItem]) -> int:
         "version": 1,
         "seed_sha256": hashlib.sha256(seed.encode()).hexdigest(),
         "items": items,
-        "position": 0,
+        "position": len(items),
         "finalized": False,
     }
     return len(

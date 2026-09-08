@@ -307,9 +307,15 @@ def test_inline_mini_tasks_fit_the_persisted_plan_size_boundary() -> None:
     value["work_items"] = [
         {"id": f"task-{index}", "task": "x" * 4000} for index in range(7)
     ]
-    value["work_items"].append({"id": "task-7", "task": "x" * 3657})
+    value["work_items"].extend(
+        [
+            {"id": "task-7", "task": "x"},
+            {"id": "task-8", "task": "x"},
+            {"id": "task-9", "task": "x" * 3602},
+        ]
+    )
 
-    assert len(parse(value).work_items) == 8
+    assert len(parse(value).work_items) == 10
 
     value["work_items"][-1]["task"] += "x"
     with pytest.raises(IssueDrivenValidationError) as caught:
@@ -1001,6 +1007,36 @@ def test_planner_rejects_oversized_plan_transactionally() -> None:
     assert [issue.key for issue in plan.snapshot] == [90]
     assert plan.position == 0
     assert plan.finalized is False
+
+
+def test_plan_size_boundary_reserves_multi_digit_dispatch_position() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3602]
+    issues = tuple(
+        workflow["planner_inline_issue"](f"task-{index}", task)
+        for index, task in enumerate(tasks)
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        issues,
+        "true",
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    for _ in range(9):
+        assert plan.take_next() is not None
+    workflow["serialized_work_item_plan"](plan)
+    assert plan.take_next() is not None
+    source = workflow["work_item_plan_source"](
+        plan, position=plan.position, finalized=False
+    )
+
+    assert plan.position == 10
+    assert len(source.encode()) == 32_000
+    workflow["serialized_work_item_plan"](plan)
 
 
 def test_planner_persists_undispatched_addition_before_interruption() -> None:

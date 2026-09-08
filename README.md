@@ -71,9 +71,10 @@ it through `plan.add()`, `plan.update()`, or `plan.skip()`. A planner can add a
 pending Issue or mini task, refine a pending mini task while preserving its
 stable ID and branch, skip obsolete work, or declare the plan complete. Invalid,
 ambiguous, oversized, or unbounded decisions fail closed. The initial aggregate
-serialized plan is limited to 32,000 bytes while each inline task remains limited
-to 4,000 characters. Already-dispatched items cannot be revised and completed
-identities cannot be reused. The final plan snapshot is passed explicitly to
+serialized plan, including its largest possible dispatch position, is limited to
+32,000 bytes while each inline task remains limited to 4,000 characters.
+Already-dispatched items cannot be revised and completed identities cannot be
+reused. The final plan snapshot is passed explicitly to
 handoff generation; configuration is never mutated. Before dispatch, every
 accepted decision is stored as seed-bound recovery state in the Draft Base PR,
 and each item is marked dispatched before child processing. A new run restores
