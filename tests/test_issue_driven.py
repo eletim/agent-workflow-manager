@@ -723,6 +723,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         " implementer": "IMPLEMENTER_AGENT",
         " scope reviewer": "REVIEWER_AGENT",
         " correctness reviewer": "REVIEWER_AGENT",
+        "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
@@ -871,42 +872,70 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
         "acme/project",
         "dev/v1",
         "main",
-        [original, issue_type(90, "feature/issue-90")],
+        (original, issue_type(90, "feature/issue-90")),
         "true",
     )
     processed: list[object] = []
-    hook_calls = 0
-    captured_plan: list[object] = []
-
-    def update_work_items(plan, _config, _client) -> None:
-        nonlocal hook_calls
-        captured_plan[:] = [plan]
-        if hook_calls == 0:
-            plan.update("release-notes", updated)
-            assert plan.skip(90).number == 90
-            plan.add(issue_type(91, "feature/issue-91"))
-        elif hook_calls == 1:
-            plan.add(issue_type(92, "feature/issue-92"))
-        hook_calls += 1
-
-    workflow["update_work_items"] = update_work_items
+    planner_decisions = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "update",
+                            "key": "release-notes",
+                            "task": updated_task,
+                        },
+                        {"action": "skip", "key": 90},
+                        {"action": "add", "item": 91},
+                    ],
+                    "complete": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "actions": [{"action": "add", "item": 92}],
+                    "complete": False,
+                }
+            ),
+            json.dumps({"actions": [], "complete": False}),
+            json.dumps({"actions": [], "complete": True}),
+        )
+    )
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: next(planner_decisions)
     workflow["process_issue"] = lambda issue, _config, _client, _repo, _github: (
         processed.append(issue)
     )
     workflow["run_outline_step"] = lambda _name, action: action()
 
-    workflow["process_work_items"](
+    effective = workflow["process_work_items"](
         config, SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
     )
 
     assert [issue.key for issue in processed] == ["release-notes", 91, 92]
     assert processed[0].task == updated_task
-    assert [issue.key for issue in config.issues] == ["release-notes", 91, 92]
-    plan = captured_plan[0]
+    assert [issue.key for issue in effective] == ["release-notes", 91, 92]
+    assert [issue.key for issue in config.issues] == ["release-notes", 90]
+
+    plan = workflow["WorkItemPlan"](config)
+    assert plan.take_next() is original
     with pytest.raises(ValueError, match="no unprocessed work item"):
         plan.update("release-notes", updated)
-    with pytest.raises(ValueError, match="identities must be unique"):
-        plan.add(issue_type(91, "feature/issue-191"))
+    with pytest.raises(WorkerFailure, match="unsupported shape"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [
+                        {"action": "add", "item": 91},
+                        {"action": "replace", "key": 90},
+                    ],
+                    "complete": False,
+                }
+            ),
+        )
+    assert [issue.key for issue in plan.snapshot] == ["release-notes", 90]
 
 
 def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> None:
@@ -981,7 +1010,7 @@ def test_human_handoff_prompt_and_validation_contract() -> None:
     )
     delivery = workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha, 2)  # type: ignore[operator]
     prompt = workflow["human_handoff_prompt"](  # type: ignore[operator]
-        config, pr, delivery, ()
+        config, (issue,), pr, delivery, ()
     )
 
     assert "Reviewer role Agent selected by reviewer_agent" in prompt
@@ -1122,7 +1151,7 @@ def test_handoff_updates_ready_or_warning_draft_without_changing_state(
             return replace(pr, body=str(kwargs["body"]))
 
     updated = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
-        config, object(), GitHub(), pr, delivery
+        config, (issue,), object(), GitHub(), pr, delivery
     )
 
     assert updated.is_draft is draft
@@ -1163,7 +1192,7 @@ def test_handoff_failure_warns_but_mutation_unknown_remains_fail_closed() -> Non
     )
 
     unchanged = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
-        config, object(), object(), pr, delivery
+        config, (issue,), object(), object(), pr, delivery
     )
     assert unchanged is pr
     assert findings[-1][2] == "warning"
@@ -1192,7 +1221,7 @@ def test_handoff_failure_warns_but_mutation_unknown_remains_fail_closed() -> Non
 
     with pytest.raises(MutationOutcomeUnknown, match="response lost"):
         workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
-            config, object(), UnknownGitHub(), pr, delivery
+            config, (issue,), object(), UnknownGitHub(), pr, delivery
         )
 
 
@@ -1480,11 +1509,11 @@ def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() 
 
     integration_globals["review_whole_version"] = recovered_review
     integration_globals["update_base_pr_human_handoff"] = (
-        lambda config, client, github, pr, delivery: pr
+        lambda config, work_items, client, github, pr, delivery: pr
     )
 
     delivered = second_run["integration_delivery"](  # type: ignore[operator]
-        second_config, object(), Repository(), SecondGitHub()
+        second_config, second_config.issues, object(), Repository(), SecondGitHub()
     )
 
     assert delivered.is_draft is False

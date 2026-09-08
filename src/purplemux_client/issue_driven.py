@@ -823,9 +823,9 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         repository.expected_github_slug,
         {config.integration_branch!r},
         {config.final_branch!r},
-        [
+        (
         {issues},
-        ],
+        ),
         "git diff --check",
         WORKFLOW_POLICY_ISSUE,
     )
