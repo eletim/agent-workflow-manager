@@ -116,3 +116,5 @@ def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
     assert ".mode-switch" in styles and "repeat(3, minmax(0, 1fr))" in styles
     assert ".controls" in styles and "repeat(2, minmax(0, 1fr))" in styles
     assert ".output-panel { min-width: 0; }" in styles
+    assert 'id="issue-summary-panel"' in INDEX.read_text(encoding="utf-8")
+    assert "grid-template-columns: 20px minmax(0, 1fr)" in styles

@@ -6,8 +6,12 @@ import os
 import pytest
 
 from purplemux_client import (
+    emit_finding,
+    emit_issue_driven_context,
+    emit_issue_result,
     emit_run_pr,
     emit_step,
+    emit_whole_review_result,
     register_run_resource,
 )
 from purplemux_client.progress import (
@@ -66,6 +70,92 @@ def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) ->
             "pr_number": 17,
             "pr_url": "https://github.com/example/repo/pull/17",
         }
+
+
+def test_emit_issue_driven_results_write_narrow_structured_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
+        emit_issue_result(
+            10,
+            "continued_with_warning",
+            3,
+            44,
+            "https://github.com/acme/project/pull/44",
+            warnings=("review limit reached",),
+        )
+        emit_whole_review_result("approved", 2)
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        events = [json.loads(line) for line in stream]
+
+    assert events == [
+        {
+            "type": "issue_driven_context",
+            "repository": "acme/project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "policy_issue": 9,
+        },
+        {
+            "type": "issue_result",
+            "issue": 10,
+            "outcome": "continued_with_warning",
+            "reviews": 3,
+            "pr_number": 44,
+            "pr_url": "https://github.com/acme/project/pull/44",
+            "warnings": ["review limit reached"],
+        },
+        {
+            "type": "whole_review_result",
+            "outcome": "approved",
+            "reviews": 2,
+            "warnings": [],
+        },
+    ]
+
+
+def test_emit_finding_writes_structured_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_finding("github", "review limit reached", status="warning")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "finding",
+            "category": "github",
+            "status": "warning",
+            "message": "review limit reached",
+        }
+
+
+def test_emit_finding_accepts_policy_issue_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_finding("policy_issue", "policy conflict", status="warning")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read())["category"] == "policy_issue"
+
+
+def test_emit_finding_rejects_unsupported_status() -> None:
+    with pytest.raises(ValueError, match="passed, warning, failed, or info"):
+        emit_finding("github", "review result", status="WARN")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

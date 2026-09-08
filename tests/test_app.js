@@ -108,6 +108,8 @@ function snapshot({
   mode = undefined,
   prompt = undefined,
   integrationPr = null,
+  issueDrivenSummary = null,
+  hasWarnings = false,
 }) {
   const result = {
     args,
@@ -128,11 +130,13 @@ function snapshot({
     dryRunEligible: true,
     dryRunIssues: [],
     findings: [],
+    hasWarnings,
     resources,
     resourceCleanupStatus,
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
     integrationPr,
+    issueDrivenSummary,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -209,6 +213,9 @@ async function loadApp({
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
+    "issue-summary-panel", "issue-summary-context", "issue-summary-terminal",
+    "issue-summary-list", "issue-summary-whole", "issue-summary-base",
+    "issue-summary-policy", "issue-summary-warnings",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
@@ -239,6 +246,7 @@ async function loadApp({
   const document = {
     body: new Element(),
     createElement() { return new Element(); },
+    createTextNode(text) { return {textContent: text}; },
     execCommand() { return true; },
     querySelector(selector) { return elements[selector.slice(1)]; },
   };
@@ -1133,8 +1141,60 @@ test("run rows render independent decorative indicators from textual states", as
 
   for (const run of runs) {
     assert.equal(markerState(elements, run.runId), run.state);
-    assert.match(runItem(elements, run.runId).textContent, new RegExp(`  ${run.state}  `));
+    assert.match(runItem(elements, run.runId).textContent, {
+      running: /● Running/,
+      success: /✓ Success/,
+      failed: /✕ Failed/,
+      stopped: /■ Stopped/,
+    }[run.state]);
   }
+});
+
+test("structured warning state distinguishes only successful warning runs", async () => {
+  const runs = [
+    {runId: 1, state: "success", hasWarnings: false, cwd: "/work/run-1"},
+    {runId: 2, state: "success", hasWarnings: true, cwd: "/work/run-2"},
+    {runId: 3, state: "failed", hasWarnings: true, cwd: "/work/run-3"},
+    {runId: 4, state: "stopped", hasWarnings: true, cwd: "/work/run-4"},
+  ];
+  const details = Object.fromEntries(runs.map((run) => [
+    run.runId,
+    snapshot({
+      runId: run.runId,
+      state: run.state,
+      hasWarnings: run.hasWarnings,
+      stdout: "WARN: text must not control presentation",
+    }),
+  ]));
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.match(runItem(elements, 1).textContent, /✓ Success/);
+  assert.equal(markerState(elements, 1), "success");
+  assert.match(runItem(elements, 2).textContent, /⚠ Success with warnings/);
+  assert.equal(markerState(elements, 2), "success-with-warnings");
+  assert.match(runItem(elements, 3).textContent, /✕ Failed/);
+  assert.equal(markerState(elements, 3), "failed");
+  assert.match(runItem(elements, 4).textContent, /■ Stopped/);
+  assert.equal(markerState(elements, 4), "stopped");
+
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(elements.status.textContent, "⚠ Success with warnings");
+  assert.equal(elements.status.className, "status success-with-warnings");
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.status.textContent, "✓ Success");
+  assert.equal(elements.status.className, "status success");
+
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(elements.status.textContent, "⚠ Success with warnings");
+
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.status.className, "status idle");
 });
 
 test("state changes and selection update independently", async () => {
@@ -1205,7 +1265,7 @@ test("stale refresh cannot roll a newer run indicator back", async () => {
   await staleRefresh;
 
   assert.equal(markerState(elements, 1), "success");
-  assert.match(runItem(elements, 1).textContent, /  success  /);
+  assert.match(runItem(elements, 1).textContent, /✓ Success/);
   assert.equal(faviconIsRunning(elements), false);
 });
 
@@ -1306,6 +1366,49 @@ test("selected run renders authoritative run and Progress PR links", async () =>
   );
 });
 
+test("terminal Issue Driven Summary renders structured outcomes and clears for New Run", async () => {
+  const issueDrivenSummary = {
+    repository: "acme/project",
+    integrationBranch: "dev/v1",
+    finalBranch: "main",
+    terminalResult: "success",
+    warningCount: 1,
+    policyIssue: 9,
+    issues: [
+      {
+        issue: 10,
+        outcome: "continued_with_warning",
+        reviews: 5,
+        pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+        warnings: ["review limit reached"],
+      },
+    ],
+    wholeReview: {outcome: "approved", reviews: 2, warnings: []},
+    basePr: {number: 50, url: "https://github.com/acme/project/pull/50"},
+  };
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    issueDrivenSummary,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["issue-summary-panel"].hidden, false);
+  assert.equal(elements["issue-summary-list"].children.length, 1);
+  assert.match(elements["issue-summary-whole"].textContent, /APPROVED \(2 reviews\)/);
+  assert.equal(elements["issue-summary-warnings"].textContent, "Warnings: 1");
+  assert.equal(elements["issue-summary-base"].children[1].textContent, "#50");
+  assert.equal(elements["issue-summary-policy"].children[1].textContent, "#9");
+
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["issue-summary-panel"].hidden, true);
+});
+
 test("validation displays a valid draft outline before execution", async () => {
   const {elements} = await loadApp({
     runs: [],
@@ -1343,7 +1446,7 @@ test("SSE changes refresh state, output, and progress without polling", async ()
     progress: [{name: "deploy", status: "completed"}],
   };
   eventSource.emit("runner-change");
-  await waitFor(() => elements.status.textContent === "success");
+  await waitFor(() => elements.status.textContent === "✓ Success");
 
   assert.equal(elements.stdout.textContent, "starting\nfinished\n");
   assert.equal(elements.progress.children[0].children[1].children[0].textContent, "deploy");
@@ -1409,7 +1512,7 @@ test("SSE bursts coalesce to one active and one pending refresh", async () => {
     calls.slice(callsBeforeBurst).filter(([url]) => url === "/api/runs/1").length,
     2,
   );
-  assert.equal(elements.status.textContent, "success");
+  assert.equal(elements.status.textContent, "✓ Success");
 });
 
 test("SSE refresh preserves the selected run while multiple runs change", async () => {
@@ -1457,7 +1560,7 @@ test("EventSource reconnect reconciles authoritative state", async () => {
   eventSource.emit("open");
   await waitFor(() => elements.stdout.textContent === "after reconnect");
 
-  assert.equal(elements.status.textContent, "running");
+  assert.equal(elements.status.textContent, "● Running");
 });
 
 test("EventSource reconnect preserves authoritative historical timestamps", async () => {
@@ -1679,7 +1782,7 @@ test("slow SSE refresh cannot replace a newly selected run", async () => {
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.match(selectedRun(elements).textContent, /^#1/);
-  assert.equal(elements.status.textContent, "running");
+  assert.equal(elements.status.textContent, "● Running");
   assert.equal(elements.stdout.textContent, "run one output");
   assert.deepEqual(outlineLabels(elements), ["run one plan"]);
   assert.equal(elements.stop.disabled, false);
@@ -1721,7 +1824,7 @@ test("slow run action cannot replace a newly selected run", async () => {
   await slowStop;
 
   assert.match(selectedRun(elements).textContent, /^#1/);
-  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.status.textContent, "✕ Failed");
   assert.equal(elements.stdout.textContent, "selected failed run");
   assert.equal(elements.stop.disabled, true);
 });
@@ -2027,7 +2130,7 @@ test("New run immediately clears every run-owned surface without changing histor
     },
   });
 
-  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.status.textContent, "✕ Failed");
   assert.equal(elements.stdout.textContent, "A output");
   assert.equal(elements.progress.children.length, 1);
   assert.equal(elements["integration-pr-panel"].hidden, false);
@@ -2079,7 +2182,7 @@ test("New run immediately clears every run-owned surface without changing histor
   assert.equal(selectedRun(elements), undefined);
 
   await runItem(elements, 1).dispatch("click");
-  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.status.textContent, "✕ Failed");
   assert.equal(elements.stdout.textContent, "A output");
   assert.equal(elements["resources-panel"].hidden, false);
   await elements["new-run"].dispatch("click");

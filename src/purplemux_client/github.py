@@ -360,6 +360,86 @@ class GitHubRepository:
             },
         )
 
+    def update_pr_body(
+        self,
+        pr: int,
+        *,
+        body: str,
+        expected_head: str,
+        expected_head_sha: str,
+        expected_base: str,
+        expected_base_sha: str,
+    ) -> PullRequestState:
+        """Update only an exact open PR body while preserving its review state."""
+        if "\0" in body:
+            raise ValueError("PR body must not contain null bytes")
+        current = self.require_pr(
+            number=pr,
+            head=expected_head,
+            base=expected_base,
+            state="OPEN",
+            expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+        )
+        self._require_no_deferred_merge(current)
+        if current.body == body:
+            return current
+
+        def require_unchanged_body() -> None:
+            latest = self.require_pr(
+                number=pr,
+                head=expected_head,
+                base=expected_base,
+                state="OPEN",
+                expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha,
+                draft=current.is_draft,
+            )
+            self._require_no_deferred_merge(latest)
+            if latest.body != current.body:
+                raise PullRequestTopologyError(
+                    f"PR #{pr} body changed before the requested update"
+                )
+
+        def postcondition() -> PullRequestState:
+            updated = self.require_pr(
+                number=pr,
+                head=expected_head,
+                base=expected_base,
+                state="OPEN",
+                expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha,
+                draft=current.is_draft,
+            )
+            self._require_no_deferred_merge(updated)
+            if updated.body != body:
+                raise _PostconditionAbsent("PR body was not updated")
+            return updated
+
+        return self._mutate(
+            operation="update PR body",
+            target=f"{self.slug}#{pr}",
+            pre_state=current,
+            args=[
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{self.slug}/pulls/{pr}",
+                "-f",
+                f"body={body}",
+            ],
+            pre_dispatch=require_unchanged_body,
+            unchanged=lambda: self._get_pr(pr, include_queue=True) == current,
+            postcondition=postcondition,
+            plan={
+                "kind": "update_pr_body",
+                "repository": self.slug,
+                "number": pr,
+                "headSha": expected_head_sha,
+                "baseSha": expected_base_sha,
+            },
+        )
+
     def merge_pr(
         self,
         pr: int,

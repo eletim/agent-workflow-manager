@@ -39,6 +39,7 @@ from purplemux_client.runner import (
     RunnerClosedError,
     RunnerSnapshot,
     RunResource,
+    TopologyFinding,
 )
 from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
 
@@ -962,6 +963,169 @@ if result.exit_code != 0:
     assert event.error.endswith("\n[error truncated]")
 
 
+def test_runner_parses_structured_warning_finding() -> None:
+    parsed = PythonRunner._parse_runner_event(
+        json.dumps(
+            {
+                "type": "finding",
+                "category": "github",
+                "status": "warning",
+                "message": "review limit reached",
+            }
+        )
+    )
+
+    assert parsed is not None
+    kind, finding = parsed
+    assert kind == "finding"
+    assert finding == TopologyFinding("github", "warning", "review limit reached")
+
+
+def test_successful_run_aggregates_only_structured_warning_findings() -> None:
+    runner = PythonRunner(managed_workflows=False)
+    try:
+        warning_id = runner.start(
+            """from purplemux_client import emit_finding
+emit_finding("github", "human review required", status="warning")
+print("done")
+"""
+        )
+        warning_result = wait_until_finished(runner)
+        info_id = runner.start(
+            """from purplemux_client import emit_finding
+emit_finding("runtime", "WARN: informational text", status="info")
+print("WARN: stdout text")
+"""
+        )
+        info_result = wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert warning_result.run_id == warning_id
+    assert warning_result.state == "success"
+    assert warning_result.exit_code == 0
+    assert warning_result.has_warnings is True
+    assert warning_result.as_json()["hasWarnings"] is True
+    assert warning_result.as_summary_json()["hasWarnings"] is True
+    assert info_result.run_id == info_id
+    assert info_result.state == "success"
+    assert info_result.has_warnings is False
+    assert info_result.as_json()["hasWarnings"] is False
+    assert info_result.as_summary_json()["hasWarnings"] is False
+
+
+def test_warning_aggregate_survives_finding_eviction_and_run_switching() -> None:
+    runner = PythonRunner(managed_workflows=False, max_progress_events=1)
+    try:
+        warning_id = runner.start(
+            """from purplemux_client import emit_finding
+emit_finding("git", "review required", status="warning")
+emit_finding("git", "later fact", status="passed")
+"""
+        )
+        wait_until_finished(runner)
+        clean_id = runner.start('print("clean")')
+        wait_until_finished(runner)
+
+        warning_result = runner.snapshot(warning_id)
+        clean_result = runner.snapshot(clean_id)
+    finally:
+        runner.close()
+
+    assert [finding.status for finding in warning_result.findings] == ["passed"]
+    assert warning_result.has_warnings is True
+    assert clean_result.has_warnings is False
+
+
+def test_issue_driven_summary_uses_durable_structured_results_not_progress() -> None:
+    runner = PythonRunner(managed_workflows=False, max_progress_events=1)
+    try:
+        run_id = runner.start(
+            """from purplemux_client import (
+    emit_finding, emit_issue_driven_context, emit_issue_result, emit_run_pr,
+    emit_step, emit_whole_review_result,
+)
+emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40")
+emit_finding("github", "review limit reached", status="warning")
+emit_issue_result(11, "continued_with_warning", 5, 41, "https://github.com/acme/project/pull/41", warnings=("review limit reached",))
+emit_whole_review_result("skipped", 0)
+emit_run_pr(50, "https://github.com/acme/project/pull/50")
+for number in range(3):
+    emit_step(f"noise {number}", "completed")
+"""
+        )
+        result = wait_until_finished(runner)
+        runner.start('print("another run")')
+        wait_until_finished(runner)
+        historical = runner.snapshot(run_id).as_json()
+    finally:
+        runner.close()
+
+    assert [event.name for event in result.progress] == ["noise 2"]
+    assert historical["warningCount"] == 1
+    assert historical["issueDrivenSummary"] == {
+        "repository": "acme/project",
+        "integrationBranch": "dev/v1",
+        "finalBranch": "main",
+        "terminalResult": "success",
+        "warningCount": 1,
+        "policyIssue": 9,
+        "issues": [
+            {
+                "issue": 10,
+                "outcome": "approved",
+                "reviews": 2,
+                "pr": {
+                    "number": 40,
+                    "url": "https://github.com/acme/project/pull/40",
+                },
+                "warnings": [],
+            },
+            {
+                "issue": 11,
+                "outcome": "continued_with_warning",
+                "reviews": 5,
+                "pr": {
+                    "number": 41,
+                    "url": "https://github.com/acme/project/pull/41",
+                },
+                "warnings": ["review limit reached"],
+            },
+        ],
+        "wholeReview": {"outcome": "skipped", "reviews": 0, "warnings": []},
+        "basePr": {
+            "number": 50,
+            "url": "https://github.com/acme/project/pull/50",
+        },
+    }
+
+
+def test_issue_driven_summary_is_hidden_while_running_and_scoped_to_run() -> None:
+    runner = PythonRunner(managed_workflows=False)
+    try:
+        first = runner.start(
+            """from purplemux_client import emit_issue_driven_context
+import time
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+time.sleep(60)
+"""
+        )
+        running = wait_for(
+            runner, lambda item: item.issue_driven_context is not None, run_id=first
+        )
+        runner.stop(first)
+        wait_for(runner, lambda item: item.state == "stopped", run_id=first)
+        second = runner.start('print("clean")')
+        wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert running.as_json()["issueDrivenSummary"] is None
+    assert runner.snapshot(first).as_json()["issueDrivenSummary"] is not None
+    assert runner.snapshot(second).as_json()["issueDrivenSummary"] is None
+
+
 def test_output_is_bounded_and_reports_truncation() -> None:
     runner = PythonRunner(managed_workflows=False, max_output_chars=20)
     try:
@@ -1522,9 +1686,12 @@ def test_runner_http_lifecycle(
         "dryRunIssues": [],
         "executionContext": None,
         "findings": [],
+        "hasWarnings": False,
+        "warningCount": 0,
         "exitCode": 0,
         "runId": 1,
         "integrationPr": None,
+        "issueDrivenSummary": None,
         "cwd": str(Path.cwd()),
         "args": [],
         "attempts": [

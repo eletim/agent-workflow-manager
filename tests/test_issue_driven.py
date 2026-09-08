@@ -4,12 +4,20 @@ import ast
 import inspect
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from purplemux_client import BranchState, GitHubRepository, GitRepository
+from purplemux_client import (
+    BranchState,
+    GitHubRepository,
+    GitRepository,
+    MutationOutcomeUnknown,
+    PullRequestState,
+    WorkerFailure,
+)
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -43,6 +51,38 @@ def test_valid_json_preserves_issue_order() -> None:
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+    assert config.policy_issue is None
+
+
+def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
+    config = parse(payload(policy_issue=200))
+
+    assert config.policy_issue == 200
+    assert config.as_json()["policy_issue"] == 200
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+    assert first == second
+    assert "WORKFLOW_POLICY_ISSUE = 200" in first
+    assert '"git diff --check",\n        WORKFLOW_POLICY_ISSUE,' in first
+
+
+@pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])
+def test_policy_issue_must_be_a_positive_integer(policy_issue: object) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(policy_issue=policy_issue))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.policy_issue", "must be a positive integer")
+    ]
+
+
+def test_policy_issue_must_differ_from_implementation_issues() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(policy_issue=89))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.policy_issue", "must differ from every implementation Issue")
+    ]
 
 
 def test_omitted_agents_default_to_codex_and_serialize_explicitly() -> None:
@@ -258,6 +298,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
+        "Base PR human handoff writer": "REVIEWER_AGENT",
     }
 
 
@@ -339,11 +380,18 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "require_committed_result(" in code
     assert "repo.ensure_pushed(" in code
     assert "github.create_draft_pr(" in code
-    assert "reviewer requested changes, but implementer re-evaluated" in code
+    assert "reviewer requested changes, but the " in code
+    assert "continuing without reviewer approval" in code
+    assert 'status="warning"' in code
     assert "Commit every intended source, test, and configuration" in code
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code
     assert "emit_run_pr(pr.number, pr.url)" in code
+    assert "emit_issue_driven_context(" in code
+    assert "emit_issue_result(" in code
+    assert "emit_whole_review_result(" in code
+    assert '"continued_with_warning"' in code
+    assert '"skipped"' in code
     assert '{"pr_number": pr.number, "pr_url": pr.url}' in code
     assert "Finish with a clean worktree" in code
     assert "commit SHA and PR number or URL" in code
@@ -355,6 +403,593 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
         "discard ambiguous local work",
     ):
         assert prohibited in code
+
+
+def load_generated_workflow(**overrides: object) -> dict[str, object]:
+    code = generate_issue_driven_workflow(parse(payload(**overrides)))
+    module_name = f"generated_handoff_workflow_{len(sys.modules)}"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-handoff-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    return module.__dict__
+
+
+def test_human_handoff_prompt_and_validation_contract() -> None:
+    secret_check_command = "API_TOKEN=sentinel-secret pytest"
+    workflow = load_generated_workflow(
+        issues=[138], policy_issue=200, reviewer_agent="claude"
+    )
+    issue = workflow["Issue"](138, "feature/issue-138")  # type: ignore[operator]
+    config = workflow["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.4",
+        "main",
+        (issue,),
+        secret_check_command,
+        200,
+    )
+    pr = PullRequestState(
+        201,
+        "https://github.com/eletim/agent-workflow-manager/pull/201",
+        "OPEN",
+        False,
+        config.slug,
+        config.integration_branch,
+        "h" * 40,
+        config.slug,
+        config.main_branch,
+        "b" * 40,
+        None,
+        False,
+        None,
+        "PR_201",
+        "existing",
+    )
+    delivery = workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha, 2)  # type: ignore[operator]
+    prompt = workflow["human_handoff_prompt"](  # type: ignore[operator]
+        config, pr, delivery, ()
+    )
+
+    assert "Reviewer role Agent selected by reviewer_agent" in prompt
+    assert "gh issue view NUMBER" in prompt
+    assert "Issue numbers: 138" in prompt
+    assert "environment values, credentials, tokens, or secrets" in prompt
+    assert secret_check_command not in prompt
+    assert "sentinel-secret" not in prompt
+    assert "configured final checks passed on the exact head" in prompt
+    assert "quickly answerable\nYes/No observation" in prompt
+    assert "do not require terminal\ncommands" in prompt
+    assert "state=Ready" in prompt
+
+    markdown = """## 概要
+
+変更内容を短く説明します。
+
+## 主な変更
+
+- 引き渡し本文を生成します。
+
+## 人間による確認
+
+- [ ] ブラウザでBase PRを開くと日本語の概要が表示される
+
+## 自動検証
+
+- pytest: passed
+
+方針: https://github.com/eletim/agent-workflow-manager/issues/200"""
+    validated = workflow["validate_human_handoff"](  # type: ignore[operator]
+        markdown, config, has_warnings=False
+    )
+    assert validated == markdown
+
+    with pytest.raises(WorkerFailure, match="section contract"):
+        workflow["validate_human_handoff"](  # type: ignore[operator]
+            markdown + "\n\n## 余分", config, has_warnings=False
+        )
+
+    english = """## 概要
+
+Summary.
+
+## 主な変更
+
+- Change.
+
+## 人間による確認
+
+- [ ] The page opens
+
+## 自動検証
+
+- pytest: passed
+
+https://github.com/eletim/agent-workflow-manager/issues/200"""
+    with pytest.raises(WorkerFailure, match="Japanese"):
+        workflow["validate_human_handoff"](  # type: ignore[operator]
+            english, config, has_warnings=False
+        )
+
+
+def test_managed_handoff_replacement_preserves_existing_metadata() -> None:
+    workflow = load_generated_workflow(issues=[138])
+    start = workflow["HUMAN_HANDOFF_START"]
+    end = workflow["HUMAN_HANDOFF_END"]
+    existing = (
+        "Intro\n\n<!-- agent-workflow-manager:create-pr:run-1 -->\n\n"
+        f"{start}\nold handoff\n{end}\n\n"
+        "<!-- agent-workflow-manager:policy-conflict:c2FmZQ== -->"
+    )
+
+    updated = workflow["with_human_handoff"](existing, "new handoff")  # type: ignore[operator]
+
+    assert "old handoff" not in updated
+    assert updated.count(start) == updated.count(end) == 1
+    assert "create-pr:run-1" in updated
+    assert "policy-conflict:c2FmZQ==" in updated
+
+
+@pytest.mark.parametrize(
+    ("draft", "outcome"),
+    [(False, "approved"), (True, "continued_with_warning")],
+)
+def test_handoff_updates_ready_or_warning_draft_without_changing_state(
+    draft: bool, outcome: str
+) -> None:
+    workflow = load_generated_workflow(issues=[138])
+    issue = workflow["Issue"](138, "feature/issue-138")  # type: ignore[operator]
+    config = workflow["Config"](  # type: ignore[operator]
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "pytest"
+    )
+    pr = PullRequestState(
+        8,
+        "https://github.com/acme/project/pull/8",
+        "OPEN",
+        draft,
+        config.slug,
+        config.integration_branch,
+        "h" * 40,
+        config.slug,
+        config.main_branch,
+        "b" * 40,
+        None,
+        False,
+        None,
+        "PR_8",
+        "<!-- agent-workflow-manager:create-pr:run-8 -->",
+    )
+    warnings = ("レビュー警告があります。",) if draft else ()
+    delivery = workflow["ReviewDelivery"](  # type: ignore[operator]
+        outcome, pr.head_sha, pr.base_sha, 1, warnings
+    )
+    markdown = """## 概要
+
+変更の概要です。
+
+## 主な変更
+
+- Base PRの説明を改善します。
+
+## 人間による確認
+
+- [ ] ブラウザで説明が読みやすく表示される
+
+## 自動検証
+
+- pytest: passed"""
+    if draft:
+        markdown += "\n\n## 注意事項\n\n- レビュー警告があります。"
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: markdown
+
+    class GitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == pr.number
+            return replace(pr, body=str(kwargs["body"]))
+
+    updated = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
+        config, object(), GitHub(), pr, delivery
+    )
+
+    assert updated.is_draft is draft
+    assert "## 人間による確認" in updated.body
+    assert "create-pr:run-8" in updated.body
+
+
+def test_handoff_failure_warns_but_mutation_unknown_remains_fail_closed() -> None:
+    workflow = load_generated_workflow(issues=[138])
+    issue = workflow["Issue"](138, "feature/issue-138")  # type: ignore[operator]
+    config = workflow["Config"](  # type: ignore[operator]
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "pytest"
+    )
+    pr = PullRequestState(
+        8,
+        "https://github.com/acme/project/pull/8",
+        "OPEN",
+        False,
+        config.slug,
+        config.integration_branch,
+        "h" * 40,
+        config.slug,
+        config.main_branch,
+        "b" * 40,
+        None,
+        False,
+        None,
+        "PR_8",
+        "existing",
+    )
+    delivery = workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha)  # type: ignore[operator]
+    findings: list[tuple[str, str, str]] = []
+    workflow["emit_finding"] = lambda category, message, status="passed": (
+        findings.append((category, message, status))
+    )
+    workflow["create_agent"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        WorkerFailure("agent timed out")
+    )
+
+    unchanged = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
+        config, object(), object(), pr, delivery
+    )
+    assert unchanged is pr
+    assert findings[-1][2] == "warning"
+
+    valid = """## 概要
+
+概要です。
+
+## 主な変更
+
+- 変更です。
+
+## 人間による確認
+
+- [ ] ブラウザで表示を確認できる
+
+## 自動検証
+
+- pytest: passed"""
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: valid
+
+    class UnknownGitHub:
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            raise MutationOutcomeUnknown("response lost")
+
+    with pytest.raises(MutationOutcomeUnknown, match="response lost"):
+        workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
+            config, object(), UnknownGitHub(), pr, delivery
+        )
+
+
+def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() -> None:
+    code = generate_issue_driven_workflow(parse(payload(policy_issue=200)))
+
+    assert "Before doing anything else, run `gh issue view" in code
+    assert 'policy_context(config, scope=f"Issue #{issue.number}")' in code
+    assert 'policy_context(config, scope=f"fixes for Issue #{issue.number}")' in code
+    assert 'policy_context(config, scope="the whole-version review")' in code
+    assert 'policy_context(config, scope="whole-version fixes")' in code
+    assert "https://github.com/{config.slug}/issues/{config.policy_issue}" in code
+    assert "ensure_base_pr_policy_notes(github, pr, config)" in code
+    assert "github.update_pr_body(" in code
+
+
+def test_policy_conflict_marker_emits_warning_and_preserves_child_precedence() -> None:
+    code = generate_issue_driven_workflow(parse(payload(policy_issue=200)))
+    module_name = "generated_policy_issue_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    findings: list[tuple[str, str, str]] = []
+    module.__dict__["emit_finding"] = lambda category, message, status="completed": (
+        findings.append((category, message, status))
+    )
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (),
+        "true",
+        200,
+    )
+
+    module.__dict__["emit_policy_conflicts"](
+        "APPROVED\nPOLICY_CONFLICT: child explicitly chooses the other API",
+        config,
+        scope="review of Issue #90",
+    )
+
+    assert len(findings) == 1
+    assert findings[0][0] == "policy_issue"
+    assert findings[0][2] == "warning"
+    assert "child explicitly chooses the other API" in findings[0][1]
+    assert "implementation Issue as the primary requirement" in findings[0][1]
+
+
+def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[90], policy_issue=200)))
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    first_run = load_run("generated_policy_first_run")
+    issue = first_run["Issue"](90, "feature/issue-90")  # type: ignore[operator]
+    config = first_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (issue,),
+        "true",
+        200,
+    )
+    child_pr = PullRequestState(
+        90,
+        "https://example.test/pull/90",
+        "OPEN",
+        True,
+        config.slug,
+        issue.branch,
+        "child-head",
+        config.slug,
+        config.integration_branch,
+        "integration-head",
+        None,
+        False,
+        None,
+        "PR_90",
+        "Sequential implementation of Issue #90.",
+    )
+
+    class ChildGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == child_pr.number
+            return replace(child_pr, body=str(kwargs["body"]))
+
+    first_run["emit_finding"] = lambda *args, **kwargs: None
+    first_run["emit_policy_conflicts"](  # type: ignore[operator]
+        "POLICY_CONFLICT: child requires the legacy API",
+        config,
+        scope="implementation Issue #90",
+        issue_number=90,
+    )
+    persisted = first_run["ensure_issue_pr_policy_conflicts"](  # type: ignore[operator]
+        ChildGitHub(), child_pr, issue, config
+    )
+    assert "agent-workflow-manager:policy-conflict:" in persisted.body
+
+    # A new module models recovery after interruption; no process-local warning
+    # state crosses this boundary and the already-merged Issue is skipped.
+    second_run = load_run("generated_policy_second_run")
+    recovered_issue = second_run["Issue"](90, "feature/issue-90")  # type: ignore[operator]
+    recovered_config = second_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        config.slug,
+        config.integration_branch,
+        config.main_branch,
+        (recovered_issue,),
+        "true",
+        200,
+    )
+    merged = replace(persisted, state="MERGED", is_draft=False)
+    findings: list[tuple[str, str, str]] = []
+    process_globals = second_run["process_issue"].__globals__  # type: ignore[attr-defined]
+    process_globals["prepare_issue"] = lambda *args: merged
+    process_globals["emit_finding"] = lambda category, message, status="completed": (
+        findings.append((category, message, status))
+    )
+
+    class CleanRepository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+    recovered = second_run["process_issue"](  # type: ignore[operator]
+        recovered_issue, recovered_config, object(), CleanRepository(), object()
+    )
+
+    assert recovered is merged
+    assert findings and findings[0][2] == "warning"
+    warning = findings[0][1]
+    whole_review_context = second_run["policy_context"](  # type: ignore[operator]
+        recovered_config, scope="the whole-version review"
+    )
+    assert warning in whole_review_context
+
+    base_pr = replace(
+        child_pr,
+        number=200,
+        head_branch=recovered_config.integration_branch,
+        head_sha="integration-head",
+        base_branch=recovered_config.main_branch,
+        base_sha="main-head",
+        body="Sequential integration.",
+    )
+    delivered_bodies: list[str] = []
+
+    class BaseGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == base_pr.number
+            delivered_bodies.append(str(kwargs["body"]))
+            return replace(base_pr, body=delivered_bodies[-1])
+
+    second_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
+        BaseGitHub(), base_pr, recovered_config
+    )
+    assert delivered_bodies and warning in delivered_bodies[-1]
+
+
+def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[90], policy_issue=200)))
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    first_run = load_run("generated_whole_policy_first_run")
+    first_config = first_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (),
+        "true",
+        200,
+    )
+    base_pr = PullRequestState(
+        200,
+        "https://example.test/pull/200",
+        "OPEN",
+        True,
+        first_config.slug,
+        first_config.integration_branch,
+        "integration-head",
+        first_config.slug,
+        first_config.main_branch,
+        "main-head",
+        None,
+        False,
+        None,
+        "PR_200",
+        "Sequential integration.",
+    )
+
+    class FirstGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == base_pr.number
+            return replace(base_pr, body=str(kwargs["body"]))
+
+    first_run["emit_finding"] = lambda *args, **kwargs: None
+    first_run["emit_policy_conflicts"](  # type: ignore[operator]
+        "APPROVED\nPOLICY_CONFLICT: integrated features disagree on ownership",
+        first_config,
+        scope="the integrated version",
+    )
+    persisted = first_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
+        FirstGitHub(), base_pr, first_config
+    )
+    assert "agent-workflow-manager:policy-conflict:" in persisted.body
+
+    # Simulate interruption immediately after persistence and start a fresh run.
+    second_run = load_run("generated_whole_policy_second_run")
+    second_config = second_run["Config"](  # type: ignore[operator]
+        Path("/repo"),
+        first_config.slug,
+        first_config.integration_branch,
+        first_config.main_branch,
+        (),
+        "true",
+        200,
+    )
+    current = persisted
+    findings: list[tuple[str, str, str]] = []
+    reviewer_contexts: list[str] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == second_config.integration_branch
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == second_config.main_branch
+            return BranchState(branch, current.base_sha, current.base_sha, True)
+
+    class SecondGitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return current if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=str(kwargs["body"]))
+            return current
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            current = replace(current, is_draft=False)
+            return current
+
+    integration_globals = second_run["integration_delivery"].__globals__  # type: ignore[attr-defined]
+    integration_globals["emit_finding"] = lambda category, message, status="completed": (
+        findings.append((category, message, status))
+    )
+
+    def recovered_review(*args: object) -> tuple[PullRequestState, object]:
+        context = integration_globals["policy_context"](
+            second_config, scope="the whole-version review"
+        )
+        reviewer_contexts.append(context)
+        delivery = integration_globals["ReviewDelivery"](
+            "approved", current.head_sha, current.base_sha
+        )
+        return current, delivery
+
+    integration_globals["review_whole_version"] = recovered_review
+    integration_globals["update_base_pr_human_handoff"] = (
+        lambda config, client, github, pr, delivery: pr
+    )
+
+    delivered = second_run["integration_delivery"](  # type: ignore[operator]
+        second_config, object(), Repository(), SecondGitHub()
+    )
+
+    assert delivered.is_draft is False
+    warnings = [message for _, message, status in findings if status == "warning"]
+    assert len(warnings) == 1
+    warning = warnings[0]
+    assert reviewer_contexts and warning in reviewer_contexts[0]
+    assert warning in delivered.body
+
+
+def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
+    module_name = "generated_without_policy_issue_workflow"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-policy-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "eletim/agent-workflow-manager",
+        "dev/v0.2.0",
+        "main",
+        (),
+        "true",
+    )
+    issue = module.__dict__["Issue"](90, "feature/issue-90")
+
+    implementation, review = module.__dict__["issue_prompts"](issue, config)
+
+    assert implementation.startswith("Implement Issue #90")
+    assert review.startswith("Independently review Issue #90")
+    assert "policy Issue" not in implementation
+    assert "POLICY_CONFLICT" not in review
 
 
 def test_generated_workflow_has_focused_dirty_worktree_recovery() -> None:
@@ -543,7 +1178,8 @@ def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
 
     assert "MERGE_TO_INTEGRATION = True" in merging
     assert "MERGE_TO_INTEGRATION = False" in ready_only
-    assert "Approved Issue #{issue.number} PR is Ready" in ready_only
+    assert "Issue #{issue.number} PR is Ready" in ready_only
+    assert 'delivery.outcome == "approved"' in ready_only
 
 
 def test_final_review_policy_selects_the_generated_control_flow() -> None:

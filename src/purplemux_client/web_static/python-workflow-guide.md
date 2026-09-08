@@ -523,6 +523,10 @@ github.set_draft(
     pr, *, draft, expected_head, expected_head_sha, expected_base,
     expected_base_sha
 ) -> PullRequestState
+github.update_pr_body(
+    pr, *, body, expected_head, expected_head_sha, expected_base,
+    expected_base_sha
+) -> PullRequestState
 github.merge_pr(
     pr, *, expected_head, expected_head_sha, expected_base, expected_base_sha,
     method="merge"
@@ -532,9 +536,11 @@ github.merge_pr(
 `state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
-`merge_pr()` supports only an immediate merge commit and verifies its parents
-and the resulting base ref; it never queues, squashes, rebases, or enables
-auto-merge.
+`update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
+concurrent body or review-state change. `merge_pr()` supports only an immediate
+merge commit and verifies
+its parents and the resulting base ref; it never queues, squashes, rebases, or
+enables auto-merge.
 
 The repository execution helpers are:
 
@@ -604,11 +610,12 @@ The following categories are normative:
 - **Inspection-aware, reconciliation-capable mutation:**
   `prepare_run_repository()`; workspace/tab creation and identity-checked
   deletion/close; `interrupt()`; every Git mutation listed above; and
-  `create_draft_pr()`, `set_draft()`, and `merge_pr()`. Each captures exact
-  preconditions, dispatches at most once, and inspects an authoritative
-  postcondition. It can return the confirmed desired result, report a proven
-  rejection/conflict, or raise `MutationOutcomeUnknown` if inspection still
-  cannot distinguish the outcome. Reconciliation is not a promise of success.
+  `create_draft_pr()`, `set_draft()`, `update_pr_body()`, and `merge_pr()`. Each
+  captures exact preconditions, dispatches at most once, and inspects an
+  authoritative postcondition. It can return the confirmed desired result,
+  report a proven rejection/conflict, or raise `MutationOutcomeUnknown` if
+  inspection still cannot distinguish the outcome. Reconciliation is not a
+  promise of success.
 - **Unknown-outcome mutation without a sufficient remote postcondition:**
   `send_input()`. A successful synchronous response is accepted, but a timeout
   cannot prove whether the prompt was delivered. Do not retry it. `start_shell()`
@@ -798,14 +805,20 @@ Do not infer either kind of PR metadata from output or labels. The workflow's
 structured GitHub result is the source of truth; `emit_run_pr()` and the optional
 `emit_step()` fields only expose that known identity to the current run.
 
+Generated Issue Driven workflows additionally use the specialized
+`emit_issue_driven_context()`, `emit_issue_result()`, and
+`emit_whole_review_result()` observation helpers. These retain narrow final
+facts for the terminal Summary without parsing Progress or stdout. They are not
+a general event store or a workflow control-flow API.
+
 Findings and advanced resource registration use:
 
 ```python
 emit_finding(
-    category,                # "runtime", "git", or "github"
+    category,                # "runtime", "git", "github", or "policy_issue"
     message,
     *,
-    status="passed",        # "passed", "failed", or "info"
+    status="passed",        # "passed", "warning", "failed", or "info"
 )
 register_run_resource(kind, identity, metadata=None)
 ```
