@@ -48,6 +48,20 @@ def test_documented_fields_exactly_match_the_parser_schema() -> None:
     assert documented == _ALLOWED_FIELDS
 
 
+def test_documented_one_shot_example_is_valid_and_starts_empty() -> None:
+    match = re.search(
+        r"To deliver one large Issue.*?```json\n(.*?)\n```",
+        guide_text(),
+        re.DOTALL,
+    )
+    assert match is not None
+
+    config = parse_issue_driven_json(match.group(1))
+
+    assert config.one_shot_issue == 169
+    assert config.work_items == ()
+
+
 def test_repository_guidance_matches_generated_worktree_semantics() -> None:
     guide = guide_text()
     config = parse_issue_driven_json(json.dumps(canonical_json()))

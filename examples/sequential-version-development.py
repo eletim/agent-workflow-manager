@@ -162,6 +162,7 @@ class Config:
     issues: tuple[Issue, ...]
     check_command: str
     policy_issue: int | None = None
+    one_shot_issue: int | None = None
 
 
 @dataclass
@@ -277,12 +278,14 @@ def parse_args() -> Config:
     parser.add_argument("--slug", required=True)
     parser.add_argument("--integration-branch", required=True)
     parser.add_argument("--main-branch", default="main")
-    parser.add_argument("--issue", action="append", required=True)
+    work = parser.add_mutually_exclusive_group(required=True)
+    work.add_argument("--issue", action="append")
+    work.add_argument("--one-shot-issue", type=int)
     parser.add_argument("--check-command", required=True)
     parser.add_argument("--policy-issue", type=int)
     args = parser.parse_args()
     issues: list[Issue] = []
-    for value in args.issue:
+    for value in args.issue or ():
         number, separator, branch = value.partition(":")
         if not separator or not number.isdigit() or not branch.strip():
             parser.error(f"invalid --issue {value!r}; expected NUMBER:BRANCH")
@@ -301,6 +304,8 @@ def parse_args() -> Config:
         item.number for item in issues
     }:
         parser.error("policy Issue must differ from every implementation Issue")
+    if args.one_shot_issue is not None and args.one_shot_issue < 1:
+        parser.error("one-shot Issue must be a positive integer")
     return Config(
         args.repo.resolve(),
         args.slug,
@@ -309,6 +314,7 @@ def parse_args() -> Config:
         tuple(issues),
         args.check_command,
         args.policy_issue,
+        args.one_shot_issue,
     )
 
 
@@ -560,6 +566,12 @@ def human_handoff_prompt(
         if config.policy_issue is not None
         else "Policy Issue: none"
     )
+    one_shot = (
+        "One-shot source Issue: "
+        f"https://github.com/{config.slug}/issues/{config.one_shot_issue}"
+        if config.one_shot_issue is not None
+        else "One-shot source Issue: none"
+    )
     warning_lines = "\n".join(f"- {item}" for item in warnings) or "- none"
     issue_numbers = ", ".join(
         str(item.number) for item in work_items if item.number is not None
@@ -570,6 +582,12 @@ def human_handoff_prompt(
         if issue_numbers
         else "There are no implementation GitHub Issues to read for this run."
     )
+    one_shot_source = (
+        "Before writing, read the one-shot source Issue with `gh issue view "
+        f"{config.one_shot_issue} --repo {config.slug}`."
+        if config.one_shot_issue is not None
+        else "This is not a one-shot run."
+    )
     mini_tasks = "\n".join(
         f"- {item.label}: {item.task}" for item in work_items if item.task is not None
     ) or "- none"
@@ -578,7 +596,7 @@ You are the Reviewer role Agent selected by reviewer_agent. This turn generates
 prose only and does not change any review verdict. Do not edit files, run GitHub
 mutations, or change Git/PR state.
 
-{issue_source_guidance} If a Policy Issue is listed below, read it first with
+{one_shot_source} {issue_source_guidance} If a Policy Issue is listed below, read it first with
 `gh issue view` in the same way. Inspect the PR diff when useful, but
 do not include raw logs, environment values, credentials, tokens, or secrets.
 Inline mini tasks do not have GitHub Issues; use these embedded requirements:
@@ -591,6 +609,7 @@ Authoritative handoff context:
 - Base PR: #{pr.number} {pr.url}; state={"Draft" if pr.is_draft else "Ready"}
 - whole review: outcome={delivery.outcome}, reviews={delivery.reviews}
 - automated verification: configured final checks passed on the exact head
+- {one_shot}
 - {policy}
 - implementation results:
 {issue_lines}
@@ -602,8 +621,9 @@ Return only Japanese Markdown, with these headings exactly once and in order:
 ## 主な変更
 ## 人間による確認
 ## 自動検証
-Add `## 注意事項` only when warnings are listed above. When a Policy Issue is
-listed, include its full URL in the prose. Under 人間による確認, use 1 to 12
+Add `## 注意事項` only when warnings are listed above. When a Policy Issue or
+one-shot source Issue is listed, include its full URL in the prose. Under
+人間による確認, use 1 to 12
 unchecked `- [ ]` items. Each item must describe one concrete, quickly answerable
 Yes/No observation, primarily in a browser or real environment. Do not ask a
 human to rerun checks already covered by automation and do not require terminal
@@ -647,6 +667,10 @@ def validate_human_handoff(
         reference = f"https://github.com/{config.slug}/issues/{config.policy_issue}"
         if reference not in value:
             raise WorkerFailure("human handoff Markdown lacks the Policy Issue URL")
+    if config.one_shot_issue is not None:
+        reference = f"https://github.com/{config.slug}/issues/{config.one_shot_issue}"
+        if reference not in value:
+            raise WorkerFailure("human handoff Markdown lacks the one-shot Issue URL")
     return value
 
 
@@ -784,6 +808,31 @@ def policy_pr_notes(config: Config) -> str:
         "Policy conflicts, if any, are reported as structured warning findings "
         "and implementation work items remain authoritative."
         f"{conflict_notes}"
+    )
+
+
+def one_shot_pr_notes(config: Config) -> str:
+    if config.one_shot_issue is None:
+        return ""
+    reference = f"https://github.com/{config.slug}/issues/{config.one_shot_issue}"
+    return f"\n\nOne-shot source Issue: {reference}"
+
+
+def ensure_base_pr_one_shot_notes(
+    github: GitHubRepository, pr: PullRequestState, config: Config
+) -> PullRequestState:
+    if config.one_shot_issue is None:
+        return pr
+    reference = f"https://github.com/{config.slug}/issues/{config.one_shot_issue}"
+    if reference in pr.body:
+        return pr
+    return github.update_pr_body(
+        pr.number,
+        body=f"{pr.body.rstrip()}{one_shot_pr_notes(config)}",
+        expected_head=config.integration_branch,
+        expected_head_sha=pr.head_sha,
+        expected_base=config.main_branch,
+        expected_base_sha=pr.base_sha,
     )
 
 
@@ -1600,6 +1649,17 @@ def planner_work_item_json(issue: Issue) -> int | dict[str, str]:
 def planner_prompt(plan: WorkItemPlan, config: Config) -> str:
     processed = [planner_work_item_json(issue) for issue in plan.items[: plan.position]]
     remaining = [planner_work_item_json(issue) for issue in plan.remaining]
+    one_shot_context = ""
+    if config.one_shot_issue is not None:
+        one_shot_context = f"""This is a one-shot run sourced from GitHub Issue
+#{config.one_shot_issue}. Before deciding, read it with `gh issue view
+{config.one_shot_issue} --repo {config.slug}`. Manage its delivery by decomposing
+the remaining work into short inline mini tasks. Each task must state its purpose
+and any non-negotiable design decision, while leaving implementation detail to
+the implementer. Do not create GitHub Issues or implement the source Issue as one
+undivided work item.
+
+"""
     return f"""Review the workflow-owned work-item plan before its next dispatch.
 You are the planning role only: do not edit files, implement work, or mutate Git
 or GitHub. Inspect repository and GitHub state read-only when useful. Preserve
@@ -1608,7 +1668,7 @@ work, refine a pending inline mini task, or skip obsolete/redundant pending work
 Never update or skip a processed item. GitHub Issue work uses its positive number;
 inline work uses a stable lowercase kebab-case ID and a concise authoritative task.
 
-Repository: {config.slug}
+{one_shot_context}Repository: {config.slug}
 Integration branch: {config.integration_branch}
 Processed work items: {json.dumps(processed, ensure_ascii=False)}
 Pending work items: {json.dumps(remaining, ensure_ascii=False)}
@@ -1734,8 +1794,11 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> bool:
 
 
 def plan_seed_fingerprint(config: Config) -> str:
+    seed_value: object = [planner_work_item_json(issue) for issue in config.issues]
+    if config.one_shot_issue is not None:
+        seed_value = {"one_shot_issue": config.one_shot_issue, "items": seed_value}
     seed = json.dumps(
-        [planner_work_item_json(issue) for issue in config.issues],
+        seed_value,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -1905,6 +1968,7 @@ def prepare_work_item_plan_pr(
             title=f"Integrate {config.integration_branch}",
             body=with_work_item_plan(
                 "Sequential integration; Ready only after whole-version checks."
+                f"{one_shot_pr_notes(config)}"
                 f"{policy_pr_notes(config)}",
                 initial_plan,
             ),
@@ -1919,6 +1983,7 @@ def prepare_work_item_plan_pr(
             head=config.integration_branch,
             base=config.main_branch,
         )
+        pr = ensure_base_pr_one_shot_notes(github, pr, config)
     pr = github.require_pr(
         number=pr.number,
         head=config.integration_branch,
@@ -2297,6 +2362,7 @@ def integration_delivery(
             title=f"Integrate {config.integration_branch}",
             body=(
                 "Sequential integration; Ready only after whole-version checks."
+                f"{one_shot_pr_notes(config)}"
                 f"{policy_pr_notes(config)}"
             ),
             correlation_id=run_correlation("integration-pr"),

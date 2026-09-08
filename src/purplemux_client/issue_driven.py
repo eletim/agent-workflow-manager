@@ -418,6 +418,7 @@ class IssueDrivenConfig:
     reviewer_agent: str = "codex"
     policy_issue: int | None = None
     make_integration_branch: bool = False
+    one_shot_issue: int | None = None
 
     @property
     def issues(self) -> tuple[int, ...]:
@@ -440,7 +441,9 @@ class IssueDrivenConfig:
         }
         if self.policy_issue is not None:
             result["policy_issue"] = self.policy_issue
-        if all(item.issue is not None for item in self.work_items):
+        if self.one_shot_issue is not None:
+            result["one_shot_issue"] = self.one_shot_issue
+        elif all(item.issue is not None for item in self.work_items):
             result["issues"] = [item.issue for item in self.work_items]
         else:
             result["work_items"] = [item.as_json() for item in self.work_items]
@@ -464,6 +467,7 @@ _OPTIONAL_FIELDS = {
     "policy_issue",
     "issues",
     "work_items",
+    "one_shot_issue",
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
@@ -546,15 +550,24 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(IssueDrivenFinding(f"$.{key}", "unknown field is not allowed"))
     if "mode" in value and value["mode"] != "issue-driven":
         findings.append(IssueDrivenFinding("$.mode", "must be exactly 'issue-driven'"))
-    if "issues" not in value and "work_items" not in value:
+    work_item_fields = {"issues", "work_items", "one_shot_issue"} & set(value)
+    if not work_item_fields:
         findings.append(
             IssueDrivenFinding(
-                "$.work_items", "work_items or the legacy issues field is required"
+                "$.work_items",
+                "one_shot_issue, work_items, or the legacy issues field is required",
             )
         )
     if "issues" in value and "work_items" in value:
         findings.append(
             IssueDrivenFinding("$.work_items", "must not be combined with issues")
+        )
+    if "one_shot_issue" in value and ({"issues", "work_items"} & set(value)):
+        findings.append(
+            IssueDrivenFinding(
+                "$.one_shot_issue",
+                "must not be combined with issues or work_items",
+            )
         )
     for key in ("repository", "integration_branch", "final_branch"):
         item = value.get(key)
@@ -579,13 +592,15 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             IssueDrivenFinding("$.final_branch", "must differ from integration_branch")
         )
     items_key = "work_items" if "work_items" in value else "issues"
-    raw_items = value.get(items_key)
+    raw_items = value.get(items_key, [])
     work_items: list[WorkItem] = []
-    if not isinstance(raw_items, list) or not raw_items:
+    if "one_shot_issue" not in value and (
+        not isinstance(raw_items, list) or not raw_items
+    ):
         findings.append(
             IssueDrivenFinding(f"$.{items_key}", "must be a non-empty array")
         )
-    else:
+    elif "one_shot_issue" not in value:
         if len(raw_items) > _MAX_INITIAL_WORK_ITEMS:
             findings.append(
                 IssueDrivenFinding(
@@ -714,6 +729,15 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                     )
                 )
     policy_issue = value.get("policy_issue")
+    one_shot_issue = value.get("one_shot_issue")
+    if "one_shot_issue" in value and (
+        isinstance(one_shot_issue, bool)
+        or not isinstance(one_shot_issue, int)
+        or one_shot_issue < 1
+    ):
+        findings.append(
+            IssueDrivenFinding("$.one_shot_issue", "must be a positive integer")
+        )
     if "policy_issue" in value:
         if (
             isinstance(policy_issue, bool)
@@ -773,6 +797,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         implementer_agent=value.get("implementer_agent", "codex"),
         reviewer_agent=value.get("reviewer_agent", "codex"),
         policy_issue=value.get("policy_issue"),
+        one_shot_issue=value.get("one_shot_issue"),
     )
 
 
@@ -802,6 +827,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         )
         for item in config.work_items
     )
+    issue_tuple = f"(\n        {issues},\n        )" if issues else "()"
     base_branch = (
         config.final_branch
         if config.make_integration_branch
@@ -832,8 +858,9 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         for item in config.work_items
     )
     prospective = config.final_branch if config.make_integration_branch else None
-    return f"""def parse_args() -> Config:
-    inspect_issue_driven_topology(
+    topology_inspection = ""
+    if config.work_items:
+        topology_inspection = f"""    inspect_issue_driven_topology(
         repo={config.repository!r},
         integration_branch={config.integration_branch!r},
         issues=(
@@ -841,7 +868,9 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         ),
         prospective_base_branch={prospective!r},
     )
-    context = prepare_run_repository(
+"""
+    return f"""def parse_args() -> Config:
+{topology_inspection}    context = prepare_run_repository(
         repo={config.repository!r},
         base_branch={base_branch!r},
     )
@@ -854,11 +883,10 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         repository.expected_github_slug,
         {config.integration_branch!r},
         {config.final_branch!r},
-        (
-        {issues},
-        ),
+        {issue_tuple},
         "git diff --check",
         WORKFLOW_POLICY_ISSUE,
+        {config.one_shot_issue!r},
     )
 
 

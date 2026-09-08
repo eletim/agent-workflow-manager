@@ -276,6 +276,51 @@ def test_ordered_work_items_mix_github_issues_and_inline_mini_tasks() -> None:
     assert parse(config.as_json()) == config
 
 
+def test_one_shot_issue_starts_with_an_empty_round_trip_plan() -> None:
+    value = payload()
+    value.pop("issues")
+    value["one_shot_issue"] = 169
+
+    config = parse(value)
+
+    assert config.one_shot_issue == 169
+    assert config.work_items == ()
+    assert config.issues == ()
+    assert "issues" not in config.as_json()
+    assert "work_items" not in config.as_json()
+    assert parse(config.as_json()) == config
+
+
+@pytest.mark.parametrize("one_shot_issue", [None, True, False, 0, -1, "169", 1.5])
+def test_one_shot_issue_must_be_a_positive_integer(one_shot_issue: object) -> None:
+    value = payload()
+    value.pop("issues")
+    value["one_shot_issue"] = one_shot_issue
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert ("$.one_shot_issue", "must be a positive integer") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
+
+
+@pytest.mark.parametrize("field", ["issues", "work_items"])
+def test_one_shot_issue_cannot_be_combined_with_seed_work_items(field: str) -> None:
+    value = payload(one_shot_issue=169)
+    if field == "work_items":
+        value.pop("issues")
+        value["work_items"] = [90]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.one_shot_issue",
+        "must not be combined with issues or work_items",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
 @pytest.mark.parametrize(
     ("work_item", "path"),
     [
@@ -384,6 +429,95 @@ def test_generated_workflow_requires_existing_integration_by_default() -> None:
     assert parse_args.index("inspect_issue_driven_topology(") < parse_args.index(
         "prepare_run_repository("
     )
+
+
+def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() -> None:
+    value = payload()
+    value.pop("issues")
+    value["one_shot_issue"] = 169
+
+    code = generate_issue_driven_workflow(parse(value))
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+
+    assert "inspect_issue_driven_topology(" not in parse_args
+    assert '        (),\n        "git diff --check",' in parse_args
+    assert "        WORKFLOW_POLICY_ISSUE,\n        169," in parse_args
+    assert "gh issue view\n{config.one_shot_issue} --repo {config.slug}" in code
+    assert "short inline mini tasks" in code
+    assert "Do not create GitHub Issues" in code
+    assert "one_shot_issue" in code
+    assert "One-shot source Issue:" in code
+
+    result = WorkflowValidator(check_timeout=10).validate(code)
+    assert result.valid, result.issues
+    assert result.dry_run_issues == ()
+
+
+def test_one_shot_source_issue_is_part_of_recovery_identity() -> None:
+    first = load_generated_workflow(one_shot_issue=169)
+    second = load_generated_workflow(one_shot_issue=170)
+    config_type = first["Config"]
+    first_config = config_type(
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    second_config = config_type(
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 170
+    )
+
+    assert first["plan_seed_fingerprint"](first_config) != second[
+        "plan_seed_fingerprint"
+    ](second_config)
+
+
+def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    decisions = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "add",
+                            "item": {
+                                "id": "focused-change",
+                                "task": "Implement the required behavior while preserving the public contract.",
+                            },
+                        }
+                    ],
+                    "complete": False,
+                }
+            ),
+            json.dumps({"actions": [], "complete": True}),
+        )
+    )
+    processed: list[object] = []
+    prompts: list[str] = []
+    workflow["create_agent"] = lambda *args, **kwargs: "manager"
+    workflow["run_turn"] = lambda *_args, **kwargs: (
+        prompts.append(_args[3]) or next(decisions)
+    )
+    workflow["process_issue"] = lambda issue, *_args: processed.append(issue)
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+    plan = workflow["WorkItemPlan"](config)
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        plan,
+    )
+
+    assert [item.key for item in processed] == ["focused-change"]
+    assert [item.key for item in effective] == ["focused-change"]
+    assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
 
 
 def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
@@ -862,7 +996,10 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
 
 
 def load_generated_workflow(**overrides: object) -> dict[str, object]:
-    code = generate_issue_driven_workflow(parse(payload(**overrides)))
+    value = payload(**overrides)
+    if "one_shot_issue" in overrides:
+        value.pop("issues")
+    code = generate_issue_driven_workflow(parse(value))
     module_name = f"generated_handoff_workflow_{len(sys.modules)}"
     module = ModuleType(module_name)
     sys.modules[module_name] = module
