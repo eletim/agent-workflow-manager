@@ -151,6 +151,17 @@ marked Ready after approval and stays Draft after a warning continuation. The
 implementer and reviewer selections are independent. Omitting either agent field
 selects `codex` for that role.
 
+The configured list seeds the generated Python's `WorkItemPlan` instead of
+freezing the entire execution schedule. Before each item is dispatched, the
+workflow calls `update_work_items(plan, config, client)`. Specialized generated
+Python may use `plan.add(issue)`, `plan.update(key, issue)`, and `plan.skip(key)`
+there to revise the remaining work as progress becomes available. A key is the
+GitHub Issue number or inline mini-task ID. Updates preserve the stable key and
+branch, and dispatched or completed items cannot be changed or reused. Dynamic
+items still enter the same recovery, Draft PR, review, and delivery flow. This is
+ordinary Python control flow; JSON, Runner state, Progress, and the UI do not
+become scheduling authorities.
+
 When `policy_issue` is present, implementation, Issue review/fix, and
 whole-version review/fix agents read it first as shared design context. It is not
 interpreted as workflow control or a DSL. A clear conflict with a listed

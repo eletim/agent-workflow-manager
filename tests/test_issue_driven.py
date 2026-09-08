@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import sys
@@ -449,13 +450,11 @@ def test_invalid_agent_selection_reports_exact_field_path(
     ]
 
 
-@pytest.mark.parametrize(
-    ("final_review", "maximum"),
-    [(True, MAX_OUTLINE_ITEMS - 2), (False, MAX_OUTLINE_ITEMS - 1)],
-)
-def test_issue_count_reserves_final_outline_entries(
-    final_review: bool, maximum: int
+@pytest.mark.parametrize("final_review", [True, False])
+def test_initial_work_item_count_is_bounded_independently_of_outline(
+    final_review: bool,
 ) -> None:
+    maximum = MAX_OUTLINE_ITEMS
     accepted = parse(
         payload(issues=list(range(1, maximum + 1)), final_review=final_review)
     )
@@ -465,14 +464,12 @@ def test_issue_count_reserves_final_outline_entries(
     outline_issues: list[object] = []
     outline = WorkflowValidator()._validate_outline(ast.parse(code), outline_issues)
     assert outline_issues == []
-    assert len(outline) == MAX_OUTLINE_ITEMS
+    assert len(outline) == (3 if final_review else 2)
 
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(issues=list(range(1, maximum + 2)), final_review=final_review))
 
-    expected_message = (
-        f"must contain at most {maximum} items when final_review is {final_review!r}"
-    )
+    expected_message = f"must contain at most {maximum} items"
     assert ("$.issues", expected_message) in {
         (finding.path, finding.message) for finding in caught.value.findings
     }
@@ -739,20 +736,18 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         (
             True,
             (
-                "Issue #91",
-                "Issue #90",
-                "Issue #89",
+                "Work items",
                 "Whole-version review",
                 "Final integration PR",
             ),
         ),
         (
             False,
-            ("Issue #91", "Issue #90", "Issue #89", "Final integration PR"),
+            ("Work items", "Final integration PR"),
         ),
     ],
 )
-def test_generated_outline_uses_concrete_run_units(
+def test_generated_outline_keeps_dynamic_work_items_in_one_run_unit(
     final_review: bool, expected: tuple[str, ...]
 ) -> None:
     code = generate_issue_driven_workflow(
@@ -849,6 +844,69 @@ def load_generated_workflow(**overrides: object) -> dict[str, object]:
     finally:
         del sys.modules[module_name]
     return module.__dict__
+
+
+def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config_type = workflow["Config"]
+    original_task = "Draft the release notes."
+    updated_task = "Draft concise release notes and cover the wording."
+    original = issue_type(
+        None,
+        "feature/work-item-release-notes",
+        "release-notes",
+        original_task,
+        hashlib.sha256(original_task.encode()).hexdigest(),
+    )
+    updated = issue_type(
+        None,
+        "feature/work-item-release-notes",
+        "release-notes",
+        updated_task,
+        hashlib.sha256(updated_task.encode()).hexdigest(),
+    )
+    config = config_type(
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        [original, issue_type(90, "feature/issue-90")],
+        "true",
+    )
+    processed: list[object] = []
+    hook_calls = 0
+    captured_plan: list[object] = []
+
+    def update_work_items(plan, _config, _client) -> None:
+        nonlocal hook_calls
+        captured_plan[:] = [plan]
+        if hook_calls == 0:
+            plan.update("release-notes", updated)
+            assert plan.skip(90).number == 90
+            plan.add(issue_type(91, "feature/issue-91"))
+        elif hook_calls == 1:
+            plan.add(issue_type(92, "feature/issue-92"))
+        hook_calls += 1
+
+    workflow["update_work_items"] = update_work_items
+    workflow["process_issue"] = lambda issue, _config, _client, _repo, _github: (
+        processed.append(issue)
+    )
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    workflow["process_work_items"](
+        config, SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+
+    assert [issue.key for issue in processed] == ["release-notes", 91, 92]
+    assert processed[0].task == updated_task
+    assert [issue.key for issue in config.issues] == ["release-notes", 91, 92]
+    plan = captured_plan[0]
+    with pytest.raises(ValueError, match="no unprocessed work item"):
+        plan.update("release-notes", updated)
+    with pytest.raises(ValueError, match="identities must be unique"):
+        plan.add(issue_type(91, "feature/issue-191"))
 
 
 def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> None:

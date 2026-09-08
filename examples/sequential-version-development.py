@@ -112,6 +112,12 @@ class Issue:
         return self.number if self.number is not None else f"mini-task:{self.task_id}"
 
     @property
+    def key(self) -> int | str:
+        """Return the stable key used to revise a pending work item."""
+        assert self.number is not None or self.task_id is not None
+        return self.number if self.number is not None else self.task_id
+
+    @property
     def correlation_id(self) -> str:
         return (
             f"issue-{self.number}"
@@ -147,9 +153,68 @@ class Config:
     slug: str
     integration_branch: str
     main_branch: str
-    issues: tuple[Issue, ...]
+    issues: list[Issue]
     check_command: str
     policy_issue: int | None = None
+
+
+@dataclass
+class WorkItemPlan:
+    """Mutable work-item order owned by this plain-Python workflow."""
+
+    config: Config
+    position: int = 0
+
+    def __post_init__(self) -> None:
+        self._validate(self.config.issues)
+
+    def _validate(self, issues: list[Issue]) -> None:
+        identities = [issue.key for issue in issues]
+        branches = [issue.branch for issue in issues]
+        if len(set(identities)) != len(identities):
+            raise ValueError("work-item identities must be unique")
+        if len(set(branches)) != len(branches):
+            raise ValueError("work-item branches must be unique")
+        reserved = {self.config.integration_branch, self.config.main_branch}
+        if len(reserved) != 2 or any(branch in reserved for branch in branches):
+            raise ValueError(
+                "integration, main, and every work-item branch must be distinct"
+            )
+        if self.config.policy_issue in identities:
+            raise ValueError(
+                "policy Issue must differ from every implementation work item"
+            )
+
+    def add(self, issue: Issue) -> None:
+        candidate = [*self.config.issues, issue]
+        self._validate(candidate)
+        self.config.issues.append(issue)
+
+    def update(self, identity: int | str, issue: Issue) -> None:
+        index = self._remaining_index(identity)
+        current = self.config.issues[index]
+        if issue.result_id != current.result_id or issue.branch != current.branch:
+            raise ValueError("updated work item must preserve its identity and branch")
+        candidate = list(self.config.issues)
+        candidate[index] = issue
+        self._validate(candidate)
+        self.config.issues[index] = issue
+
+    def skip(self, identity: int | str) -> Issue:
+        return self.config.issues.pop(self._remaining_index(identity))
+
+    def take_next(self) -> Issue | None:
+        if self.position == len(self.config.issues):
+            return None
+        issue = self.config.issues[self.position]
+        self.position += 1
+        return issue
+
+    def _remaining_index(self, identity: int | str) -> int:
+        for index in range(self.position, len(self.config.issues)):
+            if self.config.issues[index].key == identity:
+                return index
+        raise ValueError(f"no unprocessed work item with identity {identity!r}")
 
 
 @dataclass(frozen=True)
@@ -222,7 +287,7 @@ def parse_args() -> Config:
         args.slug,
         args.integration_branch,
         args.main_branch,
-        tuple(issues),
+        issues,
         args.check_command,
         args.policy_issue,
     )
@@ -1504,6 +1569,38 @@ def process_issue(
     return merged.pr
 
 
+def update_work_items(
+    plan: WorkItemPlan,
+    config: Config,
+    client: PurpleMuxCLIClient,
+) -> None:
+    """Revise pending work before its next dispatch using ordinary Python.
+
+    The canonical sequential workflow leaves the JSON-seeded plan unchanged.
+    Specialized generated workflows can make a runtime decision here and call
+    ``plan.add()``, ``plan.update()``, or ``plan.skip()``. The Runner and
+    progress events remain observation surfaces rather than control-flow state.
+    """
+
+
+def process_work_items(
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+) -> None:
+    plan = WorkItemPlan(config)
+    while True:
+        update_work_items(plan, config, client)
+        issue = plan.take_next()
+        if issue is None:
+            return
+        run_outline_step(
+            issue.label,
+            lambda issue=issue: process_issue(issue, config, client, repo, github),
+        )
+
+
 def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
     shell = client.start_shell(
         ShellCommandRequest(config.check_command, str(config.repo), "Final checks")
@@ -1926,11 +2023,10 @@ def main() -> None:
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
-    for issue in config.issues:
-        run_outline_step(
-            f"{issue.label}",
-            lambda issue=issue: process_issue(issue, config, client, repo, github),
-        )
+    run_outline_step(
+        "Work items",
+        lambda: process_work_items(config, client, repo, github),
+    )
     ready = integration_delivery(config, client, repo, github)
     if ready.state == "MERGED":
         outcome = "Merged"

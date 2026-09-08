@@ -64,6 +64,15 @@ such as `{"id":"update-copy","task":"Update the empty-state copy and its test."}
 Inline tasks are embedded in the generated Python and do not require creating a
 GitHub Issue; the legacy Issue-only `issues` array remains supported.
 
+The JSON list seeds a workflow-owned `WorkItemPlan`; it is not frozen as the
+execution schedule. Before each dispatch, the generated Python calls its
+`update_work_items()` hook. Ordinary Python in that hook may add a new pending
+Issue or mini task, update a pending mini task while preserving its stable ID and
+branch, or skip a pending item. Already-dispatched items cannot be revised and
+completed identities cannot be reused. The Runner and progress events only
+observe these decisions, so the generated plain Python remains the control-flow
+source of truth.
+
 ```json
 {
   "mode": "issue-driven",
