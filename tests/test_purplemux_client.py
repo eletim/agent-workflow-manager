@@ -103,6 +103,7 @@ class FakeRunner:
 
 def client(runner: FakeRunner, **kwargs: object) -> PurpleMuxCLIClient:
     kwargs.setdefault("codex_project_truster", lambda path: path)
+    kwargs.setdefault("claude_project_truster", lambda path: path)
     return PurpleMuxCLIClient(
         "ws-test",
         poll_interval_seconds=0,
@@ -236,15 +237,85 @@ def test_direct_client_rejects_workspace_without_directories() -> None:
     assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
-def test_claude_session_does_not_change_codex_trust() -> None:
-    trusted: list[str] = []
+def test_claude_project_is_trusted_before_tab_creation() -> None:
+    codex_trusted: list[str] = []
+    claude_trusted: list[str] = []
     runner = FakeRunner([completed({"tabId": "tab-claude"})])
 
     client(
-        runner, codex_project_truster=lambda path: trusted.append(path) or path
+        runner,
+        codex_project_truster=lambda path: codex_trusted.append(path) or path,
+        claude_project_truster=lambda path: claude_trusted.append(path) or path,
     ).create_session(request("claude-code", "claude"))
 
-    assert trusted == []
+    assert codex_trusted == []
+    assert claude_trusted == ["/workspace/project"]
+    assert runner.calls[0][1:] == ["workspaces"]
+
+
+def test_claude_trust_runs_in_a_purplemux_terminal_before_provider_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeRunner([completed({"tabId": "tab-claude"})])
+    cli = PurpleMuxCLIClient(
+        "ws-test",
+        poll_interval_seconds=0,
+        runner=runner,
+        sleep=lambda _: None,
+        codex_project_truster=lambda path: path,
+    )
+    events: list[object] = []
+
+    def start_shell(shell_request, *, on_created=None):  # type: ignore[no-untyped-def]
+        events.append(shell_request)
+        if on_created is not None:
+            on_created("tab-trust", "/tmp/result.json")
+        return "tab-trust"
+
+    monkeypatch.setattr(cli, "start_shell", start_shell)
+    monkeypatch.setattr(
+        cli,
+        "wait_for_shell_completion",
+        lambda session_id, timeout_seconds: events.append(
+            ("wait", session_id, timeout_seconds)
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "read_shell_result", lambda session_id: client_module.ShellResult(0)
+    )
+    monkeypatch.setattr(
+        cli, "close_session", lambda session_id: events.append(("close", session_id))
+    )
+
+    assert cli.create_session(request("claude-code", "claude")) == "tab-claude"
+
+    shell_request = events[0]
+    assert isinstance(shell_request, ShellCommandRequest)
+    assert shell_request.cwd == "/workspace/project"
+    assert "-I -m purplemux_client.claude_trust /workspace/project" in (
+        shell_request.command
+    )
+    assert events[1:] == [
+        ("wait", "tab-trust", cli.command_timeout_seconds),
+        ("close", "tab-trust"),
+    ]
+    create_calls = [call for call in runner.calls if call[1:3] == ["tab", "create"]]
+    assert len(create_calls) == 1
+    assert create_calls[0][create_calls[0].index("-t") + 1] == "claude-code"
+
+
+def test_claude_trust_failure_prevents_tab_creation() -> None:
+    runner = FakeRunner([])
+
+    def fail(_path: str) -> str:
+        raise WorkerFailure("Claude trust unavailable")
+
+    with pytest.raises(WorkerFailure, match="Claude trust unavailable"):
+        client(runner, claude_project_truster=fail).create_session(
+            request("claude-code", "claude")
+        )
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
 def test_named_session_derives_run_scoped_correlation(

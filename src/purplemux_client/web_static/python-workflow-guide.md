@@ -429,8 +429,15 @@ created, so an unavailable or overridden trust configuration fails early. Trust
 mutations are serialized through a user-local lock so concurrent Workflow
 processes cannot lose another worktree's configuration update.
 Fresh worktrees are handled independently from their source repository path.
-This does not change sandbox or approval policy. AWM does not apply a broad
-permission bypass or simulated trust-dialog keystrokes to Claude Code.
+For Claude, the same exact launch-path boundary is enforced before updating and
+verifying only `projects[canonical_path].hasTrustDialogAccepted` in Claude Code's
+project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrated
+`.config.json`, legacy `.claude.json`, and custom-OAuth state precedence;
+unrelated state is preserved, and updates coordinate on Claude's state-file lock.
+Claude home-directory trust fails early because Claude does not persist it.
+Neither provider integration changes sandbox or approval policy, and AWM does
+not use a broad permission bypass, screen-text detection, or simulated
+trust-dialog keystrokes.
 
 Relevant errors all derive from `TerminalSessionError`:
 

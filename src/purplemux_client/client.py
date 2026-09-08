@@ -5,6 +5,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -573,6 +574,7 @@ class PurpleMuxCLIClient:
         monotonic: Callable[[], float] = time.monotonic,
         owned_by_run: bool = False,
         codex_project_truster: Callable[[str], str] = ensure_codex_project_trust,
+        claude_project_truster: Callable[[str], str] | None = None,
     ) -> None:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
@@ -592,6 +594,7 @@ class PurpleMuxCLIClient:
         self._monotonic = monotonic
         self.owned_by_run = owned_by_run
         self._codex_project_truster = codex_project_truster
+        self._claude_project_truster = claude_project_truster
         self._turn_baselines: dict[str, _TurnBaseline] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
         self._shell_runs: dict[str, _ShellRun] = {}
@@ -607,20 +610,23 @@ class PurpleMuxCLIClient:
                 f"unsupported PurpleMux worker {request.worker!r}; "
                 "expected codex or claude-code"
             )
+        provider_name = "Codex" if panel_type == "codex-cli" else "Claude"
+        launch_directory = self._current_workspace_launch_directory(provider_name)
+        try:
+            requested = os.path.realpath(os.path.expanduser(request.cwd))
+        except (OSError, ValueError) as exc:
+            raise WorkerFailure(
+                f"{provider_name} project trust path could not be resolved: {exc}"
+            ) from exc
+        if requested != launch_directory:
+            raise WorkerFailure(
+                f"{provider_name} request cwd does not match the current PurpleMux "
+                "workspace launch directory"
+            )
         if panel_type == "codex-cli":
-            launch_directory = self._current_workspace_launch_directory()
-            try:
-                requested = os.path.realpath(os.path.expanduser(request.cwd))
-            except (OSError, ValueError) as exc:
-                raise WorkerFailure(
-                    f"Codex project trust path could not be resolved: {exc}"
-                ) from exc
-            if requested != launch_directory:
-                raise WorkerFailure(
-                    "Codex request cwd does not match the current PurpleMux "
-                    "workspace launch directory"
-                )
             self._codex_project_truster(launch_directory)
+        else:
+            self._ensure_claude_project_trust(launch_directory)
         correlation_id = request.correlation_id or (
             run_correlation(request.name)
             if request.name is not None
@@ -695,7 +701,13 @@ class PurpleMuxCLIClient:
         if any(tab.name == probe_name for tab in current):
             raise WorkerFailure("probe correlation identity is already in use")
         if panel_type == "codex-cli":
-            self._codex_project_truster(self._current_workspace_launch_directory())
+            self._codex_project_truster(
+                self._current_workspace_launch_directory("Codex")
+            )
+        else:
+            self._ensure_claude_project_trust(
+                self._current_workspace_launch_directory("Claude")
+            )
         tab = self._create_correlated_tab(
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",
@@ -729,7 +741,7 @@ class PurpleMuxCLIClient:
             True,
         )
 
-    def _current_workspace_launch_directory(self) -> str:
+    def _current_workspace_launch_directory(self, provider_name: str) -> str:
         runtime = PurpleMuxRuntime(
             executable=self.executable,
             command_timeout_seconds=self.command_timeout_seconds,
@@ -747,18 +759,64 @@ class PurpleMuxCLIClient:
         if selected is None:
             raise WorkerFailure(
                 f"PurpleMux workspace {self.workspace_id!r} was not found "
-                "before Codex project trust"
+                f"before {provider_name} project trust"
             )
         if not selected.directories:
             raise WorkerFailure(
-                "selected PurpleMux workspace has no directory for Codex project trust"
+                "selected PurpleMux workspace has no directory for "
+                f"{provider_name} project trust"
             )
         directory = selected.directories[0]
         if not directory or "\0" in directory:
             raise WorkerFailure(
-                "selected PurpleMux workspace has an invalid Codex launch directory"
+                "selected PurpleMux workspace has an invalid "
+                f"{provider_name} launch directory"
             )
         return os.path.realpath(os.path.expanduser(directory))
+
+    def _ensure_claude_project_trust(self, launch_directory: str) -> None:
+        if self._claude_project_truster is not None:
+            self._claude_project_truster(launch_directory)
+            return
+
+        correlation_id = f"claude-trust-{secrets.token_hex(6)}"
+        command = shlex.join(
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "purplemux_client.claude_trust",
+                launch_directory,
+            ]
+        )
+        created: list[str] = []
+        try:
+            session_id = self.start_shell(
+                ShellCommandRequest(
+                    command=command,
+                    cwd=launch_directory,
+                    name=f"Claude project trust [awm:{correlation_id}]",
+                    correlation_id=correlation_id,
+                ),
+                on_created=lambda tab_id, _result_path: created.append(tab_id),
+            )
+            self.wait_for_shell_completion(
+                session_id, timeout_seconds=self.command_timeout_seconds
+            )
+            result = self.read_shell_result(session_id)
+            if result.exit_code != 0:
+                raise WorkerFailure(result.failure_message("Claude project trust"))
+        except BaseException as trust_error:
+            if created:
+                try:
+                    self.close_session(created[0])
+                except BaseException as cleanup_error:
+                    raise WorkerFailure(
+                        f"{trust_error}; transient trust terminal cleanup failed: "
+                        f"{cleanup_error}"
+                    ) from cleanup_error
+            raise
+        self.close_session(session_id)
 
     def start_shell(
         self,
