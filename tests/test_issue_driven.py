@@ -629,6 +629,61 @@ def test_optional_policy_issue_round_trips_and_is_generated_deterministically() 
     assert '"git diff --check",\n        WORKFLOW_POLICY_ISSUE,' in first
 
 
+def test_optional_scenarios_round_trip_into_generated_scenario_gate() -> None:
+    scenarios = [
+        "Existing: a Prompt run still completes successfully.",
+        "New: a one-shot run plans its first mini task.",
+        "Failure: invalid planner output is rejected without dispatch.",
+    ]
+    config = parse(payload(scenarios=scenarios))
+
+    assert config.scenarios == tuple(scenarios)
+    assert config.as_json()["scenarios"] == scenarios
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+    assert first == second
+    assert f"SCENARIOS: tuple[str, ...] = {tuple(scenarios)!r}" in first
+    assert "Select a small, risk-relevant subset" in first
+    assert "exact Before commit" in first
+    assert "exact\nAfter commit" in first
+    assert "Do not treat this as a fixed" in first
+    assert "expected-output test" in first
+
+
+@pytest.mark.parametrize(
+    ("scenarios", "path", "message"),
+    [
+        ("scenario", "$.scenarios", "must be an array"),
+        ([""], "$.scenarios[0]", "must be a non-empty trimmed string"),
+        (
+            [" duplicate", "duplicate"],
+            "$.scenarios[0]",
+            "must be a non-empty trimmed string",
+        ),
+        (["duplicate", "duplicate"], "$.scenarios[1]", "must be unique"),
+    ],
+)
+def test_scenarios_reject_invalid_human_authored_entries(
+    scenarios: object, path: str, message: str
+) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert any(
+        finding.path == path and message in finding.message
+        for finding in caught.value.findings
+    )
+
+
+def test_scenarios_require_whole_version_review() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=["Existing behavior"], final_review=False))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.scenarios", "requires final_review to be true")
+    ]
+
+
 @pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])
 def test_policy_issue_must_be_a_positive_integer(policy_issue: object) -> None:
     with pytest.raises(IssueDrivenValidationError) as caught:
@@ -983,6 +1038,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
+        "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
     }

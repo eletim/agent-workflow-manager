@@ -54,8 +54,8 @@ Incorrect when that version worktree does not already exist:
 
 Unknown fields are rejected. Provide exactly one of `one_shot_issue`, `work_items`,
 or the legacy `issues` field. `mode`, `make_integration_branch`, `policy_issue`,
-`implementer_agent`, and `reviewer_agent` are otherwise optional; every other
-field is required.
+`implementer_agent`, `reviewer_agent`, and `scenarios` are otherwise optional;
+every other field is required.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -71,6 +71,7 @@ field is required.
 | `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 5 unless the user requests another value. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
+| `scenarios` | array of strings | Optional human-authored Scenario List for Whole Review. The Scenario Gate selects a risk-relevant subset and uses AI to judge each scenario's Before/After behavioral difference. Requires `final_review: true`. |
 | `merge_to_integration` | boolean | Whether each safely deliverable Issue PR is merged into the integration branch, including explicit warning continuations. |
 | `final_review` | boolean | Whether the completed integration branch receives a final review. |
 | `merge_final` | boolean | Whether final delivery is automatically merged into `final_branch`. |
@@ -85,6 +86,27 @@ safety, regressions, and tests. The counters and outcomes are independent. A
 phase that exhausts its limit may continue with an explicit warning after exact
 clean, pushed PR topology is revalidated; it is never recorded as approved.
 Whole-version Review remains a separate integration and cross-Issue review.
+
+When `scenarios` is present, Whole Review first runs a Scenario Gate against the
+exact final-base commit (Before) and integration-head commit (After). Each string
+should describe one observable scenario and may cover existing behavior, new
+behavior, or a failure path. The reviewer selects a small risk-relevant subset,
+records evidence for both commits, and judges whether each behavioral difference
+is appropriate in the Issue and policy context. This is intentionally not a
+fixed expected-output assertion, and the gate does not need to execute every
+scenario. A requested change enters the existing Whole Review fix/re-review loop.
+The generated plain Python contains the list, selection prompt, gate ordering,
+and review loop, so it remains the control-flow Source of Truth.
+
+For example:
+
+```json
+"scenarios": [
+  "Existing: a normal Prompt run still completes and preserves its output.",
+  "New: a one-shot Issue Driven run plans and dispatches its first mini task.",
+  "Failure: malformed planner output is rejected without dispatching work."
+]
+```
 
 Before creating a run worktree, Static Validation and Dry Run inspect every
 declared work item's remote feature branch, current integration head, and bounded

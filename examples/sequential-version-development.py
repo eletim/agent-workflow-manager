@@ -57,6 +57,7 @@ MAX_PLAN_STATE_CHARS = 32_000
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
+SCENARIOS: tuple[str, ...] = ()
 READY_TIMEOUT = 120
 TURN_TIMEOUT = 3600
 SHELL_TIMEOUT = 1800
@@ -2127,6 +2128,28 @@ def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
         raise WorkerFailure(failure)
 
 
+def scenario_gate_prompt(pr: PullRequestState) -> str:
+    """Build the AI-judged Before/After gate from human-authored scenarios."""
+    scenario_list = "\n".join(
+        f"{index}. {scenario}" for index, scenario in enumerate(SCENARIOS, 1)
+    )
+    return f"""Run the Scenario Gate for exact Before commit {pr.base_sha} and exact
+After commit {pr.head_sha}. The human-authored scenario list is below.
+
+{scenario_list}
+
+Select a small, risk-relevant subset; executing every scenario is not required.
+The subset may cover existing behavior, new behavior, and failure behavior. For
+each selected scenario, observe or inspect both Before and After, report the
+material behavioral difference and evidence, and judge whether that difference
+is appropriate for the integrated work items. Do not treat this as a fixed
+expected-output test: use the Issue and policy context to judge the difference.
+Use read-only inspection or disposable temporary directories and leave the
+repository worktree unchanged. Return APPROVED or CHANGES_REQUESTED first,
+followed by the selected scenarios, Before/After evidence, and actionable
+findings. Do not mutate files or PR state."""
+
+
 def review_whole_version(
     config: Config,
     client: PurpleMuxCLIClient,
@@ -2147,23 +2170,77 @@ def review_whole_version(
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
     )
+    scenario_reviewer = (
+        create_agent(
+            client,
+            config,
+            agent_type=REVIEWER_AGENT,
+            name="Scenario Gate reviewer",
+        )
+        if SCENARIOS
+        else None
+    )
     delivery: ReviewDelivery | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
-        result = run_turn(
-            client,
-            reviewer,
-            "Whole-version reviewer turn",
-            policy_context(config, scope="the whole-version review")
-            + f"Review the whole version at exact head {pr.head_sha} against final "
-            f"base {pr.base_sha}. Examine integration consistency across Issues, "
-            "duplication between their implementations, cross-feature interactions "
-            "and regressions, and whether shared versus feature-specific "
-            "responsibilities are placed at the right boundaries. Also review the "
-            "combined version for correctness, safety, and missing integration "
-            "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
-            "actionable findings; do not mutate anything.",
-            iteration=review_number,
-        )
+        result: str
+        if scenario_reviewer is not None:
+            result = run_turn(
+                client,
+                scenario_reviewer,
+                "Scenario Gate reviewer turn",
+                policy_context(config, scope="the whole-version Scenario Gate")
+                + scenario_gate_prompt(pr),
+                iteration=review_number,
+            )
+            emit_policy_conflicts(result, config, scope="the integrated version")
+            scenario_sha, scenario_reviewer_changed = require_agent_result(
+                repo,
+                client,
+                fixer,
+                config.integration_branch,
+                pr.head_sha,
+                allow_unchanged=True,
+                iteration=review_number,
+            )
+            if scenario_reviewer_changed:
+                pushed = repo.ensure_pushed(
+                    config.integration_branch, expected_local_sha=scenario_sha
+                )
+                assert pushed.remote_sha is not None
+                pr = github.require_pr(
+                    number=pr.number,
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="OPEN",
+                    expected_head_sha=pushed.remote_sha,
+                    expected_base_sha=pr.base_sha,
+                    draft=True,
+                )
+                pr = ensure_base_pr_policy_notes(github, pr, config)
+                emit_finding(
+                    "git",
+                    "Scenario Gate review changed the integration branch; "
+                    f"approval invalidated at {scenario_sha}",
+                )
+                continue
+        else:
+            result = "APPROVED\nScenario Gate not configured."
+        if decision(result) == "APPROVED":
+            result = run_turn(
+                client,
+                reviewer,
+                "Whole-version reviewer turn",
+                policy_context(config, scope="the whole-version review")
+                + f"Review the whole version at exact head {pr.head_sha} against final "
+                f"base {pr.base_sha}. Examine integration consistency across Issues, "
+                "duplication between their implementations, cross-feature interactions "
+                "and regressions, and whether shared versus feature-specific "
+                "responsibilities are placed at the right boundaries. Also review the "
+                "combined version for correctness, safety, and missing integration "
+                "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
+                "actionable findings; do not mutate anything.",
+                iteration=review_number,
+            )
         emit_policy_conflicts(result, config, scope="the integrated version")
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,

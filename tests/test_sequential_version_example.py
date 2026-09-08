@@ -183,11 +183,34 @@ def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> No
     assert "right boundaries" in source
 
 
+def test_scenario_gate_prompt_selects_and_compares_human_scenarios() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    prompt_globals = workflow["scenario_gate_prompt"].__globals__
+    prompt_globals["SCENARIOS"] = (
+        "Existing: prompt execution still succeeds.",
+        "New: scenario configuration is accepted.",
+        "Failure: malformed scenarios are rejected.",
+    )
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+
+    prompt = workflow["scenario_gate_prompt"](pr)
+
+    assert pr.base_sha in prompt
+    assert pr.head_sha in prompt
+    assert "Select a small, risk-relevant subset" in prompt
+    assert "executing every scenario is not required" in prompt
+    assert "observe or inspect both Before and After" in prompt
+    assert "judge whether that difference\nis appropriate" in prompt
+    assert "1. Existing:" in prompt
+    assert "2. New:" in prompt
+    assert "3. Failure:" in prompt
+
+
 def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert source.count("def decision(result: str) -> str:") == 1
-    assert source.count("decision(result)") == 2
+    assert source.count("decision(result)") == 3
 
 
 def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
