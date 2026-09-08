@@ -125,6 +125,9 @@ def test_decision_accepts_bounded_reviewer_verdict_variations(
     "result",
     [
         "APPROVED and CHANGES_REQUESTED",
+        "APPROVED\nCHANGES_REQUESTED",
+        "Review result:\nAPPROVED\nCHANGES_REQUESTED",
+        "Verdict: CHANGES_REQUESTED\n## APPROVED",
         "I initially considered APPROVED,\nbut the final verdict is CHANGES_REQUESTED.",
         "Review result:\nNothing conclusive\nPlease retry",
         "Introduction\nDetails\nMore details\nAPPROVED",
@@ -159,6 +162,12 @@ def test_decision_ignores_verdict_words_in_finding_prose(
     decision = runpy.run_path(str(EXAMPLE))["decision"]
 
     assert decision(result) == expected
+
+
+def test_decision_accepts_repeated_equivalent_standalone_verdicts() -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    assert decision("APPROVED\nVerdict: APPROVED") == "APPROVED"
 
 
 def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> None:

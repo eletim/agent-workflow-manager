@@ -246,9 +246,15 @@ def _normalized_verdict(line: str) -> str | None:
 
 def decision(result: str) -> str:
     leading_lines = [line for line in result.splitlines() if line.strip()][:3]
-    for line in leading_lines:
-        if verdict := _normalized_verdict(line):
-            return verdict
+    verdicts = [
+        verdict
+        for line in leading_lines
+        if (verdict := _normalized_verdict(line)) is not None
+    ]
+    if len(set(verdicts)) > 1:
+        raise WorkerFailure("reviewer verdict is ambiguous")
+    if verdicts:
+        return verdicts[0]
     raise WorkerFailure(
         "reviewer must provide APPROVED or CHANGES_REQUESTED near the beginning"
     )
