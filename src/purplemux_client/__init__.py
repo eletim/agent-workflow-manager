@@ -43,6 +43,7 @@ from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
     inspect_issue_driven_topology,
+    inspect_issue_driven_work_item_topology,
     parse_issue_driven_json,
 )
 from purplemux_client.operations import MutationConflict
@@ -97,6 +98,7 @@ __all__ = [
     "emit_whole_review_result",
     "inspect_run_repository",
     "inspect_issue_driven_topology",
+    "inspect_issue_driven_work_item_topology",
     "generate_issue_driven_workflow",
     "parse_issue_driven_json",
     "prepare_run_repository",

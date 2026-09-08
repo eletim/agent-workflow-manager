@@ -192,6 +192,20 @@ def test_issue_topology_classifies_authoritatively_integrated_head() -> None:
     assert result.classification == "already_integrated"
 
 
+def test_issue_topology_rejects_stale_merged_pr_not_contained_by_integration() -> None:
+    merged = topology_pr(state="MERGED", head_sha="f" * 40)
+
+    with pytest.raises(WorkerFailure, match="is not contained by current integration"):
+        classify(None, TopologyGitHub((merged,)))
+
+
+def test_issue_topology_rejects_closed_unmerged_pr() -> None:
+    closed = topology_pr(state="CLOSED")
+
+    with pytest.raises(WorkerFailure, match="closed unmerged PR"):
+        classify(None, TopologyGitHub((closed,)))
+
+
 @pytest.mark.parametrize("state", ["OPEN", "MERGED"])
 def test_inline_task_topology_rejects_pr_fingerprint_mismatch(state: str) -> None:
     expected = "a" * 64
@@ -497,11 +511,15 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     )
     processed: list[object] = []
     prompts: list[str] = []
+    inspected: list[object] = []
     workflow["create_agent"] = lambda *args, **kwargs: "manager"
     workflow["run_turn"] = lambda *_args, **kwargs: (
         prompts.append(_args[3]) or next(decisions)
     )
     workflow["process_issue"] = lambda issue, *_args: processed.append(issue)
+    workflow["inspect_dynamic_work_item_topology"] = lambda issue, _config: (
+        inspected.append(issue)
+    )
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
     plan = workflow["WorkItemPlan"](config)
@@ -516,8 +534,87 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     )
 
     assert [item.key for item in processed] == ["focused-change"]
+    assert [item.key for item in inspected] == ["focused-change"]
     assert [item.key for item in effective] == ["focused-change"]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
+
+
+def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    with pytest.raises(WorkerFailure, match="only inline mini tasks"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [{"action": "add", "item": 169}],
+                    "complete": False,
+                }
+            ),
+        )
+
+    assert plan.snapshot == ()
+    assert plan.position == 0
+
+
+@pytest.mark.parametrize(
+    "topology_error",
+    [
+        "merged PR head is not contained by current integration",
+        "closed unmerged PR exists for the dynamic task",
+    ],
+)
+def test_dynamic_topology_failure_remains_undispatched_for_recovery(
+    topology_error: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    stored_body = "Base PR"
+    workflow["create_agent"] = lambda *args, **kwargs: "manager"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {
+            "actions": [
+                {
+                    "action": "add",
+                    "item": {"id": "dynamic-task", "task": "Do the focused work."},
+                }
+            ],
+            "complete": False,
+        }
+    )
+
+    def persist(plan, *_args):
+        nonlocal stored_body
+        stored_body = workflow["with_work_item_plan"](stored_body, plan)
+        return _args[-1]
+
+    workflow["persist_work_item_plan"] = persist
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: (
+        _ for _ in ()
+    ).throw(WorkerFailure(topology_error))
+    workflow["process_issue"] = lambda *_args: pytest.fail(
+        "unsafe dynamic work item was dispatched"
+    )
+
+    with pytest.raises(WorkerFailure, match=topology_error):
+        workflow["process_work_items"](
+            config,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            workflow["WorkItemPlan"](config),
+        )
+
+    recovered = workflow["work_item_plan_from_body"](stored_body, config)
+    assert recovered.position == 0
+    assert [item.key for item in recovered.remaining] == ["dynamic-task"]
 
 
 def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
@@ -1070,6 +1167,7 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
     workflow["process_issue"] = lambda issue, _config, _client, _repo, _github: (
         processed.append(issue)
     )
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
     workflow["run_outline_step"] = lambda _name, action: action()
     persisted: list[str] = []
 
@@ -1434,6 +1532,7 @@ def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:
     workflow["process_issue"] = lambda issue, *_args: prepared.append(
         prepare_issue(repository, github, issue, config)
     )
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["create_agent"] = lambda *args, **kwargs: pytest.fail(
         "a finalized recovered plan must not restart its planner"

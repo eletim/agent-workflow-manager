@@ -91,6 +91,9 @@ implementation progresses. Each mini task records its purpose and indispensable
 design decisions, then enters the same implementation, independent review,
 recovery, and delivery flow as every other work item. The source Issue is part of
 the persisted plan identity and is referenced by the Base PR and final handoff.
+Numeric Issue additions are rejected in this mode, and every manager-created or
+revised mini task receives authoritative branch/PR topology validation before its
+dispatch is persisted.
 
 ```json
 {

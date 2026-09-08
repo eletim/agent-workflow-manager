@@ -357,6 +357,24 @@ def inspect_issue_driven_topology(
     return states
 
 
+def inspect_issue_driven_work_item_topology(
+    *,
+    repo: str,
+    integration_branch: str,
+    issue: tuple[int | str, str] | tuple[int | str, str, str],
+    remote: str = "origin",
+    command_timeout_seconds: float = 30.0,
+) -> IssueTopologyState:
+    """Authoritatively inspect one runtime-planned work item before dispatch."""
+    return inspect_issue_driven_topology(
+        repo=repo,
+        integration_branch=integration_branch,
+        issues=(issue,),
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+    )[0]
+
+
 def _pr_topology(
     snapshot: PullRequestSnapshot,
 ) -> tuple[tuple[object, ...], ...]:

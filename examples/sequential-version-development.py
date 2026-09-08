@@ -35,6 +35,7 @@ from purplemux_client import (
     emit_run_pr,
     emit_step,
     emit_whole_review_result,
+    inspect_issue_driven_work_item_topology,
     run_correlation,
 )
 
@@ -196,6 +197,10 @@ class WorkItemPlan:
             raise ValueError(
                 "policy Issue must differ from every implementation work item"
             )
+        if self.config.one_shot_issue is not None and any(
+            issue.number is not None for issue in issues
+        ):
+            raise ValueError("one-shot plans can contain only inline mini tasks")
 
     def add(self, issue: Issue) -> None:
         candidate = [*self.items, issue]
@@ -1657,7 +1662,7 @@ def planner_prompt(plan: WorkItemPlan, config: Config) -> str:
 the remaining work into short inline mini tasks. Each task must state its purpose
 and any non-negotiable design decision, while leaving implementation detail to
 the implementer. Do not create GitHub Issues or implement the source Issue as one
-undivided work item.
+undivided work item. Numeric Issue additions are invalid in one-shot mode.
 
 """
     return f"""Review the workflow-owned work-item plan before its next dispatch.
@@ -2034,6 +2039,28 @@ def persist_work_item_plan(
     )
 
 
+def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
+    """Validate a non-seed item authoritatively before recording its dispatch."""
+    if issue in config.issues:
+        return
+    declaration: tuple[int | str, str] | tuple[int | str, str, str]
+    if issue.number is not None:
+        declaration = (issue.number, issue.branch)
+    else:
+        assert issue.task_id is not None and issue.task_fingerprint is not None
+        declaration = (
+            f"Mini task {issue.task_id}",
+            issue.branch,
+            issue.task_fingerprint,
+        )
+    inspect_issue_driven_work_item_topology(
+        repo=str(config.repo),
+        integration_branch=config.integration_branch,
+        issue=declaration,
+        command_timeout_seconds=COMMAND_TIMEOUT,
+    )
+
+
 def process_work_items(
     config: Config,
     client: PurpleMuxCLIClient,
@@ -2043,6 +2070,7 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
+        inspect_dynamic_work_item_topology(recovered_issue, config)
         run_outline_step(
             recovered_issue.label,
             lambda issue=recovered_issue: process_issue(
@@ -2072,6 +2100,7 @@ def process_work_items(
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
+        inspect_dynamic_work_item_topology(issue, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         run_outline_step(
             issue.label,

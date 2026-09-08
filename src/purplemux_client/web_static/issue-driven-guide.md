@@ -162,7 +162,9 @@ or skip pending tasks as progress changes what remains. It does not create GitHu
 Issues or collapse the source Issue into one implementation item. Every generated
 mini task uses the normal implementation, review, recovery, and delivery path.
 The source Issue is bound into persisted recovery state and linked from the Base
-PR and final human handoff.
+PR and final human handoff. Numeric Issue additions are rejected, and each added
+or revised mini task receives the same authoritative remote branch, PR-state,
+SHA-containment, and fingerprint checks before its dispatch is persisted.
 
 The generated Python embeds the mini-task instruction and uses the deterministic
 branch `feature/work-item-refresh-run-help`. Its recovery declaration and Draft
