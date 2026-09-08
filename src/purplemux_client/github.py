@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, TypeVar, cast
 from urllib.parse import quote
@@ -21,6 +22,7 @@ from purplemux_client.operations import (
 
 PullRequestStatus = Literal["OPEN", "MERGED", "CLOSED"]
 CommitComparison = Literal["ahead", "behind", "diverged", "identical"]
+_TOPOLOGY_READ_WORKERS = 16
 _CORRELATION_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _HTTP_REJECTION_RE = re.compile(r"\bHTTP (4\d\d)\b", re.IGNORECASE)
 _READY_MUTATION = """
@@ -136,6 +138,7 @@ class PullRequestSnapshot:
 
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 
 def _validate_pr_lookup(head: str, base: str, state: PullRequestStatus) -> None:
@@ -199,6 +202,45 @@ def _require_pr_topology(
         )
 
 
+@dataclass(frozen=True)
+class CommitComparisonSnapshot:
+    """Cached authoritative commit relationships for one topology inspection."""
+
+    comparisons: Mapping[tuple[str, str], CommitComparison]
+
+    def compare_commits(self, *, base_sha: str, head_sha: str) -> CommitComparison:
+        try:
+            return self.comparisons[(base_sha, head_sha)]
+        except KeyError as exc:
+            raise WorkerFailure(
+                "commit relationship was not included in the topology inspection"
+            ) from exc
+
+
+class GitHubTopologyInspection:
+    """Repository-pinned, bounded GitHub reads with cached ancestry results."""
+
+    def __init__(self, repository: GitHubRepository) -> None:
+        self._repository = repository
+
+    def inspect_pr_snapshot(self, heads: Sequence[str]) -> PullRequestSnapshot:
+        return self._repository._inspect_pr_snapshot(heads)
+
+    def inspect_comparisons(
+        self, pairs: Sequence[tuple[str, str]]
+    ) -> CommitComparisonSnapshot:
+        unique_pairs = tuple(dict.fromkeys(pairs))
+        for base_sha, head_sha in unique_pairs:
+            self._repository._validate_comparison(base_sha, head_sha)
+        comparisons = self._repository._parallel_map(
+            unique_pairs,
+            lambda pair: self._repository._compare_commits(
+                base_sha=pair[0], head_sha=pair[1]
+            ),
+        )
+        return CommitComparisonSnapshot(dict(zip(unique_pairs, comparisons)))
+
+
 class GitHubRepository:
     """Validated, repository-pinned GitHub PR topology operations."""
 
@@ -220,6 +262,7 @@ class GitHubRepository:
         self.page_size = page_size
         self.max_pages = max_pages
         self._runner = runner
+        self._identity_validated = False
 
     @classmethod
     def open(
@@ -252,6 +295,12 @@ class GitHubRepository:
         repository._validate_identity()
         return repository
 
+    def topology_inspection(self) -> GitHubTopologyInspection:
+        """Start read-only topology work from this repository's validated identity."""
+        if not self._identity_validated:
+            self._validate_identity()
+        return GitHubTopologyInspection(self)
+
     def find_pr(
         self, *, head: str, base: str, state: PullRequestStatus
     ) -> PullRequestState | None:
@@ -260,14 +309,28 @@ class GitHubRepository:
         candidates = self._list_same_head(head, state)
         return _find_pr(candidates, head=head, base=base, state=state)
 
-    def inspect_pr_snapshot(self) -> PullRequestSnapshot:
-        """Enumerate all PRs once for read-only, multi-branch topology checks."""
+    def inspect_pr_snapshot(self, heads: Sequence[str]) -> PullRequestSnapshot:
+        """Inspect PRs for declared heads without scanning unrelated history."""
         self._validate_identity()
+        return self._inspect_pr_snapshot(heads)
+
+    def _inspect_pr_snapshot(self, heads: Sequence[str]) -> PullRequestSnapshot:
+        unique_heads = tuple(dict.fromkeys(heads))
+        if not unique_heads or any(not head or "\0" in head for head in unique_heads):
+            raise ValueError("heads must contain non-empty branch names")
+        pages = self._parallel_map(unique_heads, self._list_same_head_all)
+        return PullRequestSnapshot(
+            self.slug, tuple(pr for pull_requests in pages for pr in pull_requests)
+        )
+
+    def _list_same_head_all(self, head: str) -> tuple[PullRequestState, ...]:
+        owner = self.slug.split("/", 1)[0]
         found: list[PullRequestState] = []
         for page in range(1, self.max_pages + 1):
             endpoint = (
-                f"repos/{self.slug}/pulls?state=all&per_page={self.page_size}"
-                f"&page={page}"
+                f"repos/{self.slug}/pulls?state=all"
+                f"&head={quote(owner + ':' + head, safe='')}"
+                f"&per_page={self.page_size}&page={page}"
             )
             data = self._read_json(["api", endpoint])
             if not isinstance(data, list):
@@ -275,19 +338,34 @@ class GitHubRepository:
                     "GitHub PR enumeration returned a non-list page"
                 )
             page_items = cast(list[object], data)
-            found.extend(self._parse_pr(raw) for raw in page_items)
+            for raw in page_items:
+                candidate = self._parse_pr(raw)
+                if (
+                    candidate.head_repository.lower() != self.slug.lower()
+                    or candidate.head_branch != head
+                ):
+                    continue
+                found.append(candidate)
             if len(page_items) < self.page_size:
-                return PullRequestSnapshot(self.slug, tuple(found))
+                return tuple(found)
         raise IncompletePullRequestEnumeration(
-            f"PR enumeration exceeded the {self.max_pages}-page safety bound"
+            f"PR enumeration for {head!r} exceeded the "
+            f"{self.max_pages}-page safety bound"
         )
 
     def compare_commits(self, *, base_sha: str, head_sha: str) -> CommitComparison:
         """Compare two authoritative GitHub commits without changing repository state."""
         self._validate_identity()
+        self._validate_comparison(base_sha, head_sha)
+        return self._compare_commits(base_sha=base_sha, head_sha=head_sha)
+
+    @staticmethod
+    def _validate_comparison(base_sha: str, head_sha: str) -> None:
         for value in (base_sha, head_sha):
             if re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", value) is None:
                 raise ValueError(f"expected a full Git object ID, got {value!r}")
+
+    def _compare_commits(self, *, base_sha: str, head_sha: str) -> CommitComparison:
         data = self._read_object(
             ["api", f"repos/{self.slug}/compare/{base_sha}...{head_sha}"]
         )
@@ -295,6 +373,15 @@ class GitHubRepository:
         if status not in {"ahead", "behind", "diverged", "identical"}:
             raise WorkerFailure("GitHub returned an invalid commit comparison")
         return cast(CommitComparison, status)
+
+    @staticmethod
+    def _parallel_map(items: Sequence[T], read: Callable[[T], U]) -> tuple[U, ...]:
+        if not items:
+            return ()
+        with ThreadPoolExecutor(
+            max_workers=min(_TOPOLOGY_READ_WORKERS, len(items))
+        ) as executor:
+            return tuple(executor.map(read, items))
 
     def require_pr(
         self,
@@ -761,6 +848,7 @@ class GitHubRepository:
             raise WorkerFailure(
                 f"GitHub resolved repository {identity!r}, expected {self.slug!r}"
             )
+        self._identity_validated = True
 
     def _validate_lookup(self, head: str, base: str, state: PullRequestStatus) -> None:
         _validate_pr_lookup(head, base, state)

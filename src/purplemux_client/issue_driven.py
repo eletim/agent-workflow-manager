@@ -154,9 +154,10 @@ def classify_issue_topology(
                 expected_head_sha=feature_sha,
             )
 
-        already_integrated = _commit_is_contained(github, feature_sha, integration_sha)
-        contains_base = _commit_is_contained(github, integration_sha, feature_sha)
-        if already_integrated:
+        relationship = github.compare_commits(
+            base_sha=integration_sha, head_sha=feature_sha
+        )
+        if relationship in {"behind", "identical"}:
             if open_pr is not None:
                 raise WorkerFailure(
                     f"open PR #{open_pr.number} remains although {branch} is "
@@ -170,7 +171,7 @@ def classify_issue_topology(
                 f"merged PR #{merged_pr.number} exists but current feature head "
                 f"{feature_sha} is not integrated"
             )
-        if not contains_base:
+        if relationship != "ahead":
             raise WorkerFailure(
                 f"existing feature branch {branch} does not contain current "
                 f"integration base {integration_sha} and is not already integrated"
@@ -236,7 +237,7 @@ def inspect_issue_driven_topology(
         repository.expected_github_slug,
         command_timeout_seconds=command_timeout_seconds,
     )
-    pull_requests = github.inspect_pr_snapshot()
+    github_inspection = github.topology_inspection()
     remote_shas = repository.inspect_remote_branches((integration_branch, *branches))
     cached_repository = _CachedIssueGit(remote_shas)
     integration_sha = remote_shas[integration_branch]
@@ -246,8 +247,23 @@ def inspect_issue_driven_topology(
                 f"remote integration branch {integration_branch!r} does not exist"
             )
         integration_sha = preparation.base_sha
-    elif prospective_base_branch is not None and not _commit_is_contained(
-        github, preparation.base_sha, integration_sha
+    pull_requests = github_inspection.inspect_pr_snapshot(branches)
+    comparison_pairs: list[tuple[str, str]] = []
+    if prospective_base_branch is not None:
+        comparison_pairs.append((preparation.base_sha, integration_sha))
+    for branch in branches:
+        feature_sha = remote_shas[branch]
+        if feature_sha is not None:
+            comparison_pairs.append((integration_sha, feature_sha))
+            continue
+        merged_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="MERGED"
+        )
+        if merged_pr is not None:
+            comparison_pairs.append((merged_pr.head_sha, integration_sha))
+    comparisons = github_inspection.inspect_comparisons(comparison_pairs)
+    if prospective_base_branch is not None and not _commit_is_contained(
+        comparisons, preparation.base_sha, integration_sha
     ):
         raise WorkerFailure(
             f"existing integration branch {integration_branch!r} does not contain "
@@ -258,7 +274,7 @@ def inspect_issue_driven_topology(
         classify_issue_topology(
             cached_repository,
             pull_requests,
-            github,
+            comparisons,
             issue=number,
             branch=branch,
             integration_branch=integration_branch,
@@ -271,7 +287,7 @@ def inspect_issue_driven_topology(
         != remote_shas
     ):
         raise WorkerFailure("remote branch topology changed during inspection")
-    current_pull_requests = github.inspect_pr_snapshot()
+    current_pull_requests = github_inspection.inspect_pr_snapshot(branches)
     if _pr_topology(current_pull_requests) != _pr_topology(pull_requests):
         raise WorkerFailure("GitHub PR topology changed during inspection")
     for state in states:

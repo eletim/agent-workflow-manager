@@ -83,6 +83,7 @@ class TopologyGitHub:
         self.prs = prs
         self.contains = contains or set()
         self.failure = failure
+        self.comparison_calls: list[tuple[str, str]] = []
 
     def find_pr(self, *, head: str, base: str, state: str):
         if self.failure is not None:
@@ -110,9 +111,14 @@ class TopologyGitHub:
         return pr
 
     def compare_commits(self, *, base_sha: str, head_sha: str) -> str:
+        self.comparison_calls.append((base_sha, head_sha))
         if base_sha == head_sha:
             return "identical"
-        return "ahead" if (base_sha, head_sha) in self.contains else "diverged"
+        if (base_sha, head_sha) in self.contains:
+            return "ahead"
+        if (head_sha, base_sha) in self.contains:
+            return "behind"
+        return "diverged"
 
 
 def classify(
@@ -152,6 +158,15 @@ def test_issue_topology_with_current_base_and_expected_pr_is_recoverable() -> No
 
     assert result.classification == "recoverable"
     assert result.feature_sha == feature_sha
+
+
+def test_issue_topology_uses_one_comparison_for_existing_branch() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    github = TopologyGitHub(contains={(base_sha, feature_sha)})
+
+    assert classify(feature_sha, github).classification == "recoverable"
+    assert github.comparison_calls == [(base_sha, feature_sha)]
 
 
 def test_issue_topology_rejects_branch_that_lacks_current_base() -> None:
