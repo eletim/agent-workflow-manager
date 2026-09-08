@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -10,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+import purplemux_client.preflight as preflight
+from purplemux_client import WorkerFailure
 from purplemux_client.preflight import (
     MAX_OUTLINE_ITEMS,
     MAX_OUTLINE_LABEL_CHARS,
@@ -29,6 +32,36 @@ def validator(tmp_path: Path, **environment: str) -> WorkflowValidator:
         cwd=tmp_path,
         module_search_path=[],
     )
+
+
+def test_issue_topology_validation_reports_authoritative_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject(**_kwargs: object) -> None:
+        raise WorkerFailure(
+            "Issue #158: existing feature branch feature/issue-158 does not "
+            "contain current integration base abc and is not already integrated"
+        )
+
+    monkeypatch.setattr(preflight, "inspect_issue_driven_topology", reject)
+    source = """
+from purplemux_client import inspect_issue_driven_topology
+inspect_issue_driven_topology(
+    repo='/repo',
+    integration_branch='dev/v1',
+    issues=((158, 'feature/issue-158'),),
+)
+"""
+    findings: list[preflight.ValidationIssue] = []
+
+    WorkflowValidator(cwd=tmp_path)._validate_issue_topologies(
+        ast.parse(source), findings
+    )
+
+    assert len(findings) == 1
+    assert findings[0].kind == "issue_topology"
+    assert "Issue #158" in findings[0].message
+    assert "not already integrated" in findings[0].message
 
 
 def stalling_worker_command(pid_log: Path) -> list[str]:

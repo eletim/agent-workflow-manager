@@ -83,6 +83,15 @@ phase that exhausts its limit may continue with an explicit warning after exact
 clean, pushed PR topology is revalidated; it is never recorded as approved.
 Whole-version Review remains a separate integration and cross-Issue review.
 
+Before creating a run worktree, Static Validation and Dry Run inspect every
+declared Issue's remote feature branch, current integration head, and bounded
+GitHub PR history. A missing feature branch is safe for a new run; a branch that
+contains the current integration base and has consistent PR topology is
+recoverable; and a feature head already contained by integration is reported as
+already integrated. Mismatched, contradictory, or ambiguous topology fails
+validation with the Issue number and authoritative Git/GitHub reason. These
+checks use live remote refs and perform no branch, PR, or repository mutation.
+
 ## Canonical example
 
 ```json

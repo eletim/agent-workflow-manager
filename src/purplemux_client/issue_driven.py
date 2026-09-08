@@ -4,7 +4,17 @@ import json
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Protocol
+
+from purplemux_client.errors import WorkerFailure
+from purplemux_client.execution_context import _inspect_repository_declaration
+from purplemux_client.git import BranchState, GitRepository
+from purplemux_client.github import (
+    GitHubRepository,
+    PullRequestSnapshot,
+    PullRequestState,
+)
+from purplemux_client.progress import emit_finding
 
 
 @dataclass(frozen=True)
@@ -20,6 +30,300 @@ class IssueDrivenValidationError(ValueError):
     def __init__(self, findings: list[IssueDrivenFinding]) -> None:
         super().__init__("issue-driven JSON validation failed")
         self.findings = tuple(findings)
+
+
+IssueTopologyClassification = Literal["new", "recoverable", "already_integrated"]
+
+
+@dataclass(frozen=True)
+class IssueTopologyState:
+    issue: int
+    branch: str
+    classification: IssueTopologyClassification
+    feature_sha: str | None
+    integration_sha: str
+
+
+class _IssueGitRepository(Protocol):
+    def inspect_branch(self, branch: str) -> Any: ...
+
+
+class _CachedIssueGit:
+    def __init__(self, remote_shas: dict[str, str | None]) -> None:
+        self._remote_shas = remote_shas
+
+    def inspect_branch(self, branch: str) -> BranchState:
+        return BranchState(branch, None, self._remote_shas[branch], False)
+
+
+class _IssueGitHubRepository(Protocol):
+    def compare_commits(self, *, base_sha: str, head_sha: str) -> str: ...
+
+
+class _IssuePullRequests(Protocol):
+    def find_pr(
+        self, *, head: str, base: str, state: Literal["OPEN", "MERGED", "CLOSED"]
+    ) -> PullRequestState | None: ...
+
+    def require_pr(
+        self,
+        *,
+        head: str,
+        base: str,
+        number: int | None = None,
+        state: Literal["OPEN", "MERGED", "CLOSED"] = "OPEN",
+        expected_head_sha: str | None = None,
+        expected_base_sha: str | None = None,
+        draft: bool | None = None,
+    ) -> PullRequestState: ...
+
+
+def classify_issue_topology(
+    repository: _IssueGitRepository,
+    pull_requests: _IssuePullRequests,
+    github: _IssueGitHubRepository,
+    *,
+    issue: int,
+    branch: str,
+    integration_branch: str,
+    integration_sha: str,
+) -> IssueTopologyState:
+    """Classify one Issue from authoritative remote Git and GitHub state."""
+    try:
+        feature = repository.inspect_branch(branch)
+        open_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="OPEN"
+        )
+        merged_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="MERGED"
+        )
+        closed_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="CLOSED"
+        )
+        matching = tuple(pr for pr in (open_pr, merged_pr, closed_pr) if pr is not None)
+        if len(matching) > 1:
+            numbers = ", ".join(f"#{pr.number}" for pr in matching)
+            raise WorkerFailure(
+                f"ambiguous PR states from {branch} to {integration_branch}: {numbers}"
+            )
+        if closed_pr is not None:
+            raise WorkerFailure(
+                f"closed unmerged PR #{closed_pr.number} exists from {branch} "
+                f"to {integration_branch}"
+            )
+
+        feature_sha = feature.remote_sha
+        if feature_sha is None:
+            if open_pr is not None:
+                raise WorkerFailure(
+                    f"open PR #{open_pr.number} exists but remote feature branch "
+                    f"{branch} does not"
+                )
+            if merged_pr is None:
+                return IssueTopologyState(issue, branch, "new", None, integration_sha)
+            merged = pull_requests.require_pr(
+                number=merged_pr.number,
+                head=branch,
+                base=integration_branch,
+                state="MERGED",
+            )
+            if not _commit_is_contained(github, merged.head_sha, integration_sha):
+                raise WorkerFailure(
+                    f"merged PR #{merged.number} head {merged.head_sha} is not "
+                    f"contained by current integration {integration_sha}"
+                )
+            return IssueTopologyState(
+                issue, branch, "already_integrated", merged.head_sha, integration_sha
+            )
+
+        if open_pr is not None:
+            pull_requests.require_pr(
+                number=open_pr.number,
+                head=branch,
+                base=integration_branch,
+                state="OPEN",
+                expected_head_sha=feature_sha,
+                expected_base_sha=integration_sha,
+            )
+        if merged_pr is not None:
+            pull_requests.require_pr(
+                number=merged_pr.number,
+                head=branch,
+                base=integration_branch,
+                state="MERGED",
+                expected_head_sha=feature_sha,
+            )
+
+        relationship = github.compare_commits(
+            base_sha=integration_sha, head_sha=feature_sha
+        )
+        if relationship in {"behind", "identical"}:
+            if open_pr is not None:
+                raise WorkerFailure(
+                    f"open PR #{open_pr.number} remains although {branch} is "
+                    "already integrated"
+                )
+            return IssueTopologyState(
+                issue, branch, "already_integrated", feature_sha, integration_sha
+            )
+        if merged_pr is not None:
+            raise WorkerFailure(
+                f"merged PR #{merged_pr.number} exists but current feature head "
+                f"{feature_sha} is not integrated"
+            )
+        if relationship != "ahead":
+            raise WorkerFailure(
+                f"existing feature branch {branch} does not contain current "
+                f"integration base {integration_sha} and is not already integrated"
+            )
+        return IssueTopologyState(
+            issue, branch, "recoverable", feature_sha, integration_sha
+        )
+    except WorkerFailure as exc:
+        if str(exc).startswith(f"Issue #{issue}:"):
+            raise
+        raise WorkerFailure(f"Issue #{issue}: {exc}") from exc
+
+
+def _commit_is_contained(
+    github: _IssueGitHubRepository, commit_sha: str, branch_sha: str
+) -> bool:
+    return github.compare_commits(base_sha=commit_sha, head_sha=branch_sha) in {
+        "ahead",
+        "identical",
+    }
+
+
+def inspect_issue_driven_topology(
+    *,
+    repo: str,
+    integration_branch: str,
+    issues: tuple[tuple[int, str], ...],
+    prospective_base_branch: str | None = None,
+    remote: str = "origin",
+    command_timeout_seconds: float = 30.0,
+    _cwd: Path | None = None,
+) -> tuple[IssueTopologyState, ...]:
+    """Inspect all Issue branches and PRs before any workflow mutation."""
+    if not issues or any(
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or number < 1
+        or not isinstance(branch, str)
+        or not branch
+        for number, branch in issues
+    ):
+        raise ValueError("issues must contain positive Issue numbers and branches")
+    numbers = tuple(number for number, _branch in issues)
+    branches = tuple(branch for _number, branch in issues)
+    if len(set(numbers)) != len(numbers) or len(set(branches)) != len(branches):
+        raise ValueError("Issue numbers and feature branches must be unique")
+    if integration_branch in branches:
+        raise ValueError("integration and feature branches must differ")
+    inspection_base = prospective_base_branch or integration_branch
+    preparation = _inspect_repository_declaration(
+        repo=repo,
+        base_branch=inspection_base,
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+        cwd=_cwd,
+    )
+    repository = GitRepository.open(
+        preparation.source_repository,
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+    github = GitHubRepository.open(
+        repository.expected_github_slug,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+    github_inspection = github.topology_inspection()
+    remote_shas = repository.inspect_remote_branches((integration_branch, *branches))
+    cached_repository = _CachedIssueGit(remote_shas)
+    integration_sha = remote_shas[integration_branch]
+    if integration_sha is None:
+        if prospective_base_branch is None:
+            raise WorkerFailure(
+                f"remote integration branch {integration_branch!r} does not exist"
+            )
+        integration_sha = preparation.base_sha
+    pull_requests = github_inspection.inspect_pr_snapshot(branches)
+    comparison_pairs: list[tuple[str, str]] = []
+    if prospective_base_branch is not None:
+        comparison_pairs.append((preparation.base_sha, integration_sha))
+    for branch in branches:
+        feature_sha = remote_shas[branch]
+        if feature_sha is not None:
+            comparison_pairs.append((integration_sha, feature_sha))
+            continue
+        merged_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="MERGED"
+        )
+        if merged_pr is not None:
+            comparison_pairs.append((merged_pr.head_sha, integration_sha))
+    comparisons = github_inspection.inspect_comparisons(comparison_pairs)
+    if prospective_base_branch is not None and not _commit_is_contained(
+        comparisons, preparation.base_sha, integration_sha
+    ):
+        raise WorkerFailure(
+            f"existing integration branch {integration_branch!r} does not contain "
+            f"prospective base {preparation.base_sha}"
+        )
+
+    states = tuple(
+        classify_issue_topology(
+            cached_repository,
+            pull_requests,
+            comparisons,
+            issue=number,
+            branch=branch,
+            integration_branch=integration_branch,
+            integration_sha=integration_sha,
+        )
+        for number, branch in issues
+    )
+    if (
+        repository.inspect_remote_branches((integration_branch, *branches))
+        != remote_shas
+    ):
+        raise WorkerFailure("remote branch topology changed during inspection")
+    current_pull_requests = github_inspection.inspect_pr_snapshot(branches)
+    if _pr_topology(current_pull_requests) != _pr_topology(pull_requests):
+        raise WorkerFailure("GitHub PR topology changed during inspection")
+    for state in states:
+        if state.classification == "new":
+            message = (
+                f"Issue #{state.issue}: no existing feature branch; new run is safe"
+            )
+        elif state.classification == "recoverable":
+            message = (
+                f"Issue #{state.issue}: existing feature branch / PR topology "
+                "is recoverable"
+            )
+        else:
+            message = f"Issue #{state.issue}: already integrated; execution may skip this Issue"
+        emit_finding("github", message, status="info")
+    return states
+
+
+def _pr_topology(
+    snapshot: PullRequestSnapshot,
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                pr.number,
+                pr.state,
+                pr.head_repository.lower(),
+                pr.head_branch,
+                pr.head_sha,
+                pr.base_repository.lower(),
+                pr.base_branch,
+                pr.base_sha,
+            )
+            for pr in snapshot.pull_requests
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -292,7 +596,19 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         expected_local_sha=integration.local_sha,
     )
 """
+    topology_issues = ",\n        ".join(
+        f"({number}, 'feature/issue-{number}')" for number in config.issues
+    )
+    prospective = config.final_branch if config.make_integration_branch else None
     return f"""def parse_args() -> Config:
+    inspect_issue_driven_topology(
+        repo={config.repository!r},
+        integration_branch={config.integration_branch!r},
+        issues=(
+        {topology_issues},
+        ),
+        prospective_base_branch={prospective!r},
+    )
     context = prepare_run_repository(
         repo={config.repository!r},
         base_branch={base_branch!r},
@@ -331,7 +647,8 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     source = _canonical_source()
     source = source.replace(
         "    PurpleMuxRuntime,\n",
-        "    PurpleMuxRuntime,\n    prepare_run_repository,\n",
+        "    PurpleMuxRuntime,\n    inspect_issue_driven_topology,\n"
+        "    prepare_run_repository,\n",
         1,
     )
     outline_start = source.index("WORKFLOW_OUTLINE = [\n")

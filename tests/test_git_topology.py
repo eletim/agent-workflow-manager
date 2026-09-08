@@ -194,6 +194,23 @@ def test_safe_synchronize_prepare_and_read_only_require_pushed(
     )
 
 
+def test_remote_branch_batch_ignores_stale_tracking_refs(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    stale_sha = git(work, "rev-parse", "refs/remotes/origin/main")
+    git(seed, "commit", "--allow-empty", "-m", "advance remote only")
+    git(seed, "push", "origin", "main")
+    current_sha = git(seed, "rev-parse", "HEAD")
+
+    result = repo.inspect_remote_branches(("main", "feature/missing"))
+
+    assert stale_sha != current_sha
+    assert result == {"main": current_sha, "feature/missing": None}
+    assert git(work, "rev-parse", "refs/remotes/origin/main") == stale_sha
+
+
 def test_committed_result_and_delivery_push_absent_or_behind_remote(
     repositories: tuple[Path, Path, Path],
 ) -> None:

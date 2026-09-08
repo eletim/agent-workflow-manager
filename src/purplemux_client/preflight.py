@@ -16,6 +16,7 @@ from pathlib import Path
 
 from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
 from purplemux_client.execution_context import _inspect_repository_declaration
+from purplemux_client.issue_driven import inspect_issue_driven_topology
 
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
 PREFLIGHT_KEYS = frozenset({"commands", "imports", "environment", "paths"})
@@ -24,7 +25,7 @@ DRY_RUN_NAME = "WORKFLOW_DRY_RUN"
 DRY_RUN_VERSION = 1
 MAX_OUTLINE_ITEMS = 100
 MAX_OUTLINE_LABEL_CHARS = 200
-DEFAULT_CHECK_TIMEOUT = 2.0
+DEFAULT_CHECK_TIMEOUT = 30.0
 STDLIB_MODULE_ALIASES = frozenset({"os.path"})
 
 
@@ -241,6 +242,7 @@ class WorkflowValidator:
         issues: list[ValidationIssue] = []
         self._validate_imports(tree, issues)
         self._validate_repository_preparations(tree, issues)
+        self._validate_issue_topologies(tree, issues)
         self._validate_required_environment(tree, issues)
         self._validate_metadata(tree, issues)
         outline = self._validate_outline(tree, issues)
@@ -344,6 +346,118 @@ class WorkflowValidator:
                     ValidationIssue(
                         "execution_context",
                         f"repository preparation is invalid: {exc}",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+
+    def _validate_issue_topologies(
+        self, tree: ast.Module, issues: list[ValidationIssue]
+    ) -> None:
+        aliases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".", 1)[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module == "purplemux_client":
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = (
+                        f"purplemux_client.{alias.name}"
+                    )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = self._qualified_name(node.func)
+            if name:
+                root, separator, remainder = name.partition(".")
+                name = aliases.get(root, root) + (
+                    separator + remainder if separator else ""
+                )
+            if name != "purplemux_client.inspect_issue_driven_topology":
+                continue
+            if node.args:
+                issues.append(
+                    ValidationIssue(
+                        "issue_topology",
+                        "inspect_issue_driven_topology arguments must be explicit keywords",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+                continue
+            values: dict[str, object] = {}
+            malformed = False
+            allowed = {
+                "repo",
+                "integration_branch",
+                "issues",
+                "prospective_base_branch",
+                "remote",
+                "command_timeout_seconds",
+            }
+            for keyword in node.keywords:
+                if keyword.arg is None or keyword.arg not in allowed:
+                    malformed = True
+                    break
+                try:
+                    values[keyword.arg] = ast.literal_eval(keyword.value)
+                except (ValueError, TypeError):
+                    malformed = True
+                    break
+            if malformed or not {
+                "repo",
+                "integration_branch",
+                "issues",
+            }.issubset(values):
+                issues.append(
+                    ValidationIssue(
+                        "issue_topology",
+                        "inspect_issue_driven_topology requires literal repository, integration branch, and Issues",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+                continue
+            repo = values["repo"]
+            integration_branch = values["integration_branch"]
+            declared_issues = values["issues"]
+            prospective = values.get("prospective_base_branch")
+            remote = values.get("remote", "origin")
+            timeout = values.get("command_timeout_seconds", 30.0)
+            if (
+                not isinstance(repo, str)
+                or not isinstance(integration_branch, str)
+                or not isinstance(declared_issues, tuple)
+                or (prospective is not None and not isinstance(prospective, str))
+                or not isinstance(remote, str)
+                or isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "issue_topology",
+                        "inspect_issue_driven_topology settings have invalid literal types",
+                        node.lineno,
+                        node.col_offset + 1,
+                    )
+                )
+                continue
+            try:
+                inspect_issue_driven_topology(
+                    repo=repo,
+                    integration_branch=integration_branch,
+                    issues=declared_issues,
+                    prospective_base_branch=prospective,
+                    remote=remote,
+                    command_timeout_seconds=float(timeout),
+                    _cwd=self._cwd,
+                )
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                issues.append(
+                    ValidationIssue(
+                        "issue_topology",
+                        f"Issue topology is invalid: {exc}",
                         node.lineno,
                         node.col_offset + 1,
                     )

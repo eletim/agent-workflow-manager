@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from collections.abc import Sequence
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+import purplemux_client.issue_driven as issue_driven
 import purplemux_client.operations as operations
 from purplemux_client import (
     GitHubRepository,
@@ -60,8 +65,14 @@ def pr_data(
 
 
 class FakeGitHubRunner:
-    def __init__(self, prs: list[dict[str, object]] | None = None) -> None:
+    def __init__(
+        self,
+        prs: list[dict[str, object]] | None = None,
+        *,
+        delay_seconds: float = 0,
+    ) -> None:
         self.prs = prs or []
+        self.delay_seconds = delay_seconds
         self.refs = {"feature/65": HEAD_SHA, "dev/v0.1.4": BASE_SHA}
         self.queue_entry: object = None
         self.mutation_outcome = "success"
@@ -77,6 +88,8 @@ class FakeGitHubRunner:
         timeout: float,
         check: bool,
     ) -> subprocess.CompletedProcess[str]:
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
         command = list(args)
         self.calls.append(command)
         assert capture_output and text and not check
@@ -86,14 +99,30 @@ class FakeGitHubRunner:
             return self._done({"full_name": "acme/project"})
         if len(command) >= 3 and command[1] == "api" and "pulls?" in command[2]:
             endpoint = command[2]
-            requested_open = "state=open" in endpoint
             page = int(re.search(r"[?&]page=(\d+)", endpoint).group(1))  # type: ignore[union-attr]
             per_page = int(re.search(r"[?&]per_page=(\d+)", endpoint).group(1))  # type: ignore[union-attr]
-            matching = [
-                item for item in self.prs if (item["state"] == "open") is requested_open
-            ]
+            if "state=all" in endpoint:
+                matching = self.prs
+            else:
+                requested_open = "state=open" in endpoint
+                matching = [
+                    item
+                    for item in self.prs
+                    if (item["state"] == "open") is requested_open
+                ]
+            requested_head = parse_qs(urlsplit(endpoint).query).get("head")
+            if requested_head:
+                head_branch = requested_head[0].split(":", 1)[1]
+                matching = [
+                    item
+                    for item in matching
+                    if isinstance(item.get("head"), dict)
+                    and item["head"].get("ref") == head_branch  # type: ignore[union-attr]
+                ]
             start = (page - 1) * per_page
             return self._done(matching[start : start + per_page])
+        if len(command) >= 3 and command[1] == "api" and "/compare/" in command[2]:
+            return self._done({"status": "ahead"})
         if len(command) >= 3 and command[1] == "api" and "/pulls/" in command[2]:
             endpoint = command[2]
             if endpoint.endswith("/merge") and "--method" in command:
@@ -221,12 +250,121 @@ def repository(runner: FakeGitHubRunner, **kwargs: int) -> GitHubRepository:
 
 def test_open_discovery_rejects_wrong_base_and_ambiguity() -> None:
     wrong = repository(FakeGitHubRunner([pr_data(1, base="main")]))
-    with pytest.raises(PullRequestTopologyError, match="wrong base"):
-        wrong.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+    for topology in (wrong, wrong.inspect_pr_snapshot(("feature/65",))):
+        with pytest.raises(PullRequestTopologyError, match="wrong base"):
+            topology.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
 
     duplicate = repository(FakeGitHubRunner([pr_data(1), pr_data(2)]))
-    with pytest.raises(PullRequestTopologyError, match="ambiguous"):
-        duplicate.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+    for topology in (duplicate, duplicate.inspect_pr_snapshot(("feature/65",))):
+        with pytest.raises(PullRequestTopologyError, match="ambiguous"):
+            topology.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+
+
+def test_bounded_all_pr_enumeration_and_commit_comparison_are_read_only() -> None:
+    runner = FakeGitHubRunner(
+        [pr_data(1), pr_data(2, state="merged", merge_sha=MERGE_SHA)]
+    )
+    repo = repository(runner)
+
+    snapshot = repo.inspect_pr_snapshot(("feature/65",))
+    comparison = repo.compare_commits(base_sha="a" * 40, head_sha="b" * 40)
+
+    assert [pr.number for pr in snapshot.pull_requests] == [1, 2]
+    assert (
+        snapshot.require_pr(
+            number=1,
+            head="feature/65",
+            base="dev/v0.1.4",
+            state="OPEN",
+            expected_head_sha=HEAD_SHA,
+            expected_base_sha=BASE_SHA,
+        ).number
+        == 1
+    )
+    with pytest.raises(PullRequestTopologyError, match="PR head changed"):
+        snapshot.require_pr(
+            head="feature/65",
+            base="dev/v0.1.4",
+            expected_head_sha="a" * 40,
+        )
+    assert comparison == "ahead"
+    assert all("--method" not in call for call in runner.calls)
+
+
+def test_snapshot_scope_ignores_excess_unrelated_pr_history() -> None:
+    unrelated = [pr_data(number, head=f"historical/{number}") for number in range(1001)]
+    runner = FakeGitHubRunner([*unrelated, pr_data(2000)])
+
+    snapshot = repository(runner, page_size=10, max_pages=3).inspect_pr_snapshot(
+        ("feature/65",)
+    )
+
+    assert [pr.number for pr in snapshot.pull_requests] == [2000]
+    pull_endpoints = [call[2] for call in runner.calls if "pulls?" in call[2]]
+    assert len(pull_endpoints) == 1
+    assert "head=acme%3Afeature%2F65" in pull_endpoints[0]
+
+
+def test_snapshot_scope_ignores_unrelated_deleted_fork_pr() -> None:
+    deleted_fork = pr_data(1, head="historical/deleted-fork")
+    deleted_fork["head"] = {
+        "ref": "historical/deleted-fork",
+        "sha": HEAD_SHA,
+        "repo": None,
+    }
+    runner = FakeGitHubRunner([deleted_fork, pr_data(2)])
+
+    snapshot = repository(runner).inspect_pr_snapshot(("feature/65",))
+
+    assert [pr.number for pr in snapshot.pull_requests] == [2]
+
+
+def test_issue_validation_batches_multiple_branches_under_command_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = tuple(f"feature/{number}" for number in range(32))
+    prs = [
+        pr_data(number + 1, head=head, head_sha=f"{number + 1:040x}")
+        for number, head in enumerate(heads)
+    ]
+    runner = FakeGitHubRunner(prs, delay_seconds=0.05)
+    github = repository(runner)
+    remote_shas = {
+        "dev/v0.1.4": BASE_SHA,
+        **{head: f"{number + 1:040x}" for number, head in enumerate(heads)},
+    }
+    git = SimpleNamespace(
+        expected_github_slug="acme/project",
+        inspect_remote_branches=lambda branches: {
+            branch: remote_shas.get(branch) for branch in branches
+        },
+    )
+    monkeypatch.setattr(
+        issue_driven,
+        "_inspect_repository_declaration",
+        lambda **kwargs: SimpleNamespace(
+            source_repository=Path("/repo"), base_sha=BASE_SHA
+        ),
+    )
+    monkeypatch.setattr(issue_driven.GitRepository, "open", lambda *args, **kwargs: git)
+    monkeypatch.setattr(
+        issue_driven.GitHubRepository, "open", lambda *args, **kwargs: github
+    )
+
+    started = time.monotonic()
+    states = issue_driven.inspect_issue_driven_topology(
+        repo="acme/project",
+        integration_branch="dev/v0.1.4",
+        issues=tuple((number + 1, head) for number, head in enumerate(heads)),
+    )
+    elapsed = time.monotonic() - started
+
+    assert len(states) == 32
+    assert {state.classification for state in states} == {"recoverable"}
+    assert elapsed < 1.5
+    assert (
+        sum(call[1:4] == ["auth", "status", "--hostname"] for call in runner.calls) == 1
+    )
 
 
 def test_find_none_requires_complete_bounded_enumeration() -> None:

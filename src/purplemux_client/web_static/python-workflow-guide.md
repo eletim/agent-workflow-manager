@@ -91,6 +91,11 @@ context = prepare_run_repository(
 REPO = context.execution_root
 ```
 
+Generated Issue Driven workflows also call `inspect_issue_driven_topology` with
+literal repository, integration branch, and Issue declarations. Static
+Validation evaluates that read-only declaration, and Dry Run repeats it to emit
+recoverable or already-integrated findings before the worktree mutation frontier.
+
 The helper resolves the source repository and exact current remote base SHA,
 creates and verifies a fresh detached run worktree under the AWM-owned data
 directory, registers it for explicit Cleanup, and returns both source and
