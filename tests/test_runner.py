@@ -519,6 +519,33 @@ def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
     assert validation.outline == ("Prompt",)
 
 
+def test_prepare_prompt_execution_retains_validated_github_identity(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+        check=True,
+    )
+
+    execution = prepare_prompt_execution(
+        agent="codex", cwd=str(tmp_path), prompt="Work"
+    )
+
+    assert execution.repository_json() == {
+        "slug": "acme/widgets",
+        "url": "https://github.com/acme/widgets",
+    }
+
+
 @pytest.mark.parametrize(
     ("agent", "cwd", "prompt", "message"),
     [
@@ -555,6 +582,47 @@ def test_prompt_run_hides_generated_code_and_rejects_workflow_cleanup(
     assert summary["prompt"] == {"agent": "codex", "cwd": str(tmp_path)}
     with pytest.raises(RunCleanupNotAllowedError, match="Prompt run"):
         runner.cleanup(run_id)
+
+
+def test_prompt_repository_navigation_survives_run_history(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    execution = PromptExecution(
+        "codex",
+        str(tmp_path),
+        "answer",
+        repository_slug="acme/widgets",
+        repository_url="https://github.com/acme/widgets",
+    )
+    first = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = first.start("print('done')", prompt=execution)
+        result = wait_for(first, lambda item: item.state == "success", run_id=run_id)
+        assert result.as_json()["repository"] == {
+            "slug": "acme/widgets",
+            "url": "https://github.com/acme/widgets",
+        }
+    finally:
+        first.close()
+
+    restored = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        payload = restored.snapshot(run_id).as_json()
+        assert payload["repository"] == {
+            "slug": "acme/widgets",
+            "url": "https://github.com/acme/widgets",
+        }
+    finally:
+        restored.close()
 
 
 def test_run_owned_resources_are_retained_structurally_after_success(

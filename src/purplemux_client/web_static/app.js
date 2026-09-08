@@ -23,6 +23,9 @@ const directoryPickerMessage = document.querySelector("#directory-picker-message
 const directoryPickerList = document.querySelector("#directory-picker-list");
 const directoryPickerSelect = document.querySelector("#directory-picker-select");
 const activeContext = document.querySelector("#active-context");
+const repositoryNavigation = document.querySelector("#repository-navigation");
+const repositorySlug = document.querySelector("#repository-slug");
+const repositoryLink = document.querySelector("#repository-link");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
 const deleteCheckedRunsButton = document.querySelector("#delete-checked-runs");
@@ -288,6 +291,7 @@ function renderCleanDraftState() {
   renderOutline([], []);
   renderProgress([]);
   renderIntegrationPr(null);
+  renderRepository(null);
   renderRecovery({state: "idle", attempts: []});
   renderResources({
     runId: null,
@@ -335,6 +339,7 @@ function renderRun(result) {
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderIntegrationPr(result.integrationPr || null);
+  renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderRecovery(result);
   renderResources(result);
   renderDryRun(result);
@@ -782,6 +787,13 @@ function renderIntegrationPr(pr) {
   integrationPr.textContent = pr ? `PR #${pr.number}` : "";
   if (pr) integrationPr.setAttribute("href", pr.url);
   else integrationPr.removeAttribute("href");
+}
+
+function renderRepository(repository) {
+  repositoryNavigation.hidden = !repository;
+  repositorySlug.textContent = repository ? repository.slug : "";
+  if (repository) repositoryLink.setAttribute("href", repository.url);
+  else repositoryLink.removeAttribute("href");
 }
 
 function selectedGuide() {

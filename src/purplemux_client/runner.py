@@ -321,10 +321,11 @@ class RunnerSnapshot:
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
-        prompt = payload.pop("prompt")
-        payload["mode"] = "prompt" if prompt is not None else "workflow"
-        if prompt is not None:
-            payload["prompt"] = prompt
+        payload.pop("prompt")
+        payload["mode"] = "prompt" if self.prompt is not None else "workflow"
+        if self.prompt is not None:
+            payload["prompt"] = self.prompt.as_json()
+            payload["repository"] = self.prompt.repository_json()
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
         integration_pr = payload.pop("integration_pr")
@@ -385,6 +386,7 @@ class RunnerSnapshot:
                 "agent": self.prompt.agent,
                 "cwd": self.prompt.cwd,
             }
+            payload["repository"] = self.prompt.repository_json()
         return payload
 
     def _execution_context_json(self) -> dict[str, str] | None:

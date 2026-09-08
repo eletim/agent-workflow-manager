@@ -183,6 +183,20 @@ textarea {
   overflow-wrap: anywhere;
 }
 .editor-mode-bar .active-context { margin: 0; }
+.repository-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 9px 11px;
+  border: 1px solid #303746;
+  border-radius: 7px;
+  color: #aab0bf;
+  font-size: 13px;
+}
+.repository-navigation[hidden] { display: none; }
+.repository-navigation strong { color: #e1e4eb; }
 input[readonly], textarea[readonly] {
   opacity: 0.7;
   cursor: default;
@@ -471,6 +485,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .mode-switch button { min-width: 0; padding-inline: 6px; }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
   .editor-mode-bar #new-run { align-self: stretch; }
+  .repository-navigation { align-items: flex-start; flex-direction: column; }
   button, select, input[type="text"], input[type="url"], input[type="password"] { min-height: 44px; }
   .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .controls button { width: 100%; padding-inline: 8px; }
