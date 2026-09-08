@@ -231,7 +231,6 @@ def run_outline_step(name: str, action):
 
 
 _REVIEW_VERDICTS = {"APPROVED", "CHANGES_REQUESTED"}
-_VERDICT_TOKEN = re.compile(r"(?<![A-Z_])(APPROVED|CHANGES_REQUESTED)(?![A-Z_])")
 _VERDICT_PREFIX = re.compile(r"^VERDICT\s*:\s*", re.IGNORECASE)
 
 
@@ -247,13 +246,6 @@ def _normalized_verdict(line: str) -> str | None:
 
 def decision(result: str) -> str:
     leading_lines = [line for line in result.splitlines() if line.strip()][:3]
-    candidates = {
-        match.group(1)
-        for line in leading_lines
-        for match in _VERDICT_TOKEN.finditer(line.upper())
-    }
-    if len(candidates) > 1:
-        raise WorkerFailure("reviewer verdict is ambiguous")
     for line in leading_lines:
         if verdict := _normalized_verdict(line):
             return verdict
@@ -938,8 +930,14 @@ def review_whole_version(
             client,
             reviewer,
             "Whole-version reviewer turn",
-            f"Review exact head {pr.head_sha} against final base {pr.base_sha}. "
-            "Return APPROVED or CHANGES_REQUESTED first; do not mutate anything.",
+            f"Review the whole version at exact head {pr.head_sha} against final "
+            f"base {pr.base_sha}. Examine integration consistency across Issues, "
+            "duplication between their implementations, cross-feature interactions "
+            "and regressions, and whether shared versus feature-specific "
+            "responsibilities are placed at the right boundaries. Also review the "
+            "combined version for correctness, safety, and missing integration "
+            "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
+            "actionable findings; do not mutate anything.",
             iteration=review_number,
         )
         current = github.require_pr(

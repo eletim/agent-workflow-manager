@@ -1525,7 +1525,7 @@ class PythonRunner:
             return self._snapshot_run(run)
 
     def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
-        """Delete only checked terminal-run records, without cleaning resources."""
+        """Delete only checked terminal-run records whose resources are cleaned."""
         run_ids = tuple(confirmed_run_ids)
         if any(
             isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
@@ -1533,24 +1533,30 @@ class PythonRunner:
         ) or len(set(run_ids)) != len(run_ids):
             raise ValueError("run IDs must be unique positive integers")
         with self._lock:
-            eligible_run_ids = tuple(
+            checked_terminal_run_ids = tuple(
                 run.run_id
                 for run in self._runs.values()
                 if run.checked and run.state in ("success", "failed", "stopped")
             )
-            if set(run_ids) != set(eligible_run_ids):
-                raise RunDeletionNotAllowedError(
-                    "checked terminal runs changed; refresh and confirm deletion again"
-                )
             cleaning_run_ids = tuple(
                 run_id
-                for run_id in eligible_run_ids
+                for run_id in checked_terminal_run_ids
                 if self._runs[run_id].cleanup_lock.locked()
             )
             if cleaning_run_ids:
                 raise RunDeletionNotAllowedError(
                     "cleanup is active for confirmed run(s): "
                     + ", ".join(str(run_id) for run_id in cleaning_run_ids)
+                )
+            eligible_run_ids = tuple(
+                run_id
+                for run_id in checked_terminal_run_ids
+                if _resource_cleanup_status(self._runs[run_id].resources) == "cleaned"
+            )
+            if set(run_ids) != set(eligible_run_ids):
+                raise RunDeletionNotAllowedError(
+                    "checked, fully cleaned terminal runs changed; "
+                    "refresh and confirm deletion again"
                 )
             if not eligible_run_ids:
                 return ()

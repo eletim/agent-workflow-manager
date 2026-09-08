@@ -462,7 +462,9 @@ function renderRunList(runs) {
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
   deletableRunIds = runs.filter(
-    (run) => run.checked && ["success", "failed", "stopped"].includes(run.state),
+    (run) => run.checked
+      && ["success", "failed", "stopped"].includes(run.state)
+      && run.resourceCleanupStatus === "cleaned",
   ).map((run) => run.runId);
   const checkedRunCount = deletableRunIds.length;
   deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;

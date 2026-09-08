@@ -140,6 +140,37 @@ def test_decision_fails_closed_for_ambiguous_or_invalid_results(result: str) -> 
         decision(result)
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            "CHANGES_REQUESTED\nScope was not APPROVED because coverage is missing.",
+            "CHANGES_REQUESTED",
+        ),
+        (
+            "APPROVED\nThe prior CHANGES_REQUESTED findings have been resolved.",
+            "APPROVED",
+        ),
+    ],
+)
+def test_decision_ignores_verdict_words_in_finding_prose(
+    result: str, expected: str
+) -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    assert decision(result) == expected
+
+
+def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert "integration consistency across Issues" in source
+    assert "duplication between their implementations" in source
+    assert "cross-feature interactions" in source
+    assert "shared versus feature-specific" in source
+    assert "right boundaries" in source
+
+
 def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
