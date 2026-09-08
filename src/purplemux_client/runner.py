@@ -212,6 +212,10 @@ class RunCheckNotAllowedError(RuntimeError):
     """Raised when human-review metadata is set on a non-terminal run."""
 
 
+class RunDeletionNotAllowedError(RuntimeError):
+    """Raised when the confirmed deletion set is no longer safe."""
+
+
 class RunHistoryError(RuntimeError):
     """Raised when durable terminal-run history cannot be read or written."""
 
@@ -1518,6 +1522,48 @@ class PythonRunner:
                 self._mark_changed()
             return self._snapshot_run(run)
 
+    def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
+        """Delete only checked terminal-run records, without cleaning resources."""
+        run_ids = tuple(confirmed_run_ids)
+        if any(
+            isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
+            for run_id in run_ids
+        ) or len(set(run_ids)) != len(run_ids):
+            raise ValueError("run IDs must be unique positive integers")
+        with self._lock:
+            eligible_run_ids = tuple(
+                run.run_id
+                for run in self._runs.values()
+                if run.checked and run.state in ("success", "failed", "stopped")
+            )
+            if set(run_ids) != set(eligible_run_ids):
+                raise RunDeletionNotAllowedError(
+                    "checked terminal runs changed; refresh and confirm deletion again"
+                )
+            cleaning_run_ids = tuple(
+                run_id
+                for run_id in eligible_run_ids
+                if self._runs[run_id].cleanup_lock.locked()
+            )
+            if cleaning_run_ids:
+                raise RunDeletionNotAllowedError(
+                    "cleanup is active for confirmed run(s): "
+                    + ", ".join(str(run_id) for run_id in cleaning_run_ids)
+                )
+            if not eligible_run_ids:
+                return ()
+
+            previous_runs = self._runs.copy()
+            for run_id in eligible_run_ids:
+                del self._runs[run_id]
+            try:
+                self._write_run_history_locked()
+            except RunHistoryError:
+                self._runs = previous_runs
+                raise
+            self._mark_changed()
+            return eligible_run_ids
+
     def _get_run(self, run_id: int) -> _RunRecord:
         try:
             return self._runs[run_id]
@@ -1611,8 +1657,10 @@ class PythonRunner:
             self._ensure_open()
             run = self._get_run(run_id)
             cleanup_lock = run.cleanup_lock
-        if not cleanup_lock.acquire(blocking=False):
-            raise RunCleanupInProgressError(f"run {run_id} cleanup is already active")
+            if not cleanup_lock.acquire(blocking=False):
+                raise RunCleanupInProgressError(
+                    f"run {run_id} cleanup is already active"
+                )
         try:
             with self._lock:
                 self._ensure_open()

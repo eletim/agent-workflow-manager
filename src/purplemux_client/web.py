@@ -37,6 +37,7 @@ from purplemux_client.runner import (
     RunCheckNotAllowedError,
     RunCleanupInProgressError,
     RunCleanupNotAllowedError,
+    RunDeletionNotAllowedError,
     RunHistoryError,
     RunNotFoundError,
     RunStopUncertainError,
@@ -401,6 +402,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             return
         json_paths = {
             "/api/directories",
+            "/api/runs/delete-checked",
             "/api/prompt",
             "/api/run",
             "/api/validate",
@@ -442,6 +444,43 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, snapshot.as_json())
+            return
+        if path == "/api/runs/delete-checked":
+            payload = self._read_json()
+            if payload is None:
+                return
+            run_ids = payload.get("runIds")
+            if (
+                set(payload) != {"runIds"}
+                or not isinstance(run_ids, list)
+                or any(
+                    isinstance(run_id, bool)
+                    or not isinstance(run_id, int)
+                    or run_id < 1
+                    for run_id in run_ids
+                )
+                or len(set(run_ids)) != len(run_ids)
+            ):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain unique positive integer runIds"},
+                )
+                return
+            try:
+                deleted_run_ids = self.server.runner.delete_checked_runs(run_ids)
+            except RunDeletionNotAllowedError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "deletedCount": len(deleted_run_ids),
+                    "deletedRunIds": list(deleted_run_ids),
+                },
+            )
             return
         if path == "/api/directories":
             payload = self._read_json()
