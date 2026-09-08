@@ -1607,7 +1607,8 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
     policyIssue: 9,
     issues: [
       {
-        issue: 10,
+        issue: "mini-task:refresh-help",
+        label: "Mini task refresh-help",
         outcome: "continued_with_warning",
         reviews: 5,
         pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
@@ -1631,6 +1632,11 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
 
   assert.equal(elements["issue-summary-panel"].hidden, false);
   assert.equal(elements["issue-summary-list"].children.length, 1);
+  assert.equal(
+    elements["issue-summary-list"].children[0].children[1].children[0].children[0]
+      .textContent,
+    "Mini task refresh-help  ",
+  );
   assert.match(elements["issue-summary-whole"].textContent, /APPROVED \(2 reviews\)/);
   assert.equal(elements["issue-summary-warnings"].textContent, "Warnings: 1");
   assert.equal(elements["issue-summary-base"].children[1].textContent, "#50");

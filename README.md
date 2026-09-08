@@ -59,6 +59,10 @@ deterministically expands it into the canonical sequential plain-Python workflow
 The generated Python is visible for inspection and is then passed unchanged to the
 existing Static Validation, Dry Run, and Run path. JSON is configuration, not an
 executable DSL, and there is no Issue Driven runtime or UI-side control-flow model.
+The ordered `work_items` form may mix GitHub Issue numbers with inline mini tasks
+such as `{"id":"update-copy","task":"Update the empty-state copy and its test."}`.
+Inline tasks are embedded in the generated Python and do not require creating a
+GitHub Issue; the legacy Issue-only `issues` array remains supported.
 
 ```json
 {
@@ -86,8 +90,8 @@ is reused only when it contains that exact starting commit and passes the normal
 safe recovery checks. The final PR still targets `final_branch`. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design
 context to every implementation, review, and fix turn and is referenced by the
-Base PR. It cannot also appear in `issues`. Clear conflicts produce structured
-warnings while the implementation Issue remains authoritative. Conflict records
+Base PR. It cannot also appear as an implementation GitHub Issue work item. Clear conflicts produce structured
+warnings while the implementation work item remains authoritative. Conflict records
 are persisted on the relevant child PR or Base PR so a recovery run can restore
 them for whole-version review, Summary, and Base PR handoff.
 `implementer_agent` selects implementation, fix, and cleanup turns, while

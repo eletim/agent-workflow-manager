@@ -53,6 +53,8 @@ def topology_pr(
     state: str = "OPEN",
     head_sha: str = "f" * 40,
     base_sha: str = "b" * 40,
+    head_branch: str = "feature/issue-158",
+    body: str = "",
 ) -> PullRequestState:
     return PullRequestState(
         number,
@@ -60,7 +62,7 @@ def topology_pr(
         state,  # type: ignore[arg-type]
         True,
         "acme/project",
-        "feature/issue-158",
+        head_branch,
         head_sha,
         "acme/project",
         "dev/v1",
@@ -69,7 +71,7 @@ def topology_pr(
         False,
         None,
         f"PR_{number}",
-        "",
+        body,
     )
 
 
@@ -189,6 +191,34 @@ def test_issue_topology_classifies_authoritatively_integrated_head() -> None:
     assert result.classification == "already_integrated"
 
 
+@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
+def test_inline_task_topology_rejects_pr_fingerprint_mismatch(state: str) -> None:
+    expected = "a" * 64
+    branch = "feature/work-item-refresh-run-help"
+    pr = topology_pr(
+        state=state,
+        head_branch=branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    repository = SimpleNamespace(
+        inspect_branch=lambda _branch: BranchState(
+            branch, None, "f" * 40 if state == "OPEN" else None, False
+        )
+    )
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        classify_issue_topology(
+            repository,
+            TopologyGitHub((pr,)),
+            TopologyGitHub((pr,)),
+            issue="Mini task refresh-run-help",
+            branch=branch,
+            integration_branch="dev/v1",
+            integration_sha="b" * 40,
+            inline_task_fingerprint=expected,
+        )
+
+
 def test_issue_topology_rejects_pr_sha_mismatch_and_ambiguity() -> None:
     base_sha = "b" * 40
     feature_sha = "f" * 40
@@ -226,6 +256,57 @@ def test_valid_json_preserves_issue_order() -> None:
     assert config.merge_final is False
     assert config.make_integration_branch is False
     assert config.policy_issue is None
+
+
+def test_ordered_work_items_mix_github_issues_and_inline_mini_tasks() -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        90,
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."},
+        91,
+    ]
+
+    config = parse(value)
+
+    assert [item.as_json() for item in config.work_items] == value["work_items"]
+    assert config.issues == (90, 91)
+    assert "issues" not in config.as_json()
+    assert parse(config.as_json()) == config
+
+
+@pytest.mark.parametrize(
+    ("work_item", "path"),
+    [
+        ({"id": "Bad ID", "task": "Do it"}, "$.work_items[0].id"),
+        ({"id": "docs", "task": ""}, "$.work_items[0].task"),
+        ({"id": "docs"}, "$.work_items[0].task"),
+        (
+            {"id": "docs", "task": "Do it", "branch": "custom"},
+            "$.work_items[0].branch",
+        ),
+    ],
+)
+def test_inline_mini_task_validation_is_structured(
+    work_item: object, path: str
+) -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [work_item]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert path in {finding.path for finding in caught.value.findings}
+
+
+def test_issues_and_work_items_are_mutually_exclusive() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(work_items=[90]))
+
+    assert ("$.work_items", "must not be combined with issues") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
 
 
 def test_make_integration_branch_round_trips_when_enabled() -> None:
@@ -474,6 +555,115 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "MAX_REVIEWS = 5" in first
 
 
+def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        90,
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."},
+    ]
+    parsed = parse(value)
+    item = parsed.work_items[1]
+    assert item.task_fingerprint is not None
+    code = generate_issue_driven_workflow(parsed)
+    module_name = "generated_inline_work_item"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-work-item-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    mini = module.__dict__["Issue"](
+        None,
+        item.branch,
+        "refresh-run-help",
+        "Refresh the New Run help.",
+        item.task_fingerprint,
+    )
+    config = module.__dict__["parse_args"]()
+
+    implementation, scope_review, correctness_review = module.__dict__["issue_prompts"](
+        mini, config
+    )
+
+    assert code.index("Issue(90, 'feature/issue-90')") < code.index(
+        f"Issue(None, '{item.branch}'"
+    )
+    assert "'Mini task refresh-run-help'" in code
+    assert item.task_fingerprint in code
+    assert "Refresh the New Run help." in implementation
+    assert "Refresh the New Run help." in scope_review
+    assert "Refresh the New Run help." in correctness_review
+    assert "gh issue view" not in mini.requirement
+    assert item.task_fingerprint in mini.pr_body
+
+
+def test_inline_task_content_changes_topology_recovery_identity() -> None:
+    def inline_config(task: str):
+        value = payload()
+        value.pop("issues")
+        value["work_items"] = [{"id": "refresh-run-help", "task": task}]
+        return parse(value)
+
+    first = inline_config("Refresh the New Run help.")
+    changed = inline_config("Replace the New Run help.")
+    first_item = first.work_items[0]
+    changed_item = changed.work_items[0]
+
+    assert first_item.branch == changed_item.branch
+    assert first_item.task_fingerprint != changed_item.task_fingerprint
+    assert first_item.task_fingerprint in generate_issue_driven_workflow(first)
+    assert changed_item.task_fingerprint in generate_issue_driven_workflow(changed)
+
+
+@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
+def test_generated_inline_task_recovery_rejects_pr_fingerprint_mismatch(
+    state: str,
+) -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."}
+    ]
+    parsed = parse(value)
+    item = parsed.work_items[0]
+    assert item.task_fingerprint is not None
+    code = generate_issue_driven_workflow(parsed)
+    module_name = f"generated_inline_recovery_{state.lower()}"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-inline-recovery>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    issue = module.__dict__["Issue"](
+        None,
+        item.branch,
+        item.id,
+        item.task,
+        item.task_fingerprint,
+    )
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.0",
+        "main",
+        (issue,),
+        "true",
+    )
+    pr = topology_pr(
+        state=state,
+        head_branch=item.branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    github = SimpleNamespace(
+        find_pr=lambda *, head, base, state: pr if state == pr.state else None
+    )
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        module.__dict__["prepare_issue"](SimpleNamespace(), github, issue, config)
+
+
 @pytest.mark.parametrize("final_review", [False, True])
 def test_generated_workflow_always_preserves_implementation_principle(
     final_review: bool,
@@ -532,10 +722,10 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
             calls[text] = agent_type.id
 
     assert calls == {
-        "Issue  worktree cleanup": "IMPLEMENTER_AGENT",
-        "Issue  implementer": "IMPLEMENTER_AGENT",
-        "Issue  scope reviewer": "REVIEWER_AGENT",
-        "Issue  correctness reviewer": "REVIEWER_AGENT",
+        " worktree cleanup": "IMPLEMENTER_AGENT",
+        " implementer": "IMPLEMENTER_AGENT",
+        " scope reviewer": "REVIEWER_AGENT",
+        " correctness reviewer": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
@@ -642,7 +832,7 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "You may push" not in code
     for prohibited in (
         "reset, rebase, stash, force-push",
-        "merge the Issue PR",
+        "merge the work-item PR",
         "create unrelated PRs",
         "discard ambiguous local work",
     ):
@@ -952,8 +1142,8 @@ def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() 
     code = generate_issue_driven_workflow(parse(payload(policy_issue=200)))
 
     assert "Before doing anything else, run `gh issue view" in code
-    assert 'policy_context(config, scope=f"Issue #{issue.number}")' in code
-    assert 'policy_context(config, scope=f"fixes for Issue #{issue.number}")' in code
+    assert "policy_context(config, scope=issue.label)" in code
+    assert 'policy_context(config, scope=f"fixes for {issue.label}")' in code
     assert 'policy_context(config, scope="the whole-version review")' in code
     assert 'policy_context(config, scope="whole-version fixes")' in code
     assert "https://github.com/{config.slug}/issues/{config.policy_issue}" in code
@@ -994,7 +1184,7 @@ def test_policy_conflict_marker_emits_warning_and_preserves_child_precedence() -
     assert findings[0][0] == "policy_issue"
     assert findings[0][2] == "warning"
     assert "child explicitly chooses the other API" in findings[0][1]
-    assert "implementation Issue as the primary requirement" in findings[0][1]
+    assert "implementation work item as the primary requirement" in findings[0][1]
 
 
 def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> None:
@@ -1271,10 +1461,8 @@ def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
     )
 
     assert implementation.startswith("Implement Issue #90")
-    assert scope_review.startswith("Perform only the Scope / Design Review for Issue")
-    assert correctness_review.startswith(
-        "Perform only the Correctness Review for Issue"
-    )
+    assert scope_review.startswith("Perform only the Scope / Design Review for")
+    assert correctness_review.startswith("Perform only the Correctness Review for")
     assert "policy Issue" not in implementation
     assert "POLICY_CONFLICT" not in scope_review
     assert "POLICY_CONFLICT" not in correctness_review
@@ -1445,7 +1633,7 @@ def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() 
     assert "RUN_TOKEN" not in code
     assert "[awm:" not in code
     assert "CreateSessionRequest(" in code
-    assert 'name=f"Issue {issue.number} implementer"' in code
+    assert 'name=f"{issue.label} implementer"' in code
 
 
 def test_generated_workflow_has_no_in_place_recovery_state() -> None:
@@ -1466,7 +1654,7 @@ def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
 
     assert "MERGE_TO_INTEGRATION = True" in merging
     assert "MERGE_TO_INTEGRATION = False" in ready_only
-    assert "Issue #{issue.number} PR is Ready" in ready_only
+    assert "{issue.label} PR is Ready" in ready_only
     assert 'delivery.outcome == "approved"' in ready_only
 
 

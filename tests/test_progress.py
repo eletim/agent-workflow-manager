@@ -120,6 +120,36 @@ def test_emit_issue_driven_results_write_narrow_structured_events(
     ]
 
 
+def test_emit_issue_result_accepts_labeled_inline_work_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_result(
+            "mini-task:refresh-help",
+            "approved",
+            2,
+            45,
+            "https://github.com/acme/project/pull/45",
+            label="Mini task refresh-help",
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "issue_result",
+            "issue": "mini-task:refresh-help",
+            "label": "Mini task refresh-help",
+            "outcome": "approved",
+            "reviews": 2,
+            "pr_number": 45,
+            "pr_url": "https://github.com/acme/project/pull/45",
+            "warnings": [],
+        }
+
+
 def test_emit_finding_writes_structured_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

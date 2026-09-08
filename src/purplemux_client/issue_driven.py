@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -33,11 +35,13 @@ class IssueDrivenValidationError(ValueError):
 
 
 IssueTopologyClassification = Literal["new", "recoverable", "already_integrated"]
+INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
 class IssueTopologyState:
-    issue: int
+    issue: int | str
     branch: str
     classification: IssueTopologyClassification
     feature_sha: str | None
@@ -83,10 +87,11 @@ def classify_issue_topology(
     pull_requests: _IssuePullRequests,
     github: _IssueGitHubRepository,
     *,
-    issue: int,
+    issue: int | str,
     branch: str,
     integration_branch: str,
     integration_sha: str,
+    inline_task_fingerprint: str | None = None,
 ) -> IssueTopologyState:
     """Classify one Issue from authoritative remote Git and GitHub state."""
     try:
@@ -106,6 +111,8 @@ def classify_issue_topology(
             raise WorkerFailure(
                 f"ambiguous PR states from {branch} to {integration_branch}: {numbers}"
             )
+        for pr in matching:
+            _require_inline_task_fingerprint(pr, inline_task_fingerprint)
         if closed_pr is not None:
             raise WorkerFailure(
                 f"closed unmerged PR #{closed_pr.number} exists from {branch} "
@@ -180,9 +187,38 @@ def classify_issue_topology(
             issue, branch, "recoverable", feature_sha, integration_sha
         )
     except WorkerFailure as exc:
-        if str(exc).startswith(f"Issue #{issue}:"):
+        label = _work_item_label(issue)
+        if str(exc).startswith(f"{label}:"):
             raise
-        raise WorkerFailure(f"Issue #{issue}: {exc}") from exc
+        raise WorkerFailure(f"{label}: {exc}") from exc
+
+
+def _work_item_label(issue: int | str) -> str:
+    return f"Issue #{issue}" if isinstance(issue, int) else issue
+
+
+def _inline_task_fingerprints(body: str) -> tuple[str, ...]:
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    suffix = " -->"
+    lines = body.splitlines()
+    if not lines:
+        return ()
+    marker = lines[0].strip()
+    if not marker.startswith(prefix) or not marker.endswith(suffix):
+        return ()
+    return (marker[len(prefix) : -len(suffix)],)
+
+
+def _require_inline_task_fingerprint(
+    pr: PullRequestState, expected: str | None
+) -> None:
+    if expected is None:
+        return
+    if _inline_task_fingerprints(pr.body) != (expected,):
+        raise WorkerFailure(
+            f"PR #{pr.number} inline task fingerprint is missing or does not match "
+            "the declared task"
+        )
 
 
 def _commit_is_contained(
@@ -198,26 +234,44 @@ def inspect_issue_driven_topology(
     *,
     repo: str,
     integration_branch: str,
-    issues: tuple[tuple[int, str], ...],
+    issues: tuple[tuple[int | str, str] | tuple[int | str, str, str], ...],
     prospective_base_branch: str | None = None,
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
     _cwd: Path | None = None,
 ) -> tuple[IssueTopologyState, ...]:
     """Inspect all Issue branches and PRs before any workflow mutation."""
-    if not issues or any(
-        isinstance(number, bool)
-        or not isinstance(number, int)
-        or number < 1
-        or not isinstance(branch, str)
-        or not branch
-        for number, branch in issues
-    ):
-        raise ValueError("issues must contain positive Issue numbers and branches")
-    numbers = tuple(number for number, _branch in issues)
-    branches = tuple(branch for _number, branch in issues)
+    normalized: list[tuple[int | str, str, str | None]] = []
+    for declaration in issues:
+        if not isinstance(declaration, tuple) or len(declaration) not in (2, 3):
+            raise ValueError("issues must contain work-item declarations")
+        number, branch = declaration[:2]
+        fingerprint = declaration[2] if len(declaration) == 3 else None
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, str))
+            or (isinstance(number, int) and number < 1)
+            or (isinstance(number, str) and not number.strip())
+            or not isinstance(branch, str)
+            or not branch
+            or (
+                fingerprint is not None
+                and (
+                    not isinstance(fingerprint, str)
+                    or _SHA256.fullmatch(fingerprint) is None
+                )
+            )
+            or (isinstance(number, str) and fingerprint is None)
+            or (isinstance(number, int) and fingerprint is not None)
+        ):
+            raise ValueError("issues must contain valid work-item declarations")
+        normalized.append((number, branch, fingerprint))
+    if not normalized:
+        raise ValueError("issues must contain work-item identifiers and branches")
+    numbers = tuple(number for number, _branch, _fingerprint in normalized)
+    branches = tuple(branch for _number, branch, _fingerprint in normalized)
     if len(set(numbers)) != len(numbers) or len(set(branches)) != len(branches):
-        raise ValueError("Issue numbers and feature branches must be unique")
+        raise ValueError("work-item identifiers and feature branches must be unique")
     if integration_branch in branches:
         raise ValueError("integration and feature branches must differ")
     inspection_base = prospective_base_branch or integration_branch
@@ -279,8 +333,9 @@ def inspect_issue_driven_topology(
             branch=branch,
             integration_branch=integration_branch,
             integration_sha=integration_sha,
+            inline_task_fingerprint=fingerprint,
         )
-        for number, branch in issues
+        for number, branch, fingerprint in normalized
     )
     if (
         repository.inspect_remote_branches((integration_branch, *branches))
@@ -291,17 +346,13 @@ def inspect_issue_driven_topology(
     if _pr_topology(current_pull_requests) != _pr_topology(pull_requests):
         raise WorkerFailure("GitHub PR topology changed during inspection")
     for state in states:
+        label = _work_item_label(state.issue)
         if state.classification == "new":
-            message = (
-                f"Issue #{state.issue}: no existing feature branch; new run is safe"
-            )
+            message = f"{label}: no existing feature branch; new run is safe"
         elif state.classification == "recoverable":
-            message = (
-                f"Issue #{state.issue}: existing feature branch / PR topology "
-                "is recoverable"
-            )
+            message = f"{label}: existing feature branch / PR topology is recoverable"
         else:
-            message = f"Issue #{state.issue}: already integrated; execution may skip this Issue"
+            message = f"{label}: already integrated; execution may skip this work item"
         emit_finding("github", message, status="info")
     return states
 
@@ -320,6 +371,7 @@ def _pr_topology(
                 pr.base_repository.lower(),
                 pr.base_branch,
                 pr.base_sha,
+                _inline_task_fingerprints(pr.body),
             )
             for pr in snapshot.pull_requests
         )
@@ -327,11 +379,37 @@ def _pr_topology(
 
 
 @dataclass(frozen=True)
+class WorkItem:
+    issue: int | None = None
+    id: str | None = None
+    task: str | None = None
+
+    @property
+    def task_fingerprint(self) -> str | None:
+        if self.task is None:
+            return None
+        return hashlib.sha256(self.task.encode()).hexdigest()
+
+    @property
+    def branch(self) -> str:
+        if self.issue is not None:
+            return f"feature/issue-{self.issue}"
+        assert self.id is not None
+        return f"feature/work-item-{self.id}"
+
+    def as_json(self) -> int | dict[str, str]:
+        if self.issue is not None:
+            return self.issue
+        assert self.id is not None and self.task is not None
+        return {"id": self.id, "task": self.task}
+
+
+@dataclass(frozen=True)
 class IssueDrivenConfig:
     repository: str
     integration_branch: str
     final_branch: str
-    issues: tuple[int, ...]
+    work_items: tuple[WorkItem, ...]
     max_reviews: int
     merge_to_integration: bool
     final_review: bool
@@ -341,6 +419,11 @@ class IssueDrivenConfig:
     policy_issue: int | None = None
     make_integration_branch: bool = False
 
+    @property
+    def issues(self) -> tuple[int, ...]:
+        """Return GitHub Issue numbers for compatibility with existing callers."""
+        return tuple(item.issue for item in self.work_items if item.issue is not None)
+
     def as_json(self) -> dict[str, object]:
         result: dict[str, object] = {
             "mode": "issue-driven",
@@ -348,7 +431,6 @@ class IssueDrivenConfig:
             "integration_branch": self.integration_branch,
             "final_branch": self.final_branch,
             "make_integration_branch": self.make_integration_branch,
-            "issues": list(self.issues),
             "max_reviews": self.max_reviews,
             "merge_to_integration": self.merge_to_integration,
             "final_review": self.final_review,
@@ -358,6 +440,10 @@ class IssueDrivenConfig:
         }
         if self.policy_issue is not None:
             result["policy_issue"] = self.policy_issue
+        if all(item.issue is not None for item in self.work_items):
+            result["issues"] = [item.issue for item in self.work_items]
+        else:
+            result["work_items"] = [item.as_json() for item in self.work_items]
         return result
 
 
@@ -365,7 +451,6 @@ _REQUIRED_FIELDS = {
     "repository",
     "integration_branch",
     "final_branch",
-    "issues",
     "max_reviews",
     "merge_to_integration",
     "final_review",
@@ -377,11 +462,14 @@ _OPTIONAL_FIELDS = {
     "implementer_agent",
     "reviewer_agent",
     "policy_issue",
+    "issues",
+    "work_items",
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
 # Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
 _MAX_WORKFLOW_OUTLINE_ITEMS = 100
+_WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def _valid_branch_name(value: str) -> bool:
@@ -438,6 +526,16 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(IssueDrivenFinding(f"$.{key}", "unknown field is not allowed"))
     if "mode" in value and value["mode"] != "issue-driven":
         findings.append(IssueDrivenFinding("$.mode", "must be exactly 'issue-driven'"))
+    if "issues" not in value and "work_items" not in value:
+        findings.append(
+            IssueDrivenFinding(
+                "$.work_items", "work_items or the legacy issues field is required"
+            )
+        )
+    if "issues" in value and "work_items" in value:
+        findings.append(
+            IssueDrivenFinding("$.work_items", "must not be combined with issues")
+        )
     for key in ("repository", "integration_branch", "final_branch"):
         item = value.get(key)
         if (
@@ -460,35 +558,119 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(
             IssueDrivenFinding("$.final_branch", "must differ from integration_branch")
         )
-    issues = value.get("issues")
-    if not isinstance(issues, list) or not issues:
-        findings.append(IssueDrivenFinding("$.issues", "must be a non-empty array"))
+    items_key = "work_items" if "work_items" in value else "issues"
+    raw_items = value.get(items_key)
+    work_items: list[WorkItem] = []
+    if not isinstance(raw_items, list) or not raw_items:
+        findings.append(
+            IssueDrivenFinding(f"$.{items_key}", "must be a non-empty array")
+        )
     else:
         reserved_outline_items = 2 if value.get("final_review") is True else 1
-        max_issues = _MAX_WORKFLOW_OUTLINE_ITEMS - reserved_outline_items
-        if len(issues) > max_issues:
+        max_items = _MAX_WORKFLOW_OUTLINE_ITEMS - reserved_outline_items
+        if len(raw_items) > max_items:
             findings.append(
                 IssueDrivenFinding(
-                    "$.issues",
-                    f"must contain at most {max_issues} items when "
+                    f"$.{items_key}",
+                    f"must contain at most {max_items} items when "
                     f"final_review is {value.get('final_review')!r}",
                 )
             )
-        seen: set[int] = set()
-        for index, issue in enumerate(issues):
-            if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
+        seen_issues: set[int] = set()
+        seen_ids: set[str] = set()
+        for index, item in enumerate(raw_items):
+            path = f"$.{items_key}[{index}]"
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, (int, dict))
+                or (items_key == "issues" and not isinstance(item, int))
+            ):
                 findings.append(
                     IssueDrivenFinding(
-                        f"$.issues[{index}]", "must be a positive integer"
+                        path,
+                        (
+                            "must be a positive integer"
+                            if items_key == "issues"
+                            else "must be a positive Issue number or a mini-task object"
+                        ),
                     )
                 )
-            elif issue in seen:
-                findings.append(
-                    IssueDrivenFinding(f"$.issues[{index}]", "must be unique")
-                )
+            elif isinstance(item, int):
+                if item < 1:
+                    findings.append(
+                        IssueDrivenFinding(path, "must be a positive Issue number")
+                    )
+                elif item in seen_issues:
+                    findings.append(IssueDrivenFinding(path, "must be unique"))
+                else:
+                    seen_issues.add(item)
+                    work_items.append(WorkItem(issue=item))
             else:
-                seen.add(issue)
-        generated_branches = {f"feature/issue-{issue}" for issue in seen}
+                unknown = sorted(set(item) - {"id", "task"})
+                for key in unknown:
+                    findings.append(
+                        IssueDrivenFinding(
+                            f"{path}.{key}", "unknown field is not allowed"
+                        )
+                    )
+                for key in sorted({"id", "task"} - set(item)):
+                    findings.append(
+                        IssueDrivenFinding(f"{path}.{key}", "required field is missing")
+                    )
+                item_id = item.get("id")
+                task = item.get("task")
+                id_valid = (
+                    isinstance(item_id, str)
+                    and _WORK_ITEM_ID.fullmatch(item_id) is not None
+                    and len(item_id) <= 50
+                )
+                duplicate_id = id_valid and item_id in seen_ids
+                if not id_valid:
+                    findings.append(
+                        IssueDrivenFinding(
+                            f"{path}.id",
+                            "must be a lowercase kebab-case identifier of at most 50 characters",
+                        )
+                    )
+                elif duplicate_id:
+                    findings.append(IssueDrivenFinding(f"{path}.id", "must be unique"))
+                else:
+                    assert isinstance(item_id, str)
+                    seen_ids.add(item_id)
+                task_has_surrogate = isinstance(task, str) and any(
+                    0xD800 <= ord(character) <= 0xDFFF for character in task
+                )
+                task_valid = (
+                    isinstance(task, str)
+                    and bool(task)
+                    and task == task.strip()
+                    and "\0" not in task
+                    and len(task) <= 4000
+                    and not task_has_surrogate
+                )
+                if task_has_surrogate:
+                    findings.append(
+                        IssueDrivenFinding(
+                            f"{path}.task", "must contain only Unicode scalar values"
+                        )
+                    )
+                elif not task_valid:
+                    findings.append(
+                        IssueDrivenFinding(
+                            f"{path}.task",
+                            "must be a non-empty trimmed string of at most 4000 characters",
+                        )
+                    )
+                if id_valid and not duplicate_id and task_valid and not unknown:
+                    assert isinstance(item_id, str) and isinstance(task, str)
+                    work_items.append(WorkItem(id=item_id, task=task))
+        generated_branches = {item.branch for item in work_items}
+        if len(generated_branches) != len(work_items):
+            findings.append(
+                IssueDrivenFinding(
+                    f"$.{items_key}", "generated branches must be unique"
+                )
+            )
         for key, branch in (
             ("integration_branch", integration),
             ("final_branch", final),
@@ -496,7 +678,12 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             if isinstance(branch, str) and branch in generated_branches:
                 findings.append(
                     IssueDrivenFinding(
-                        f"$.{key}", "must differ from every generated Issue branch"
+                        f"$.{key}",
+                        (
+                            "must differ from every generated Issue branch"
+                            if items_key == "issues"
+                            else "must differ from every generated work-item branch"
+                        ),
                     )
                 )
     policy_issue = value.get("policy_issue")
@@ -509,7 +696,9 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             findings.append(
                 IssueDrivenFinding("$.policy_issue", "must be a positive integer")
             )
-        elif isinstance(issues, list) and policy_issue in issues:
+        elif policy_issue in {
+            item.issue for item in work_items if item.issue is not None
+        }:
             findings.append(
                 IssueDrivenFinding(
                     "$.policy_issue", "must differ from every implementation Issue"
@@ -549,7 +738,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         integration_branch=value["integration_branch"],
         final_branch=value["final_branch"],
         make_integration_branch=value.get("make_integration_branch", False),
-        issues=tuple(value["issues"]),
+        work_items=tuple(work_items),
         max_reviews=value["max_reviews"],
         merge_to_integration=value["merge_to_integration"],
         final_review=value["final_review"],
@@ -576,7 +765,15 @@ def _canonical_source() -> str:
 
 def _fixed_config_function(config: IssueDrivenConfig) -> str:
     issues = ",\n        ".join(
-        f"Issue({number}, 'feature/issue-{number}')" for number in config.issues
+        (
+            f"Issue({item.issue}, {item.branch!r})"
+            if item.issue is not None
+            else (
+                f"Issue(None, {item.branch!r}, {item.id!r}, {item.task!r}, "
+                f"{item.task_fingerprint!r})"
+            )
+        )
+        for item in config.work_items
     )
     base_branch = (
         config.final_branch
@@ -597,7 +794,15 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
     )
 """
     topology_issues = ",\n        ".join(
-        f"({number}, 'feature/issue-{number}')" for number in config.issues
+        (
+            f"({item.issue!r}, {item.branch!r})"
+            if item.issue is not None
+            else (
+                f"({f'Mini task {item.id}'!r}, {item.branch!r}, "
+                f"{item.task_fingerprint!r})"
+            )
+        )
+        for item in config.work_items
     )
     prospective = config.final_branch if config.make_integration_branch else None
     return f"""def parse_args() -> Config:
@@ -634,7 +839,10 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
 
 
 def _workflow_outline(config: IssueDrivenConfig) -> str:
-    labels = [f"Issue #{number}" for number in config.issues]
+    labels = [
+        f"Issue #{item.issue}" if item.issue is not None else f"Mini task {item.id}"
+        for item in config.work_items
+    ]
     if config.final_review:
         labels.append("Whole-version review")
     labels.append("Final integration PR")

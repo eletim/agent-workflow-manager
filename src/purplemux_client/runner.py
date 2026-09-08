@@ -154,11 +154,12 @@ class TopologyFinding:
 
 @dataclass(frozen=True)
 class IssueResult:
-    issue: int
+    issue: int | str
     outcome: Literal["approved", "continued_with_warning", "skipped"]
     reviews: int
     pr: PullRequestNavigation
     warnings: tuple[str, ...] = ()
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -405,16 +406,18 @@ class RunnerSnapshot:
         context = self.issue_driven_context
         if context is None or self.state in ("idle", "running", "validation_failed"):
             return None
-        issues = [
-            {
+        issues = []
+        for result in self.issue_results:
+            item = {
                 "issue": result.issue,
                 "outcome": result.outcome,
                 "reviews": result.reviews,
                 "pr": result.pr.as_json(),
                 "warnings": list(result.warnings),
             }
-            for result in self.issue_results
-        ]
+            if result.label is not None:
+                item["label"] = result.label
+            issues.append(item)
         whole_review = self.whole_review_result
         return {
             "repository": context.repository,
@@ -517,7 +520,7 @@ class _RunRecord:
     integration_pr: PullRequestNavigation | None = None
     checked: bool = False
     issue_driven_context: IssueDrivenContext | None = None
-    issue_results: dict[int, IssueResult] = field(default_factory=dict)
+    issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
 
 
@@ -2515,12 +2518,22 @@ class PythonRunner:
                     typed_outcome, reviews, typed_warnings
                 )
             issue = value.get("issue")
+            label = value.get("label")
             pr_number = value.get("pr_number")
             pr_url = value.get("pr_url")
             if (
                 isinstance(issue, bool)
-                or not isinstance(issue, int)
-                or issue < 1
+                or not isinstance(issue, (int, str))
+                or (isinstance(issue, int) and issue < 1)
+                or (isinstance(issue, str) and (not issue.strip() or len(issue) > 100))
+                or (
+                    label is not None
+                    and (
+                        not isinstance(label, str)
+                        or not label.strip()
+                        or len(label) > 100
+                    )
+                )
                 or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
             ):
                 return None
@@ -2530,6 +2543,7 @@ class PythonRunner:
                 reviews,
                 PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
                 typed_warnings,
+                cast(str | None, label),
             )
         name = value.get("name")
         status = value.get("status")
