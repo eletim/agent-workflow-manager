@@ -2767,6 +2767,39 @@ def test_issue_driven_generation_api_rejects_unpaired_task_surrogate(
     ]
 
 
+@pytest.mark.parametrize("policy_issue", ["200", "\ud800"])
+def test_issue_driven_generation_api_rejects_invalid_policy_identity(
+    web_server: tuple[tuple[str, int], str], policy_issue: str
+) -> None:
+    address, token = web_server
+    source = json.dumps(
+        {
+            "repository": "/tmp/example",
+            "integration_branch": "dev/v0.2.0",
+            "final_branch": "main",
+            "issues": [90],
+            "policy_issue": policy_issue,
+            "max_reviews": 5,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
+
+    status, rejected = request(
+        address,
+        "POST",
+        "/api/issue-driven/generate",
+        json.dumps({"json": source}),
+        token=token,
+    )
+
+    assert status == 422
+    assert rejected["issueDrivenValidation"] == [
+        {"path": "$.policy_issue", "message": "must be a positive integer"}
+    ]
+
+
 def test_runner_page_exposes_agent_workflow_manager_favicon(
     web_server: tuple[tuple[str, int], str],
 ) -> None:

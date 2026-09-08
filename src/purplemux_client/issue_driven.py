@@ -613,6 +613,30 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                 "must not be combined with issues or work_items",
             )
         )
+    raw_policy_issue = value.get("policy_issue")
+    policy_issue = (
+        raw_policy_issue
+        if isinstance(raw_policy_issue, int)
+        and not isinstance(raw_policy_issue, bool)
+        and raw_policy_issue > 0
+        else None
+    )
+    if "policy_issue" in value and policy_issue is None:
+        findings.append(
+            IssueDrivenFinding("$.policy_issue", "must be a positive integer")
+        )
+    raw_one_shot_issue = value.get("one_shot_issue")
+    one_shot_issue = (
+        raw_one_shot_issue
+        if isinstance(raw_one_shot_issue, int)
+        and not isinstance(raw_one_shot_issue, bool)
+        and raw_one_shot_issue > 0
+        else None
+    )
+    if "one_shot_issue" in value and one_shot_issue is None:
+        findings.append(
+            IssueDrivenFinding("$.one_shot_issue", "must be a positive integer")
+        )
     for key in ("repository", "integration_branch", "final_branch"):
         item = value.get(key)
         if (
@@ -742,9 +766,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                     work_items.append(WorkItem(id=item_id, task=task))
         if (
             len(work_items) == len(raw_items)
-            and _work_item_plan_state_size(
-                work_items, value.get("policy_issue"), value.get("one_shot_issue")
-            )
+            and _work_item_plan_state_size(work_items, policy_issue, one_shot_issue)
             > _MAX_WORK_ITEM_PLAN_STATE_BYTES
         ):
             findings.append(
@@ -775,26 +797,8 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                         ),
                     )
                 )
-    policy_issue = value.get("policy_issue")
-    one_shot_issue = value.get("one_shot_issue")
-    if "one_shot_issue" in value and (
-        isinstance(one_shot_issue, bool)
-        or not isinstance(one_shot_issue, int)
-        or one_shot_issue < 1
-    ):
-        findings.append(
-            IssueDrivenFinding("$.one_shot_issue", "must be a positive integer")
-        )
-    if "policy_issue" in value:
-        if (
-            isinstance(policy_issue, bool)
-            or not isinstance(policy_issue, int)
-            or policy_issue < 1
-        ):
-            findings.append(
-                IssueDrivenFinding("$.policy_issue", "must be a positive integer")
-            )
-        elif policy_issue in {
+    if policy_issue is not None:
+        if policy_issue in {
             item.issue for item in work_items if item.issue is not None
         }:
             findings.append(
@@ -896,8 +900,8 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         merge_final=value["merge_final"],
         implementer_agent=value.get("implementer_agent", "codex"),
         reviewer_agent=value.get("reviewer_agent", "codex"),
-        policy_issue=value.get("policy_issue"),
-        one_shot_issue=value.get("one_shot_issue"),
+        policy_issue=policy_issue,
+        one_shot_issue=one_shot_issue,
         scenarios=tuple(scenarios),
     )
 

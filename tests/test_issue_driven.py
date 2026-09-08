@@ -809,7 +809,9 @@ def test_scenario_list_aggregate_limit_counts_utf8_bytes() -> None:
     ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
-@pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])
+@pytest.mark.parametrize(
+    "policy_issue", [None, True, False, 0, -1, "200", "\ud800", 1.5]
+)
 def test_policy_issue_must_be_a_positive_integer(policy_issue: object) -> None:
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(policy_issue=policy_issue))
@@ -1579,7 +1581,9 @@ def test_planner_policy_conflict_is_persisted_before_dispatch_and_recovered() ->
     first["persist_work_item_plan"] = lambda active_plan, _config, _repo, github, pr: (
         github.update_pr_body(
             pr.number,
-            body=first["with_work_item_plan"](pr.body, active_plan),
+            body=first["with_base_pr_policy_notes"](
+                first["with_work_item_plan"](pr.body, active_plan), _config
+            ),
         )
     )
     first["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
@@ -1626,6 +1630,172 @@ def test_planner_policy_conflict_is_persisted_before_dispatch_and_recovered() ->
         second_config, scope="work-item planning", structured_conflicts=True
     )
     assert "different owner" in context
+
+
+def test_policy_plan_reacquires_base_pr_after_first_child_advances_integration() -> (
+    None
+):
+    workflow = load_generated_workflow(issues=[90, 91], policy_issue=200)
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (
+            issue_type(90, "feature/issue-90"),
+            issue_type(91, "feature/issue-91"),
+        ),
+        "true",
+        200,
+    )
+    plan = workflow["WorkItemPlan"](config)
+    integration_head = "a" * 40
+    main_head = "b" * 40
+    current = replace(
+        topology_pr(head_sha=integration_head, base_sha=main_head),
+        head_branch=config.integration_branch,
+        base_branch=config.main_branch,
+        body=workflow["with_work_item_plan"](
+            "Base PR" + workflow["policy_pr_notes"](config), plan
+        ),
+    )
+    updated_heads: list[str] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, integration_head, integration_head, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.main_branch
+            return BranchState(branch, main_head, main_head, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == integration_head
+            return current
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            assert kwargs["expected_head_sha"] == integration_head
+            updated_heads.append(str(kwargs["expected_head_sha"]))
+            current = replace(current, body=str(kwargs["body"]))
+            return current
+
+    decisions = iter(
+        (
+            {"actions": [], "complete": False, "policy_conflicts": []},
+            {"actions": [], "complete": False, "policy_conflicts": []},
+            {"actions": [], "complete": True, "policy_conflicts": []},
+        )
+    )
+    processed: list[int] = []
+
+    def process(issue: object, *_args: object) -> None:
+        nonlocal current, integration_head
+        processed.append(issue.number)
+        if issue.number == 90:
+            integration_head = "c" * 40
+            current = replace(current, head_sha=integration_head)
+
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
+    workflow["process_issue"] = process
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    effective = workflow["process_work_items"](
+        config, object(), Repository(), GitHub(), current, plan
+    )
+
+    assert processed == [90, 91]
+    assert [item.number for item in effective] == [90, 91]
+    assert "a" * 40 in updated_heads
+    assert "c" * 40 in updated_heads
+
+
+def test_policy_conflicts_and_base_pr_body_have_aggregate_budgets() -> None:
+    workflow = load_generated_workflow(issues=[90], policy_issue=200)
+    limit = workflow["MAX_POLICY_CONFLICT_WARNINGS"]
+    for index in range(limit):
+        workflow["record_policy_conflict"](None, f"warning-{index}")
+
+    with pytest.raises(WorkerFailure, match="policy conflict warning limit"):
+        workflow["record_policy_conflict"](None, "one warning too many")
+    assert len(workflow["POLICY_CONFLICT_WARNINGS"]) == limit
+
+
+def test_near_max_plan_conflicts_and_handoff_fail_before_body_mutation() -> None:
+    workflow = load_generated_workflow(issues=[90], policy_issue=200)
+    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3602]
+    issues = tuple(
+        workflow["planner_inline_issue"](f"task-{index}", task)
+        for index, task in enumerate(tasks)
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", issues, "true", 200
+    )
+    for index in range(workflow["MAX_POLICY_CONFLICT_WARNINGS"]):
+        workflow["record_policy_conflict"](
+            None,
+            f"Policy Issue #200 conflicts with work-item planning: {index}-"
+            f"{'x' * 500}; continuing with the implementation work item as the "
+            "primary requirement.",
+        )
+    plan = workflow["WorkItemPlan"](config)
+    body = workflow["with_work_item_plan"](
+        "Base PR" + workflow["policy_pr_notes"](config), plan
+    )
+    pr = replace(
+        topology_pr(head_branch=config.integration_branch, body=body),
+        base_branch=config.main_branch,
+    )
+    handoff = f"""## 概要
+
+{"あ" * 11_000}
+
+## 主な変更
+
+https://github.com/acme/project/issues/200
+
+## 人間による確認
+
+- [ ] 表示を確認できる
+
+## 自動検証
+
+- passed
+
+## 注意事項
+
+- Policy conflict warnings are recorded."""
+    mutations: list[str] = []
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: handoff
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    class GitHub:
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            mutations.append("update")
+            return pr
+
+    validated = workflow["validate_human_handoff"](handoff, config, has_warnings=True)
+    with pytest.raises(WorkerFailure, match="Base PR body exceeds"):
+        workflow["with_human_handoff"](body, validated)
+
+    unchanged = workflow["update_base_pr_human_handoff"](
+        config,
+        issues,
+        object(),
+        GitHub(),
+        pr,
+        workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha),
+    )
+
+    assert unchanged is pr
+    assert mutations == []
 
 
 @pytest.mark.parametrize("child_state", ["OPEN", "MERGED"])

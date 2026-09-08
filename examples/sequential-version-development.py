@@ -81,6 +81,8 @@ MAX_HUMAN_HANDOFF_CHARS = 12_000
 WORK_ITEM_PLAN_MARKER = "agent-workflow-manager:work-item-plan:"
 MAX_PLANNER_POLICY_CONFLICTS = 3
 MAX_POLICY_CONFLICT_DETAIL_CHARS = 500
+MAX_POLICY_CONFLICT_WARNINGS = 8
+MAX_BASE_PR_BODY_BYTES = 65_536
 
 
 @dataclass(frozen=True)
@@ -509,6 +511,10 @@ implementation work item remains the primary requirement. {conflict_instruction}
 def record_policy_conflict(issue_number: int | str | None, warning: str) -> None:
     if any(existing == warning for _, existing in POLICY_CONFLICT_WARNINGS):
         return
+    if len(POLICY_CONFLICT_WARNINGS) >= MAX_POLICY_CONFLICT_WARNINGS:
+        raise WorkerFailure(
+            f"policy conflict warning limit {MAX_POLICY_CONFLICT_WARNINGS} exceeded"
+        )
     record = (issue_number, warning)
     POLICY_CONFLICT_WARNINGS.append(record)
     print(f"WARN: {warning}", flush=True)
@@ -706,10 +712,14 @@ def with_human_handoff(existing_body: str, handoff: str) -> str:
     managed = f"{HUMAN_HANDOFF_START}\n{handoff}\n{HUMAN_HANDOFF_END}"
     if start_count == 0:
         prefix = existing_body.rstrip()
-        return f"{prefix}\n\n{managed}" if prefix else managed
+        body = f"{prefix}\n\n{managed}" if prefix else managed
+        require_base_pr_body_size(body)
+        return body
     start = existing_body.index(HUMAN_HANDOFF_START)
     end = existing_body.index(HUMAN_HANDOFF_END, start) + len(HUMAN_HANDOFF_END)
-    return f"{existing_body[:start]}{managed}{existing_body[end:]}"
+    body = f"{existing_body[:start]}{managed}{existing_body[end:]}"
+    require_base_pr_body_size(body)
+    return body
 
 
 def warn_human_handoff(message: str) -> None:
@@ -834,6 +844,31 @@ def policy_pr_notes(config: Config) -> str:
     )
 
 
+def require_base_pr_body_size(body: str) -> None:
+    if len(body.encode()) > MAX_BASE_PR_BODY_BYTES:
+        raise WorkerFailure(
+            f"Base PR body exceeds its {MAX_BASE_PR_BODY_BYTES}-byte limit"
+        )
+
+
+def with_base_pr_policy_notes(body: str, config: Config) -> str:
+    if config.policy_issue is None:
+        require_base_pr_body_size(body)
+        return body
+    reference = f"https://github.com/{config.slug}/issues/{config.policy_issue}"
+    if reference not in body:
+        body = f"{body.rstrip()}{policy_pr_notes(config)}"
+    else:
+        for _, warning in POLICY_CONFLICT_WARNINGS:
+            marker = encoded_policy_conflict_marker(warning)
+            if marker not in body:
+                body = (
+                    f"{body.rstrip()}\n\nPolicy conflict warning: {warning}\n{marker}"
+                )
+    require_base_pr_body_size(body)
+    return body
+
+
 def one_shot_pr_notes(config: Config) -> str:
     if config.one_shot_issue is None:
         return ""
@@ -849,9 +884,11 @@ def ensure_base_pr_one_shot_notes(
     reference = f"https://github.com/{config.slug}/issues/{config.one_shot_issue}"
     if reference in pr.body:
         return pr
+    body = f"{pr.body.rstrip()}{one_shot_pr_notes(config)}"
+    require_base_pr_body_size(body)
     return github.update_pr_body(
         pr.number,
-        body=f"{pr.body.rstrip()}{one_shot_pr_notes(config)}",
+        body=body,
         expected_head=config.integration_branch,
         expected_head_sha=pr.head_sha,
         expected_base=config.main_branch,
@@ -862,19 +899,9 @@ def ensure_base_pr_one_shot_notes(
 def ensure_base_pr_policy_notes(
     github: GitHubRepository, pr: PullRequestState, config: Config
 ) -> PullRequestState:
-    if config.policy_issue is None:
+    body = with_base_pr_policy_notes(pr.body, config)
+    if body == pr.body:
         return pr
-    reference = f"https://github.com/{config.slug}/issues/{config.policy_issue}"
-    body = pr.body
-    if reference not in body:
-        body = f"{body.rstrip()}{policy_pr_notes(config)}"
-    else:
-        for _, warning in POLICY_CONFLICT_WARNINGS:
-            marker = encoded_policy_conflict_marker(warning)
-            if marker not in body:
-                body = (
-                    f"{body.rstrip()}\n\nPolicy conflict warning: {warning}\n{marker}"
-                )
     return github.update_pr_body(
         pr.number,
         body=body,
@@ -1988,8 +2015,11 @@ def with_work_item_plan(body: str, plan: WorkItemPlan) -> str:
         raise WorkerFailure("Base PR has ambiguous work-item plan recovery state")
     if indexes:
         lines[indexes[0]] = marker
-        return "\n".join(lines)
-    return f"{body.rstrip()}\n\n{marker}" if body.strip() else marker
+        result = "\n".join(lines)
+    else:
+        result = f"{body.rstrip()}\n\n{marker}" if body.strip() else marker
+    require_base_pr_body_size(result)
+    return result
 
 
 def prepare_work_item_plan_pr(
@@ -2091,7 +2121,9 @@ def persist_work_item_plan(
         expected_base_sha=final.remote_sha,
         draft=True,
     )
-    body = with_work_item_plan(current.body, plan)
+    body = with_base_pr_policy_notes(
+        with_work_item_plan(current.body, plan), config
+    )
     if body == current.body:
         return current
     return github.update_pr_body(
@@ -2169,7 +2201,6 @@ def process_work_items(
                 f"planning: {conflict}; continuing with the implementation work "
                 "item as the primary requirement.",
             )
-        plan_pr = ensure_base_pr_policy_notes(github, plan_pr, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:
             return plan.snapshot
