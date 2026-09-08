@@ -253,6 +253,57 @@ def test_claude_project_is_trusted_before_tab_creation() -> None:
     assert runner.calls[0][1:] == ["workspaces"]
 
 
+def test_claude_trust_runs_in_a_purplemux_terminal_before_provider_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeRunner([completed({"tabId": "tab-claude"})])
+    cli = PurpleMuxCLIClient(
+        "ws-test",
+        poll_interval_seconds=0,
+        runner=runner,
+        sleep=lambda _: None,
+        codex_project_truster=lambda path: path,
+    )
+    events: list[object] = []
+
+    def start_shell(shell_request, *, on_created=None):  # type: ignore[no-untyped-def]
+        events.append(shell_request)
+        if on_created is not None:
+            on_created("tab-trust", "/tmp/result.json")
+        return "tab-trust"
+
+    monkeypatch.setattr(cli, "start_shell", start_shell)
+    monkeypatch.setattr(
+        cli,
+        "wait_for_shell_completion",
+        lambda session_id, timeout_seconds: events.append(
+            ("wait", session_id, timeout_seconds)
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "read_shell_result", lambda session_id: client_module.ShellResult(0)
+    )
+    monkeypatch.setattr(
+        cli, "close_session", lambda session_id: events.append(("close", session_id))
+    )
+
+    assert cli.create_session(request("claude-code", "claude")) == "tab-claude"
+
+    shell_request = events[0]
+    assert isinstance(shell_request, ShellCommandRequest)
+    assert shell_request.cwd == "/workspace/project"
+    assert "-m purplemux_client.claude_trust /workspace/project" in (
+        shell_request.command
+    )
+    assert events[1:] == [
+        ("wait", "tab-trust", cli.command_timeout_seconds),
+        ("close", "tab-trust"),
+    ]
+    create_calls = [call for call in runner.calls if call[1:3] == ["tab", "create"]]
+    assert len(create_calls) == 1
+    assert create_calls[0][create_calls[0].index("-t") + 1] == "claude-code"
+
+
 def test_claude_trust_failure_prevents_tab_creation() -> None:
     runner = FakeRunner([])
 

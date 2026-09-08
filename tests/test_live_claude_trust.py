@@ -38,8 +38,16 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     reason="set AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1",
 )
 def test_fresh_and_already_trusted_worktree_launch_without_interaction(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    awm_only_config = tmp_path / "awm-only-claude-config"
+    awm_only_config.mkdir()
+    awm_only_state = awm_only_config / ".config.json"
+    awm_only_state.write_text('{"projects":{},"awmOnly":true}\n', encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(awm_only_config))
+    monkeypatch.setenv(
+        "CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://not-forwarded.invalid/oauth"
+    )
     source = Path(_git("rev-parse", "--show-toplevel"))
     worktree = tmp_path / "fresh-linked-worktree"
     runtime = PurpleMuxRuntime()
@@ -75,6 +83,10 @@ def test_fresh_and_already_trusted_worktree_launch_without_interaction(
             assert client.read_result(session_id).strip() == EXPECTED_RESULT
             client.close_session(session_id)
             sessions.remove(session_id)
+        assert json.loads(awm_only_state.read_text(encoding="utf-8")) == {
+            "projects": {},
+            "awmOnly": True,
+        }
     finally:
         if client is not None:
             for session_id in sessions:

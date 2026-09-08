@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import purplemux_client.claude_trust as claude_trust
 from purplemux_client.claude_trust import ensure_claude_project_trust
 from purplemux_client.errors import WorkerFailure
 
@@ -289,3 +290,59 @@ def test_waits_for_claude_state_lock_and_preserves_external_update(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["externalClaudeUpdate"] is True
     assert state["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
+
+
+def test_reclaims_abandoned_claude_state_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    state_path = config / ".config.json"
+    state_path.write_text('{"projects":{},"preserved":true}\n', encoding="utf-8")
+    lock_path = config / ".config.json.lock"
+    lock_path.mkdir()
+    abandoned = time.time() - claude_trust._LOCK_STALE_SECONDS - 1
+    os.utime(lock_path, (abandoned, abandoned))
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+    ensure_claude_project_trust(str(project))
+
+    assert not lock_path.exists()
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["preserved"] is True
+    assert state["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
+
+
+def test_refreshes_claude_state_lock_during_slow_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    state_path = config / ".config.json"
+    state_path.write_text('{"projects":{}}\n', encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setattr(claude_trust, "_LOCK_UPDATE_SECONDS", 0.02)
+    original_write = claude_trust._write_state
+
+    def slow_write(path: Path, state: object, mode: int) -> None:
+        lock_path = Path(f"{path}.lock")
+        created_mtime = lock_path.stat().st_mtime_ns
+        time.sleep(0.08)
+        assert lock_path.stat().st_mtime_ns > created_mtime
+        original_write(path, state, mode)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(claude_trust, "_write_state", slow_write)
+
+    ensure_claude_project_trust(str(project))
+
+    assert not Path(f"{state_path}.lock").exists()

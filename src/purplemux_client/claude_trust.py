@@ -4,7 +4,9 @@ import errno
 import json
 import os
 import stat
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -12,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from purplemux_client.errors import WorkerFailure
+
+_LOCK_STALE_SECONDS = 10.0
+_LOCK_UPDATE_SECONDS = 1.0
 
 
 def ensure_claude_project_trust(
@@ -182,6 +187,24 @@ def _trust_mutation_lock(path: Path, deadline: float) -> Iterator[None]:
                     raise WorkerFailure(
                         "Claude project trust lock is not a safe user directory"
                     )
+                if time.time() - details.st_mtime > _LOCK_STALE_SECONDS:
+                    try:
+                        current = lock_path.stat(follow_symlinks=False)
+                        if (
+                            current.st_dev,
+                            current.st_ino,
+                            current.st_mtime_ns,
+                        ) == (
+                            details.st_dev,
+                            details.st_ino,
+                            details.st_mtime_ns,
+                        ):
+                            lock_path.rmdir()
+                            continue
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        pass
                 if time.monotonic() >= deadline:
                     raise WorkerFailure(
                         "Claude project trust configuration timed out waiting for lock"
@@ -193,9 +216,37 @@ def _trust_mutation_lock(path: Path, deadline: float) -> Iterator[None]:
         raise WorkerFailure(f"could not open Claude project trust lock: {exc}") from exc
 
     assert identity is not None
+    heartbeat_stop = threading.Event()
+    heartbeat_errors: list[OSError | WorkerFailure] = []
+
+    def refresh_lock() -> None:
+        while not heartbeat_stop.wait(_LOCK_UPDATE_SECONDS):
+            try:
+                details = lock_path.stat(follow_symlinks=False)
+                if (details.st_dev, details.st_ino) != identity:
+                    raise WorkerFailure(
+                        "Claude project trust lock changed while it was held"
+                    )
+                os.utime(lock_path, follow_symlinks=False)
+            except (OSError, WorkerFailure) as exc:
+                heartbeat_errors.append(exc)
+                return
+
+    heartbeat = threading.Thread(
+        target=refresh_lock,
+        name="claude-trust-lock-heartbeat",
+        daemon=True,
+    )
+    heartbeat.start()
     try:
         yield
+        if heartbeat_errors:
+            raise WorkerFailure(
+                f"could not refresh Claude project trust lock: {heartbeat_errors[0]}"
+            )
     finally:
+        heartbeat_stop.set()
+        heartbeat.join()
         try:
             details = lock_path.stat(follow_symlinks=False)
             if (details.st_dev, details.st_ino) != identity:
@@ -213,3 +264,20 @@ def _trust_mutation_lock(path: Path, deadline: float) -> Iterator[None]:
             raise WorkerFailure(
                 f"could not release Claude project trust lock: {exc}"
             ) from exc
+
+
+def main() -> int:
+    """Apply trust from the environment of the process Claude will inherit."""
+    if len(sys.argv) != 2:
+        print("usage: python -m purplemux_client.claude_trust PROJECT", file=sys.stderr)
+        return 2
+    try:
+        ensure_claude_project_trust(sys.argv[1])
+    except (ValueError, WorkerFailure) as exc:
+        print(f"Claude project trust failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
