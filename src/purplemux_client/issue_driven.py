@@ -501,9 +501,21 @@ _MAX_SCENARIO_LIST_BYTES = 64_000
 _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
-def _work_item_plan_state_size(work_items: list[WorkItem]) -> int:
-    items = [item.as_json() for item in work_items]
-    seed = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+def _work_item_plan_state_size(
+    work_items: list[WorkItem], policy_issue: object, one_shot_issue: object
+) -> int:
+    items = [
+        {"issue": item.issue, "branch": item.branch}
+        if item.issue is not None
+        else item.as_json()
+        for item in work_items
+    ]
+    seed_value = {
+        "items": items,
+        "one_shot_issue": one_shot_issue,
+        "policy_issue": policy_issue,
+    }
+    seed = json.dumps(seed_value, ensure_ascii=False, separators=(",", ":"))
     payload = {
         "version": 1,
         "seed_sha256": hashlib.sha256(seed.encode()).hexdigest(),
@@ -730,7 +742,10 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                     work_items.append(WorkItem(id=item_id, task=task))
         if (
             len(work_items) == len(raw_items)
-            and _work_item_plan_state_size(work_items) > _MAX_WORK_ITEM_PLAN_STATE_BYTES
+            and _work_item_plan_state_size(
+                work_items, value.get("policy_issue"), value.get("one_shot_issue")
+            )
+            > _MAX_WORK_ITEM_PLAN_STATE_BYTES
         ):
             findings.append(
                 IssueDrivenFinding(

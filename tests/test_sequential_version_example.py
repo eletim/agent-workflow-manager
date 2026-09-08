@@ -192,8 +192,11 @@ def test_scenario_gate_prompt_selects_and_compares_human_scenarios() -> None:
         "Failure: malformed scenarios are rejected.",
     )
     pr = open_pr(head="dev/v1", base="main", draft=True)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
 
-    prompt = workflow["scenario_gate_prompt"](pr)
+    prompt = workflow["scenario_gate_prompt"](pr, config, config.issues)
 
     assert pr.base_sha in prompt
     assert pr.head_sha in prompt
@@ -204,6 +207,47 @@ def test_scenario_gate_prompt_selects_and_compares_human_scenarios() -> None:
     assert "1. Existing:" in prompt
     assert "2. New:" in prompt
     assert "3. Failure:" in prompt
+
+
+def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    prompt_globals = workflow["scenario_gate_prompt"].__globals__
+    prompt_globals["SCENARIOS"] = ("New: dynamically planned behavior works.",)
+    issue_type = workflow["Issue"]
+    revised_task = "Publish the revised dynamically planned release notes."
+    work_items = (
+        issue_type(91, "feature/custom-91"),
+        workflow["planner_inline_issue"]("release-notes", revised_task),
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        work_items,
+        "true",
+    )
+    one_shot_items = (work_items[1],)
+    one_shot_config = replace(config, issues=one_shot_items, one_shot_issue=169)
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+
+    dynamic_prompts = (
+        workflow["scenario_gate_prompt"](pr, config, work_items),
+        workflow["whole_version_review_prompt"](pr, config, work_items),
+    )
+
+    for prompt in dynamic_prompts:
+        assert "GitHub Issue #91, branch feature/custom-91" in prompt
+        assert "Mini task release-notes" in prompt
+        assert revised_task in prompt
+
+    one_shot_prompts = (
+        workflow["scenario_gate_prompt"](pr, one_shot_config, one_shot_items),
+        workflow["whole_version_review_prompt"](pr, one_shot_config, one_shot_items),
+    )
+    for prompt in one_shot_prompts:
+        assert revised_task in prompt
+        assert "One-shot source: GitHub Issue #169" in prompt
 
 
 def test_all_review_phases_share_decision_parser() -> None:
@@ -1597,7 +1641,7 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
     _, delivery = workflow["review_whole_version"](
-        config, object(), Repository(), GitHub(), current_pr
+        config, object(), Repository(), GitHub(), current_pr, config.issues
     )
 
     assert delivery.outcome == "approved"
@@ -1747,7 +1791,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     )
 
     pr, delivery = workflow["review_whole_version"](
-        config, object(), Repository(), GitHub(), current_pr
+        config, object(), Repository(), GitHub(), current_pr, config.issues
     )
 
     assert pr.is_draft is True

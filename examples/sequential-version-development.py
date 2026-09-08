@@ -79,6 +79,8 @@ HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
 HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
 MAX_HUMAN_HANDOFF_CHARS = 12_000
 WORK_ITEM_PLAN_MARKER = "agent-workflow-manager:work-item-plan:"
+MAX_PLANNER_POLICY_CONFLICTS = 3
+MAX_POLICY_CONFLICT_DETAIL_CHARS = 500
 
 
 @dataclass(frozen=True)
@@ -250,6 +252,12 @@ class ReviewDelivery:
     base_sha: str
     reviews: int = 0
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlannerDecision:
+    complete: bool
+    policy_conflicts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -465,7 +473,9 @@ def decision(result: str) -> str:
     )
 
 
-def policy_context(config: Config, *, scope: str) -> str:
+def policy_context(
+    config: Config, *, scope: str, structured_conflicts: bool = False
+) -> str:
     """Return agent guidance without changing prompts when no policy is set."""
     if config.policy_issue is None:
         return ""
@@ -477,13 +487,20 @@ def policy_context(config: Config, *, scope: str) -> str:
             "\nKnown policy conflicts recovered or detected earlier in this workflow:"
             f"{known_conflicts}\n"
         )
+    conflict_instruction = (
+        "If you find a clear conflict, continue by following the implementation "
+        "Issue and include a concise description in the policy_conflicts array "
+        "of the required JSON response. Otherwise return an empty array."
+        if structured_conflicts
+        else f"""If you find a clear conflict, continue by following the implementation
+Issue and include a line starting with {POLICY_CONFLICT_MARKER} that truthfully
+describes the conflict."""
+    )
     return f"""Before doing anything else, run `gh issue view {config.policy_issue}
 --repo {config.slug}` and read policy Issue #{config.policy_issue}. Treat it as
 the version-wide design context for {scope},
 not as a workflow DSL or a source of ordering, retry, or merge behavior. The
-implementation work item remains the primary requirement. If you find a clear
-conflict, continue by following the implementation Issue and include a line
-starting with {POLICY_CONFLICT_MARKER} that truthfully describes the conflict.
+implementation work item remains the primary requirement. {conflict_instruction}
 {known_conflicts}
 
 """
@@ -1645,9 +1662,9 @@ def process_issue(
     return merged.pr
 
 
-def planner_work_item_json(issue: Issue) -> int | dict[str, str]:
+def planner_work_item_json(issue: Issue) -> dict[str, int | str]:
     if issue.number is not None:
-        return issue.number
+        return {"issue": issue.number, "branch": issue.branch}
     assert issue.task_id is not None and issue.task is not None
     return {"id": issue.task_id, "task": issue.task}
 
@@ -1679,8 +1696,11 @@ Integration branch: {config.integration_branch}
 Processed work items: {json.dumps(processed, ensure_ascii=False)}
 Pending work items: {json.dumps(remaining, ensure_ascii=False)}
 
-Return exactly one JSON object with keys "actions" and "complete". Actions run
-in order and have one of these exact shapes:
+Return exactly one JSON object with keys "actions", "complete", and
+"policy_conflicts". policy_conflicts must be an array containing at most
+{MAX_PLANNER_POLICY_CONFLICTS} concise strings of at most
+{MAX_POLICY_CONFLICT_DETAIL_CHARS} characters each, and must be empty when no
+conflict exists. Actions run in order and have one of these exact shapes:
 - {{"action":"add","item":123}}
 - {{"action":"add","item":{{"id":"task-id","task":"instruction"}}}}
 - {{"action":"update","key":"task-id","task":"revised instruction"}}
@@ -1744,21 +1764,61 @@ def planner_added_issue(value: object) -> Issue:
     return planner_inline_issue(value["id"], value["task"])
 
 
-def apply_planner_decision(plan: WorkItemPlan, source: str) -> bool:
+def persisted_work_item(value: object) -> Issue:
+    if isinstance(value, dict) and set(value) == {"issue", "branch"}:
+        number = value["issue"]
+        branch = value["branch"]
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or not isinstance(branch, str)
+            or not branch
+            or branch != branch.strip()
+            or "\0" in branch
+        ):
+            raise WorkerFailure("persisted GitHub Issue work item is invalid")
+        return Issue(number, branch)
+    return planner_added_issue(value)
+
+
+def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     try:
         decision = json.loads(source)
     except json.JSONDecodeError as exc:
         raise WorkerFailure(f"planner returned invalid JSON: {exc.msg}") from exc
-    if not isinstance(decision, dict) or set(decision) != {"actions", "complete"}:
-        raise WorkerFailure("planner decision must contain only actions and complete")
+    expected_fields = {"actions", "complete", "policy_conflicts"}
+    if not isinstance(decision, dict) or set(decision) != expected_fields:
+        raise WorkerFailure(
+            "planner decision must contain only actions, complete, and "
+            "policy_conflicts"
+        )
     actions = decision["actions"]
     complete = decision["complete"]
+    policy_conflicts = decision["policy_conflicts"]
     if (
         not isinstance(actions, list)
         or len(actions) > MAX_PLANNER_ACTIONS
         or not isinstance(complete, bool)
+        or not isinstance(policy_conflicts, list)
+        or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
     ):
-        raise WorkerFailure("planner decision has invalid actions or complete value")
+        raise WorkerFailure("planner decision has invalid bounded values")
+    for conflict in policy_conflicts:
+        conflict_has_surrogate = isinstance(conflict, str) and any(
+            0xD800 <= ord(character) <= 0xDFFF for character in conflict
+        )
+        if (
+            not isinstance(conflict, str)
+            or not conflict
+            or conflict != conflict.strip()
+            or "\0" in conflict
+            or len(conflict) > MAX_POLICY_CONFLICT_DETAIL_CHARS
+            or conflict_has_surrogate
+        ):
+            raise WorkerFailure("planner policy conflict is invalid")
+    if policy_conflicts and plan.config.policy_issue is None:
+        raise WorkerFailure("planner reported a policy conflict without a policy Issue")
 
     candidate = WorkItemPlan(plan.config)
     candidate.items = list(plan.items)
@@ -1796,13 +1856,15 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> bool:
     validate_work_item_plan_capacity(candidate)
     plan.items = candidate.items
     plan.finalized = complete
-    return complete
+    return PlannerDecision(complete, tuple(policy_conflicts))
 
 
 def plan_seed_fingerprint(config: Config) -> str:
-    seed_value: object = [planner_work_item_json(issue) for issue in config.issues]
-    if config.one_shot_issue is not None:
-        seed_value = {"one_shot_issue": config.one_shot_issue, "items": seed_value}
+    seed_value = {
+        "items": [planner_work_item_json(issue) for issue in config.issues],
+        "one_shot_issue": config.one_shot_issue,
+        "policy_issue": config.policy_issue,
+    }
     seed = json.dumps(
         seed_value,
         ensure_ascii=False,
@@ -1904,7 +1966,7 @@ def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
         raise WorkerFailure("Base PR work-item plan recovery values are invalid")
     plan = WorkItemPlan(config)
     try:
-        plan.items = [planner_added_issue(item) for item in items]
+        plan.items = [persisted_work_item(item) for item in items]
         plan._validate(plan.items)
     except ValueError as exc:
         raise WorkerFailure(f"Base PR work-item plan is invalid: {exc}") from exc
@@ -1963,6 +2025,7 @@ def prepare_work_item_plan_pr(
             plan.finalized = True
         if not plan.finalized:
             raise WorkerFailure("merged final PR has an unfinished work-item plan")
+        rehydrate_policy_conflicts(merged.body, config, issue_number=None)
         return merged, plan
     if pr is None:
         initial_plan = WorkItemPlan(config)
@@ -1999,6 +2062,7 @@ def prepare_work_item_plan_pr(
         expected_base_sha=final.remote_sha,
         draft=True,
     )
+    rehydrate_policy_conflicts(pr.body, config, issue_number=None)
     emit_run_pr(pr.number, pr.url)
     return pr, plan
 
@@ -2091,13 +2155,23 @@ def process_work_items(
             client,
             planner,
             "Work-item planning",
-            policy_context(config, scope="work-item planning")
+            policy_context(
+                config, scope="work-item planning", structured_conflicts=True
+            )
             + planner_prompt(plan, config),
             iteration=planner_turn,
         )
-        complete = apply_planner_decision(plan, decision)
+        planner_decision = apply_planner_decision(plan, decision)
+        for conflict in planner_decision.policy_conflicts:
+            record_policy_conflict(
+                None,
+                f"Policy Issue #{config.policy_issue} conflicts with work-item "
+                f"planning: {conflict}; continuing with the implementation work "
+                "item as the primary requirement.",
+            )
+        plan_pr = ensure_base_pr_policy_notes(github, plan_pr, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
-        if complete:
+        if planner_decision.complete:
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
@@ -2128,7 +2202,31 @@ def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
         raise WorkerFailure(failure)
 
 
-def scenario_gate_prompt(pr: PullRequestState) -> str:
+def final_work_item_context(config: Config, work_items: tuple[Issue, ...]) -> str:
+    items = "\n".join(
+        (
+            f"- GitHub Issue #{item.number}, branch {item.branch}"
+            if item.number is not None
+            else f"- {item.label}, branch {item.branch}: {item.task}"
+        )
+        for item in work_items
+    ) or "- none"
+    one_shot = (
+        f"One-shot source: GitHub Issue #{config.one_shot_issue}."
+        if config.one_shot_issue is not None
+        else "One-shot source: none."
+    )
+    return f"""Authoritative final work-item plan:
+{items}
+{one_shot}
+Read each listed GitHub Issue and the one-shot source, when present, with
+`gh issue view NUMBER --repo {config.slug}` before judging its requirements.
+Inline mini-task text above is authoritative."""
+
+
+def scenario_gate_prompt(
+    pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
+) -> str:
     """Build the AI-judged Before/After gate from human-authored scenarios."""
     scenario_list = "\n".join(
         f"{index}. {scenario}" for index, scenario in enumerate(SCENARIOS, 1)
@@ -2137,6 +2235,8 @@ def scenario_gate_prompt(pr: PullRequestState) -> str:
 After commit {pr.head_sha}. The human-authored scenario list is below.
 
 {scenario_list}
+
+{final_work_item_context(config, work_items)}
 
 Select a small, risk-relevant subset; executing every scenario is not required.
 The subset may cover existing behavior, new behavior, and failure behavior. For
@@ -2150,12 +2250,29 @@ followed by the selected scenarios, Before/After evidence, and actionable
 findings. Do not mutate files or PR state."""
 
 
+def whole_version_review_prompt(
+    pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
+) -> str:
+    return (
+        f"Review the whole version at exact head {pr.head_sha} against final "
+        f"base {pr.base_sha}. Examine integration consistency across Issues, "
+        "duplication between their implementations, cross-feature interactions "
+        "and regressions, and whether shared versus feature-specific "
+        "responsibilities are placed at the right boundaries. Also review the "
+        "combined version for correctness, safety, and missing integration "
+        "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
+        "actionable findings; do not mutate anything.\n\n"
+        + final_work_item_context(config, work_items)
+    )
+
+
 def review_whole_version(
     config: Config,
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
     pr: PullRequestState,
+    work_items: tuple[Issue, ...],
 ) -> tuple[PullRequestState, ReviewDelivery]:
     """Review, fix, and check the whole version as one outline-level phase."""
     fixer = create_agent(
@@ -2189,7 +2306,7 @@ def review_whole_version(
                 scenario_reviewer,
                 "Scenario Gate reviewer turn",
                 policy_context(config, scope="the whole-version Scenario Gate")
-                + scenario_gate_prompt(pr),
+                + scenario_gate_prompt(pr, config, work_items),
                 iteration=review_number,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
@@ -2231,14 +2348,7 @@ def review_whole_version(
                 reviewer,
                 "Whole-version reviewer turn",
                 policy_context(config, scope="the whole-version review")
-                + f"Review the whole version at exact head {pr.head_sha} against final "
-                f"base {pr.base_sha}. Examine integration consistency across Issues, "
-                "duplication between their implementations, cross-feature interactions "
-                "and regressions, and whether shared versus feature-specific "
-                "responsibilities are placed at the right boundaries. Also review the "
-                "combined version for correctness, safety, and missing integration "
-                "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
-                "actionable findings; do not mutate anything.",
+                + whole_version_review_prompt(pr, config, work_items),
                 iteration=review_number,
             )
         emit_policy_conflicts(result, config, scope="the integrated version")
@@ -2495,7 +2605,9 @@ def integration_delivery(
     if FINAL_REVIEW:
         pr, delivery = run_outline_step(
             "Whole-version review",
-            lambda: review_whole_version(config, client, repo, github, pr),
+            lambda: review_whole_version(
+                config, client, repo, github, pr, work_items
+            ),
         )
         pr = ensure_base_pr_policy_notes(github, pr, config)
     else:

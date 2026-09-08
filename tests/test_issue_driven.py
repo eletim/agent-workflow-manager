@@ -487,6 +487,30 @@ def test_one_shot_source_issue_is_part_of_recovery_identity() -> None:
     ](second_config)
 
 
+def test_plan_recovery_fails_closed_when_policy_or_seed_branch_changes() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config_type = workflow["Config"]
+    issue_type = workflow["Issue"]
+    original = config_type(
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/custom-90"),),
+        "true",
+        200,
+    )
+    body = workflow["with_work_item_plan"](
+        "Base PR", workflow["WorkItemPlan"](original)
+    )
+
+    changed_policy = replace(original, policy_issue=201)
+    changed_branch = replace(original, issues=(issue_type(90, "feature/another-90"),))
+    for changed in (changed_policy, changed_branch):
+        with pytest.raises(WorkerFailure, match="does not match the workflow seed"):
+            workflow["work_item_plan_from_body"](body, changed)
+
+
 def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> None:
     workflow = load_generated_workflow(one_shot_issue=169)
     config = workflow["Config"](
@@ -506,9 +530,10 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
                         }
                     ],
                     "complete": False,
+                    "policy_conflicts": [],
                 }
             ),
-            json.dumps({"actions": [], "complete": True}),
+            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
         )
     )
     processed: list[object] = []
@@ -555,12 +580,45 @@ def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
                 {
                     "actions": [{"action": "add", "item": 169}],
                     "complete": False,
+                    "policy_conflicts": [],
                 }
             ),
         )
 
     assert plan.snapshot == ()
     assert plan.position == 0
+
+
+def test_planner_policy_conflicts_use_a_bounded_json_contract() -> None:
+    workflow = load_generated_workflow(issues=[90], policy_issue=200)
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (workflow["Issue"](90, "feature/issue-90"),),
+        "true",
+        200,
+    )
+    context = workflow["policy_context"](
+        config, scope="work-item planning", structured_conflicts=True
+    )
+    prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
+
+    assert "policy_conflicts array" in context
+    assert "starting with POLICY_CONFLICT:" not in context
+    assert 'keys "actions", "complete", and\n"policy_conflicts"' in prompt
+    with pytest.raises(WorkerFailure, match="planner policy conflict is invalid"):
+        workflow["apply_planner_decision"](
+            workflow["WorkItemPlan"](config),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": False,
+                    "policy_conflicts": ["x" * 501],
+                }
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -588,6 +646,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
                 }
             ],
             "complete": False,
+            "policy_conflicts": [],
         }
     )
 
@@ -706,8 +765,18 @@ def test_scenario_list_boundary_produces_dispatchable_gate_prompt() -> None:
         exec(compile(code, "<generated-scenario-boundary>", "exec"), module.__dict__)
     finally:
         del sys.modules[module_name]
+    runtime_config = module.__dict__["Config"](
+        Path("/repo"),
+        "acme/project",
+        config.integration_branch,
+        config.final_branch,
+        (module.__dict__["Issue"](90, "feature/issue-90"),),
+        "true",
+    )
     prompt = module.__dict__["scenario_gate_prompt"](
-        topology_pr(head_sha="h" * 40, base_sha="b" * 40)
+        topology_pr(head_sha="h" * 40, base_sha="b" * 40),
+        runtime_config,
+        runtime_config.issues,
     )
 
     assert _MAX_SCENARIO_LIST_BYTES < len(prompt.encode()) < 66_000
@@ -1262,16 +1331,18 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
                         {"action": "add", "item": 91},
                     ],
                     "complete": False,
+                    "policy_conflicts": [],
                 }
             ),
             json.dumps(
                 {
                     "actions": [{"action": "add", "item": 92}],
                     "complete": False,
+                    "policy_conflicts": [],
                 }
             ),
-            json.dumps({"actions": [], "complete": False}),
-            json.dumps({"actions": [], "complete": True}),
+            json.dumps({"actions": [], "complete": False, "policy_conflicts": []}),
+            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
         )
     )
     workflow["create_agent"] = lambda *args, **kwargs: "planner"
@@ -1319,6 +1390,7 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
                         {"action": "replace", "key": 90},
                     ],
                     "complete": False,
+                    "policy_conflicts": [],
                 }
             ),
         )
@@ -1348,7 +1420,8 @@ def test_planner_rejects_oversized_plan_transactionally() -> None:
 
     with pytest.raises(WorkerFailure, match="recovery state exceeds"):
         workflow["apply_planner_decision"](
-            plan, json.dumps({"actions": actions, "complete": False})
+            plan,
+            json.dumps({"actions": actions, "complete": False, "policy_conflicts": []}),
         )
 
     assert [issue.key for issue in plan.snapshot] == [90]
@@ -1404,6 +1477,7 @@ def test_planner_persists_undispatched_addition_before_interruption() -> None:
                 {"action": "add", "item": {"id": "recovery-test", "task": task}}
             ],
             "complete": False,
+            "policy_conflicts": [],
         }
     )
     stored_body = "Base PR"
@@ -1438,6 +1512,120 @@ def test_planner_persists_undispatched_addition_before_interruption() -> None:
     assert recovered.remaining[0].task == task
     with pytest.raises(WorkerFailure, match="missing work-item plan"):
         workflow["work_item_plan_from_body"]("Base PR", config)
+
+
+def test_custom_issue_branch_round_trips_through_plan_recovery() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue = workflow["Issue"](90, "feature/custom-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.take_next()
+    body = workflow["with_work_item_plan"]("Base PR", plan)
+
+    recovered = workflow["work_item_plan_from_body"](body, config)
+
+    assert recovered.position == 1
+    assert recovered.snapshot[0].number == 90
+    assert recovered.snapshot[0].branch == "feature/custom-90"
+
+
+def test_planner_policy_conflict_is_persisted_before_dispatch_and_recovered() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[90], policy_issue=200)))
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-planner-policy>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    first = load_run("planner_policy_first")
+    issue = first["Issue"](90, "feature/issue-90")
+    config = first["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue,),
+        "true",
+        200,
+    )
+    plan = first["WorkItemPlan"](config)
+    current = replace(
+        topology_pr(head_branch=config.integration_branch),
+        base_branch=config.main_branch,
+        body=first["with_work_item_plan"]("Base PR", plan),
+    )
+
+    class GitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=str(kwargs["body"]))
+            return current
+
+    first["create_agent"] = lambda *args, **kwargs: "planner"
+    first["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {
+            "actions": [],
+            "complete": False,
+            "policy_conflicts": ["the policy requires a different owner"],
+        }
+    )
+    first["persist_work_item_plan"] = lambda active_plan, _config, _repo, github, pr: (
+        github.update_pr_body(
+            pr.number,
+            body=first["with_work_item_plan"](pr.body, active_plan),
+        )
+    )
+    first["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
+        RuntimeError("interrupted before dispatch")
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted before dispatch"):
+        first["process_work_items"](config, object(), object(), GitHub(), current, plan)
+
+    assert "agent-workflow-manager:policy-conflict:" in current.body
+    second = load_run("planner_policy_second")
+    second_config = second["Config"](
+        config.repo,
+        config.slug,
+        config.integration_branch,
+        config.main_branch,
+        (second["Issue"](90, "feature/issue-90"),),
+        config.check_command,
+        config.policy_issue,
+    )
+
+    class RecoveryRepository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, current.base_sha, current.base_sha, True)
+
+    class RecoveryGitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return current if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+    _, recovered = second["prepare_work_item_plan_pr"](
+        second_config, RecoveryRepository(), RecoveryGitHub()
+    )
+
+    assert recovered.position == 1
+    context = second["policy_context"](
+        second_config, scope="work-item planning", structured_conflicts=True
+    )
+    assert "different owner" in context
 
 
 @pytest.mark.parametrize("child_state", ["OPEN", "MERGED"])
@@ -1491,7 +1679,7 @@ def test_interrupted_dispatched_item_is_reinspected_before_planning(
 
     workflow["create_agent"] = lambda *args, **kwargs: "planner"
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
-        {"actions": [], "complete": False}
+        {"actions": [], "complete": False, "policy_conflicts": []}
     )
     workflow["persist_work_item_plan"] = persist
     workflow["process_issue"] = interrupted_child
@@ -1520,7 +1708,7 @@ def test_interrupted_dispatched_item_is_reinspected_before_planning(
     workflow["process_issue"] = reinspect
     workflow["create_agent"] = lambda *args, **kwargs: events.append("planner") or "p"
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
-        {"actions": [], "complete": True}
+        {"actions": [], "complete": True, "policy_conflicts": []}
     )
 
     workflow["process_work_items"](
