@@ -40,8 +40,14 @@ h2, label { font-size: 14px; font-weight: 650; }
 .runs-title { font-size: 14px; font-weight: 650; }
 #runs-empty { color: #737d91; font-size: 13px; }
 .runs-toggle-hint { margin-left: auto; color: #9ba3b5; font-size: 12px; }
-.run-list { display: grid; gap: 7px; margin-top: 10px; }
+.run-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  margin-top: 10px;
+}
 .run-item {
+  grid-column: 1;
   position: relative;
   width: 100%;
   padding-left: 32px;
@@ -51,6 +57,14 @@ h2, label { font-size: 14px; font-weight: 650; }
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+.run-check-toggle {
+  grid-column: 2;
+  flex: 0 0 auto;
+  min-width: 94px;
+  padding-inline: 12px;
+  color: #ffd66b;
+}
+.run-check-toggle.checked { color: #75e2a8; }
 .run-state-marker {
   position: absolute;
   top: 50%;

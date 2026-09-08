@@ -136,6 +136,55 @@ print(run_correlation("workspace"))
     assert first_values[0] != second_values[0]
 
 
+def test_terminal_run_checked_metadata_is_reversible_and_run_scoped(
+    runner: PythonRunner,
+) -> None:
+    first_id = runner.start("print('first')")
+    first = wait_for(runner, lambda item: item.state == "success", run_id=first_id)
+    assert first.checked is False
+    assert first.as_json()["checked"] is False
+
+    checked = runner.set_checked(first_id, True)
+    assert checked.checked is True
+    assert checked.state == "success"
+
+    second_id = runner.start("print('second')")
+    second = wait_for(runner, lambda item: item.state == "success", run_id=second_id)
+    assert second.checked is False
+    assert runner.snapshot(first_id).checked is True
+    assert [item.as_summary_json()["checked"] for item in runner.snapshots()] == [
+        True,
+        False,
+    ]
+
+    unchecked = runner.set_checked(first_id, False)
+    assert unchecked.checked is False
+    assert unchecked.state == "success"
+
+
+@pytest.mark.parametrize("terminal_state", ["success", "failed", "stopped"])
+def test_checked_metadata_does_not_change_terminal_state(
+    runner: PythonRunner, terminal_state: str
+) -> None:
+    code = {
+        "success": "print('done')",
+        "failed": "raise RuntimeError('failed')",
+        "stopped": "import time; time.sleep(60)",
+    }[terminal_state]
+    run_id = runner.start(code)
+    if terminal_state == "stopped":
+        assert runner.stop(run_id) is True
+    terminal = wait_for(
+        runner, lambda item: item.state == terminal_state, run_id=run_id
+    )
+
+    checked = runner.set_checked(run_id, True)
+
+    assert checked.state == terminal.state
+    assert checked.exit_code == terminal.exit_code
+    assert checked.checked is True
+
+
 def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
     first_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     second_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
@@ -1538,6 +1587,7 @@ def test_runner_http_lifecycle(
         "resources": [],
         "resourceCleanupStatus": "cleaned",
         "cleanupAvailable": True,
+        "checked": False,
     }
 
 
@@ -1764,6 +1814,61 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
+
+
+def test_run_api_updates_checked_metadata_only_for_terminal_run(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "import time; time.sleep(0.1)"}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    assert started["checked"] is False
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 409
+    assert "only terminal runs" in str(rejected["error"])
+
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, checked = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 200
+    assert checked["checked"] is True
+    assert checked["state"] == "success"
+    assert request(address, "GET", f"/api/runs/{run_id}")[1]["checked"] is True
+    assert request(address, "GET", "/api/runs")[1]["runs"][0]["checked"] is True
+
+    status, unchecked = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": False}),
+        token=token,
+    )
+    assert status == 200
+    assert unchecked["checked"] is False
+    assert unchecked["state"] == "success"
 
 
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(

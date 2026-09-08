@@ -207,6 +207,10 @@ class RunCleanupInProgressError(RuntimeError):
     """Raised when cleanup is already active for the selected run."""
 
 
+class RunCheckNotAllowedError(RuntimeError):
+    """Raised when human-review metadata is set on a non-terminal run."""
+
+
 class RunStopUncertainError(RuntimeError):
     """Raised when PurpleMux cannot prove that a stopped Workflow terminated."""
 
@@ -304,6 +308,7 @@ class RunnerSnapshot:
     code: str | None = None
     prompt: PromptExecution | None = None
     integration_pr: PullRequestNavigation | None = None
+    checked: bool = False
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -364,6 +369,7 @@ class RunnerSnapshot:
             "attempts": len(self.attempts),
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
+            "checked": self.checked,
         }
         if self.prompt is not None:
             payload["prompt"] = {
@@ -424,6 +430,7 @@ class _RunRecord:
     credential_path: Path | None = None
     event_token: str | None = None
     integration_pr: PullRequestNavigation | None = None
+    checked: bool = False
 
 
 class PythonRunner:
@@ -1182,7 +1189,23 @@ class PythonRunner:
             resources=tuple(run.resources),
             prompt=run.prompt,
             integration_pr=run.integration_pr,
+            checked=run.checked,
         )
+
+    def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
+        """Set human-review metadata without changing execution state."""
+        if not isinstance(checked, bool):
+            raise TypeError("checked must be a boolean")
+        with self._lock:
+            run = self._get_run(run_id)
+            if run.state not in ("success", "failed", "stopped"):
+                raise RunCheckNotAllowedError(
+                    f"run {run_id} is {run.state}; only terminal runs can be checked"
+                )
+            if run.checked != checked:
+                run.checked = checked
+                self._mark_changed()
+            return self._snapshot_run(run)
 
     def _get_run(self, run_id: int) -> _RunRecord:
         try:
