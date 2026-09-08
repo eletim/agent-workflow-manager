@@ -54,14 +54,23 @@ optional; every other field is required.
 | `integration_branch` | string | Existing remote/integration branch used as the development base. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `issues` | array of integers | Positive, unique Issue numbers, executed in the listed order. |
-| `max_reviews` | integer | Review limit from 1 through 100; use 5 unless the user requests another value. |
+| `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; use 5 unless the user requests another value. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
-| `merge_to_integration` | boolean | Whether each approved Issue PR is merged into the integration branch. |
+| `merge_to_integration` | boolean | Whether each reviewed Issue PR is merged into the integration branch, including explicit warning continuation. |
 | `final_review` | boolean | Whether the completed integration branch receives a final review. |
 | `merge_final` | boolean | Whether final delivery is automatically merged into `final_branch`. |
 
 Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
+
+Each implementation Issue is reviewed in two ordered phases. A fixed internal
+limit of three Scope / Design reviews checks that the change is necessary,
+sufficient, minimal, and placed within the right responsibilities. After that
+phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
+safety, regressions, and tests. The counters and outcomes are independent. A
+phase that exhausts its limit may continue with an explicit warning after exact
+clean, pushed PR topology is revalidated; it is never recorded as approved.
+Whole-version Review remains a separate integration and cross-Issue review.
 
 ## Canonical example
 
