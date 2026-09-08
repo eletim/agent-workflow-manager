@@ -292,7 +292,7 @@ def test_claude_trust_runs_in_a_purplemux_terminal_before_provider_creation(
     shell_request = events[0]
     assert isinstance(shell_request, ShellCommandRequest)
     assert shell_request.cwd == "/workspace/project"
-    assert "-m purplemux_client.claude_trust /workspace/project" in (
+    assert "-I -m purplemux_client.claude_trust /workspace/project" in (
         shell_request.command
     )
     assert events[1:] == [

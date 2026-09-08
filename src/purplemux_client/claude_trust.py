@@ -269,7 +269,10 @@ def _trust_mutation_lock(path: Path, deadline: float) -> Iterator[None]:
 def main() -> int:
     """Apply trust from the environment of the process Claude will inherit."""
     if len(sys.argv) != 2:
-        print("usage: python -m purplemux_client.claude_trust PROJECT", file=sys.stderr)
+        print(
+            "usage: python -I -m purplemux_client.claude_trust PROJECT",
+            file=sys.stderr,
+        )
         return 2
     try:
         ensure_claude_project_trust(sys.argv[1])

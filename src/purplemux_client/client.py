@@ -783,6 +783,7 @@ class PurpleMuxCLIClient:
         command = shlex.join(
             [
                 sys.executable,
+                "-I",
                 "-m",
                 "purplemux_client.claude_trust",
                 launch_directory,

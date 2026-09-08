@@ -346,3 +346,54 @@ def test_refreshes_claude_state_lock_during_slow_mutation(
     ensure_claude_project_trust(str(project))
 
     assert not Path(f"{state_path}.lock").exists()
+
+
+def test_isolated_helper_does_not_import_workspace_python_modules(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "claude-config"
+    project = tmp_path / "untrusted-project"
+    project.mkdir()
+    site_marker = tmp_path / "sitecustomize-imported"
+    package_marker = tmp_path / "shadow-package-imported"
+    (project / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(site_marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    shadow_package = project / "purplemux_client"
+    shadow_package.mkdir()
+    (shadow_package / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(package_marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    (shadow_package / "claude_trust.py").write_text(
+        "raise RuntimeError('workspace helper shadow was imported')\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["HOME"] = str(home)
+    environment["CLAUDE_CONFIG_DIR"] = str(config)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "purplemux_client.claude_trust",
+            str(project),
+        ],
+        cwd=project,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert (completed.returncode, completed.stdout, completed.stderr) == (0, "", "")
+    assert not site_marker.exists()
+    assert not package_marker.exists()
+    state = json.loads((config / ".claude.json").read_text(encoding="utf-8"))
+    assert state["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
