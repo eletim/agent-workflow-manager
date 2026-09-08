@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -34,6 +35,8 @@ class IssueDrivenValidationError(ValueError):
 
 
 IssueTopologyClassification = Literal["new", "recoverable", "already_integrated"]
+INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ def classify_issue_topology(
     branch: str,
     integration_branch: str,
     integration_sha: str,
+    inline_task_fingerprint: str | None = None,
 ) -> IssueTopologyState:
     """Classify one Issue from authoritative remote Git and GitHub state."""
     try:
@@ -107,6 +111,8 @@ def classify_issue_topology(
             raise WorkerFailure(
                 f"ambiguous PR states from {branch} to {integration_branch}: {numbers}"
             )
+        for pr in matching:
+            _require_inline_task_fingerprint(pr, inline_task_fingerprint)
         if closed_pr is not None:
             raise WorkerFailure(
                 f"closed unmerged PR #{closed_pr.number} exists from {branch} "
@@ -191,6 +197,30 @@ def _work_item_label(issue: int | str) -> str:
     return f"Issue #{issue}" if isinstance(issue, int) else issue
 
 
+def _inline_task_fingerprints(body: str) -> tuple[str, ...]:
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    suffix = " -->"
+    lines = body.splitlines()
+    if not lines:
+        return ()
+    marker = lines[0].strip()
+    if not marker.startswith(prefix) or not marker.endswith(suffix):
+        return ()
+    return (marker[len(prefix) : -len(suffix)],)
+
+
+def _require_inline_task_fingerprint(
+    pr: PullRequestState, expected: str | None
+) -> None:
+    if expected is None:
+        return
+    if _inline_task_fingerprints(pr.body) != (expected,):
+        raise WorkerFailure(
+            f"PR #{pr.number} inline task fingerprint is missing or does not match "
+            "the declared task"
+        )
+
+
 def _commit_is_contained(
     github: _IssueGitHubRepository, commit_sha: str, branch_sha: str
 ) -> bool:
@@ -204,25 +234,42 @@ def inspect_issue_driven_topology(
     *,
     repo: str,
     integration_branch: str,
-    issues: tuple[tuple[int | str, str], ...],
+    issues: tuple[tuple[int | str, str] | tuple[int | str, str, str], ...],
     prospective_base_branch: str | None = None,
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
     _cwd: Path | None = None,
 ) -> tuple[IssueTopologyState, ...]:
     """Inspect all Issue branches and PRs before any workflow mutation."""
-    if not issues or any(
-        isinstance(number, bool)
-        or not isinstance(number, (int, str))
-        or (isinstance(number, int) and number < 1)
-        or (isinstance(number, str) and not number.strip())
-        or not isinstance(branch, str)
-        or not branch
-        for number, branch in issues
-    ):
+    normalized: list[tuple[int | str, str, str | None]] = []
+    for declaration in issues:
+        if not isinstance(declaration, tuple) or len(declaration) not in (2, 3):
+            raise ValueError("issues must contain work-item declarations")
+        number, branch = declaration[:2]
+        fingerprint = declaration[2] if len(declaration) == 3 else None
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, str))
+            or (isinstance(number, int) and number < 1)
+            or (isinstance(number, str) and not number.strip())
+            or not isinstance(branch, str)
+            or not branch
+            or (
+                fingerprint is not None
+                and (
+                    not isinstance(fingerprint, str)
+                    or _SHA256.fullmatch(fingerprint) is None
+                )
+            )
+            or (isinstance(number, str) and fingerprint is None)
+            or (isinstance(number, int) and fingerprint is not None)
+        ):
+            raise ValueError("issues must contain valid work-item declarations")
+        normalized.append((number, branch, fingerprint))
+    if not normalized:
         raise ValueError("issues must contain work-item identifiers and branches")
-    numbers = tuple(number for number, _branch in issues)
-    branches = tuple(branch for _number, branch in issues)
+    numbers = tuple(number for number, _branch, _fingerprint in normalized)
+    branches = tuple(branch for _number, branch, _fingerprint in normalized)
     if len(set(numbers)) != len(numbers) or len(set(branches)) != len(branches):
         raise ValueError("work-item identifiers and feature branches must be unique")
     if integration_branch in branches:
@@ -286,8 +333,9 @@ def inspect_issue_driven_topology(
             branch=branch,
             integration_branch=integration_branch,
             integration_sha=integration_sha,
+            inline_task_fingerprint=fingerprint,
         )
-        for number, branch in issues
+        for number, branch, fingerprint in normalized
     )
     if (
         repository.inspect_remote_branches((integration_branch, *branches))
@@ -323,6 +371,7 @@ def _pr_topology(
                 pr.base_repository.lower(),
                 pr.base_branch,
                 pr.base_sha,
+                _inline_task_fingerprints(pr.body),
             )
             for pr in snapshot.pull_requests
         )
@@ -334,6 +383,12 @@ class WorkItem:
     issue: int | None = None
     id: str | None = None
     task: str | None = None
+
+    @property
+    def task_fingerprint(self) -> str | None:
+        if self.task is None:
+            return None
+        return hashlib.sha256(self.task.encode()).hexdigest()
 
     @property
     def branch(self) -> str:
@@ -703,7 +758,10 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         (
             f"Issue({item.issue}, {item.branch!r})"
             if item.issue is not None
-            else f"Issue(None, {item.branch!r}, {item.id!r}, {item.task!r})"
+            else (
+                f"Issue(None, {item.branch!r}, {item.id!r}, {item.task!r}, "
+                f"{item.task_fingerprint!r})"
+            )
         )
         for item in config.work_items
     )
@@ -726,7 +784,14 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
     )
 """
     topology_issues = ",\n        ".join(
-        f"({item.issue if item.issue is not None else f'Mini task {item.id}'!r}, {item.branch!r})"
+        (
+            f"({item.issue!r}, {item.branch!r})"
+            if item.issue is not None
+            else (
+                f"({f'Mini task {item.id}'!r}, {item.branch!r}, "
+                f"{item.task_fingerprint!r})"
+            )
+        )
         for item in config.work_items
     )
     prospective = config.final_branch if config.make_integration_branch else None

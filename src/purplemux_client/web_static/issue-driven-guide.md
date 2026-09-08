@@ -138,10 +138,12 @@ To mix a GitHub Issue with a workflow-local task, replace `issues` with
 ```
 
 The generated Python embeds the mini-task instruction and uses the deterministic
-branch `feature/work-item-refresh-run-help`. Implementers and both review phases
-receive that embedded instruction instead of running `gh issue view`. GitHub
-Issue work items continue to use `feature/issue-N` and read Issue `N` with `gh`.
-Both forms use the same recovery, Draft PR, review, and delivery functions.
+branch `feature/work-item-refresh-run-help`. Its recovery declaration and Draft
+PR record the SHA-256 fingerprint of the authoritative task text, and recovery
+fails if the PR fingerprint is missing or different. Implementers and both review
+phases receive that embedded instruction instead of running `gh issue view`.
+GitHub Issue work items continue to use `feature/issue-N` and read Issue `N` with
+`gh`. Both forms use the same recovery, Draft PR, review, and delivery functions.
 
 Work-item order is significant and must be preserved. Here, `merge_final: false`
 means the final PR is prepared but `main` is not automatically merged. It is

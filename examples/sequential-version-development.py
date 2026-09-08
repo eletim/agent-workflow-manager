@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,7 @@ IMPLEMENTATION_PRINCIPLE = (
 )
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
+INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
 POLICY_CONFLICT_WARNINGS: list[tuple[int | str | None, str]] = []
 HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
 HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
@@ -77,6 +79,26 @@ class Issue:
     branch: str
     task_id: str | None = None
     task: str | None = None
+    task_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.number is not None:
+            if any(
+                value is not None
+                for value in (self.task_id, self.task, self.task_fingerprint)
+            ):
+                raise ValueError("GitHub Issues cannot include inline task metadata")
+            return
+        if None in (self.task_id, self.task, self.task_fingerprint):
+            raise ValueError("inline tasks require an ID, task, and fingerprint")
+        assert self.task_id is not None
+        assert self.task is not None
+        assert self.task_fingerprint is not None
+        actual = hashlib.sha256(self.task.encode()).hexdigest()
+        if self.task_fingerprint != actual:
+            raise ValueError("inline task fingerprint does not match its task")
+        if self.branch != f"feature/work-item-{self.task_id}":
+            raise ValueError("inline task branch does not match its ID")
 
     @property
     def label(self) -> str:
@@ -106,6 +128,17 @@ class Issue:
             )
         assert self.task is not None
         return f"The following inline mini task is authoritative:\n\n{self.task}"
+
+    @property
+    def pr_body(self) -> str:
+        body = f"Sequential implementation of {self.label}."
+        if self.task_fingerprint is None:
+            return body
+        assert self.task is not None
+        return (
+            f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{self.task_fingerprint} -->\n\n"
+            f"{body}\n\nInline task:\n\n{self.task}"
+        )
 
 
 @dataclass(frozen=True)
@@ -805,6 +838,27 @@ APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
     return implementation, scope_review, correctness_review
 
 
+def require_inline_task_pr_identity(
+    pr: PullRequestState, issue: Issue
+) -> PullRequestState:
+    if issue.task_fingerprint is None:
+        return pr
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    suffix = " -->"
+    lines = pr.body.splitlines()
+    marker = lines[0].strip() if lines else ""
+    if (
+        not marker.startswith(prefix)
+        or not marker.endswith(suffix)
+        or marker[len(prefix) : -len(suffix)] != issue.task_fingerprint
+    ):
+        raise WorkerFailure(
+            f"PR #{pr.number} inline task fingerprint is missing or does not match "
+            "the declared task"
+        )
+    return pr
+
+
 def prepare_issue(
     repo: GitRepository,
     github: GitHubRepository,
@@ -812,10 +866,13 @@ def prepare_issue(
     config: Config,
 ) -> tuple[PullRequestState | None, str, bool] | PullRequestState:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
+    if open_pr is not None:
+        require_inline_task_pr_identity(open_pr, issue)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
     )
     if merged is not None:
+        require_inline_task_pr_identity(merged, issue)
         if open_pr is not None:
             raise WorkerFailure("merged Issue also has an open same-head PR")
         emit_finding(
@@ -902,17 +959,20 @@ def ensure_issue_pr(
             expected_head_sha=feature.remote_sha,
             expected_base_sha=expected_base_sha,
             title=issue.label,
-            body=f"Sequential implementation of {issue.label}.",
+            body=issue.pr_body,
             correlation_id=run_correlation(f"{issue.correlation_id}-pr"),
         )
-    return github.require_pr(
-        number=pr.number,
-        head=issue.branch,
-        base=config.integration_branch,
-        state="OPEN",
-        expected_head_sha=feature.remote_sha,
-        expected_base_sha=expected_base_sha,
-        draft=True,
+    return require_inline_task_pr_identity(
+        github.require_pr(
+            number=pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=feature.remote_sha,
+            expected_base_sha=expected_base_sha,
+            draft=True,
+        ),
+        issue,
     )
 
 

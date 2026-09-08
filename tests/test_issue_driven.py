@@ -53,6 +53,8 @@ def topology_pr(
     state: str = "OPEN",
     head_sha: str = "f" * 40,
     base_sha: str = "b" * 40,
+    head_branch: str = "feature/issue-158",
+    body: str = "",
 ) -> PullRequestState:
     return PullRequestState(
         number,
@@ -60,7 +62,7 @@ def topology_pr(
         state,  # type: ignore[arg-type]
         True,
         "acme/project",
-        "feature/issue-158",
+        head_branch,
         head_sha,
         "acme/project",
         "dev/v1",
@@ -69,7 +71,7 @@ def topology_pr(
         False,
         None,
         f"PR_{number}",
-        "",
+        body,
     )
 
 
@@ -187,6 +189,34 @@ def test_issue_topology_classifies_authoritatively_integrated_head() -> None:
     )
 
     assert result.classification == "already_integrated"
+
+
+@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
+def test_inline_task_topology_rejects_pr_fingerprint_mismatch(state: str) -> None:
+    expected = "a" * 64
+    branch = "feature/work-item-refresh-run-help"
+    pr = topology_pr(
+        state=state,
+        head_branch=branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    repository = SimpleNamespace(
+        inspect_branch=lambda _branch: BranchState(
+            branch, None, "f" * 40 if state == "OPEN" else None, False
+        )
+    )
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        classify_issue_topology(
+            repository,
+            TopologyGitHub((pr,)),
+            TopologyGitHub((pr,)),
+            issue="Mini task refresh-run-help",
+            branch=branch,
+            integration_branch="dev/v1",
+            integration_sha="b" * 40,
+            inline_task_fingerprint=expected,
+        )
 
 
 def test_issue_topology_rejects_pr_sha_mismatch_and_ambiguity() -> None:
@@ -532,7 +562,10 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
         90,
         {"id": "refresh-run-help", "task": "Refresh the New Run help."},
     ]
-    code = generate_issue_driven_workflow(parse(value))
+    parsed = parse(value)
+    item = parsed.work_items[1]
+    assert item.task_fingerprint is not None
+    code = generate_issue_driven_workflow(parsed)
     module_name = "generated_inline_work_item"
     module = ModuleType(module_name)
     sys.modules[module_name] = module
@@ -542,9 +575,10 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
         del sys.modules[module_name]
     mini = module.__dict__["Issue"](
         None,
-        "feature/work-item-refresh-run-help",
+        item.branch,
         "refresh-run-help",
         "Refresh the New Run help.",
+        item.task_fingerprint,
     )
     config = module.__dict__["parse_args"]()
 
@@ -553,13 +587,81 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     )
 
     assert code.index("Issue(90, 'feature/issue-90')") < code.index(
-        "Issue(None, 'feature/work-item-refresh-run-help'"
+        f"Issue(None, '{item.branch}'"
     )
     assert "'Mini task refresh-run-help'" in code
+    assert item.task_fingerprint in code
     assert "Refresh the New Run help." in implementation
     assert "Refresh the New Run help." in scope_review
     assert "Refresh the New Run help." in correctness_review
     assert "gh issue view" not in mini.requirement
+    assert item.task_fingerprint in mini.pr_body
+
+
+def test_inline_task_content_changes_topology_recovery_identity() -> None:
+    def inline_config(task: str):
+        value = payload()
+        value.pop("issues")
+        value["work_items"] = [{"id": "refresh-run-help", "task": task}]
+        return parse(value)
+
+    first = inline_config("Refresh the New Run help.")
+    changed = inline_config("Replace the New Run help.")
+    first_item = first.work_items[0]
+    changed_item = changed.work_items[0]
+
+    assert first_item.branch == changed_item.branch
+    assert first_item.task_fingerprint != changed_item.task_fingerprint
+    assert first_item.task_fingerprint in generate_issue_driven_workflow(first)
+    assert changed_item.task_fingerprint in generate_issue_driven_workflow(changed)
+
+
+@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
+def test_generated_inline_task_recovery_rejects_pr_fingerprint_mismatch(
+    state: str,
+) -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."}
+    ]
+    parsed = parse(value)
+    item = parsed.work_items[0]
+    assert item.task_fingerprint is not None
+    code = generate_issue_driven_workflow(parsed)
+    module_name = f"generated_inline_recovery_{state.lower()}"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-inline-recovery>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    issue = module.__dict__["Issue"](
+        None,
+        item.branch,
+        item.id,
+        item.task,
+        item.task_fingerprint,
+    )
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.0",
+        "main",
+        (issue,),
+        "true",
+    )
+    pr = topology_pr(
+        state=state,
+        head_branch=item.branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    github = SimpleNamespace(
+        find_pr=lambda *, head, base, state: pr if state == pr.state else None
+    )
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        module.__dict__["prepare_issue"](SimpleNamespace(), github, issue, config)
 
 
 @pytest.mark.parametrize("final_review", [False, True])
