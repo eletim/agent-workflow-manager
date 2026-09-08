@@ -270,7 +270,8 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
     assert calls == {
         "Issue  worktree cleanup": "IMPLEMENTER_AGENT",
         "Issue  implementer": "IMPLEMENTER_AGENT",
-        "Issue  reviewer": "REVIEWER_AGENT",
+        "Issue  scope reviewer": "REVIEWER_AGENT",
+        "Issue  correctness reviewer": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
@@ -355,7 +356,8 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "require_committed_result(" in code
     assert "repo.ensure_pushed(" in code
     assert "github.create_draft_pr(" in code
-    assert "reviewer requested changes, but implementer re-evaluated" in code
+    assert "reviewer requested changes, but" in code
+    assert "the implementer re-evaluated the finding" in code
     assert "Commit every intended source, test, and configuration" in code
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code

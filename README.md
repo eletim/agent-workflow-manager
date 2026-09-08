@@ -146,10 +146,21 @@ origin is still rechecked on every topology operation.
 
 The Workflow similarly creates or reuses the exact Draft PR when the agent did
 not create one, then verifies its head, base, SHAs, and Draft state before
-review. A dirty agent result cannot advance. A review-fix turn normally has the
-same new-commit/clean contract; if the implementer explicitly re-evaluates a
-finding and returns clean without a commit, the Workflow records a WARN policy
-outcome rather than pretending that the reviewer approved it.
+review. Each Issue first receives a Scope / Design Review of whether its diff is
+necessary, sufficient, appropriately placed, and consistent with the shared
+minimal-change principle. Only then does a separately counted Correctness Review
+check implementation quality. Scope Review uses a fixed internal limit of three;
+`max_reviews` remains the Correctness and whole-version review limit, so no new
+JSON workflow field is needed. Whole-version Review retains its integration and
+cross-Issue responsibility.
+
+A dirty agent result cannot advance. A review-fix turn normally has the same
+new-commit/clean contract; if the implementer explicitly re-evaluates a finding
+and returns clean without a commit, or a phase reaches its review limit, the
+Workflow records `continued_with_warning` rather than pretending that the
+reviewer approved it. Scope and Correctness outcomes and review counts are
+reported separately, and exact clean, pushed PR topology is revalidated before
+warning continuation.
 
 At a required clean-worktree boundary, a dirty state receives one focused
 CodingAgent remediation turn before failure. That turn may commit intended

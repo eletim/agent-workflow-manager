@@ -140,7 +140,7 @@ def test_decision_fails_closed_for_ambiguous_or_invalid_results(result: str) -> 
         decision(result)
 
 
-def test_issue_and_whole_version_reviews_share_decision_parser() -> None:
+def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert source.count("def decision(result: str) -> str:") == 1
@@ -161,14 +161,38 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
         "git diff --check",
     )
 
-    implementation, review = workflow["issue_prompts"](config.issues[0], config)
+    implementation, scope_review, correctness_review = workflow["issue_prompts"](
+        config.issues[0], config
+    )
 
     assert principle in implementation
-    assert principle not in review
+    assert principle not in scope_review
+    assert principle not in correctness_review
+    assert "reuse" in scope_review.lower()
+    assert "responsibilities" in scope_review
+    assert "over-generalization" in scope_review
+    assert "policy Issue" in scope_review
+    assert "functional behavior" in correctness_review
+    assert "Do not reopen scope preferences" in correctness_review
     assert "Reuse the existing implementation where appropriate" in principle
     assert "minimum required for this Issue" in principle
     assert "mixing responsibilities unnaturally" in principle
     assert "over-generalizing distinct behavior" in principle
+
+
+def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert "MAX_SCOPE_REVIEWS = 3" in source
+    assert "max_reviews=MAX_SCOPE_REVIEWS" in source
+    assert "max_reviews=MAX_REVIEWS" in source
+    for field in (
+        "scope_reviews=",
+        "correctness_reviews=",
+        "scope_outcome=",
+        "correctness_outcome=",
+    ):
+        assert field in source
 
 
 def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
@@ -190,21 +214,153 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
             continue
         prompts[label] = call.args[3]
 
-    # Initial implementation, cleanup/remediation, Issue fixes, and whole-version
+    # Initial implementation, cleanup/remediation, phase fixes, and whole-version
     # fixes are the four prompt-producing implementer paths.
     assert isinstance(prompts["Issue # implementation"], ast.Name)
-    for label in ("Clean worktree", "Issue # fixes", "Whole-version fixes"):
+    for label in ("Clean worktree", "Issue #  fixes", "Whole-version fixes"):
         prompt = prompts[label]
         assert isinstance(prompt, ast.Call)
         assert isinstance(prompt.func, ast.Name)
         assert prompt.func.id == "implementer_prompt"
-    for label in ("Issue # review", "Whole-version reviewer turn"):
+    for label in ("Issue #  review", "Whole-version reviewer turn"):
         prompt = prompts[label]
         assert not (
             isinstance(prompt, ast.Call)
             and isinstance(prompt.func, ast.Name)
             and prompt.func.id == "implementer_prompt"
         )
+
+
+def test_scope_review_fix_is_re_reviewed_with_an_independent_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    review_issue_phase = workflow["review_issue_phase"]
+    globals_ = review_issue_phase.__globals__
+    issue = workflow["Issue"](150, "feature/issue-150")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    original = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+    fixed_sha = "fixed-head"
+    current = original
+    agent_results = iter(
+        ((original.head_sha, False), (fixed_sha, True), (fixed_sha, False))
+    )
+    turns: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (issue.branch, fixed_sha)
+            return BranchState(branch, fixed_sha, fixed_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            current = replace(current, head_sha=str(kwargs["expected_head_sha"]))
+            return current
+
+    results = iter(("CHANGES_REQUESTED\nreduce the scope", "APPROVED"))
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        name = str(args[2])
+        turns.append(name)
+        return "fixed" if name.endswith("fixes") else next(results)
+
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_, "require_agent_result", lambda *args, **kwargs: next(agent_results)
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    result = review_issue_phase(
+        issue,
+        config,
+        object(),
+        Repository(),
+        GitHub(),
+        "implementer",
+        "reviewer",
+        original,
+        phase="scope/design",
+        prompt="scope prompt",
+        max_reviews=3,
+    )
+
+    assert result.outcome == "approved"
+    assert result.reviews == 2
+    assert result.head_sha == fixed_sha
+    assert turns == [
+        "Issue #150 scope/design review",
+        "Issue #150 scope/design fixes",
+        "Issue #150 scope/design review",
+    ]
+
+
+def test_scope_review_limit_continues_without_faking_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    review_issue_phase = workflow["review_issue_phase"]
+    globals_ = review_issue_phase.__globals__
+    issue = workflow["Issue"](150, "feature/issue-150")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pr = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+    findings: list[tuple[str, str, str]] = []
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            assert branch == issue.branch
+            return BranchState(branch, pr.head_sha, pr.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == pr.head_sha
+            assert kwargs["expected_base_sha"] == pr.base_sha
+            return pr
+
+    monkeypatch.setitem(
+        globals_,
+        "run_turn",
+        lambda *args, **kwargs: "CHANGES_REQUESTED\nstill too broad",
+    )
+    monkeypatch.setitem(
+        globals_,
+        "require_agent_result",
+        lambda *args, **kwargs: (pr.head_sha, False),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "emit_finding",
+        lambda category, message, status="passed": findings.append(
+            (category, message, status)
+        ),
+    )
+
+    result = review_issue_phase(
+        issue,
+        config,
+        object(),
+        Repository(),
+        GitHub(),
+        "implementer",
+        "reviewer",
+        pr,
+        phase="scope/design",
+        prompt="scope prompt",
+        max_reviews=1,
+    )
+
+    assert result.outcome == "continued_with_warning"
+    assert result.reviews == 1
+    assert any(
+        status == "info"
+        and "CHANGES_REQUESTED" in message
+        and "without reviewer approval" in message
+        for _, message, status in findings
+    )
 
 
 def test_clean_worktree_does_not_invoke_cleanup_turn(
@@ -240,9 +396,7 @@ def test_dirty_worktree_gets_focused_cleanup_and_is_rechecked(
                 current_branch="feature/issue-116",
                 status=(" M src/feature.py", "?? build/output.js"),
             ),
-            SimpleNamespace(
-                dirty=False, current_branch="feature/issue-116", status=()
-            ),
+            SimpleNamespace(dirty=False, current_branch="feature/issue-116", status=()),
         )
     )
     prompts: list[str] = []
@@ -425,7 +579,9 @@ def test_ready_issue_pr_is_redrafted_and_independently_reviewed(
     workflow["process_issue"](issue, config, object(), Repository(), GitHub())
 
     assert events[0] == "set_draft:True"
-    assert "Issue #90 review" in events
+    assert events.index("Issue #90 scope/design review") < events.index(
+        "Issue #90 correctness review"
+    )
     assert events[-1] == "set_draft:False"
 
 
@@ -474,9 +630,7 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
             assert branch == config.integration_branch
             return BranchState(branch, base_sha, base_sha, False)
 
-        def ensure_pushed(
-            self, branch: str, *, expected_local_sha: str
-        ) -> BranchState:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")
             assert branch == issue.branch
             assert expected_local_sha == self.local_sha
@@ -537,7 +691,7 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
 
     workflow["process_issue"](issue, config, object(), repository, GitHub())
 
-    assert review_count == 2
+    assert review_count == 3
     assert f"push:{cleanup_sha}" in events
     assert f"require_pr:{cleanup_sha}" in events
     assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
@@ -562,9 +716,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             self.local_sha = start_sha
 
         def inspect_worktree(self) -> SimpleNamespace:
-            return SimpleNamespace(
-                dirty=False, current_branch=issue.branch, status=()
-            )
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
 
         def require_current_branch(self, branch: str) -> BranchState:
             assert branch == issue.branch
@@ -582,9 +734,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             assert branch == config.integration_branch
             return BranchState(branch, base_sha, base_sha, False)
 
-        def ensure_pushed(
-            self, branch: str, *, expected_local_sha: str
-        ) -> BranchState:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")
             assert (branch, expected_local_sha) == (
                 issue.branch,
@@ -739,9 +889,7 @@ def test_unchanged_whole_version_fixer_still_runs_checks_before_ready(
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    draft = open_pr(
-        head=config.integration_branch, base=config.main_branch, draft=True
-    )
+    draft = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
     events: list[str] = []
 
     class Repository:
@@ -785,9 +933,7 @@ def test_unchanged_whole_version_fixer_still_runs_checks_before_ready(
         lambda *args: events.append("final checks"),
     )
 
-    result = workflow["integration_delivery"](
-        config, object(), Repository(), GitHub()
-    )
+    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
 
     assert result.is_draft is False
     assert events.count("Whole-version reviewer turn") == 1
@@ -809,9 +955,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     cleanup_sha = "check-cleanup-head"
     base_sha = "main-head"
     current_pr = replace(
-        open_pr(
-            head=config.integration_branch, base=config.main_branch, draft=True
-        ),
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
         head_sha=initial_sha,
         base_sha=base_sha,
     )
@@ -848,9 +992,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
-        def ensure_pushed(
-            self, branch: str, *, expected_local_sha: str
-        ) -> BranchState:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")
             return BranchState(branch, expected_local_sha, expected_local_sha, True)
 
@@ -915,9 +1057,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         lambda name, status, **kwargs: outline_events.append((name, status)),
     )
 
-    ready = workflow["integration_delivery"](
-        config, object(), repository, GitHub()
-    )
+    ready = workflow["integration_delivery"](config, object(), repository, GitHub())
 
     assert ready.is_draft is False
     assert review_count == 2
