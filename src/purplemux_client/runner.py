@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import fcntl
 import json
 import logging
 import os
@@ -488,6 +489,7 @@ class PythonRunner:
             )
             else None
         )
+        self._run_history_lock_descriptor: int | None = None
         self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
@@ -524,7 +526,13 @@ class PythonRunner:
             dry_run=None,
         )
         self._validator = validator or WorkflowValidator()
-        self._load_run_history()
+        try:
+            self._acquire_run_history_lock()
+            self._load_run_history()
+        except BaseException:
+            self._release_run_history_lock()
+            self._validator.close()
+            raise
 
     @staticmethod
     def _default_run_history_file() -> Path:
@@ -538,6 +546,44 @@ class PythonRunner:
             else Path.home() / ".local/state"
         )
         return root / "agent-workflow-manager" / "run-history.json"
+
+    def _acquire_run_history_lock(self) -> None:
+        path = self._run_history_file
+        if path is None:
+            return
+        lock_path = path.with_name(f".{path.name}.lock")
+        descriptor: int | None = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RunHistoryError(
+                    "another AWM server owns the terminal run history"
+                ) from exc
+            self._run_history_lock_descriptor = descriptor
+        except RunHistoryError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise RunHistoryError(
+                f"terminal run history lock could not be acquired: {exc}"
+            ) from exc
+
+    def _release_run_history_lock(self) -> None:
+        descriptor = self._run_history_lock_descriptor
+        if descriptor is None:
+            return
+        self._run_history_lock_descriptor = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     def _run_history_json(self, run: _RunRecord) -> dict[str, object]:
         return {
@@ -2011,6 +2057,12 @@ class PythonRunner:
             if remaining <= 0:
                 break
             thread.join(remaining)
+        if any(thread.is_alive() for thread in wait_threads):
+            logger.warning(
+                "Retaining terminal run history lock while runner threads exit"
+            )
+        else:
+            self._release_run_history_lock()
 
     def _read_stream(
         self,

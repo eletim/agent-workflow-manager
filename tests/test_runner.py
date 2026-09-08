@@ -212,6 +212,48 @@ def test_checked_terminal_run_is_restored_after_runner_reconstruction(
     assert stat.S_IMODE(history_file.stat().st_mode) == 0o600
 
 
+def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    owner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = owner.start("print('owner')")
+        wait_for(owner, lambda item: item.state == "success", run_id=run_id)
+        owner.set_checked(run_id, True)
+
+        with pytest.raises(
+            runner_module.RunHistoryError,
+            match="another AWM server owns",
+        ):
+            PythonRunner(
+                managed_workflows=False,
+                stop_timeout=0.5,
+                run_history_file=history_file,
+            )
+
+        assert owner.snapshot(run_id).checked is True
+    finally:
+        owner.close()
+
+    successor = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        restored = successor.snapshot(run_id)
+        assert restored.stdout == "owner\n"
+        assert restored.checked is True
+        assert successor.start("print('successor')") == run_id + 1
+    finally:
+        successor.close()
+
+
 @pytest.mark.parametrize("terminal_state", ["success", "failed", "stopped"])
 def test_checked_metadata_does_not_change_terminal_state(
     runner: PythonRunner, terminal_state: str
