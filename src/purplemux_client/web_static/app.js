@@ -31,6 +31,7 @@ const validateButton = document.querySelector("#validate");
 const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
 const cleanupButton = document.querySelector("#cleanup");
+const checkedToggle = document.querySelector("#checked-toggle");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
 const stderr = document.querySelector("#stderr");
@@ -277,6 +278,9 @@ function renderCleanDraftState() {
   exitCode.textContent = "Exit code: —";
   stopButton.disabled = true;
   cleanupButton.disabled = true;
+  checkedToggle.hidden = true;
+  checkedToggle.disabled = true;
+  checkedToggle.setAttribute("aria-pressed", "false");
 
   renderOutline([], []);
   renderProgress([]);
@@ -320,6 +324,11 @@ function renderRun(result) {
   cleanupButton.disabled = activeRunId === null
     || !result.cleanupAvailable
     || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
+  const checkable = ["success", "failed", "stopped"].includes(result.state);
+  checkedToggle.hidden = activeRunId === null || !checkable;
+  checkedToggle.disabled = activeRunId === null || !checkable;
+  checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
+  checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderIntegrationPr(result.integrationPr || null);
@@ -453,7 +462,7 @@ function renderRunList(runs) {
     const executionRoot = run.mode === "prompt"
       ? run.prompt?.cwd || run.cwd
       : run.executionContext?.executionRoot || "execution context pending";
-    button.textContent = `#${run.runId}  ${mode}  ${run.state}  ${executionRoot}`;
+    button.textContent = `#${run.runId}  ${mode}  ${run.state}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -468,6 +477,38 @@ function renderRunList(runs) {
       await refresh();
     });
     runList.append(button);
+    if (["success", "failed", "stopped"].includes(run.state)) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = `run-check-toggle ${run.checked ? "checked" : "unchecked"}`;
+      toggle.textContent = run.checked ? "Checked" : "Unchecked";
+      toggle.setAttribute(
+        "aria-label",
+        `${run.checked ? "Mark unchecked" : "Mark checked"} Run #${run.runId}`,
+      );
+      toggle.setAttribute("aria-pressed", String(Boolean(run.checked)));
+      toggle.addEventListener("click", async () => {
+        await updateChecked(run.runId, !run.checked);
+      });
+      runList.append(toggle);
+    }
+  }
+}
+
+async function updateChecked(runId, checked) {
+  const selectionGeneration = activeRunGeneration;
+  try {
+    const result = await request(`/api/runs/${runId}/checked`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({checked}),
+    });
+    if (runId === activeRunId && selectionGeneration === activeRunGeneration) {
+      renderRun(result);
+    }
+    await refresh();
+  } catch (error) {
+    stderr.textContent = String(error);
   }
 }
 
@@ -1296,6 +1337,14 @@ cleanupButton.addEventListener("click", async () => {
       && selectionGeneration === activeRunGeneration
     ) stderr.textContent = String(error);
   }
+});
+
+checkedToggle.addEventListener("click", async () => {
+  if (activeRunId === null || checkedToggle.hidden) return;
+  await updateChecked(
+    activeRunId,
+    checkedToggle.getAttribute("aria-pressed") !== "true",
+  );
 });
 
 settingsOpen.addEventListener("click", () => {

@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -134,6 +135,224 @@ print(run_correlation("workspace"))
     assert first_values[0] == first_values[1]
     assert second_values[0] == second_values[1]
     assert first_values[0] != second_values[0]
+
+
+def test_terminal_run_checked_metadata_is_reversible_and_run_scoped(
+    runner: PythonRunner,
+) -> None:
+    first_id = runner.start("print('first')")
+    first = wait_for(runner, lambda item: item.state == "success", run_id=first_id)
+    assert first.checked is False
+    assert first.as_json()["checked"] is False
+
+    checked = runner.set_checked(first_id, True)
+    assert checked.checked is True
+    assert checked.state == "success"
+
+    second_id = runner.start("print('second')")
+    second = wait_for(runner, lambda item: item.state == "success", run_id=second_id)
+    assert second.checked is False
+    assert runner.snapshot(first_id).checked is True
+    assert [item.as_summary_json()["checked"] for item in runner.snapshots()] == [
+        True,
+        False,
+    ]
+
+    unchecked = runner.set_checked(first_id, False)
+    assert unchecked.checked is False
+    assert unchecked.state == "success"
+
+
+def test_checked_terminal_run_is_restored_after_runner_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "state" / "run-history.json"
+    first_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        first_id = first_runner.start("print('persisted output')")
+        finished = wait_for(
+            first_runner, lambda item: item.state == "success", run_id=first_id
+        )
+        stable_identity = first_runner._run_identity(first_id)
+        assert finished.checked is False
+        first_runner.set_checked(first_id, True)
+        saved = json.loads(history_file.read_text(encoding="utf-8"))
+        assert list(saved["runs"]) == [stable_identity]
+    finally:
+        first_runner.close()
+
+    second_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        second_runner.configure_event_endpoint("http://127.0.0.1:8765")
+        restored = second_runner.snapshot(first_id)
+        assert second_runner._run_identity(first_id) == stable_identity
+        assert restored.state == "success"
+        assert restored.checked is True
+        assert restored.stdout == "persisted output\n"
+        assert [item.run_id for item in second_runner.snapshots()] == [first_id]
+
+        second_id = second_runner.start("print('new run')")
+        assert second_id == first_id + 1
+        second = wait_for(
+            second_runner, lambda item: item.state == "success", run_id=second_id
+        )
+        assert second.checked is False
+        assert second_runner.snapshot(first_id).checked is True
+    finally:
+        second_runner.close()
+
+    assert stat.S_IMODE(history_file.stat().st_mode) == 0o600
+
+
+def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    owner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = owner.start("print('owner')")
+        wait_for(owner, lambda item: item.state == "success", run_id=run_id)
+        owner.set_checked(run_id, True)
+
+        with pytest.raises(
+            runner_module.RunHistoryError,
+            match="another AWM server owns",
+        ):
+            PythonRunner(
+                managed_workflows=False,
+                stop_timeout=0.5,
+                run_history_file=history_file,
+            )
+
+        assert owner.snapshot(run_id).checked is True
+    finally:
+        owner.close()
+
+    successor = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        restored = successor.snapshot(run_id)
+        assert restored.stdout == "owner\n"
+        assert restored.checked is True
+        assert successor.start("print('successor')") == run_id + 1
+    finally:
+        successor.close()
+
+
+def test_run_id_is_durably_reserved_before_launch_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    crashed_identity: str | None = None
+    crashing_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_before_process(*_args: object, **_kwargs: object) -> None:
+        raise SimulatedCrash
+
+    monkeypatch.setattr(crashing_runner, "_spawn_process", crash_before_process)
+    try:
+        crashed_identity = crashing_runner._run_identity(1)
+        with pytest.raises(SimulatedCrash):
+            crashing_runner.start("print('never launched')")
+        saved = json.loads(history_file.read_text(encoding="utf-8"))
+        assert saved["nextRunId"] == 2
+        assert saved["runs"] == {}
+    finally:
+        crashing_runner.close()
+
+    reconstructed = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = reconstructed.start("print('after crash')")
+        assert run_id == 2
+        assert reconstructed._run_identity(run_id) != crashed_identity
+        wait_for(reconstructed, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        reconstructed.close()
+
+
+def test_failed_run_id_reservation_prevents_launch_and_consumes_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=tmp_path / "run-history.json",
+    )
+    original_write = runner._write_run_history_locked
+    original_spawn = runner._spawn_process
+    spawn_calls = 0
+
+    def fail_reservation() -> None:
+        raise runner_module.RunHistoryError("reservation failed")
+
+    def track_spawn(*args: object, **kwargs: object) -> object:
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "_write_run_history_locked", fail_reservation)
+    monkeypatch.setattr(runner, "_spawn_process", track_spawn)
+    try:
+        with pytest.raises(runner_module.RunHistoryError, match="reservation failed"):
+            runner.start("print('not launched')")
+        assert spawn_calls == 0
+
+        monkeypatch.setattr(runner, "_write_run_history_locked", original_write)
+        run_id = runner.start("print('launched')")
+        assert run_id == 2
+        assert spawn_calls == 1
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("terminal_state", ["success", "failed", "stopped"])
+def test_checked_metadata_does_not_change_terminal_state(
+    runner: PythonRunner, terminal_state: str
+) -> None:
+    code = {
+        "success": "print('done')",
+        "failed": "raise RuntimeError('failed')",
+        "stopped": "import time; time.sleep(60)",
+    }[terminal_state]
+    run_id = runner.start(code)
+    if terminal_state == "stopped":
+        assert runner.stop(run_id) is True
+    terminal = wait_for(
+        runner, lambda item: item.state == terminal_state, run_id=run_id
+    )
+
+    checked = runner.set_checked(run_id, True)
+
+    assert checked.state == terminal.state
+    assert checked.exit_code == terminal.exit_code
+    assert checked.checked is True
 
 
 def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
@@ -1538,6 +1757,7 @@ def test_runner_http_lifecycle(
         "resources": [],
         "resourceCleanupStatus": "cleaned",
         "cleanupAvailable": True,
+        "checked": False,
     }
 
 
@@ -1764,6 +1984,61 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
+
+
+def test_run_api_updates_checked_metadata_only_for_terminal_run(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "import time; time.sleep(0.1)"}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    assert started["checked"] is False
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 409
+    assert "only terminal runs" in str(rejected["error"])
+
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, checked = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 200
+    assert checked["checked"] is True
+    assert checked["state"] == "success"
+    assert request(address, "GET", f"/api/runs/{run_id}")[1]["checked"] is True
+    assert request(address, "GET", "/api/runs")[1]["runs"][0]["checked"] is True
+
+    status, unchecked = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": False}),
+        token=token,
+    )
+    assert status == 200
+    assert unchecked["checked"] is False
+    assert unchecked["state"] == "success"
 
 
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(

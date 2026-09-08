@@ -108,6 +108,7 @@ function snapshot({
   mode = undefined,
   prompt = undefined,
   integrationPr = null,
+  checked = false,
 }) {
   const result = {
     args,
@@ -133,6 +134,7 @@ function snapshot({
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
     integrationPr,
+    checked,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -206,7 +208,7 @@ async function loadApp({
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
     "active-context", "run-list",
-    "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
+    "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
@@ -359,6 +361,59 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("terminal run checked state toggles from detail and list without leaking", async () => {
+  const runs = [
+    {runId: 1, state: "success", mode: "workflow", cwd: "/work/one", checked: false},
+    {runId: 2, state: "running", mode: "workflow", cwd: "/work/two", checked: false},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done", checked: false}),
+    2: snapshot({runId: 2, state: "running", stdout: "", checked: false}),
+  };
+  const updates = [];
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      const match = url.match(/^\/api\/runs\/(\d+)\/checked$/);
+      if (!match) return undefined;
+      const runId = Number(match[1]);
+      const {checked} = JSON.parse(options.body);
+      updates.push([runId, checked]);
+      runs.find((run) => run.runId === runId).checked = checked;
+      details[runId].checked = checked;
+      return response(details[runId]);
+    },
+  });
+
+  assert.equal(elements["checked-toggle"].hidden, true);
+  assert.equal(runItem(elements, 1).textContent.includes("unchecked"), true);
+  assert.equal(
+    elements["run-list"].children.filter(
+      (item) => item.className.includes("run-check-toggle"),
+    ).length,
+    1,
+  );
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["checked-toggle"].hidden, false);
+  assert.equal(elements["checked-toggle"].textContent, "Mark checked");
+  await elements["checked-toggle"].dispatch("click");
+  assert.deepEqual(updates, [[1, true]]);
+  assert.equal(elements["checked-toggle"].textContent, "Mark unchecked");
+  assert.equal(runItem(elements, 1).textContent.includes("checked"), true);
+  assert.equal(details[2].checked, false);
+
+  const listToggle = elements["run-list"].children.find(
+    (item) => item.className.includes("run-check-toggle"),
+  );
+  await listToggle.dispatch("click");
+  assert.deepEqual(updates, [[1, true], [1, false]]);
+  assert.equal(elements["checked-toggle"].textContent, "Mark checked");
+  assert.equal(details[2].checked, false);
+});
 
 test("Settings opens Notifications repeatedly without losing form state", async () => {
   const {elements} = await loadApp({

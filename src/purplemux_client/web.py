@@ -34,8 +34,10 @@ from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
     PythonRunner,
+    RunCheckNotAllowedError,
     RunCleanupInProgressError,
     RunCleanupNotAllowedError,
+    RunHistoryError,
     RunNotFoundError,
     RunStopUncertainError,
     WorkflowDryRunError,
@@ -409,8 +411,37 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/settings/notifications",
             "/api/settings/notifications/test",
         }
-        if not self._is_trusted_request(require_json=path in json_paths):
+        checked_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/checked", path)
+        if not self._is_trusted_request(
+            require_json=path in json_paths or checked_match is not None
+        ):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+            return
+        if checked_match is not None:
+            payload = self._read_json()
+            if payload is None:
+                return
+            checked = payload.get("checked")
+            if not isinstance(checked, bool) or set(payload) != {"checked"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain only a boolean checked value"},
+                )
+                return
+            try:
+                snapshot = self.server.runner.set_checked(
+                    int(checked_match.group(1)), checked
+                )
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except RunCheckNotAllowedError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, snapshot.as_json())
             return
         if path == "/api/directories":
             payload = self._read_json()
@@ -464,6 +495,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {"error": "generated Prompt execution failed validation"},
                 )
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             except AlreadyRunningError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
@@ -577,6 +611,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         **self.server.runner.validation_snapshot().as_json(),
                     },
                 )
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             except AlreadyRunningError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
