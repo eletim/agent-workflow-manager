@@ -1037,13 +1037,13 @@ class PythonRunner:
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
     ) -> int:
-        run_id = self._next_run_id
-        self._next_run_id += 1
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
                 raise RuntimeError(
                     "managed Workflow execution requires an attached event endpoint"
                 )
+        run_id = self._reserve_run_id_locked()
+        if prompt is None and self.managed_workflows:
             return self._start_managed_workflow(
                 run_id,
                 code,
@@ -1080,6 +1080,15 @@ class PythonRunner:
             run, process, script_path, progress_read_fd, resource_ack_fd
         )
         self._mark_changed()
+        return run_id
+
+    def _reserve_run_id_locked(self) -> int:
+        """Durably consume one identity before any workflow-side mutation."""
+        run_id = self._next_run_id
+        self._next_run_id += 1
+        # A failed write prevents launch. Keep the in-memory ID consumed because
+        # replacement failure can be outcome-unknown; reuse would be less safe.
+        self._write_run_history_locked()
         return run_id
 
     def _start_managed_workflow(

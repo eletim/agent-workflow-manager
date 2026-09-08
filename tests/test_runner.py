@@ -254,6 +254,84 @@ def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
         successor.close()
 
 
+def test_run_id_is_durably_reserved_before_launch_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    crashed_identity: str | None = None
+    crashing_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_before_process(*_args: object, **_kwargs: object) -> None:
+        raise SimulatedCrash
+
+    monkeypatch.setattr(crashing_runner, "_spawn_process", crash_before_process)
+    try:
+        crashed_identity = crashing_runner._run_identity(1)
+        with pytest.raises(SimulatedCrash):
+            crashing_runner.start("print('never launched')")
+        saved = json.loads(history_file.read_text(encoding="utf-8"))
+        assert saved["nextRunId"] == 2
+        assert saved["runs"] == {}
+    finally:
+        crashing_runner.close()
+
+    reconstructed = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = reconstructed.start("print('after crash')")
+        assert run_id == 2
+        assert reconstructed._run_identity(run_id) != crashed_identity
+        wait_for(reconstructed, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        reconstructed.close()
+
+
+def test_failed_run_id_reservation_prevents_launch_and_consumes_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=tmp_path / "run-history.json",
+    )
+    original_write = runner._write_run_history_locked
+    original_spawn = runner._spawn_process
+    spawn_calls = 0
+
+    def fail_reservation() -> None:
+        raise runner_module.RunHistoryError("reservation failed")
+
+    def track_spawn(*args: object, **kwargs: object) -> object:
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "_write_run_history_locked", fail_reservation)
+    monkeypatch.setattr(runner, "_spawn_process", track_spawn)
+    try:
+        with pytest.raises(runner_module.RunHistoryError, match="reservation failed"):
+            runner.start("print('not launched')")
+        assert spawn_calls == 0
+
+        monkeypatch.setattr(runner, "_write_run_history_locked", original_write)
+        run_id = runner.start("print('launched')")
+        assert run_id == 2
+        assert spawn_calls == 1
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+
+
 @pytest.mark.parametrize("terminal_state", ["success", "failed", "stopped"])
 def test_checked_metadata_does_not_change_terminal_state(
     runner: PythonRunner, terminal_state: str

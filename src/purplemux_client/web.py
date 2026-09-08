@@ -496,6 +496,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     {"error": "generated Prompt execution failed validation"},
                 )
                 return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
             except AlreadyRunningError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
@@ -608,6 +611,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         **self.server.runner.validation_snapshot().as_json(),
                     },
                 )
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             except AlreadyRunningError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
