@@ -363,6 +363,127 @@ def test_scope_review_limit_continues_without_faking_approval(
     )
 
 
+def test_correctness_fix_restarts_scope_before_final_correctness_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](150, "feature/issue-150")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_a = "scope-approved-head"
+    head_b = "correctness-fixed-head"
+    base_sha = "integration-head"
+    current_pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=head_a,
+        base_sha=base_sha,
+    )
+    events: list[tuple[str, str]] = []
+    findings: list[str] = []
+    agent_results = iter(
+        (
+            (head_a, False),
+            (head_a, False),
+            (head_a, False),
+            (head_b, True),
+            (head_b, False),
+            (head_b, False),
+        )
+    )
+
+    class Repository:
+        local_sha = head_a
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, base_sha, base_sha, False)
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (issue.branch, head_b)
+            self.local_sha = head_b
+            return BranchState(branch, head_b, head_b, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == current_pr.number
+            assert kwargs["expected_head_sha"] == head_b
+            events.append(("ready", head_b))
+            return replace(current_pr, is_draft=False)
+
+    correctness_reviews = 0
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        nonlocal correctness_reviews
+        name = str(args[2])
+        prompt = str(args[3])
+        events.append((name, prompt))
+        if name.endswith("implementation"):
+            return "implementation already committed"
+        if name.endswith("correctness review"):
+            correctness_reviews += 1
+            return (
+                "CHANGES_REQUESTED\nfix correctness"
+                if correctness_reviews == 1
+                else "APPROVED"
+            )
+        if name.endswith("scope/design review"):
+            return "APPROVED"
+        if name.endswith("correctness fixes"):
+            return "fixed and committed"
+        raise AssertionError(f"unexpected turn {name}")
+
+    monkeypatch.setitem(
+        globals_, "prepare_issue", lambda *args: (current_pr, head_a, True)
+    )
+    monkeypatch.setitem(
+        globals_, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_, "require_agent_result", lambda *args, **kwargs: next(agent_results)
+    )
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *args, **kwargs: current_pr)
+    monkeypatch.setitem(
+        globals_,
+        "emit_finding",
+        lambda category, message, **kwargs: findings.append(message),
+    )
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+
+    result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+
+    review_events = [name for name, _ in events if name.endswith("review")]
+    assert review_events == [
+        "Issue #150 scope/design review",
+        "Issue #150 correctness review",
+        "Issue #150 scope/design review",
+        "Issue #150 correctness review",
+    ]
+    scope_prompts = [
+        prompt for name, prompt in events if name.endswith("scope/design review")
+    ]
+    assert head_a in scope_prompts[0]
+    assert head_b in scope_prompts[1]
+    assert result.head_sha == head_b
+    assert any(
+        "scope_reviews=2" in finding
+        and "correctness_reviews=2" in finding
+        and "scope_outcome=approved" in finding
+        and "correctness_outcome=approved" in finding
+        for finding in findings
+    )
+
+
 def test_clean_worktree_does_not_invoke_cleanup_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

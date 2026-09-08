@@ -78,7 +78,7 @@ class Config:
 @dataclass(frozen=True)
 class IssueReviewPhaseResult:
     pr: PullRequestState
-    outcome: Literal["approved", "continued_with_warning"]
+    outcome: Literal["approved", "continued_with_warning", "head_changed"]
     head_sha: str
     base_sha: str
     reviews: int
@@ -551,9 +551,35 @@ def review_issue_phase(
     phase: str,
     prompt: str,
     max_reviews: int,
+    review_offset: int = 0,
+    restart_scope_on_change: bool = False,
 ) -> IssueReviewPhaseResult:
     """Run one independently counted Issue review/fix phase."""
-    for review_number in range(1, max_reviews + 1):
+    if review_offset >= max_reviews:
+        warning = (
+            f"Issue #{issue.number} {phase} review limit {max_reviews} was already "
+            "reached before the current head could complete this phase; continuing "
+            "without reviewer approval."
+        )
+        current = require_warning_delivery(
+            repo,
+            github,
+            pr,
+            issue,
+            config,
+            expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+        )
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("git", warning, status="info")
+        return IssueReviewPhaseResult(
+            current,
+            "continued_with_warning",
+            current.head_sha,
+            current.base_sha,
+            review_offset,
+        )
+    for review_number in range(review_offset + 1, max_reviews + 1):
         result = run_turn(
             client,
             reviewer,
@@ -597,6 +623,10 @@ def review_issue_phase(
                 f"{phase} review changed {issue.branch}; outcome invalidated at "
                 f"{reviewed_sha}",
             )
+            if restart_scope_on_change:
+                return IssueReviewPhaseResult(
+                    pr, "head_changed", pr.head_sha, pr.base_sha, review_number
+                )
             continue
         if decision(result) == "APPROVED":
             return IssueReviewPhaseResult(
@@ -679,6 +709,10 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""),
             expected_base_sha=current.base_sha,
             draft=True,
         )
+        if restart_scope_on_change:
+            return IssueReviewPhaseResult(
+                pr, "head_changed", pr.head_sha, pr.base_sha, review_number
+            )
     raise WorkerFailure(f"Issue #{issue.number} {phase} review ended unexpectedly")
 
 
@@ -770,42 +804,59 @@ def process_issue(
         pr_number=pr.number,
         pr_url=pr.url,
     )
-    scope = review_issue_phase(
-        issue,
-        config,
-        client,
-        repo,
-        github,
-        implementer,
-        scope_reviewer,
-        pr,
-        phase="scope/design",
-        prompt=scope_prompt,
-        max_reviews=MAX_SCOPE_REVIEWS,
-    )
-    if scope.outcome == "continued_with_warning":
-        correctness_prompt += (
-            "\nThe Scope / Design phase reached warning continuation without "
-            "reviewer approval. Do not describe it as approved, and preserve that "
-            "distinction in your findings."
+    scope_reviews = 0
+    correctness_reviews = 0
+    while True:
+        scope = review_issue_phase(
+            issue,
+            config,
+            client,
+            repo,
+            github,
+            implementer,
+            scope_reviewer,
+            pr,
+            phase="scope/design",
+            prompt=scope_prompt,
+            max_reviews=MAX_SCOPE_REVIEWS,
+            review_offset=scope_reviews,
         )
-    correctness = review_issue_phase(
-        issue,
-        config,
-        client,
-        repo,
-        github,
-        implementer,
-        correctness_reviewer,
-        scope.pr,
-        phase="correctness",
-        prompt=correctness_prompt,
-        max_reviews=MAX_REVIEWS,
-    )
+        scope_reviews = scope.reviews
+        current_correctness_prompt = correctness_prompt
+        if scope.outcome == "continued_with_warning":
+            current_correctness_prompt += (
+                "\nThe Scope / Design phase reached warning continuation without "
+                "reviewer approval. Do not describe it as approved, and preserve "
+                "that distinction in your findings."
+            )
+        correctness = review_issue_phase(
+            issue,
+            config,
+            client,
+            repo,
+            github,
+            implementer,
+            correctness_reviewer,
+            scope.pr,
+            phase="correctness",
+            prompt=current_correctness_prompt,
+            max_reviews=MAX_REVIEWS,
+            review_offset=correctness_reviews,
+            restart_scope_on_change=True,
+        )
+        correctness_reviews = correctness.reviews
+        if correctness.outcome != "head_changed":
+            break
+        emit_finding(
+            "git",
+            f"Issue #{issue.number} correctness changed the head to "
+            f"{correctness.head_sha}; restarting Scope / Design Review",
+        )
+        pr = correctness.pr
     emit_finding(
         "git",
-        f"Issue #{issue.number} review summary: scope_reviews={scope.reviews}, "
-        f"correctness_reviews={correctness.reviews}, "
+        f"Issue #{issue.number} review summary: scope_reviews={scope_reviews}, "
+        f"correctness_reviews={correctness_reviews}, "
         f"scope_outcome={scope.outcome}, "
         f"correctness_outcome={correctness.outcome}",
     )

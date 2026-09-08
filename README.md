@@ -152,7 +152,9 @@ minimal-change principle. Only then does a separately counted Correctness Review
 check implementation quality. Scope Review uses a fixed internal limit of three;
 `max_reviews` remains the Correctness and whole-version review limit, so no new
 JSON workflow field is needed. Whole-version Review retains its integration and
-cross-Issue responsibility.
+cross-Issue responsibility. If a Correctness reviewer or fix changes the head,
+the prior Scope outcome is invalidated and the ordered Scope then Correctness
+sequence restarts on the new commit within the separate cumulative limits.
 
 A dirty agent result cannot advance. A review-fix turn normally has the same
 new-commit/clean contract; if the implementer explicitly re-evaluates a finding
