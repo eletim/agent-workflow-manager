@@ -107,6 +107,10 @@ dispatch is persisted.
   "max_reviews": 5,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
+  "scenarios": [
+    "Existing: a normal Prompt run still completes and preserves its output.",
+    "Failure: malformed planner output is rejected without dispatching work."
+  ],
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -130,9 +134,9 @@ original Issue as its work definition:
 }
 ```
 
-The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`, and
-the two agent fields are optional; every other field is required. With
-`make_integration_branch: true`, the workflow creates and pushes a missing
+The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`, the
+two agent fields, and `scenarios` are optional; every other field is required.
+With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal
 safe recovery checks. The final PR still targets `final_branch`. When set,
@@ -150,6 +154,18 @@ are positive, unique, and retain their array order. Unknown fields are rejected 
 generic actions, conditions, loops, and nested executable blocks cannot grow into
 a second workflow language. With `merge_final: false`, the generated final control
 flow makes the integration PR Ready but contains no final merge call.
+
+`scenarios` is a list of unique, non-empty human-authored descriptions, bounded
+to 100 items, 4,000 characters per item, and 64,000 UTF-8 bytes for the complete
+numbered list. It requires `final_review: true`. Before ordinary Whole Review, a
+dedicated AI Scenario Gate selects a small risk-relevant subset, compares each
+scenario at the exact final-base commit (Before) and integration-head commit
+(After), and judges whether the behavioral difference is appropriate in the
+Issue context. Scenarios may cover existing behavior, new behavior, or failure
+paths; they are not fixed expected-output assertions and need not all be run. A
+requested change enters the existing Whole Review fix/re-review loop. The list
+and gate control flow are embedded in generated plain Python rather than modeled
+by the UI or a second runtime.
 
 ## Git and GitHub topology operations
 

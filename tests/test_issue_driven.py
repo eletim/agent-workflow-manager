@@ -4,6 +4,7 @@ import ast
 import hashlib
 import inspect
 import json
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,7 @@ from purplemux_client import (
     WorkerFailure,
 )
 from purplemux_client.issue_driven import (
+    _MAX_SCENARIO_LIST_BYTES,
     IssueDrivenValidationError,
     classify_issue_topology,
     generate_issue_driven_workflow,
@@ -629,6 +631,115 @@ def test_optional_policy_issue_round_trips_and_is_generated_deterministically() 
     assert '"git diff --check",\n        WORKFLOW_POLICY_ISSUE,' in first
 
 
+def test_optional_scenarios_round_trip_into_generated_scenario_gate() -> None:
+    scenarios = [
+        "Existing: a Prompt run still completes successfully.",
+        "New: a one-shot run plans its first mini task.",
+        "Failure: invalid planner output is rejected without dispatch.",
+    ]
+    config = parse(payload(scenarios=scenarios))
+
+    assert config.scenarios == tuple(scenarios)
+    assert config.as_json()["scenarios"] == scenarios
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+    assert first == second
+    assert f"SCENARIOS: tuple[str, ...] = {tuple(scenarios)!r}" in first
+    assert "Select a small, risk-relevant subset" in first
+    assert "exact Before commit" in first
+    assert "exact\nAfter commit" in first
+    assert "Do not treat this as a fixed" in first
+    assert "expected-output test" in first
+
+
+@pytest.mark.parametrize(
+    ("scenarios", "path", "message"),
+    [
+        ("scenario", "$.scenarios", "must be an array"),
+        ([""], "$.scenarios[0]", "must be a non-empty trimmed string"),
+        (
+            [" duplicate", "duplicate"],
+            "$.scenarios[0]",
+            "must be a non-empty trimmed string",
+        ),
+        (["duplicate", "duplicate"], "$.scenarios[1]", "must be unique"),
+    ],
+)
+def test_scenarios_reject_invalid_human_authored_entries(
+    scenarios: object, path: str, message: str
+) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert any(
+        finding.path == path and message in finding.message
+        for finding in caught.value.findings
+    )
+
+
+def test_scenarios_require_whole_version_review() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=["Existing behavior"], final_review=False))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.scenarios", "requires final_review to be true")
+    ]
+
+
+def test_scenario_list_boundary_produces_dispatchable_gate_prompt() -> None:
+    scenarios = [f"{'x' * (3999 - len(str(index)))}-{index}" for index in range(15)]
+    used = len(
+        "\n".join(
+            f"{index}. {scenario}" for index, scenario in enumerate(scenarios, 1)
+        ).encode()
+    )
+    final_prefix_bytes = len(f"\n{len(scenarios) + 1}. ".encode())
+    final_size = _MAX_SCENARIO_LIST_BYTES - used - final_prefix_bytes
+    scenarios.append("y" * final_size)
+
+    config = parse(payload(scenarios=scenarios))
+    code = generate_issue_driven_workflow(config)
+    module_name = "generated_scenario_boundary"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-scenario-boundary>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    prompt = module.__dict__["scenario_gate_prompt"](
+        topology_pr(head_sha="h" * 40, base_sha="b" * 40)
+    )
+
+    assert _MAX_SCENARIO_LIST_BYTES < len(prompt.encode()) < 66_000
+    completed = subprocess.run(
+        [sys.executable, "-c", "import sys; assert sys.argv[1]", prompt],
+        check=False,
+    )
+    assert completed.returncode == 0
+
+    scenarios[-1] += "z"
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        (
+            "$.scenarios",
+            "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+        )
+    ]
+
+
+def test_scenario_list_aggregate_limit_counts_utf8_bytes() -> None:
+    scenarios = [f"{index}:{'界' * (3999 - len(str(index)))}" for index in range(6)]
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert (
+        "$.scenarios",
+        "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
 @pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])
 def test_policy_issue_must_be_a_positive_integer(policy_issue: object) -> None:
     with pytest.raises(IssueDrivenValidationError) as caught:
@@ -983,6 +1094,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
+        "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
     }

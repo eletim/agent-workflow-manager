@@ -437,6 +437,7 @@ class IssueDrivenConfig:
     policy_issue: int | None = None
     make_integration_branch: bool = False
     one_shot_issue: int | None = None
+    scenarios: tuple[str, ...] = ()
 
     @property
     def issues(self) -> tuple[int, ...]:
@@ -459,6 +460,8 @@ class IssueDrivenConfig:
         }
         if self.policy_issue is not None:
             result["policy_issue"] = self.policy_issue
+        if self.scenarios:
+            result["scenarios"] = list(self.scenarios)
         if self.one_shot_issue is not None:
             result["one_shot_issue"] = self.one_shot_issue
         elif all(item.issue is not None for item in self.work_items):
@@ -486,11 +489,15 @@ _OPTIONAL_FIELDS = {
     "issues",
     "work_items",
     "one_shot_issue",
+    "scenarios",
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
 _MAX_INITIAL_WORK_ITEMS = 100
 _MAX_WORK_ITEM_PLAN_STATE_BYTES = 32_000
+_MAX_SCENARIOS = 100
+_MAX_SCENARIO_CHARS = 4_000
+_MAX_SCENARIO_LIST_BYTES = 64_000
 _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -512,6 +519,13 @@ def _work_item_plan_state_size(work_items: list[WorkItem]) -> int:
             separators=(",", ":"),
         ).encode()
     )
+
+
+def _scenario_list_size(scenarios: list[str]) -> int:
+    numbered = "\n".join(
+        f"{index}. {scenario}" for index, scenario in enumerate(scenarios, 1)
+    )
+    return len(numbered.encode())
 
 
 def _valid_branch_name(value: str) -> bool:
@@ -800,6 +814,59 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             findings.append(
                 IssueDrivenFinding(f"$.{key}", "must be one of: codex, claude")
             )
+    raw_scenarios = value.get("scenarios", [])
+    scenarios: list[str] = []
+    if not isinstance(raw_scenarios, list):
+        findings.append(IssueDrivenFinding("$.scenarios", "must be an array"))
+    else:
+        if len(raw_scenarios) > _MAX_SCENARIOS:
+            findings.append(
+                IssueDrivenFinding(
+                    "$.scenarios", f"must contain at most {_MAX_SCENARIOS} items"
+                )
+            )
+        seen_scenarios: set[str] = set()
+        for index, scenario in enumerate(raw_scenarios):
+            path = f"$.scenarios[{index}]"
+            has_surrogate = isinstance(scenario, str) and any(
+                0xD800 <= ord(character) <= 0xDFFF for character in scenario
+            )
+            if has_surrogate:
+                findings.append(
+                    IssueDrivenFinding(path, "must contain only Unicode scalar values")
+                )
+            elif (
+                not isinstance(scenario, str)
+                or not scenario
+                or scenario != scenario.strip()
+                or "\0" in scenario
+                or len(scenario) > _MAX_SCENARIO_CHARS
+            ):
+                findings.append(
+                    IssueDrivenFinding(
+                        path,
+                        "must be a non-empty trimmed string of at most 4000 characters",
+                    )
+                )
+            elif scenario in seen_scenarios:
+                findings.append(IssueDrivenFinding(path, "must be unique"))
+            else:
+                seen_scenarios.add(scenario)
+                scenarios.append(scenario)
+        if (
+            len(scenarios) == len(raw_scenarios)
+            and _scenario_list_size(scenarios) > _MAX_SCENARIO_LIST_BYTES
+        ):
+            findings.append(
+                IssueDrivenFinding(
+                    "$.scenarios",
+                    "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+                )
+            )
+    if scenarios and value.get("final_review") is False:
+        findings.append(
+            IssueDrivenFinding("$.scenarios", "requires final_review to be true")
+        )
     if findings:
         raise IssueDrivenValidationError(findings)
     return IssueDrivenConfig(
@@ -816,6 +883,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         reviewer_agent=value.get("reviewer_agent", "codex"),
         policy_issue=value.get("policy_issue"),
         one_shot_issue=value.get("one_shot_issue"),
+        scenarios=tuple(scenarios),
     )
 
 
@@ -946,6 +1014,11 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     source = source.replace(
         "WORKFLOW_POLICY_ISSUE = None",
         f"WORKFLOW_POLICY_ISSUE = {config.policy_issue!r}",
+        1,
+    )
+    source = source.replace(
+        "SCENARIOS: tuple[str, ...] = ()",
+        f"SCENARIOS: tuple[str, ...] = {config.scenarios!r}",
         1,
     )
     source = source.replace(

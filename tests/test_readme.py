@@ -18,3 +18,12 @@ def test_personal_setup_starts_agent_workflow_manager_without_secrets() -> None:
     assert "bash start.sh" in personal_setup
     assert "PMUX_TOKEN=" not in personal_setup
     assert "cli-token" not in personal_setup
+
+
+def test_issue_driven_overview_documents_optional_scenario_gate() -> None:
+    assert "two agent fields, and `scenarios` are optional" in README
+    assert "dedicated AI Scenario Gate" in README
+    assert "exact final-base commit (Before)" in README
+    assert "integration-head commit\n(After)" in README
+    assert "not fixed expected-output assertions" in README
+    assert "embedded in generated plain Python" in README
