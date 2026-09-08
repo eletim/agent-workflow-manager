@@ -103,6 +103,7 @@ class FakeRunner:
 
 def client(runner: FakeRunner, **kwargs: object) -> PurpleMuxCLIClient:
     kwargs.setdefault("codex_project_truster", lambda path: path)
+    kwargs.setdefault("claude_project_truster", lambda path: path)
     return PurpleMuxCLIClient(
         "ws-test",
         poll_interval_seconds=0,
@@ -236,15 +237,34 @@ def test_direct_client_rejects_workspace_without_directories() -> None:
     assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
-def test_claude_session_does_not_change_codex_trust() -> None:
-    trusted: list[str] = []
+def test_claude_project_is_trusted_before_tab_creation() -> None:
+    codex_trusted: list[str] = []
+    claude_trusted: list[str] = []
     runner = FakeRunner([completed({"tabId": "tab-claude"})])
 
     client(
-        runner, codex_project_truster=lambda path: trusted.append(path) or path
+        runner,
+        codex_project_truster=lambda path: codex_trusted.append(path) or path,
+        claude_project_truster=lambda path: claude_trusted.append(path) or path,
     ).create_session(request("claude-code", "claude"))
 
-    assert trusted == []
+    assert codex_trusted == []
+    assert claude_trusted == ["/workspace/project"]
+    assert runner.calls[0][1:] == ["workspaces"]
+
+
+def test_claude_trust_failure_prevents_tab_creation() -> None:
+    runner = FakeRunner([])
+
+    def fail(_path: str) -> str:
+        raise WorkerFailure("Claude trust unavailable")
+
+    with pytest.raises(WorkerFailure, match="Claude trust unavailable"):
+        client(runner, claude_project_truster=fail).create_session(
+            request("claude-code", "claude")
+        )
+
+    assert not any(call[1:3] == ["tab", "create"] for call in runner.calls)
 
 
 def test_named_session_derives_run_scoped_correlation(

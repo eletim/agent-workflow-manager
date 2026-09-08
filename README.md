@@ -308,10 +308,15 @@ fresh run worktrees, whose new paths do not inherit trust from their source
 repositories. The operation does not change Codex sandbox or approval settings
 and does not trust a parent, secondary, or unrelated path.
 
-Claude Code has no equivalent narrow path-trust mutation in the integration
-used here. AWM does not use a broad permission bypass or terminal keystroke
-automation for Claude; its provider-specific trust behavior remains owned by
-Claude Code and PurpleMux.
+Before creating a Claude tab, the adapter applies the same exact launch-directory
+check, then uses Claude Code's supported project-state contract to set only
+`projects[canonical_path].hasTrustDialogAccepted`. The state update respects
+`CLAUDE_CONFIG_DIR`, preserves all other Claude and project values, is serialized
+across concurrent AWM processes, and is read back before launch. Claude's home
+directory is rejected because Claude only permits session-scoped trust there.
+AWM does not alter permission mode, sandbox behavior, onboarding state, parent
+directories, or unrelated projects, and does not inspect prompt text or automate
+terminal keystrokes.
 
 ## Local Python Runner UI
 
@@ -636,4 +641,12 @@ interactive trust prompt, then repeats the launch for the already-trusted path:
 ```bash
 AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_TRUST=1 \
   uv run pytest tests/test_live_codex_trust.py
+```
+
+The equivalent Claude test verifies both a fresh worktree's first turn and a
+second launch using its already-established project trust:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
+  uv run pytest tests/test_live_claude_trust.py
 ```
