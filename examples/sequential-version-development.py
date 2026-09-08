@@ -859,6 +859,16 @@ def require_inline_task_pr_identity(
     return pr
 
 
+def inline_task_pr_fingerprint(pr: PullRequestState) -> str | None:
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    lines = pr.body.splitlines()
+    marker = lines[0].strip() if lines else ""
+    if not marker.startswith(prefix):
+        return None
+    suffix = " -->"
+    return marker[len(prefix) : -len(suffix)] if marker.endswith(suffix) else ""
+
+
 def prepare_issue(
     repo: GitRepository,
     github: GitHubRepository,
@@ -946,6 +956,7 @@ def ensure_issue_pr(
     config: Config,
     *,
     expected_base_sha: str,
+    may_initialize_inline_identity: bool = False,
 ) -> PullRequestState:
     local = repo.require_current_branch(issue.branch)
     assert local.local_sha is not None
@@ -962,18 +973,31 @@ def ensure_issue_pr(
             body=issue.pr_body,
             correlation_id=run_correlation(f"{issue.correlation_id}-pr"),
         )
-    return require_inline_task_pr_identity(
-        github.require_pr(
-            number=pr.number,
-            head=issue.branch,
-            base=config.integration_branch,
-            state="OPEN",
-            expected_head_sha=feature.remote_sha,
-            expected_base_sha=expected_base_sha,
-            draft=True,
-        ),
-        issue,
+    current = github.require_pr(
+        number=pr.number,
+        head=issue.branch,
+        base=config.integration_branch,
+        state="OPEN",
+        expected_head_sha=feature.remote_sha,
+        expected_base_sha=expected_base_sha,
+        draft=True,
     )
+    if (
+        may_initialize_inline_identity
+        and issue.task_fingerprint is not None
+        and inline_task_pr_fingerprint(current) is None
+    ):
+        marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{issue.task_fingerprint} -->"
+        body = f"{marker}\n\n{current.body}" if current.body else marker
+        current = github.update_pr_body(
+            current.number,
+            body=body,
+            expected_head=issue.branch,
+            expected_head_sha=feature.remote_sha,
+            expected_base=config.integration_branch,
+            expected_base_sha=expected_base_sha,
+        )
+    return require_inline_task_pr_identity(current, issue)
 
 
 def merge_pr_and_advance(
@@ -1340,7 +1364,12 @@ def process_issue(
     if integration.remote_sha is None:
         raise WorkerFailure("integration remote branch disappeared")
     pr = ensure_issue_pr(
-        repo, github, issue, config, expected_base_sha=integration.remote_sha
+        repo,
+        github,
+        issue,
+        config,
+        expected_base_sha=integration.remote_sha,
+        may_initialize_inline_identity=existing_pr is None,
     )
     pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
     if pr.head_sha != implementation_sha:

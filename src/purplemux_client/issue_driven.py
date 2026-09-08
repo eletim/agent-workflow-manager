@@ -637,14 +637,24 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                 else:
                     assert isinstance(item_id, str)
                     seen_ids.add(item_id)
+                task_has_surrogate = isinstance(task, str) and any(
+                    0xD800 <= ord(character) <= 0xDFFF for character in task
+                )
                 task_valid = (
                     isinstance(task, str)
                     and bool(task)
                     and task == task.strip()
                     and "\0" not in task
                     and len(task) <= 4000
+                    and not task_has_surrogate
                 )
-                if not task_valid:
+                if task_has_surrogate:
+                    findings.append(
+                        IssueDrivenFinding(
+                            f"{path}.task", "must contain only Unicode scalar values"
+                        )
+                    )
+                elif not task_valid:
                     findings.append(
                         IssueDrivenFinding(
                             f"{path}.task",

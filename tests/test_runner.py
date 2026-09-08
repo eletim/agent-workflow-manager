@@ -2733,6 +2733,40 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert rejected["issueDrivenValidation"]
 
 
+def test_issue_driven_generation_api_rejects_unpaired_task_surrogate(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    source = json.dumps(
+        {
+            "repository": "/tmp/example",
+            "integration_branch": "dev/v0.2.0",
+            "final_branch": "main",
+            "work_items": [{"id": "invalid-unicode", "task": "Do it \ud800"}],
+            "max_reviews": 5,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
+
+    status, rejected = request(
+        address,
+        "POST",
+        "/api/issue-driven/generate",
+        json.dumps({"json": source}),
+        token=token,
+    )
+
+    assert status == 422
+    assert rejected["issueDrivenValidation"] == [
+        {
+            "path": "$.work_items[0].task",
+            "message": "must contain only Unicode scalar values",
+        }
+    ]
+
+
 def test_runner_page_exposes_agent_workflow_manager_favicon(
     web_server: tuple[tuple[str, int], str],
 ) -> None:

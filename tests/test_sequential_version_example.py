@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import runpy
 import subprocess
 from dataclasses import replace
@@ -971,6 +972,110 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     verify_index = events.index(f"require_pr:{implementation_sha}")
     assert commit_index < push_index < draft_index < verify_index
     assert events[-1] == "ready"
+
+
+def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["process_issue"].__globals__
+    task = "Refresh the New Run help."
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    branch = "feature/work-item-refresh-run-help"
+    issue = workflow["Issue"](None, branch, "refresh-run-help", task, fingerprint)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    implementation_sha = "implementation-head"
+    base_sha = "integration-head"
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    events: list[str] = []
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, base_sha, base_sha, False)
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, implementation_sha, None, True)
+
+        def ensure_pushed(
+            self, current: str, *, expected_local_sha: str
+        ) -> BranchState:
+            assert (current, expected_local_sha) == (branch, implementation_sha)
+            return BranchState(current, implementation_sha, implementation_sha, True)
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.pr: PullRequestState | None = None
+
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base, state) == (branch, config.integration_branch, "OPEN")
+            return self.pr
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert self.pr is not None
+            assert kwargs["expected_head_sha"] == implementation_sha
+            assert kwargs["expected_base_sha"] == base_sha
+            return self.pr
+
+        def update_pr_body(
+            self, number: int, *, body: str, **kwargs: object
+        ) -> PullRequestState:
+            assert self.pr is not None and number == self.pr.number
+            assert body == f"{marker}\n\nAgent-created PR body"
+            events.append("identity")
+            self.pr = replace(self.pr, body=body)
+            return self.pr
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            assert self.pr is not None and number == self.pr.number
+            events.append("ready")
+            self.pr = replace(self.pr, is_draft=False)
+            return self.pr
+
+    github = GitHub()
+    agent_pr = replace(
+        open_pr(head=branch, base=config.integration_branch, draft=True),
+        head_sha=implementation_sha,
+        base_sha=base_sha,
+        body="Agent-created PR body",
+    )
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        github.pr = agent_pr
+        events.append("agent-created")
+        return "implemented, committed, pushed, and opened Draft PR"
+
+    def review_issue_phase(*args: object, **kwargs: object):
+        assert github.pr is not None and github.pr.body.startswith(marker)
+        return workflow["IssueReviewPhaseResult"](
+            github.pr, "approved", implementation_sha, base_sha, 1
+        )
+
+    monkeypatch.setitem(
+        workflow_globals, "prepare_issue", lambda *args: (None, "start-head", False)
+    )
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (implementation_sha, True),
+    )
+    monkeypatch.setitem(workflow_globals, "review_issue_phase", review_issue_phase)
+    monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
+
+    result = workflow["process_issue"](issue, config, object(), Repository(), github)
+
+    assert result.body == f"{marker}\n\nAgent-created PR body"
+    assert events == ["agent-created", "identity", "ready"]
 
 
 def test_issue_review_limit_warns_without_starting_an_extra_fix(
