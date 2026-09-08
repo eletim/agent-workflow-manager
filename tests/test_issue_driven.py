@@ -51,7 +51,55 @@ def test_valid_json_preserves_issue_order() -> None:
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+    assert config.make_integration_branch is False
     assert config.policy_issue is None
+
+
+def test_make_integration_branch_round_trips_when_enabled() -> None:
+    config = parse(payload(make_integration_branch=True))
+
+    assert config.make_integration_branch is True
+    assert config.as_json()["make_integration_branch"] is True
+    assert parse(config.as_json()) == config
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_make_integration_branch_must_be_boolean(value: object) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(make_integration_branch=value))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.make_integration_branch", "must be a boolean")
+    ]
+
+
+def test_generated_workflow_can_create_integration_from_final_branch() -> None:
+    config = parse(
+        payload(
+            integration_branch="dev/v0.2.5",
+            final_branch="dev/v0.2.4",
+            make_integration_branch=True,
+        )
+    )
+
+    code = generate_issue_driven_workflow(config)
+
+    assert "base_branch='dev/v0.2.4'" in code
+    assert "repository.prepare_feature_branch(\n        'dev/v0.2.5'," in code
+    assert "base='dev/v0.2.4'" in code
+    assert "expected_base_sha=context.base_sha" in code
+    assert "repository.ensure_pushed(\n        'dev/v0.2.5'," in code
+
+
+def test_generated_workflow_requires_existing_integration_by_default() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+
+    assert "base_branch='dev/v0.2.0'" in parse_args
+    assert "prepare_feature_branch(" not in parse_args
+    assert "ensure_pushed(" not in parse_args
 
 
 def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
@@ -434,6 +482,43 @@ def load_generated_workflow(**overrides: object) -> dict[str, object]:
     finally:
         del sys.modules[module_name]
     return module.__dict__
+
+
+def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> None:
+    workflow = load_generated_workflow(
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    final_sha = "f" * 40
+    calls: list[tuple[object, ...]] = []
+    repository = SimpleNamespace(expected_github_slug="acme/project")
+
+    def prepare_feature_branch(
+        branch: str, *, base: str, expected_base_sha: str
+    ) -> BranchState:
+        calls.append(("prepare", branch, base, expected_base_sha))
+        return BranchState(branch, final_sha, None, True)
+
+    def ensure_pushed(branch: str, *, expected_local_sha: str) -> BranchState:
+        calls.append(("push", branch, expected_local_sha))
+        return BranchState(branch, final_sha, final_sha, True)
+
+    repository.prepare_feature_branch = prepare_feature_branch
+    repository.ensure_pushed = ensure_pushed
+    workflow["prepare_run_repository"] = lambda **kwargs: SimpleNamespace(
+        execution_root=Path("/run"), base_sha=final_sha
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repository)
+
+    config = workflow["parse_args"]()  # type: ignore[operator]
+
+    assert config.integration_branch == "dev/v0.2.5"
+    assert config.main_branch == "dev/v0.2.4"
+    assert calls == [
+        ("prepare", "dev/v0.2.5", "dev/v0.2.4", final_sha),
+        ("push", "dev/v0.2.5", final_sha),
+    ]
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:

@@ -66,6 +66,7 @@ executable DSL, and there is no Issue Driven runtime or UI-side control-flow mod
   "repository": "~/DevEnv/project",
   "integration_branch": "dev/v0.2.0",
   "final_branch": "main",
+  "make_integration_branch": false,
   "policy_issue": 88,
   "issues": [90, 89],
   "max_reviews": 5,
@@ -77,16 +78,21 @@ executable DSL, and there is no Issue Driven runtime or UI-side control-flow mod
 }
 ```
 
-The fixed `mode` discriminator, `policy_issue`, and the two agent fields are
-optional; every other field is required. When set, `policy_issue` is a positive
-Issue number that supplies version-wide design context to every implementation,
-review, and fix turn and is referenced by the Base PR. It cannot also appear in
-`issues`. Clear conflicts produce structured warnings while the implementation
-Issue remains authoritative. Conflict records are persisted on the relevant
-child PR or Base PR so a recovery run can restore them for whole-version review,
-Summary, and Base PR handoff. `implementer_agent` selects implementation, fix,
-and cleanup turns, while `reviewer_agent` selects Issue and whole-version review
-turns plus the final Japanese Base PR handoff writer. Each
+The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`, and
+the two agent fields are optional; every other field is required. With
+`make_integration_branch: true`, the workflow creates and pushes a missing
+integration branch from the exact remote `final_branch` HEAD. An existing branch
+is reused only when it contains that exact starting commit and passes the normal
+safe recovery checks. The final PR still targets `final_branch`. When set,
+`policy_issue` is a positive Issue number that supplies version-wide design
+context to every implementation, review, and fix turn and is referenced by the
+Base PR. It cannot also appear in `issues`. Clear conflicts produce structured
+warnings while the implementation Issue remains authoritative. Conflict records
+are persisted on the relevant child PR or Base PR so a recovery run can restore
+them for whole-version review, Summary, and Base PR handoff.
+`implementer_agent` selects implementation, fix, and cleanup turns, while
+`reviewer_agent` selects Issue and whole-version review turns plus the final
+Japanese Base PR handoff writer. Each
 accepts `codex` or `claude` and independently defaults to `codex`. Issue numbers
 are positive, unique, and retain their array order. Unknown fields are rejected so
 generic actions, conditions, loops, and nested executable blocks cannot grow into

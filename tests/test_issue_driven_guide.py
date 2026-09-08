@@ -60,7 +60,9 @@ def test_repository_guidance_matches_generated_worktree_semantics() -> None:
         in guide
     )
     assert "repo='~/DevEnv/agent-workflow-manager'" in generated
-    assert "base_branch='dev/v0.2.1'" in generated
+    assert "base_branch='main'" in generated
+    assert "base='main'" in generated
+    assert "expected_base_sha=context.base_sha" in generated
 
 
 def test_starter_and_template_use_five_reviews_and_safe_final_delivery() -> None:
