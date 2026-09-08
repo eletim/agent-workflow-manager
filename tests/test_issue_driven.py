@@ -908,15 +908,29 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
         processed.append(issue)
     )
     workflow["run_outline_step"] = lambda _name, action: action()
+    persisted: list[str] = []
+
+    def persist(plan, _config, _repo, _github, pr):
+        persisted.append(workflow["serialized_work_item_plan"](plan))
+        return pr
+
+    workflow["persist_work_item_plan"] = persist
+    plan = workflow["WorkItemPlan"](config)
 
     effective = workflow["process_work_items"](
-        config, SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        plan,
     )
 
     assert [issue.key for issue in processed] == ["release-notes", 91, 92]
     assert processed[0].task == updated_task
     assert [issue.key for issue in effective] == ["release-notes", 91, 92]
     assert [issue.key for issue in config.issues] == ["release-notes", 90]
+    assert len(persisted) == 7
 
     plan = workflow["WorkItemPlan"](config)
     assert plan.take_next() is original
@@ -936,6 +950,135 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
             ),
         )
     assert [issue.key for issue in plan.snapshot] == ["release-notes", 90]
+
+
+def test_planner_persists_undispatched_addition_before_interruption() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    task = "Add the missing recovery test."
+    decision = json.dumps(
+        {
+            "actions": [
+                {"action": "add", "item": {"id": "recovery-test", "task": task}}
+            ],
+            "complete": False,
+        }
+    )
+    stored_body = "Base PR"
+
+    def persist(plan, _config, _repo, _github, pr):
+        nonlocal stored_body
+        stored_body = workflow["with_work_item_plan"](stored_body, plan)
+        return pr
+
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: decision
+    workflow["persist_work_item_plan"] = persist
+    workflow["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
+        RuntimeError("interrupted")
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        workflow["process_work_items"](
+            config,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            plan,
+        )
+
+    recovered = workflow["work_item_plan_from_body"](stored_body, config)
+    assert recovered.position == 0
+    assert [issue.key for issue in recovered.remaining] == [90, "recovery-test"]
+    assert recovered.remaining[1].task == task
+    with pytest.raises(WorkerFailure, match="missing work-item plan"):
+        workflow["work_item_plan_from_body"]("Base PR", config)
+
+
+def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    task = "Document the recovered dynamic work."
+    dynamic_mini = workflow["planner_inline_issue"]("recovery-docs", task)
+    plan = workflow["WorkItemPlan"](config)
+    plan.skip(90)
+    plan.add(issue_type(91, "feature/issue-91"))
+    plan.add(dynamic_mini)
+    plan.position = len(plan.items)
+    plan.finalized = True
+    body = workflow["with_work_item_plan"]("Base PR", plan)
+    recovered = workflow["work_item_plan_from_body"](body, config)
+    dynamic_issue, recovered_mini = recovered.snapshot
+    open_dynamic = topology_pr(number=191, head_branch=dynamic_issue.branch)
+    merged_mini = topology_pr(
+        number=192,
+        state="MERGED",
+        head_branch=recovered_mini.branch,
+        body=recovered_mini.pr_body,
+    )
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert base == config.integration_branch
+            for pr in (open_dynamic, merged_mini):
+                if pr.head_branch == head and pr.state == state:
+                    return pr
+            return None
+
+    repository = SimpleNamespace(
+        require_clean=lambda: None,
+        synchronize_branch=lambda branch: BranchState(
+            branch,
+            open_dynamic.head_sha if branch == dynamic_issue.branch else "b" * 40,
+            open_dynamic.head_sha if branch == dynamic_issue.branch else "b" * 40,
+            True,
+        ),
+        inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
+            base_is_ancestor=True
+        ),
+    )
+
+    github = GitHub()
+    prepared: list[object] = []
+    prepare_issue = workflow["prepare_issue"]
+    workflow["process_issue"] = lambda issue, *_args: prepared.append(
+        prepare_issue(repository, github, issue, config)
+    )
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail(
+        "a finalized recovered plan must not restart its planner"
+    )
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        repository,
+        github,
+        SimpleNamespace(),
+        recovered,
+    )
+
+    assert prepared[0][0] is open_dynamic
+    assert prepared[1] is merged_mini
+    assert [issue.key for issue in effective] == [91, "recovery-docs"]
 
 
 def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> None:

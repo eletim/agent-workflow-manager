@@ -82,6 +82,15 @@ workflow engine, graph, state machine, or automatic retry facility. Obsolete
 checkpoint fields from older data or inherited environments are ignored and
 must never trigger replay.
 
+Workflow-owned business decisions that cannot be reconstructed from Git topology
+may be persisted by the plain Python workflow in an authoritative external
+resource. In Issue Driven mode, accepted work-item plan decisions and the last
+completed position are stored in the Draft Base PR before further dispatch or
+final delivery. Recovery validates that state against the immutable generated
+seed and re-inspects the recorded items' GitHub topology. This is domain state
+owned and interpreted by the workflow, not a Runner checkpoint or progress-event
+state machine.
+
 PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
 `purplemux_client` uses
 PurpleMux's public CLI contract and does not replace its runtime or access tmux
