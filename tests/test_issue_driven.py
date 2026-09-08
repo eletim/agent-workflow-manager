@@ -2415,9 +2415,33 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
         ChildGitHub(), child_pr, issue, config
     )
     assert "agent-workflow-manager:policy-conflict:" in persisted.body
+    plan = first_run["WorkItemPlan"](config)  # type: ignore[operator]
+    base_pr = replace(
+        child_pr,
+        number=200,
+        head_branch=config.integration_branch,
+        head_sha="integration-head",
+        base_branch=config.main_branch,
+        base_sha="main-head",
+        body=first_run["with_work_item_plan"](  # type: ignore[operator]
+            "Sequential integration.", plan
+        ),
+    )
+
+    class FirstBaseGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == base_pr.number
+            return replace(base_pr, body=str(kwargs["body"]))
+
+    base_pr = first_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
+        FirstBaseGitHub(), base_pr, config
+    )
+    assert "agent-workflow-manager:policy-conflict:" in base_pr.body
 
     # A new module models recovery after interruption; no process-local warning
-    # state crosses this boundary and the already-merged Issue is skipped.
+    # state crosses this boundary. Recover the Base PR before the already-merged
+    # Issue, as process_work_items does, so its copied marker is initially
+    # rehydrated without an Issue scope.
     second_run = load_run("generated_policy_second_run")
     recovered_issue = second_run["Issue"](90, "feature/issue-90")  # type: ignore[operator]
     recovered_config = second_run["Config"](  # type: ignore[operator]
@@ -2431,11 +2455,37 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
     )
     merged = replace(persisted, state="MERGED", is_draft=False)
     findings: list[tuple[str, str, str]] = []
+    issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
     process_globals = second_run["process_issue"].__globals__  # type: ignore[attr-defined]
-    process_globals["prepare_issue"] = lambda *args: merged
     process_globals["emit_finding"] = lambda category, message, status="completed": (
         findings.append((category, message, status))
     )
+    process_globals["emit_issue_result"] = lambda *args, **kwargs: issue_results.append(
+        (args, kwargs)
+    )
+
+    class RecoveryRepository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == recovered_config.integration_branch
+            return BranchState(branch, base_pr.head_sha, base_pr.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == recovered_config.main_branch
+            return BranchState(branch, base_pr.base_sha, base_pr.base_sha, True)
+
+    class RecoveryGitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return base_pr if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return base_pr
+
+    second_run["prepare_work_item_plan_pr"](  # type: ignore[operator]
+        recovered_config, RecoveryRepository(), RecoveryGitHub()
+    )
+    process_globals["prepare_issue"] = lambda *args: merged
 
     class CleanRepository:
         def inspect_worktree(self) -> SimpleNamespace:
@@ -2446,34 +2496,17 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
     )
 
     assert recovered is merged
-    assert findings and findings[0][2] == "warning"
-    warning = findings[0][1]
+    warning = next(message for _, message, status in findings if status == "warning")
+    assert issue_results == [
+        (
+            (90, "skipped", 0, merged.number, merged.url),
+            {"warnings": (warning,), "label": "Issue #90"},
+        )
+    ]
     whole_review_context = second_run["policy_context"](  # type: ignore[operator]
         recovered_config, scope="the whole-version review"
     )
     assert warning in whole_review_context
-
-    base_pr = replace(
-        child_pr,
-        number=200,
-        head_branch=recovered_config.integration_branch,
-        head_sha="integration-head",
-        base_branch=recovered_config.main_branch,
-        base_sha="main-head",
-        body="Sequential integration.",
-    )
-    delivered_bodies: list[str] = []
-
-    class BaseGitHub:
-        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
-            assert number == base_pr.number
-            delivered_bodies.append(str(kwargs["body"]))
-            return replace(base_pr, body=delivered_bodies[-1])
-
-    second_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
-        BaseGitHub(), base_pr, recovered_config
-    )
-    assert delivered_bodies and warning in delivered_bodies[-1]
 
 
 def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() -> None:

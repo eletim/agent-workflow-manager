@@ -509,7 +509,11 @@ implementation work item remains the primary requirement. {conflict_instruction}
 
 
 def record_policy_conflict(issue_number: int | str | None, warning: str) -> None:
-    if any(existing == warning for _, existing in POLICY_CONFLICT_WARNINGS):
+    for index, (warning_issue, existing) in enumerate(POLICY_CONFLICT_WARNINGS):
+        if existing != warning:
+            continue
+        if warning_issue is None and issue_number is not None:
+            POLICY_CONFLICT_WARNINGS[index] = (issue_number, warning)
         return
     if len(POLICY_CONFLICT_WARNINGS) >= MAX_POLICY_CONFLICT_WARNINGS:
         raise WorkerFailure(
