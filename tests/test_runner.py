@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,55 @@ def test_terminal_run_checked_metadata_is_reversible_and_run_scoped(
     unchecked = runner.set_checked(first_id, False)
     assert unchecked.checked is False
     assert unchecked.state == "success"
+
+
+def test_checked_terminal_run_is_restored_after_runner_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "state" / "run-history.json"
+    first_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        first_id = first_runner.start("print('persisted output')")
+        finished = wait_for(
+            first_runner, lambda item: item.state == "success", run_id=first_id
+        )
+        stable_identity = first_runner._run_identity(first_id)
+        assert finished.checked is False
+        first_runner.set_checked(first_id, True)
+        saved = json.loads(history_file.read_text(encoding="utf-8"))
+        assert list(saved["runs"]) == [stable_identity]
+    finally:
+        first_runner.close()
+
+    second_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        second_runner.configure_event_endpoint("http://127.0.0.1:8765")
+        restored = second_runner.snapshot(first_id)
+        assert second_runner._run_identity(first_id) == stable_identity
+        assert restored.state == "success"
+        assert restored.checked is True
+        assert restored.stdout == "persisted output\n"
+        assert [item.run_id for item in second_runner.snapshots()] == [first_id]
+
+        second_id = second_runner.start("print('new run')")
+        assert second_id == first_id + 1
+        second = wait_for(
+            second_runner, lambda item: item.state == "success", run_id=second_id
+        )
+        assert second.checked is False
+        assert second_runner.snapshot(first_id).checked is True
+    finally:
+        second_runner.close()
+
+    assert stat.S_IMODE(history_file.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("terminal_state", ["success", "failed", "stopped"])

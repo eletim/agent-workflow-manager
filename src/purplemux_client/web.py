@@ -37,6 +37,7 @@ from purplemux_client.runner import (
     RunCheckNotAllowedError,
     RunCleanupInProgressError,
     RunCleanupNotAllowedError,
+    RunHistoryError,
     RunNotFoundError,
     RunStopUncertainError,
     WorkflowDryRunError,
@@ -436,6 +437,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             except RunCheckNotAllowedError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, snapshot.as_json())
             return
