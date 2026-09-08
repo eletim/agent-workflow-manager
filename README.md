@@ -83,6 +83,18 @@ fails closed if the state is missing, ambiguous, or belongs to a different seed.
 The Runner and progress events only observe these decisions, so the generated
 plain Python remains the control-flow source of truth.
 
+For one-shot delivery, replace the initial `issues` / `work_items` list with a
+single `one_shot_issue`. The generated workflow starts with an empty plan and its
+dedicated manager reads that source Issue before every planning turn, decomposes
+the remaining goal into short inline mini tasks, and adjusts the pending plan as
+implementation progresses. Each mini task records its purpose and indispensable
+design decisions, then enters the same implementation, independent review,
+recovery, and delivery flow as every other work item. The source Issue is part of
+the persisted plan identity and is referenced by the Base PR and final handoff.
+Numeric Issue additions are rejected in this mode, and every manager-created or
+revised mini task receives authoritative branch/PR topology validation before its
+dispatch is persisted.
+
 ```json
 {
   "mode": "issue-driven",
@@ -95,6 +107,23 @@ plain Python remains the control-flow source of truth.
   "max_reviews": 5,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
+  "merge_to_integration": true,
+  "final_review": true,
+  "merge_final": false
+}
+```
+
+A one-shot configuration uses the same delivery settings but needs only the
+original Issue as its work definition:
+
+```json
+{
+  "mode": "issue-driven",
+  "repository": "~/DevEnv/project",
+  "integration_branch": "dev/v0.3.0",
+  "final_branch": "main",
+  "one_shot_issue": 169,
+  "max_reviews": 5,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false

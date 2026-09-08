@@ -52,8 +52,8 @@ Incorrect when that version worktree does not already exist:
 
 ## Supported schema
 
-Unknown fields are rejected. Provide exactly one of `work_items` or the legacy
-`issues` field. `mode`, `make_integration_branch`, `policy_issue`,
+Unknown fields are rejected. Provide exactly one of `one_shot_issue`, `work_items`,
+or the legacy `issues` field. `mode`, `make_integration_branch`, `policy_issue`,
 `implementer_agent`, and `reviewer_agent` are otherwise optional; every other
 field is required.
 
@@ -65,6 +65,7 @@ field is required.
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `make_integration_branch` | boolean | Create/recover `integration_branch` from the exact remote `final_branch` HEAD; default `false`. |
 | `policy_issue` | integer | Optional positive Issue number containing version-wide design context; it must not also appear as an implementation GitHub Issue item. |
+| `one_shot_issue` | integer | Positive source Issue for a manager-planned one-shot run. It starts with no work items and cannot be combined with `issues` or `work_items`. |
 | `issues` | array of integers | Legacy form for positive, unique GitHub Issue numbers, executed in the listed order. Do not combine it with `work_items`. |
 | `work_items` | array | Ordered GitHub Issue numbers and/or inline mini-task objects. A mini task is exactly `{"id": "lowercase-kebab-id", "task": "authoritative instruction"}` and does not require a GitHub Issue. |
 | `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 5 unless the user requests another value. |
@@ -137,6 +138,34 @@ To mix a GitHub Issue with a workflow-local task, replace `issues` with
 }
 ```
 
+To deliver one large Issue without preparing its work-item list, use
+`one_shot_issue` instead:
+
+```json
+{
+  "mode": "issue-driven",
+  "repository": "~/DevEnv/agent-workflow-manager",
+  "integration_branch": "dev/v0.3.0",
+  "final_branch": "main",
+  "one_shot_issue": 169,
+  "max_reviews": 5,
+  "merge_to_integration": true,
+  "final_review": true,
+  "merge_final": false
+}
+```
+
+The workflow starts this mode with an empty plan. Before every dispatch, the
+dedicated manager reads the source Issue and adds short inline mini tasks whose
+instructions focus on purpose and non-negotiable design decisions. It may update
+or skip pending tasks as progress changes what remains. It does not create GitHub
+Issues or collapse the source Issue into one implementation item. Every generated
+mini task uses the normal implementation, review, recovery, and delivery path.
+The source Issue is bound into persisted recovery state and linked from the Base
+PR and final human handoff. Numeric Issue additions are rejected, and each added
+or revised mini task receives the same authoritative remote branch, PR-state,
+SHA-containment, and fingerprint checks before its dispatch is persisted.
+
 The generated Python embeds the mini-task instruction and uses the deterministic
 branch `feature/work-item-refresh-run-help`. Its recovery declaration and Draft
 PR record the SHA-256 fingerprint of the authoritative task text, and recovery
@@ -202,6 +231,8 @@ and the New Run draft do not display a premature or previous-run Summary.
   path.
 - Preserve work-item order exactly as requested. Use `work_items` when any item
   is an inline mini task; use `issues` for compatibility with Issue-only input.
+- Use `one_shot_issue` when the user supplies one large source Issue and wants the
+  manager to create and revise the mini-task plan during the run.
 - Give each mini task a stable lowercase kebab-case ID and a self-contained,
   short authoritative instruction. Do not create a GitHub Issue for it.
 - Set `make_integration_branch` to true only when the integration branch should
