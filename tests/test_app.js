@@ -32,6 +32,7 @@ class Element {
     this.dataset = {};
     this.disabled = false;
     this.hidden = false;
+    this.open = false;
     this.listeners = new Map();
     this.scrollHeight = 0;
     this.scrollTop = 0;
@@ -65,6 +66,10 @@ class Element {
     return this.attributes[name];
   }
 
+  removeAttribute(name) {
+    delete this.attributes[name];
+  }
+
   focus() {}
 
   select() {}
@@ -80,9 +85,9 @@ class Element {
     }
   }
 
-  showModal() {}
+  showModal() { this.open = true; }
 
-  close() {}
+  close() { this.open = false; }
 }
 
 function snapshot({
@@ -102,6 +107,7 @@ function snapshot({
   executionContext = null,
   mode = undefined,
   prompt = undefined,
+  integrationPr = null,
 }) {
   const result = {
     args,
@@ -126,6 +132,7 @@ function snapshot({
     resourceCleanupStatus,
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
+    integrationPr,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -201,6 +208,7 @@ async function loadApp({
     "active-context", "run-list",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
+    "integration-pr-panel", "integration-pr",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
@@ -212,9 +220,10 @@ async function loadApp({
     "readiness-cleanup", "readiness-guidance",
     "guide-open", "guide-close", "guide-copy", "guide-title", "guide-raw",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
-    "manual-copy-close", "notification-settings", "notifications-enabled",
+    "manual-copy-close", "settings-dialog", "settings-open", "settings-close",
+    "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
-    "notify-topic", "replacement-token", "credential-status", "settings-message",
+    "notify-server-link", "notify-topic", "replacement-token", "credential-status", "settings-message",
     "save-settings", "test-notification",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
@@ -240,6 +249,7 @@ async function loadApp({
     onStopped: false,
     onSuccess: false,
     server: "https://example.invalid",
+    serverUrl: "https://example.invalid",
     topic: "test",
   };
   const initial = {
@@ -303,6 +313,7 @@ async function loadApp({
       setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
     },
+    URL,
   };
   vm.runInNewContext(logDisplaySource, context, {filename: "log-display.js"});
   vm.runInNewContext(appSource, context, {filename: "app.js"});
@@ -348,6 +359,183 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Settings opens Notifications repeatedly without losing form state", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+  });
+
+  assert.equal(elements["notify-server"].value, "https://example.invalid");
+  await elements["settings-open"].dispatch("click");
+  assert.equal(elements["settings-dialog"].open, true);
+  elements["notify-topic"].value = "edited-topic";
+  await elements["settings-close"].dispatch("click");
+  assert.equal(elements["settings-dialog"].open, false);
+  await elements["settings-open"].dispatch("click");
+  assert.equal(elements["settings-dialog"].open, true);
+  assert.equal(elements["notify-topic"].value, "edited-topic");
+});
+
+test("Notify server link is exposed only for safe HTTP URLs", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+  });
+  const server = elements["notify-server"];
+  const link = elements["notify-server-link"];
+
+  assert.equal(link.hidden, false);
+  assert.equal(link.getAttribute("href"), "https://example.invalid");
+  server.value = "ftp://example.invalid";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://secret@example.invalid";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://notify.example/?token=secret";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "https://notify.example/#token=secret";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "http://notify.example";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+  server.value = "http://localhost:8080";
+  await server.dispatch("input");
+  assert.equal(link.hidden, true);
+  assert.equal(link.getAttribute("href"), undefined);
+});
+
+test("Notify server link uses the backend-validated round-trip URL", async () => {
+  const mapped = "http://[::ffff:127.0.0.1]";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method !== "POST") {
+        return undefined;
+      }
+      return response({
+        credentialStatus: "missing",
+        enabled: false,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: false,
+        server: mapped,
+        serverUrl: mapped,
+        topic: "test",
+      });
+    },
+  });
+
+  elements["notify-server"].value = mapped;
+  await elements["notification-settings"].dispatch("submit");
+
+  assert.equal(elements["notify-server-link"].hidden, false);
+  assert.equal(elements["notify-server-link"].getAttribute("href"), mapped);
+});
+
+test("Malformed configured hostname is editable but never linkable", async () => {
+  const malformed = "https://exa%5cmple.com";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method) {
+        return undefined;
+      }
+      return response({
+        credentialStatus: "missing",
+        enabled: false,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: false,
+        server: malformed,
+        serverUrl: null,
+        topic: "test",
+      });
+    },
+  });
+
+  assert.equal(elements["notify-server"].value, malformed);
+  assert.equal(elements["notify-server-link"].hidden, true);
+  assert.equal(elements["notify-server-link"].getAttribute("href"), undefined);
+});
+
+test("Notifications save reuses the protected settings endpoint", async () => {
+  let savedRequest = null;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/notifications" || options.method !== "POST") {
+        return undefined;
+      }
+      savedRequest = options;
+      return response({
+        credentialStatus: "missing",
+        enabled: true,
+        onFailure: false,
+        onStopped: false,
+        onSuccess: true,
+        server: "https://example.invalid",
+        serverUrl: "https://example.invalid",
+        topic: "saved-topic",
+      });
+    },
+  });
+  elements["notifications-enabled"].checked = true;
+  elements["notify-success"].checked = true;
+  elements["notify-topic"].value = "saved-topic";
+
+  await elements["notification-settings"].dispatch("submit");
+
+  assert.ok(savedRequest);
+  assert.equal(savedRequest.headers["X-Python-Runner-Token"], "request-token");
+  assert.deepEqual(JSON.parse(savedRequest.body), {
+    enabled: true,
+    onSuccess: true,
+    onFailure: false,
+    onStopped: false,
+    server: "https://example.invalid",
+    topic: "saved-topic",
+  });
+  assert.equal(elements["settings-message"].textContent, "Settings saved. Changes apply immediately.");
+});
+
+test("Test notification shows backend success and sanitized failure feedback", async () => {
+  let testResponse = response({message: "Test notification sent."});
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/settings/notifications/test") return testResponse;
+      return undefined;
+    },
+  });
+
+  await elements["test-notification"].dispatch("click");
+  assert.equal(elements["settings-message"].textContent, "Test notification sent.");
+  assert.equal(elements["settings-message"].className, "success-message");
+
+  testResponse = response({error: "Check the notify server and network."}, 502);
+  await elements["test-notification"].dispatch("click");
+  assert.equal(elements["settings-message"].textContent, "Error: Check the notify server and network.");
+  assert.equal(elements["settings-message"].className, "error");
+});
 
 test("Prompt mode shows only one-shot inputs and submits them directly", async () => {
   let submitted = null;
@@ -1086,6 +1274,38 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
   );
 });
 
+test("selected run renders authoritative run and Progress PR links", async () => {
+  const issueUrl = "https://github.com/eletim/agent-workflow-manager/pull/130";
+  const integrationUrl = "https://github.com/eletim/agent-workflow-manager/pull/131";
+  const current = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    integrationPr: {number: 131, url: integrationUrl},
+    progress: [
+      {name: "Issue #127", status: "started", pr_number: 130, pr_url: issueUrl},
+      {name: "Issue #127", status: "completed"},
+      {name: "Issue #128", status: "started", pr_number: 132, pr_url: `${issueUrl}2`},
+    ],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", cwd: "/work/run-1"}],
+    details: {1: current},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["integration-pr-panel"].hidden, false);
+  assert.equal(elements["integration-pr"].textContent, "PR #131");
+  assert.equal(elements["integration-pr"].getAttribute("href"), integrationUrl);
+  const issueLink = elements.progress.children[0].children[1].children[0].children[1];
+  assert.equal(issueLink.textContent, "PR #130");
+  assert.equal(issueLink.href, issueUrl);
+  assert.equal(
+    elements.progress.children[1].children[1].children[0].children[1].textContent,
+    "PR #132",
+  );
+});
+
 test("validation displays a valid draft outline before execution", async () => {
   const {elements} = await loadApp({
     runs: [],
@@ -1761,6 +1981,156 @@ test("New run restores the retained draft unchanged after switching between runs
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
 });
 
+test("New run immediately clears every run-owned surface without changing history", async () => {
+  const executionContext = {
+    executionRoot: "/managed/run-a",
+    baseRef: "origin/dev/v0.2.3",
+    baseSha: "a".repeat(40),
+  };
+  const runA = {
+    ...snapshot({
+      runId: 1,
+      state: "failed",
+      stdout: "A output",
+      attempts: [{number: 1, state: "failed", exitCode: 1}],
+      outline: ["A plan"],
+      progress: [{name: "A plan", status: "failed", error: "A failure"}],
+      integrationPr: {
+        number: 140,
+        url: "https://github.com/eletim/agent-workflow-manager/pull/140",
+      },
+      resources: [{
+        kind: "purplemux_tab",
+        identity: "tab-a",
+        cleanupState: "retained",
+        cleanupError: null,
+      }],
+      executionContext,
+    }),
+    dryRun: {
+      status: "frontier",
+      findings: [{category: "git", status: "passed", message: "A finding"}],
+      nextMutation: {operation: "push", target: "origin/feature/a", preState: {}},
+    },
+  };
+  const runs = [{runId: 1, state: "failed", cwd: "/work/run-1"}];
+  const details = {1: runA};
+  const {calls, elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {
+      status: 422,
+      body: {
+        error: "workflow validation failed",
+        validation: [{line: 2, column: null, message: "draft failure"}],
+      },
+    },
+  });
+
+  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.stdout.textContent, "A output");
+  assert.equal(elements.progress.children.length, 1);
+  assert.equal(elements["integration-pr-panel"].hidden, false);
+  assert.equal(elements["recovery-panel"].hidden, false);
+  assert.equal(elements["resources-panel"].hidden, false);
+  assert.equal(elements["dry-run-panel"].hidden, false);
+
+  const callsBeforeNewRun = calls.length;
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.status.className, "status idle");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements.stderr.textContent, "");
+  assert.equal(elements["output-copy"].disabled, true);
+  assert.equal(elements["exit-code"].textContent, "Exit code: —");
+  assert.equal(elements.progress.children.length, 0);
+  assert.equal(elements["integration-pr-panel"].hidden, true);
+  assert.equal(elements["integration-pr"].getAttribute("href"), undefined);
+  assert.equal(elements["progress-empty"].hidden, false);
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["recovery-panel"].hidden, true);
+  assert.equal(elements["attempt-history"].children.length, 0);
+  assert.equal(elements["resources-panel"].hidden, true);
+  assert.equal(elements.resources.children.length, 0);
+  assert.equal(elements["execution-context-details"].textContent, "");
+  assert.equal(elements["dry-run-panel"].hidden, true);
+  assert.equal(elements["topology-findings"].children.length, 0);
+  assert.equal(elements["next-mutation"].textContent, "No Dry Run result yet.");
+  assert.equal(elements.stop.disabled, true);
+  assert.equal(elements.cleanup.disabled, true);
+  assert.equal(selectedRun(elements), undefined);
+  assert.ok(
+    calls.slice(callsBeforeNewRun)
+      .every(([, method]) => (method || "GET") === "GET"),
+  );
+
+  await elements.validate.dispatch("click");
+  assert.equal(elements["validation-panel"].hidden, false);
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["validation-panel"].hidden, true);
+  assert.equal(elements.validation.children.length, 0);
+
+  eventSource.emit("runner-change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.status.textContent, "failed");
+  assert.equal(elements.stdout.textContent, "A output");
+  assert.equal(elements["resources-panel"].hidden, false);
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("Workflow, Prompt, and Issue Driven drafts survive run selection independently", async () => {
+  const runs = [];
+  const details = {};
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  elements["run-arguments"].value = "workflow draft";
+  elements.code.value = "print('workflow draft')";
+  await elements["prompt-mode"].dispatch("click");
+  elements["prompt-agent"].value = "claude-code";
+  elements["prompt-cwd"].value = "/work/prompt-draft";
+  elements["prompt-text"].value = "prompt draft";
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[125]}';
+  elements["issue-driven-python"].value = "# generated issue draft";
+
+  runs.push({runId: 1, state: "success", cwd: "/work/run-1"});
+  details[1] = snapshot({runId: 1, state: "success", stdout: "historical"});
+  eventSource.emit("runner-change");
+  await waitFor(() => runItem(elements, 1) !== undefined);
+  await runItem(elements, 1).dispatch("click");
+
+  await elements["workflow-mode"].dispatch("click");
+  assert.equal(elements["run-arguments"].value, "workflow draft");
+  assert.equal(elements.code.value, "print('workflow draft')");
+  await runItem(elements, 1).dispatch("click");
+
+  await elements["prompt-mode"].dispatch("click");
+  assert.equal(elements["prompt-agent"].value, "claude-code");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-draft");
+  assert.equal(elements["prompt-text"].value, "prompt draft");
+  await runItem(elements, 1).dispatch("click");
+
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["issue-driven-json"].value, '{"issues":[125]}');
+  assert.equal(elements["issue-driven-python"].value, "# generated issue draft");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+});
+
 test("selecting a run never calls a mutating endpoint", async () => {
   const runA = snapshot({runId: 1, state: "success", stdout: "A"});
   const runB = snapshot({
@@ -1790,27 +2160,23 @@ test("Run submission after returning to New run uses the draft, not a viewed run
     runId: 1, state: "success", stdout: "A", cwd: "/work/run-1",
     args: ["a"], code: "print('A')",
   });
+  const runB = snapshot({
+    runId: 2, state: "running", stdout: "B only", cwd: "/tmp/draft-dir",
+    args: ["draft-arg"], code: "print('draft')",
+  });
+  const runs = [{runId: 1, state: "success", cwd: "/work/run-1"}];
+  const details = {1: runA};
   let runRequestBody = null;
   const {elements} = await loadApp({
-    runs: [{runId: 1, state: "success", cwd: "/work/run-1"}],
-    details: {1: runA},
+    runs,
+    details,
     validation: {status: 200, body: {validation: []}},
     fetchOverride(url, options) {
       if (url !== "/api/run") return undefined;
       runRequestBody = JSON.parse(options.body);
-      return response({
-        runId: 2,
-        state: "running",
-        stdout: "",
-        stderr: "",
-        exitCode: null,
-        progress: [],
-        validation: [],
-        cwd: "/tmp/draft-dir",
-        args: ["draft-arg"],
-        code: "print('draft')",
-        attempts: [],
-      });
+      runs.push({runId: 2, state: "running", cwd: runB.cwd});
+      details[2] = runB;
+      return response(runB);
     },
   });
 
@@ -1827,6 +2193,13 @@ test("Run submission after returning to New run uses the draft, not a viewed run
     code: "print('draft')",
     args: ["draft-arg"],
   });
+  assert.match(selectedRun(elements).textContent, /^#2/);
+  assert.equal(elements.stdout.textContent, "B only");
+  assert.equal(elements.code.value, "print('draft')");
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.stdout.textContent, "A");
+  assert.equal(elements.code.value, "print('A')");
 });
 
 test("a delayed run-detail response cannot overwrite fields belonging to a newer selection", async () => {
@@ -1867,6 +2240,42 @@ test("a delayed run-detail response cannot overwrite fields belonging to a newer
   assert.match(selectedRun(elements).textContent, /^#1/);
   assert.equal(elements["run-arguments"].value, "a");
   assert.equal(elements.code.value, "print('A')");
+});
+
+test("a delayed run-detail response cannot repaint New run", async () => {
+  const delayedRun = deferred();
+  let delayRunOne = false;
+  const runOne = snapshot({
+    runId: 1, state: "failed", stdout: "stale A", outline: ["stale A plan"],
+  });
+  const runTwo = snapshot({runId: 2, state: "success", stdout: "run B"});
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "failed", cwd: "/work/run-1"},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: runOne, 2: runTwo},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunOne && url === "/api/runs/1") return delayedRun.promise;
+      return undefined;
+    },
+  });
+
+  delayRunOne = true;
+  const staleSelection = runItem(elements, 1).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+
+  delayedRun.resolve(response(runOne));
+  await staleSelection;
+
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(selectedRun(elements), undefined);
 });
 
 test("New run while already drafting never discards in-progress edits", async () => {

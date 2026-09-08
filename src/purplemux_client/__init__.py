@@ -47,6 +47,7 @@ from purplemux_client.issue_driven import (
 from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
     emit_finding,
+    emit_run_pr,
     emit_step,
     register_run_resource,
 )
@@ -86,6 +87,7 @@ __all__ = [
     "WorktreeState",
     "emit_step",
     "emit_finding",
+    "emit_run_pr",
     "inspect_run_repository",
     "generate_issue_driven_workflow",
     "parse_issue_driven_json",

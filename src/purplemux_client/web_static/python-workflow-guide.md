@@ -775,12 +775,28 @@ emit_step(
     error=None,             # short str
     workspace=None,         # PurpleMux workspace id
     tab=None,               # PurpleMux tab id
+    pr_number=None,         # authoritative related PR number
+    pr_url=None,            # authoritative related absolute HTTPS PR URL
 )
 ```
 
 Outside the Runner it is a no-op. Inside the Runner, encoded events over 4 KiB
-are dropped and only the latest 200 events are retained. Do not use events to
-drive the workflow, add statuses, or build decorators/state machines around it.
+are dropped and the diagnostic stream retains only the latest 200 events. The
+latest PR-bearing event for each observed PR is retained separately and included
+in snapshots if its diagnostic event is evicted. Do not use events to drive the
+workflow, add statuses, or build decorators/state machines around it.
+
+When GitHub inspection or creation has authoritatively identified a PR, pass
+`pr_number` and `pr_url` together to attach read-only navigation to that Progress
+item. For the overall Base/Integration PR, publish run-level navigation with:
+
+```python
+emit_run_pr(pr.number, pr.url)
+```
+
+Do not infer either kind of PR metadata from output or labels. The workflow's
+structured GitHub result is the source of truth; `emit_run_pr()` and the optional
+`emit_step()` fields only expose that known identity to the current run.
 
 Findings and advanced resource registration use:
 

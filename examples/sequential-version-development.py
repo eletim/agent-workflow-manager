@@ -24,6 +24,7 @@ from purplemux_client import (
     ShellCommandRequest,
     WorkerFailure,
     emit_finding,
+    emit_run_pr,
     emit_step,
     run_correlation,
 )
@@ -38,6 +39,8 @@ WORKFLOW_OUTLINE = [
     "Review and deliver the whole version",
 ]
 MAX_REVIEWS = 5
+IMPLEMENTER_AGENT = "codex"
+REVIEWER_AGENT = "codex"
 READY_TIMEOUT = 120
 TURN_TIMEOUT = 3600
 SHELL_TIMEOUT = 1800
@@ -134,9 +137,11 @@ def create_runtime(config: Config) -> PurpleMuxCLIClient:
     return runtime.workspace(workspace.id)
 
 
-def create_agent(client: PurpleMuxCLIClient, config: Config, *, name: str) -> str:
+def create_agent(
+    client: PurpleMuxCLIClient, config: Config, *, agent_type: str, name: str
+) -> str:
     return client.create_session(
-        CreateSessionRequest("codex", str(config.repo), "codex", name=name)
+        CreateSessionRequest(agent_type, str(config.repo), agent_type, name=name)
     )
 
 
@@ -147,9 +152,16 @@ def run_turn(
     prompt: str,
     *,
     iteration: int | None = None,
+    pr: PullRequestState | None = None,
 ) -> str:
+    navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
-        name, "started", iteration=iteration, workspace=client.workspace_id, tab=tab
+        name,
+        "started",
+        iteration=iteration,
+        workspace=client.workspace_id,
+        tab=tab,
+        **navigation,
     )
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
@@ -164,10 +176,16 @@ def run_turn(
             error=short_error(exc),
             workspace=client.workspace_id,
             tab=tab,
+            **navigation,
         )
         raise
     emit_step(
-        name, "completed", iteration=iteration, workspace=client.workspace_id, tab=tab
+        name,
+        "completed",
+        iteration=iteration,
+        workspace=client.workspace_id,
+        tab=tab,
+        **navigation,
     )
     return result
 
@@ -180,7 +198,12 @@ def run_outline_step(name: str, action):
     except BaseException as exc:
         emit_step(name, "failed", error=short_error(exc))
         raise
-    emit_step(name, "completed")
+    navigation = (
+        {"pr_number": result.number, "pr_url": result.url}
+        if isinstance(result, PullRequestState)
+        else {}
+    )
+    emit_step(name, "completed", **navigation)
     return result
 
 
@@ -284,7 +307,7 @@ def prepare_issue(
     github: GitHubRepository,
     issue: Issue,
     config: Config,
-) -> tuple[PullRequestState | None, str, bool] | None:
+) -> tuple[PullRequestState | None, str, bool] | PullRequestState:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
@@ -295,7 +318,7 @@ def prepare_issue(
         emit_finding(
             "github", f"Issue #{issue.number} already merged as #{merged.number}"
         )
-        return None
+        return merged
     repo.require_clean()
     integration = repo.synchronize_branch(config.integration_branch)
     assert integration.remote_sha is not None
@@ -426,10 +449,13 @@ def process_issue(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
-) -> None:
+) -> PullRequestState:
     if repo.inspect_worktree().dirty:
         cleanup = create_agent(
-            client, config, name=f"Issue {issue.number} worktree cleanup"
+            client,
+            config,
+            agent_type=IMPLEMENTER_AGENT,
+            name=f"Issue {issue.number} worktree cleanup",
         )
         require_clean_worktree(
             repo,
@@ -438,9 +464,9 @@ def process_issue(
             context=f"preparing Issue #{issue.number}",
         )
     prepared = prepare_issue(repo, github, issue, config)
-    if prepared is None:
+    if isinstance(prepared, PullRequestState):
         print(f"Skipping already-merged Issue #{issue.number}", flush=True)
-        return
+        return prepared
     existing_pr, start_sha, reused_existing_work = prepared
     if existing_pr is not None:
         existing_pr = return_to_draft_for_review(
@@ -449,14 +475,31 @@ def process_issue(
             head=issue.branch,
             base=config.integration_branch,
         )
-    implementer = create_agent(client, config, name=f"Issue {issue.number} implementer")
-    reviewer = create_agent(client, config, name=f"Issue {issue.number} reviewer")
+        emit_step(
+            f"Issue #{issue.number}",
+            "started",
+            pr_number=existing_pr.number,
+            pr_url=existing_pr.url,
+        )
+    implementer = create_agent(
+        client,
+        config,
+        agent_type=IMPLEMENTER_AGENT,
+        name=f"Issue {issue.number} implementer",
+    )
+    reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name=f"Issue {issue.number} reviewer",
+    )
     implementation_prompt, review_prompt = issue_prompts(issue, config)
     run_turn(
         client,
         implementer,
         f"Issue #{issue.number} implementation",
         implementation_prompt,
+        pr=existing_pr,
     )
     implementation_sha, _ = require_agent_result(
         repo,
@@ -474,6 +517,12 @@ def process_issue(
     )
     if pr.head_sha != implementation_sha:
         raise WorkerFailure("delivered PR head does not match committed result")
+    emit_step(
+        f"Issue #{issue.number}",
+        "started",
+        pr_number=pr.number,
+        pr_url=pr.url,
+    )
     approved_head: str | None = None
     approved_base: str | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
@@ -483,6 +532,7 @@ def process_issue(
             f"Issue #{issue.number} review",
             f"{review_prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
             iteration=review_number,
+            pr=pr,
         )
         current = github.require_pr(
             number=pr.number,
@@ -503,9 +553,7 @@ def process_issue(
             iteration=review_number,
         )
         if reviewer_changed:
-            pushed = repo.ensure_pushed(
-                issue.branch, expected_local_sha=reviewed_sha
-            )
+            pushed = repo.ensure_pushed(issue.branch, expected_local_sha=reviewed_sha)
             assert pushed.remote_sha is not None
             pr = github.require_pr(
                 number=pr.number,
@@ -533,8 +581,9 @@ def process_issue(
             f"Issue #{issue.number} fixes",
             f"""Re-evaluate every finding below. If warranted, fix, test, commit,
 and leave the worktree clean. If no change is warranted, leave it clean and
-explain why; do not create an empty commit.\n\n{result}""",
+            explain why; do not create an empty commit.\n\n{result}""",
             iteration=review_number,
+            pr=pr,
         )
         fixed_sha, changed = require_agent_result(
             repo,
@@ -577,7 +626,7 @@ explain why; do not create an empty commit.\n\n{result}""",
     )
     if not MERGE_TO_INTEGRATION:
         print(f"Approved Issue #{issue.number} PR is Ready: {pr.url}", flush=True)
-        return
+        return pr
     merged = merge_pr_and_advance(
         repo,
         github,
@@ -588,6 +637,7 @@ explain why; do not create an empty commit.\n\n{result}""",
         base_sha=approved_base,
     )
     print(f"Merged approved Issue #{issue.number} PR: {merged.pr.url}", flush=True)
+    return merged.pr
 
 
 def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
@@ -616,8 +666,18 @@ def review_whole_version(
     pr: PullRequestState,
 ) -> tuple[PullRequestState, str, str]:
     """Review, fix, and check the whole version as one outline-level phase."""
-    fixer = create_agent(client, config, name="Whole-version fixer")
-    reviewer = create_agent(client, config, name="Whole-version reviewer")
+    fixer = create_agent(
+        client,
+        config,
+        agent_type=IMPLEMENTER_AGENT,
+        name="Whole-version fixer",
+    )
+    reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name="Whole-version reviewer",
+    )
     approved_head: str | None = None
     approved_base: str | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
@@ -778,6 +838,7 @@ def integration_delivery(
             f"final delivery already merged as #{merged_pr.number} at "
             f"{integration.remote_sha}",
         )
+        emit_run_pr(merged_pr.number, merged_pr.url)
         if FINAL_REVIEW:
             emit_step(
                 "Whole-version review",
@@ -816,6 +877,7 @@ def integration_delivery(
         expected_base_sha=main.remote_sha,
         draft=True,
     )
+    emit_run_pr(pr.number, pr.url)
     approved_head, approved_base = pr.head_sha, pr.base_sha
     if FINAL_REVIEW:
         pr, approved_head, approved_base = run_outline_step(
@@ -828,7 +890,12 @@ def integration_delivery(
             run_final_checks(client, config)
             state = repo.inspect_worktree()
             if state.dirty and cleanup is None:
-                cleanup = create_agent(client, config, name="Whole-version cleanup")
+                cleanup = create_agent(
+                    client,
+                    config,
+                    agent_type=IMPLEMENTER_AGENT,
+                    name="Whole-version cleanup",
+                )
             if cleanup is None:
                 checked = repo.require_committed_result(
                     config.integration_branch,
@@ -867,6 +934,7 @@ def integration_delivery(
             raise WorkerFailure("final checks kept changing the integration branch")
         approved_head, approved_base = pr.head_sha, pr.base_sha
     assert approved_head is not None and approved_base is not None
+
     def finalize() -> PullRequestState:
         ready = github.set_draft(
             pr.number,

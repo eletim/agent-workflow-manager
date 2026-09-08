@@ -38,6 +38,8 @@ const outputCopy = document.querySelector("#output-copy");
 const exitCode = document.querySelector("#exit-code");
 const progress = document.querySelector("#progress");
 const progressEmpty = document.querySelector("#progress-empty");
+const integrationPrPanel = document.querySelector("#integration-pr-panel");
+const integrationPr = document.querySelector("#integration-pr");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
@@ -78,12 +80,16 @@ const guideRaw = document.querySelector("#guide-raw");
 const manualCopyDialog = document.querySelector("#manual-copy-dialog");
 const manualCopyContent = document.querySelector("#manual-copy-content");
 const manualCopyClose = document.querySelector("#manual-copy-close");
+const settingsDialog = document.querySelector("#settings-dialog");
+const settingsOpen = document.querySelector("#settings-open");
+const settingsClose = document.querySelector("#settings-close");
 const settingsForm = document.querySelector("#notification-settings");
 const notificationsEnabled = document.querySelector("#notifications-enabled");
 const notifySuccess = document.querySelector("#notify-success");
 const notifyFailure = document.querySelector("#notify-failure");
 const notifyStopped = document.querySelector("#notify-stopped");
 const notifyServer = document.querySelector("#notify-server");
+const notifyServerLink = document.querySelector("#notify-server-link");
 const notifyTopic = document.querySelector("#notify-topic");
 const replacementToken = document.querySelector("#replacement-token");
 const credentialStatus = document.querySelector("#credential-status");
@@ -226,6 +232,39 @@ function captureDraftIfEditing() {
   }
 }
 
+function renderCleanDraftState() {
+  statusBadge.textContent = "not started";
+  statusBadge.className = "status idle";
+  rawStdout = "";
+  rawStderr = "";
+  stdout.textContent = "";
+  stderr.textContent = "";
+  outputCopy.disabled = true;
+  exitCode.textContent = "Exit code: —";
+  stopButton.disabled = true;
+  cleanupButton.disabled = true;
+
+  renderOutline([], []);
+  renderProgress([]);
+  renderIntegrationPr(null);
+  renderRecovery({state: "idle", attempts: []});
+  renderResources({
+    runId: null,
+    resources: [],
+    resourceCleanupStatus: "cleaned",
+    executionContext: null,
+  });
+  renderDryRun({dryRun: null, dryRunIssues: [], dryRunEligible: true});
+
+  validationPanel.hidden = true;
+  validationPanel.className = "panel validation-panel";
+  validationSuccess.hidden = true;
+  validation.hidden = false;
+  validation.replaceChildren();
+  issueDrivenSuccess.hidden = true;
+  issueDrivenValidation.replaceChildren();
+}
+
 function renderRun(result) {
   currentMode = result.mode === "prompt" ? "prompt" : "workflow";
   const running = result.state === "running";
@@ -241,6 +280,7 @@ function renderRun(result) {
     result.stderrEntries,
     rawStderr,
   );
+  outputCopy.disabled = result.runId == null;
   exitCode.textContent = `Exit code: ${result.exitCode ?? "—"}`;
   stopButton.disabled = activeRunId === null || !running;
   cleanupButton.disabled = activeRunId === null
@@ -248,6 +288,7 @@ function renderRun(result) {
     || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
+  renderIntegrationPr(result.integrationPr || null);
   renderRecovery(result);
   renderResources(result);
   renderDryRun(result);
@@ -285,9 +326,6 @@ async function enterDraftMode(mode = currentMode) {
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
   captureDraftIfEditing();
-  // Only the draft/editable fields and the run-scoped controls change here;
-  // the output/progress/recovery panels are left showing whatever was last
-  // viewed (harmless reference) until a run is selected or started again.
   activeRunGeneration += 1;
   activeRunId = null;
   currentMode = mode;
@@ -297,15 +335,16 @@ async function enterDraftMode(mode = currentMode) {
       promptAgent.value = promptDraft.agent;
       promptCwd.value = promptDraft.cwd;
       promptText.value = promptDraft.prompt;
+    } else if (currentMode === "issue-driven") {
+      issueDrivenJson.value = issueDrivenDraft.json;
+      issueDrivenPython.value = issueDrivenDraft.code;
     } else {
       runArguments.value = draft.args;
       code.value = draft.code;
     }
   }
+  renderCleanDraftState();
   showDraftLabel();
-  stopButton.disabled = true;
-  cleanupButton.disabled = true;
-  renderOutline([], []);
   applyFieldMode();
   await refresh();
 }
@@ -530,7 +569,12 @@ function renderProgress(events) {
   const latest = new Map();
   for (const event of events) {
     const key = JSON.stringify([event.name, event.iteration, event.attempt]);
-    latest.set(key, event);
+    const previous = latest.get(key);
+    latest.set(key, {
+      ...event,
+      pr_number: event.pr_number ?? previous?.pr_number,
+      pr_url: event.pr_url ?? previous?.pr_url,
+    });
   }
 
   progress.replaceChildren();
@@ -559,6 +603,16 @@ function renderProgress(events) {
     }
     details.append(label, timestamp);
 
+    if (event.pr_number && event.pr_url) {
+      const link = document.createElement("a");
+      link.className = "progress-pr-link";
+      link.href = event.pr_url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `PR #${event.pr_number}`;
+      label.append(" ", link);
+    }
+
     const noteText = event.error || event.message;
     if (noteText) {
       const note = document.createElement("div");
@@ -576,6 +630,13 @@ function renderProgress(events) {
     item.append(marker, details);
     progress.append(item);
   }
+}
+
+function renderIntegrationPr(pr) {
+  integrationPrPanel.hidden = !pr;
+  integrationPr.textContent = pr ? `PR #${pr.number}` : "";
+  if (pr) integrationPr.setAttribute("href", pr.url);
+  else integrationPr.removeAttribute("href");
 }
 
 function selectedGuide() {
@@ -844,10 +905,18 @@ function renderSettings(settings) {
   notifyFailure.checked = settings.onFailure;
   notifyStopped.checked = settings.onStopped;
   notifyServer.value = settings.server;
+  renderNotifyServerLink(settings.serverUrl);
   notifyTopic.value = settings.topic;
   const configured = settings.credentialStatus === "configured";
   credentialStatus.textContent = `Credentials: ${configured ? "Configured" : "Missing"}`;
   credentialStatus.className = `credential ${configured ? "configured" : "missing"}`;
+}
+
+function renderNotifyServerLink(serverUrl) {
+  const available = typeof serverUrl === "string" && serverUrl !== "";
+  notifyServerLink.hidden = !available;
+  if (!available) notifyServerLink.removeAttribute("href");
+  else notifyServerLink.setAttribute("href", serverUrl);
 }
 
 function showSettingsMessage(message, isError = false) {
@@ -1168,6 +1237,16 @@ cleanupButton.addEventListener("click", async () => {
     ) stderr.textContent = String(error);
   }
 });
+
+settingsOpen.addEventListener("click", () => {
+  settingsDialog.showModal();
+});
+
+settingsClose.addEventListener("click", () => {
+  settingsDialog.close();
+});
+
+notifyServer.addEventListener("input", () => renderNotifyServerLink(null));
 
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();

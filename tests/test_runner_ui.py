@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 INDEX = ROOT / "src/purplemux_client/web_static/index.html"
+STYLES = ROOT / "src/purplemux_client/web_static/style.css"
 
 
 class _StructureParser(HTMLParser):
@@ -79,3 +80,39 @@ def test_agent_readiness_is_available_only_in_collapsed_diagnostics() -> None:
         and "open" not in attributes
         for tag, attributes in ancestors
     )
+
+
+def test_notifications_are_reached_from_the_header_settings_dialog() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    ancestors = _ancestors("notification-settings")
+
+    assert '<button id="settings-open" type="button">Settings</button>' in html
+    assert any(
+        tag == "dialog" and attributes.get("id") == "settings-dialog"
+        for tag, attributes in ancestors
+    )
+    assert '<label for="notify-server">Notify server URL</label>' in html
+    assert 'id="notify-server-link"' in html
+    assert 'rel="noopener noreferrer"' in html
+
+
+def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
+    ancestors = _ancestors("run-list")
+
+    assert any(
+        tag == "details"
+        and attributes.get("id") == "runs-panel"
+        and "open" in attributes
+        for tag, attributes in ancestors
+    )
+    assert "runs-toggle-hint" in INDEX.read_text(encoding="utf-8")
+
+
+def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
+    styles = STYLES.read_text(encoding="utf-8")
+
+    assert "@media (max-width: 760px)" in styles
+    assert "overflow-x: clip" in styles
+    assert ".mode-switch" in styles and "repeat(3, minmax(0, 1fr))" in styles
+    assert ".controls" in styles and "repeat(2, minmax(0, 1fr))" in styles
+    assert ".output-panel { min-width: 0; }" in styles

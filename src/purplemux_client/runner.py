@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
+from urllib.parse import urlparse
 
 from purplemux_client.client import (
     WORKFLOW_HOST_WORKSPACE_ENV,
@@ -128,7 +129,18 @@ class ProgressEvent:
     error: str | None = None
     workspace: str | None = None
     tab: str | None = None
+    pr_number: int | None = None
+    pr_url: str | None = None
     observed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class PullRequestNavigation:
+    number: int
+    url: str
+
+    def as_json(self) -> dict[str, object]:
+        return {"number": self.number, "url": self.url}
 
 
 @dataclass(frozen=True)
@@ -291,6 +303,7 @@ class RunnerSnapshot:
     # lightweight.
     code: str | None = None
     prompt: PromptExecution | None = None
+    integration_pr: PullRequestNavigation | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -300,6 +313,8 @@ class RunnerSnapshot:
             payload["prompt"] = prompt
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
+        integration_pr = payload.pop("integration_pr")
+        payload["integrationPr"] = integration_pr
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -395,6 +410,9 @@ class _RunRecord:
     exit_code: int | None = None
     stop_requested: bool = False
     progress: deque[ProgressEvent] = field(default_factory=deque)
+    # One latest PR-bearing event per authoritative PR survives eviction from
+    # the bounded diagnostic stream so historical Issue navigation remains.
+    progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     attempts: list[RunAttempt] = field(default_factory=list)
@@ -405,6 +423,7 @@ class _RunRecord:
     managed_tab_name: str | None = None
     credential_path: Path | None = None
     event_token: str | None = None
+    integration_pr: PullRequestNavigation | None = None
 
 
 class PythonRunner:
@@ -1133,6 +1152,15 @@ class PythonRunner:
     def _snapshot_run(self, run: _RunRecord) -> RunnerSnapshot:
         stdout_entries = self._render_output_entries(run.stdout, run.stdout_truncated)
         stderr_entries = self._render_output_entries(run.stderr, run.stderr_truncated)
+        progress = tuple(run.progress)
+        visible_prs = {
+            event.pr_number for event in progress if event.pr_number is not None
+        }
+        durable_pr_progress = tuple(
+            event
+            for number, event in run.progress_prs.items()
+            if number not in visible_prs
+        )
         return RunnerSnapshot(
             state=run.state,
             stdout="".join(entry.text for entry in stdout_entries),
@@ -1142,7 +1170,7 @@ class PythonRunner:
             outline=run.outline,
             exit_code=run.exit_code,
             run_id=run.run_id,
-            progress=tuple(run.progress),
+            progress=durable_pr_progress + progress,
             validation=(),
             dry_run_issues=(),
             cwd=run.cwd,
@@ -1153,6 +1181,7 @@ class PythonRunner:
             code=None if run.prompt is not None else run.code,
             resources=tuple(run.resources),
             prompt=run.prompt,
+            integration_pr=run.integration_pr,
         )
 
     def _get_run(self, run_id: int) -> _RunRecord:
@@ -1837,9 +1866,14 @@ class PythonRunner:
             return self._register_owned_resource(
                 run, cast(_ResourceOwnershipEvent, event)
             )
+        elif event_type == "run_pr":
+            run.integration_pr = cast(PullRequestNavigation, event)
         else:
             progress = cast(ProgressEvent, event)
-            run.progress.append(replace(progress, observed_at=self._accepted_at()))
+            accepted = replace(progress, observed_at=self._accepted_at())
+            run.progress.append(accepted)
+            if accepted.pr_number is not None:
+                run.progress_prs[accepted.pr_number] = accepted
         return True
 
     @staticmethod
@@ -1852,6 +1886,7 @@ class PythonRunner:
                 "finding",
                 "resource",
                 "resource_ownership",
+                "run_pr",
             ],
             object,
         ]
@@ -1927,13 +1962,19 @@ class PythonRunner:
                 token,
                 RunResource("git_worktree", identity, dict(metadata)),
             )
+        if event_type == "run_pr":
+            pr_number = value.get("pr_number")
+            pr_url = value.get("pr_url")
+            if not PythonRunner._valid_pr_navigation(pr_number, pr_url):
+                return None
+            return "run_pr", PullRequestNavigation(pr_number, pr_url)
         name = value.get("name")
         status = value.get("status")
         if not isinstance(name, str) or not name.strip():
             return None
         if status not in ("started", "completed", "failed"):
             return None
-        optional_strings = ("message", "error", "workspace", "tab")
+        optional_strings = ("message", "error", "workspace", "tab", "pr_url")
         if any(
             value.get(key) is not None and not isinstance(value.get(key), str)
             for key in optional_strings
@@ -1945,6 +1986,12 @@ class PythonRunner:
                 isinstance(number, bool) or not isinstance(number, int) or number < 1
             ):
                 return None
+        pr_number = value.get("pr_number")
+        pr_url = value.get("pr_url")
+        if (
+            pr_number is not None or pr_url is not None
+        ) and not PythonRunner._valid_pr_navigation(pr_number, pr_url):
+            return None
         return (
             "progress",
             ProgressEvent(
@@ -1956,8 +2003,19 @@ class PythonRunner:
                 error=value.get("error"),
                 workspace=value.get("workspace"),
                 tab=value.get("tab"),
+                pr_number=pr_number,
+                pr_url=pr_url,
             ),
         )
+
+    @staticmethod
+    def _valid_pr_navigation(number: object, url: object) -> bool:
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            return False
+        if not isinstance(url, str):
+            return False
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and bool(parsed.netloc) and bool(parsed.path)
 
     @staticmethod
     def _register_resource(run: _RunRecord, resource: RunResource) -> None:
