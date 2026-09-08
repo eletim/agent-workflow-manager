@@ -4,6 +4,7 @@ import ast
 import hashlib
 import inspect
 import json
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,7 @@ from purplemux_client import (
     WorkerFailure,
 )
 from purplemux_client.issue_driven import (
+    _MAX_SCENARIO_LIST_BYTES,
     IssueDrivenValidationError,
     classify_issue_topology,
     generate_issue_driven_workflow,
@@ -682,6 +684,60 @@ def test_scenarios_require_whole_version_review() -> None:
     assert [(finding.path, finding.message) for finding in caught.value.findings] == [
         ("$.scenarios", "requires final_review to be true")
     ]
+
+
+def test_scenario_list_boundary_produces_dispatchable_gate_prompt() -> None:
+    scenarios = [f"{'x' * (3999 - len(str(index)))}-{index}" for index in range(15)]
+    used = len(
+        "\n".join(
+            f"{index}. {scenario}" for index, scenario in enumerate(scenarios, 1)
+        ).encode()
+    )
+    final_prefix_bytes = len(f"\n{len(scenarios) + 1}. ".encode())
+    final_size = _MAX_SCENARIO_LIST_BYTES - used - final_prefix_bytes
+    scenarios.append("y" * final_size)
+
+    config = parse(payload(scenarios=scenarios))
+    code = generate_issue_driven_workflow(config)
+    module_name = "generated_scenario_boundary"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-scenario-boundary>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    prompt = module.__dict__["scenario_gate_prompt"](
+        topology_pr(head_sha="h" * 40, base_sha="b" * 40)
+    )
+
+    assert _MAX_SCENARIO_LIST_BYTES < len(prompt.encode()) < 66_000
+    completed = subprocess.run(
+        [sys.executable, "-c", "import sys; assert sys.argv[1]", prompt],
+        check=False,
+    )
+    assert completed.returncode == 0
+
+    scenarios[-1] += "z"
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        (
+            "$.scenarios",
+            "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+        )
+    ]
+
+
+def test_scenario_list_aggregate_limit_counts_utf8_bytes() -> None:
+    scenarios = [f"{index}:{'界' * (3999 - len(str(index)))}" for index in range(6)]
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert (
+        "$.scenarios",
+        "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
 @pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])

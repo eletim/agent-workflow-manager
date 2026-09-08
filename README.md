@@ -155,8 +155,9 @@ generic actions, conditions, loops, and nested executable blocks cannot grow int
 a second workflow language. With `merge_final: false`, the generated final control
 flow makes the integration PR Ready but contains no final merge call.
 
-`scenarios` is a bounded list of unique, non-empty human-authored scenario
-descriptions and requires `final_review: true`. Before ordinary Whole Review, a
+`scenarios` is a list of unique, non-empty human-authored descriptions, bounded
+to 100 items, 4,000 characters per item, and 64,000 UTF-8 bytes for the complete
+numbered list. It requires `final_review: true`. Before ordinary Whole Review, a
 dedicated AI Scenario Gate selects a small risk-relevant subset, compares each
 scenario at the exact final-base commit (Before) and integration-head commit
 (After), and judges whether the behavioral difference is appropriate in the

@@ -497,6 +497,7 @@ _MAX_INITIAL_WORK_ITEMS = 100
 _MAX_WORK_ITEM_PLAN_STATE_BYTES = 32_000
 _MAX_SCENARIOS = 100
 _MAX_SCENARIO_CHARS = 4_000
+_MAX_SCENARIO_LIST_BYTES = 64_000
 _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -518,6 +519,13 @@ def _work_item_plan_state_size(work_items: list[WorkItem]) -> int:
             separators=(",", ":"),
         ).encode()
     )
+
+
+def _scenario_list_size(scenarios: list[str]) -> int:
+    numbered = "\n".join(
+        f"{index}. {scenario}" for index, scenario in enumerate(scenarios, 1)
+    )
+    return len(numbered.encode())
 
 
 def _valid_branch_name(value: str) -> bool:
@@ -845,6 +853,16 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             else:
                 seen_scenarios.add(scenario)
                 scenarios.append(scenario)
+        if (
+            len(scenarios) == len(raw_scenarios)
+            and _scenario_list_size(scenarios) > _MAX_SCENARIO_LIST_BYTES
+        ):
+            findings.append(
+                IssueDrivenFinding(
+                    "$.scenarios",
+                    "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+                )
+            )
     if scenarios and value.get("final_review") is False:
         findings.append(
             IssueDrivenFinding("$.scenarios", "requires final_review to be true")

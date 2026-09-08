@@ -71,7 +71,7 @@ every other field is required.
 | `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 5 unless the user requests another value. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
-| `scenarios` | array of strings | Optional human-authored Scenario List for Whole Review. The Scenario Gate selects a risk-relevant subset and uses AI to judge each scenario's Before/After behavioral difference. Requires `final_review: true`. |
+| `scenarios` | array of strings | Optional human-authored Scenario List for Whole Review. The numbered list may contain at most 100 items and 64,000 UTF-8 bytes; each item may contain at most 4,000 characters. The Scenario Gate selects a risk-relevant subset and uses AI to judge each scenario's Before/After behavioral difference. Requires `final_review: true`. |
 | `merge_to_integration` | boolean | Whether each safely deliverable Issue PR is merged into the integration branch, including explicit warning continuations. |
 | `final_review` | boolean | Whether the completed integration branch receives a final review. |
 | `merge_final` | boolean | Whether final delivery is automatically merged into `final_branch`. |
