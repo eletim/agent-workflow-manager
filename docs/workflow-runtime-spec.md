@@ -85,7 +85,7 @@ must never trigger replay.
 Workflow-owned business decisions that cannot be reconstructed from Git topology
 may be persisted by the plain Python workflow in an authoritative external
 resource. In Issue Driven mode, accepted work-item plan decisions and the last
-completed position are stored in the Draft Base PR before further dispatch or
+dispatched position are stored in the Draft Base PR before child processing or
 final delivery. Recovery validates that state against the immutable generated
 seed and re-inspects the recorded items' GitHub topology. This is domain state
 owned and interpreted by the workflow, not a Runner checkpoint or progress-event

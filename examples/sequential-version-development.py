@@ -1726,6 +1726,8 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> bool:
         raise WorkerFailure("planner cannot complete while work items remain")
     if not complete and not candidate.remaining:
         raise WorkerFailure("planner must add work or complete an empty plan")
+    candidate.finalized = complete
+    serialized_work_item_plan(candidate)
     plan.items = candidate.items
     plan.finalized = complete
     return complete
@@ -1885,7 +1887,9 @@ def prepare_work_item_plan_pr(
             ),
             correlation_id=run_correlation("integration-pr"),
         )
+        plan = initial_plan
     else:
+        plan = work_item_plan_from_body(pr.body, config)
         pr = return_to_draft_for_review(
             github,
             pr,
@@ -1902,7 +1906,7 @@ def prepare_work_item_plan_pr(
         draft=True,
     )
     emit_run_pr(pr.number, pr.url)
-    return pr, work_item_plan_from_body(pr.body, config)
+    return pr, plan
 
 
 def persist_work_item_plan(
@@ -1980,11 +1984,11 @@ def process_work_items(
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
+        plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         run_outline_step(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
-        plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
 
 

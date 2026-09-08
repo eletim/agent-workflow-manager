@@ -301,6 +301,26 @@ def test_inline_mini_task_validation_is_structured(
     assert path in {finding.path for finding in caught.value.findings}
 
 
+def test_inline_mini_tasks_fit_the_persisted_plan_size_boundary() -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        {"id": f"task-{index}", "task": "x" * 4000} for index in range(7)
+    ]
+    value["work_items"].append({"id": "task-7", "task": "x" * 3657})
+
+    assert len(parse(value).work_items) == 8
+
+    value["work_items"][-1]["task"] += "x"
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.work_items",
+        "serialized recovery state must not exceed 32000 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
 def test_issues_and_work_items_are_mutually_exclusive() -> None:
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(work_items=[90]))
@@ -952,6 +972,37 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
     assert [issue.key for issue in plan.snapshot] == ["release-notes", 90]
 
 
+def test_planner_rejects_oversized_plan_transactionally() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    plan = workflow["WorkItemPlan"](config)
+    actions = [{"action": "skip", "key": 90}]
+    actions.extend(
+        {
+            "action": "add",
+            "item": {"id": f"task-{index}", "task": "x" * 4000},
+        }
+        for index in range(8)
+    )
+
+    with pytest.raises(WorkerFailure, match="recovery state exceeds"):
+        workflow["apply_planner_decision"](
+            plan, json.dumps({"actions": actions, "complete": False})
+        )
+
+    assert [issue.key for issue in plan.snapshot] == [90]
+    assert plan.position == 0
+    assert plan.finalized is False
+
+
 def test_planner_persists_undispatched_addition_before_interruption() -> None:
     workflow = load_generated_workflow(issues=[90])
     issue_type = workflow["Issue"]
@@ -998,11 +1049,159 @@ def test_planner_persists_undispatched_addition_before_interruption() -> None:
         )
 
     recovered = workflow["work_item_plan_from_body"](stored_body, config)
-    assert recovered.position == 0
-    assert [issue.key for issue in recovered.remaining] == [90, "recovery-test"]
-    assert recovered.remaining[1].task == task
+    assert recovered.position == 1
+    assert [issue.key for issue in recovered.snapshot] == [90, "recovery-test"]
+    assert [issue.key for issue in recovered.remaining] == ["recovery-test"]
+    assert recovered.remaining[0].task == task
     with pytest.raises(WorkerFailure, match="missing work-item plan"):
         workflow["work_item_plan_from_body"]("Base PR", config)
+
+
+@pytest.mark.parametrize("child_state", ["OPEN", "MERGED"])
+def test_interrupted_dispatched_item_is_reinspected_before_planning(
+    child_state: str,
+) -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    stored_body = "Base PR"
+    events: list[str] = []
+    issue = config.issues[0]
+    child_pr = topology_pr(
+        number=190,
+        state=child_state,
+        head_branch=issue.branch,
+    )
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert head == issue.branch
+            assert base == config.integration_branch
+            return child_pr if state == child_state else None
+
+    repository = SimpleNamespace(
+        require_clean=lambda: None,
+        synchronize_branch=lambda branch: BranchState(
+            branch, child_pr.head_sha, child_pr.head_sha, True
+        ),
+        inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
+            base_is_ancestor=True
+        ),
+    )
+    github = GitHub()
+
+    def persist(plan, _config, _repo, _github, pr):
+        nonlocal stored_body
+        stored_body = workflow["with_work_item_plan"](stored_body, plan)
+        return pr
+
+    def interrupted_child(*_args):
+        events.append(f"child-{child_state.lower()}")
+        raise RuntimeError("interrupted after child mutation")
+
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": False}
+    )
+    workflow["persist_work_item_plan"] = persist
+    workflow["process_issue"] = interrupted_child
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    with pytest.raises(RuntimeError, match="after child mutation"):
+        workflow["process_work_items"](
+            config,
+            SimpleNamespace(),
+            repository,
+            github,
+            SimpleNamespace(),
+            workflow["WorkItemPlan"](config),
+        )
+
+    recovered = workflow["work_item_plan_from_body"](stored_body, config)
+    assert recovered.position == 1
+    events.clear()
+    prepared: list[object] = []
+    prepare_issue = workflow["prepare_issue"]
+
+    def reinspect(*_args):
+        events.append(f"reinspect-{child_state.lower()}")
+        prepared.append(prepare_issue(repository, github, issue, config))
+
+    workflow["process_issue"] = reinspect
+    workflow["create_agent"] = lambda *args, **kwargs: events.append("planner") or "p"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": True}
+    )
+
+    workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        repository,
+        github,
+        SimpleNamespace(),
+        recovered,
+    )
+
+    assert events == [f"reinspect-{child_state.lower()}", "planner"]
+    if child_state == "OPEN":
+        assert prepared[0][0] is child_pr
+    else:
+        assert prepared == [child_pr]
+
+
+def test_ready_base_pr_recovery_is_validated_before_draft_mutation() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    ready = replace(
+        topology_pr(
+            number=190,
+            head_branch=config.integration_branch,
+            body="Base PR without recovery state",
+        ),
+        is_draft=False,
+        base_branch=config.main_branch,
+    )
+    mutations: list[str] = []
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert head == config.integration_branch
+            assert base == config.main_branch
+            return ready if state == "OPEN" else None
+
+        def set_draft(self, *args, **kwargs):
+            mutations.append("set-draft")
+            return replace(ready, is_draft=True)
+
+    repository = SimpleNamespace(
+        synchronize_branch=lambda branch: BranchState(
+            branch, ready.head_sha, ready.head_sha, True
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, ready.base_sha, ready.base_sha, True
+        ),
+    )
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    with pytest.raises(WorkerFailure, match="missing work-item plan"):
+        workflow["prepare_work_item_plan_pr"](config, repository, GitHub())
+
+    assert mutations == []
 
 
 def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:

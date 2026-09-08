@@ -70,15 +70,17 @@ Python asks a dedicated planning agent for one bounded JSON decision and applies
 it through `plan.add()`, `plan.update()`, or `plan.skip()`. A planner can add a
 pending Issue or mini task, refine a pending mini task while preserving its
 stable ID and branch, skip obsolete work, or declare the plan complete. Invalid,
-ambiguous, or unbounded decisions fail closed. Already-dispatched items cannot
-be revised and completed identities cannot be reused. The final plan snapshot is
-passed explicitly to handoff generation; configuration is never mutated. Before
-dispatch, every accepted decision is stored as seed-bound recovery state in the
-Draft Base PR, and the completed position is stored after each work item. A new
-run restores that exact plan, re-inspects any dynamic open or merged child PRs,
-and fails closed if the state is missing, ambiguous, or belongs to a different
-seed. The Runner and progress events only observe these decisions, so the
-generated plain Python remains the control-flow source of truth.
+ambiguous, oversized, or unbounded decisions fail closed. The initial aggregate
+serialized plan is limited to 32,000 bytes while each inline task remains limited
+to 4,000 characters. Already-dispatched items cannot be revised and completed
+identities cannot be reused. The final plan snapshot is passed explicitly to
+handoff generation; configuration is never mutated. Before dispatch, every
+accepted decision is stored as seed-bound recovery state in the Draft Base PR,
+and each item is marked dispatched before child processing. A new run restores
+that exact plan, re-inspects dispatched dynamic open or merged child PRs, and
+fails closed if the state is missing, ambiguous, or belongs to a different seed.
+The Runner and progress events only observe these decisions, so the generated
+plain Python remains the control-flow source of truth.
 
 ```json
 {
