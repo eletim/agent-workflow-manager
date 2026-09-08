@@ -86,14 +86,21 @@ class FakeGitHubRunner:
             return self._done({"full_name": "acme/project"})
         if len(command) >= 3 and command[1] == "api" and "pulls?" in command[2]:
             endpoint = command[2]
-            requested_open = "state=open" in endpoint
             page = int(re.search(r"[?&]page=(\d+)", endpoint).group(1))  # type: ignore[union-attr]
             per_page = int(re.search(r"[?&]per_page=(\d+)", endpoint).group(1))  # type: ignore[union-attr]
-            matching = [
-                item for item in self.prs if (item["state"] == "open") is requested_open
-            ]
+            if "state=all" in endpoint:
+                matching = self.prs
+            else:
+                requested_open = "state=open" in endpoint
+                matching = [
+                    item
+                    for item in self.prs
+                    if (item["state"] == "open") is requested_open
+                ]
             start = (page - 1) * per_page
             return self._done(matching[start : start + per_page])
+        if len(command) >= 3 and command[1] == "api" and "/compare/" in command[2]:
+            return self._done({"status": "ahead"})
         if len(command) >= 3 and command[1] == "api" and "/pulls/" in command[2]:
             endpoint = command[2]
             if endpoint.endswith("/merge") and "--method" in command:
@@ -227,6 +234,20 @@ def test_open_discovery_rejects_wrong_base_and_ambiguity() -> None:
     duplicate = repository(FakeGitHubRunner([pr_data(1), pr_data(2)]))
     with pytest.raises(PullRequestTopologyError, match="ambiguous"):
         duplicate.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+
+
+def test_bounded_all_pr_enumeration_and_commit_comparison_are_read_only() -> None:
+    runner = FakeGitHubRunner(
+        [pr_data(1), pr_data(2, state="merged", merge_sha=MERGE_SHA)]
+    )
+    repo = repository(runner)
+
+    prs = repo.list_prs()
+    comparison = repo.compare_commits(base_sha="a" * 40, head_sha="b" * 40)
+
+    assert [pr.number for pr in prs] == [1, 2]
+    assert comparison == "ahead"
+    assert all("--method" not in call for call in runner.calls)
 
 
 def test_find_none_requires_complete_bounded_enumeration() -> None:

@@ -240,6 +240,37 @@ class GitRepository:
         self._validate_branch(branch)
         return self._inspect_branch(branch)
 
+    def inspect_remote_branches(self, branches: Sequence[str]) -> dict[str, str | None]:
+        """Resolve several remote heads authoritatively without tracking refs."""
+        self._validate_identity()
+        ordered = tuple(dict.fromkeys(branches))
+        for branch in ordered:
+            self._validate_branch(branch)
+        if not ordered:
+            return {}
+        completed = self._command(
+            [
+                "ls-remote",
+                "--refs",
+                self.remote,
+                *(f"refs/heads/{branch}" for branch in ordered),
+            ],
+            {0},
+        )
+        result: dict[str, str | None] = dict.fromkeys(ordered)
+        expected_refs = {f"refs/heads/{branch}": branch for branch in ordered}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or fields[1] not in expected_refs:
+                raise WorkerFailure(
+                    "unexpected ls-remote result for requested branches"
+                )
+            branch = expected_refs[fields[1]]
+            if result[branch] is not None or not _OBJECT_ID_RE.fullmatch(fields[0]):
+                raise WorkerFailure("ambiguous ls-remote result for requested branch")
+            result[branch] = fields[0]
+        return result
+
     def inspect_feature_preparation(
         self,
         branch: str,

@@ -20,6 +20,7 @@ from purplemux_client.operations import (
 )
 
 PullRequestStatus = Literal["OPEN", "MERGED", "CLOSED"]
+CommitComparison = Literal["ahead", "behind", "diverged", "identical"]
 _CORRELATION_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _HTTP_REJECTION_RE = re.compile(r"\bHTTP (4\d\d)\b", re.IGNORECASE)
 _READY_MUTATION = """
@@ -160,6 +161,42 @@ class GitHubRepository:
                 f"ambiguous {state.lower()} PRs from {head!r} to {base!r}: {numbers}"
             )
         return exact[0] if exact else None
+
+    def list_prs(self) -> tuple[PullRequestState, ...]:
+        """Enumerate all PRs once for read-only, multi-branch topology checks."""
+        self._validate_identity()
+        found: list[PullRequestState] = []
+        for page in range(1, self.max_pages + 1):
+            endpoint = (
+                f"repos/{self.slug}/pulls?state=all&per_page={self.page_size}"
+                f"&page={page}"
+            )
+            data = self._read_json(["api", endpoint])
+            if not isinstance(data, list):
+                raise IncompletePullRequestEnumeration(
+                    "GitHub PR enumeration returned a non-list page"
+                )
+            page_items = cast(list[object], data)
+            found.extend(self._parse_pr(raw) for raw in page_items)
+            if len(page_items) < self.page_size:
+                return tuple(found)
+        raise IncompletePullRequestEnumeration(
+            f"PR enumeration exceeded the {self.max_pages}-page safety bound"
+        )
+
+    def compare_commits(self, *, base_sha: str, head_sha: str) -> CommitComparison:
+        """Compare two authoritative GitHub commits without changing repository state."""
+        self._validate_identity()
+        for value in (base_sha, head_sha):
+            if re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", value) is None:
+                raise ValueError(f"expected a full Git object ID, got {value!r}")
+        data = self._read_object(
+            ["api", f"repos/{self.slug}/compare/{base_sha}...{head_sha}"]
+        )
+        status = data.get("status")
+        if status not in {"ahead", "behind", "diverged", "identical"}:
+            raise WorkerFailure("GitHub returned an invalid commit comparison")
+        return cast(CommitComparison, status)
 
     def require_pr(
         self,

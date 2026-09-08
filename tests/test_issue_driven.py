@@ -20,6 +20,7 @@ from purplemux_client import (
 )
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
+    classify_issue_topology,
     generate_issue_driven_workflow,
     parse_issue_driven_json,
 )
@@ -44,6 +45,162 @@ def payload(**overrides: object) -> dict[str, object]:
 
 def parse(value: dict[str, object]):
     return parse_issue_driven_json(json.dumps(value))
+
+
+def topology_pr(
+    *,
+    number: int = 158,
+    state: str = "OPEN",
+    head_sha: str = "f" * 40,
+    base_sha: str = "b" * 40,
+) -> PullRequestState:
+    return PullRequestState(
+        number,
+        f"https://example.invalid/{number}",
+        state,  # type: ignore[arg-type]
+        True,
+        "acme/project",
+        "feature/issue-158",
+        head_sha,
+        "acme/project",
+        "dev/v1",
+        base_sha,
+        "m" * 40 if state == "MERGED" else None,
+        False,
+        None,
+        f"PR_{number}",
+        "",
+    )
+
+
+class TopologyGitHub:
+    def __init__(
+        self,
+        prs: tuple[PullRequestState, ...] = (),
+        contains: set[tuple[str, str]] | None = None,
+        failure: WorkerFailure | None = None,
+    ) -> None:
+        self.prs = prs
+        self.contains = contains or set()
+        self.failure = failure
+
+    def find_pr(self, *, head: str, base: str, state: str):
+        if self.failure is not None:
+            raise self.failure
+        matches = [
+            pr
+            for pr in self.prs
+            if pr.head_branch == head and pr.base_branch == base and pr.state == state
+        ]
+        if len(matches) > 1:
+            raise WorkerFailure("ambiguous matching PRs")
+        return matches[0] if matches else None
+
+    def require_pr(self, **kwargs: object) -> PullRequestState:
+        pr = self.find_pr(
+            head=str(kwargs["head"]),
+            base=str(kwargs["base"]),
+            state=str(kwargs["state"]),
+        )
+        assert pr is not None
+        if kwargs.get("expected_head_sha") not in (None, pr.head_sha):
+            raise WorkerFailure("PR head SHA mismatch")
+        if kwargs.get("expected_base_sha") not in (None, pr.base_sha):
+            raise WorkerFailure("PR base SHA mismatch")
+        return pr
+
+    def compare_commits(self, *, base_sha: str, head_sha: str) -> str:
+        if base_sha == head_sha:
+            return "identical"
+        return "ahead" if (base_sha, head_sha) in self.contains else "diverged"
+
+
+def classify(
+    remote_sha: str | None,
+    github: TopologyGitHub,
+):
+    repository = SimpleNamespace(
+        inspect_branch=lambda branch: BranchState(
+            branch, "stale-local-sha", remote_sha, False
+        )
+    )
+    return classify_issue_topology(
+        repository,
+        github,
+        issue=158,
+        branch="feature/issue-158",
+        integration_branch="dev/v1",
+        integration_sha="b" * 40,
+    )
+
+
+def test_issue_topology_without_remote_branch_is_new() -> None:
+    assert classify(None, TopologyGitHub()).classification == "new"
+
+
+def test_issue_topology_with_current_base_and_expected_pr_is_recoverable() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    result = classify(
+        feature_sha,
+        TopologyGitHub(
+            (topology_pr(head_sha=feature_sha, base_sha=base_sha),),
+            {(base_sha, feature_sha)},
+        ),
+    )
+
+    assert result.classification == "recoverable"
+    assert result.feature_sha == feature_sha
+
+
+def test_issue_topology_rejects_branch_that_lacks_current_base() -> None:
+    with pytest.raises(WorkerFailure, match=r"Issue #158:.*does not contain"):
+        classify("f" * 40, TopologyGitHub())
+
+
+def test_issue_topology_classifies_authoritatively_integrated_head() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+
+    result = classify(
+        feature_sha,
+        TopologyGitHub(
+            (topology_pr(state="MERGED", head_sha=feature_sha),),
+            {(feature_sha, base_sha)},
+        ),
+    )
+
+    assert result.classification == "already_integrated"
+
+
+def test_issue_topology_rejects_pr_sha_mismatch_and_ambiguity() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    with pytest.raises(WorkerFailure, match="PR head SHA mismatch"):
+        classify(
+            feature_sha,
+            TopologyGitHub(
+                (topology_pr(head_sha="e" * 40),), {(base_sha, feature_sha)}
+            ),
+        )
+    with pytest.raises(WorkerFailure, match="ambiguous matching PRs"):
+        classify(
+            feature_sha,
+            TopologyGitHub(failure=WorkerFailure("ambiguous matching PRs")),
+        )
+
+
+def test_issue_topology_uses_remote_sha_instead_of_stale_local_ref() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+
+    result = classify(
+        feature_sha,
+        TopologyGitHub(contains={(base_sha, feature_sha)}),
+    )
+
+    assert result.feature_sha == feature_sha
+    assert result.classification == "recoverable"
 
 
 def test_valid_json_preserves_issue_order() -> None:
@@ -100,6 +257,9 @@ def test_generated_workflow_requires_existing_integration_by_default() -> None:
     assert "base_branch='dev/v0.2.0'" in parse_args
     assert "prepare_feature_branch(" not in parse_args
     assert "ensure_pushed(" not in parse_args
+    assert parse_args.index("inspect_issue_driven_topology(") < parse_args.index(
+        "prepare_run_repository("
+    )
 
 
 def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
@@ -204,11 +364,11 @@ def test_issue_count_reserves_final_outline_entries(
     )
 
     assert len(accepted.issues) == maximum
-    result = WorkflowValidator(check_timeout=10).validate(
-        generate_issue_driven_workflow(accepted)
-    )
-    assert result.valid, result.issues
-    assert len(result.outline) == MAX_OUTLINE_ITEMS
+    code = generate_issue_driven_workflow(accepted)
+    outline_issues: list[object] = []
+    outline = WorkflowValidator()._validate_outline(ast.parse(code), outline_issues)
+    assert outline_issues == []
+    assert len(outline) == MAX_OUTLINE_ITEMS
 
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(issues=list(range(1, maximum + 2)), final_review=final_review))
@@ -393,10 +553,11 @@ def test_generated_outline_uses_concrete_run_units(
         parse(payload(issues=[91, 90, 89], final_review=final_review))
     )
 
-    result = WorkflowValidator(check_timeout=10).validate(code)
+    outline_issues: list[object] = []
+    outline = WorkflowValidator()._validate_outline(ast.parse(code), outline_issues)
 
-    assert result.valid, result.issues
-    assert result.outline == expected
+    assert outline_issues == []
+    assert outline == expected
     assert "Inspect authoritative Issue topology" not in code
     assert "Prepare or reuse the feature branch" not in code
     assert "Implement and independently review" not in code
@@ -509,6 +670,7 @@ def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> No
     workflow["prepare_run_repository"] = lambda **kwargs: SimpleNamespace(
         execution_root=Path("/run"), base_sha=final_sha
     )
+    workflow["inspect_issue_driven_topology"] = lambda **kwargs: ()
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repository)
 
     config = workflow["parse_args"]()  # type: ignore[operator]
