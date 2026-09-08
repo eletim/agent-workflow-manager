@@ -228,6 +228,54 @@ def test_delete_checked_runs_rolls_back_when_history_cannot_be_saved(
     assert runner.snapshot(run_id).checked is True
 
 
+def test_delete_checked_runs_rejects_concurrent_cleanup(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
+    wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    runner.set_checked(run_id, True)
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    cleanup_results: list[RunnerSnapshot] = []
+    cleanup_errors: list[BaseException] = []
+
+    def blocking_cleanup(_resource: RunResource) -> None:
+        cleanup_entered.set()
+        if not allow_cleanup.wait(timeout=5):
+            raise AssertionError("cleanup test was not released")
+
+    def cleanup() -> None:
+        try:
+            cleanup_results.append(runner.cleanup(run_id))
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+    monkeypatch.setattr(runner, "_cleanup_resource", blocking_cleanup)
+    cleanup_thread = threading.Thread(target=cleanup)
+    cleanup_thread.start()
+    try:
+        assert cleanup_entered.wait(timeout=5)
+        with pytest.raises(
+            runner_module.RunDeletionNotAllowedError, match="cleanup is active"
+        ):
+            runner.delete_checked_runs((run_id,))
+        during_cleanup = runner.snapshot(run_id)
+        assert during_cleanup.resources[0].cleanup_state == "cleanup_pending"
+    finally:
+        allow_cleanup.set()
+        cleanup_thread.join(timeout=5)
+
+    assert not cleanup_thread.is_alive()
+    assert cleanup_errors == []
+    assert cleanup_results[0].resources[0].cleanup_state == "cleaned"
+    assert runner.delete_checked_runs((run_id,)) == (run_id,)
+
+
 def test_checked_terminal_run_is_restored_after_runner_reconstruction(
     tmp_path: Path,
 ) -> None:

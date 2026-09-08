@@ -131,6 +131,7 @@ let explicitNewRun = false;
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
 let deletableRunIds = [];
+let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
@@ -454,6 +455,7 @@ function renderRecovery(result) {
 function renderRunList(runs) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
+  renderedRunIds = new Set(runs.map((run) => run.runId));
   deletableRunIds = runs.filter(
     (run) => run.checked && ["success", "failed", "stopped"].includes(run.state),
   ).map((run) => run.runId);
@@ -995,6 +997,18 @@ async function refresh() {
     }
     const targetRunId = activeRunId;
     const selected = runs.find((run) => run.runId === targetRunId);
+    if (targetRunId !== null && !selected && renderedRunIds.has(targetRunId)) {
+      if (
+        selectionGeneration !== activeRunGeneration
+        || targetRunId !== activeRunId
+        || requestGeneration <= renderedRefreshGeneration
+      ) return;
+      showNewRunAfterHistoryDeletion();
+      renderRunList(runs);
+      renderFavicon(runs);
+      renderedRefreshGeneration = requestGeneration;
+      return;
+    }
     const result = selected
       ? await request(`/api/runs/${targetRunId}`)
       : null;

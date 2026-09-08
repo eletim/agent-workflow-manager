@@ -1540,6 +1540,16 @@ class PythonRunner:
                 raise RunDeletionNotAllowedError(
                     "checked terminal runs changed; refresh and confirm deletion again"
                 )
+            cleaning_run_ids = tuple(
+                run_id
+                for run_id in eligible_run_ids
+                if self._runs[run_id].cleanup_lock.locked()
+            )
+            if cleaning_run_ids:
+                raise RunDeletionNotAllowedError(
+                    "cleanup is active for confirmed run(s): "
+                    + ", ".join(str(run_id) for run_id in cleaning_run_ids)
+                )
             if not eligible_run_ids:
                 return ()
 
@@ -1647,8 +1657,10 @@ class PythonRunner:
             self._ensure_open()
             run = self._get_run(run_id)
             cleanup_lock = run.cleanup_lock
-        if not cleanup_lock.acquire(blocking=False):
-            raise RunCleanupInProgressError(f"run {run_id} cleanup is already active")
+            if not cleanup_lock.acquire(blocking=False):
+                raise RunCleanupInProgressError(
+                    f"run {run_id} cleanup is already active"
+                )
         try:
             with self._lock:
                 self._ensure_open()

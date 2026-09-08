@@ -484,6 +484,26 @@ test("checked run deletion stops when confirmation is cancelled", async () => {
   assert.match(selectedRun(elements).textContent, /#1/);
 });
 
+test("external checked history deletion clears stale selected detail", async () => {
+  const run = {runId: 1, state: "success", cwd: "/work/one", checked: true};
+  const runs = [run];
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details: {1: snapshot({...run, stdout: "deleted output"})},
+    validation: {status: 200, body: {validation: []}},
+  });
+  assert.equal(elements.stdout.textContent, "deleted output");
+
+  runs.splice(0, 1);
+  eventSource.emit("runner-change");
+  await waitFor(() => (
+    elements["active-context"].textContent.includes("New Python Workflow run")
+  ));
+
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements["run-list"].children.length, 0);
+});
+
 test("Settings opens Notifications repeatedly without losing form state", async () => {
   const {elements} = await loadApp({
     runs: [],
