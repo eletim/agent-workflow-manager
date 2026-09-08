@@ -19,10 +19,18 @@ when arbitrary control flow is required.
 ## Repository semantics
 
 `repository` is the path to the existing source repository. `integration_branch`
-is the remote/integration branch to develop on. The generated Python calls
-`prepare_run_repository(repo=repository, base_branch=integration_branch)` to
-create a fresh, run-specific worktree from that branch. The user does not need to
-create a version worktree first.
+is the remote/integration branch to develop on. By default, the generated Python
+calls `prepare_run_repository(repo=repository, base_branch=integration_branch)`
+to create a fresh, run-specific worktree from that branch. The user does not need
+to create a version worktree first.
+
+Set `make_integration_branch` to `true` when the integration branch may not exist
+yet. The workflow creates the isolated worktree at the exact remote
+`final_branch` HEAD, creates and pushes `integration_branch` from that commit,
+then uses it for Issue delivery. If the integration branch already exists, the
+same recovery path requires it to contain that exact final-branch HEAD and
+rejects unsafe remote movement or divergence. The final PR remains
+`integration_branch` to `final_branch`.
 
 Correct:
 
@@ -44,15 +52,17 @@ Incorrect when that version worktree does not already exist:
 
 ## Supported schema
 
-Unknown fields are rejected. `mode`, `policy_issue`, `implementer_agent`, and
-`reviewer_agent` are optional; every other field is required.
+Unknown fields are rejected. `mode`, `make_integration_branch`, `policy_issue`,
+`implementer_agent`, and `reviewer_agent` are optional; every other field is
+required.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `mode` | string | Optional discriminator; when present it must be `issue-driven`. |
 | `repository` | string | Existing source repository path. |
-| `integration_branch` | string | Existing remote/integration branch used as the development base. |
+| `integration_branch` | string | Remote/integration branch used as the development base; it may be created when `make_integration_branch` is true. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
+| `make_integration_branch` | boolean | Create/recover `integration_branch` from the exact remote `final_branch` HEAD; default `false`. |
 | `policy_issue` | integer | Optional positive Issue number containing version-wide design context; it must not also appear in `issues`. |
 | `issues` | array of integers | Positive, unique Issue numbers, executed in the listed order. |
 | `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 5 unless the user requests another value. |
@@ -81,6 +91,7 @@ Whole-version Review remains a separate integration and cross-Issue review.
   "repository": "~/DevEnv/agent-workflow-manager",
   "integration_branch": "dev/v0.2.1",
   "final_branch": "main",
+  "make_integration_branch": true,
   "policy_issue": 80,
   "issues": [86, 99, 87, 84],
   "max_reviews": 5,
@@ -134,6 +145,8 @@ and the New Run draft do not display a premature or previous-run Summary.
 - Use the existing source repository path, not a not-yet-created version worktree
   path.
 - Preserve Issue order exactly as requested.
+- Set `make_integration_branch` to true only when the integration branch should
+  be created or validated as descending from the exact `final_branch` HEAD.
 - Use `policy_issue` only for shared version design context, never for workflow
   ordering or conditions, and never repeat it in `issues`.
 - Set `max_reviews` to 5 unless the user explicitly requests another value.

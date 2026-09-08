@@ -35,6 +35,7 @@ class IssueDrivenConfig:
     implementer_agent: str = "codex"
     reviewer_agent: str = "codex"
     policy_issue: int | None = None
+    make_integration_branch: bool = False
 
     def as_json(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -42,6 +43,7 @@ class IssueDrivenConfig:
             "repository": self.repository,
             "integration_branch": self.integration_branch,
             "final_branch": self.final_branch,
+            "make_integration_branch": self.make_integration_branch,
             "issues": list(self.issues),
             "max_reviews": self.max_reviews,
             "merge_to_integration": self.merge_to_integration,
@@ -65,7 +67,13 @@ _REQUIRED_FIELDS = {
     "final_review",
     "merge_final",
 }
-_OPTIONAL_FIELDS = {"mode", "implementer_agent", "reviewer_agent", "policy_issue"}
+_OPTIONAL_FIELDS = {
+    "mode",
+    "make_integration_branch",
+    "implementer_agent",
+    "reviewer_agent",
+    "policy_issue",
+}
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
 # Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
@@ -212,7 +220,14 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(
             IssueDrivenFinding("$.max_reviews", "must be an integer from 1 to 100")
         )
-    for key in ("merge_to_integration", "final_review", "merge_final"):
+    for key in (
+        "make_integration_branch",
+        "merge_to_integration",
+        "final_review",
+        "merge_final",
+    ):
+        if key == "make_integration_branch" and key not in value:
+            continue
         if not isinstance(value.get(key), bool):
             findings.append(IssueDrivenFinding(f"$.{key}", "must be a boolean"))
     for key in ("implementer_agent", "reviewer_agent"):
@@ -229,6 +244,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         repository=value["repository"],
         integration_branch=value["integration_branch"],
         final_branch=value["final_branch"],
+        make_integration_branch=value.get("make_integration_branch", False),
         issues=tuple(value["issues"]),
         max_reviews=value["max_reviews"],
         merge_to_integration=value["merge_to_integration"],
@@ -258,16 +274,34 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
     issues = ",\n        ".join(
         f"Issue({number}, 'feature/issue-{number}')" for number in config.issues
     )
+    base_branch = (
+        config.final_branch
+        if config.make_integration_branch
+        else config.integration_branch
+    )
+    prepare_integration = ""
+    if config.make_integration_branch:
+        prepare_integration = f"""    integration = repository.prepare_feature_branch(
+        {config.integration_branch!r},
+        base={config.final_branch!r},
+        expected_base_sha=context.base_sha,
+    )
+    assert integration.local_sha is not None
+    repository.ensure_pushed(
+        {config.integration_branch!r},
+        expected_local_sha=integration.local_sha,
+    )
+"""
     return f"""def parse_args() -> Config:
     context = prepare_run_repository(
         repo={config.repository!r},
-        base_branch={config.integration_branch!r},
+        base_branch={base_branch!r},
     )
     repository = GitRepository.open(
         context.execution_root,
         command_timeout_seconds=COMMAND_TIMEOUT,
     )
-    return Config(
+{prepare_integration}    return Config(
         context.execution_root,
         repository.expected_github_slug,
         {config.integration_branch!r},
