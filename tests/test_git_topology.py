@@ -14,7 +14,49 @@ from purplemux_client import GitRepository, MutationOutcomeUnknown, WorkerFailur
 from purplemux_client.git import (
     _QuiescentMutationTimeout,
     _run_git_mutation_process_group,
+    inspect_github_repository,
 )
+
+
+def test_inspect_github_repository_resolves_nested_directory(tmp_path: Path) -> None:
+    repository = tmp_path / "project"
+    nested = repository / "packages" / "client"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:acme/widgets.git",
+        ],
+        check=True,
+    )
+
+    identity = inspect_github_repository(nested)
+
+    assert identity.slug == "acme/widgets"
+    assert identity.url == "https://github.com/acme/widgets"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["https://gitlab.com/acme/widgets.git", "https://example.com/acme/widgets.git"],
+)
+def test_inspect_github_repository_rejects_non_github_remote(
+    tmp_path: Path, origin: str
+) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", origin],
+        check=True,
+    )
+
+    with pytest.raises(WorkerFailure, match="non-GitHub"):
+        inspect_github_repository(tmp_path)
 
 
 class RecordingGitRunner:

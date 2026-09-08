@@ -107,6 +107,7 @@ function snapshot({
   executionContext = null,
   mode = undefined,
   prompt = undefined,
+  repository = null,
   integrationPr = null,
   checked = false,
 }) {
@@ -133,6 +134,7 @@ function snapshot({
     resourceCleanupStatus,
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
+    repository,
     integrationPr,
     checked,
   };
@@ -208,7 +210,8 @@ async function loadApp({
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
-    "active-context", "run-list", "delete-checked-runs",
+    "active-context", "repository-navigation", "repository-slug", "repository-link",
+    "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
@@ -1005,6 +1008,47 @@ test("Prompt history restores Prompt fields without exposing generated Python", 
   assert.equal(elements["prompt-text"].value, prompt.prompt);
   assert.match(selectedRun(elements).textContent, /Prompt.*selected\/project/);
   assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+  assert.equal(elements["repository-navigation"].hidden, true);
+});
+
+test("Prompt repository navigation is scoped to the selected run and cleared for New run", async () => {
+  const repository = {
+    slug: "eletim/agent-workflow-manager",
+    url: "https://github.com/eletim/agent-workflow-manager",
+  };
+  const prompt = {agent: "codex", cwd: "/selected/project", prompt: "Work"};
+  const promptRun = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    mode: "prompt",
+    prompt,
+    repository,
+  });
+  const workflowRun = snapshot({runId: 2, state: "success", stdout: "done"});
+  const runs = [
+    {runId: 1, state: "success", cwd: prompt.cwd, mode: "prompt"},
+    {runId: 2, state: "success", cwd: "/work/run-2", mode: "workflow"},
+  ];
+  const {elements} = await loadApp({
+    runs,
+    details: {1: promptRun, 2: workflowRun},
+    validation: {body: {}, status: 200},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["repository-navigation"].hidden, false);
+  assert.equal(elements["repository-slug"].textContent, repository.slug);
+  assert.equal(elements["repository-link"].getAttribute("href"), repository.url);
+
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(elements["repository-navigation"].hidden, true);
+  assert.equal(elements["repository-link"].getAttribute("href"), undefined);
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["repository-navigation"].hidden, true);
+  assert.equal(elements["repository-link"].getAttribute("href"), undefined);
 });
 
 test("Dry Run renders topology findings and the first mutation frontier", async () => {
