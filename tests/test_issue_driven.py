@@ -127,6 +127,7 @@ def classify(
     return classify_issue_topology(
         repository,
         github,
+        github,
         issue=158,
         branch="feature/issue-158",
         integration_branch="dev/v1",

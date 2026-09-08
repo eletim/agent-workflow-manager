@@ -228,12 +228,14 @@ def repository(runner: FakeGitHubRunner, **kwargs: int) -> GitHubRepository:
 
 def test_open_discovery_rejects_wrong_base_and_ambiguity() -> None:
     wrong = repository(FakeGitHubRunner([pr_data(1, base="main")]))
-    with pytest.raises(PullRequestTopologyError, match="wrong base"):
-        wrong.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+    for topology in (wrong, wrong.inspect_pr_snapshot()):
+        with pytest.raises(PullRequestTopologyError, match="wrong base"):
+            topology.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
 
     duplicate = repository(FakeGitHubRunner([pr_data(1), pr_data(2)]))
-    with pytest.raises(PullRequestTopologyError, match="ambiguous"):
-        duplicate.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+    for topology in (duplicate, duplicate.inspect_pr_snapshot()):
+        with pytest.raises(PullRequestTopologyError, match="ambiguous"):
+            topology.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
 
 
 def test_bounded_all_pr_enumeration_and_commit_comparison_are_read_only() -> None:
@@ -242,10 +244,27 @@ def test_bounded_all_pr_enumeration_and_commit_comparison_are_read_only() -> Non
     )
     repo = repository(runner)
 
-    prs = repo.list_prs()
+    snapshot = repo.inspect_pr_snapshot()
     comparison = repo.compare_commits(base_sha="a" * 40, head_sha="b" * 40)
 
-    assert [pr.number for pr in prs] == [1, 2]
+    assert [pr.number for pr in snapshot.pull_requests] == [1, 2]
+    assert (
+        snapshot.require_pr(
+            number=1,
+            head="feature/65",
+            base="dev/v0.1.4",
+            state="OPEN",
+            expected_head_sha=HEAD_SHA,
+            expected_base_sha=BASE_SHA,
+        ).number
+        == 1
+    )
+    with pytest.raises(PullRequestTopologyError, match="PR head changed"):
+        snapshot.require_pr(
+            head="feature/65",
+            base="dev/v0.1.4",
+            expected_head_sha="a" * 40,
+        )
     assert comparison == "ahead"
     assert all("--method" not in call for call in runner.calls)
 

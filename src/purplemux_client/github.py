@@ -82,7 +82,121 @@ class MergeResult:
     reconciled: bool = False
 
 
+@dataclass(frozen=True)
+class PullRequestSnapshot:
+    """One bounded, repository-pinned view of authoritative PR topology."""
+
+    slug: str
+    pull_requests: tuple[PullRequestState, ...]
+
+    def find_pr(
+        self, *, head: str, base: str, state: PullRequestStatus
+    ) -> PullRequestState | None:
+        _validate_pr_lookup(head, base, state)
+        candidates = tuple(
+            pr
+            for pr in self.pull_requests
+            if pr.head_repository.lower() == self.slug.lower()
+            and pr.head_branch == head
+            and pr.state == state
+        )
+        return _find_pr(candidates, head=head, base=base, state=state)
+
+    def require_pr(
+        self,
+        *,
+        head: str,
+        base: str,
+        number: int | None = None,
+        state: PullRequestStatus = "OPEN",
+        expected_head_sha: str | None = None,
+        expected_base_sha: str | None = None,
+        draft: bool | None = None,
+    ) -> PullRequestState:
+        pr = self.find_pr(head=head, base=base, state=state)
+        if pr is None:
+            raise PullRequestTopologyError(
+                f"no {state.lower()} PR from {head!r} to {base!r}"
+            )
+        if number is not None and pr.number != number:
+            raise PullRequestTopologyError(
+                f"PR identity changed: expected #{number}, found #{pr.number}"
+            )
+        _require_pr_topology(
+            self.slug,
+            pr,
+            head=head,
+            base=base,
+            state=state,
+            expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+            draft=draft,
+        )
+        return pr
+
+
 T = TypeVar("T")
+
+
+def _validate_pr_lookup(head: str, base: str, state: PullRequestStatus) -> None:
+    if not head or not base or head == base or "\0" in head or "\0" in base:
+        raise ValueError("head and base must be distinct non-empty branch names")
+    if state not in {"OPEN", "MERGED", "CLOSED"}:
+        raise ValueError(f"unsupported PR state: {state!r}")
+
+
+def _find_pr(
+    candidates: Sequence[PullRequestState],
+    *,
+    head: str,
+    base: str,
+    state: PullRequestStatus,
+) -> PullRequestState | None:
+    if state == "OPEN":
+        wrong = [pr for pr in candidates if pr.base_branch != base]
+        if wrong:
+            descriptions = ", ".join(f"#{pr.number}->{pr.base_branch}" for pr in wrong)
+            raise PullRequestTopologyError(
+                f"open PR(s) from {head!r} target the wrong base: {descriptions}; "
+                f"expected {base!r}"
+            )
+    exact = [pr for pr in candidates if pr.base_branch == base]
+    if len(exact) > 1:
+        numbers = ", ".join(f"#{pr.number}" for pr in exact)
+        raise PullRequestTopologyError(
+            f"ambiguous {state.lower()} PRs from {head!r} to {base!r}: {numbers}"
+        )
+    return exact[0] if exact else None
+
+
+def _require_pr_topology(
+    slug: str,
+    pr: PullRequestState,
+    *,
+    head: str,
+    base: str,
+    state: PullRequestStatus,
+    expected_head_sha: str | None,
+    expected_base_sha: str | None,
+    draft: bool | None,
+) -> None:
+    expected = slug.lower()
+    if pr.head_repository.lower() != expected or pr.base_repository.lower() != expected:
+        raise PullRequestTopologyError("PR crosses an unexpected repository")
+    if pr.head_branch != head or pr.base_branch != base or pr.state != state:
+        raise PullRequestTopologyError("PR head/base/state topology changed")
+    if expected_head_sha is not None and pr.head_sha != expected_head_sha:
+        raise PullRequestTopologyError(
+            f"PR head changed: reviewed {expected_head_sha}, current {pr.head_sha}"
+        )
+    if expected_base_sha is not None and pr.base_sha != expected_base_sha:
+        raise PullRequestTopologyError(
+            f"PR base changed: reviewed {expected_base_sha}, current {pr.base_sha}"
+        )
+    if draft is not None and pr.is_draft is not draft:
+        raise PullRequestTopologyError(
+            f"PR Draft state is {pr.is_draft}, expected {draft}"
+        )
 
 
 class GitHubRepository:
@@ -144,25 +258,9 @@ class GitHubRepository:
         self._validate_identity()
         self._validate_lookup(head, base, state)
         candidates = self._list_same_head(head, state)
-        if state == "OPEN":
-            wrong = [pr for pr in candidates if pr.base_branch != base]
-            if wrong:
-                descriptions = ", ".join(
-                    f"#{pr.number}->{pr.base_branch}" for pr in wrong
-                )
-                raise PullRequestTopologyError(
-                    f"open PR(s) from {head!r} target the wrong base: {descriptions}; "
-                    f"expected {base!r}"
-                )
-        exact = [pr for pr in candidates if pr.base_branch == base]
-        if len(exact) > 1:
-            numbers = ", ".join(f"#{pr.number}" for pr in exact)
-            raise PullRequestTopologyError(
-                f"ambiguous {state.lower()} PRs from {head!r} to {base!r}: {numbers}"
-            )
-        return exact[0] if exact else None
+        return _find_pr(candidates, head=head, base=base, state=state)
 
-    def list_prs(self) -> tuple[PullRequestState, ...]:
+    def inspect_pr_snapshot(self) -> PullRequestSnapshot:
         """Enumerate all PRs once for read-only, multi-branch topology checks."""
         self._validate_identity()
         found: list[PullRequestState] = []
@@ -179,7 +277,7 @@ class GitHubRepository:
             page_items = cast(list[object], data)
             found.extend(self._parse_pr(raw) for raw in page_items)
             if len(page_items) < self.page_size:
-                return tuple(found)
+                return PullRequestSnapshot(self.slug, tuple(found))
         raise IncompletePullRequestEnumeration(
             f"PR enumeration exceeded the {self.max_pages}-page safety bound"
         )
@@ -221,7 +319,8 @@ class GitHubRepository:
                 f"PR identity changed: expected #{number}, found #{discovered.number}"
             )
         pr = self._get_pr(discovered.number, include_queue=True)
-        self._require_topology(
+        _require_pr_topology(
+            self.slug,
             pr,
             head=head,
             base=base,
@@ -554,7 +653,8 @@ class GitHubRepository:
         if merged is None or merged.number != number:
             raise _PostconditionAbsent("PR is not synchronously merged")
         detailed = self._get_pr(number, include_queue=True)
-        self._require_topology(
+        _require_pr_topology(
+            self.slug,
             detailed,
             head=expected_head,
             base=expected_base,
@@ -663,10 +763,7 @@ class GitHubRepository:
             )
 
     def _validate_lookup(self, head: str, base: str, state: PullRequestStatus) -> None:
-        if not head or not base or head == base or "\0" in head or "\0" in base:
-            raise ValueError("head and base must be distinct non-empty branch names")
-        if state not in {"OPEN", "MERGED", "CLOSED"}:
-            raise ValueError(f"unsupported PR state: {state!r}")
+        _validate_pr_lookup(head, base, state)
 
     def _list_same_head(
         self, head: str, state: PullRequestStatus
@@ -790,38 +887,6 @@ class GitHubRepository:
             node_id=cast(str, node_id),
             body=body,
         )
-
-    def _require_topology(
-        self,
-        pr: PullRequestState,
-        *,
-        head: str,
-        base: str,
-        state: PullRequestStatus,
-        expected_head_sha: str | None,
-        expected_base_sha: str | None,
-        draft: bool | None,
-    ) -> None:
-        expected = self.slug.lower()
-        if (
-            pr.head_repository.lower() != expected
-            or pr.base_repository.lower() != expected
-        ):
-            raise PullRequestTopologyError("PR crosses an unexpected repository")
-        if pr.head_branch != head or pr.base_branch != base or pr.state != state:
-            raise PullRequestTopologyError("PR head/base/state topology changed")
-        if expected_head_sha is not None and pr.head_sha != expected_head_sha:
-            raise PullRequestTopologyError(
-                f"PR head changed: reviewed {expected_head_sha}, current {pr.head_sha}"
-            )
-        if expected_base_sha is not None and pr.base_sha != expected_base_sha:
-            raise PullRequestTopologyError(
-                f"PR base changed: reviewed {expected_base_sha}, current {pr.base_sha}"
-            )
-        if draft is not None and pr.is_draft is not draft:
-            raise PullRequestTopologyError(
-                f"PR Draft state is {pr.is_draft}, expected {draft}"
-            )
 
     def _require_no_deferred_merge(self, pr: PullRequestState) -> None:
         if pr.auto_merge_enabled:

@@ -4,12 +4,16 @@ import json
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
 from purplemux_client.errors import WorkerFailure
 from purplemux_client.execution_context import _inspect_repository_declaration
 from purplemux_client.git import BranchState, GitRepository
-from purplemux_client.github import GitHubRepository, PullRequestState
+from purplemux_client.github import (
+    GitHubRepository,
+    PullRequestSnapshot,
+    PullRequestState,
+)
 from purplemux_client.progress import emit_finding
 
 
@@ -53,90 +57,30 @@ class _CachedIssueGit:
 
 
 class _IssueGitHubRepository(Protocol):
+    def compare_commits(self, *, base_sha: str, head_sha: str) -> str: ...
+
+
+class _IssuePullRequests(Protocol):
     def find_pr(
         self, *, head: str, base: str, state: Literal["OPEN", "MERGED", "CLOSED"]
     ) -> PullRequestState | None: ...
 
-    def require_pr(self, **kwargs: object) -> PullRequestState: ...
-
-    def compare_commits(self, *, base_sha: str, head_sha: str) -> str: ...
-
-
-class _CachedIssueGitHub:
-    """Reuse one bounded PR enumeration across every Issue classification."""
-
-    def __init__(
-        self, github: GitHubRepository, pull_requests: tuple[PullRequestState, ...]
-    ) -> None:
-        self._github = github
-        self._pull_requests = pull_requests
-
-    def find_pr(
-        self, *, head: str, base: str, state: Literal["OPEN", "MERGED", "CLOSED"]
-    ) -> PullRequestState | None:
-        candidates = tuple(
-            pr
-            for pr in self._pull_requests
-            if pr.head_repository.lower() == self._github.slug.lower()
-            and pr.head_branch == head
-            and pr.state == state
-        )
-        if state == "OPEN":
-            wrong = tuple(pr for pr in candidates if pr.base_branch != base)
-            if wrong:
-                descriptions = ", ".join(
-                    f"#{pr.number}->{pr.base_branch}" for pr in wrong
-                )
-                raise WorkerFailure(
-                    f"open PR(s) from {head!r} target the wrong base: "
-                    f"{descriptions}; expected {base!r}"
-                )
-        exact = tuple(pr for pr in candidates if pr.base_branch == base)
-        if len(exact) > 1:
-            numbers = ", ".join(f"#{pr.number}" for pr in exact)
-            raise WorkerFailure(
-                f"ambiguous {state.lower()} PRs from {head!r} to {base!r}: {numbers}"
-            )
-        return exact[0] if exact else None
-
-    def require_pr(self, **kwargs: object) -> PullRequestState:
-        head = str(kwargs["head"])
-        base = str(kwargs["base"])
-        state_value = kwargs.get("state", "OPEN")
-        if state_value not in {"OPEN", "MERGED", "CLOSED"}:
-            raise ValueError(f"unsupported PR state: {state_value!r}")
-        state = cast(Literal["OPEN", "MERGED", "CLOSED"], state_value)
-        pr = self.find_pr(head=head, base=base, state=state)
-        if pr is None:
-            raise WorkerFailure(f"no {str(state).lower()} PR from {head!r} to {base!r}")
-        if kwargs.get("number") is not None and pr.number != kwargs["number"]:
-            raise WorkerFailure(
-                f"PR identity changed: expected #{kwargs['number']}, found #{pr.number}"
-            )
-        expected_head_sha = kwargs.get("expected_head_sha")
-        expected_base_sha = kwargs.get("expected_base_sha")
-        if expected_head_sha is not None and pr.head_sha != expected_head_sha:
-            raise WorkerFailure(
-                f"PR head changed: expected {expected_head_sha}, found {pr.head_sha}"
-            )
-        if expected_base_sha is not None and pr.base_sha != expected_base_sha:
-            raise WorkerFailure(
-                f"PR base changed: expected {expected_base_sha}, found {pr.base_sha}"
-            )
-        expected = self._github.slug.lower()
-        if (
-            pr.head_repository.lower() != expected
-            or pr.base_repository.lower() != expected
-        ):
-            raise WorkerFailure("PR crosses an unexpected repository")
-        return pr
-
-    def compare_commits(self, *, base_sha: str, head_sha: str) -> str:
-        return self._github.compare_commits(base_sha=base_sha, head_sha=head_sha)
+    def require_pr(
+        self,
+        *,
+        head: str,
+        base: str,
+        number: int | None = None,
+        state: Literal["OPEN", "MERGED", "CLOSED"] = "OPEN",
+        expected_head_sha: str | None = None,
+        expected_base_sha: str | None = None,
+        draft: bool | None = None,
+    ) -> PullRequestState: ...
 
 
 def classify_issue_topology(
     repository: _IssueGitRepository,
+    pull_requests: _IssuePullRequests,
     github: _IssueGitHubRepository,
     *,
     issue: int,
@@ -147,9 +91,15 @@ def classify_issue_topology(
     """Classify one Issue from authoritative remote Git and GitHub state."""
     try:
         feature = repository.inspect_branch(branch)
-        open_pr = github.find_pr(head=branch, base=integration_branch, state="OPEN")
-        merged_pr = github.find_pr(head=branch, base=integration_branch, state="MERGED")
-        closed_pr = github.find_pr(head=branch, base=integration_branch, state="CLOSED")
+        open_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="OPEN"
+        )
+        merged_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="MERGED"
+        )
+        closed_pr = pull_requests.find_pr(
+            head=branch, base=integration_branch, state="CLOSED"
+        )
         matching = tuple(pr for pr in (open_pr, merged_pr, closed_pr) if pr is not None)
         if len(matching) > 1:
             numbers = ", ".join(f"#{pr.number}" for pr in matching)
@@ -171,7 +121,7 @@ def classify_issue_topology(
                 )
             if merged_pr is None:
                 return IssueTopologyState(issue, branch, "new", None, integration_sha)
-            merged = github.require_pr(
+            merged = pull_requests.require_pr(
                 number=merged_pr.number,
                 head=branch,
                 base=integration_branch,
@@ -187,7 +137,7 @@ def classify_issue_topology(
             )
 
         if open_pr is not None:
-            github.require_pr(
+            pull_requests.require_pr(
                 number=open_pr.number,
                 head=branch,
                 base=integration_branch,
@@ -196,7 +146,7 @@ def classify_issue_topology(
                 expected_base_sha=integration_sha,
             )
         if merged_pr is not None:
-            github.require_pr(
+            pull_requests.require_pr(
                 number=merged_pr.number,
                 head=branch,
                 base=integration_branch,
@@ -286,8 +236,7 @@ def inspect_issue_driven_topology(
         repository.expected_github_slug,
         command_timeout_seconds=command_timeout_seconds,
     )
-    pull_requests = github.list_prs()
-    cached_github = _CachedIssueGitHub(github, pull_requests)
+    pull_requests = github.inspect_pr_snapshot()
     remote_shas = repository.inspect_remote_branches((integration_branch, *branches))
     cached_repository = _CachedIssueGit(remote_shas)
     integration_sha = remote_shas[integration_branch]
@@ -298,7 +247,7 @@ def inspect_issue_driven_topology(
             )
         integration_sha = preparation.base_sha
     elif prospective_base_branch is not None and not _commit_is_contained(
-        cached_github, preparation.base_sha, integration_sha
+        github, preparation.base_sha, integration_sha
     ):
         raise WorkerFailure(
             f"existing integration branch {integration_branch!r} does not contain "
@@ -308,7 +257,8 @@ def inspect_issue_driven_topology(
     states = tuple(
         classify_issue_topology(
             cached_repository,
-            cached_github,
+            pull_requests,
+            github,
             issue=number,
             branch=branch,
             integration_branch=integration_branch,
@@ -321,7 +271,7 @@ def inspect_issue_driven_topology(
         != remote_shas
     ):
         raise WorkerFailure("remote branch topology changed during inspection")
-    current_pull_requests = github.list_prs()
+    current_pull_requests = github.inspect_pr_snapshot()
     if _pr_topology(current_pull_requests) != _pr_topology(pull_requests):
         raise WorkerFailure("GitHub PR topology changed during inspection")
     for state in states:
@@ -341,7 +291,7 @@ def inspect_issue_driven_topology(
 
 
 def _pr_topology(
-    pull_requests: tuple[PullRequestState, ...],
+    snapshot: PullRequestSnapshot,
 ) -> tuple[tuple[object, ...], ...]:
     return tuple(
         sorted(
@@ -355,7 +305,7 @@ def _pr_topology(
                 pr.base_branch,
                 pr.base_sha,
             )
-            for pr in pull_requests
+            for pr in snapshot.pull_requests
         )
     )
 
