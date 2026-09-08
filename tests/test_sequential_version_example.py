@@ -94,6 +94,59 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ("APPROVED", "APPROVED"),
+        ("## APPROVED", "APPROVED"),
+        ("**APPROVED**", "APPROVED"),
+        ("Verdict: APPROVED", "APPROVED"),
+        ("**Verdict: APPROVED**", "APPROVED"),
+        ("Review result:\nAPPROVED\n\n- no findings", "APPROVED"),
+        ("CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+        ("### CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+        ("**CHANGES_REQUESTED**", "CHANGES_REQUESTED"),
+        ("Verdict: CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+        ("`Verdict: CHANGES_REQUESTED`", "CHANGES_REQUESTED"),
+        ("Review result:\nCHANGES_REQUESTED\n\n- finding", "CHANGES_REQUESTED"),
+        ("`approved`", "APPROVED"),
+        ("Verdict:   changes_requested", "CHANGES_REQUESTED"),
+    ],
+)
+def test_decision_accepts_bounded_reviewer_verdict_variations(
+    result: str, expected: str
+) -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    assert decision(result) == expected
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "APPROVED and CHANGES_REQUESTED",
+        "I initially considered APPROVED,\nbut the final verdict is CHANGES_REQUESTED.",
+        "Review result:\nNothing conclusive\nPlease retry",
+        "Introduction\nDetails\nMore details\nAPPROVED",
+        "NOT APPROVED",
+        "This review is APPROVED",
+        "UNAPPROVED",
+    ],
+)
+def test_decision_fails_closed_for_ambiguous_or_invalid_results(result: str) -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    with pytest.raises(WorkerFailure):
+        decision(result)
+
+
+def test_issue_and_whole_version_reviews_share_decision_parser() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert source.count("def decision(result: str) -> str:") == 1
+    assert source.count("decision(result)") == 2
+
+
 def test_clean_worktree_does_not_invoke_cleanup_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

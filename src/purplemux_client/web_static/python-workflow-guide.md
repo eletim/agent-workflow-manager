@@ -855,8 +855,10 @@ result = run_turn(session_id, "Run the requested tests and report the result.")
 ```
 
 Implement/review/fix: use separate implementer and reviewer sessions. Give each
-turn one bounded role; parse a small explicit review protocol such as a first
-line of `APPROVED` or `CHANGES_REQUESTED`; keep the loop in Python.
+turn one bounded role; parse a small explicit review protocol near the beginning
+of the result, accepting harmless Markdown decoration while rejecting negation
+or competing verdicts; keep the loop in Python. Never search the entire result
+for a verdict.
 
 Maximum attempts: use `range(1, maximum + 1)` and fail explicitly when the last
 review still requests changes. Never start an unbounded agent or Python retry
@@ -896,6 +898,8 @@ until explicit Cleanup.
 
 ```python
 from __future__ import annotations
+
+import re
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -978,12 +982,23 @@ def run_turn(
 
 
 def review_decision(result: str) -> str:
-    first_line = next(
-        (line.strip() for line in result.splitlines() if line.strip()), ""
-    )
-    if first_line in {"APPROVED", "CHANGES_REQUESTED"}:
-        return first_line
-    raise WorkerFailure("review result must start with APPROVED or CHANGES_REQUESTED")
+    # Inspect only a small leading window. Reject competing verdicts before
+    # normalizing Markdown decoration or a short prefix on an otherwise exact line.
+    leading = [line for line in result.splitlines() if line.strip()][:3]
+    token = re.compile(r"(?<![A-Z_])(APPROVED|CHANGES_REQUESTED)(?![A-Z_])")
+    candidates = {
+        match.group(1) for line in leading for match in token.finditer(line.upper())
+    }
+    if len(candidates) > 1:
+        raise WorkerFailure("review verdict is ambiguous")
+    for line in leading:
+        normalized = re.sub(r"^#{1,6}\s*", "", line.strip().upper())
+        normalized = normalized.strip(" \t*_`")
+        normalized = re.sub(r"^VERDICT\s*:\s*", "", normalized)
+        normalized = " ".join(normalized.strip(" \t*_`").split())
+        if normalized in {"APPROVED", "CHANGES_REQUESTED"}:
+            return normalized
+    raise WorkerFailure("review verdict is missing near the beginning")
 
 
 emit_step("workspace create", "started")

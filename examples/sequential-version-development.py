@@ -9,6 +9,7 @@ a new run and creates new runtime resources.
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -207,11 +208,36 @@ def run_outline_step(name: str, action):
     return result
 
 
+_REVIEW_VERDICTS = {"APPROVED", "CHANGES_REQUESTED"}
+_VERDICT_TOKEN = re.compile(r"(?<![A-Z_])(APPROVED|CHANGES_REQUESTED)(?![A-Z_])")
+_VERDICT_PREFIX = re.compile(r"^VERDICT\s*:\s*", re.IGNORECASE)
+
+
+def _normalized_verdict(line: str) -> str | None:
+    normalized = line.strip().upper()
+    normalized = re.sub(r"^#{1,6}\s*", "", normalized)
+    normalized = normalized.strip(" \t*_`")
+    normalized = _VERDICT_PREFIX.sub("", normalized)
+    normalized = normalized.strip(" \t*_`")
+    normalized = " ".join(normalized.split())
+    return normalized if normalized in _REVIEW_VERDICTS else None
+
+
 def decision(result: str) -> str:
-    verdict = next((line.strip() for line in result.splitlines() if line.strip()), "")
-    if verdict not in {"APPROVED", "CHANGES_REQUESTED"}:
-        raise WorkerFailure("reviewer must begin with APPROVED or CHANGES_REQUESTED")
-    return verdict
+    leading_lines = [line for line in result.splitlines() if line.strip()][:3]
+    candidates = {
+        match.group(1)
+        for line in leading_lines
+        for match in _VERDICT_TOKEN.finditer(line.upper())
+    }
+    if len(candidates) > 1:
+        raise WorkerFailure("reviewer verdict is ambiguous")
+    for line in leading_lines:
+        if verdict := _normalized_verdict(line):
+            return verdict
+    raise WorkerFailure(
+        "reviewer must provide APPROVED or CHANGES_REQUESTED near the beginning"
+    )
 
 
 def require_clean_worktree(
