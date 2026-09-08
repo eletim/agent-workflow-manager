@@ -82,16 +82,24 @@ def ensure_claude_project_trust(
 def _claude_state_path(home: Path) -> Path:
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     if configured is None:
-        return home / ".claude.json"
-    if not configured.strip() or "\0" in configured:
-        raise WorkerFailure("CLAUDE_CONFIG_DIR is not a valid directory")
-    config_directory = Path(configured)
-    if not config_directory.is_absolute():
-        raise WorkerFailure("CLAUDE_CONFIG_DIR must be an absolute path")
+        config_directory = home / ".claude"
+        legacy_directory = home
+    else:
+        if not configured.strip() or "\0" in configured:
+            raise WorkerFailure("CLAUDE_CONFIG_DIR is not a valid directory")
+        config_directory = Path(configured)
+        if not config_directory.is_absolute():
+            raise WorkerFailure("CLAUDE_CONFIG_DIR must be an absolute path")
+        legacy_directory = config_directory
     current_state = config_directory / ".config.json"
     if current_state.exists():
         return current_state
-    return config_directory / ".claude.json"
+    filename = (
+        ".claude-custom-oauth.json"
+        if os.environ.get("CLAUDE_CODE_CUSTOM_OAUTH_URL")
+        else ".claude.json"
+    )
+    return legacy_directory / filename
 
 
 def _read_state(path: Path) -> tuple[dict[str, Any], int]:

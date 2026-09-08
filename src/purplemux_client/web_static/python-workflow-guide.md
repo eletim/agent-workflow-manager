@@ -431,12 +431,13 @@ processes cannot lose another worktree's configuration update.
 Fresh worktrees are handled independently from their source repository path.
 For Claude, the same exact launch-path boundary is enforced before updating and
 verifying only `projects[canonical_path].hasTrustDialogAccepted` in Claude Code's
-project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's
-`.config.json`/`.claude.json` precedence, unrelated state is preserved, and
-updates coordinate on Claude's state-file lock. Claude home-directory trust
-fails early because Claude does not persist it. Neither provider integration
-changes sandbox or approval policy, and AWM does not use a broad permission
-bypass, screen-text detection, or simulated trust-dialog keystrokes.
+project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrated
+`.config.json`, legacy `.claude.json`, and custom-OAuth state precedence;
+unrelated state is preserved, and updates coordinate on Claude's state-file lock.
+Claude home-directory trust fails early because Claude does not persist it.
+Neither provider integration changes sandbox or approval policy, and AWM does
+not use a broad permission bypass, screen-text detection, or simulated
+trust-dialog keystrokes.
 
 Relevant errors all derive from `TerminalSessionError`:
 

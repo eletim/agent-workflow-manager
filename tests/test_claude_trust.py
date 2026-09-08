@@ -13,6 +13,11 @@ from purplemux_client.claude_trust import ensure_claude_project_trust
 from purplemux_client.errors import WorkerFailure
 
 
+@pytest.fixture(autouse=True)
+def _clear_custom_oauth_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
+
+
 def test_trusts_only_exact_canonical_project_and_preserves_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -66,6 +71,32 @@ def test_default_state_file_is_in_home(
     assert state["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
 
 
+def test_config_json_takes_precedence_in_default_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config = home / ".claude"
+    config.mkdir(parents=True)
+    current_state = config / ".config.json"
+    legacy_state = home / ".claude.json"
+    current_state.write_text('{"projects":{},"current":true}\n', encoding="utf-8")
+    legacy_state.write_text('{"projects":{},"legacy":true}\n', encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    ensure_claude_project_trust(str(project))
+
+    current = json.loads(current_state.read_text(encoding="utf-8"))
+    assert current["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
+    assert current["current"] is True
+    assert json.loads(legacy_state.read_text(encoding="utf-8")) == {
+        "projects": {},
+        "legacy": True,
+    }
+
+
 def test_config_json_takes_precedence_in_custom_config_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -87,6 +118,40 @@ def test_config_json_takes_precedence_in_custom_config_directory(
     current = json.loads(current_state.read_text(encoding="utf-8"))
     assert current["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
     assert current["current"] is True
+    assert json.loads(legacy_state.read_text(encoding="utf-8")) == {
+        "projects": {},
+        "legacy": True,
+    }
+
+
+@pytest.mark.parametrize("custom_config", [False, True])
+def test_custom_oauth_state_suffix_is_used_without_config_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    custom_config: bool,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    state_directory = tmp_path / "claude-config" if custom_config else home
+    if custom_config:
+        state_directory.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(state_directory))
+    else:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    custom_state = state_directory / ".claude-custom-oauth.json"
+    legacy_state = state_directory / ".claude.json"
+    custom_state.write_text('{"projects":{},"custom":true}\n', encoding="utf-8")
+    legacy_state.write_text('{"projects":{},"legacy":true}\n', encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://oauth.example")
+
+    ensure_claude_project_trust(str(project))
+
+    custom = json.loads(custom_state.read_text(encoding="utf-8"))
+    assert custom["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
+    assert custom["custom"] is True
     assert json.loads(legacy_state.read_text(encoding="utf-8")) == {
         "projects": {},
         "legacy": True,
