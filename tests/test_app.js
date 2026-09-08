@@ -2032,6 +2032,48 @@ test("each New run inherits the folder from the most recently selected Prompt ru
   assert.equal(elements["prompt-cwd"].value, "/work/prompt-b");
 });
 
+test("New run waits for a newly selected Prompt run's authoritative folder", async () => {
+  const delayedRunB = deferred();
+  let delayRunB = false;
+  const promptA = {agent: "codex", cwd: "/work/prompt-a", prompt: "A"};
+  const promptB = {agent: "codex", cwd: "/work/prompt-b", prompt: "B"};
+  const runA = snapshot({
+    runId: 1, state: "success", stdout: "A", mode: "prompt", prompt: promptA,
+  });
+  const runB = snapshot({
+    runId: 2, state: "success", stdout: "B", mode: "prompt", prompt: promptB,
+  });
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: promptA.cwd, mode: "prompt", prompt: promptA},
+      {runId: 2, state: "success", cwd: promptB.cwd, mode: "prompt", prompt: promptB},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunB && url === "/api/runs/2") return delayedRunB.promise;
+      return undefined;
+    },
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+
+  delayRunB = true;
+  const selectRunB = runItem(elements, 2).dispatch("click");
+  const enterNewRun = elements["new-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  delayedRunB.resolve(response(runB));
+  await Promise.all([selectRunB, enterNewRun]);
+
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-b");
+  assert.equal(elements["prompt-text"].value, "");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+});
+
 test("New run keeps the existing Prompt draft folder when a run has none", async () => {
   const prompt = {agent: "codex", cwd: "", prompt: "No folder"};
   const {elements} = await loadApp({
@@ -2378,12 +2420,10 @@ test("a delayed run-detail response cannot repaint New run", async () => {
   delayRunOne = true;
   const staleSelection = runItem(elements, 1).dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
-  await elements["new-run"].dispatch("click");
-  assert.equal(elements.status.textContent, "not started");
-  assert.equal(elements.stdout.textContent, "");
+  const newRun = elements["new-run"].dispatch("click");
 
   delayedRun.resolve(response(runOne));
-  await staleSelection;
+  await Promise.all([staleSelection, newRun]);
 
   assert.equal(elements.status.textContent, "not started");
   assert.equal(elements.stdout.textContent, "");

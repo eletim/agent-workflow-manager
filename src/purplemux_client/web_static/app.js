@@ -357,12 +357,33 @@ function renderRun(result) {
 async function enterDraftMode(mode = currentMode) {
   const wasViewingRun = activeRunId !== null;
   const changedMode = mode !== currentMode;
+  const selectedRunId = activeRunId;
   // A New-run click is an explicit selection even if the fields are already
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
   captureDraftIfEditing();
-  if (wasViewingRun) inheritFolderIntoDraft(activeRunSnapshot, mode);
-  activeRunGeneration += 1;
+  const transitionGeneration = ++activeRunGeneration;
+  let selectedSnapshot = activeRunSnapshot;
+  if (wasViewingRun && selectedSnapshot?.runId !== selectedRunId) {
+    try {
+      const result = await request(`/api/runs/${selectedRunId}`);
+      if (result.runId !== selectedRunId) {
+        throw new Error("Run detail did not match the selected run");
+      }
+      selectedSnapshot = result;
+    } catch (error) {
+      if (
+        transitionGeneration === activeRunGeneration
+        && activeRunId === selectedRunId
+      ) stderr.textContent = String(error);
+      return;
+    }
+  }
+  if (
+    transitionGeneration !== activeRunGeneration
+    || activeRunId !== selectedRunId
+  ) return;
+  if (wasViewingRun) inheritFolderIntoDraft(selectedSnapshot, mode);
   activeRunId = null;
   activeRunSnapshot = null;
   currentMode = mode;
