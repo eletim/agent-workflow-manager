@@ -151,6 +151,20 @@ marked Ready after approval and stays Draft after a warning continuation. The
 implementer and reviewer selections are independent. Omitting either agent field
 selects `codex` for that role.
 
+The configured tuple is an immutable seed for the generated Python's separate
+`WorkItemPlan`, not a frozen execution schedule. Before each item is dispatched,
+the workflow asks one dedicated planning-agent session for a bounded JSON
+decision. The plain Python parser applies valid `add`, `update`, and `skip`
+actions to pending work, or accepts completion only when no work remains. A key
+is the GitHub Issue number or inline mini-task ID. Updates preserve the stable
+key and branch, dispatched or completed items cannot be changed or reused, and
+invalid or unbounded decisions fail closed without partially changing the plan.
+Dynamic items still enter the same recovery, Draft PR, review, and delivery
+flow. The effective final snapshot is passed explicitly to handoff generation;
+the immutable configuration is not changed. This remains ordinary Python
+control flow: planner prose, JSON input, Runner state, Progress, and the UI do not
+become scheduling authorities.
+
 When `policy_issue` is present, implementation, Issue review/fix, and
 whole-version review/fix agents read it first as shared design context. It is not
 interpreted as workflow control or a DSL. A clear conflict with a listed

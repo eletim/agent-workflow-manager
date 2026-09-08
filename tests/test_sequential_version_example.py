@@ -1495,7 +1495,9 @@ def test_ready_final_pr_repeats_review_and_checks(
         lambda *args: events.append("final checks"),
     )
 
-    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+    result = workflow["integration_delivery"](
+        config, config.issues, object(), Repository(), GitHub()
+    )
 
     assert result.is_draft is False
     assert events == [
@@ -1637,7 +1639,9 @@ def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
         lambda *args: events.append("final checks"),
     )
 
-    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+    result = workflow["integration_delivery"](
+        config, config.issues, object(), Repository(), GitHub()
+    )
 
     assert result.is_draft is True
     assert events.count("Whole-version reviewer turn") == 1
@@ -1795,7 +1799,9 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
         lambda *args: pytest.fail("disabled final review must not run"),
     )
 
-    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+    result = workflow["integration_delivery"](
+        config, config.issues, object(), Repository(), GitHub()
+    )
 
     assert result.is_draft is False
     assert outcomes == ["skipped"]
@@ -1916,7 +1922,9 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         lambda name, status, **kwargs: outline_events.append((name, status)),
     )
 
-    ready = workflow["integration_delivery"](config, object(), repository, GitHub())
+    ready = workflow["integration_delivery"](
+        config, config.issues, object(), repository, GitHub()
+    )
 
     assert ready.is_draft is False
     assert review_count == 2
@@ -1984,7 +1992,9 @@ def test_whole_version_outline_fails_when_final_checks_fail(
     )
 
     with pytest.raises(WorkerFailure, match="checks failed"):
-        workflow["integration_delivery"](config, object(), Repository(), GitHub())
+        workflow["integration_delivery"](
+            config, config.issues, object(), Repository(), GitHub()
+        )
 
     assert outline_events == [
         ("Whole-version review", "started"),
@@ -2028,7 +2038,7 @@ def test_historical_merged_final_pr_cannot_complete_newer_delivery() -> None:
 
     repository = Repository()
     with pytest.raises(WorkerFailure, match="historical merged final PR #17"):
-        integration_delivery(config, object(), repository, GitHub())
+        integration_delivery(config, config.issues, object(), repository, GitHub())
 
     assert repository.synchronized == ["dev/v1"]
 
@@ -2079,7 +2089,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     )
 
     delivered = workflow["integration_delivery"](
-        config, object(), Repository(), GitHub()
+        config, config.issues, object(), Repository(), GitHub()
     )
 
     assert delivered is merged
@@ -2115,7 +2125,7 @@ def test_exact_merged_final_pr_requires_final_branch_containment() -> None:
             return merged_final_pr("new-head")
 
     with pytest.raises(WorkerFailure, match="main does not contain new-head"):
-        integration_delivery(config, object(), Repository(), GitHub())
+        integration_delivery(config, config.issues, object(), Repository(), GitHub())
 
 
 def test_example_passes_static_validation() -> None:

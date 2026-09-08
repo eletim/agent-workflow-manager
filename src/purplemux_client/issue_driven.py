@@ -467,9 +467,29 @@ _OPTIONAL_FIELDS = {
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
-# Kept in lockstep with preflight.MAX_OUTLINE_ITEMS by boundary tests.
-_MAX_WORKFLOW_OUTLINE_ITEMS = 100
+_MAX_INITIAL_WORK_ITEMS = 100
+_MAX_WORK_ITEM_PLAN_STATE_BYTES = 32_000
 _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _work_item_plan_state_size(work_items: list[WorkItem]) -> int:
+    items = [item.as_json() for item in work_items]
+    seed = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    payload = {
+        "version": 1,
+        "seed_sha256": hashlib.sha256(seed.encode()).hexdigest(),
+        "items": items,
+        "position": len(items),
+        "finalized": False,
+    }
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
 
 
 def _valid_branch_name(value: str) -> bool:
@@ -566,14 +586,11 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
             IssueDrivenFinding(f"$.{items_key}", "must be a non-empty array")
         )
     else:
-        reserved_outline_items = 2 if value.get("final_review") is True else 1
-        max_items = _MAX_WORKFLOW_OUTLINE_ITEMS - reserved_outline_items
-        if len(raw_items) > max_items:
+        if len(raw_items) > _MAX_INITIAL_WORK_ITEMS:
             findings.append(
                 IssueDrivenFinding(
                     f"$.{items_key}",
-                    f"must contain at most {max_items} items when "
-                    f"final_review is {value.get('final_review')!r}",
+                    f"must contain at most {_MAX_INITIAL_WORK_ITEMS} items",
                 )
             )
         seen_issues: set[int] = set()
@@ -664,6 +681,16 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                 if id_valid and not duplicate_id and task_valid and not unknown:
                     assert isinstance(item_id, str) and isinstance(task, str)
                     work_items.append(WorkItem(id=item_id, task=task))
+        if (
+            len(work_items) == len(raw_items)
+            and _work_item_plan_state_size(work_items) > _MAX_WORK_ITEM_PLAN_STATE_BYTES
+        ):
+            findings.append(
+                IssueDrivenFinding(
+                    f"$.{items_key}",
+                    "serialized recovery state must not exceed 32000 bytes",
+                )
+            )
         generated_branches = {item.branch for item in work_items}
         if len(generated_branches) != len(work_items):
             findings.append(
@@ -839,10 +866,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
 
 
 def _workflow_outline(config: IssueDrivenConfig) -> str:
-    labels = [
-        f"Issue #{item.issue}" if item.issue is not None else f"Mini task {item.id}"
-        for item in config.work_items
-    ]
+    labels = ["Work items"]
     if config.final_review:
         labels.append("Whole-version review")
     labels.append("Final integration PR")

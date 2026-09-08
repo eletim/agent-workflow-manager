@@ -11,8 +11,9 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -48,6 +49,10 @@ WORKFLOW_OUTLINE = [
 ]
 MAX_REVIEWS = 5
 MAX_SCOPE_REVIEWS = 3
+MAX_WORK_ITEMS = 200
+MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
+MAX_PLANNER_ACTIONS = 100
+MAX_PLAN_STATE_CHARS = 32_000
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -71,6 +76,7 @@ POLICY_CONFLICT_WARNINGS: list[tuple[int | str | None, str]] = []
 HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
 HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
 MAX_HUMAN_HANDOFF_CHARS = 12_000
+WORK_ITEM_PLAN_MARKER = "agent-workflow-manager:work-item-plan:"
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,12 @@ class Issue:
         return self.number if self.number is not None else f"mini-task:{self.task_id}"
 
     @property
+    def key(self) -> int | str:
+        """Return the stable key used to revise a pending work item."""
+        assert self.number is not None or self.task_id is not None
+        return self.number if self.number is not None else self.task_id
+
+    @property
     def correlation_id(self) -> str:
         return (
             f"issue-{self.number}"
@@ -150,6 +162,78 @@ class Config:
     issues: tuple[Issue, ...]
     check_command: str
     policy_issue: int | None = None
+
+
+@dataclass
+class WorkItemPlan:
+    """Mutable work-item order owned by this plain-Python workflow."""
+
+    config: Config
+    items: list[Issue] = field(init=False)
+    position: int = 0
+    finalized: bool = False
+
+    def __post_init__(self) -> None:
+        self.items = list(self.config.issues)
+        self._validate(self.items)
+
+    def _validate(self, issues: list[Issue]) -> None:
+        if len(issues) > MAX_WORK_ITEMS:
+            raise ValueError(f"work-item plan cannot exceed {MAX_WORK_ITEMS} items")
+        identities = [issue.key for issue in issues]
+        branches = [issue.branch for issue in issues]
+        if len(set(identities)) != len(identities):
+            raise ValueError("work-item identities must be unique")
+        if len(set(branches)) != len(branches):
+            raise ValueError("work-item branches must be unique")
+        reserved = {self.config.integration_branch, self.config.main_branch}
+        if len(reserved) != 2 or any(branch in reserved for branch in branches):
+            raise ValueError(
+                "integration, main, and every work-item branch must be distinct"
+            )
+        if self.config.policy_issue in identities:
+            raise ValueError(
+                "policy Issue must differ from every implementation work item"
+            )
+
+    def add(self, issue: Issue) -> None:
+        candidate = [*self.items, issue]
+        self._validate(candidate)
+        self.items.append(issue)
+
+    def update(self, identity: int | str, issue: Issue) -> None:
+        index = self._remaining_index(identity)
+        current = self.items[index]
+        if issue.result_id != current.result_id or issue.branch != current.branch:
+            raise ValueError("updated work item must preserve its identity and branch")
+        candidate = list(self.items)
+        candidate[index] = issue
+        self._validate(candidate)
+        self.items[index] = issue
+
+    def skip(self, identity: int | str) -> Issue:
+        return self.items.pop(self._remaining_index(identity))
+
+    def take_next(self) -> Issue | None:
+        if self.position == len(self.items):
+            return None
+        issue = self.items[self.position]
+        self.position += 1
+        return issue
+
+    @property
+    def snapshot(self) -> tuple[Issue, ...]:
+        return tuple(self.items)
+
+    @property
+    def remaining(self) -> tuple[Issue, ...]:
+        return tuple(self.items[self.position :])
+
+    def _remaining_index(self, identity: int | str) -> int:
+        for index in range(self.position, len(self.items)):
+            if self.items[index].key == identity:
+                return index
+        raise ValueError(f"no unprocessed work item with identity {identity!r}")
 
 
 @dataclass(frozen=True)
@@ -460,6 +544,7 @@ def record_issue_handoff_result(
 
 def human_handoff_prompt(
     config: Config,
+    work_items: tuple[Issue, ...],
     pr: PullRequestState,
     delivery: ReviewDelivery,
     warnings: tuple[str, ...],
@@ -477,7 +562,7 @@ def human_handoff_prompt(
     )
     warning_lines = "\n".join(f"- {item}" for item in warnings) or "- none"
     issue_numbers = ", ".join(
-        str(item.number) for item in config.issues if item.number is not None
+        str(item.number) for item in work_items if item.number is not None
     )
     issue_source_guidance = (
         "Before writing, read every implementation Issue body with `gh issue view "
@@ -486,7 +571,7 @@ def human_handoff_prompt(
         else "There are no implementation GitHub Issues to read for this run."
     )
     mini_tasks = "\n".join(
-        f"- {item.label}: {item.task}" for item in config.issues if item.task is not None
+        f"- {item.label}: {item.task}" for item in work_items if item.task is not None
     ) or "- none"
     return f"""Create the final human handoff Markdown for Base PR #{pr.number}.
 You are the Reviewer role Agent selected by reviewer_agent. This turn generates
@@ -596,6 +681,7 @@ def human_handoff_warnings(delivery: ReviewDelivery) -> tuple[str, ...]:
 
 def update_base_pr_human_handoff(
     config: Config,
+    work_items: tuple[Issue, ...],
     client: PurpleMuxCLIClient,
     github: GitHubRepository,
     pr: PullRequestState,
@@ -614,7 +700,7 @@ def update_base_pr_human_handoff(
             client,
             writer,
             "Base PR human handoff",
-            human_handoff_prompt(config, pr, delivery, warnings),
+            human_handoff_prompt(config, work_items, pr, delivery, warnings),
             pr=pr,
         )
         handoff = validate_human_handoff(
@@ -1504,6 +1590,431 @@ def process_issue(
     return merged.pr
 
 
+def planner_work_item_json(issue: Issue) -> int | dict[str, str]:
+    if issue.number is not None:
+        return issue.number
+    assert issue.task_id is not None and issue.task is not None
+    return {"id": issue.task_id, "task": issue.task}
+
+
+def planner_prompt(plan: WorkItemPlan, config: Config) -> str:
+    processed = [planner_work_item_json(issue) for issue in plan.items[: plan.position]]
+    remaining = [planner_work_item_json(issue) for issue in plan.remaining]
+    return f"""Review the workflow-owned work-item plan before its next dispatch.
+You are the planning role only: do not edit files, implement work, or mutate Git
+or GitHub. Inspect repository and GitHub state read-only when useful. Preserve
+the current plan unless progress provides a concrete reason to add necessary
+work, refine a pending inline mini task, or skip obsolete/redundant pending work.
+Never update or skip a processed item. GitHub Issue work uses its positive number;
+inline work uses a stable lowercase kebab-case ID and a concise authoritative task.
+
+Repository: {config.slug}
+Integration branch: {config.integration_branch}
+Processed work items: {json.dumps(processed, ensure_ascii=False)}
+Pending work items: {json.dumps(remaining, ensure_ascii=False)}
+
+Return exactly one JSON object with keys "actions" and "complete". Actions run
+in order and have one of these exact shapes:
+- {{"action":"add","item":123}}
+- {{"action":"add","item":{{"id":"task-id","task":"instruction"}}}}
+- {{"action":"update","key":"task-id","task":"revised instruction"}}
+- {{"action":"skip","key":123}}
+- {{"action":"skip","key":"task-id"}}
+Use complete=true only when no pending or newly added work remains and the
+workflow should proceed to whole-version delivery. Otherwise use complete=false.
+Do not use Markdown fences or add explanation outside the JSON object."""
+
+
+def planner_inline_issue(task_id: object, task: object) -> Issue:
+    if (
+        not isinstance(task_id, str)
+        or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", task_id) is None
+        or len(task_id) > 50
+    ):
+        raise WorkerFailure("planner mini-task ID is invalid")
+    task_has_surrogate = isinstance(task, str) and any(
+        0xD800 <= ord(character) <= 0xDFFF for character in task
+    )
+    if (
+        not isinstance(task, str)
+        or not task
+        or task != task.strip()
+        or "\0" in task
+        or len(task) > 4000
+        or task_has_surrogate
+    ):
+        raise WorkerFailure("planner mini-task instruction is invalid")
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    return Issue(
+        None,
+        f"feature/work-item-{task_id}",
+        task_id,
+        task,
+        fingerprint,
+    )
+
+
+def planner_key(value: object) -> int | str:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise WorkerFailure("planner work-item key is invalid")
+    if isinstance(value, int):
+        if value < 1:
+            raise WorkerFailure("planner Issue key is invalid")
+        return value
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value) is None or len(value) > 50:
+        raise WorkerFailure("planner mini-task key is invalid")
+    return value
+
+
+def planner_added_issue(value: object) -> Issue:
+    if isinstance(value, bool):
+        raise WorkerFailure("planner added work item is invalid")
+    if isinstance(value, int):
+        if value < 1:
+            raise WorkerFailure("planner added Issue is invalid")
+        return Issue(value, f"feature/issue-{value}")
+    if not isinstance(value, dict) or set(value) != {"id", "task"}:
+        raise WorkerFailure("planner added work item is invalid")
+    return planner_inline_issue(value["id"], value["task"])
+
+
+def apply_planner_decision(plan: WorkItemPlan, source: str) -> bool:
+    try:
+        decision = json.loads(source)
+    except json.JSONDecodeError as exc:
+        raise WorkerFailure(f"planner returned invalid JSON: {exc.msg}") from exc
+    if not isinstance(decision, dict) or set(decision) != {"actions", "complete"}:
+        raise WorkerFailure("planner decision must contain only actions and complete")
+    actions = decision["actions"]
+    complete = decision["complete"]
+    if (
+        not isinstance(actions, list)
+        or len(actions) > MAX_PLANNER_ACTIONS
+        or not isinstance(complete, bool)
+    ):
+        raise WorkerFailure("planner decision has invalid actions or complete value")
+
+    candidate = WorkItemPlan(plan.config)
+    candidate.items = list(plan.items)
+    candidate.position = plan.position
+    try:
+        for action in actions:
+            if not isinstance(action, dict) or not isinstance(
+                action.get("action"), str
+            ):
+                raise WorkerFailure("planner action is invalid")
+            kind = action["action"]
+            if kind == "add" and set(action) == {"action", "item"}:
+                candidate.add(planner_added_issue(action["item"]))
+            elif kind == "update" and set(action) == {"action", "key", "task"}:
+                key = planner_key(action["key"])
+                index = candidate._remaining_index(key)
+                current = candidate.items[index]
+                if current.task_id is None:
+                    raise WorkerFailure("planner can update only an inline mini task")
+                candidate.update(
+                    key, planner_inline_issue(current.task_id, action["task"])
+                )
+            elif kind == "skip" and set(action) == {"action", "key"}:
+                candidate.skip(planner_key(action["key"]))
+            else:
+                raise WorkerFailure("planner action has an unsupported shape")
+    except ValueError as exc:
+        raise WorkerFailure(f"planner decision is invalid: {exc}") from exc
+
+    if complete and candidate.remaining:
+        raise WorkerFailure("planner cannot complete while work items remain")
+    if not complete and not candidate.remaining:
+        raise WorkerFailure("planner must add work or complete an empty plan")
+    candidate.finalized = complete
+    validate_work_item_plan_capacity(candidate)
+    plan.items = candidate.items
+    plan.finalized = complete
+    return complete
+
+
+def plan_seed_fingerprint(config: Config) -> str:
+    seed = json.dumps(
+        [planner_work_item_json(issue) for issue in config.issues],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def work_item_plan_source(
+    plan: WorkItemPlan, *, position: int, finalized: bool
+) -> str:
+    payload = {
+        "version": 1,
+        "seed_sha256": plan_seed_fingerprint(plan.config),
+        "items": [planner_work_item_json(issue) for issue in plan.items],
+        "position": position,
+        "finalized": finalized,
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def require_work_item_plan_size(source: str) -> None:
+    if len(source.encode()) > MAX_PLAN_STATE_CHARS:
+        raise WorkerFailure("work-item plan recovery state exceeds its size limit")
+
+
+def validate_work_item_plan_capacity(plan: WorkItemPlan) -> None:
+    source = work_item_plan_source(
+        plan,
+        position=len(plan.items),
+        finalized=False,
+    )
+    require_work_item_plan_size(source)
+
+
+def serialized_work_item_plan(plan: WorkItemPlan) -> str:
+    source = work_item_plan_source(
+        plan,
+        position=plan.position,
+        finalized=plan.finalized,
+    )
+    require_work_item_plan_size(source)
+    encoded = base64.urlsafe_b64encode(source.encode()).decode()
+    return f"<!-- {WORK_ITEM_PLAN_MARKER}{encoded} -->"
+
+
+def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
+    prefix = f"<!-- {WORK_ITEM_PLAN_MARKER}"
+    markers = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith(prefix)
+    ]
+    if not markers:
+        raise WorkerFailure("Base PR is missing work-item plan recovery state")
+    if len(markers) != 1 or not markers[0].endswith(" -->"):
+        raise WorkerFailure("Base PR has ambiguous work-item plan recovery state")
+    encoded = markers[0][len(prefix) : -len(" -->")]
+    try:
+        source = base64.b64decode(encoded, altchars=b"-_", validate=True).decode()
+        payload = json.loads(source)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkerFailure("Base PR work-item plan recovery state is invalid") from exc
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if source != canonical or len(source.encode()) > MAX_PLAN_STATE_CHARS:
+        raise WorkerFailure("Base PR work-item plan recovery state is not canonical")
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "seed_sha256",
+        "items",
+        "position",
+        "finalized",
+    }:
+        raise WorkerFailure("Base PR work-item plan recovery state has invalid fields")
+    if payload["version"] != 1 or payload["seed_sha256"] != plan_seed_fingerprint(
+        config
+    ):
+        raise WorkerFailure("Base PR work-item plan does not match the workflow seed")
+    items = payload["items"]
+    position = payload["position"]
+    finalized = payload["finalized"]
+    if (
+        not isinstance(items, list)
+        or isinstance(position, bool)
+        or not isinstance(position, int)
+        or not 0 <= position <= len(items)
+        or not isinstance(finalized, bool)
+    ):
+        raise WorkerFailure("Base PR work-item plan recovery values are invalid")
+    plan = WorkItemPlan(config)
+    try:
+        plan.items = [planner_added_issue(item) for item in items]
+        plan._validate(plan.items)
+    except ValueError as exc:
+        raise WorkerFailure(f"Base PR work-item plan is invalid: {exc}") from exc
+    plan.position = position
+    plan.finalized = finalized
+    if finalized and position != len(plan.items):
+        raise WorkerFailure("Base PR work-item plan completion state is inconsistent")
+    return plan
+
+
+def with_work_item_plan(body: str, plan: WorkItemPlan) -> str:
+    marker = serialized_work_item_plan(plan)
+    prefix = f"<!-- {WORK_ITEM_PLAN_MARKER}"
+    lines = body.splitlines()
+    indexes = [
+        index for index, line in enumerate(lines) if line.strip().startswith(prefix)
+    ]
+    if len(indexes) > 1:
+        raise WorkerFailure("Base PR has ambiguous work-item plan recovery state")
+    if indexes:
+        lines[indexes[0]] = marker
+        return "\n".join(lines)
+    return f"{body.rstrip()}\n\n{marker}" if body.strip() else marker
+
+
+def prepare_work_item_plan_pr(
+    config: Config,
+    repo: GitRepository,
+    github: GitHubRepository,
+) -> tuple[PullRequestState, WorkItemPlan]:
+    integration = repo.synchronize_branch(config.integration_branch)
+    final = repo.inspect_branch(config.main_branch)
+    if integration.remote_sha is None or final.remote_sha is None:
+        raise WorkerFailure("integration or final remote branch is missing")
+    pr = inspect_pr(github, head=config.integration_branch, base=config.main_branch)
+    merged = github.find_pr(
+        head=config.integration_branch, base=config.main_branch, state="MERGED"
+    )
+    if merged is not None:
+        if pr is not None:
+            raise WorkerFailure("merged final delivery also has an open same-head PR")
+        merged = github.require_pr(
+            number=merged.number,
+            head=config.integration_branch,
+            base=config.main_branch,
+            state="MERGED",
+            expected_head_sha=integration.remote_sha,
+        )
+        if f"<!-- {WORK_ITEM_PLAN_MARKER}" in merged.body:
+            plan = work_item_plan_from_body(merged.body, config)
+        else:
+            # A merged Base PR from before durable dynamic plans authoritatively
+            # completed the immutable seed; it cannot contain dynamic decisions.
+            plan = WorkItemPlan(config)
+            plan.position = len(plan.items)
+            plan.finalized = True
+        if not plan.finalized:
+            raise WorkerFailure("merged final PR has an unfinished work-item plan")
+        return merged, plan
+    if pr is None:
+        initial_plan = WorkItemPlan(config)
+        pr = github.create_draft_pr(
+            head=config.integration_branch,
+            base=config.main_branch,
+            expected_head_sha=integration.remote_sha,
+            expected_base_sha=final.remote_sha,
+            title=f"Integrate {config.integration_branch}",
+            body=with_work_item_plan(
+                "Sequential integration; Ready only after whole-version checks."
+                f"{policy_pr_notes(config)}",
+                initial_plan,
+            ),
+            correlation_id=run_correlation("integration-pr"),
+        )
+        plan = initial_plan
+    else:
+        plan = work_item_plan_from_body(pr.body, config)
+        pr = return_to_draft_for_review(
+            github,
+            pr,
+            head=config.integration_branch,
+            base=config.main_branch,
+        )
+    pr = github.require_pr(
+        number=pr.number,
+        head=config.integration_branch,
+        base=config.main_branch,
+        state="OPEN",
+        expected_head_sha=integration.remote_sha,
+        expected_base_sha=final.remote_sha,
+        draft=True,
+    )
+    emit_run_pr(pr.number, pr.url)
+    return pr, plan
+
+
+def persist_work_item_plan(
+    plan: WorkItemPlan,
+    config: Config,
+    repo: GitRepository,
+    github: GitHubRepository,
+    pr: PullRequestState,
+) -> PullRequestState:
+    if pr.state == "MERGED":
+        if with_work_item_plan(pr.body, plan) != pr.body:
+            raise WorkerFailure("cannot change work-item plan after final PR merge")
+        return pr
+    integration = repo.synchronize_branch(config.integration_branch)
+    final = repo.inspect_branch(config.main_branch)
+    if integration.remote_sha is None or final.remote_sha is None:
+        raise WorkerFailure("integration or final remote branch is missing")
+    current = github.require_pr(
+        number=pr.number,
+        head=config.integration_branch,
+        base=config.main_branch,
+        state="OPEN",
+        expected_head_sha=integration.remote_sha,
+        expected_base_sha=final.remote_sha,
+        draft=True,
+    )
+    body = with_work_item_plan(current.body, plan)
+    if body == current.body:
+        return current
+    return github.update_pr_body(
+        current.number,
+        body=body,
+        expected_head=config.integration_branch,
+        expected_head_sha=current.head_sha,
+        expected_base=config.main_branch,
+        expected_base_sha=current.base_sha,
+    )
+
+
+def process_work_items(
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+    plan_pr: PullRequestState,
+    plan: WorkItemPlan,
+) -> tuple[Issue, ...]:
+    for recovered_issue in plan.items[: plan.position]:
+        run_outline_step(
+            recovered_issue.label,
+            lambda issue=recovered_issue: process_issue(
+                issue, config, client, repo, github
+            ),
+        )
+    if plan.finalized:
+        return plan.snapshot
+    planner = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name="Work-item planner",
+    )
+    for planner_turn in range(1, MAX_PLANNER_TURNS + 1):
+        decision = run_turn(
+            client,
+            planner,
+            "Work-item planning",
+            policy_context(config, scope="work-item planning")
+            + planner_prompt(plan, config),
+            iteration=planner_turn,
+        )
+        complete = apply_planner_decision(plan, decision)
+        plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
+        if complete:
+            return plan.snapshot
+        issue = plan.take_next()
+        assert issue is not None
+        plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
+        run_outline_step(
+            issue.label,
+            lambda issue=issue: process_issue(issue, config, client, repo, github),
+        )
+    raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
+
+
 def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
     shell = client.start_shell(
         ShellCommandRequest(config.check_command, str(config.repo), "Final checks")
@@ -1720,6 +2231,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
 
 def integration_delivery(
     config: Config,
+    work_items: tuple[Issue, ...],
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
@@ -1891,7 +2403,7 @@ def integration_delivery(
                 expected_base_sha=delivery.base_sha,
             )
         delivered = update_base_pr_human_handoff(
-            config, client, github, delivered, delivery
+            config, work_items, client, github, delivered, delivery
         )
         if delivery.outcome == "continued_with_warning":
             return delivered
@@ -1926,12 +2438,12 @@ def main() -> None:
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
-    for issue in config.issues:
-        run_outline_step(
-            f"{issue.label}",
-            lambda issue=issue: process_issue(issue, config, client, repo, github),
-        )
-    ready = integration_delivery(config, client, repo, github)
+    plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
+    work_items = run_outline_step(
+        "Work items",
+        lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+    )
+    ready = integration_delivery(config, work_items, client, repo, github)
     if ready.state == "MERGED":
         outcome = "Merged"
     elif ready.is_draft:
