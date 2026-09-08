@@ -49,6 +49,12 @@ COMMAND_TIMEOUT = 30
 MERGE_TO_INTEGRATION = True
 FINAL_REVIEW = True
 MERGE_FINAL = False
+IMPLEMENTATION_PRINCIPLE = (
+    "Reuse the existing implementation where appropriate and keep the change scope "
+    "to the minimum required for this Issue. Do not achieve a minimal diff or "
+    "reduced code size by mixing responsibilities unnaturally or by "
+    "over-generalizing distinct behavior into shared abstractions."
+)
 
 
 @dataclass(frozen=True)
@@ -191,6 +197,11 @@ def run_turn(
     return result
 
 
+def implementer_prompt(prompt: str) -> str:
+    """Add the shared change-boundary policy to an implementation turn."""
+    return f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}"
+
+
 def run_outline_step(name: str, action):
     """Run one concrete outline unit while retaining detailed nested progress."""
     emit_step(name, "started")
@@ -256,7 +267,7 @@ def require_clean_worktree(
         client,
         tab,
         "Clean worktree",
-        f"""Your only task is to make the current repository state clean and
+        implementer_prompt(f"""Your only task is to make the current repository state clean and
 correct before {context}. The worktree is on {branch!r}. Inspect Git status and
 every existing diff first. Preserve and commit all intended source, test, and
 configuration changes. Add only narrow, appropriate .gitignore entries for
@@ -267,7 +278,7 @@ Do not push, modify PR state, merge, start a review, reset, stash, rebase,
 force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
-ignored, removed, or could not resolve.""",
+ignored, removed, or could not resolve."""),
         iteration=iteration,
     )
     remaining = repo.inspect_worktree()
@@ -309,7 +320,7 @@ def require_agent_result(
 
 
 def issue_prompts(issue: Issue, config: Config) -> tuple[str, str]:
-    implementation = f"""Implement Issue #{issue.number} in {config.slug} on the
+    implementation = implementer_prompt(f"""Implement Issue #{issue.number} in {config.slug} on the
 existing branch {issue.branch}, based on {config.integration_branch}. Read the
 Issue with gh. Inspect existing Git and GitHub state before editing because this
 may be a new recovery run. Implement only the requested Issue and run appropriate
@@ -321,7 +332,7 @@ change, leaving none uncommitted or untracked. Push the exact feature branch
 Never reset, rebase, stash, force-push, merge the Issue PR, target
 {config.main_branch}, create unrelated PRs, or discard ambiguous local work.
 Return a concise summary including the commit SHA and PR number or URL when
-available."""
+available.""")
     review = f"""Independently review Issue #{issue.number} and its PR from
 {issue.branch} to {config.integration_branch}. Do not mutate files or PR state.
 Return APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
@@ -605,9 +616,9 @@ def process_issue(
             client,
             implementer,
             f"Issue #{issue.number} fixes",
-            f"""Re-evaluate every finding below. If warranted, fix, test, commit,
+            implementer_prompt(f"""Re-evaluate every finding below. If warranted, fix, test, commit,
 and leave the worktree clean. If no change is warranted, leave it clean and
-            explain why; do not create an empty commit.\n\n{result}""",
+            explain why; do not create an empty commit.\n\n{result}"""),
             iteration=review_number,
             pr=pr,
         )
@@ -760,8 +771,8 @@ def review_whole_version(
                 client,
                 fixer,
                 "Whole-version fixes",
-                f"""Re-evaluate every finding. If warranted, fix, test, commit,
-and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                implementer_prompt(f"""Re-evaluate every finding. If warranted, fix, test, commit,
+and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}"""),
                 iteration=review_number,
             )
             fixed_sha, changed = require_agent_result(
