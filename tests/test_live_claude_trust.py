@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -78,3 +82,64 @@ def test_fresh_and_already_trusted_worktree_launch_without_interaction(
         if workspace is not None:
             runtime.delete_workspace(workspace.id, expected_state=workspace)
         _git("worktree", "remove", str(worktree), cwd=source)
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    not RUN_LIVE,
+    reason="set AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1",
+)
+def test_real_claude_writer_and_awm_share_the_state_lock(tmp_path: Path) -> None:
+    claude = shutil.which("claude")
+    if claude is None:
+        pytest.skip("claude executable is unavailable")
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    state_path = config / ".config.json"
+    state_path.write_text(
+        '{"projects":{},"preservedSentinel":true}\n', encoding="utf-8"
+    )
+    lock_path = config / ".config.json.lock"
+    lock_path.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    environment = dict(os.environ)
+    environment["HOME"] = str(home)
+    environment["CLAUDE_CONFIG_DIR"] = str(config)
+    helper_program = (
+        "from purplemux_client.claude_trust import ensure_claude_project_trust; "
+        "import sys; ensure_claude_project_trust(sys.argv[1])"
+    )
+    doctor = subprocess.Popen(
+        [claude, "doctor"],
+        cwd=project,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    helper = subprocess.Popen(
+        [sys.executable, "-c", helper_program, str(project)],
+        cwd=project,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.2)
+        assert doctor.poll() is None
+        assert helper.poll() is None
+    finally:
+        lock_path.rmdir()
+    doctor_stdout, doctor_stderr = doctor.communicate(timeout=20)
+    helper_stdout, helper_stderr = helper.communicate(timeout=20)
+
+    assert (doctor.returncode, doctor_stderr) == (0, "")
+    assert "Claude Code doctor" in doctor_stdout
+    assert (helper.returncode, helper_stdout, helper_stderr) == (0, "", "")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["preservedSentinel"] is True
+    assert state["projects"][str(project)]["hasTrustDialogAccepted"] is True

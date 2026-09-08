@@ -310,9 +310,10 @@ and does not trust a parent, secondary, or unrelated path.
 
 Before creating a Claude tab, the adapter applies the same exact launch-directory
 check, then uses Claude Code's supported project-state contract to set only
-`projects[canonical_path].hasTrustDialogAccepted`. The state update respects
-`CLAUDE_CONFIG_DIR`, preserves all other Claude and project values, is serialized
-across concurrent AWM processes, and is read back before launch. Claude's home
+`projects[canonical_path].hasTrustDialogAccepted`. The state update follows
+Claude's `.config.json`/`.claude.json` resolver, requires an absolute
+`CLAUDE_CONFIG_DIR`, preserves all other Claude and project values, coordinates
+on Claude's own state-file lock, and is read back before launch. Claude's home
 directory is rejected because Claude only permits session-scoped trust there.
 AWM does not alter permission mode, sandbox behavior, onboarding state, parent
 directories, or unrelated projects, and does not inspect prompt text or automate

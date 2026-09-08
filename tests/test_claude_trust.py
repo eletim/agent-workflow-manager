@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,50 @@ def test_default_state_file_is_in_home(
 
     state = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
     assert state["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
+
+
+def test_config_json_takes_precedence_in_custom_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    current_state = config / ".config.json"
+    legacy_state = config / ".claude.json"
+    current_state.write_text('{"projects":{},"current":true}\n', encoding="utf-8")
+    legacy_state.write_text('{"projects":{},"legacy":true}\n', encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+    ensure_claude_project_trust(str(project))
+
+    current = json.loads(current_state.read_text(encoding="utf-8"))
+    assert current["projects"] == {str(project): {"hasTrustDialogAccepted": True}}
+    assert current["current"] is True
+    assert json.loads(legacy_state.read_text(encoding="utf-8")) == {
+        "projects": {},
+        "legacy": True,
+    }
+
+
+def test_relative_config_directory_fails_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative-config")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(WorkerFailure, match="must be an absolute path"):
+        ensure_claude_project_trust(str(project))
+
+    assert not (tmp_path / "relative-config").exists()
 
 
 def test_home_directory_fails_before_changing_state(
@@ -136,3 +181,46 @@ def test_concurrent_processes_preserve_both_project_entries(
     assert state["projects"] == {
         str(project): {"hasTrustDialogAccepted": True} for project in projects
     }
+
+
+def test_waits_for_claude_state_lock_and_preserves_external_update(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    state_path = config / ".config.json"
+    state_path.write_text('{"projects":{}}\n', encoding="utf-8")
+    lock_path = config / ".config.json.lock"
+    lock_path.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    environment = dict(os.environ)
+    environment["HOME"] = str(home)
+    environment["CLAUDE_CONFIG_DIR"] = str(config)
+    program = (
+        "from purplemux_client.claude_trust import ensure_claude_project_trust; "
+        "import sys; ensure_claude_project_trust(sys.argv[1])"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", program, str(project)],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.1)
+        assert process.poll() is None
+        state_path.write_text(
+            '{"projects":{},"externalClaudeUpdate":true}\n', encoding="utf-8"
+        )
+    finally:
+        lock_path.rmdir()
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert (process.returncode, stdout, stderr) == (0, "", "")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["externalClaudeUpdate"] is True
+    assert state["projects"] == {str(project): {"hasTrustDialogAccepted": True}}

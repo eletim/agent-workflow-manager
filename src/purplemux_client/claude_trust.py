@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import stat
@@ -86,7 +85,13 @@ def _claude_state_path(home: Path) -> Path:
         return home / ".claude.json"
     if not configured.strip() or "\0" in configured:
         raise WorkerFailure("CLAUDE_CONFIG_DIR is not a valid directory")
-    return Path(configured).expanduser().absolute() / ".claude.json"
+    config_directory = Path(configured)
+    if not config_directory.is_absolute():
+        raise WorkerFailure("CLAUDE_CONFIG_DIR must be an absolute path")
+    current_state = config_directory / ".config.json"
+    if current_state.exists():
+        return current_state
+    return config_directory / ".claude.json"
 
 
 def _read_state(path: Path) -> tuple[dict[str, Any], int]:
@@ -150,41 +155,53 @@ def _write_state(path: Path, state: Mapping[str, Any], mode: int) -> None:
 
 @contextmanager
 def _trust_mutation_lock(path: Path, deadline: float) -> Iterator[None]:
-    descriptor: int | None = None
+    lock_path = Path(f"{path}.lock")
+    identity: tuple[int, int] | None = None
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_path = path.parent / ".agent-workflow-manager-claude-trust.lock"
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(lock_path, flags, 0o600)
-        details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
-            os.close(descriptor)
-            descriptor = None
-            raise WorkerFailure("Claude project trust lock is not a safe user file")
-        os.fchmod(descriptor, 0o600)
-    except WorkerFailure:
-        raise
-    except OSError as exc:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise WorkerFailure(f"could not open Claude project trust lock: {exc}") from exc
-
-    assert descriptor is not None
-    try:
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_path.mkdir(mode=0o700)
+                details = lock_path.stat(follow_symlinks=False)
+                identity = (details.st_dev, details.st_ino)
                 break
-            except BlockingIOError:
+            except FileExistsError:
+                try:
+                    details = lock_path.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+                    raise WorkerFailure(
+                        "Claude project trust lock is not a safe user directory"
+                    )
                 if time.monotonic() >= deadline:
                     raise WorkerFailure(
                         "Claude project trust configuration timed out waiting for lock"
                     )
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    except WorkerFailure:
+        raise
+    except OSError as exc:
+        raise WorkerFailure(f"could not open Claude project trust lock: {exc}") from exc
+
+    assert identity is not None
+    try:
         yield
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+            details = lock_path.stat(follow_symlinks=False)
+            if (details.st_dev, details.st_ino) != identity:
+                raise WorkerFailure(
+                    "Claude project trust lock changed before it could be released"
+                )
+            lock_path.rmdir()
+        except FileNotFoundError as exc:
+            raise WorkerFailure(
+                "Claude project trust lock disappeared before it could be released"
+            ) from exc
+        except WorkerFailure:
+            raise
+        except OSError as exc:
+            raise WorkerFailure(
+                f"could not release Claude project trust lock: {exc}"
+            ) from exc
