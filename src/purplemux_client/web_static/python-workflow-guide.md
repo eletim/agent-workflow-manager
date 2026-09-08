@@ -20,7 +20,8 @@ never merged into `main` automatically.
 
 Issue Driven mode is a deterministic authoring aid in front of this same contract.
 It validates a deliberately small JSON object (repository, integration/final
-branches, ordered Issue numbers, bounded review count, and merge/review policies),
+branches, ordered GitHub Issues and/or inline mini tasks, bounded review count,
+and merge/review policies),
 then displays a complete generated plain-Python workflow. Static Validation, Dry
 Run, and Run operate on that generated Python through the existing Runner path.
 The JSON is never interpreted as runtime control flow, and it has no generic
@@ -92,7 +93,7 @@ REPO = context.execution_root
 ```
 
 Generated Issue Driven workflows also call `inspect_issue_driven_topology` with
-literal repository, integration branch, and Issue declarations. Static
+literal repository, integration branch, and work-item branch declarations. Static
 Validation evaluates that read-only declaration, and Dry Run repeats it to emit
 recoverable or already-integrated findings before the worktree mutation frontier.
 

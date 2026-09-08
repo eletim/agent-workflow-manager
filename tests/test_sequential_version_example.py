@@ -258,13 +258,13 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
 
     # Initial implementation, cleanup/remediation, phase fixes, and whole-version
     # fixes are the four prompt-producing implementer paths.
-    assert isinstance(prompts["Issue # implementation"], ast.Name)
-    for label in ("Clean worktree", "Issue #  fixes", "Whole-version fixes"):
+    assert isinstance(prompts[" implementation"], ast.Name)
+    for label in ("Clean worktree", "  fixes", "Whole-version fixes"):
         prompt = prompts[label]
         assert isinstance(prompt, ast.Call)
         assert isinstance(prompt.func, ast.Name)
         assert prompt.func.id == "implementer_prompt"
-    for label in ("Issue #  review", "Whole-version reviewer turn"):
+    for label in ("  review", "Whole-version reviewer turn"):
         prompt = prompts[label]
         assert not (
             isinstance(prompt, ast.Call)
@@ -1938,7 +1938,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     )
     warning = (
         "Policy Issue #200 conflicts with the integrated version: ownership "
-        "differs; continuing with the implementation Issue as the primary requirement."
+        "differs; continuing with the implementation work item as the primary requirement."
     )
     marker = workflow["encoded_policy_conflict_marker"](warning)
     merged = replace(merged_final_pr("new-head"), body=f"Base PR.\n\n{marker}")

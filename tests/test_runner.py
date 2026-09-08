@@ -1471,6 +1471,7 @@ emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
 emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40")
 emit_finding("github", "review limit reached", status="warning")
 emit_issue_result(11, "continued_with_warning", 5, 41, "https://github.com/acme/project/pull/41", warnings=("review limit reached",))
+emit_issue_result("mini-task:refresh-help", "approved", 2, 42, "https://github.com/acme/project/pull/42", label="Mini task refresh-help")
 emit_whole_review_result("skipped", 0)
 emit_run_pr(50, "https://github.com/acme/project/pull/50")
 for number in range(3):
@@ -1513,6 +1514,17 @@ for number in range(3):
                     "url": "https://github.com/acme/project/pull/41",
                 },
                 "warnings": ["review limit reached"],
+            },
+            {
+                "issue": "mini-task:refresh-help",
+                "label": "Mini task refresh-help",
+                "outcome": "approved",
+                "reviews": 2,
+                "pr": {
+                    "number": 42,
+                    "url": "https://github.com/acme/project/pull/42",
+                },
+                "warnings": [],
             },
         ],
         "wholeReview": {"outcome": "skipped", "reviews": 0, "warnings": []},
