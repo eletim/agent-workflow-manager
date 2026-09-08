@@ -1981,6 +1981,161 @@ test("New run restores the retained draft unchanged after switching between runs
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
 });
 
+test("New run inherits only the selected Prompt run's working directory", async () => {
+  const promptA = {agent: "claude-code", cwd: "/work/prompt-a", prompt: "Old prompt"};
+  const runA = snapshot({
+    runId: 1,
+    state: "failed",
+    stdout: "old output",
+    mode: "prompt",
+    prompt: promptA,
+    integrationPr: {number: 151, url: "https://example.invalid/151"},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", cwd: promptA.cwd, mode: "prompt", prompt: promptA}],
+    details: {1: runA},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+  assert.equal(elements["prompt-agent"].value, "codex");
+  assert.equal(elements["prompt-text"].value, "");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements["integration-pr-panel"].hidden, true);
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("each New run inherits the folder from the most recently selected Prompt run", async () => {
+  const promptA = {agent: "codex", cwd: "/work/prompt-a", prompt: "A"};
+  const promptB = {agent: "codex", cwd: "/work/prompt-b", prompt: "B"};
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: promptA.cwd, mode: "prompt", prompt: promptA},
+      {runId: 2, state: "success", cwd: promptB.cwd, mode: "prompt", prompt: promptB},
+    ],
+    details: {
+      1: snapshot({runId: 1, state: "success", stdout: "A", mode: "prompt", prompt: promptA}),
+      2: snapshot({runId: 2, state: "success", stdout: "B", mode: "prompt", prompt: promptB}),
+    },
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+
+  await runItem(elements, 2).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-b");
+});
+
+test("New run waits for a newly selected Prompt run's authoritative folder", async () => {
+  const delayedRunB = deferred();
+  let delayRunB = false;
+  const promptA = {agent: "codex", cwd: "/work/prompt-a", prompt: "A"};
+  const promptB = {agent: "codex", cwd: "/work/prompt-b", prompt: "B"};
+  const runA = snapshot({
+    runId: 1, state: "success", stdout: "A", mode: "prompt", prompt: promptA,
+  });
+  const runB = snapshot({
+    runId: 2, state: "success", stdout: "B", mode: "prompt", prompt: promptB,
+  });
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: promptA.cwd, mode: "prompt", prompt: promptA},
+      {runId: 2, state: "success", cwd: promptB.cwd, mode: "prompt", prompt: promptB},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunB && url === "/api/runs/2") return delayedRunB.promise;
+      return undefined;
+    },
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+
+  delayRunB = true;
+  const selectRunB = runItem(elements, 2).dispatch("click");
+  const enterNewRun = elements["new-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  delayedRunB.resolve(response(runB));
+  await Promise.all([selectRunB, enterNewRun]);
+
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-b");
+  assert.equal(elements["prompt-text"].value, "");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("New run keeps the existing Prompt draft folder when a run has none", async () => {
+  const prompt = {agent: "codex", cwd: "", prompt: "No folder"};
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", cwd: "", mode: "prompt", prompt}],
+    details: {1: snapshot({
+      runId: 1, state: "failed", stdout: "failed", cwd: "", mode: "prompt", prompt,
+    })},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+  elements["prompt-cwd"].value = "/work/fallback";
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["prompt-cwd"].value, "/work/fallback");
+});
+
+test("Issue Driven inherits a selected run's authoritative source repository only", async () => {
+  const sourceRepository = "/source/repository-b";
+  const run = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    executionContext: {
+      sourceRepository,
+      executionRoot: "/managed/run-b",
+      baseRef: "origin/dev/v0.2.5",
+      baseSha: "b".repeat(40),
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/runner", executionContext: run.executionContext}],
+    details: {1: run},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    mode: "issue-driven",
+    repository: "/source/old-repository",
+    integration_branch: "dev/v0.2.0",
+    final_branch: "main",
+    issues: [90, 89],
+    max_reviews: 5,
+    merge_to_integration: true,
+    final_review: true,
+    merge_final: false,
+  });
+  elements["issue-driven-python"].value = "# generated for old repository";
+  await runItem(elements, 1).dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  const inherited = JSON.parse(elements["issue-driven-json"].value);
+
+  assert.equal(inherited.repository, sourceRepository);
+  assert.equal(inherited.integration_branch, "dev/v0.2.0");
+  assert.deepEqual(inherited.issues, [90, 89]);
+  assert.equal(elements["issue-driven-python"].value, "");
+  assert.equal(elements.stdout.textContent, "");
+});
+
 test("New run immediately clears every run-owned surface without changing history", async () => {
   const executionContext = {
     executionRoot: "/managed/run-a",
@@ -2265,12 +2420,10 @@ test("a delayed run-detail response cannot repaint New run", async () => {
   delayRunOne = true;
   const staleSelection = runItem(elements, 1).dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
-  await elements["new-run"].dispatch("click");
-  assert.equal(elements.status.textContent, "not started");
-  assert.equal(elements.stdout.textContent, "");
+  const newRun = elements["new-run"].dispatch("click");
 
   delayedRun.resolve(response(runOne));
-  await staleSelection;
+  await Promise.all([staleSelection, newRun]);
 
   assert.equal(elements.status.textContent, "not started");
   assert.equal(elements.stdout.textContent, "");
