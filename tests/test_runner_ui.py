@@ -108,6 +108,16 @@ def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     assert "runs-toggle-hint" in INDEX.read_text(encoding="utf-8")
 
 
+def test_checked_run_deletion_is_available_inside_run_history() -> None:
+    ancestors = _ancestors("delete-checked-runs")
+
+    assert any(
+        tag == "details" and attributes.get("id") == "runs-panel"
+        for tag, attributes in ancestors
+    )
+    assert 'id="delete-checked-runs"' in INDEX.read_text(encoding="utf-8")
+
+
 def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
     styles = STYLES.read_text(encoding="utf-8")
 

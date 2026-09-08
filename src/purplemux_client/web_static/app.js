@@ -25,6 +25,7 @@ const directoryPickerSelect = document.querySelector("#directory-picker-select")
 const activeContext = document.querySelector("#active-context");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
+const deleteCheckedRunsButton = document.querySelector("#delete-checked-runs");
 const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
 const validateButton = document.querySelector("#validate");
@@ -129,6 +130,7 @@ let explicitNewRun = false;
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
+let deletableRunIds = [];
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
@@ -452,6 +454,13 @@ function renderRecovery(result) {
 function renderRunList(runs) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
+  deletableRunIds = runs.filter(
+    (run) => run.checked && ["success", "failed", "stopped"].includes(run.state),
+  ).map((run) => run.runId);
+  const checkedRunCount = deletableRunIds.length;
+  deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;
+  deleteCheckedRunsButton.disabled = checkedRunCount === 0;
+  deleteCheckedRunsButton.dataset.count = String(checkedRunCount);
   for (const run of [...runs].reverse()) {
     const button = document.createElement("button");
     button.type = "button";
@@ -511,6 +520,40 @@ async function updateChecked(runId, checked) {
     stderr.textContent = String(error);
   }
 }
+
+function showNewRunAfterHistoryDeletion() {
+  activeRunGeneration += 1;
+  activeRunId = null;
+  activeRunSnapshot = null;
+  explicitNewRun = true;
+  renderCleanDraftState();
+  showDraftLabel();
+  applyFieldMode();
+}
+
+deleteCheckedRunsButton.addEventListener("click", async () => {
+  const count = Number(deleteCheckedRunsButton.dataset.count || 0);
+  if (count < 1) return;
+  const confirmedRunIds = [...deletableRunIds];
+  const noun = count === 1 ? "run" : "runs";
+  if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
+
+  deleteCheckedRunsButton.disabled = true;
+  try {
+    const result = await request("/api/runs/delete-checked", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({runIds: confirmedRunIds}),
+    });
+    if (result.deletedRunIds.includes(activeRunId)) {
+      showNewRunAfterHistoryDeletion();
+    }
+    await refresh();
+  } catch (error) {
+    stderr.textContent = String(error);
+    await refresh();
+  }
+});
 
 function renderValidation(issues) {
   validation.replaceChildren();

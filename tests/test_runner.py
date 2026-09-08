@@ -163,6 +163,71 @@ def test_terminal_run_checked_metadata_is_reversible_and_run_scoped(
     assert unchecked.state == "success"
 
 
+def test_delete_checked_runs_removes_only_checked_terminal_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        checked_id = runner.start("print('checked')")
+        wait_for(runner, lambda item: item.state == "success", run_id=checked_id)
+        runner.set_checked(checked_id, True)
+
+        unchecked_id = runner.start("print('unchecked')")
+        wait_for(runner, lambda item: item.state == "success", run_id=unchecked_id)
+
+        active_id = runner.start("import time; time.sleep(60)")
+        with runner._lock:
+            # Exercise the backend's final state check even for inconsistent
+            # metadata that cannot be produced through the public API.
+            runner._runs[active_id].checked = True
+
+        def unexpected_cleanup(_run_id: int) -> None:
+            raise AssertionError("history deletion must not clean run resources")
+
+        monkeypatch.setattr(runner, "cleanup", unexpected_cleanup)
+        with pytest.raises(
+            runner_module.RunDeletionNotAllowedError, match="refresh and confirm"
+        ):
+            runner.delete_checked_runs((checked_id, unchecked_id))
+        assert runner.snapshot(checked_id).checked is True
+        assert runner.delete_checked_runs((checked_id,)) == (checked_id,)
+        assert [item.run_id for item in runner.snapshots()] == [unchecked_id, active_id]
+        assert runner.snapshot(unchecked_id).checked is False
+        assert runner.snapshot(active_id).state == "running"
+        assert checked_id not in {
+            run["runId"]
+            for run in json.loads(history_file.read_text(encoding="utf-8"))[
+                "runs"
+            ].values()
+        }
+        with runner._lock:
+            runner._runs[active_id].checked = False
+    finally:
+        runner.close()
+
+
+def test_delete_checked_runs_rolls_back_when_history_cannot_be_saved(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start("print('keep me')")
+    wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    runner.set_checked(run_id, True)
+
+    def fail_write() -> None:
+        raise runner_module.RunHistoryError("save failed")
+
+    monkeypatch.setattr(runner, "_write_run_history_locked", fail_write)
+    with pytest.raises(runner_module.RunHistoryError, match="save failed"):
+        runner.delete_checked_runs((run_id,))
+
+    assert runner.snapshot(run_id).checked is True
+
+
 def test_checked_terminal_run_is_restored_after_runner_reconstruction(
     tmp_path: Path,
 ) -> None:
@@ -2039,6 +2104,58 @@ def test_run_api_updates_checked_metadata_only_for_terminal_run(
     assert status == 200
     assert unchecked["checked"] is False
     assert unchecked["state"] == "success"
+
+
+def test_run_api_deletes_only_checked_terminal_history(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    run_ids = []
+    for source in ("print('checked')", "print('unchecked')"):
+        status, started = request(
+            address, "POST", "/api/run", json.dumps({"code": source}), token=token
+        )
+        assert status == 202
+        run_id = int(started["runId"])
+        run_ids.append(run_id)
+        deadline = time.monotonic() + 5
+        while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+
+    status, _ = request(
+        address,
+        "POST",
+        f"/api/runs/{run_ids[0]}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 200
+
+    status, changed = request(
+        address,
+        "POST",
+        "/api/runs/delete-checked",
+        json.dumps({"runIds": run_ids}),
+        token=token,
+    )
+    assert status == 409
+    assert "refresh and confirm" in str(changed["error"])
+    assert request(address, "GET", f"/api/runs/{run_ids[0]}")[0] == 200
+
+    deletion_body = json.dumps({"runIds": [run_ids[0]]})
+    assert request(address, "POST", "/api/runs/delete-checked", deletion_body)[0] == 403
+    status, deleted = request(
+        address,
+        "POST",
+        "/api/runs/delete-checked",
+        deletion_body,
+        token=token,
+    )
+    assert status == 200
+    assert deleted == {"deletedCount": 1, "deletedRunIds": [run_ids[0]]}
+    assert request(address, "GET", f"/api/runs/{run_ids[0]}")[0] == 404
+    assert request(address, "GET", f"/api/runs/{run_ids[1]}")[0] == 200
 
 
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(

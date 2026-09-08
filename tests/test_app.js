@@ -198,6 +198,7 @@ async function loadApp({
   validation,
   fetchOverride = null,
   clipboardOverride = null,
+  confirmOverride = null,
 }) {
   const ids = [
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
@@ -207,7 +208,7 @@ async function loadApp({
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
-    "active-context", "run-list",
+    "active-context", "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
@@ -311,6 +312,7 @@ async function loadApp({
     clearTimeout,
     window: {
       clearTimeout,
+      confirm: confirmOverride || (() => true),
       EventSource: FakeEventSource,
       setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
@@ -413,6 +415,73 @@ test("terminal run checked state toggles from detail and list without leaking", 
   assert.deepEqual(updates, [[1, true], [1, false]]);
   assert.equal(elements["checked-toggle"].textContent, "Mark checked");
   assert.equal(details[2].checked, false);
+});
+
+test("checked run deletion shows the eligible count and clears deleted detail", async () => {
+  const runs = [
+    {runId: 1, state: "success", cwd: "/work/one", checked: true},
+    {runId: 2, state: "success", cwd: "/work/two", checked: false},
+    {runId: 3, state: "failed", cwd: "/work/three", checked: true},
+  ];
+  const details = Object.fromEntries(runs.map((run) => [
+    run.runId,
+    snapshot({...run, stdout: `output-${run.runId}`}),
+  ]));
+  const confirmations = [];
+  const {calls, elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    confirmOverride(message) {
+      confirmations.push(message);
+      return true;
+    },
+    fetchOverride(url, options) {
+      if (url !== "/api/runs/delete-checked") return undefined;
+      assert.equal(options.method, "POST");
+      assert.deepEqual(JSON.parse(options.body), {runIds: [1, 3]});
+      const deletedRunIds = runs
+        .filter((run) => run.checked && ["success", "failed", "stopped"].includes(run.state))
+        .map((run) => run.runId);
+      for (let index = runs.length - 1; index >= 0; index -= 1) {
+        if (deletedRunIds.includes(runs[index].runId)) runs.splice(index, 1);
+      }
+      return response({deletedCount: deletedRunIds.length, deletedRunIds});
+    },
+  });
+
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
+  assert.equal(elements["delete-checked-runs"].disabled, false);
+  assert.match(selectedRun(elements).textContent, /#3/);
+  await elements["delete-checked-runs"].dispatch("click");
+
+  assert.deepEqual(confirmations, ["Delete 2 checked runs from local history?"]);
+  assert.ok(calls.some(
+    ([url, method]) => url === "/api/runs/delete-checked" && method === "POST",
+  ));
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
+  assert.equal(elements["delete-checked-runs"].disabled, true);
+  assert.equal(
+    elements["run-list"].children.filter((item) => item.dataset.runId).length,
+    1,
+  );
+  assert.match(elements["active-context"].textContent, /New Python Workflow run/);
+  assert.equal(elements.stdout.textContent, "");
+});
+
+test("checked run deletion stops when confirmation is cancelled", async () => {
+  const run = {runId: 1, state: "success", cwd: "/work/one", checked: true};
+  const {calls, elements} = await loadApp({
+    runs: [run],
+    details: {1: snapshot({...run, stdout: "done"})},
+    validation: {status: 200, body: {validation: []}},
+    confirmOverride: () => false,
+  });
+
+  await elements["delete-checked-runs"].dispatch("click");
+
+  assert.equal(calls.some(([url]) => url === "/api/runs/delete-checked"), false);
+  assert.match(selectedRun(elements).textContent, /#1/);
 });
 
 test("Settings opens Notifications repeatedly without losing form state", async () => {
