@@ -210,6 +210,22 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "MAX_REVIEWS = 5" in first
 
 
+@pytest.mark.parametrize("final_review", [False, True])
+def test_generated_workflow_always_preserves_implementation_principle(
+    final_review: bool,
+) -> None:
+    config = parse(payload(final_review=final_review))
+
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+
+    assert first == second
+    assert "Reuse the existing implementation where appropriate" in first
+    assert "minimum required for this Issue" in first
+    assert "mixing responsibilities unnaturally" in first
+    assert "over-generalizing distinct behavior" in first
+
+
 @pytest.mark.parametrize(
     ("implementer", "reviewer"),
     [

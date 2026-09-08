@@ -147,6 +147,66 @@ def test_issue_and_whole_version_reviews_share_decision_parser() -> None:
     assert source.count("decision(result)") == 2
 
 
+def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    principle = workflow["IMPLEMENTATION_PRINCIPLE"]
+    issue_type = workflow["Issue"]
+    config_type = workflow["Config"]
+    config = config_type(
+        Path("/tmp/project"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(149, "feature/issue-149"),),
+        "git diff --check",
+    )
+
+    implementation, review = workflow["issue_prompts"](config.issues[0], config)
+
+    assert principle in implementation
+    assert principle not in review
+    assert "Reuse the existing implementation where appropriate" in principle
+    assert "minimum required for this Issue" in principle
+    assert "mixing responsibilities unnaturally" in principle
+    assert "over-generalizing distinct behavior" in principle
+
+
+def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
+    tree = ast.parse(EXAMPLE.read_text(encoding="utf-8"))
+    prompts: dict[str, ast.expr] = {}
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != "run_turn":
+            continue
+        name = call.args[2]
+        if isinstance(name, ast.Constant):
+            label = str(name.value)
+        elif isinstance(name, ast.JoinedStr):
+            label = "".join(
+                str(value.value)
+                for value in name.values
+                if isinstance(value, ast.Constant)
+            )
+        else:
+            continue
+        prompts[label] = call.args[3]
+
+    # Initial implementation, cleanup/remediation, Issue fixes, and whole-version
+    # fixes are the four prompt-producing implementer paths.
+    assert isinstance(prompts["Issue # implementation"], ast.Name)
+    for label in ("Clean worktree", "Issue # fixes", "Whole-version fixes"):
+        prompt = prompts[label]
+        assert isinstance(prompt, ast.Call)
+        assert isinstance(prompt.func, ast.Name)
+        assert prompt.func.id == "implementer_prompt"
+    for label in ("Issue # review", "Whole-version reviewer turn"):
+        prompt = prompts[label]
+        assert not (
+            isinstance(prompt, ast.Call)
+            and isinstance(prompt.func, ast.Name)
+            and prompt.func.id == "implementer_prompt"
+        )
+
+
 def test_clean_worktree_does_not_invoke_cleanup_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
