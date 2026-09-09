@@ -96,6 +96,16 @@ def test_notifications_are_reached_from_the_header_settings_dialog() -> None:
     assert 'rel="noopener noreferrer"' in html
 
 
+def test_prompt_repository_navigation_is_read_only_and_safe() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+
+    assert 'id="repository-navigation"' in html
+    assert 'id="repository-slug"' in html
+    assert 'id="repository-link"' in html
+    assert "Open GitHub Repository" in html
+    assert 'target="_blank" rel="noopener noreferrer"' in html
+
+
 def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     ancestors = _ancestors("run-list")
 
@@ -106,6 +116,16 @@ def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
         for tag, attributes in ancestors
     )
     assert "runs-toggle-hint" in INDEX.read_text(encoding="utf-8")
+
+
+def test_checked_run_deletion_is_available_inside_run_history() -> None:
+    ancestors = _ancestors("delete-checked-runs")
+
+    assert any(
+        tag == "details" and attributes.get("id") == "runs-panel"
+        for tag, attributes in ancestors
+    )
+    assert 'id="delete-checked-runs"' in INDEX.read_text(encoding="utf-8")
 
 
 def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:

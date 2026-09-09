@@ -115,7 +115,7 @@ class RuntimeRunner:
                 "workspaceId": "ws-test",
                 "name": name,
                 "panelType": panel_type,
-                "agentProviderId": "codex" if panel_type == "codex-cli" else None,
+                "agentProviderId": ("codex" if panel_type == "codex-cli" else "claude"),
             }
             self.tabs[state_id] = state
             if self.mode == "duplicate-after-apply":
@@ -172,6 +172,7 @@ def topology_client(runner: RuntimeRunner) -> PurpleMuxCLIClient:
         "ws-test",
         runner=runner,
         codex_project_truster=lambda path: path,
+        claude_project_truster=lambda path: path,
     )
 
 
@@ -186,6 +187,7 @@ def probe_client(
         runner=runner,
         poll_interval_seconds=0,
         codex_project_truster=lambda path: path,
+        claude_project_truster=lambda path: path,
         monotonic=monotonic,
     )
 
@@ -310,6 +312,35 @@ def test_probe_trusts_only_current_first_workspace_directory() -> None:
     )
 
     assert trusted == ["/repo"]
+
+
+def test_claude_probe_trusts_only_current_first_workspace_directory() -> None:
+    runner = RuntimeRunner()
+    runner.workspaces["ws-test"] = {
+        "id": "ws-test",
+        "name": "Test",
+        "directories": ["/repo", "/secondary"],
+    }
+    codex_trusted: list[str] = []
+    claude_trusted: list[str] = []
+    client = PurpleMuxCLIClient(
+        "ws-test",
+        runner=runner,
+        poll_interval_seconds=0,
+        codex_project_truster=lambda path: codex_trusted.append(path) or path,
+        claude_project_truster=lambda path: claude_trusted.append(path) or path,
+    )
+
+    client.probe_agent_readiness(
+        provider="claude",
+        probe_name="readiness-corr-1",
+        correlation_id="corr-1",
+        preexisting_tab_ids=(),
+        timeout_seconds=1,
+    )
+
+    assert codex_trusted == []
+    assert claude_trusted == ["/repo"]
 
 
 def test_probe_rejects_stale_preexisting_set_before_creation() -> None:

@@ -107,7 +107,9 @@ function snapshot({
   executionContext = null,
   mode = undefined,
   prompt = undefined,
+  repository = null,
   integrationPr = null,
+  checked = false,
   issueDrivenSummary = null,
   hasWarnings = false,
 }) {
@@ -135,7 +137,9 @@ function snapshot({
     resourceCleanupStatus,
     executionContext,
     cleanupAvailable: !["idle", "running", "validation_failed"].includes(state),
+    repository,
     integrationPr,
+    checked,
     issueDrivenSummary,
   };
   if (mode !== undefined) result.mode = mode;
@@ -200,6 +204,7 @@ async function loadApp({
   validation,
   fetchOverride = null,
   clipboardOverride = null,
+  confirmOverride = null,
 }) {
   const ids = [
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
@@ -209,8 +214,9 @@ async function loadApp({
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
-    "active-context", "run-list",
-    "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "status", "stdout",
+    "active-context", "repository-navigation", "repository-slug", "repository-link",
+    "run-list", "delete-checked-runs",
+    "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
     "issue-summary-panel", "issue-summary-context", "issue-summary-terminal",
@@ -317,6 +323,7 @@ async function loadApp({
     clearTimeout,
     window: {
       clearTimeout,
+      confirm: confirmOverride || (() => true),
       EventSource: FakeEventSource,
       setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
@@ -367,6 +374,189 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("terminal run checked state toggles from detail and list without leaking", async () => {
+  const runs = [
+    {runId: 1, state: "success", mode: "workflow", cwd: "/work/one", checked: false},
+    {runId: 2, state: "running", mode: "workflow", cwd: "/work/two", checked: false},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done", checked: false}),
+    2: snapshot({runId: 2, state: "running", stdout: "", checked: false}),
+  };
+  const updates = [];
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      const match = url.match(/^\/api\/runs\/(\d+)\/checked$/);
+      if (!match) return undefined;
+      const runId = Number(match[1]);
+      const {checked} = JSON.parse(options.body);
+      updates.push([runId, checked]);
+      runs.find((run) => run.runId === runId).checked = checked;
+      details[runId].checked = checked;
+      return response(details[runId]);
+    },
+  });
+
+  assert.equal(elements["checked-toggle"].hidden, true);
+  assert.equal(runItem(elements, 1).textContent.includes("unchecked"), true);
+  assert.equal(
+    elements["run-list"].children.filter(
+      (item) => item.className.includes("run-check-toggle"),
+    ).length,
+    1,
+  );
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["checked-toggle"].hidden, false);
+  assert.equal(elements["checked-toggle"].textContent, "Mark checked");
+  await elements["checked-toggle"].dispatch("click");
+  assert.deepEqual(updates, [[1, true]]);
+  assert.equal(elements["checked-toggle"].textContent, "Mark unchecked");
+  assert.equal(runItem(elements, 1).textContent.includes("checked"), true);
+  assert.equal(details[2].checked, false);
+
+  const listToggle = elements["run-list"].children.find(
+    (item) => item.className.includes("run-check-toggle"),
+  );
+  await listToggle.dispatch("click");
+  assert.deepEqual(updates, [[1, true], [1, false]]);
+  assert.equal(elements["checked-toggle"].textContent, "Mark checked");
+  assert.equal(details[2].checked, false);
+});
+
+test("checked run deletion shows the eligible count and clears deleted detail", async () => {
+  const runs = [
+    {
+      runId: 1, state: "success", cwd: "/work/one", checked: true,
+      resourceCleanupStatus: "cleaned",
+    },
+    {
+      runId: 2, state: "success", cwd: "/work/two", checked: false,
+      resourceCleanupStatus: "cleaned",
+    },
+    {
+      runId: 3, state: "failed", cwd: "/work/three", checked: true,
+      resourceCleanupStatus: "cleaned",
+    },
+  ];
+  const details = Object.fromEntries(runs.map((run) => [
+    run.runId,
+    snapshot({...run, stdout: `output-${run.runId}`}),
+  ]));
+  const confirmations = [];
+  const {calls, elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    confirmOverride(message) {
+      confirmations.push(message);
+      return true;
+    },
+    fetchOverride(url, options) {
+      if (url !== "/api/runs/delete-checked") return undefined;
+      assert.equal(options.method, "POST");
+      assert.deepEqual(JSON.parse(options.body), {runIds: [1, 3]});
+      const deletedRunIds = runs
+        .filter((run) => run.checked && ["success", "failed", "stopped"].includes(run.state))
+        .map((run) => run.runId);
+      for (let index = runs.length - 1; index >= 0; index -= 1) {
+        if (deletedRunIds.includes(runs[index].runId)) runs.splice(index, 1);
+      }
+      return response({deletedCount: deletedRunIds.length, deletedRunIds});
+    },
+  });
+
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
+  assert.equal(elements["delete-checked-runs"].disabled, false);
+  assert.match(selectedRun(elements).textContent, /#3/);
+  await elements["delete-checked-runs"].dispatch("click");
+
+  assert.deepEqual(confirmations, ["Delete 2 checked runs from local history?"]);
+  assert.ok(calls.some(
+    ([url, method]) => url === "/api/runs/delete-checked" && method === "POST",
+  ));
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
+  assert.equal(elements["delete-checked-runs"].disabled, true);
+  assert.equal(
+    elements["run-list"].children.filter((item) => item.dataset.runId).length,
+    1,
+  );
+  assert.match(elements["active-context"].textContent, /New Python Workflow run/);
+  assert.equal(elements.stdout.textContent, "");
+});
+
+test("checked run deletion stops when confirmation is cancelled", async () => {
+  const run = {
+    runId: 1, state: "success", cwd: "/work/one", checked: true,
+    resourceCleanupStatus: "cleaned",
+  };
+  const {calls, elements} = await loadApp({
+    runs: [run],
+    details: {1: snapshot({...run, stdout: "done"})},
+    validation: {status: 200, body: {validation: []}},
+    confirmOverride: () => false,
+  });
+
+  await elements["delete-checked-runs"].dispatch("click");
+
+  assert.equal(calls.some(([url]) => url === "/api/runs/delete-checked"), false);
+  assert.match(selectedRun(elements).textContent, /#1/);
+});
+
+test("checked run deletion excludes runs with retained resources", async () => {
+  const retained = {
+    runId: 1, state: "success", cwd: "/work/one", checked: true,
+    resourceCleanupStatus: "retained",
+  };
+  const cleaned = {
+    runId: 2, state: "failed", cwd: "/work/two", checked: true,
+    resourceCleanupStatus: "cleaned",
+  };
+  const runs = [retained, cleaned];
+  const {elements} = await loadApp({
+    runs,
+    details: {
+      1: snapshot(retained),
+      2: snapshot(cleaned),
+    },
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url !== "/api/runs/delete-checked") return undefined;
+      assert.deepEqual(JSON.parse(options.body), {runIds: [2]});
+      runs.pop();
+      return response({deletedCount: 1, deletedRunIds: [2]});
+    },
+  });
+
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (1)");
+  await elements["delete-checked-runs"].dispatch("click");
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
+  assert.match(runItem(elements, 1).textContent, /#1/);
+});
+
+test("external checked history deletion clears stale selected detail", async () => {
+  const run = {runId: 1, state: "success", cwd: "/work/one", checked: true};
+  const runs = [run];
+  const {elements, eventSource} = await loadApp({
+    runs,
+    details: {1: snapshot({...run, stdout: "deleted output"})},
+    validation: {status: 200, body: {validation: []}},
+  });
+  assert.equal(elements.stdout.textContent, "deleted output");
+
+  runs.splice(0, 1);
+  eventSource.emit("runner-change");
+  await waitFor(() => (
+    elements["active-context"].textContent.includes("New Python Workflow run")
+  ));
+
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements["run-list"].children.length, 0);
+});
 
 test("Settings opens Notifications repeatedly without losing form state", async () => {
   const {elements} = await loadApp({
@@ -869,6 +1059,47 @@ test("Prompt history restores Prompt fields without exposing generated Python", 
   assert.equal(elements["prompt-text"].value, prompt.prompt);
   assert.match(selectedRun(elements).textContent, /Prompt.*selected\/project/);
   assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
+  assert.equal(elements["repository-navigation"].hidden, true);
+});
+
+test("Prompt repository navigation is scoped to the selected run and cleared for New run", async () => {
+  const repository = {
+    slug: "eletim/agent-workflow-manager",
+    url: "https://github.com/eletim/agent-workflow-manager",
+  };
+  const prompt = {agent: "codex", cwd: "/selected/project", prompt: "Work"};
+  const promptRun = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    mode: "prompt",
+    prompt,
+    repository,
+  });
+  const workflowRun = snapshot({runId: 2, state: "success", stdout: "done"});
+  const runs = [
+    {runId: 1, state: "success", cwd: prompt.cwd, mode: "prompt"},
+    {runId: 2, state: "success", cwd: "/work/run-2", mode: "workflow"},
+  ];
+  const {elements} = await loadApp({
+    runs,
+    details: {1: promptRun, 2: workflowRun},
+    validation: {body: {}, status: 200},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements["repository-navigation"].hidden, false);
+  assert.equal(elements["repository-slug"].textContent, repository.slug);
+  assert.equal(elements["repository-link"].getAttribute("href"), repository.url);
+
+  await runItem(elements, 2).dispatch("click");
+  assert.equal(elements["repository-navigation"].hidden, true);
+  assert.equal(elements["repository-link"].getAttribute("href"), undefined);
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["repository-navigation"].hidden, true);
+  assert.equal(elements["repository-link"].getAttribute("href"), undefined);
 });
 
 test("Dry Run renders topology findings and the first mutation frontier", async () => {
@@ -2084,6 +2315,161 @@ test("New run restores the retained draft unchanged after switching between runs
   assert.deepEqual(outlineLabels(elements), ["A plan"]);
 });
 
+test("New run inherits only the selected Prompt run's working directory", async () => {
+  const promptA = {agent: "claude-code", cwd: "/work/prompt-a", prompt: "Old prompt"};
+  const runA = snapshot({
+    runId: 1,
+    state: "failed",
+    stdout: "old output",
+    mode: "prompt",
+    prompt: promptA,
+    integrationPr: {number: 151, url: "https://example.invalid/151"},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", cwd: promptA.cwd, mode: "prompt", prompt: promptA}],
+    details: {1: runA},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+  assert.equal(elements["prompt-agent"].value, "codex");
+  assert.equal(elements["prompt-text"].value, "");
+  assert.equal(elements.status.textContent, "not started");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(elements["integration-pr-panel"].hidden, true);
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("each New run inherits the folder from the most recently selected Prompt run", async () => {
+  const promptA = {agent: "codex", cwd: "/work/prompt-a", prompt: "A"};
+  const promptB = {agent: "codex", cwd: "/work/prompt-b", prompt: "B"};
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: promptA.cwd, mode: "prompt", prompt: promptA},
+      {runId: 2, state: "success", cwd: promptB.cwd, mode: "prompt", prompt: promptB},
+    ],
+    details: {
+      1: snapshot({runId: 1, state: "success", stdout: "A", mode: "prompt", prompt: promptA}),
+      2: snapshot({runId: 2, state: "success", stdout: "B", mode: "prompt", prompt: promptB}),
+    },
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+
+  await runItem(elements, 2).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-b");
+});
+
+test("New run waits for a newly selected Prompt run's authoritative folder", async () => {
+  const delayedRunB = deferred();
+  let delayRunB = false;
+  const promptA = {agent: "codex", cwd: "/work/prompt-a", prompt: "A"};
+  const promptB = {agent: "codex", cwd: "/work/prompt-b", prompt: "B"};
+  const runA = snapshot({
+    runId: 1, state: "success", stdout: "A", mode: "prompt", prompt: promptA,
+  });
+  const runB = snapshot({
+    runId: 2, state: "success", stdout: "B", mode: "prompt", prompt: promptB,
+  });
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: promptA.cwd, mode: "prompt", prompt: promptA},
+      {runId: 2, state: "success", cwd: promptB.cwd, mode: "prompt", prompt: promptB},
+    ],
+    details: {1: runA, 2: runB},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (delayRunB && url === "/api/runs/2") return delayedRunB.promise;
+      return undefined;
+    },
+  });
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-a");
+
+  delayRunB = true;
+  const selectRunB = runItem(elements, 2).dispatch("click");
+  const enterNewRun = elements["new-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  delayedRunB.resolve(response(runB));
+  await Promise.all([selectRunB, enterNewRun]);
+
+  assert.equal(elements["prompt-cwd"].value, "/work/prompt-b");
+  assert.equal(elements["prompt-text"].value, "");
+  assert.equal(elements.stdout.textContent, "");
+  assert.equal(selectedRun(elements), undefined);
+});
+
+test("New run keeps the existing Prompt draft folder when a run has none", async () => {
+  const prompt = {agent: "codex", cwd: "", prompt: "No folder"};
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", cwd: "", mode: "prompt", prompt}],
+    details: {1: snapshot({
+      runId: 1, state: "failed", stdout: "failed", cwd: "", mode: "prompt", prompt,
+    })},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+  elements["prompt-cwd"].value = "/work/fallback";
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["prompt-cwd"].value, "/work/fallback");
+});
+
+test("Issue Driven inherits a selected run's authoritative source repository only", async () => {
+  const sourceRepository = "/source/repository-b";
+  const run = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    executionContext: {
+      sourceRepository,
+      executionRoot: "/managed/run-b",
+      baseRef: "origin/dev/v0.2.5",
+      baseSha: "b".repeat(40),
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/runner", executionContext: run.executionContext}],
+    details: {1: run},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["new-run"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    mode: "issue-driven",
+    repository: "/source/old-repository",
+    integration_branch: "dev/v0.2.0",
+    final_branch: "main",
+    issues: [90, 89],
+    max_reviews: 5,
+    merge_to_integration: true,
+    final_review: true,
+    merge_final: false,
+  });
+  elements["issue-driven-python"].value = "# generated for old repository";
+  await runItem(elements, 1).dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  const inherited = JSON.parse(elements["issue-driven-json"].value);
+
+  assert.equal(inherited.repository, sourceRepository);
+  assert.equal(inherited.integration_branch, "dev/v0.2.0");
+  assert.deepEqual(inherited.issues, [90, 89]);
+  assert.equal(elements["issue-driven-python"].value, "");
+  assert.equal(elements.stdout.textContent, "");
+});
+
 test("New run immediately clears every run-owned surface without changing history", async () => {
   const executionContext = {
     executionRoot: "/managed/run-a",
@@ -2368,12 +2754,10 @@ test("a delayed run-detail response cannot repaint New run", async () => {
   delayRunOne = true;
   const staleSelection = runItem(elements, 1).dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
-  await elements["new-run"].dispatch("click");
-  assert.equal(elements.status.textContent, "not started");
-  assert.equal(elements.stdout.textContent, "");
+  const newRun = elements["new-run"].dispatch("click");
 
   delayedRun.resolve(response(runOne));
-  await staleSelection;
+  await Promise.all([staleSelection, newRun]);
 
   assert.equal(elements.status.textContent, "not started");
   assert.equal(elements.stdout.textContent, "");

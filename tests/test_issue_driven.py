@@ -250,6 +250,22 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "MAX_REVIEWS = 5" in first
 
 
+@pytest.mark.parametrize("final_review", [False, True])
+def test_generated_workflow_always_preserves_implementation_principle(
+    final_review: bool,
+) -> None:
+    config = parse(payload(final_review=final_review))
+
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+
+    assert first == second
+    assert "Reuse the existing implementation where appropriate" in first
+    assert "minimum required for this Issue" in first
+    assert "mixing responsibilities unnaturally" in first
+    assert "over-generalizing distinct behavior" in first
+
+
 @pytest.mark.parametrize(
     ("implementer", "reviewer"),
     [
@@ -294,7 +310,8 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
     assert calls == {
         "Issue  worktree cleanup": "IMPLEMENTER_AGENT",
         "Issue  implementer": "IMPLEMENTER_AGENT",
-        "Issue  reviewer": "REVIEWER_AGENT",
+        "Issue  scope reviewer": "REVIEWER_AGENT",
+        "Issue  correctness reviewer": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
@@ -380,6 +397,8 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "require_committed_result(" in code
     assert "repo.ensure_pushed(" in code
     assert "github.create_draft_pr(" in code
+    assert "reviewer requested changes, but" in code
+    assert "the implementer re-evaluated the finding" in code
     assert "reviewer requested changes, but the " in code
     assert "continuing without reviewer approval" in code
     assert 'status="warning"' in code
@@ -984,12 +1003,18 @@ def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
     )
     issue = module.__dict__["Issue"](90, "feature/issue-90")
 
-    implementation, review = module.__dict__["issue_prompts"](issue, config)
+    implementation, scope_review, correctness_review = module.__dict__["issue_prompts"](
+        issue, config
+    )
 
     assert implementation.startswith("Implement Issue #90")
-    assert review.startswith("Independently review Issue #90")
+    assert scope_review.startswith("Perform only the Scope / Design Review for Issue")
+    assert correctness_review.startswith(
+        "Perform only the Correctness Review for Issue"
+    )
     assert "policy Issue" not in implementation
-    assert "POLICY_CONFLICT" not in review
+    assert "POLICY_CONFLICT" not in scope_review
+    assert "POLICY_CONFLICT" not in correctness_review
 
 
 def test_generated_workflow_has_focused_dirty_worktree_recovery() -> None:

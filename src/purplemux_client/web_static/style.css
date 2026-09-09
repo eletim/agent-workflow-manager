@@ -40,8 +40,16 @@ h2, label { font-size: 14px; font-weight: 650; }
 .runs-title { font-size: 14px; font-weight: 650; }
 #runs-empty { color: #737d91; font-size: 13px; }
 .runs-toggle-hint { margin-left: auto; color: #9ba3b5; font-size: 12px; }
-.run-list { display: grid; gap: 7px; margin-top: 10px; }
+.run-history-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.run-history-actions button { color: #ff9ca8; }
+.run-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  margin-top: 10px;
+}
 .run-item {
+  grid-column: 1;
   position: relative;
   width: 100%;
   padding-left: 32px;
@@ -51,6 +59,14 @@ h2, label { font-size: 14px; font-weight: 650; }
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+.run-check-toggle {
+  grid-column: 2;
+  flex: 0 0 auto;
+  min-width: 94px;
+  padding-inline: 12px;
+  color: #ffd66b;
+}
+.run-check-toggle.checked { color: #75e2a8; }
 .run-state-marker {
   position: absolute;
   top: 50%;
@@ -172,6 +188,20 @@ textarea {
   overflow-wrap: anywhere;
 }
 .editor-mode-bar .active-context { margin: 0; }
+.repository-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 9px 11px;
+  border: 1px solid #303746;
+  border-radius: 7px;
+  color: #aab0bf;
+  font-size: 13px;
+}
+.repository-navigation[hidden] { display: none; }
+.repository-navigation strong { color: #e1e4eb; }
 input[readonly], textarea[readonly] {
   opacity: 0.7;
   cursor: default;
@@ -468,11 +498,14 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .runs-panel { padding: 0; }
   .runs-heading { min-height: 48px; padding: 10px 12px; }
   .runs-panel[open] .runs-heading { border-bottom: 1px solid #303746; }
+  .run-history-actions { margin: 0; padding: 10px 12px 0; }
+  .run-history-actions button { width: 100%; }
   .run-list { max-height: 32vh; margin: 0; padding: 10px 12px; overflow-y: auto; }
   .mode-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
   .mode-switch button { min-width: 0; padding-inline: 6px; }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
   .editor-mode-bar #new-run { align-self: stretch; }
+  .repository-navigation { align-items: flex-start; flex-direction: column; }
   button, select, input[type="text"], input[type="url"], input[type="password"] { min-height: 44px; }
   .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .controls button { width: 100%; padding-inline: 8px; }

@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,359 @@ print(run_correlation("workspace"))
     assert first_values[0] != second_values[0]
 
 
+def test_terminal_run_checked_metadata_is_reversible_and_run_scoped(
+    runner: PythonRunner,
+) -> None:
+    first_id = runner.start("print('first')")
+    first = wait_for(runner, lambda item: item.state == "success", run_id=first_id)
+    assert first.checked is False
+    assert first.as_json()["checked"] is False
+
+    checked = runner.set_checked(first_id, True)
+    assert checked.checked is True
+    assert checked.state == "success"
+
+    second_id = runner.start("print('second')")
+    second = wait_for(runner, lambda item: item.state == "success", run_id=second_id)
+    assert second.checked is False
+    assert runner.snapshot(first_id).checked is True
+    assert [item.as_summary_json()["checked"] for item in runner.snapshots()] == [
+        True,
+        False,
+    ]
+
+    unchecked = runner.set_checked(first_id, False)
+    assert unchecked.checked is False
+    assert unchecked.state == "success"
+
+
+def test_delete_checked_runs_removes_only_checked_terminal_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        checked_id = runner.start("print('checked')")
+        wait_for(runner, lambda item: item.state == "success", run_id=checked_id)
+        runner.set_checked(checked_id, True)
+
+        unchecked_id = runner.start("print('unchecked')")
+        wait_for(runner, lambda item: item.state == "success", run_id=unchecked_id)
+
+        active_id = runner.start("import time; time.sleep(60)")
+        with runner._lock:
+            # Exercise the backend's final state check even for inconsistent
+            # metadata that cannot be produced through the public API.
+            runner._runs[active_id].checked = True
+
+        def unexpected_cleanup(_run_id: int) -> None:
+            raise AssertionError("history deletion must not clean run resources")
+
+        monkeypatch.setattr(runner, "cleanup", unexpected_cleanup)
+        with pytest.raises(
+            runner_module.RunDeletionNotAllowedError, match="refresh and confirm"
+        ):
+            runner.delete_checked_runs((checked_id, unchecked_id))
+        assert runner.snapshot(checked_id).checked is True
+        assert runner.delete_checked_runs((checked_id,)) == (checked_id,)
+        assert [item.run_id for item in runner.snapshots()] == [unchecked_id, active_id]
+        assert runner.snapshot(unchecked_id).checked is False
+        assert runner.snapshot(active_id).state == "running"
+        assert checked_id not in {
+            run["runId"]
+            for run in json.loads(history_file.read_text(encoding="utf-8"))[
+                "runs"
+            ].values()
+        }
+        with runner._lock:
+            runner._runs[active_id].checked = False
+    finally:
+        runner.close()
+
+
+def test_delete_checked_runs_rolls_back_when_history_cannot_be_saved(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start("print('keep me')")
+    wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    runner.set_checked(run_id, True)
+
+    def fail_write() -> None:
+        raise runner_module.RunHistoryError("save failed")
+
+    monkeypatch.setattr(runner, "_write_run_history_locked", fail_write)
+    with pytest.raises(runner_module.RunHistoryError, match="save failed"):
+        runner.delete_checked_runs((run_id,))
+
+    assert runner.snapshot(run_id).checked is True
+
+
+def test_delete_checked_runs_rejects_concurrent_cleanup(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
+    wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    runner.set_checked(run_id, True)
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    cleanup_results: list[RunnerSnapshot] = []
+    cleanup_errors: list[BaseException] = []
+
+    def blocking_cleanup(_resource: RunResource) -> None:
+        cleanup_entered.set()
+        if not allow_cleanup.wait(timeout=5):
+            raise AssertionError("cleanup test was not released")
+
+    def cleanup() -> None:
+        try:
+            cleanup_results.append(runner.cleanup(run_id))
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+    monkeypatch.setattr(runner, "_cleanup_resource", blocking_cleanup)
+    cleanup_thread = threading.Thread(target=cleanup)
+    cleanup_thread.start()
+    try:
+        assert cleanup_entered.wait(timeout=5)
+        with pytest.raises(
+            runner_module.RunDeletionNotAllowedError, match="cleanup is active"
+        ):
+            runner.delete_checked_runs((run_id,))
+        during_cleanup = runner.snapshot(run_id)
+        assert during_cleanup.resources[0].cleanup_state == "cleanup_pending"
+    finally:
+        allow_cleanup.set()
+        cleanup_thread.join(timeout=5)
+
+    assert not cleanup_thread.is_alive()
+    assert cleanup_errors == []
+    assert cleanup_results[0].resources[0].cleanup_state == "cleaned"
+    assert runner.delete_checked_runs((run_id,)) == (run_id,)
+
+
+def test_delete_checked_runs_retains_resource_ownership_until_fully_cleaned(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
+    wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    runner.set_checked(run_id, True)
+
+    with pytest.raises(runner_module.RunDeletionNotAllowedError, match="fully cleaned"):
+        runner.delete_checked_runs((run_id,))
+    assert runner.snapshot(run_id).resources[0].cleanup_state == "retained"
+
+    monkeypatch.setattr(runner, "_cleanup_resource", lambda _resource: None)
+    cleaned = runner.cleanup(run_id)
+    assert cleaned.resources[0].cleanup_state == "cleaned"
+    assert runner.delete_checked_runs((run_id,)) == (run_id,)
+
+
+def test_checked_terminal_run_is_restored_after_runner_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "state" / "run-history.json"
+    first_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        first_id = first_runner.start("print('persisted output')")
+        finished = wait_for(
+            first_runner, lambda item: item.state == "success", run_id=first_id
+        )
+        stable_identity = first_runner._run_identity(first_id)
+        assert finished.checked is False
+        first_runner.set_checked(first_id, True)
+        saved = json.loads(history_file.read_text(encoding="utf-8"))
+        assert list(saved["runs"]) == [stable_identity]
+    finally:
+        first_runner.close()
+
+    second_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        second_runner.configure_event_endpoint("http://127.0.0.1:8765")
+        restored = second_runner.snapshot(first_id)
+        assert second_runner._run_identity(first_id) == stable_identity
+        assert restored.state == "success"
+        assert restored.checked is True
+        assert restored.stdout == "persisted output\n"
+        assert [item.run_id for item in second_runner.snapshots()] == [first_id]
+
+        second_id = second_runner.start("print('new run')")
+        assert second_id == first_id + 1
+        second = wait_for(
+            second_runner, lambda item: item.state == "success", run_id=second_id
+        )
+        assert second.checked is False
+        assert second_runner.snapshot(first_id).checked is True
+    finally:
+        second_runner.close()
+
+    assert stat.S_IMODE(history_file.stat().st_mode) == 0o600
+
+
+def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    owner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = owner.start("print('owner')")
+        wait_for(owner, lambda item: item.state == "success", run_id=run_id)
+        owner.set_checked(run_id, True)
+
+        with pytest.raises(
+            runner_module.RunHistoryError,
+            match="another AWM server owns",
+        ):
+            PythonRunner(
+                managed_workflows=False,
+                stop_timeout=0.5,
+                run_history_file=history_file,
+            )
+
+        assert owner.snapshot(run_id).checked is True
+    finally:
+        owner.close()
+
+    successor = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        restored = successor.snapshot(run_id)
+        assert restored.stdout == "owner\n"
+        assert restored.checked is True
+        assert successor.start("print('successor')") == run_id + 1
+    finally:
+        successor.close()
+
+
+def test_run_id_is_durably_reserved_before_launch_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    crashed_identity: str | None = None
+    crashing_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_before_process(*_args: object, **_kwargs: object) -> None:
+        raise SimulatedCrash
+
+    monkeypatch.setattr(crashing_runner, "_spawn_process", crash_before_process)
+    try:
+        crashed_identity = crashing_runner._run_identity(1)
+        with pytest.raises(SimulatedCrash):
+            crashing_runner.start("print('never launched')")
+        saved = json.loads(history_file.read_text(encoding="utf-8"))
+        assert saved["nextRunId"] == 2
+        assert saved["runs"] == {}
+    finally:
+        crashing_runner.close()
+
+    reconstructed = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = reconstructed.start("print('after crash')")
+        assert run_id == 2
+        assert reconstructed._run_identity(run_id) != crashed_identity
+        wait_for(reconstructed, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        reconstructed.close()
+
+
+def test_failed_run_id_reservation_prevents_launch_and_consumes_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=tmp_path / "run-history.json",
+    )
+    original_write = runner._write_run_history_locked
+    original_spawn = runner._spawn_process
+    spawn_calls = 0
+
+    def fail_reservation() -> None:
+        raise runner_module.RunHistoryError("reservation failed")
+
+    def track_spawn(*args: object, **kwargs: object) -> object:
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "_write_run_history_locked", fail_reservation)
+    monkeypatch.setattr(runner, "_spawn_process", track_spawn)
+    try:
+        with pytest.raises(runner_module.RunHistoryError, match="reservation failed"):
+            runner.start("print('not launched')")
+        assert spawn_calls == 0
+
+        monkeypatch.setattr(runner, "_write_run_history_locked", original_write)
+        run_id = runner.start("print('launched')")
+        assert run_id == 2
+        assert spawn_calls == 1
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("terminal_state", ["success", "failed", "stopped"])
+def test_checked_metadata_does_not_change_terminal_state(
+    runner: PythonRunner, terminal_state: str
+) -> None:
+    code = {
+        "success": "print('done')",
+        "failed": "raise RuntimeError('failed')",
+        "stopped": "import time; time.sleep(60)",
+    }[terminal_state]
+    run_id = runner.start(code)
+    if terminal_state == "stopped":
+        assert runner.stop(run_id) is True
+    terminal = wait_for(
+        runner, lambda item: item.state == terminal_state, run_id=run_id
+    )
+
+    checked = runner.set_checked(run_id, True)
+
+    assert checked.state == terminal.state
+    assert checked.exit_code == terminal.exit_code
+    assert checked.checked is True
+
+
 def test_new_runner_instance_does_not_reuse_run_correlation() -> None:
     first_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     second_runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
@@ -188,6 +542,33 @@ def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
     assert validation.outline == ("Prompt",)
 
 
+def test_prepare_prompt_execution_retains_validated_github_identity(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+        check=True,
+    )
+
+    execution = prepare_prompt_execution(
+        agent="codex", cwd=str(tmp_path), prompt="Work"
+    )
+
+    assert execution.repository_json() == {
+        "slug": "acme/widgets",
+        "url": "https://github.com/acme/widgets",
+    }
+
+
 @pytest.mark.parametrize(
     ("agent", "cwd", "prompt", "message"),
     [
@@ -224,6 +605,47 @@ def test_prompt_run_hides_generated_code_and_rejects_workflow_cleanup(
     assert summary["prompt"] == {"agent": "codex", "cwd": str(tmp_path)}
     with pytest.raises(RunCleanupNotAllowedError, match="Prompt run"):
         runner.cleanup(run_id)
+
+
+def test_prompt_repository_navigation_survives_run_history(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    execution = PromptExecution(
+        "codex",
+        str(tmp_path),
+        "answer",
+        repository_slug="acme/widgets",
+        repository_url="https://github.com/acme/widgets",
+    )
+    first = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = first.start("print('done')", prompt=execution)
+        result = wait_for(first, lambda item: item.state == "success", run_id=run_id)
+        assert result.as_json()["repository"] == {
+            "slug": "acme/widgets",
+            "url": "https://github.com/acme/widgets",
+        }
+    finally:
+        first.close()
+
+    restored = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        payload = restored.snapshot(run_id).as_json()
+        assert payload["repository"] == {
+            "slug": "acme/widgets",
+            "url": "https://github.com/acme/widgets",
+        }
+    finally:
+        restored.close()
 
 
 def test_run_owned_resources_are_retained_structurally_after_success(
@@ -1705,6 +2127,7 @@ def test_runner_http_lifecycle(
         "resources": [],
         "resourceCleanupStatus": "cleaned",
         "cleanupAvailable": True,
+        "checked": False,
     }
 
 
@@ -1931,6 +2354,113 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
+
+
+def test_run_api_updates_checked_metadata_only_for_terminal_run(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "import time; time.sleep(0.1)"}),
+        token=token,
+    )
+    assert status == 202
+    run_id = int(started["runId"])
+    assert started["checked"] is False
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 409
+    assert "only terminal runs" in str(rejected["error"])
+
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, checked = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 200
+    assert checked["checked"] is True
+    assert checked["state"] == "success"
+    assert request(address, "GET", f"/api/runs/{run_id}")[1]["checked"] is True
+    assert request(address, "GET", "/api/runs")[1]["runs"][0]["checked"] is True
+
+    status, unchecked = request(
+        address,
+        "POST",
+        f"/api/runs/{run_id}/checked",
+        json.dumps({"checked": False}),
+        token=token,
+    )
+    assert status == 200
+    assert unchecked["checked"] is False
+    assert unchecked["state"] == "success"
+
+
+def test_run_api_deletes_only_checked_terminal_history(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    run_ids = []
+    for source in ("print('checked')", "print('unchecked')"):
+        status, started = request(
+            address, "POST", "/api/run", json.dumps({"code": source}), token=token
+        )
+        assert status == 202
+        run_id = int(started["runId"])
+        run_ids.append(run_id)
+        deadline = time.monotonic() + 5
+        while request(address, "GET", f"/api/runs/{run_id}")[1]["state"] == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+
+    status, _ = request(
+        address,
+        "POST",
+        f"/api/runs/{run_ids[0]}/checked",
+        json.dumps({"checked": True}),
+        token=token,
+    )
+    assert status == 200
+
+    status, changed = request(
+        address,
+        "POST",
+        "/api/runs/delete-checked",
+        json.dumps({"runIds": run_ids}),
+        token=token,
+    )
+    assert status == 409
+    assert "refresh and confirm" in str(changed["error"])
+    assert request(address, "GET", f"/api/runs/{run_ids[0]}")[0] == 200
+
+    deletion_body = json.dumps({"runIds": [run_ids[0]]})
+    assert request(address, "POST", "/api/runs/delete-checked", deletion_body)[0] == 403
+    status, deleted = request(
+        address,
+        "POST",
+        "/api/runs/delete-checked",
+        deletion_body,
+        token=token,
+    )
+    assert status == 200
+    assert deleted == {"deletedCount": 1, "deletedRunIds": [run_ids[0]]}
+    assert request(address, "GET", f"/api/runs/{run_ids[0]}")[0] == 404
+    assert request(address, "GET", f"/api/runs/{run_ids[1]}")[0] == 200
 
 
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(

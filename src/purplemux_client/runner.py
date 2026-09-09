@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import fcntl
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Literal, Protocol, cast
+from typing import IO, Any, Literal, Protocol, cast
 from urllib.parse import urlparse
 
 from purplemux_client.client import (
@@ -231,6 +232,18 @@ class RunCleanupInProgressError(RuntimeError):
     """Raised when cleanup is already active for the selected run."""
 
 
+class RunCheckNotAllowedError(RuntimeError):
+    """Raised when human-review metadata is set on a non-terminal run."""
+
+
+class RunDeletionNotAllowedError(RuntimeError):
+    """Raised when the confirmed deletion set is no longer safe."""
+
+
+class RunHistoryError(RuntimeError):
+    """Raised when durable terminal-run history cannot be read or written."""
+
+
 class RunStopUncertainError(RuntimeError):
     """Raised when PurpleMux cannot prove that a stopped Workflow terminated."""
 
@@ -329,6 +342,7 @@ class RunnerSnapshot:
     code: str | None = None
     prompt: PromptExecution | None = None
     integration_pr: PullRequestNavigation | None = None
+    checked: bool = False
     warning_count: int = 0
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: tuple[IssueResult, ...] = ()
@@ -336,10 +350,11 @@ class RunnerSnapshot:
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
-        prompt = payload.pop("prompt")
-        payload["mode"] = "prompt" if prompt is not None else "workflow"
-        if prompt is not None:
-            payload["prompt"] = prompt
+        payload.pop("prompt")
+        payload["mode"] = "prompt" if self.prompt is not None else "workflow"
+        if self.prompt is not None:
+            payload["prompt"] = self.prompt.as_json()
+            payload["repository"] = self.prompt.repository_json()
         payload["exitCode"] = payload.pop("exit_code")
         payload["runId"] = payload.pop("run_id")
         integration_pr = payload.pop("integration_pr")
@@ -436,12 +451,14 @@ class RunnerSnapshot:
             "warningCount": self.warning_count,
             "resourceCleanupStatus": _resource_cleanup_status(self.resources),
             "resourceCount": len(self.resources),
+            "checked": self.checked,
         }
         if self.prompt is not None:
             payload["prompt"] = {
                 "agent": self.prompt.agent,
                 "cwd": self.prompt.cwd,
             }
+            payload["repository"] = self.prompt.repository_json()
         return payload
 
     def _execution_context_json(self) -> dict[str, str] | None:
@@ -498,6 +515,7 @@ class _RunRecord:
     credential_path: Path | None = None
     event_token: str | None = None
     integration_pr: PullRequestNavigation | None = None
+    checked: bool = False
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: dict[int, IssueResult] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
@@ -518,6 +536,7 @@ class PythonRunner:
         workflow_cwd: str | os.PathLike[str] | None = None,
         runtime_factory: Callable[[], PurpleMuxRuntime] = PurpleMuxRuntime,
         managed_workflows: bool = True,
+        run_history_file: str | os.PathLike[str] | None = None,
     ) -> None:
         if os.name != "posix":
             raise RuntimeError("PythonRunner requires a POSIX operating system")
@@ -543,6 +562,17 @@ class PythonRunner:
         # The local process host remains only as an explicit deterministic test
         # harness. Production Workflow runs use the PurpleMux host.
         self.managed_workflows = managed_workflows
+        self._run_history_file = (
+            Path(run_history_file).expanduser()
+            if run_history_file is not None
+            else self._default_run_history_file()
+            if (
+                "AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE" in os.environ
+                or (managed_workflows and runtime_factory is PurpleMuxRuntime)
+            )
+            else None
+        )
+        self._run_history_lock_descriptor: int | None = None
         self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
@@ -580,16 +610,294 @@ class PythonRunner:
             dry_run=None,
         )
         self._validator = validator or WorkflowValidator()
+        try:
+            self._acquire_run_history_lock()
+            self._load_run_history()
+        except BaseException:
+            self._release_run_history_lock()
+            self._validator.close()
+            raise
+
+    @staticmethod
+    def _default_run_history_file() -> Path:
+        configured = os.environ.get("AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE")
+        if configured:
+            return Path(configured).expanduser()
+        state_home = os.environ.get("XDG_STATE_HOME")
+        root = (
+            Path(state_home).expanduser()
+            if state_home
+            else Path.home() / ".local/state"
+        )
+        return root / "agent-workflow-manager" / "run-history.json"
+
+    def _acquire_run_history_lock(self) -> None:
+        path = self._run_history_file
+        if path is None:
+            return
+        lock_path = path.with_name(f".{path.name}.lock")
+        descriptor: int | None = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RunHistoryError(
+                    "another AWM server owns the terminal run history"
+                ) from exc
+            self._run_history_lock_descriptor = descriptor
+        except RunHistoryError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise RunHistoryError(
+                f"terminal run history lock could not be acquired: {exc}"
+            ) from exc
+
+    def _release_run_history_lock(self) -> None:
+        descriptor = self._run_history_lock_descriptor
+        if descriptor is None:
+            return
+        self._run_history_lock_descriptor = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def _run_history_json(self, run: _RunRecord) -> dict[str, object]:
+        return {
+            "identity": self._run_identity(run.run_id),
+            "runId": run.run_id,
+            "cwd": run.cwd,
+            "args": list(run.args),
+            "code": run.code,
+            "outline": list(run.outline),
+            "state": run.state,
+            "stdoutEntries": [asdict(entry) for entry in run.stdout],
+            "stderrEntries": [asdict(entry) for entry in run.stderr],
+            "stdoutTruncated": run.stdout_truncated,
+            "stderrTruncated": run.stderr_truncated,
+            "exitCode": run.exit_code,
+            "progress": [asdict(event) for event in run.progress],
+            "progressPrs": {
+                str(number): asdict(event) for number, event in run.progress_prs.items()
+            },
+            "findings": [asdict(finding) for finding in run.findings],
+            "attempts": [asdict(attempt) for attempt in run.attempts],
+            "resources": [asdict(resource) for resource in run.resources],
+            "prompt": asdict(run.prompt) if run.prompt is not None else None,
+            "integrationPr": (
+                asdict(run.integration_pr) if run.integration_pr is not None else None
+            ),
+            "checked": run.checked,
+        }
+
+    def _write_run_history_locked(self) -> None:
+        path = self._run_history_file
+        if path is None:
+            return
+        terminal_runs = [
+            run
+            for run in self._runs.values()
+            if run.state in ("success", "failed", "stopped")
+        ]
+        payload = json.dumps(
+            {
+                "version": 1,
+                "instanceId": self._correlation_instance,
+                "nextRunId": self._next_run_id,
+                "runs": {
+                    self._run_identity(run.run_id): self._run_history_json(run)
+                    for run in terminal_runs
+                },
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        temporary_path: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", dir=path.parent
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                temporary.write(payload)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            temporary_path.chmod(0o600)
+            os.replace(temporary_path, path)
+        except OSError as exc:
+            raise RunHistoryError(
+                f"terminal run history could not be durably saved: {exc}"
+            ) from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _persist_run_history_locked(self) -> None:
+        try:
+            self._write_run_history_locked()
+        except RunHistoryError:
+            logger.exception("Could not persist terminal run history")
+
+    @staticmethod
+    def _history_dataclass(kind: type[Any], value: object) -> Any:
+        if not isinstance(value, dict):
+            raise ValueError
+        return kind(**value)
+
+    def _record_from_run_history(self, value: object) -> _RunRecord:
+        if not isinstance(value, dict):
+            raise ValueError
+        run_id = value.get("runId")
+        state = value.get("state")
+        checked = value.get("checked")
+        identity = value.get("identity")
+        cwd = value.get("cwd")
+        code = value.get("code")
+        args = value.get("args")
+        outline = value.get("outline")
+        exit_code = value.get("exitCode")
+        if (
+            isinstance(run_id, bool)
+            or not isinstance(run_id, int)
+            or run_id < 1
+            or state not in ("success", "failed", "stopped")
+            or not isinstance(checked, bool)
+            or identity != self._run_identity(run_id)
+            or not isinstance(cwd, str)
+            or not isinstance(code, str)
+            or not isinstance(args, list)
+            or any(not isinstance(item, str) for item in args)
+            or not isinstance(outline, list)
+            or any(not isinstance(item, str) for item in outline)
+            or isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+        ):
+            raise ValueError
+
+        def load_many(kind: type[Any], key: str) -> list[Any]:
+            items = value.get(key)
+            if not isinstance(items, list):
+                raise ValueError
+            return [self._history_dataclass(kind, item) for item in items]
+
+        stdout = load_many(OutputEntry, "stdoutEntries")
+        stderr = load_many(OutputEntry, "stderrEntries")
+        progress = load_many(ProgressEvent, "progress")
+        findings = load_many(TopologyFinding, "findings")
+        attempts = load_many(RunAttempt, "attempts")
+        resources = load_many(RunResource, "resources")
+        progress_pr_values = value.get("progressPrs")
+        if not isinstance(progress_pr_values, dict):
+            raise ValueError
+        progress_prs = {
+            int(number): self._history_dataclass(ProgressEvent, event)
+            for number, event in progress_pr_values.items()
+        }
+        prompt_value = value.get("prompt")
+        integration_pr_value = value.get("integrationPr")
+        prompt = (
+            None
+            if prompt_value is None
+            else self._history_dataclass(PromptExecution, prompt_value)
+        )
+        integration_pr = (
+            None
+            if integration_pr_value is None
+            else self._history_dataclass(PullRequestNavigation, integration_pr_value)
+        )
+        stdout_truncated = value.get("stdoutTruncated")
+        stderr_truncated = value.get("stderrTruncated")
+        if not isinstance(stdout_truncated, bool) or not isinstance(
+            stderr_truncated, bool
+        ):
+            raise ValueError
+        return _RunRecord(
+            run_id=run_id,
+            cwd=cwd,
+            args=tuple(args),
+            process=None,
+            process_group_id=None,
+            script_path=Path(),
+            code=code,
+            outline=tuple(outline),
+            state=cast(RunnerState, state),
+            stdout=deque(stdout),
+            stderr=deque(stderr),
+            stdout_chars=sum(len(entry.text) for entry in stdout),
+            stderr_chars=sum(len(entry.text) for entry in stderr),
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            exit_code=exit_code,
+            progress=deque(progress, maxlen=self._max_progress_events),
+            progress_prs=progress_prs,
+            findings=deque(findings, maxlen=self._max_progress_events),
+            attempts=attempts,
+            resources=resources,
+            prompt=prompt,
+            integration_pr=integration_pr,
+            checked=checked,
+        )
+
+    def _load_run_history(self) -> None:
+        path = self._run_history_file
+        if path is None:
+            return
+        try:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return
+            payload = json.loads(content)
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                raise ValueError
+            instance_id = payload.get("instanceId")
+            next_run_id = payload.get("nextRunId")
+            runs = payload.get("runs")
+            if (
+                not isinstance(instance_id, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", instance_id)
+                or isinstance(next_run_id, bool)
+                or not isinstance(next_run_id, int)
+                or next_run_id < 1
+                or not isinstance(runs, dict)
+            ):
+                raise ValueError
+            self._correlation_instance = instance_id
+            restored = [
+                self._record_from_run_history(run)
+                for identity, run in runs.items()
+                if isinstance(identity, str)
+                and isinstance(run, dict)
+                and run.get("identity") == identity
+            ]
+            if (
+                len({run.run_id for run in restored}) != len(restored)
+                or len(restored) != len(runs)
+                or next_run_id <= max((run.run_id for run in restored), default=0)
+            ):
+                raise ValueError
+            self._runs = {run.run_id: run for run in restored}
+            self._next_run_id = next_run_id
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RunHistoryError(
+                f"terminal run history is unreadable: {path}"
+            ) from exc
 
     def configure_event_endpoint(self, base_url: str) -> None:
         """Enable PurpleMux-hosted Workflow execution for an attached HTTP server."""
         if not base_url.startswith("http://") or "\0" in base_url:
             raise ValueError("event endpoint must be a local HTTP URL")
         with self._lock:
-            if self._runs:
-                raise RuntimeError(
-                    "event endpoint must be configured before runs start"
-                )
+            if any(run.state == "running" for run in self._runs.values()):
+                raise RuntimeError("event endpoint cannot change while a run is active")
             self._event_base_url = base_url.rstrip("/")
 
     def validate(
@@ -816,13 +1124,13 @@ class PythonRunner:
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
     ) -> int:
-        run_id = self._next_run_id
-        self._next_run_id += 1
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
                 raise RuntimeError(
                     "managed Workflow execution requires an attached event endpoint"
                 )
+        run_id = self._reserve_run_id_locked()
+        if prompt is None and self.managed_workflows:
             return self._start_managed_workflow(
                 run_id,
                 code,
@@ -859,6 +1167,15 @@ class PythonRunner:
             run, process, script_path, progress_read_fd, resource_ack_fd
         )
         self._mark_changed()
+        return run_id
+
+    def _reserve_run_id_locked(self) -> int:
+        """Durably consume one identity before any workflow-side mutation."""
+        run_id = self._next_run_id
+        self._next_run_id += 1
+        # A failed write prevents launch. Keep the in-memory ID consumed because
+        # replacement failure can be outcome-unknown; reuse would be less safe.
+        self._write_run_history_locked()
         return run_id
 
     def _start_managed_workflow(
@@ -1021,6 +1338,7 @@ class PythonRunner:
         )
         run.attempts.append(RunAttempt(1, "failed", 1))
         self._mark_changed()
+        self._persist_run_history_locked()
 
     def _attach_managed_shell(
         self,
@@ -1265,11 +1583,81 @@ class PythonRunner:
             resources=tuple(run.resources),
             prompt=run.prompt,
             integration_pr=run.integration_pr,
+            checked=run.checked,
             warning_count=run.warning_count,
             issue_driven_context=run.issue_driven_context,
             issue_results=tuple(run.issue_results.values()),
             whole_review_result=run.whole_review_result,
         )
+
+    def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
+        """Set human-review metadata without changing execution state."""
+        if not isinstance(checked, bool):
+            raise TypeError("checked must be a boolean")
+        with self._lock:
+            run = self._get_run(run_id)
+            if run.state not in ("success", "failed", "stopped"):
+                raise RunCheckNotAllowedError(
+                    f"run {run_id} is {run.state}; only terminal runs can be checked"
+                )
+            if run.checked != checked:
+                previous = run.checked
+                run.checked = checked
+                try:
+                    self._write_run_history_locked()
+                except RunHistoryError:
+                    run.checked = previous
+                    raise
+                self._mark_changed()
+            return self._snapshot_run(run)
+
+    def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
+        """Delete only checked terminal-run records whose resources are cleaned."""
+        run_ids = tuple(confirmed_run_ids)
+        if any(
+            isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
+            for run_id in run_ids
+        ) or len(set(run_ids)) != len(run_ids):
+            raise ValueError("run IDs must be unique positive integers")
+        with self._lock:
+            checked_terminal_run_ids = tuple(
+                run.run_id
+                for run in self._runs.values()
+                if run.checked and run.state in ("success", "failed", "stopped")
+            )
+            cleaning_run_ids = tuple(
+                run_id
+                for run_id in checked_terminal_run_ids
+                if self._runs[run_id].cleanup_lock.locked()
+            )
+            if cleaning_run_ids:
+                raise RunDeletionNotAllowedError(
+                    "cleanup is active for confirmed run(s): "
+                    + ", ".join(str(run_id) for run_id in cleaning_run_ids)
+                )
+            eligible_run_ids = tuple(
+                run_id
+                for run_id in checked_terminal_run_ids
+                if _resource_cleanup_status(self._runs[run_id].resources) == "cleaned"
+            )
+            if set(run_ids) != set(eligible_run_ids):
+                raise RunDeletionNotAllowedError(
+                    "checked, fully cleaned terminal runs changed; "
+                    "refresh and confirm deletion again"
+                )
+            if not eligible_run_ids:
+                return ()
+
+            previous_runs = self._runs.copy()
+            for run_id in eligible_run_ids:
+                del self._runs[run_id]
+            try:
+                self._write_run_history_locked()
+            except RunHistoryError:
+                self._runs = previous_runs
+                raise
+            self._mark_changed()
+            return eligible_run_ids
 
     def _get_run(self, run_id: int) -> _RunRecord:
         try:
@@ -1364,8 +1752,10 @@ class PythonRunner:
             self._ensure_open()
             run = self._get_run(run_id)
             cleanup_lock = run.cleanup_lock
-        if not cleanup_lock.acquire(blocking=False):
-            raise RunCleanupInProgressError(f"run {run_id} cleanup is already active")
+            if not cleanup_lock.acquire(blocking=False):
+                raise RunCleanupInProgressError(
+                    f"run {run_id} cleanup is already active"
+                )
         try:
             with self._lock:
                 self._ensure_open()
@@ -1449,6 +1839,7 @@ class PythonRunner:
                         )
                         self._mark_changed()
             with self._lock:
+                self._persist_run_history_locked()
                 return self._snapshot_run(run)
         finally:
             cleanup_lock.release()
@@ -1818,6 +2209,12 @@ class PythonRunner:
             if remaining <= 0:
                 break
             thread.join(remaining)
+        if any(thread.is_alive() for thread in wait_threads):
+            logger.warning(
+                "Retaining terminal run history lock while runner threads exit"
+            )
+        else:
+            self._release_run_history_lock()
 
     def _read_stream(
         self,
@@ -2285,6 +2682,7 @@ class PythonRunner:
                 )
                 terminal_state = run.state
                 self._mark_changed()
+                self._persist_run_history_locked()
 
             self._notify_terminal(
                 run_id=run.run_id, state=terminal_state, exit_code=exit_code
@@ -2366,6 +2764,7 @@ class PythonRunner:
             )
             terminal_state = run.state
             self._mark_changed()
+            self._persist_run_history_locked()
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)

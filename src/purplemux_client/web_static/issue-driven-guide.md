@@ -55,7 +55,7 @@ Unknown fields are rejected. `mode`, `policy_issue`, `implementer_agent`, and
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `policy_issue` | integer | Optional positive Issue number containing version-wide design context; it must not also appear in `issues`. |
 | `issues` | array of integers | Positive, unique Issue numbers, executed in the listed order. |
-| `max_reviews` | integer | Automatic review/fix iteration limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. |
+| `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 5 unless the user requests another value. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
 | `merge_to_integration` | boolean | Whether each safely deliverable Issue PR is merged into the integration branch, including explicit warning continuations. |
@@ -63,6 +63,15 @@ Unknown fields are rejected. `mode`, `policy_issue`, `implementer_agent`, and
 | `merge_final` | boolean | Whether final delivery is automatically merged into `final_branch`. |
 
 Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
+
+Each implementation Issue is reviewed in two ordered phases. A fixed internal
+limit of three Scope / Design reviews checks that the change is necessary,
+sufficient, minimal, and placed within the right responsibilities. After that
+phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
+safety, regressions, and tests. The counters and outcomes are independent. A
+phase that exhausts its limit may continue with an explicit warning after exact
+clean, pushed PR topology is revalidated; it is never recorded as approved.
+Whole-version Review remains a separate integration and cross-Issue review.
 
 ## Canonical example
 

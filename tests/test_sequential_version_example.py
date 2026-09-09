@@ -96,6 +96,436 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ("APPROVED", "APPROVED"),
+        ("## APPROVED", "APPROVED"),
+        ("**APPROVED**", "APPROVED"),
+        ("Verdict: APPROVED", "APPROVED"),
+        ("**Verdict: APPROVED**", "APPROVED"),
+        ("Review result:\nAPPROVED\n\n- no findings", "APPROVED"),
+        ("CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+        ("### CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+        ("**CHANGES_REQUESTED**", "CHANGES_REQUESTED"),
+        ("Verdict: CHANGES_REQUESTED", "CHANGES_REQUESTED"),
+        ("`Verdict: CHANGES_REQUESTED`", "CHANGES_REQUESTED"),
+        ("Review result:\nCHANGES_REQUESTED\n\n- finding", "CHANGES_REQUESTED"),
+        ("`approved`", "APPROVED"),
+        ("Verdict:   changes_requested", "CHANGES_REQUESTED"),
+    ],
+)
+def test_decision_accepts_bounded_reviewer_verdict_variations(
+    result: str, expected: str
+) -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    assert decision(result) == expected
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "APPROVED and CHANGES_REQUESTED",
+        "APPROVED\nCHANGES_REQUESTED",
+        "Review result:\nAPPROVED\nCHANGES_REQUESTED",
+        "Verdict: CHANGES_REQUESTED\n## APPROVED",
+        "I initially considered APPROVED,\nbut the final verdict is CHANGES_REQUESTED.",
+        "Review result:\nNothing conclusive\nPlease retry",
+        "Introduction\nDetails\nMore details\nAPPROVED",
+        "NOT APPROVED",
+        "This review is APPROVED",
+        "UNAPPROVED",
+    ],
+)
+def test_decision_fails_closed_for_ambiguous_or_invalid_results(result: str) -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    with pytest.raises(WorkerFailure):
+        decision(result)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            "CHANGES_REQUESTED\nScope was not APPROVED because coverage is missing.",
+            "CHANGES_REQUESTED",
+        ),
+        (
+            "APPROVED\nThe prior CHANGES_REQUESTED findings have been resolved.",
+            "APPROVED",
+        ),
+    ],
+)
+def test_decision_ignores_verdict_words_in_finding_prose(
+    result: str, expected: str
+) -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    assert decision(result) == expected
+
+
+def test_decision_accepts_repeated_equivalent_standalone_verdicts() -> None:
+    decision = runpy.run_path(str(EXAMPLE))["decision"]
+
+    assert decision("APPROVED\nVerdict: APPROVED") == "APPROVED"
+
+
+def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert "integration consistency across Issues" in source
+    assert "duplication between their implementations" in source
+    assert "cross-feature interactions" in source
+    assert "shared versus feature-specific" in source
+    assert "right boundaries" in source
+
+
+def test_all_review_phases_share_decision_parser() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert source.count("def decision(result: str) -> str:") == 1
+    assert source.count("decision(result)") == 2
+
+
+def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    principle = workflow["IMPLEMENTATION_PRINCIPLE"]
+    issue_type = workflow["Issue"]
+    config_type = workflow["Config"]
+    config = config_type(
+        Path("/tmp/project"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(149, "feature/issue-149"),),
+        "git diff --check",
+    )
+
+    implementation, scope_review, correctness_review = workflow["issue_prompts"](
+        config.issues[0], config
+    )
+
+    assert principle in implementation
+    assert principle not in scope_review
+    assert principle not in correctness_review
+    assert "reuse" in scope_review.lower()
+    assert "responsibilities" in scope_review
+    assert "over-generalization" in scope_review
+    assert "policy Issue" in scope_review
+    assert "functional behavior" in correctness_review
+    assert "Do not reopen scope preferences" in correctness_review
+    assert "Reuse the existing implementation where appropriate" in principle
+    assert "minimum required for this Issue" in principle
+    assert "mixing responsibilities unnaturally" in principle
+    assert "over-generalizing distinct behavior" in principle
+
+
+def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert "MAX_SCOPE_REVIEWS = 3" in source
+    assert "max_reviews=MAX_SCOPE_REVIEWS" in source
+    assert "max_reviews=MAX_REVIEWS" in source
+    for field in (
+        "scope_reviews=",
+        "correctness_reviews=",
+        "scope_outcome=",
+        "correctness_outcome=",
+    ):
+        assert field in source
+
+
+def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
+    tree = ast.parse(EXAMPLE.read_text(encoding="utf-8"))
+    prompts: dict[str, ast.expr] = {}
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != "run_turn":
+            continue
+        name = call.args[2]
+        if isinstance(name, ast.Constant):
+            label = str(name.value)
+        elif isinstance(name, ast.JoinedStr):
+            label = "".join(
+                str(value.value)
+                for value in name.values
+                if isinstance(value, ast.Constant)
+            )
+        else:
+            continue
+        prompts[label] = call.args[3]
+
+    # Initial implementation, cleanup/remediation, phase fixes, and whole-version
+    # fixes are the four prompt-producing implementer paths.
+    assert isinstance(prompts["Issue # implementation"], ast.Name)
+    for label in ("Clean worktree", "Issue #  fixes", "Whole-version fixes"):
+        prompt = prompts[label]
+        assert isinstance(prompt, ast.Call)
+        assert isinstance(prompt.func, ast.Name)
+        assert prompt.func.id == "implementer_prompt"
+    for label in ("Issue #  review", "Whole-version reviewer turn"):
+        prompt = prompts[label]
+        assert not (
+            isinstance(prompt, ast.Call)
+            and isinstance(prompt.func, ast.Name)
+            and prompt.func.id == "implementer_prompt"
+        )
+
+
+def test_scope_review_fix_is_re_reviewed_with_an_independent_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    review_issue_phase = workflow["review_issue_phase"]
+    globals_ = review_issue_phase.__globals__
+    issue = workflow["Issue"](150, "feature/issue-150")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    original = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+    fixed_sha = "fixed-head"
+    current = original
+    agent_results = iter(
+        ((original.head_sha, False), (fixed_sha, True), (fixed_sha, False))
+    )
+    turns: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (issue.branch, fixed_sha)
+            return BranchState(branch, fixed_sha, fixed_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            current = replace(current, head_sha=str(kwargs["expected_head_sha"]))
+            return current
+
+    results = iter(("CHANGES_REQUESTED\nreduce the scope", "APPROVED"))
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        name = str(args[2])
+        turns.append(name)
+        return "fixed" if name.endswith("fixes") else next(results)
+
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_, "require_agent_result", lambda *args, **kwargs: next(agent_results)
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    result = review_issue_phase(
+        issue,
+        config,
+        object(),
+        Repository(),
+        GitHub(),
+        "implementer",
+        "reviewer",
+        original,
+        phase="scope/design",
+        prompt="scope prompt",
+        max_reviews=3,
+    )
+
+    assert result.outcome == "approved"
+    assert result.reviews == 2
+    assert result.head_sha == fixed_sha
+    assert turns == [
+        "Issue #150 scope/design review",
+        "Issue #150 scope/design fixes",
+        "Issue #150 scope/design review",
+    ]
+
+
+def test_scope_review_limit_continues_without_faking_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    review_issue_phase = workflow["review_issue_phase"]
+    globals_ = review_issue_phase.__globals__
+    issue = workflow["Issue"](150, "feature/issue-150")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pr = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+    findings: list[tuple[str, str, str]] = []
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            assert branch == issue.branch
+            return BranchState(branch, pr.head_sha, pr.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == pr.head_sha
+            assert kwargs["expected_base_sha"] == pr.base_sha
+            return pr
+
+    monkeypatch.setitem(
+        globals_,
+        "run_turn",
+        lambda *args, **kwargs: "CHANGES_REQUESTED\nstill too broad",
+    )
+    monkeypatch.setitem(
+        globals_,
+        "require_agent_result",
+        lambda *args, **kwargs: (pr.head_sha, False),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "emit_finding",
+        lambda category, message, status="passed": findings.append(
+            (category, message, status)
+        ),
+    )
+
+    result = review_issue_phase(
+        issue,
+        config,
+        object(),
+        Repository(),
+        GitHub(),
+        "implementer",
+        "reviewer",
+        pr,
+        phase="scope/design",
+        prompt="scope prompt",
+        max_reviews=1,
+    )
+
+    assert result.outcome == "continued_with_warning"
+    assert result.reviews == 1
+    assert any(
+        status == "warning"
+        and "CHANGES_REQUESTED" in message
+        and "without reviewer approval" in message
+        for _, message, status in findings
+    )
+
+
+def test_correctness_fix_restarts_scope_before_final_correctness_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](150, "feature/issue-150")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_a = "scope-approved-head"
+    head_b = "correctness-fixed-head"
+    base_sha = "integration-head"
+    current_pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=head_a,
+        base_sha=base_sha,
+    )
+    events: list[tuple[str, str]] = []
+    findings: list[str] = []
+    agent_results = iter(
+        (
+            (head_a, False),
+            (head_a, False),
+            (head_a, False),
+            (head_b, True),
+            (head_b, False),
+            (head_b, False),
+        )
+    )
+
+    class Repository:
+        local_sha = head_a
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, base_sha, base_sha, False)
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (issue.branch, head_b)
+            self.local_sha = head_b
+            return BranchState(branch, head_b, head_b, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == current_pr.number
+            assert kwargs["expected_head_sha"] == head_b
+            events.append(("ready", head_b))
+            return replace(current_pr, is_draft=False)
+
+    correctness_reviews = 0
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        nonlocal correctness_reviews
+        name = str(args[2])
+        prompt = str(args[3])
+        events.append((name, prompt))
+        if name.endswith("implementation"):
+            return "implementation already committed"
+        if name.endswith("correctness review"):
+            correctness_reviews += 1
+            return (
+                "CHANGES_REQUESTED\nfix correctness"
+                if correctness_reviews == 1
+                else "APPROVED"
+            )
+        if name.endswith("scope/design review"):
+            return "APPROVED"
+        if name.endswith("correctness fixes"):
+            return "fixed and committed"
+        raise AssertionError(f"unexpected turn {name}")
+
+    monkeypatch.setitem(
+        globals_, "prepare_issue", lambda *args: (current_pr, head_a, True)
+    )
+    monkeypatch.setitem(
+        globals_, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_, "require_agent_result", lambda *args, **kwargs: next(agent_results)
+    )
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *args, **kwargs: current_pr)
+    monkeypatch.setitem(
+        globals_,
+        "emit_finding",
+        lambda category, message, **kwargs: findings.append(message),
+    )
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+
+    result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+
+    review_events = [name for name, _ in events if name.endswith("review")]
+    assert review_events == [
+        "Issue #150 scope/design review",
+        "Issue #150 correctness review",
+        "Issue #150 scope/design review",
+        "Issue #150 correctness review",
+    ]
+    scope_prompts = [
+        prompt for name, prompt in events if name.endswith("scope/design review")
+    ]
+    assert head_a in scope_prompts[0]
+    assert head_b in scope_prompts[1]
+    assert result.head_sha == head_b
+    assert any(
+        "scope_reviews=2" in finding
+        and "correctness_reviews=2" in finding
+        and "scope_outcome=approved" in finding
+        and "correctness_outcome=approved" in finding
+        for finding in findings
+    )
+
+
 def test_clean_worktree_does_not_invoke_cleanup_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -313,7 +743,9 @@ def test_ready_issue_pr_is_redrafted_and_independently_reviewed(
     workflow["process_issue"](issue, config, object(), Repository(), GitHub())
 
     assert events[0] == "set_draft:True"
-    assert "Issue #90 review" in events
+    assert events.index("Issue #90 scope/design review") < events.index(
+        "Issue #90 correctness review"
+    )
     assert events[-1] == "set_draft:False"
 
 
@@ -423,7 +855,7 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
 
     workflow["process_issue"](issue, config, object(), repository, GitHub())
 
-    assert review_count == 2
+    assert review_count == 3
     assert f"push:{cleanup_sha}" in events
     assert f"require_pr:{cleanup_sha}" in events
     assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
@@ -592,13 +1024,18 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
             (initial_sha, False),
             (fixed_sha, True),
             (fixed_sha, False),
+            (fixed_sha, False),
         )
     )
 
     def run_turn(*args: object, **kwargs: object) -> str:
         name = str(args[2])
         events.append(name)
-        return "CHANGES_REQUESTED\nstill needs work" if "review" in name else "done"
+        if "scope/design review" in name:
+            return "CHANGES_REQUESTED\nstill needs work"
+        if "correctness review" in name:
+            return "APPROVED"
+        return "done"
 
     monkeypatch.setitem(
         workflow_globals,
@@ -618,6 +1055,7 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         workflow_globals, "ensure_issue_pr", lambda *args, **kwargs: current_pr
     )
     monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(workflow_globals, "MAX_SCOPE_REVIEWS", 2)
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(
         workflow_globals,
@@ -630,9 +1068,11 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
 
     assert result.is_draft is False
-    assert events.count("Issue #134 review") == 2
-    assert events.count("Issue #134 fixes") == 1
-    assert events[-2:] == ["require_pushed", f"ready:{fixed_sha}"]
+    assert events.count("Issue #134 scope/design review") == 2
+    assert events.count("Issue #134 scope/design fixes") == 1
+    assert events.count("Issue #134 correctness review") == 1
+    assert "require_pushed" in events
+    assert events[-1] == f"ready:{fixed_sha}"
     assert any(
         status == "warning"
         and "review limit 2 reached" in message
@@ -695,6 +1135,7 @@ def test_policy_conflict_from_fixer_is_persisted_after_pushed_head(
             (initial_sha, False),
             (initial_sha, False),
             (fixed_sha, True),
+            (fixed_sha, False),
             (fixed_sha, False),
         )
     )
@@ -784,7 +1225,14 @@ def test_policy_conflict_from_changed_reviewer_uses_reacquired_child_head(
         def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
             return replace(current_pr, is_draft=False)
 
-    results = iter(((initial_sha, False), (reviewed_sha, True), (reviewed_sha, False)))
+    results = iter(
+        (
+            (initial_sha, False),
+            (reviewed_sha, True),
+            (reviewed_sha, False),
+            (reviewed_sha, False),
+        )
+    )
     review_count = 0
 
     def run_turn(*args: object, **kwargs: object) -> str:
@@ -818,7 +1266,7 @@ def test_policy_conflict_from_changed_reviewer_uses_reacquired_child_head(
 
     workflow["process_issue"](issue, config, object(), Repository(), GitHub())
 
-    assert review_count == 2
+    assert review_count == 3
     assert persisted_heads
     assert set(persisted_heads) == {reviewed_sha}
 

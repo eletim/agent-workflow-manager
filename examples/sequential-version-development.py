@@ -46,6 +46,7 @@ WORKFLOW_OUTLINE = [
     "Review and deliver the whole version",
 ]
 MAX_REVIEWS = 5
+MAX_SCOPE_REVIEWS = 3
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -56,6 +57,12 @@ COMMAND_TIMEOUT = 30
 MERGE_TO_INTEGRATION = True
 FINAL_REVIEW = True
 MERGE_FINAL = False
+IMPLEMENTATION_PRINCIPLE = (
+    "Reuse the existing implementation where appropriate and keep the change scope "
+    "to the minimum required for this Issue. Do not achieve a minimal diff or "
+    "reduced code size by mixing responsibilities unnaturally or by "
+    "over-generalizing distinct behavior into shared abstractions."
+)
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 POLICY_CONFLICT_WARNINGS: list[tuple[int | None, str]] = []
@@ -101,6 +108,16 @@ class IssueHandoffResult:
 
 
 ISSUE_HANDOFF_RESULTS: list[IssueHandoffResult] = []
+
+
+@dataclass(frozen=True)
+class IssueReviewPhaseResult:
+    pr: PullRequestState
+    outcome: Literal["approved", "continued_with_warning", "head_changed"]
+    head_sha: str
+    base_sha: str
+    reviews: int
+    warnings: tuple[str, ...] = ()
 
 
 def parse_args() -> Config:
@@ -235,6 +252,11 @@ def run_turn(
     return result
 
 
+def implementer_prompt(prompt: str) -> str:
+    """Add the shared change-boundary policy to an implementation turn."""
+    return f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}"
+
+
 def run_outline_step(name: str, action):
     """Run one concrete outline unit while retaining detailed nested progress."""
     emit_step(name, "started")
@@ -252,11 +274,34 @@ def run_outline_step(name: str, action):
     return result
 
 
+_REVIEW_VERDICTS = {"APPROVED", "CHANGES_REQUESTED"}
+_VERDICT_PREFIX = re.compile(r"^VERDICT\s*:\s*", re.IGNORECASE)
+
+
+def _normalized_verdict(line: str) -> str | None:
+    normalized = line.strip().upper()
+    normalized = re.sub(r"^#{1,6}\s*", "", normalized)
+    normalized = normalized.strip(" \t*_`")
+    normalized = _VERDICT_PREFIX.sub("", normalized)
+    normalized = normalized.strip(" \t*_`")
+    normalized = " ".join(normalized.split())
+    return normalized if normalized in _REVIEW_VERDICTS else None
+
+
 def decision(result: str) -> str:
-    verdict = next((line.strip() for line in result.splitlines() if line.strip()), "")
-    if verdict not in {"APPROVED", "CHANGES_REQUESTED"}:
-        raise WorkerFailure("reviewer must begin with APPROVED or CHANGES_REQUESTED")
-    return verdict
+    leading_lines = [line for line in result.splitlines() if line.strip()][:3]
+    verdicts = [
+        verdict
+        for line in leading_lines
+        if (verdict := _normalized_verdict(line)) is not None
+    ]
+    if len(set(verdicts)) > 1:
+        raise WorkerFailure("reviewer verdict is ambiguous")
+    if verdicts:
+        return verdicts[0]
+    raise WorkerFailure(
+        "reviewer must provide APPROVED or CHANGES_REQUESTED near the beginning"
+    )
 
 
 def policy_context(config: Config, *, scope: str) -> str:
@@ -620,7 +665,7 @@ def require_clean_worktree(
         client,
         tab,
         "Clean worktree",
-        f"""Your only task is to make the current repository state clean and
+        implementer_prompt(f"""Your only task is to make the current repository state clean and
 correct before {context}. The worktree is on {branch!r}. Inspect Git status and
 every existing diff first. Preserve and commit all intended source, test, and
 configuration changes. Add only narrow, appropriate .gitignore entries for
@@ -631,7 +676,7 @@ Do not push, modify PR state, merge, start a review, reset, stash, rebase,
 force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
-ignored, removed, or could not resolve.""",
+ignored, removed, or could not resolve."""),
         iteration=iteration,
     )
     remaining = repo.inspect_worktree()
@@ -672,48 +717,9 @@ def require_agent_result(
     return result.local_sha, result.local_sha != previous_sha
 
 
-def require_warning_delivery(
-    repo: GitRepository,
-    github: GitHubRepository,
-    pr: PullRequestState,
-    *,
-    head: str,
-    base: str,
-    expected_head_sha: str,
-    expected_base_sha: str,
-) -> PullRequestState:
-    """Revalidate exact clean, pushed PR topology before unapproved delivery."""
-    pushed = repo.require_pushed(head)
-    if pushed.local_sha != expected_head_sha:
-        raise WorkerFailure(
-            f"warning delivery head changed: expected {expected_head_sha}, "
-            f"found {pushed.local_sha}"
-        )
-    current = github.require_pr(
-        number=pr.number,
-        head=head,
-        base=base,
-        state="OPEN",
-        expected_head_sha=expected_head_sha,
-        expected_base_sha=expected_base_sha,
-        draft=True,
-    )
-    if current.auto_merge_enabled:
-        raise WorkerFailure(
-            f"warning delivery PR #{current.number} has auto-merge enabled"
-        )
-    if current.merge_queue_entry is not None:
-        raise WorkerFailure(
-            f"warning delivery PR #{current.number} has a merge queue entry"
-        )
-    return current
-
-
-def issue_prompts(issue: Issue, config: Config) -> tuple[str, str]:
+def issue_prompts(issue: Issue, config: Config) -> tuple[str, str, str]:
     context = policy_context(config, scope=f"Issue #{issue.number}")
-    implementation = (
-        context
-        + f"""Implement Issue #{issue.number} in {config.slug} on the
+    implementation = context + implementer_prompt(f"""Implement Issue #{issue.number} in {config.slug} on the
 existing branch {issue.branch}, based on {config.integration_branch}. Read the
 Issue with gh. Inspect existing Git and GitHub state before editing because this
 may be a new recovery run. Implement only the requested Issue and run appropriate
@@ -725,15 +731,30 @@ change, leaving none uncommitted or untracked. Push the exact feature branch
 Never reset, rebase, stash, force-push, merge the Issue PR, target
 {config.main_branch}, create unrelated PRs, or discard ambiguous local work.
 Return a concise summary including the commit SHA and PR number or URL when
-available."""
-    )
-    review = (
-        context
-        + f"""Independently review Issue #{issue.number} and its PR from
-{issue.branch} to {config.integration_branch}. Do not mutate files or PR state.
-Return APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
-    )
-    return implementation, review
+available.""")
+    scope_review = context + f"""Perform only the Scope / Design Review for Issue
+#{issue.number} and its PR from {issue.branch} to {config.integration_branch}.
+Read the Issue body and inspect the PR diff. Decide whether the changed targets,
+amount of change, and responsibility placement are necessary and sufficient for
+the Issue. Check for unrelated work or unnecessary refactors, failure to reuse
+appropriate existing implementation, unnatural mixing of responsibilities to
+minimize the diff, over-generalization of meaningfully distinct behavior, and
+unnecessary violations of the existing architecture or Source of Truth. If the
+Issue identifies a policy Issue, use that version-design context; the
+implementation Issue remains authoritative when they conflict, and report the
+conflict as a warning. Do not focus on detailed implementation bugs in this
+phase. Do not mutate files or PR state. Return APPROVED or CHANGES_REQUESTED
+first, followed by actionable findings."""
+    correctness_review = context + f"""Perform only the Correctness Review for Issue
+#{issue.number} and its PR from {issue.branch} to {config.integration_branch}.
+The change scope has already completed Scope / Design Review. Concentrate on
+whether that implementation is correct and safe: functional behavior, edge
+cases, state and lifecycle consistency, error handling, races or stale state,
+Git/GitHub topology, regressions, missing tests, cleanup and resource ownership,
+and security or secret handling. Do not reopen scope preferences unless they
+cause a concrete correctness problem. Do not mutate files or PR state. Return
+APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
+    return implementation, scope_review, correctness_review
 
 
 def prepare_issue(
@@ -877,6 +898,242 @@ def merge_pr_and_advance(
     return merged
 
 
+def require_warning_delivery(
+    repo: GitRepository,
+    github: GitHubRepository,
+    pr: PullRequestState,
+    *,
+    head: str,
+    base: str,
+    expected_head_sha: str,
+    expected_base_sha: str,
+) -> PullRequestState:
+    """Revalidate exact clean, pushed topology before unapproved continuation."""
+    pushed = repo.require_pushed(head)
+    if pushed.local_sha != expected_head_sha:
+        raise WorkerFailure(
+            f"warning delivery head changed: expected {expected_head_sha}, "
+            f"found {pushed.local_sha}"
+        )
+    current = github.require_pr(
+        number=pr.number,
+        head=head,
+        base=base,
+        state="OPEN",
+        expected_head_sha=expected_head_sha,
+        expected_base_sha=expected_base_sha,
+        draft=True,
+    )
+    if current.auto_merge_enabled:
+        raise WorkerFailure(
+            f"warning delivery PR #{current.number} has auto-merge enabled"
+        )
+    if current.merge_queue_entry is not None:
+        raise WorkerFailure(
+            f"warning delivery PR #{current.number} has a merge queue entry"
+        )
+    return current
+
+
+def review_issue_phase(
+    issue: Issue,
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+    implementer: str,
+    reviewer: str,
+    pr: PullRequestState,
+    *,
+    phase: str,
+    prompt: str,
+    max_reviews: int,
+    review_offset: int = 0,
+    restart_scope_on_change: bool = False,
+) -> IssueReviewPhaseResult:
+    """Run one independently counted Issue review/fix phase."""
+    if review_offset >= max_reviews:
+        warning = (
+            f"Issue #{issue.number} {phase} review limit {max_reviews} was already "
+            "reached before the current head could complete this phase; continuing "
+            "without reviewer approval."
+        )
+        current = require_warning_delivery(
+            repo,
+            github,
+            pr,
+            head=issue.branch,
+            base=config.integration_branch,
+            expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+        )
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("git", warning, status="warning")
+        return IssueReviewPhaseResult(
+            current,
+            "continued_with_warning",
+            current.head_sha,
+            current.base_sha,
+            review_offset,
+            (warning,),
+        )
+    for review_number in range(review_offset + 1, max_reviews + 1):
+        result = run_turn(
+            client,
+            reviewer,
+            f"Issue #{issue.number} {phase} review",
+            f"{prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
+            iteration=review_number,
+            pr=pr,
+        )
+        emit_policy_conflicts(
+            result,
+            config,
+            scope=f"{phase} review of Issue #{issue.number}",
+            issue_number=issue.number,
+        )
+        current = github.require_pr(
+            number=pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+            draft=True,
+        )
+        reviewed_sha, reviewer_changed = require_agent_result(
+            repo,
+            client,
+            implementer,
+            issue.branch,
+            current.head_sha,
+            allow_unchanged=True,
+            iteration=review_number,
+        )
+        if reviewer_changed:
+            pushed = repo.ensure_pushed(issue.branch, expected_local_sha=reviewed_sha)
+            assert pushed.remote_sha is not None
+            pr = github.require_pr(
+                number=pr.number,
+                head=issue.branch,
+                base=config.integration_branch,
+                state="OPEN",
+                expected_head_sha=pushed.remote_sha,
+                expected_base_sha=current.base_sha,
+                draft=True,
+            )
+            pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
+            emit_finding(
+                "git",
+                f"{phase} review changed {issue.branch}; outcome invalidated at "
+                f"{reviewed_sha}",
+            )
+            if restart_scope_on_change:
+                return IssueReviewPhaseResult(
+                    pr, "head_changed", pr.head_sha, pr.base_sha, review_number
+                )
+            continue
+        current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
+        if decision(result) == "APPROVED":
+            return IssueReviewPhaseResult(
+                current, "approved", current.head_sha, current.base_sha, review_number
+            )
+        if review_number == max_reviews:
+            warning = (
+                f"Issue #{issue.number} {phase} review limit {max_reviews} reached "
+                "with CHANGES_REQUESTED; continuing without reviewer approval."
+            )
+            current = require_warning_delivery(
+                repo,
+                github,
+                current,
+                head=issue.branch,
+                base=config.integration_branch,
+                expected_head_sha=current.head_sha,
+                expected_base_sha=current.base_sha,
+            )
+            print(f"WARN: {warning}", flush=True)
+            emit_finding("git", warning, status="warning")
+            return IssueReviewPhaseResult(
+                current,
+                "continued_with_warning",
+                current.head_sha,
+                current.base_sha,
+                review_number,
+                (warning,),
+            )
+        fix_result = run_turn(
+            client,
+            implementer,
+            f"Issue #{issue.number} {phase} fixes",
+            implementer_prompt(
+                policy_context(config, scope=f"fixes for Issue #{issue.number}")
+                + f"""Re-evaluate every {phase} review finding below. If warranted,
+fix, test, commit, and leave the worktree clean. If no change is warranted,
+leave it clean and explain why; do not create an empty commit.\n\n{result}"""
+            ),
+            iteration=review_number,
+            pr=pr,
+        )
+        emit_policy_conflicts(
+            fix_result,
+            config,
+            scope=f"{phase} fixes for Issue #{issue.number}",
+            issue_number=issue.number,
+        )
+        fixed_sha, changed = require_agent_result(
+            repo,
+            client,
+            implementer,
+            issue.branch,
+            current.head_sha,
+            allow_unchanged=True,
+            iteration=review_number,
+        )
+        if not changed:
+            warning = (
+                f"Issue #{issue.number} {phase} reviewer requested changes, but "
+                "the implementer re-evaluated the finding and produced no code "
+                "changes; continuing without reviewer approval."
+            )
+            current = require_warning_delivery(
+                repo,
+                github,
+                current,
+                head=issue.branch,
+                base=config.integration_branch,
+                expected_head_sha=current.head_sha,
+                expected_base_sha=current.base_sha,
+            )
+            print(f"WARN: {warning}", flush=True)
+            emit_finding("git", warning, status="warning")
+            return IssueReviewPhaseResult(
+                current,
+                "continued_with_warning",
+                current.head_sha,
+                current.base_sha,
+                review_number,
+                (warning,),
+            )
+        pushed = repo.ensure_pushed(issue.branch, expected_local_sha=fixed_sha)
+        assert pushed.remote_sha is not None
+        pr = github.require_pr(
+            number=pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=pushed.remote_sha,
+            expected_base_sha=current.base_sha,
+            draft=True,
+        )
+        pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
+        if restart_scope_on_change:
+            return IssueReviewPhaseResult(
+                pr, "head_changed", pr.head_sha, pr.base_sha, review_number
+            )
+    raise WorkerFailure(f"Issue #{issue.number} {phase} review ended unexpectedly")
+
+
 def process_issue(
     issue: Issue,
     config: Config,
@@ -934,13 +1191,21 @@ def process_issue(
         agent_type=IMPLEMENTER_AGENT,
         name=f"Issue {issue.number} implementer",
     )
-    reviewer = create_agent(
+    scope_reviewer = create_agent(
         client,
         config,
         agent_type=REVIEWER_AGENT,
-        name=f"Issue {issue.number} reviewer",
+        name=f"Issue {issue.number} scope reviewer",
     )
-    implementation_prompt, review_prompt = issue_prompts(issue, config)
+    correctness_reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name=f"Issue {issue.number} correctness reviewer",
+    )
+    implementation_prompt, scope_prompt, correctness_prompt = issue_prompts(
+        issue, config
+    )
     implementation_result = run_turn(
         client,
         implementer,
@@ -977,157 +1242,72 @@ def process_issue(
         pr_number=pr.number,
         pr_url=pr.url,
     )
-    delivery: ReviewDelivery | None = None
-    for review_number in range(1, MAX_REVIEWS + 1):
-        result = run_turn(
-            client,
-            reviewer,
-            f"Issue #{issue.number} review",
-            f"{review_prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
-            iteration=review_number,
-            pr=pr,
-        )
-        emit_policy_conflicts(
-            result,
+    scope_reviews = 0
+    correctness_reviews = 0
+    while True:
+        scope = review_issue_phase(
+            issue,
             config,
-            scope=f"review of Issue #{issue.number}",
-            issue_number=issue.number,
-        )
-        reviewed_sha, reviewer_changed = require_agent_result(
+            client,
             repo,
-            client,
+            github,
             implementer,
-            issue.branch,
-            pr.head_sha,
-            allow_unchanged=True,
-            iteration=review_number,
+            scope_reviewer,
+            pr,
+            phase="scope/design",
+            prompt=scope_prompt,
+            max_reviews=MAX_SCOPE_REVIEWS,
+            review_offset=scope_reviews,
         )
-        if reviewer_changed:
-            pushed = repo.ensure_pushed(issue.branch, expected_local_sha=reviewed_sha)
-            assert pushed.remote_sha is not None
-            pr = github.require_pr(
-                number=pr.number,
-                head=issue.branch,
-                base=config.integration_branch,
-                state="OPEN",
-                expected_head_sha=pushed.remote_sha,
-                expected_base_sha=pr.base_sha,
-                draft=True,
+        scope_reviews = scope.reviews
+        current_correctness_prompt = correctness_prompt
+        if scope.outcome == "continued_with_warning":
+            current_correctness_prompt += (
+                "\nThe Scope / Design phase reached warning continuation without "
+                "reviewer approval. Do not describe it as approved, and preserve "
+                "that distinction in your findings."
             )
-            pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
-            emit_finding(
-                "git",
-                f"review changed {issue.branch}; approval invalidated at "
-                f"{reviewed_sha}",
-            )
-            continue
-        current = github.require_pr(
-            number=pr.number,
-            head=issue.branch,
-            base=config.integration_branch,
-            state="OPEN",
-            expected_head_sha=pr.head_sha,
-            expected_base_sha=pr.base_sha,
-            draft=True,
-        )
-        current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
-        if decision(result) == "APPROVED":
-            delivery = ReviewDelivery(
-                "approved", current.head_sha, current.base_sha, review_number
-            )
-            break
-        if review_number == MAX_REVIEWS:
-            pr = require_warning_delivery(
-                repo,
-                github,
-                current,
-                head=issue.branch,
-                base=config.integration_branch,
-                expected_head_sha=current.head_sha,
-                expected_base_sha=current.base_sha,
-            )
-            warning = (
-                f"Issue #{issue.number} review limit {MAX_REVIEWS} reached with "
-                "CHANGES_REQUESTED; continuing without reviewer approval."
-            )
-            print(f"WARN: {warning}", flush=True)
-            emit_finding("github", warning, status="warning")
-            delivery = ReviewDelivery(
-                "continued_with_warning",
-                current.head_sha,
-                current.base_sha,
-                review_number,
-                (warning,),
-            )
-            break
-        fix_result = run_turn(
-            client,
-            implementer,
-            f"Issue #{issue.number} fixes",
-            policy_context(config, scope=f"fixes for Issue #{issue.number}")
-            + f"""Re-evaluate every finding below. If warranted, fix, test, commit,
-and leave the worktree clean. If no change is warranted, leave it clean and
-            explain why; do not create an empty commit.\n\n{result}""",
-            iteration=review_number,
-            pr=pr,
-        )
-        emit_policy_conflicts(
-            fix_result,
+        correctness = review_issue_phase(
+            issue,
             config,
-            scope=f"fixes for Issue #{issue.number}",
-            issue_number=issue.number,
-        )
-        fixed_sha, changed = require_agent_result(
-            repo,
             client,
+            repo,
+            github,
             implementer,
-            issue.branch,
-            current.head_sha,
-            allow_unchanged=True,
-            iteration=review_number,
+            correctness_reviewer,
+            scope.pr,
+            phase="correctness",
+            prompt=current_correctness_prompt,
+            max_reviews=MAX_REVIEWS,
+            review_offset=correctness_reviews,
+            restart_scope_on_change=True,
         )
-        if not changed:
-            current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
-            warning = (
-                f"Issue #{issue.number} reviewer requested changes, but the "
-                "implementer re-evaluated the finding and produced no code "
-                "changes; continuing without reviewer approval."
-            )
-            pr = require_warning_delivery(
-                repo,
-                github,
-                current,
-                head=issue.branch,
-                base=config.integration_branch,
-                expected_head_sha=current.head_sha,
-                expected_base_sha=current.base_sha,
-            )
-            print(f"WARN: {warning}", flush=True)
-            emit_finding("git", warning, status="warning")
-            delivery = ReviewDelivery(
-                "continued_with_warning",
-                current.head_sha,
-                current.base_sha,
-                review_number,
-                (warning,),
-            )
+        correctness_reviews = correctness.reviews
+        if correctness.outcome != "head_changed":
             break
-        pushed = repo.ensure_pushed(issue.branch, expected_local_sha=fixed_sha)
-        assert pushed.remote_sha is not None
-        pr = github.require_pr(
-            number=pr.number,
-            head=issue.branch,
-            base=config.integration_branch,
-            state="OPEN",
-            expected_head_sha=pushed.remote_sha,
-            expected_base_sha=current.base_sha,
-            draft=True,
+        emit_finding(
+            "git",
+            f"Issue #{issue.number} correctness changed the head to "
+            f"{correctness.head_sha}; restarting Scope / Design Review",
         )
-        pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
-    if delivery is None:
-        raise WorkerFailure(f"Issue #{issue.number} ended without a review outcome")
+        pr = correctness.pr
+    emit_finding(
+        "git",
+        f"Issue #{issue.number} review summary: scope_reviews={scope_reviews}, "
+        f"correctness_reviews={correctness_reviews}, "
+        f"scope_outcome={scope.outcome}, "
+        f"correctness_outcome={correctness.outcome}",
+    )
+    fully_approved = scope.outcome == correctness.outcome == "approved"
+    delivery = ReviewDelivery(
+        "approved" if fully_approved else "continued_with_warning",
+        correctness.head_sha,
+        correctness.base_sha,
+        scope_reviews + correctness_reviews,
+        scope.warnings + correctness.warnings,
+    )
     pr = github.set_draft(
-        pr.number,
+        correctness.pr.number,
         draft=False,
         expected_head=issue.branch,
         expected_head_sha=delivery.head_sha,
@@ -1224,11 +1404,14 @@ def review_whole_version(
             reviewer,
             "Whole-version reviewer turn",
             policy_context(config, scope="the whole-version review")
-            + f"Review exact head {pr.head_sha} against final base {pr.base_sha}. "
-            "Review the integration branch as one version, including design "
-            "consistency, duplication, cross-feature problems, and responsibility "
-            "boundaries; do not merely repeat individual PR reviews. Return "
-            "APPROVED or CHANGES_REQUESTED first; do not mutate anything.",
+            + f"Review the whole version at exact head {pr.head_sha} against final "
+            f"base {pr.base_sha}. Examine integration consistency across Issues, "
+            "duplication between their implementations, cross-feature interactions "
+            "and regressions, and whether shared versus feature-specific "
+            "responsibilities are placed at the right boundaries. Also review the "
+            "combined version for correctness, safety, and missing integration "
+            "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
+            "actionable findings; do not mutate anything.",
             iteration=review_number,
         )
         emit_policy_conflicts(result, config, scope="the integrated version")
@@ -1286,9 +1469,11 @@ def review_whole_version(
                     client,
                     fixer,
                     "Whole-version fixes",
-                    policy_context(config, scope="whole-version fixes")
-                    + f"""Re-evaluate every finding. If warranted, fix, test, commit,
+                    implementer_prompt(
+                        policy_context(config, scope="whole-version fixes")
+                        + f"""Re-evaluate every finding. If warranted, fix, test, commit,
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                    ),
                     iteration=review_number,
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")

@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from purplemux_client.errors import WorkerFailure
+from purplemux_client.git import github_origin_slug, inspect_github_repository
+
 PromptAgent = Literal["codex", "claude-code"]
 PROMPT_AGENTS = frozenset({"codex", "claude-code"})
 
@@ -17,9 +20,31 @@ class PromptExecution:
     agent: PromptAgent
     cwd: str
     prompt: str
+    repository_slug: str | None = None
+    repository_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.repository_slug is None) != (self.repository_url is None):
+            raise ValueError("Prompt repository identity must be complete")
+        if self.repository_slug is None or self.repository_url is None:
+            return
+        try:
+            actual_slug = github_origin_slug(self.repository_url)
+        except WorkerFailure as exc:
+            raise ValueError("Prompt repository URL must identify GitHub") from exc
+        if (
+            actual_slug != self.repository_slug
+            or self.repository_url != f"https://github.com/{self.repository_slug}"
+        ):
+            raise ValueError("Prompt repository identity is inconsistent")
 
     def as_json(self) -> dict[str, str]:
         return {"agent": self.agent, "cwd": self.cwd, "prompt": self.prompt}
+
+    def repository_json(self) -> dict[str, str] | None:
+        if self.repository_slug is None or self.repository_url is None:
+            return None
+        return {"slug": self.repository_slug, "url": self.repository_url}
 
 
 def prepare_prompt_execution(*, agent: str, cwd: str, prompt: str) -> PromptExecution:
@@ -38,7 +63,17 @@ def prepare_prompt_execution(*, agent: str, cwd: str, prompt: str) -> PromptExec
         raise ValueError(f"cwd could not be resolved: {exc}") from exc
     if not resolved.is_dir():
         raise ValueError(f"cwd is not a directory: {resolved}")
-    return PromptExecution(cast(PromptAgent, agent), str(resolved), prompt)
+    try:
+        repository = inspect_github_repository(resolved)
+    except WorkerFailure:
+        repository = None
+    return PromptExecution(
+        cast(PromptAgent, agent),
+        str(resolved),
+        prompt,
+        repository_slug=repository.slug if repository is not None else None,
+        repository_url=repository.url if repository is not None else None,
+    )
 
 
 def build_prompt_workflow(execution: PromptExecution) -> str:

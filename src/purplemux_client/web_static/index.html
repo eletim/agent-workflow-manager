@@ -27,6 +27,9 @@
           <span id="runs-empty">No runs yet.</span>
           <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
         </summary>
+        <div class="run-history-actions">
+          <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
+        </div>
         <div id="run-list" class="run-list"></div>
       </details>
 
@@ -39,6 +42,10 @@
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
           <button id="new-run" type="button">New run</button>
+        </div>
+        <div id="repository-navigation" class="repository-navigation" hidden>
+          <span>Repository: <strong id="repository-slug"></strong></span>
+          <a id="repository-link" target="_blank" rel="noopener noreferrer">Open GitHub Repository</a>
         </div>
         <div id="prompt-fields" class="prompt-fields" hidden>
           <div class="prompt-options">
@@ -107,6 +114,7 @@ emit_step("workspace create", "completed")</textarea>
           <button id="run" class="primary">Run</button>
           <button id="stop" disabled>Stop</button>
           <button id="cleanup" disabled>Cleanup</button>
+          <button id="checked-toggle" type="button" hidden>Mark checked</button>
           <span id="exit-code">Exit code: —</span>
         </div>
       </section>

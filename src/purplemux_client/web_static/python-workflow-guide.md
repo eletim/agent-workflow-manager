@@ -429,8 +429,15 @@ created, so an unavailable or overridden trust configuration fails early. Trust
 mutations are serialized through a user-local lock so concurrent Workflow
 processes cannot lose another worktree's configuration update.
 Fresh worktrees are handled independently from their source repository path.
-This does not change sandbox or approval policy. AWM does not apply a broad
-permission bypass or simulated trust-dialog keystrokes to Claude Code.
+For Claude, the same exact launch-path boundary is enforced before updating and
+verifying only `projects[canonical_path].hasTrustDialogAccepted` in Claude Code's
+project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrated
+`.config.json`, legacy `.claude.json`, and custom-OAuth state precedence;
+unrelated state is preserved, and updates coordinate on Claude's state-file lock.
+Claude home-directory trust fails early because Claude does not persist it.
+Neither provider integration changes sandbox or approval policy, and AWM does
+not use a broad permission bypass, screen-text detection, or simulated
+trust-dialog keystrokes.
 
 Relevant errors all derive from `TerminalSessionError`:
 
@@ -868,8 +875,10 @@ result = run_turn(session_id, "Run the requested tests and report the result.")
 ```
 
 Implement/review/fix: use separate implementer and reviewer sessions. Give each
-turn one bounded role; parse a small explicit review protocol such as a first
-line of `APPROVED` or `CHANGES_REQUESTED`; keep the loop in Python.
+turn one bounded role; parse a small explicit review protocol near the beginning
+of the result, accepting harmless Markdown decoration while rejecting negation
+or competing verdicts; keep the loop in Python. Never search the entire result
+for a verdict.
 
 Maximum attempts: use `range(1, maximum + 1)` and fail explicitly when the last
 review still requests changes. Never start an unbounded agent or Python retry
@@ -909,6 +918,8 @@ until explicit Cleanup.
 
 ```python
 from __future__ import annotations
+
+import re
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -991,12 +1002,23 @@ def run_turn(
 
 
 def review_decision(result: str) -> str:
-    first_line = next(
-        (line.strip() for line in result.splitlines() if line.strip()), ""
-    )
-    if first_line in {"APPROVED", "CHANGES_REQUESTED"}:
-        return first_line
-    raise WorkerFailure("review result must start with APPROVED or CHANGES_REQUESTED")
+    # Inspect only a small leading window. Reject competing verdicts before
+    # normalizing Markdown decoration or a short prefix on an otherwise exact line.
+    leading = [line for line in result.splitlines() if line.strip()][:3]
+    token = re.compile(r"(?<![A-Z_])(APPROVED|CHANGES_REQUESTED)(?![A-Z_])")
+    candidates = {
+        match.group(1) for line in leading for match in token.finditer(line.upper())
+    }
+    if len(candidates) > 1:
+        raise WorkerFailure("review verdict is ambiguous")
+    for line in leading:
+        normalized = re.sub(r"^#{1,6}\s*", "", line.strip().upper())
+        normalized = normalized.strip(" \t*_`")
+        normalized = re.sub(r"^VERDICT\s*:\s*", "", normalized)
+        normalized = " ".join(normalized.strip(" \t*_`").split())
+        if normalized in {"APPROVED", "CHANGES_REQUESTED"}:
+            return normalized
+    raise WorkerFailure("review verdict is missing near the beginning")
 
 
 emit_step("workspace create", "started")

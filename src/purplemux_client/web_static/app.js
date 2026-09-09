@@ -23,14 +23,19 @@ const directoryPickerMessage = document.querySelector("#directory-picker-message
 const directoryPickerList = document.querySelector("#directory-picker-list");
 const directoryPickerSelect = document.querySelector("#directory-picker-select");
 const activeContext = document.querySelector("#active-context");
+const repositoryNavigation = document.querySelector("#repository-navigation");
+const repositorySlug = document.querySelector("#repository-slug");
+const repositoryLink = document.querySelector("#repository-link");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
+const deleteCheckedRunsButton = document.querySelector("#delete-checked-runs");
 const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
 const validateButton = document.querySelector("#validate");
 const dryRunButton = document.querySelector("#dry-run");
 const stopButton = document.querySelector("#stop");
 const cleanupButton = document.querySelector("#cleanup");
+const checkedToggle = document.querySelector("#checked-toggle");
 const statusBadge = document.querySelector("#status");
 const stdout = document.querySelector("#stdout");
 const stderr = document.querySelector("#stderr");
@@ -131,7 +136,13 @@ let promptDraft = {
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
 let explicitNewRun = false;
+// The last detail response accepted for the selected run. This is the only
+// source used when carrying a reusable folder into a new-run draft; list
+// summaries and rendered text are intentionally insufficient.
+let activeRunSnapshot = null;
 let activeRunGeneration = 0;
+let deletableRunIds = [];
+let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
@@ -240,6 +251,36 @@ function captureDraftIfEditing() {
   }
 }
 
+function reusableFolder(snapshot) {
+  if (snapshot?.mode === "prompt") {
+    return snapshot.prompt?.cwd || snapshot.cwd || null;
+  }
+  return snapshot?.executionContext?.sourceRepository || null;
+}
+
+function inheritFolderIntoDraft(snapshot, mode) {
+  const folder = reusableFolder(snapshot);
+  if (typeof folder !== "string" || folder === "") return;
+  if (mode === "prompt") {
+    promptDraft = {...promptDraft, cwd: folder};
+    return;
+  }
+  if (mode !== "issue-driven") return;
+  try {
+    const config = JSON.parse(issueDrivenDraft.json);
+    if (config === null || Array.isArray(config) || typeof config !== "object") return;
+    config.repository = folder;
+    issueDrivenDraft = {
+      ...issueDrivenDraft,
+      json: JSON.stringify(config, null, 2),
+      code: "",
+    };
+  } catch {
+    // Preserve invalid in-progress JSON exactly; normal validation will show
+    // the user what needs fixing.
+  }
+}
+
 function renderCleanDraftState() {
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
@@ -251,10 +292,14 @@ function renderCleanDraftState() {
   exitCode.textContent = "Exit code: —";
   stopButton.disabled = true;
   cleanupButton.disabled = true;
+  checkedToggle.hidden = true;
+  checkedToggle.disabled = true;
+  checkedToggle.setAttribute("aria-pressed", "false");
 
   renderOutline([], []);
   renderProgress([]);
   renderIntegrationPr(null);
+  renderRepository(null);
   renderIssueDrivenSummary(null);
   renderRecovery({state: "idle", attempts: []});
   renderResources({
@@ -310,9 +355,15 @@ function renderRun(result) {
   cleanupButton.disabled = activeRunId === null
     || !result.cleanupAvailable
     || ["cleaned", "cleaning"].includes(result.resourceCleanupStatus);
+  const checkable = ["success", "failed", "stopped"].includes(result.state);
+  checkedToggle.hidden = activeRunId === null || !checkable;
+  checkedToggle.disabled = activeRunId === null || !checkable;
+  checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
+  checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
   renderOutline(result.outline || [], result.progress || []);
   renderProgress(result.progress || []);
   renderIntegrationPr(result.integrationPr || null);
+  renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderIssueDrivenSummary(result.issueDrivenSummary || null);
   renderRecovery(result);
   renderResources(result);
@@ -321,6 +372,7 @@ function renderRun(result) {
   // Only an authoritative snapshot for the run currently being viewed may
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
+    activeRunSnapshot = result;
     if (currentMode === "prompt") {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
@@ -414,12 +466,35 @@ function renderIssueDrivenSummary(summary) {
 async function enterDraftMode(mode = currentMode) {
   const wasViewingRun = activeRunId !== null;
   const changedMode = mode !== currentMode;
+  const selectedRunId = activeRunId;
   // A New-run click is an explicit selection even if the fields are already
   // editable. Preserve those live edits while invalidating requests started
   // for the previous selection.
   captureDraftIfEditing();
-  activeRunGeneration += 1;
+  const transitionGeneration = ++activeRunGeneration;
+  let selectedSnapshot = activeRunSnapshot;
+  if (wasViewingRun && selectedSnapshot?.runId !== selectedRunId) {
+    try {
+      const result = await request(`/api/runs/${selectedRunId}`);
+      if (result.runId !== selectedRunId) {
+        throw new Error("Run detail did not match the selected run");
+      }
+      selectedSnapshot = result;
+    } catch (error) {
+      if (
+        transitionGeneration === activeRunGeneration
+        && activeRunId === selectedRunId
+      ) stderr.textContent = String(error);
+      return;
+    }
+  }
+  if (
+    transitionGeneration !== activeRunGeneration
+    || activeRunId !== selectedRunId
+  ) return;
+  if (wasViewingRun) inheritFolderIntoDraft(selectedSnapshot, mode);
   activeRunId = null;
+  activeRunSnapshot = null;
   currentMode = mode;
   explicitNewRun = true;
   if (wasViewingRun || changedMode) {
@@ -477,6 +552,16 @@ function renderRecovery(result) {
 function renderRunList(runs) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
+  renderedRunIds = new Set(runs.map((run) => run.runId));
+  deletableRunIds = runs.filter(
+    (run) => run.checked
+      && ["success", "failed", "stopped"].includes(run.state)
+      && run.resourceCleanupStatus === "cleaned",
+  ).map((run) => run.runId);
+  const checkedRunCount = deletableRunIds.length;
+  deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;
+  deleteCheckedRunsButton.disabled = checkedRunCount === 0;
+  deleteCheckedRunsButton.dataset.count = String(checkedRunCount);
   for (const run of [...runs].reverse()) {
     const button = document.createElement("button");
     button.type = "button";
@@ -488,7 +573,7 @@ function renderRunList(runs) {
     const executionRoot = run.mode === "prompt"
       ? run.prompt?.cwd || run.cwd
       : run.executionContext?.executionRoot || "execution context pending";
-    button.textContent = `#${run.runId}  ${mode}  ${presentation.label}  ${executionRoot}`;
+    button.textContent = `#${run.runId}  ${mode}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -497,13 +582,80 @@ function renderRunList(runs) {
     button.addEventListener("click", async () => {
       captureDraftIfEditing();
       activeRunId = run.runId;
+      activeRunSnapshot = null;
       activeRunGeneration += 1;
       explicitNewRun = false;
       await refresh();
     });
     runList.append(button);
+    if (["success", "failed", "stopped"].includes(run.state)) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = `run-check-toggle ${run.checked ? "checked" : "unchecked"}`;
+      toggle.textContent = run.checked ? "Checked" : "Unchecked";
+      toggle.setAttribute(
+        "aria-label",
+        `${run.checked ? "Mark unchecked" : "Mark checked"} Run #${run.runId}`,
+      );
+      toggle.setAttribute("aria-pressed", String(Boolean(run.checked)));
+      toggle.addEventListener("click", async () => {
+        await updateChecked(run.runId, !run.checked);
+      });
+      runList.append(toggle);
+    }
   }
 }
+
+async function updateChecked(runId, checked) {
+  const selectionGeneration = activeRunGeneration;
+  try {
+    const result = await request(`/api/runs/${runId}/checked`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({checked}),
+    });
+    if (runId === activeRunId && selectionGeneration === activeRunGeneration) {
+      renderRun(result);
+    }
+    await refresh();
+  } catch (error) {
+    stderr.textContent = String(error);
+  }
+}
+
+function showNewRunAfterHistoryDeletion() {
+  activeRunGeneration += 1;
+  activeRunId = null;
+  activeRunSnapshot = null;
+  explicitNewRun = true;
+  renderCleanDraftState();
+  showDraftLabel();
+  applyFieldMode();
+}
+
+deleteCheckedRunsButton.addEventListener("click", async () => {
+  const count = Number(deleteCheckedRunsButton.dataset.count || 0);
+  if (count < 1) return;
+  const confirmedRunIds = [...deletableRunIds];
+  const noun = count === 1 ? "run" : "runs";
+  if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
+
+  deleteCheckedRunsButton.disabled = true;
+  try {
+    const result = await request("/api/runs/delete-checked", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({runIds: confirmedRunIds}),
+    });
+    if (result.deletedRunIds.includes(activeRunId)) {
+      showNewRunAfterHistoryDeletion();
+    }
+    await refresh();
+  } catch (error) {
+    stderr.textContent = String(error);
+    await refresh();
+  }
+});
 
 function renderValidation(issues) {
   validation.replaceChildren();
@@ -732,6 +884,13 @@ function renderIntegrationPr(pr) {
   else integrationPr.removeAttribute("href");
 }
 
+function renderRepository(repository) {
+  repositoryNavigation.hidden = !repository;
+  repositorySlug.textContent = repository ? repository.slug : "";
+  if (repository) repositoryLink.setAttribute("href", repository.url);
+  else repositoryLink.removeAttribute("href");
+}
+
 function selectedGuide() {
   if (currentMode === "issue-driven") {
     return {
@@ -939,11 +1098,24 @@ async function refresh() {
       // auto-selecting, exactly as an explicit run-list click would.
       captureDraftIfEditing();
       activeRunId = runs[runs.length - 1].runId;
+      activeRunSnapshot = null;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;
     }
     const targetRunId = activeRunId;
     const selected = runs.find((run) => run.runId === targetRunId);
+    if (targetRunId !== null && !selected && renderedRunIds.has(targetRunId)) {
+      if (
+        selectionGeneration !== activeRunGeneration
+        || targetRunId !== activeRunId
+        || requestGeneration <= renderedRefreshGeneration
+      ) return;
+      showNewRunAfterHistoryDeletion();
+      renderRunList(runs);
+      renderFavicon(runs);
+      renderedRefreshGeneration = requestGeneration;
+      return;
+    }
     const result = selected
       ? await request(`/api/runs/${targetRunId}`)
       : null;
@@ -1329,6 +1501,14 @@ cleanupButton.addEventListener("click", async () => {
       && selectionGeneration === activeRunGeneration
     ) stderr.textContent = String(error);
   }
+});
+
+checkedToggle.addEventListener("click", async () => {
+  if (activeRunId === null || checkedToggle.hidden) return;
+  await updateChecked(
+    activeRunId,
+    checkedToggle.getAttribute("aria-pressed") !== "true",
+  );
 });
 
 settingsOpen.addEventListener("click", () => {

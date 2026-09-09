@@ -68,6 +68,14 @@ class FeatureRecoveryState:
     reused_existing_work: bool
 
 
+@dataclass(frozen=True)
+class GitHubRepositoryIdentity:
+    """Canonical, read-only navigation identity for a local Git repository."""
+
+    slug: str
+    url: str
+
+
 def github_origin_slug(origin: str) -> str:
     path: str
     if origin.startswith("git@github.com:"):
@@ -100,6 +108,55 @@ def github_origin_slug(origin: str) -> str:
     if len(parts) != 2 or any(not _valid_slug_part(part) for part in parts):
         raise WorkerFailure(f"origin has an invalid GitHub repository path: {origin!r}")
     return "/".join(parts)
+
+
+def inspect_github_repository(
+    path: str | Path,
+    *,
+    remote: str = "origin",
+    command_timeout_seconds: float = 30.0,
+    runner: GitCommandRunner = subprocess.run,
+) -> GitHubRepositoryIdentity:
+    """Resolve a directory to a validated GitHub repository without mutation."""
+
+    if command_timeout_seconds <= 0:
+        raise ValueError("command_timeout_seconds must be positive")
+    try:
+        requested = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise WorkerFailure(f"repository path could not be resolved: {exc}") from exc
+    if not requested.is_dir():
+        raise WorkerFailure(f"repository directory does not exist: {requested}")
+    try:
+        completed = runner(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=requested,
+            capture_output=True,
+            text=True,
+            timeout=command_timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorkerFailure(f"could not inspect Git repository: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise WorkerFailure(
+            f"could not resolve Git repository root: {detail or 'git failed'}"
+        )
+    try:
+        root = Path(completed.stdout.strip()).resolve()
+        repository = GitRepository.open(
+            root,
+            remote=remote,
+            command_timeout_seconds=command_timeout_seconds,
+            runner=runner,
+        )
+    except WorkerFailure:
+        raise
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        raise WorkerFailure(f"could not inspect GitHub repository: {exc}") from exc
+    slug = repository.expected_github_slug
+    return GitHubRepositoryIdentity(slug=slug, url=f"https://github.com/{slug}")
 
 
 class GitRepository:

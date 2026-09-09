@@ -154,10 +154,23 @@ origin is still rechecked on every topology operation.
 
 The Workflow similarly creates or reuses the exact Draft PR when the agent did
 not create one, then verifies its head, base, SHAs, and Draft state before
-review. A dirty agent result cannot advance. A review-fix turn normally has the
-same new-commit/clean contract; if the implementer explicitly re-evaluates a
-finding and returns clean without a commit, the Workflow records a WARN policy
-outcome rather than pretending that the reviewer approved it.
+review. Each Issue first receives a Scope / Design Review of whether its diff is
+necessary, sufficient, appropriately placed, and consistent with the shared
+minimal-change principle. Only then does a separately counted Correctness Review
+check implementation quality. Scope Review uses a fixed internal limit of three;
+`max_reviews` remains the Correctness and whole-version review limit, so no new
+JSON workflow field is needed. Whole-version Review retains its integration and
+cross-Issue responsibility. If a Correctness reviewer or fix changes the head,
+the prior Scope outcome is invalidated and the ordered Scope then Correctness
+sequence restarts on the new commit within the separate cumulative limits.
+
+A dirty agent result cannot advance. A review-fix turn normally has the same
+new-commit/clean contract; if the implementer explicitly re-evaluates a finding
+and returns clean without a commit, or a phase reaches its review limit, the
+Workflow records `continued_with_warning` rather than pretending that the
+reviewer approved it. Scope and Correctness outcomes and review counts are
+reported separately, and exact clean, pushed PR topology is revalidated before
+warning continuation.
 
 At a required clean-worktree boundary, a dirty state receives one focused
 CodingAgent remediation turn before failure. That turn may commit intended
@@ -303,10 +316,17 @@ fresh run worktrees, whose new paths do not inherit trust from their source
 repositories. The operation does not change Codex sandbox or approval settings
 and does not trust a parent, secondary, or unrelated path.
 
-Claude Code has no equivalent narrow path-trust mutation in the integration
-used here. AWM does not use a broad permission bypass or terminal keystroke
-automation for Claude; its provider-specific trust behavior remains owned by
-Claude Code and PurpleMux.
+Before creating a Claude tab, the adapter applies the same exact launch-directory
+check, then uses Claude Code's supported project-state contract to set only
+`projects[canonical_path].hasTrustDialogAccepted`. The state update follows
+Claude's migrated `.config.json`, legacy `.claude.json`, and custom-OAuth state
+resolver, requires an absolute `CLAUDE_CONFIG_DIR`, preserves all other Claude
+and project values, coordinates on Claude's own state-file lock, and is read back
+before launch. Claude's home directory is rejected because Claude only permits
+session-scoped trust there.
+AWM does not alter permission mode, sandbox behavior, onboarding state, parent
+directories, or unrelated projects, and does not inspect prompt text or automate
+terminal keystrokes.
 
 ## Local Python Runner UI
 
@@ -631,4 +651,12 @@ interactive trust prompt, then repeats the launch for the already-trusted path:
 ```bash
 AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_TRUST=1 \
   uv run pytest tests/test_live_codex_trust.py
+```
+
+The equivalent Claude test verifies both a fresh worktree's first turn and a
+second launch using its already-established project trust:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
+  uv run pytest tests/test_live_claude_trust.py
 ```
