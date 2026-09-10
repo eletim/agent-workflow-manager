@@ -1033,6 +1033,32 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     ]
     assert positions == sorted(positions)
     assert "MAX_REVIEWS = 5" in first
+    assert "MAX_SCOPE_REVIEWS = 6" in first
+
+
+def test_optional_scope_review_limit_round_trips_and_only_changes_scope() -> None:
+    config = parse(payload(scope_max_reviews=8))
+
+    assert config.scope_max_reviews == 8
+    assert config.as_json()["scope_max_reviews"] == 8
+    assert parse(config.as_json()) == config
+
+    code = generate_issue_driven_workflow(config)
+
+    assert "MAX_SCOPE_REVIEWS = 8" in code
+    assert "MAX_REVIEWS = 5" in code
+
+
+@pytest.mark.parametrize("scope_max_reviews", [True, 0, 101, 1.5, "6"])
+def test_scope_review_limit_must_be_an_integer_in_range(
+    scope_max_reviews: object,
+) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scope_max_reviews=scope_max_reviews))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.scope_max_reviews", "must be an integer from 1 to 100")
+    ]
 
 
 def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> None:

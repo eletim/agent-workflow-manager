@@ -109,6 +109,7 @@ dispatch is persisted.
   "policy_issue": 88,
   "issues": [90, 89],
   "max_reviews": 4,
+  "scope_max_reviews": 6,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
   "scenarios": [
@@ -132,14 +133,18 @@ original Issue as its work definition:
   "final_branch": "main",
   "one_shot_issue": 169,
   "max_reviews": 4,
+  "scope_max_reviews": 6,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
 }
 ```
 
-The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`, the
-two agent fields, and `scenarios` are optional; every other field is required.
+The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`,
+`scope_max_reviews`, the two agent fields, and `scenarios` are optional; every
+other field is required. `scope_max_reviews` defaults to 6 and controls only
+Scope / Design Review; `max_reviews` controls Correctness and whole-version
+review.
 With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal
@@ -240,12 +245,12 @@ not create one, then verifies its head, base, SHAs, and Draft state before
 review. Each Issue first receives a Scope / Design Review of whether its diff is
 necessary, sufficient, appropriately placed, and consistent with the shared
 minimal-change principle. Only then does a separately counted Correctness Review
-check implementation quality. Scope Review uses a fixed internal limit of six,
-while the recommended `max_reviews` value is four for the Correctness and
-whole-version review limit. The higher Scope limit reserves capacity for the
-required rechecks after Correctness fixes change the head, without adding a new
-JSON workflow field. Whole-version Review retains its integration and
-cross-Issue responsibility. If a Correctness reviewer or fix changes the head,
+check implementation quality. Scope Review uses `scope_max_reviews`, which
+defaults to six, while the recommended `max_reviews` value is four for the
+Correctness and whole-version review limit. The higher recommended Scope limit
+reserves capacity for the required rechecks after Correctness fixes change the
+head. Whole-version Review retains its integration and cross-Issue responsibility.
+If a Correctness reviewer or fix changes the head,
 the prior Scope outcome is invalidated and the ordered Scope then Correctness
 sequence restarts on the new commit within the separate cumulative limits.
 
