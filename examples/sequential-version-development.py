@@ -179,6 +179,7 @@ class WorkItemPlan:
     items: list[Issue] = field(init=False)
     position: int = 0
     finalized: bool = False
+    persisted_source: str | None = None
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -2005,7 +2006,23 @@ def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
     plan.finalized = finalized
     if finalized and position != len(plan.items):
         raise WorkerFailure("Base PR work-item plan completion state is inconsistent")
+    plan.persisted_source = serialized_work_item_plan(plan)
     return plan
+
+
+def deferred_work_item_plan_ref(config: Config) -> str:
+    identity = json.dumps(
+        {
+            "repository": config.slug.lower(),
+            "integration_branch": config.integration_branch,
+            "final_branch": config.main_branch,
+            "seed": plan_seed_fingerprint(config),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return f"refs/notes/agent-workflow-manager/work-item-plan-{digest}"
 
 
 def with_work_item_plan(body: str, plan: WorkItemPlan) -> str:
@@ -2062,7 +2079,14 @@ def prepare_work_item_plan_pr(
         rehydrate_policy_conflicts(merged.body, config, issue_number=None)
         return merged, plan
     if pr is None:
-        initial_plan = WorkItemPlan(config)
+        recovery_body = repo.inspect_remote_note(
+            deferred_work_item_plan_ref(config), final.remote_sha
+        )
+        initial_plan = (
+            work_item_plan_from_body(recovery_body, config)
+            if recovery_body is not None
+            else WorkItemPlan(config)
+        )
         if integration.remote_sha == final.remote_sha:
             emit_finding(
                 "github",
@@ -2115,13 +2139,22 @@ def persist_work_item_plan(
     repo: GitRepository,
     github: GitHubRepository,
     pr: PullRequestState | None,
-) -> PullRequestState:
+) -> PullRequestState | None:
     if pr is None:
         pr, _initial_plan = prepare_work_item_plan_pr(config, repo, github)
         if pr is None:
-            raise WorkerFailure(
-                "cannot persist work-item plan while Base PR creation is deferred"
+            final = repo.inspect_branch(config.main_branch)
+            if final.remote_sha is None:
+                raise WorkerFailure("final remote branch is missing")
+            source = serialized_work_item_plan(plan)
+            repo.update_remote_note(
+                deferred_work_item_plan_ref(config),
+                final.remote_sha,
+                source,
+                expected_body=plan.persisted_source,
             )
+            plan.persisted_source = source
+            return None
     if pr.state == "MERGED":
         if with_work_item_plan(pr.body, plan) != pr.body:
             raise WorkerFailure("cannot change work-item plan after final PR merge")
@@ -2192,19 +2225,6 @@ def process_work_items(
                 issue, config, client, repo, github
             ),
         )
-    if plan_pr is None:
-        issue = plan.take_next()
-        if issue is None:
-            raise WorkerFailure(
-                "cannot safely plan an empty one-shot workflow while Base PR "
-                "creation is deferred"
-            )
-        inspect_dynamic_work_item_topology(issue, config)
-        run_outline_step(
-            issue.label,
-            lambda: process_issue(issue, config, client, repo, github),
-        )
-        plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     if plan.finalized:
         return plan.snapshot
     planner = create_agent(
@@ -2243,6 +2263,8 @@ def process_work_items(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
+        if plan_pr is None:
+            plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
 
 

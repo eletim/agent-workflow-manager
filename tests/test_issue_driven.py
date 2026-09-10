@@ -2082,6 +2082,7 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
     create_calls: list[tuple[str, str]] = []
     processed: list[int] = []
     planner_calls: list[str] = []
+    recovery_note: str | None = None
 
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
@@ -2091,6 +2092,24 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.main_branch
             return BranchState(branch, final_sha, final_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            assert object_sha == final_sha
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert object_sha == final_sha
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
 
     class GitHub:
         def find_pr(
@@ -2143,9 +2162,13 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
     workflow["create_agent"] = lambda *args, **kwargs: (
         planner_calls.append("planner") or "planner"
     )
-    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
-        {"actions": [], "complete": True, "policy_conflicts": []}
+    decisions = iter(
+        (
+            {"actions": [], "complete": False, "policy_conflicts": []},
+            {"actions": [], "complete": True, "policy_conflicts": []},
+        )
     )
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
 
     plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, Repository(), github)
 
@@ -2158,7 +2181,10 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
         )
 
     assert create_calls == []
-    assert planner_calls == []
+    assert planner_calls == ["planner"]
+    assert recovery_note is not None
+    interrupted = workflow["work_item_plan_from_body"](recovery_note, config)
+    assert interrupted.position == 1
 
     recovered_pr, recovered_plan = workflow["prepare_work_item_plan_pr"](
         config, Repository(), github
@@ -2169,7 +2195,7 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
 
     assert create_calls == [(config.integration_branch, config.main_branch)]
     assert processed == [90, 90]
-    assert planner_calls == ["planner"]
+    assert planner_calls == ["planner", "planner"]
     assert effective == (issue,)
     assert created is not None
     recovered = workflow["work_item_plan_from_body"](created.body, config)
@@ -2177,7 +2203,7 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
     assert recovered.finalized is True
 
 
-def test_deferred_empty_one_shot_plan_fails_before_manager_decision() -> None:
+def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
     workflow = load_generated_workflow(
         one_shot_issue=169,
         integration_branch="dev/v0.2.5",
@@ -2195,28 +2221,107 @@ def test_deferred_empty_one_shot_plan_fails_before_manager_decision() -> None:
         169,
     )
     same_sha = "f" * 40
+    integration_sha = same_sha
+    recovery_note: str | None = None
+    created: PullRequestState | None = None
+    planner_calls: list[str] = []
+    processed: list[str] = []
 
     class GitHub:
-        def find_pr(self, *, head: str, base: str, state: str) -> None:
-            return None
+        def find_pr(self, *, head: str, base: str, state: str):
+            return created if created is not None and state == "OPEN" else None
 
         def create_draft_pr(self, **kwargs: object) -> PullRequestState:
-            pytest.fail("identical branches must not attempt Base PR creation")
+            nonlocal created
+            assert integration_sha != same_sha
+            created = replace(
+                topology_pr(
+                    number=182,
+                    head_sha=integration_sha,
+                    base_sha=same_sha,
+                    head_branch=config.integration_branch,
+                    body=str(kwargs["body"]),
+                ),
+                base_branch=config.main_branch,
+            )
+            return created
 
-    repository = SimpleNamespace(
-        synchronize_branch=lambda branch: BranchState(branch, same_sha, same_sha, True),
-        inspect_branch=lambda branch: BranchState(branch, same_sha, same_sha, True),
-    )
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert created is not None
+            return created
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert created is not None
+            created = replace(created, body=str(kwargs["body"]))
+            return created
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, integration_sha, integration_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    repository = Repository()
     workflow["emit_finding"] = lambda *args, **kwargs: None
-    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail(
-        "manager must not make an unpersisted decision"
+    workflow["inspect_dynamic_work_item_topology"] = lambda *args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["create_agent"] = lambda *args, **kwargs: (
+        planner_calls.append("planner") or "planner"
     )
+    decisions = iter(
+        (
+            {
+                "actions": [
+                    {
+                        "action": "add",
+                        "item": {"id": "first-task", "task": "Do the first task."},
+                    }
+                ],
+                "complete": False,
+                "policy_conflicts": [],
+            },
+            {"actions": [], "complete": True, "policy_conflicts": []},
+        )
+    )
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
+
+    def process_issue(item: object, *_args: object) -> None:
+        nonlocal integration_sha
+        assert recovery_note is not None
+        persisted = workflow["work_item_plan_from_body"](recovery_note, config)
+        assert persisted.position == 1
+        processed.append(item.task_id)
+        integration_sha = "a" * 40
+
+    workflow["process_issue"] = process_issue
     plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, GitHub())
 
-    with pytest.raises(WorkerFailure, match="cannot safely plan an empty one-shot"):
-        workflow["process_work_items"](
-            config, object(), repository, GitHub(), plan_pr, plan
-        )
+    effective = workflow["process_work_items"](
+        config, object(), repository, GitHub(), plan_pr, plan
+    )
+
+    assert processed == ["first-task"]
+    assert planner_calls == ["planner"]
+    assert [item.task_id for item in effective] == ["first-task"]
+    assert created is not None
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:

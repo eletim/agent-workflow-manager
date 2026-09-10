@@ -211,6 +211,39 @@ def test_remote_branch_batch_ignores_stale_tracking_refs(
     assert git(work, "rev-parse", "refs/remotes/origin/main") == stale_sha
 
 
+def test_remote_notes_persist_recovery_state_without_moving_branches(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    remote, _seed, work = repositories
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-b", "main", str(remote), str(other))
+    git(other, "config", "user.email", "test@example.com")
+    git(other, "config", "user.name", "Test")
+    first = open_repo(work, RecordingGitRunner())
+    second = open_repo(other, RecordingGitRunner())
+    anchor = git(work, "rev-parse", "refs/heads/main")
+    branch_before = first.inspect_branch("main").remote_sha
+    ref = "refs/notes/agent-workflow-manager/work-item-plan-test"
+
+    assert first.inspect_remote_note(ref, anchor) is None
+    assert (
+        first.update_remote_note(ref, anchor, "position=0", expected_body=None)
+        == "position=0"
+    )
+    assert second.inspect_remote_note(ref, anchor) == "position=0"
+    assert (
+        second.update_remote_note(ref, anchor, "position=1", expected_body="position=0")
+        == "position=1"
+    )
+    assert first.inspect_remote_note(ref, anchor) == "position=1"
+    assert first.inspect_branch("main").remote_sha == branch_before
+
+    with pytest.raises(WorkerFailure, match="recovery note changed"):
+        first.update_remote_note(
+            ref, anchor, "stale update", expected_body="position=0"
+        )
+
+
 def test_committed_result_and_delivery_push_absent_or_behind_remote(
     repositories: tuple[Path, Path, Path],
 ) -> None:

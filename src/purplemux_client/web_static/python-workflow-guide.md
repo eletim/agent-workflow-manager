@@ -503,6 +503,7 @@ repo.require_committed_result(
     branch, *, previous_sha, allow_unchanged=False
 ) -> BranchState
 repo.require_contains(branch, commit_sha) -> None
+repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
 
 The inspection-aware Git operations that may mutate are:
@@ -519,11 +520,16 @@ repo.recover_feature_branch(
 repo.advance_after_merge(
     branch, *, previous_sha, merge_commit_sha, required_commit_sha
 ) -> BranchState
+repo.update_remote_note(
+    ref, object_sha, body, *, expected_body
+) -> str
 ```
 
 They validate repository identity, cleanliness, exact SHAs, ancestry, and
 fast-forward-only topology. They may return without mutation when the desired
-state already exists. They never reset, force-push, or hide divergence.
+state already exists. AWM-owned remote notes provide branch-neutral recovery
+state with exact prior-body and remote-ref checks; note updates do not move a
+branch. These helpers never reset, force-push, or hide divergence.
 
 The supported GitHub inspections and mutations are:
 
