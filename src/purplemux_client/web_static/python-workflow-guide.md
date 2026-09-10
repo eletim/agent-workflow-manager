@@ -811,6 +811,13 @@ emit_step(
 )
 ```
 
+The canonical sequential workflow also prints concise `[workflow]` lines in its
+PurpleMux Bash terminal for step starts/completions, work items, review turns,
+warning continuations, and final-PR preparation. These lines are only a human
+inspection aid. Never parse stdout to determine workflow state: structured
+Progress, Findings, result events, and authoritative Git/GitHub inspection keep
+their existing roles as the observation and delivery sources of truth.
+
 Outside the Runner it is a no-op. Inside the Runner, encoded events over 4 KiB
 are dropped and the diagnostic stream retains only the latest 200 events. The
 latest PR-bearing event for each observed PR is retained separately and included

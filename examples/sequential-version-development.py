@@ -85,6 +85,19 @@ MAX_POLICY_CONFLICT_WARNINGS = 8
 MAX_BASE_PR_BODY_BYTES = 65_536
 
 
+def terminal_progress(
+    event: str,
+    subject: str,
+    *,
+    iteration: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """Show concise human progress without making terminal output authoritative."""
+    iteration_text = f" (iteration {iteration})" if iteration is not None else ""
+    detail_text = f": {detail}" if detail is not None else ""
+    print(f"[workflow] {event} {subject}{iteration_text}{detail_text}", flush=True)
+
+
 @dataclass(frozen=True)
 class Issue:
     number: int | None
@@ -397,6 +410,7 @@ def run_turn(
         tab=tab,
         **navigation,
     )
+    terminal_progress("START", name, iteration=iteration)
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
@@ -412,6 +426,7 @@ def run_turn(
             tab=tab,
             **navigation,
         )
+        terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
         raise
     emit_step(
         name,
@@ -421,6 +436,7 @@ def run_turn(
         tab=tab,
         **navigation,
     )
+    terminal_progress("DONE", name, iteration=iteration)
     return result
 
 
@@ -432,10 +448,12 @@ def implementer_prompt(prompt: str) -> str:
 def run_outline_step(name: str, action):
     """Run one concrete outline unit while retaining detailed nested progress."""
     emit_step(name, "started")
+    terminal_progress("START", name)
     try:
         result = action()
     except BaseException as exc:
         emit_step(name, "failed", error=short_error(exc))
+        terminal_progress("FAILED", name, detail=short_error(exc))
         raise
     navigation = (
         {"pr_number": result.number, "pr_url": result.url}
@@ -443,6 +461,7 @@ def run_outline_step(name: str, action):
         else {}
     )
     emit_step(name, "completed", **navigation)
+    terminal_progress("DONE", name)
     return result
 
 
@@ -1290,6 +1309,7 @@ def review_issue_phase(
             expected_base_sha=pr.base_sha,
         )
         print(f"WARN: {warning}", flush=True)
+        terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
         emit_finding("git", warning, status="warning")
         return IssueReviewPhaseResult(
             current,
@@ -1375,6 +1395,7 @@ def review_issue_phase(
                 expected_base_sha=current.base_sha,
             )
             print(f"WARN: {warning}", flush=True)
+            terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
             return IssueReviewPhaseResult(
                 current,
@@ -1428,6 +1449,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
                 expected_base_sha=current.base_sha,
             )
             print(f"WARN: {warning}", flush=True)
+            terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
             return IssueReviewPhaseResult(
                 current,
@@ -1463,6 +1485,7 @@ def process_issue(
     repo: GitRepository,
     github: GitHubRepository,
 ) -> PullRequestState:
+    terminal_progress("WORK ITEM", issue.label, detail=issue.branch)
     if repo.inspect_worktree().dirty:
         cleanup = create_agent(
             client,
@@ -2583,6 +2606,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 expected_base_sha=current.base_sha,
             )
             print(f"WARN: {warning}", flush=True)
+            terminal_progress("WARN CONTINUATION", "Whole-version review")
             emit_finding("github", warning, status="warning")
             delivery = ReviewDelivery(
                 "continued_with_warning",
@@ -2604,6 +2628,11 @@ def integration_delivery(
     repo: GitRepository,
     github: GitHubRepository,
 ) -> PullRequestState | None:
+    terminal_progress(
+        "PREPARE",
+        "Final integration PR",
+        detail=f"{config.integration_branch} -> {config.main_branch}",
+    )
     integration = repo.synchronize_branch(config.integration_branch)
     main = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or main.remote_sha is None:
@@ -2650,10 +2679,20 @@ def integration_delivery(
                 "completed",
                 message=f"delivery already merged as PR #{merged_pr.number}",
             )
+            terminal_progress(
+                "DONE",
+                "Whole-version review",
+                detail=f"delivery already merged as PR #{merged_pr.number}",
+            )
         emit_step(
             "Final integration PR",
             "completed",
             message=f"already merged as PR #{merged_pr.number}",
+        )
+        terminal_progress(
+            "DONE",
+            "Final integration PR",
+            detail=f"already merged as PR #{merged_pr.number}",
         )
         return merged_pr
     if pr is None:
@@ -2672,6 +2711,11 @@ def integration_delivery(
                 "Final integration PR",
                 "completed",
                 message="no implementation changes; no PR required",
+            )
+            terminal_progress(
+                "DONE",
+                "Final integration PR",
+                detail="no implementation changes; no PR required",
             )
             return None
         if pr.state == "MERGED":
@@ -2697,6 +2741,9 @@ def integration_delivery(
     rehydrate_policy_conflicts(pr.body, config, issue_number=None)
     pr = ensure_base_pr_policy_notes(github, pr, config)
     emit_run_pr(pr.number, pr.url)
+    terminal_progress(
+        "IDENTIFIED", "Final integration PR", detail=f"PR #{pr.number} {pr.url}"
+    )
     if FINAL_REVIEW:
         pr, delivery = run_outline_step(
             "Whole-version review",

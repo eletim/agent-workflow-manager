@@ -97,6 +97,60 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+def test_outline_step_logs_terminal_progress_without_replacing_events(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_outline_step"].__globals__
+    events: list[tuple[str, str]] = []
+    monkeypatch.setitem(
+        globals_,
+        "emit_step",
+        lambda name, status, **kwargs: events.append((name, status)),
+    )
+
+    result = workflow["run_outline_step"]("Issue #190", lambda: "delivered")
+
+    assert result == "delivered"
+    assert events == [("Issue #190", "started"), ("Issue #190", "completed")]
+    assert capsys.readouterr().out.splitlines() == [
+        "[workflow] START Issue #190",
+        "[workflow] DONE Issue #190",
+    ]
+
+
+def test_terminal_progress_formats_iteration_and_detail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    terminal_progress = runpy.run_path(str(EXAMPLE))["terminal_progress"]
+
+    terminal_progress("START", "Issue #190 correctness review", iteration=2)
+    terminal_progress(
+        "IDENTIFIED",
+        "Final integration PR",
+        detail="PR #201 https://example.test/pull/201",
+    )
+
+    assert capsys.readouterr().out.splitlines() == [
+        "[workflow] START Issue #190 correctness review (iteration 2)",
+        "[workflow] IDENTIFIED Final integration PR: "
+        "PR #201 https://example.test/pull/201",
+    ]
+
+
+def test_canonical_workflow_logs_major_issue_driven_boundaries() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert 'terminal_progress("WORK ITEM", issue.label, detail=issue.branch)' in source
+    assert (
+        'terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")'
+        in source
+    )
+    assert 'terminal_progress("WARN CONTINUATION", "Whole-version review")' in source
+    assert '"PREPARE",\n        "Final integration PR"' in source
+    assert '"IDENTIFIED", "Final integration PR"' in source
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [
@@ -2125,6 +2179,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     marker = workflow["encoded_policy_conflict_marker"](warning)
     merged = replace(merged_final_pr("new-head"), body=f"Base PR.\n\n{marker}")
     findings: list[tuple[str, str, str]] = []
+    terminal_events: list[tuple[str, str, str | None]] = []
 
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
@@ -2154,6 +2209,13 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
             (category, message, status)
         ),
     )
+    monkeypatch.setitem(
+        workflow_globals,
+        "terminal_progress",
+        lambda event, subject, **kwargs: terminal_events.append(
+            (event, subject, kwargs.get("detail"))
+        ),
+    )
 
     delivered = workflow["integration_delivery"](
         config, config.issues, object(), Repository(), GitHub()
@@ -2161,6 +2223,15 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
 
     assert delivered is merged
     assert ("policy_issue", warning, "warning") in findings
+    assert terminal_events == [
+        ("PREPARE", "Final integration PR", "dev/v1 -> main"),
+        (
+            "DONE",
+            "Whole-version review",
+            "delivery already merged as PR #17",
+        ),
+        ("DONE", "Final integration PR", "already merged as PR #17"),
+    ]
 
 
 def test_exact_merged_final_pr_requires_final_branch_containment() -> None:
