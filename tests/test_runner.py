@@ -3657,6 +3657,13 @@ def test_mobile_connection_uses_remote_browser_origin_only() -> None:
     assert mobile_connection_url("0.0.0.0", alias_origin) is None
 
 
+def test_mobile_connection_falls_back_from_localhost_alias_to_remote_bind() -> None:
+    assert (
+        mobile_connection_url("100.64.10.20", "http://localhost:8765")
+        == "http://100.64.10.20:8765"
+    )
+
+
 def test_mobile_connection_qr_is_generated_as_svg() -> None:
     url = "http://runner.example.ts.net:8765"
 

@@ -183,13 +183,34 @@ def _parse_host_aliases(value: str) -> tuple[str, ...]:
 
 
 def mobile_connection_url(bind_host: str, browser_origin: str) -> str | None:
-    """Return the remote browser URL only for a non-loopback IPv4 bind."""
+    """Choose an externally reachable browser URL for mobile devices."""
     try:
         address = ipaddress.IPv4Address(bind_host)
     except ipaddress.AddressValueError:
         return None
     if address.is_loopback or address.is_unspecified:
         return None
+
+    parsed = urlparse(browser_origin)
+    try:
+        selected_host = parsed.hostname
+        selected_port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or selected_host is None or selected_port is None:
+        return None
+    local_hostname = selected_host == "localhost" or selected_host.endswith(
+        ".localhost"
+    )
+    try:
+        selected_address = ipaddress.ip_address(selected_host)
+    except ValueError:
+        selected_address = None
+    if local_hostname or (
+        selected_address is not None
+        and (selected_address.is_loopback or selected_address.is_unspecified)
+    ):
+        return f"http://{address}:{selected_port}"
     return browser_origin
 
 
@@ -222,7 +243,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             requested_host, browser_origin
         )
         self.mobile_connection_qr = (
-            self._make_qr_svg(browser_origin)
+            self._make_qr_svg(self.mobile_connection_url)
             if self.mobile_connection_url is not None
             else None
         )
