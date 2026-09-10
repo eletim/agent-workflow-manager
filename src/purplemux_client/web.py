@@ -191,21 +191,24 @@ class RunnerHTTPServer(ThreadingHTTPServer):
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
+        bound_host, bound_port = cast(tuple[str, int], self.server_address)
+        normalized_host_aliases = tuple(
+            normalize_host_alias(alias) for alias in host_aliases
+        )
+        browser_host = (
+            normalized_host_aliases[0]
+            if normalized_host_aliases
+            else requested_host
+            if requested_host != "0.0.0.0"
+            else "127.0.0.1"
+        )
         notifier = (
             NotifyCLI.from_environment()
             if runner is None or notification_settings is None
             else None
         )
         self.runner = runner or PythonRunner(notifier=notifier, managed_workflows=True)
-        if self.runner.managed_workflows:
-            event_host = bound_event_host = cast(tuple[str, int], self.server_address)[
-                0
-            ]
-            if event_host == "0.0.0.0":
-                bound_event_host = "127.0.0.1"
-            self.runner.configure_event_endpoint(
-                f"http://{bound_event_host}:{self.server_address[1]}"
-            )
+        self.runner.configure_runner_origin(f"http://{browser_host}:{bound_port}")
         self.notification_settings = notification_settings or NotificationSettings(
             runtime_config=Path(
                 os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")
@@ -222,16 +225,13 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             notifier if runner is not None and notification_settings is None else None
         )
         self.request_token = secrets.token_urlsafe(32)
-        bound_host, bound_port = cast(tuple[str, int], self.server_address)
         self.allowed_hosts = {
             f"{requested_host}:{bound_port}",
             f"{bound_host}:{bound_port}",
         }
         if bound_host == "127.0.0.1":
             self.allowed_hosts.add(f"localhost:{bound_port}")
-        self.host_aliases = frozenset(
-            normalize_host_alias(alias) for alias in host_aliases
-        )
+        self.host_aliases = frozenset(normalized_host_aliases)
         self.allowed_hosts.update(
             f"{alias}:{bound_port}" for alias in self.host_aliases
         )

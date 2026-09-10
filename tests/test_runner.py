@@ -329,7 +329,7 @@ def test_checked_terminal_run_is_restored_after_runner_reconstruction(
         run_history_file=history_file,
     )
     try:
-        second_runner.configure_event_endpoint("http://127.0.0.1:8765")
+        second_runner.configure_runner_origin("http://127.0.0.1:8765")
         restored = second_runner.snapshot(first_id)
         assert second_runner._run_identity(first_id) == stable_identity
         assert restored.identity == stable_identity

@@ -13,6 +13,7 @@ from purplemux_client.notifier import (
     NotifyCLI,
 )
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
+from purplemux_client.web import RunnerHTTPServer
 
 
 class FinishedProcess:
@@ -96,7 +97,7 @@ def test_terminal_result_attempts_exactly_one_notification(
     assert notifier.calls[0][3].click_url is None
 
 
-def test_runner_builds_notification_metadata_from_run_identity_and_cwd(
+def test_http_server_builds_notification_metadata_for_unmanaged_runner(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "nested" / "project-name"
@@ -107,7 +108,12 @@ def test_runner_builds_notification_metadata_from_run_identity_and_cwd(
         notifier=notifier,
         workflow_cwd=project,
     )
-    runner.configure_event_endpoint("http://100.64.0.8:8765/")
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        host_aliases=("Runner.Example.",),
+    )
+    port = server.server_address[1]
     try:
         run_id = runner.start('print("ok")')
         _wait_until_finished(runner)
@@ -116,7 +122,7 @@ def test_runner_builds_notification_metadata_from_run_identity_and_cwd(
                 break
             time.sleep(0.01)
     finally:
-        runner.close()
+        server.server_close()
 
     assert notifier.calls == [
         (
@@ -126,7 +132,7 @@ def test_runner_builds_notification_metadata_from_run_identity_and_cwd(
             NotificationMetadata(
                 title="project-name",
                 click_url=(
-                    "http://100.64.0.8:8765/?run=" + runner._run_identity(run_id)
+                    f"http://runner.example:{port}/?run=" + runner._run_identity(run_id)
                 ),
             ),
         )
