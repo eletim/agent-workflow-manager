@@ -268,6 +268,13 @@ the bounded Progress history; the Summary is an observation surface and never
 controls workflow execution. Running workflows and the New Run draft do not
 display a premature or previous-run Summary.
 
+Failed and stopped runs offer **Review & Resume**. A confirmation dialog shows
+the original Issue Driven JSON before AWM starts a distinct run with that same
+configuration and generated Python. Run history labels the new run with its
+source run. The new workflow still recovers the Base PR, work-item plan, and
+child PRs by inspecting their authoritative Git, GitHub, and PurpleMux state; it
+does not reconstruct the terminated Python process.
+
 ## Rules for AI authors
 
 - Use the existing source repository path, not a not-yet-created version worktree

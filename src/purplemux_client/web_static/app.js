@@ -56,6 +56,12 @@ const issueSummaryWarnings = document.querySelector("#issue-summary-warnings");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
+const resumeOpen = document.querySelector("#resume-open");
+const resumeDialog = document.querySelector("#resume-dialog");
+const resumeSource = document.querySelector("#resume-source");
+const resumeSettings = document.querySelector("#resume-settings");
+const resumeCancel = document.querySelector("#resume-cancel");
+const resumeConfirm = document.querySelector("#resume-confirm");
 const resourcesPanel = document.querySelector("#resources-panel");
 const resourcesSummary = document.querySelector("#resources-summary");
 const executionContextDetails = document.querySelector("#execution-context-details");
@@ -161,6 +167,7 @@ let runningFaviconHrefPromise = null;
 let directoryPickerCurrentPath = null;
 let directoryPickerParentPath = null;
 let directoryPickerRequestGeneration = 0;
+let resumeSourceRunId = null;
 
 async function withPendingButton(button, action, onSettled = null) {
   if (button.dataset.pending === "true") return;
@@ -360,7 +367,9 @@ function renderRun(result) {
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
-  currentMode = result.mode === "prompt" ? "prompt" : "workflow";
+  currentMode = ["prompt", "issue-driven"].includes(result.mode)
+    ? result.mode
+    : "workflow";
   const running = result.state === "running";
   const presentation = runPresentation(result);
   statusBadge.textContent = presentation.label;
@@ -408,13 +417,21 @@ function renderRun(result) {
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
       promptText.value = result.prompt?.prompt || "";
     } else if (currentMode === "issue-driven") {
-      issueDrivenJson.value = issueDrivenDraft.json;
-      issueDrivenPython.value = issueDrivenDraft.code;
+      issueDrivenJson.value = result.issueDrivenJson || "";
+      issueDrivenPython.value = result.code ?? "";
     } else {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
     }
-    activeContext.textContent = `Viewing ${currentMode === "prompt" ? "Prompt" : "Workflow"} Run #${result.runId} (read-only)`;
+    const modeLabel = {
+      prompt: "Prompt",
+      "issue-driven": "Issue Driven",
+      workflow: "Workflow",
+    }[currentMode];
+    const resumeLabel = result.resumedFromRunId == null
+      ? ""
+      : ` — resumed from Run #${result.resumedFromRunId}`;
+    activeContext.textContent = `Viewing ${modeLabel} Run #${result.runId}${resumeLabel} (read-only)`;
   } else if (activeRunId === null) {
     showDraftLabel();
   }
@@ -599,7 +616,9 @@ function renderResources(result) {
 function renderRecovery(result) {
   const attempts = result.attempts || [];
   recoveryPanel.hidden = !["failed", "stopped"].includes(result.state);
-  recoverySummary.textContent = "Inspect this run and its retained resources, then start a new run to recover. The new workflow must verify authoritative Git, GitHub, and PurpleMux state before mutating it.";
+  recoverySummary.textContent = "Review the original settings, then resume them as a new run. The workflow will reuse its existing recovery semantics and verify authoritative state before mutating it.";
+  resumeOpen.disabled = activeRunId === null
+    || !["failed", "stopped"].includes(result.state);
   attemptHistory.replaceChildren();
   for (const attempt of attempts) {
     const item = document.createElement("li");
@@ -628,11 +647,18 @@ function renderRunList(runs) {
     const presentation = runPresentation(run);
     button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
-    const mode = run.mode === "prompt" ? "Prompt" : "Workflow";
+    const mode = {
+      prompt: "Prompt",
+      "issue-driven": "Issue Driven",
+      workflow: "Workflow",
+    }[run.mode] || "Workflow";
     const executionRoot = run.mode === "prompt"
       ? run.prompt?.cwd || run.cwd
       : run.executionContext?.executionRoot || "execution context pending";
-    button.textContent = `#${run.runId}  ${mode}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
+    const resumed = run.resumedFromRunId == null
+      ? ""
+      : `  Resume of #${run.resumedFromRunId}`;
+    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -1422,9 +1448,15 @@ async function generateIssueDrivenCode() {
   }
 }
 
-async function workflowSubmissionPayload() {
+async function workflowSubmissionPayload(includeIssueDrivenSettings = false) {
   if (currentMode === "issue-driven") {
-    return {code: await generateIssueDrivenCode(), args: []};
+    const source = issueDrivenJson.value;
+    const payload = {
+      code: await generateIssueDrivenCode(),
+      args: [],
+    };
+    if (includeIssueDrivenSettings) payload.issueDrivenJson = source;
+    return payload;
   }
   return {code: code.value, ...executionContextPayload()};
 }
@@ -1440,6 +1472,65 @@ issueDrivenGenerate.addEventListener("click", async () => {
       }
     }
   }, applyFieldMode);
+});
+
+function resumeSettingsText(snapshot) {
+  if (snapshot.mode === "prompt") {
+    return JSON.stringify({
+      mode: "prompt",
+      agent: snapshot.prompt?.agent,
+      cwd: snapshot.prompt?.cwd || snapshot.cwd,
+      prompt: snapshot.prompt?.prompt,
+    }, null, 2);
+  }
+  if (snapshot.mode === "issue-driven") return snapshot.issueDrivenJson || "";
+  return JSON.stringify({
+    mode: "workflow",
+    arguments: snapshot.args || [],
+    python: snapshot.code || "",
+  }, null, 2);
+}
+
+resumeOpen.addEventListener("click", () => {
+  if (
+    activeRunSnapshot?.runId !== activeRunId
+    || !["failed", "stopped"].includes(activeRunSnapshot.state)
+  ) return;
+  resumeSourceRunId = activeRunId;
+  resumeSource.textContent = `Failed or stopped Run #${resumeSourceRunId}`;
+  resumeSettings.textContent = resumeSettingsText(activeRunSnapshot);
+  resumeDialog.showModal();
+});
+
+resumeCancel.addEventListener("click", () => {
+  resumeSourceRunId = null;
+  resumeDialog.close();
+});
+
+resumeConfirm.addEventListener("click", async () => {
+  if (resumeSourceRunId === null) return;
+  await withPendingButton(resumeConfirm, async () => {
+    const sourceRunId = resumeSourceRunId;
+    const selectionGeneration = ++activeRunGeneration;
+    try {
+      const result = await request(`/api/runs/${sourceRunId}/resume`, {
+        method: "POST",
+      });
+      resumeSourceRunId = null;
+      resumeDialog.close();
+      if (selectionGeneration === activeRunGeneration) {
+        activeRunId = result.runId;
+        activeRunGeneration += 1;
+        explicitNewRun = false;
+        renderRun(result);
+      }
+      await refresh();
+    } catch (error) {
+      if (selectionGeneration === activeRunGeneration) {
+        stderr.textContent = String(error);
+      }
+    }
+  });
 });
 
 runButton.addEventListener("click", async () => {
@@ -1458,7 +1549,7 @@ runButton.addEventListener("click", async () => {
           cwd: promptCwd.value,
           prompt: promptText.value,
         }
-        : await workflowSubmissionPayload();
+        : await workflowSubmissionPayload(true);
       const result = await request(requestPath, {
         method: "POST",
         headers: {"Content-Type": "application/json"},

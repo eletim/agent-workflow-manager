@@ -116,6 +116,8 @@ function snapshot({
   warningTimeline = [],
   warningTimelineOmitted = 0,
   purplemuxPort = 9123,
+  issueDrivenJson = undefined,
+  resumedFromRunId = null,
 }) {
   const result = {
     args,
@@ -148,9 +150,11 @@ function snapshot({
     checked,
     issueDrivenSummary,
     purplemuxPort,
+    resumedFromRunId,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
+  if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
   return result;
 }
 
@@ -231,6 +235,8 @@ async function loadApp({
     "issue-summary-list", "issue-summary-whole", "issue-summary-base",
     "issue-summary-policy", "issue-summary-warnings",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
+    "resume-open", "resume-dialog", "resume-source", "resume-settings",
+    "resume-cancel", "resume-confirm",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
@@ -1077,12 +1083,65 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
 
   assert.deepEqual(submissions, [
     ["/api/dry-run", {code: generatedCode, args: []}],
-    ["/api/run", {code: generatedCode, args: []}],
+    ["/api/run", {code: generatedCode, args: [], issueDrivenJson: "{}"}],
   ]);
   assert.match(elements["active-context"].textContent, /Workflow Run #12/);
   assert.equal(elements.run.dataset.pending, undefined);
   assert.equal(elements.run.getAttribute("aria-busy"), undefined);
   assert.equal(elements.run.disabled, true);
+});
+
+test("failed Issue Driven run previews immutable settings and resumes as a new run", async () => {
+  const source = '{\n  "mode": "issue-driven",\n  "one_shot_issue": 196\n}';
+  const failed = snapshot({
+    runId: 4,
+    state: "failed",
+    stdout: "failed",
+    mode: "issue-driven",
+    issueDrivenJson: source,
+  });
+  const resumed = snapshot({
+    runId: 5,
+    state: "running",
+    stdout: "",
+    mode: "issue-driven",
+    issueDrivenJson: source,
+    resumedFromRunId: 4,
+  });
+  const runs = [{runId: 4, state: "failed", mode: "issue-driven"}];
+  const details = {4: failed};
+  const {calls, elements} = await loadApp({
+    runs,
+    details,
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/runs/4/resume") return undefined;
+      assert.equal(options.method, "POST");
+      runs.push({
+        runId: 5,
+        state: "running",
+        mode: "issue-driven",
+        resumedFromRunId: 4,
+      });
+      details[5] = resumed;
+      return response(resumed, 202);
+    },
+  });
+
+  await elements["resume-open"].dispatch("click");
+  assert.equal(elements["resume-dialog"].open, true);
+  assert.equal(elements["resume-settings"].textContent, source);
+  assert.match(elements["resume-source"].textContent, /Run #4/);
+
+  await elements["resume-confirm"].dispatch("click");
+
+  assert.equal(elements["resume-dialog"].open, false);
+  assert.ok(calls.some(([url, method]) => (
+    url === "/api/runs/4/resume" && method === "POST"
+  )));
+  assert.match(elements["active-context"].textContent, /Issue Driven Run #5/);
+  assert.match(elements["active-context"].textContent, /resumed from Run #4/);
+  assert.match(runItem(elements, 5).textContent, /Resume of #4/);
 });
 
 test("Prompt directory picker navigates and selects its resolved current path", async () => {
