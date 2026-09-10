@@ -113,6 +113,7 @@ function snapshot({
   issueDrivenSummary = null,
   hasWarnings = false,
   findings = [],
+  warningTimeline = [],
 }) {
   const result = {
     args,
@@ -133,6 +134,7 @@ function snapshot({
     dryRunEligible: true,
     dryRunIssues: [],
     findings,
+    warningTimeline,
     hasWarnings,
     resources,
     resourceCleanupStatus,
@@ -1643,11 +1645,13 @@ test("Progress places structured warnings at their recorded time across run swit
     ],
     findings: [
       {
-        category: "github", status: "warning", message: "review limit reached",
+        category: "runtime", status: "info", message: "WARN: informational only",
         observedAt: warningAt,
       },
+    ],
+    warningTimeline: [
       {
-        category: "runtime", status: "info", message: "WARN: informational only",
+        category: "github", status: "warning", message: "review limit reached",
         observedAt: warningAt,
       },
     ],
@@ -1689,6 +1693,17 @@ test("Progress places structured warnings at their recorded time across run swit
   await runItem(elements, 1).dispatch("click");
   assert.equal(elements.progress.children[1].className, "progress-item warning");
   assert.equal(elements.progress.children[1].children[1].children[2].textContent, "review limit reached");
+
+  const reloaded = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1", hasWarnings: true}],
+    details: {1: warned},
+    validation: {status: 200, body: {validation: []}},
+  });
+  assert.equal(reloaded.elements.progress.children[1].className, "progress-item warning");
+  assert.equal(
+    reloaded.elements.progress.children[1].children[1].children[2].textContent,
+    "review limit reached",
+  );
 });
 
 test("selected run renders authoritative run and Progress PR links", async () => {

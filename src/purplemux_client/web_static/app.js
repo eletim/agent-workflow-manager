@@ -367,7 +367,7 @@ function renderRun(result) {
   checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
   checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
   renderOutline(result.outline || [], result.progress || []);
-  renderProgress(result.progress || [], result.findings || []);
+  renderProgress(result.progress || [], result.warningTimeline || []);
   renderIntegrationPr(result.integrationPr || null);
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderIssueDrivenSummary(result.issueDrivenSummary || null);

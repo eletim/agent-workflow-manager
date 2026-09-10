@@ -340,6 +340,7 @@ class RunnerSnapshot:
     args: tuple[str, ...]
     attempts: tuple[RunAttempt, ...]
     findings: tuple[TopologyFinding, ...]
+    warning_findings: tuple[TopologyFinding, ...]
     has_warnings: bool
     dry_run: DryRunResult | None
     resources: tuple[RunResource, ...] = ()
@@ -387,6 +388,10 @@ class RunnerSnapshot:
         payload.pop("stderr_entries")
         payload["progress"] = [_progress_json(event) for event in self.progress]
         payload["findings"] = [_finding_json(item) for item in self.findings]
+        payload["warningTimeline"] = [
+            _finding_json(item) for item in self.warning_findings
+        ]
+        payload.pop("warning_findings")
         payload["hasWarnings"] = payload.pop("has_warnings")
         payload["dryRun"] = self.dry_run.as_json() if self.dry_run else None
         payload.pop("dry_run")
@@ -517,6 +522,9 @@ class _RunRecord:
     # the bounded diagnostic stream so historical Issue navigation remains.
     progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
+    # Warning positions are durable run history, independent of the bounded
+    # diagnostic Finding stream used for the general inspection surface.
+    warning_findings: list[TopologyFinding] = field(default_factory=list)
     has_warnings: bool = False
     warning_count: int = 0
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -621,6 +629,7 @@ class PythonRunner:
             args=(),
             attempts=(),
             findings=(),
+            warning_findings=(),
             has_warnings=False,
             dry_run=None,
         )
@@ -703,6 +712,7 @@ class PythonRunner:
                 str(number): asdict(event) for number, event in run.progress_prs.items()
             },
             "findings": [asdict(finding) for finding in run.findings],
+            "warningFindings": [asdict(finding) for finding in run.warning_findings],
             "attempts": [asdict(attempt) for attempt in run.attempts],
             "resources": [asdict(resource) for resource in run.resources],
             "prompt": asdict(run.prompt) if run.prompt is not None else None,
@@ -807,6 +817,12 @@ class PythonRunner:
         stderr = load_many(OutputEntry, "stderrEntries")
         progress = load_many(ProgressEvent, "progress")
         findings = load_many(TopologyFinding, "findings")
+        warning_values = value.get("warningFindings")
+        warning_findings = (
+            [finding for finding in findings if finding.status == "warning"]
+            if warning_values is None
+            else load_many(TopologyFinding, "warningFindings")
+        )
         attempts = load_many(RunAttempt, "attempts")
         resources = load_many(RunResource, "resources")
         progress_pr_values = value.get("progressPrs")
@@ -854,6 +870,9 @@ class PythonRunner:
             progress=deque(progress, maxlen=self._max_progress_events),
             progress_prs=progress_prs,
             findings=deque(findings, maxlen=self._max_progress_events),
+            warning_findings=warning_findings,
+            has_warnings=bool(warning_findings),
+            warning_count=len(warning_findings),
             attempts=attempts,
             resources=resources,
             prompt=prompt,
@@ -981,6 +1000,11 @@ class PythonRunner:
                     args=run_args,
                     attempts=(),
                     findings=result.findings,
+                    warning_findings=tuple(
+                        finding
+                        for finding in result.findings
+                        if finding.status == "warning"
+                    ),
                     has_warnings=any(
                         finding.status == "warning" for finding in result.findings
                     ),
@@ -1531,6 +1555,7 @@ class PythonRunner:
             args=run_args,
             attempts=(),
             findings=(),
+            warning_findings=(),
             has_warnings=False,
             dry_run=None,
         )
@@ -1601,6 +1626,7 @@ class PythonRunner:
             args=run.args,
             attempts=tuple(run.attempts),
             findings=tuple(run.findings),
+            warning_findings=tuple(run.warning_findings),
             has_warnings=run.has_warnings,
             dry_run=None,
             code=None if run.prompt is not None else run.code,
@@ -2368,8 +2394,10 @@ class PythonRunner:
         event_type, event = parsed
         if event_type == "finding":
             finding = cast(TopologyFinding, event)
-            run.findings.append(replace(finding, observed_at=self._accepted_at()))
+            accepted = replace(finding, observed_at=self._accepted_at())
+            run.findings.append(accepted)
             if finding.status == "warning":
+                run.warning_findings.append(accepted)
                 run.has_warnings = True
                 run.warning_count += 1
         elif event_type == "resource":

@@ -1444,8 +1444,15 @@ print("WARN: stdout text")
     assert info_result.as_summary_json()["hasWarnings"] is False
 
 
-def test_warning_aggregate_survives_finding_eviction_and_run_switching() -> None:
-    runner = PythonRunner(managed_workflows=False, max_progress_events=1)
+def test_warning_timeline_survives_eviction_switching_and_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        max_progress_events=1,
+        run_history_file=history_file,
+    )
     try:
         warning_id = runner.start(
             """from purplemux_client import emit_finding
@@ -1463,8 +1470,35 @@ emit_finding("git", "later fact", status="passed")
         runner.close()
 
     assert [finding.status for finding in warning_result.findings] == ["passed"]
+    assert [finding.message for finding in warning_result.warning_findings] == [
+        "review required"
+    ]
+    assert warning_result.warning_findings[0].observed_at is not None
+    assert warning_result.as_json()["warningTimeline"] == [
+        {
+            "category": "git",
+            "status": "warning",
+            "message": "review required",
+            "observedAt": warning_result.warning_findings[0].observed_at,
+        }
+    ]
     assert warning_result.has_warnings is True
     assert clean_result.has_warnings is False
+
+    restored_runner = PythonRunner(
+        managed_workflows=False,
+        max_progress_events=1,
+        run_history_file=history_file,
+    )
+    try:
+        restored = restored_runner.snapshot(warning_id)
+    finally:
+        restored_runner.close()
+
+    assert [finding.status for finding in restored.findings] == ["passed"]
+    assert restored.warning_findings == warning_result.warning_findings
+    assert restored.has_warnings is True
+    assert restored.warning_count == 1
 
 
 def test_issue_driven_summary_uses_durable_structured_results_not_progress() -> None:
@@ -2130,6 +2164,7 @@ def test_runner_http_lifecycle(
         "dryRunIssues": [],
         "executionContext": None,
         "findings": [],
+        "warningTimeline": [],
         "hasWarnings": False,
         "warningCount": 0,
         "exitCode": 0,
