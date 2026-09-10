@@ -34,7 +34,7 @@ def test_canonical_example_parses_and_uses_recommended_defaults() -> None:
     config = parse_issue_driven_json(json.dumps(canonical_json()))
 
     assert config.issues == (86, 99, 87, 84)
-    assert config.max_reviews == 5
+    assert config.max_reviews == 4
     assert config.merge_final is False
     assert config.implementer_agent == "codex"
     assert config.reviewer_agent == "claude"
@@ -79,15 +79,18 @@ def test_repository_guidance_matches_generated_worktree_semantics() -> None:
     assert "expected_base_sha=context.base_sha" in generated
 
 
-def test_starter_and_template_use_five_reviews_and_safe_final_delivery() -> None:
+def test_starter_and_template_use_recommended_review_limits_and_safe_delivery() -> None:
     index = INDEX.read_text(encoding="utf-8")
     example = EXAMPLE.read_text(encoding="utf-8")
+    guide = guide_text()
 
-    assert '"max_reviews": 5' in index
+    assert '"max_reviews": 4' in index
     assert '"implementer_agent": "codex"' in index
     assert '"reviewer_agent": "codex"' in index
     assert '"merge_final": false' in index
-    assert "MAX_REVIEWS = 5" in example
+    assert "MAX_REVIEWS = 4" in example
+    assert "MAX_SCOPE_REVIEWS = 6" in example
+    assert "keeps the Scope limit\nat least as high as the Correctness limit" in guide
 
 
 def test_guide_avoids_removed_recovery_contract() -> None:

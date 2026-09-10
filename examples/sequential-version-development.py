@@ -48,8 +48,8 @@ WORKFLOW_OUTLINE = [
     "Deliver the exact Issue topology",
     "Review and deliver the whole version",
 ]
-MAX_REVIEWS = 5
-MAX_SCOPE_REVIEWS = 3
+MAX_REVIEWS = 4
+MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100

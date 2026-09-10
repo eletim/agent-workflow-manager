@@ -108,7 +108,7 @@ dispatch is persisted.
   "make_integration_branch": false,
   "policy_issue": 88,
   "issues": [90, 89],
-  "max_reviews": 5,
+  "max_reviews": 4,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
   "scenarios": [
@@ -131,7 +131,7 @@ original Issue as its work definition:
   "integration_branch": "dev/v0.3.0",
   "final_branch": "main",
   "one_shot_issue": 169,
-  "max_reviews": 5,
+  "max_reviews": 4,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -240,9 +240,11 @@ not create one, then verifies its head, base, SHAs, and Draft state before
 review. Each Issue first receives a Scope / Design Review of whether its diff is
 necessary, sufficient, appropriately placed, and consistent with the shared
 minimal-change principle. Only then does a separately counted Correctness Review
-check implementation quality. Scope Review uses a fixed internal limit of three;
-`max_reviews` remains the Correctness and whole-version review limit, so no new
-JSON workflow field is needed. Whole-version Review retains its integration and
+check implementation quality. Scope Review uses a fixed internal limit of six,
+while the recommended `max_reviews` value is four for the Correctness and
+whole-version review limit. The higher Scope limit reserves capacity for the
+required rechecks after Correctness fixes change the head, without adding a new
+JSON workflow field. Whole-version Review retains its integration and
 cross-Issue responsibility. If a Correctness reviewer or fix changes the head,
 the prior Scope outcome is invalidated and the ordered Scope then Correctness
 sequence restarts on the new commit within the separate cumulative limits.

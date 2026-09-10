@@ -293,7 +293,7 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
 def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
-    assert "MAX_SCOPE_REVIEWS = 3" in source
+    assert "MAX_SCOPE_REVIEWS = 6" in source
     assert "max_reviews=MAX_SCOPE_REVIEWS" in source
     assert "max_reviews=MAX_REVIEWS" in source
     for field in (
