@@ -211,9 +211,15 @@ not drive workflow control flow and do not participate in orchestration.
 
 | State | Title | Message |
 | --- | --- | --- |
-| `success` | `Workflow completed` | Includes the run ID and `success` state. |
-| `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
-| `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
+| `success` | Target folder name | Includes the run ID and `success` state. |
+| `failed` | Target folder name | Includes the run ID, `failed` state, and exit code when available. |
+| `stopped` | Target folder name | Includes the run ID and `stopped` state; disabled by default. |
+
+The title and Runner link are common notification metadata, independent of the
+delivery device or transport. The title contains only the basename of the
+Run's authoritative working directory. The link is built from the Runner URL
+and the opaque, persisted Run identity; opening it selects that exact Run, and
+the UI does not infer navigation from the title or other display text.
 
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
 notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,

@@ -4,6 +4,7 @@ import ast
 import http.client
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -314,6 +315,7 @@ def test_checked_terminal_run_is_restored_after_runner_reconstruction(
             first_runner, lambda item: item.state == "success", run_id=first_id
         )
         stable_identity = first_runner._run_identity(first_id)
+        assert finished.identity == stable_identity
         assert finished.checked is False
         first_runner.set_checked(first_id, True)
         saved = json.loads(history_file.read_text(encoding="utf-8"))
@@ -330,6 +332,8 @@ def test_checked_terminal_run_is_restored_after_runner_reconstruction(
         second_runner.configure_event_endpoint("http://127.0.0.1:8765")
         restored = second_runner.snapshot(first_id)
         assert second_runner._run_identity(first_id) == stable_identity
+        assert restored.identity == stable_identity
+        assert restored.as_summary_json()["identity"] == stable_identity
         assert restored.state == "success"
         assert restored.checked is True
         assert restored.stdout == "persisted output\n"
@@ -2104,9 +2108,11 @@ def test_runner_http_lifecycle(
     assert status == 200
     stdout_entries = result.pop("stdoutEntries")
     stderr_entries = result.pop("stderrEntries")
+    identity = result.pop("identity")
     assert [entry["text"] for entry in stdout_entries] == ["HTTP_OK\n"]
     assert datetime.fromisoformat(stdout_entries[0]["observedAt"]).tzinfo is not None
     assert stderr_entries == []
+    assert re.fullmatch(r"[0-9a-f]{32}-1", identity)
     assert result == {
         "mode": "workflow",
         "state": "success",
