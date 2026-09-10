@@ -28,6 +28,7 @@ _TOPOLOGY_READ_WORKERS = 16
 _CORRELATION_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _HTTP_REJECTION_RE = re.compile(r"\bHTTP (4\d\d)\b", re.IGNORECASE)
 _HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(r"\brate limit(?:ed|ing)?\b", re.IGNORECASE)
 _TRANSIENT_READ_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _READ_RETRY_MAX_BACKOFF_SECONDS = 2.0
 logger = logging.getLogger(__name__)
@@ -1165,14 +1166,16 @@ class GitHubRepository:
                     completed.stderr.strip() or completed.stdout.strip() or "no output"
                 )
                 match = _HTTP_STATUS_RE.search(detail)
+                status = int(match.group(1)) if match else None
                 if (
-                    match
-                    and int(match.group(1)) in _TRANSIENT_READ_HTTP_STATUSES
+                    status is not None
+                    and (
+                        status in _TRANSIENT_READ_HTTP_STATUSES
+                        or (status == 403 and _RATE_LIMIT_RE.search(detail))
+                    )
                     and attempt + 1 < attempts
                 ):
-                    self._backoff_read_retry(
-                        args, attempt, attempts, f"HTTP {match.group(1)}"
-                    )
+                    self._backoff_read_retry(args, attempt, attempts, f"HTTP {status}")
                     continue
                 raise WorkerFailure(f"GitHub {' '.join(args)} failed: {detail}")
             return completed.stdout

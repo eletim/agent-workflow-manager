@@ -288,6 +288,39 @@ def test_transient_github_read_errors_retry_with_backoff_and_logging(
     assert "retrying attempt 3/3" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+        "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+    ],
+)
+def test_rate_limit_specific_github_403_is_retried(detail: str) -> None:
+    runner = FakeGitHubRunner()
+    failures = 0
+    sleeps: list[float] = []
+
+    def rate_limited_read(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal failures
+        if len(args) >= 3 and "pulls?" in args[2] and failures == 0:
+            failures += 1
+            return subprocess.CompletedProcess(args, 1, "", detail)
+        return runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project",
+        runner=rate_limited_read,
+        read_retry_backoff_seconds=0.1,
+        sleep=sleeps.append,
+    )
+
+    assert github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN") is None
+    assert failures == 1
+    assert sleeps == [0.1]
+
+
 def test_transient_github_read_exhaustion_preserves_last_error() -> None:
     runner = FakeGitHubRunner()
     failures = 0
@@ -315,7 +348,14 @@ def test_transient_github_read_exhaustion_preserves_last_error() -> None:
     assert failures == 3
 
 
-def test_permanent_github_read_error_is_not_retried() -> None:
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "gh: Not Found (HTTP 404)",
+        "gh: Resource not accessible by personal access token (HTTP 403)",
+    ],
+)
+def test_permanent_github_read_error_is_not_retried(detail: str) -> None:
     runner = FakeGitHubRunner()
     failures = 0
 
@@ -325,14 +365,14 @@ def test_permanent_github_read_error_is_not_retried() -> None:
         nonlocal failures
         if len(args) >= 3 and "pulls?" in args[2]:
             failures += 1
-            return subprocess.CompletedProcess(args, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(args, 1, "", detail)
         return runner(args, **kwargs)  # type: ignore[arg-type]
 
     github = GitHubRepository.open(
         "acme/project", runner=rejected_read, read_timeout_retries=2
     )
 
-    with pytest.raises(WorkerFailure, match=r"Not Found \(HTTP 404\)"):
+    with pytest.raises(WorkerFailure, match=re.escape(detail)):
         github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
     assert failures == 1
 
