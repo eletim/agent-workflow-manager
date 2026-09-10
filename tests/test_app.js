@@ -1144,6 +1144,31 @@ test("failed Issue Driven run previews immutable settings and resumes as a new r
   assert.match(runItem(elements, 5).textContent, /Resume of #4/);
 });
 
+test("failed Prompt and custom Workflow runs do not offer Resume", async () => {
+  for (const mode of ["prompt", "workflow"]) {
+    const failed = snapshot({
+      runId: 4,
+      state: "failed",
+      stdout: "failed",
+      mode,
+      prompt: mode === "prompt"
+        ? {agent: "codex", cwd: "/work/project", prompt: "answer"}
+        : undefined,
+    });
+    const {calls, elements} = await loadApp({
+      runs: [{runId: 4, state: "failed", mode}],
+      details: {4: failed},
+      validation: {body: {}, status: 200},
+    });
+
+    assert.equal(elements["resume-open"].hidden, true);
+    assert.equal(elements["resume-open"].disabled, true);
+    await elements["resume-open"].dispatch("click");
+    assert.equal(elements["resume-dialog"].open, false);
+    assert.equal(calls.some(([url]) => url.endsWith("/resume")), false);
+  }
+});
+
 test("Prompt directory picker navigates and selects its resolved current path", async () => {
   const listings = {
     "/typed/project": {

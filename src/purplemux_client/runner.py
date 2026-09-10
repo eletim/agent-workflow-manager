@@ -1336,14 +1336,16 @@ class PythonRunner:
                 raise RunResumeNotAllowedError(
                     f"run {run_id} is {source.state}; only failed or stopped runs can be resumed"
                 )
+            if source.issue_driven_json is None:
+                raise RunResumeNotAllowedError(
+                    f"run {run_id} is not an Issue Driven run; only Issue Driven runs can be resumed"
+                )
             code = source.code
             args = source.args
-            prompt = source.prompt
             issue_driven_json = source.issue_driven_json
         return self.start(
             code,
             args=args,
-            prompt=prompt,
             issue_driven_json=issue_driven_json,
             resumed_from_run_id=run_id,
         )

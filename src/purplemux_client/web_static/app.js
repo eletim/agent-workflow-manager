@@ -616,9 +616,13 @@ function renderResources(result) {
 function renderRecovery(result) {
   const attempts = result.attempts || [];
   recoveryPanel.hidden = !["failed", "stopped"].includes(result.state);
-  recoverySummary.textContent = "Review the original settings, then resume them as a new run. The workflow will reuse its existing recovery semantics and verify authoritative state before mutating it.";
-  resumeOpen.disabled = activeRunId === null
-    || !["failed", "stopped"].includes(result.state);
+  const resumable = result.mode === "issue-driven"
+    && ["failed", "stopped"].includes(result.state);
+  recoverySummary.textContent = resumable
+    ? "Review the original settings, then resume them as a new run. The workflow will reuse its existing recovery semantics and verify authoritative state before mutating it."
+    : "Inspect this run and its retained resources, then start a new run to recover. The new workflow must verify authoritative Git, GitHub, and PurpleMux state before mutating it.";
+  resumeOpen.hidden = !resumable;
+  resumeOpen.disabled = activeRunId === null || !resumable;
   attemptHistory.replaceChildren();
   for (const attempt of attempts) {
     const item = document.createElement("li");
@@ -1494,6 +1498,7 @@ function resumeSettingsText(snapshot) {
 resumeOpen.addEventListener("click", () => {
   if (
     activeRunSnapshot?.runId !== activeRunId
+    || activeRunSnapshot.mode !== "issue-driven"
     || !["failed", "stopped"].includes(activeRunSnapshot.state)
   ) return;
   resumeSourceRunId = activeRunId;

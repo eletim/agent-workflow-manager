@@ -443,6 +443,23 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         restored.close()
 
 
+@pytest.mark.parametrize("mode", ["prompt", "workflow"])
+def test_resume_rejects_non_issue_driven_runs(
+    runner: PythonRunner, tmp_path: Path, mode: str
+) -> None:
+    prompt = (
+        PromptExecution("codex", str(tmp_path), "answer") if mode == "prompt" else None
+    )
+    run_id = runner.start("raise SystemExit(7)", prompt=prompt)
+    wait_for(runner, lambda item: item.state == "failed", run_id=run_id)
+
+    with pytest.raises(
+        runner_module.RunResumeNotAllowedError,
+        match="not an Issue Driven run",
+    ):
+        runner.resume(run_id)
+
+
 def test_run_id_is_durably_reserved_before_launch_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2571,7 +2588,7 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
 
 
-def test_run_api_resumes_only_failed_or_stopped_runs_as_new_runs(
+def test_run_api_rejects_non_issue_driven_and_nonterminal_resume(
     web_server: tuple[tuple[str, int], str],
 ) -> None:
     address, token = web_server
@@ -2589,17 +2606,14 @@ def test_run_api_resumes_only_failed_or_stopped_runs_as_new_runs(
         assert time.monotonic() < deadline
         time.sleep(0.02)
 
-    status, resumed = request(
+    status, rejected = request(
         address,
         "POST",
         f"/api/runs/{source_id}/resume",
         token=token,
     )
-    assert status == 202
-    assert resumed["runId"] == source_id + 1
-    assert resumed["resumedFromRunId"] == source_id
-    assert resumed["args"] == ["same"]
-    assert resumed["code"] == "raise SystemExit(9)"
+    assert status == 409
+    assert "not an Issue Driven run" in rejected["error"]
 
     status, successful = request(
         address,

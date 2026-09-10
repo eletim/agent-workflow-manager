@@ -737,8 +737,9 @@ Checkpoint and in-place Resume are not supported Workflow APIs. Failed and
 stopped runs remain inspectable, including output and owned PurpleMux resources,
 but their terminated Python processes are not reconstructed.
 
-Use **Review & Resume** to confirm the failed run's immutable settings and start
-a distinct recovery run, or author a new run manually. Its ordinary Python code should inspect exact Git
+Issue Driven runs can use **Review & Resume** to confirm the failed run's
+immutable settings and start a distinct recovery run. Prompt and custom Python
+Workflow recovery is authored as a new run manually. Its ordinary Python code should inspect exact Git
 branches and commits, GitHub PR topology, and any relevant PurpleMux resources
 before reusing external work or making a new mutation. Keep mutation-once and
 `MutationOutcomeUnknown` protections: reconcile a possibly dispatched mutation
