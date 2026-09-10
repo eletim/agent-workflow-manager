@@ -941,9 +941,8 @@ test("stale guide failure cannot replace the active guide", async () => {
   assert.equal(elements["guide-copy"].disabled, false);
 });
 
-test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {
-  const first = deferred();
-  const second = deferred();
+test("Issue Driven generation immediately enters pending and suppresses repeat clicks", async () => {
+  const generation = deferred();
   let requestNumber = 0;
   const {elements} = await loadApp({
     runs: [],
@@ -952,28 +951,90 @@ test("stale Issue Driven generation cannot replace newer JSON and Python", async
     fetchOverride(url) {
       if (url !== "/api/issue-driven/generate") return undefined;
       requestNumber += 1;
-      return requestNumber === 1 ? first.promise : second.promise;
+      return generation.promise;
     },
   });
 
   await elements["issue-driven-mode"].dispatch("click");
   elements["issue-driven-json"].value = '{"issues":[90]}';
-  const firstGeneration = elements["issue-driven-generate"].dispatch("click");
-  elements["issue-driven-json"].value = '{"issues":[91]}';
-  const secondGeneration = elements["issue-driven-generate"].dispatch("click");
-  second.resolve(response({
-    generatedCode: "# generated for 91",
-    issueDrivenValidation: [],
-  }));
-  await secondGeneration;
-  first.resolve(response({
+  const pendingGeneration = elements["issue-driven-generate"].dispatch("click");
+
+  assert.equal(elements["issue-driven-generate"].disabled, true);
+  assert.equal(elements["issue-driven-generate"].dataset.pending, "true");
+  assert.equal(elements["issue-driven-generate"].getAttribute("aria-busy"), "true");
+  await elements["issue-driven-generate"].dispatch("click");
+  assert.equal(requestNumber, 1);
+
+  generation.resolve(response({
     generatedCode: "# generated for 90",
     issueDrivenValidation: [],
   }));
-  await firstGeneration;
+  await pendingGeneration;
 
-  assert.equal(elements["issue-driven-json"].value, '{"issues":[91]}');
-  assert.equal(elements["issue-driven-python"].value, "# generated for 91");
+  assert.equal(elements["issue-driven-python"].value, "# generated for 90");
+  assert.equal(elements["issue-driven-generate"].disabled, false);
+  assert.equal(elements["issue-driven-generate"].dataset.pending, undefined);
+  assert.equal(elements["issue-driven-generate"].getAttribute("aria-busy"), undefined);
+});
+
+test("Run pending feedback clears after failure and permits a retry", async () => {
+  const firstRun = deferred();
+  let runRequests = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/run") return undefined;
+      runRequests += 1;
+      return runRequests === 1
+        ? firstRun.promise
+        : response({error: "retry also failed"}, 500);
+    },
+  });
+
+  const pendingRun = elements.run.dispatch("click");
+  assert.equal(elements.run.disabled, true);
+  assert.equal(elements.run.dataset.pending, "true");
+  assert.equal(elements.run.getAttribute("aria-busy"), "true");
+  await elements.run.dispatch("click");
+  assert.equal(runRequests, 1);
+
+  firstRun.resolve(response({error: "start failed"}, 500));
+  await pendingRun;
+  assert.equal(elements.run.disabled, false);
+  assert.equal(elements.run.dataset.pending, undefined);
+  assert.equal(elements.run.getAttribute("aria-busy"), undefined);
+  assert.match(elements.stderr.textContent, /start failed/);
+
+  await elements.run.dispatch("click");
+  assert.equal(runRequests, 2);
+});
+
+test("non-Run async actions use the same pending feedback", async () => {
+  const notification = deferred();
+  let notificationRequests = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/settings/notifications/test") return undefined;
+      notificationRequests += 1;
+      return notification.promise;
+    },
+  });
+
+  const pendingNotification = elements["test-notification"].dispatch("click");
+  assert.equal(elements["test-notification"].disabled, true);
+  assert.equal(elements["test-notification"].dataset.pending, "true");
+  await elements["test-notification"].dispatch("click");
+  assert.equal(notificationRequests, 1);
+
+  notification.resolve(response({message: "Test notification sent."}));
+  await pendingNotification;
+  assert.equal(elements["test-notification"].disabled, false);
+  assert.equal(elements["test-notification"].dataset.pending, undefined);
 });
 
 test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async () => {
@@ -1019,6 +1080,9 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
     ["/api/run", {code: generatedCode, args: []}],
   ]);
   assert.match(elements["active-context"].textContent, /Workflow Run #12/);
+  assert.equal(elements.run.dataset.pending, undefined);
+  assert.equal(elements.run.getAttribute("aria-busy"), undefined);
+  assert.equal(elements.run.disabled, true);
 });
 
 test("Prompt directory picker navigates and selects its resolved current path", async () => {
@@ -2263,7 +2327,7 @@ test("slow run action cannot replace a newly selected run", async () => {
   assert.equal(elements.stop.disabled, true);
 });
 
-test("slow validation response cannot replace a newer validation result", async () => {
+test("slow validation suppresses a duplicate request until it settles", async () => {
   const delayedValidation = deferred();
   let validationCalls = 0;
   const {elements} = await loadApp({
@@ -2282,18 +2346,19 @@ test("slow validation response cannot replace a newer validation result", async 
   const slowValidation = elements.validate.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
   await elements.validate.dispatch("click");
-  assert.equal(elements["validation-success"].hidden, false);
-  assert.equal(elements["validation-success"].textContent, "✓ Valid");
+  assert.equal(validationCalls, 1);
+  assert.equal(elements.validate.disabled, true);
 
   delayedValidation.resolve(response({
     error: "workflow validation failed",
-    validation: [{line: 2, column: null, message: "stale result"}],
+    validation: [{line: 2, column: null, message: "first result"}],
   }, 422));
   await slowValidation;
 
-  assert.equal(elements["validation-success"].hidden, false);
-  assert.equal(elements["validation-success"].textContent, "✓ Valid");
-  assert.equal(elements.validation.children.length, 0);
+  assert.equal(elements.validate.disabled, false);
+  assert.equal(elements["validation-success"].hidden, true);
+  assert.equal(elements.validation.children.length, 1);
+  assert.match(elements.validation.children[0].textContent, /first result/);
 });
 
 test("slow draft validation cannot replace a selected run outline", async () => {

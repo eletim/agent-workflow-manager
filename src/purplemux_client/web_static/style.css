@@ -216,6 +216,22 @@ button {
 }
 button.primary { background: #6846d7; border-color: #8061e8; }
 button:disabled { cursor: default; opacity: 0.45; }
+button[data-pending="true"]::before {
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  margin-right: 0.55em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  content: "";
+  vertical-align: -0.1em;
+  animation: button-pending-spin 0.7s linear infinite;
+}
+@keyframes button-pending-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button[data-pending="true"]::before { animation: none; }
+}
 a { color: #bcaaff; }
 #exit-code { margin-left: auto; color: #aab0bf; font-size: 13px; }
 
