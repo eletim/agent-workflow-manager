@@ -225,14 +225,19 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         notification_settings: NotificationSettings | None = None,
         host_aliases: tuple[str, ...] = (),
         readiness_service: AgentReadinessService | None = None,
-        purplemux_port: int = 8022,
+        purplemux_port: int | None = None,
+        purplemux_port_file: Path | None = None,
     ) -> None:
-        if (
-            isinstance(purplemux_port, bool)
-            or not isinstance(purplemux_port, int)
-            or not 1 <= purplemux_port <= 65535
-        ):
-            raise ValueError("PurpleMux port must be an integer from 1 to 65535")
+        if purplemux_port is not None and purplemux_port_file is not None:
+            raise ValueError("PurpleMux port and port file are mutually exclusive")
+        self._purplemux_port_file = purplemux_port_file
+        self._purplemux_port = (
+            self._read_purplemux_port_file(purplemux_port_file)
+            if purplemux_port_file is not None
+            else self._validate_purplemux_port(
+                8022 if purplemux_port is None else purplemux_port
+            )
+        )
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
         bound_host, bound_port = cast(tuple[str, int], self.server_address)
@@ -247,7 +252,6 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             else "127.0.0.1"
         )
         browser_origin = f"http://{browser_host}:{bound_port}"
-        self.purplemux_port = purplemux_port
         self.mobile_connection_url = mobile_connection_url(
             requested_host, browser_origin
         )
@@ -293,6 +297,34 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self.allowed_hosts.update(
             f"{alias}:{bound_port}" for alias in self.host_aliases
         )
+
+    @staticmethod
+    def _validate_purplemux_port(port: int) -> int:
+        if (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError("PurpleMux port must be an integer from 1 to 65535")
+        return port
+
+    @classmethod
+    def _read_purplemux_port_file(cls, path: Path) -> int:
+        value = path.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise ValueError("PurpleMux port file must contain a decimal TCP port")
+        return cls._validate_purplemux_port(int(value, 10))
+
+    @property
+    def purplemux_port(self) -> int:
+        if self._purplemux_port_file is not None:
+            try:
+                self._purplemux_port = self._read_purplemux_port_file(
+                    self._purplemux_port_file
+                )
+            except (OSError, ValueError):
+                pass
+        return self._purplemux_port
 
     @staticmethod
     def _make_qr_svg(url: str) -> bytes:
@@ -999,7 +1031,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trusted Python runner UI")
     parser.add_argument("--host", default="127.0.0.1", type=_parse_bind_host)
     parser.add_argument("--port", default=8765, type=int)
-    parser.add_argument("--purplemux-port", default=8022, type=int)
+    purplemux_port = parser.add_mutually_exclusive_group()
+    purplemux_port.add_argument("--purplemux-port", type=int)
+    purplemux_port.add_argument("--purplemux-port-file", type=Path)
     parser.add_argument(
         "--host-aliases",
         default=(),
@@ -1023,6 +1057,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    purplemux_port_file = args.purplemux_port_file
+    if args.purplemux_port is None and purplemux_port_file is None:
+        purplemux_port_file = Path.home() / ".purplemux" / "port"
     notifier = NotifyCLI.from_environment()
     notifier.config_path = str(args.notify_config)
     notification_settings = NotificationSettings(
@@ -1036,6 +1073,7 @@ def main() -> None:
         notification_settings=notification_settings,
         host_aliases=args.host_aliases,
         purplemux_port=args.purplemux_port,
+        purplemux_port_file=purplemux_port_file,
     )
     print(f"Python Runner UI: http://{args.host}:{args.port}")
     print("Trusted-network use only: this server executes arbitrary Python code.")

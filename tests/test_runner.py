@@ -3797,6 +3797,13 @@ def test_web_cli_accepts_configured_purplemux_port() -> None:
     assert args.purplemux_port == 9123
 
 
+def test_web_cli_accepts_purplemux_port_file(tmp_path: Path) -> None:
+    port_file = tmp_path / "port"
+    args = build_parser().parse_args(["--purplemux-port-file", str(port_file)])
+
+    assert args.purplemux_port_file == port_file
+
+
 def test_mobile_connection_uses_remote_browser_origin_only() -> None:
     alias_origin = "http://runner.example.ts.net:8765"
 
@@ -3819,6 +3826,31 @@ def test_purplemux_server_exposes_configured_runtime_port() -> None:
         assert server.purplemux_port == 9123
     finally:
         server.server_close()
+
+
+def test_purplemux_server_refreshes_port_file_for_each_snapshot(
+    tmp_path: Path,
+) -> None:
+    port_file = tmp_path / "port"
+    port_file.write_text("8022\n", encoding="utf-8")
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        PythonRunner(managed_workflows=False),
+        purplemux_port_file=port_file,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    try:
+        assert request(address, "GET", "/api/status")[1]["purplemuxPort"] == 8022
+
+        port_file.write_text("9123\n", encoding="utf-8")
+
+        assert request(address, "GET", "/api/status")[1]["purplemuxPort"] == 9123
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_mobile_connection_falls_back_from_localhost_alias_to_remote_bind() -> None:

@@ -51,11 +51,16 @@ purplemux_remediation() {
 
 resolve_purplemux_port() {
     local configured_port
+    local port_file="$HOME/.purplemux/port"
 
     if [[ -n ${PMUX_PORT:-} ]]; then
         configured_port=$PMUX_PORT
-    elif [[ -r $HOME/.purplemux/port ]]; then
-        configured_port=$(<"$HOME/.purplemux/port")
+        PURPLEMUX_PORT_OPTION=--purplemux-port
+        PURPLEMUX_PORT_VALUE=$PMUX_PORT
+    elif [[ -r $port_file ]]; then
+        configured_port=$(<"$port_file")
+        PURPLEMUX_PORT_OPTION=--purplemux-port-file
+        PURPLEMUX_PORT_VALUE=$port_file
     else
         printf '%s\n' \
             'ERROR: PurpleMux runtime port is unavailable.' >&2
@@ -69,7 +74,9 @@ resolve_purplemux_port() {
         purplemux_remediation
         exit 1
     fi
-    PURPLEMUX_RUNTIME_PORT=$((10#$configured_port))
+    if [[ $PURPLEMUX_PORT_OPTION == --purplemux-port ]]; then
+        PURPLEMUX_PORT_VALUE=$((10#$configured_port))
+    fi
 }
 
 validate_purplemux() {
@@ -657,7 +664,7 @@ printf 'Notify config: %s\n' "$NOTIFY_CONFIG"
 exec uv run python -m purplemux_client.web \
     --host "$AGENT_WORKFLOW_MANAGER_HOST" \
     --port "$AGENT_WORKFLOW_MANAGER_PORT" \
-    --purplemux-port "$PURPLEMUX_RUNTIME_PORT" \
+    "$PURPLEMUX_PORT_OPTION" "$PURPLEMUX_PORT_VALUE" \
     --host-aliases "$AGENT_WORKFLOW_MANAGER_HOST_ALIASES" \
     --runtime-config "$config_file" \
     --notify-config "$NOTIFY_CONFIG"
