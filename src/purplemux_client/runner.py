@@ -178,7 +178,9 @@ class IssueResult:
     pr: PullRequestNavigation
     warnings: tuple[str, ...] = ()
     label: str | None = None
-    terminal: PurpleMuxNavigation | None = None
+    implementation_terminal: PurpleMuxNavigation | None = None
+    scope_review_terminal: PurpleMuxNavigation | None = None
+    correctness_review_terminal: PurpleMuxNavigation | None = None
 
 
 @dataclass(frozen=True)
@@ -444,8 +446,17 @@ class RunnerSnapshot:
             }
             if result.label is not None:
                 item["label"] = result.label
-            if result.terminal is not None:
-                item["terminal"] = result.terminal.as_json()
+            terminals = {
+                "implementation": result.implementation_terminal,
+                "scopeReview": result.scope_review_terminal,
+                "correctnessReview": result.correctness_review_terminal,
+            }
+            if any(terminal is not None for terminal in terminals.values()):
+                item["terminals"] = {
+                    role: terminal.as_json()
+                    for role, terminal in terminals.items()
+                    if terminal is not None
+                }
             issues.append(item)
         whole_review = self.whole_review_result
         return {
@@ -901,12 +912,26 @@ class PythonRunner:
             result_value["pr"] = self._history_dataclass(
                 PullRequestNavigation, result_value.get("pr")
             )
-            terminal_value = result_value.get("terminal")
-            result_value["terminal"] = (
-                None
-                if terminal_value is None
-                else self._history_dataclass(PurpleMuxNavigation, terminal_value)
+            legacy_terminal = result_value.pop("terminal", None)
+            terminal_fields = (
+                "implementation_terminal",
+                "scope_review_terminal",
+                "correctness_review_terminal",
             )
+            for field_name in terminal_fields:
+                terminal_value = result_value.get(field_name)
+                result_value[field_name] = (
+                    None
+                    if terminal_value is None
+                    else self._history_dataclass(PurpleMuxNavigation, terminal_value)
+                )
+            if (
+                legacy_terminal is not None
+                and result_value["implementation_terminal"] is None
+            ):
+                result_value["implementation_terminal"] = self._history_dataclass(
+                    PurpleMuxNavigation, legacy_terminal
+                )
             warnings_value = result_value.get("warnings")
             if not isinstance(warnings_value, list) or any(
                 not isinstance(warning, str) for warning in warnings_value
@@ -2669,7 +2694,15 @@ class PythonRunner:
             pr_number = value.get("pr_number")
             pr_url = value.get("pr_url")
             workspace_id = value.get("workspace_id")
-            tab_id = value.get("tab_id")
+            implementation_tab_id = value.get("implementation_tab_id")
+            scope_review_tab_id = value.get("scope_review_tab_id")
+            correctness_review_tab_id = value.get("correctness_review_tab_id")
+            terminal_identities = (
+                workspace_id,
+                implementation_tab_id,
+                scope_review_tab_id,
+                correctness_review_tab_id,
+            )
             if (
                 isinstance(issue, bool)
                 or not isinstance(issue, (int, str))
@@ -2684,18 +2717,32 @@ class PythonRunner:
                     )
                 )
                 or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
-                or (workspace_id is None) != (tab_id is None)
                 or (
-                    workspace_id is not None
-                    and (
-                        not isinstance(workspace_id, str)
-                        or not workspace_id.strip()
-                        or not isinstance(tab_id, str)
-                        or not tab_id.strip()
+                    any(identity is not None for identity in terminal_identities)
+                    and any(
+                        not isinstance(identity, str) or not identity.strip()
+                        for identity in terminal_identities
                     )
                 )
             ):
                 return None
+            terminals: tuple[
+                PurpleMuxNavigation | None,
+                PurpleMuxNavigation | None,
+                PurpleMuxNavigation | None,
+            ] = (None, None, None)
+            if workspace_id is not None:
+                terminals = (
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, implementation_tab_id)
+                    ),
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, scope_review_tab_id)
+                    ),
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, correctness_review_tab_id)
+                    ),
+                )
             return "issue_result", IssueResult(
                 issue,
                 typed_outcome,
@@ -2703,11 +2750,7 @@ class PythonRunner:
                 PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
                 typed_warnings,
                 cast(str | None, label),
-                (
-                    PurpleMuxNavigation(cast(str, workspace_id), cast(str, tab_id))
-                    if workspace_id is not None
-                    else None
-                ),
+                *terminals,
             )
         name = value.get("name")
         status = value.get("status")

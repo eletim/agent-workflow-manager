@@ -1164,7 +1164,15 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     assert commit_index < push_index < draft_index < verify_index
     assert events[-1] == "ready"
     assert issue_results[0][1]["workspace_id"] == "ws-test"
-    assert issue_results[0][1]["tab_id"] == f"{issue.label} implementer"
+    assert issue_results[0][1]["implementation_tab_id"] == (
+        f"{issue.label} implementer"
+    )
+    assert issue_results[0][1]["scope_review_tab_id"] == (
+        f"{issue.label} scope reviewer"
+    )
+    assert issue_results[0][1]["correctness_review_tab_id"] == (
+        f"{issue.label} correctness reviewer"
+    )
 
 
 def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(

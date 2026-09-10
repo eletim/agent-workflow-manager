@@ -115,6 +115,7 @@ function snapshot({
   findings = [],
   warningTimeline = [],
   warningTimelineOmitted = 0,
+  purplemuxPort = 9123,
 }) {
   const result = {
     args,
@@ -146,6 +147,7 @@ function snapshot({
     integrationPr,
     checked,
     issueDrivenSummary,
+    purplemuxPort,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -1780,7 +1782,11 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
         outcome: "continued_with_warning",
         reviews: 5,
         pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
-        terminal: {workspaceId: "ws-run", tabId: "tab-implementer"},
+        terminals: {
+          implementation: {workspaceId: "ws-run", tabId: "tab-implementer"},
+          scopeReview: {workspaceId: "ws-run", tabId: "tab-scope"},
+          correctnessReview: {workspaceId: "ws-run", tabId: "tab-correctness"},
+        },
         warnings: ["review limit reached"],
       },
     ],
@@ -1797,16 +1803,31 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
     runs: [{runId: 1, state: "success"}],
     details: {1: detail},
     validation: {status: 200, body: {validation: []}},
+    locationHref: "http://100.64.10.20:8765/",
   });
 
   assert.equal(elements["issue-summary-panel"].hidden, false);
   assert.equal(elements["issue-summary-list"].children.length, 1);
-  const terminalLink = elements["issue-summary-list"].children[0]
+  const implementationLink = elements["issue-summary-list"].children[0]
     .children[1].children[0].children[4];
-  assert.equal(terminalLink.textContent, "Terminal");
+  const scopeLink = elements["issue-summary-list"].children[0]
+    .children[1].children[0].children[6];
+  const correctnessLink = elements["issue-summary-list"].children[0]
+    .children[1].children[0].children[8];
+  assert.equal(implementationLink.textContent, "Implementation");
   assert.equal(
-    terminalLink.href,
-    "http://127.0.0.1:8022/?workspace=ws-run&tab=tab-implementer",
+    implementationLink.href,
+    "http://100.64.10.20:9123/?workspace=ws-run&tab=tab-implementer",
+  );
+  assert.equal(scopeLink.textContent, "Scope Review");
+  assert.equal(
+    scopeLink.href,
+    "http://100.64.10.20:9123/?workspace=ws-run&tab=tab-scope",
+  );
+  assert.equal(correctnessLink.textContent, "Correctness Review");
+  assert.equal(
+    correctnessLink.href,
+    "http://100.64.10.20:9123/?workspace=ws-run&tab=tab-correctness",
   );
   assert.equal(
     elements["issue-summary-list"].children[0].children[1].children[0].children[0]

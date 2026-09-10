@@ -1726,7 +1726,9 @@ def process_issue(
             warnings=warnings,
             label=issue.label,
             workspace_id=client.workspace_id,
-            tab_id=implementer,
+            implementation_tab_id=implementer,
+            scope_review_tab_id=scope_reviewer,
+            correctness_review_tab_id=correctness_reviewer,
         )
         record_issue_handoff_result(
             issue.result_id, issue.label, pr, delivery.outcome, delivery.reviews, warnings
@@ -1752,7 +1754,9 @@ def process_issue(
         warnings=warnings,
         label=issue.label,
         workspace_id=client.workspace_id,
-        tab_id=implementer,
+        implementation_tab_id=implementer,
+        scope_review_tab_id=scope_reviewer,
+        correctness_review_tab_id=correctness_reviewer,
     )
     record_issue_handoff_result(
         issue.result_id,

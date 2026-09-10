@@ -257,10 +257,11 @@ structured warnings; an unknown GitHub mutation outcome still fails closed.
 After a run reaches a terminal state, its detail view shows an Issue Driven
 Summary with the repository and branches, each work-item PR and exact completed
 review-turn count, whole-version review outcome, Base PR, policy Issue, and the
-number of structured warning Findings. Each completed child PR also links to its
-implementer tab, which contains the implementation and any fixes made during
-review, using PurpleMux's canonical
-`/?workspace=<workspaceId>&tab=<tabId>` deep link. The generated workflow
+number of structured warning Findings. Each completed child PR also links to
+its implementation, Scope / Design Review, and Correctness Review tabs using
+PurpleMux's canonical `/?workspace=<workspaceId>&tab=<tabId>` deep link. AWM
+combines that path with the runtime's configured PurpleMux port and the browser's
+current trusted hostname for Desktop or Mobile access. The generated workflow
 publishes these facts and stable PurpleMux identities through dedicated result
 events as they become final. The Runner retains them per run independently of
 the bounded Progress history; the Summary is an observation surface and never

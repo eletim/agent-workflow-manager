@@ -94,7 +94,9 @@ def emit_issue_result(
     warnings: tuple[str, ...] = (),
     label: str | None = None,
     workspace_id: str | None = None,
-    tab_id: str | None = None,
+    implementation_tab_id: str | None = None,
+    scope_review_tab_id: str | None = None,
+    correctness_review_tab_id: str | None = None,
 ) -> None:
     """Publish one final, structured work-item outcome for the current run."""
     if isinstance(issue, bool) or not isinstance(issue, (int, str)):
@@ -111,7 +113,12 @@ def emit_issue_result(
     _validate_review_count(reviews)
     _validate_pr("issue result", pr_number, pr_url)
     _validate_warnings(warnings)
-    _validate_terminal(workspace_id, tab_id)
+    _validate_issue_terminals(
+        workspace_id,
+        implementation_tab_id,
+        scope_review_tab_id,
+        correctness_review_tab_id,
+    )
     event: dict[str, object] = {
         "type": "issue_result",
         "issue": issue,
@@ -125,7 +132,9 @@ def emit_issue_result(
         event["label"] = label
     if workspace_id is not None:
         event["workspace_id"] = workspace_id
-        event["tab_id"] = tab_id
+        event["implementation_tab_id"] = implementation_tab_id
+        event["scope_review_tab_id"] = scope_review_tab_id
+        event["correctness_review_tab_id"] = correctness_review_tab_id
     _write_event(event)
 
 
@@ -213,15 +222,26 @@ def _validate_pr(context: str, pr_number: int | None, pr_url: str | None) -> Non
         raise ValueError(f"{context} PR URL must be an absolute HTTPS URL")
 
 
-def _validate_terminal(workspace_id: str | None, tab_id: str | None) -> None:
-    if (workspace_id is None) != (tab_id is None):
-        raise ValueError("PurpleMux workspaceId and tabId must be provided together")
-    if workspace_id is None:
+def _validate_issue_terminals(
+    workspace_id: str | None,
+    implementation_tab_id: str | None,
+    scope_review_tab_id: str | None,
+    correctness_review_tab_id: str | None,
+) -> None:
+    identities = (
+        workspace_id,
+        implementation_tab_id,
+        scope_review_tab_id,
+        correctness_review_tab_id,
+    )
+    if all(identity is None for identity in identities):
         return
-    if not isinstance(workspace_id, str) or not workspace_id.strip():
-        raise ValueError("PurpleMux workspaceId must be a non-empty string")
-    if not isinstance(tab_id, str) or not tab_id.strip():
-        raise ValueError("PurpleMux tabId must be a non-empty string")
+    if any(
+        not isinstance(identity, str) or not identity.strip() for identity in identities
+    ):
+        raise ValueError(
+            "PurpleMux workspaceId and all work-item tabIds must be non-empty strings"
+        )
 
 
 def emit_finding(

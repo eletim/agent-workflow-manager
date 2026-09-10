@@ -1572,7 +1572,7 @@ def test_issue_driven_summary_uses_durable_structured_results_not_progress() -> 
     emit_step, emit_whole_review_result,
 )
 emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
-emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", tab_id="tab-10")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-10-implementation", scope_review_tab_id="tab-10-scope", correctness_review_tab_id="tab-10-correctness")
 emit_finding("github", "review limit reached", status="warning")
 emit_issue_result(11, "continued_with_warning", 5, 41, "https://github.com/acme/project/pull/41", warnings=("review limit reached",))
 emit_issue_result("mini-task:refresh-help", "approved", 2, 42, "https://github.com/acme/project/pull/42", label="Mini task refresh-help")
@@ -1608,7 +1608,20 @@ for number in range(3):
                     "url": "https://github.com/acme/project/pull/40",
                 },
                 "warnings": [],
-                "terminal": {"workspaceId": "ws-run", "tabId": "tab-10"},
+                "terminals": {
+                    "implementation": {
+                        "workspaceId": "ws-run",
+                        "tabId": "tab-10-implementation",
+                    },
+                    "scopeReview": {
+                        "workspaceId": "ws-run",
+                        "tabId": "tab-10-scope",
+                    },
+                    "correctnessReview": {
+                        "workspaceId": "ws-run",
+                        "tabId": "tab-10-correctness",
+                    },
+                },
             },
             {
                 "issue": 11,
@@ -1652,7 +1665,7 @@ def test_issue_driven_terminal_navigation_survives_runner_reconstruction(
         run_id = runner.start(
             """from purplemux_client import emit_issue_driven_context, emit_issue_result
 emit_issue_driven_context("acme/project", "dev/v1", "main")
-emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", tab_id="tab-10")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-10-implementation", scope_review_tab_id="tab-10-scope", correctness_review_tab_id="tab-10-correctness")
 """
         )
         expected = wait_until_finished(runner).as_json()["issueDrivenSummary"]
@@ -2266,6 +2279,7 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "integrationPr": None,
         "issueDrivenSummary": None,
+        "purplemuxPort": 8022,
         "cwd": str(Path.cwd()),
         "args": [],
         "attempts": [
@@ -3777,6 +3791,12 @@ def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
     assert args.host == "100.64.10.20"
 
 
+def test_web_cli_accepts_configured_purplemux_port() -> None:
+    args = build_parser().parse_args(["--purplemux-port", "9123"])
+
+    assert args.purplemux_port == 9123
+
+
 def test_mobile_connection_uses_remote_browser_origin_only() -> None:
     alias_origin = "http://runner.example.ts.net:8765"
 
@@ -3785,6 +3805,20 @@ def test_mobile_connection_uses_remote_browser_origin_only() -> None:
     assert mobile_connection_url("127.0.0.1", alias_origin) is None
     assert mobile_connection_url("localhost", alias_origin) is None
     assert mobile_connection_url("0.0.0.0", alias_origin) is None
+
+
+def test_purplemux_server_exposes_configured_runtime_port() -> None:
+    runner = PythonRunner(managed_workflows=False)
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        host_aliases=("runner.example.ts.net",),
+        purplemux_port=9123,
+    )
+    try:
+        assert server.purplemux_port == 9123
+    finally:
+        server.server_close()
 
 
 def test_mobile_connection_falls_back_from_localhost_alias_to_remote_bind() -> None:
