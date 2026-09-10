@@ -341,6 +341,7 @@ class RunnerSnapshot:
     attempts: tuple[RunAttempt, ...]
     findings: tuple[TopologyFinding, ...]
     warning_findings: tuple[TopologyFinding, ...]
+    warning_findings_omitted: int
     has_warnings: bool
     dry_run: DryRunResult | None
     resources: tuple[RunResource, ...] = ()
@@ -392,6 +393,7 @@ class RunnerSnapshot:
             _finding_json(item) for item in self.warning_findings
         ]
         payload.pop("warning_findings")
+        payload["warningTimelineOmitted"] = payload.pop("warning_findings_omitted")
         payload["hasWarnings"] = payload.pop("has_warnings")
         payload["dryRun"] = self.dry_run.as_json() if self.dry_run else None
         payload.pop("dry_run")
@@ -524,7 +526,8 @@ class _RunRecord:
     findings: deque[TopologyFinding] = field(default_factory=deque)
     # Warning positions are durable run history, independent of the bounded
     # diagnostic Finding stream used for the general inspection surface.
-    warning_findings: list[TopologyFinding] = field(default_factory=list)
+    warning_findings: deque[TopologyFinding] = field(default_factory=deque)
+    warning_findings_omitted: int = 0
     has_warnings: bool = False
     warning_count: int = 0
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -630,6 +633,7 @@ class PythonRunner:
             attempts=(),
             findings=(),
             warning_findings=(),
+            warning_findings_omitted=0,
             has_warnings=False,
             dry_run=None,
         )
@@ -713,6 +717,7 @@ class PythonRunner:
             },
             "findings": [asdict(finding) for finding in run.findings],
             "warningFindings": [asdict(finding) for finding in run.warning_findings],
+            "warningFindingsOmitted": run.warning_findings_omitted,
             "attempts": [asdict(attempt) for attempt in run.attempts],
             "resources": [asdict(resource) for resource in run.resources],
             "prompt": asdict(run.prompt) if run.prompt is not None else None,
@@ -823,6 +828,18 @@ class PythonRunner:
             if warning_values is None
             else load_many(TopologyFinding, "warningFindings")
         )
+        warning_findings_omitted = value.get("warningFindingsOmitted", 0)
+        if (
+            len(warning_findings) > self._max_progress_events
+            or any(
+                finding.status != "warning" or not isinstance(finding.observed_at, str)
+                for finding in warning_findings
+            )
+            or isinstance(warning_findings_omitted, bool)
+            or not isinstance(warning_findings_omitted, int)
+            or warning_findings_omitted < 0
+        ):
+            raise ValueError
         attempts = load_many(RunAttempt, "attempts")
         resources = load_many(RunResource, "resources")
         progress_pr_values = value.get("progressPrs")
@@ -870,9 +887,10 @@ class PythonRunner:
             progress=deque(progress, maxlen=self._max_progress_events),
             progress_prs=progress_prs,
             findings=deque(findings, maxlen=self._max_progress_events),
-            warning_findings=warning_findings,
-            has_warnings=bool(warning_findings),
-            warning_count=len(warning_findings),
+            warning_findings=deque(warning_findings, maxlen=self._max_progress_events),
+            warning_findings_omitted=warning_findings_omitted,
+            has_warnings=bool(warning_findings or warning_findings_omitted),
+            warning_count=warning_findings_omitted + len(warning_findings),
             attempts=attempts,
             resources=resources,
             prompt=prompt,
@@ -982,6 +1000,14 @@ class PythonRunner:
             )
             with self._lock:
                 self._ensure_open()
+                warning_findings = tuple(
+                    finding
+                    for finding in result.findings
+                    if finding.status == "warning"
+                )
+                warning_findings_omitted = max(
+                    0, len(warning_findings) - self._max_progress_events
+                )
                 self._preview = RunnerSnapshot(
                     # A runtime Dry Run failure does not invalidate the separate
                     # side-effect-free Static Validation result.
@@ -1000,14 +1026,12 @@ class PythonRunner:
                     args=run_args,
                     attempts=(),
                     findings=result.findings,
-                    warning_findings=tuple(
-                        finding
-                        for finding in result.findings
-                        if finding.status == "warning"
-                    ),
+                    warning_findings=warning_findings[-self._max_progress_events :],
+                    warning_findings_omitted=warning_findings_omitted,
                     has_warnings=any(
                         finding.status == "warning" for finding in result.findings
                     ),
+                    warning_count=len(warning_findings),
                     dry_run=result,
                 )
                 self._mark_changed()
@@ -1207,6 +1231,7 @@ class PythonRunner:
             outline=outline,
             progress=deque(maxlen=self._max_progress_events),
             findings=deque(maxlen=self._max_progress_events),
+            warning_findings=deque(maxlen=self._max_progress_events),
             prompt=prompt,
         )
         self._runs[run_id] = run
@@ -1276,6 +1301,7 @@ class PythonRunner:
             outline=outline,
             progress=deque(maxlen=self._max_progress_events),
             findings=deque(maxlen=self._max_progress_events),
+            warning_findings=deque(maxlen=self._max_progress_events),
             credential_path=credential_path,
             event_token=event_token,
         )
@@ -1556,6 +1582,7 @@ class PythonRunner:
             attempts=(),
             findings=(),
             warning_findings=(),
+            warning_findings_omitted=0,
             has_warnings=False,
             dry_run=None,
         )
@@ -1627,6 +1654,7 @@ class PythonRunner:
             attempts=tuple(run.attempts),
             findings=tuple(run.findings),
             warning_findings=tuple(run.warning_findings),
+            warning_findings_omitted=run.warning_findings_omitted,
             has_warnings=run.has_warnings,
             dry_run=None,
             code=None if run.prompt is not None else run.code,
@@ -2397,6 +2425,8 @@ class PythonRunner:
             accepted = replace(finding, observed_at=self._accepted_at())
             run.findings.append(accepted)
             if finding.status == "warning":
+                if len(run.warning_findings) == run.warning_findings.maxlen:
+                    run.warning_findings_omitted += 1
                 run.warning_findings.append(accepted)
                 run.has_warnings = True
                 run.warning_count += 1

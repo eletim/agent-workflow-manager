@@ -367,7 +367,11 @@ function renderRun(result) {
   checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
   checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
   renderOutline(result.outline || [], result.progress || []);
-  renderProgress(result.progress || [], result.warningTimeline || []);
+  renderProgress(
+    result.progress || [],
+    result.warningTimeline || [],
+    result.warningTimelineOmitted || 0,
+  );
   renderIntegrationPr(result.integrationPr || null);
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderIssueDrivenSummary(result.issueDrivenSummary || null);
@@ -817,7 +821,7 @@ function renderOutline(labels, events) {
   }
 }
 
-function renderProgress(events, findings = []) {
+function renderProgress(events, findings = [], warningsOmitted = 0) {
   const latest = new Map();
   for (const event of events) {
     const key = JSON.stringify([event.name, event.iteration, event.attempt]);
@@ -843,10 +847,35 @@ function renderProgress(events, findings = []) {
     if (typeof rightObservedAt !== "string") return -1;
     return leftObservedAt.localeCompare(rightObservedAt);
   });
+  if (warningsOmitted > 0) {
+    timeline.unshift({kind: "warning-omitted", count: warningsOmitted});
+  }
 
   progress.replaceChildren();
   progressEmpty.hidden = timeline.length > 0;
   for (const entry of timeline) {
+    if (entry.kind === "warning-omitted") {
+      const item = document.createElement("li");
+      item.className = "progress-item warning omitted";
+
+      const marker = document.createElement("span");
+      marker.className = "progress-marker";
+      marker.textContent = "⚠";
+
+      const details = document.createElement("div");
+      details.className = "progress-details";
+      const label = document.createElement("div");
+      label.className = "progress-label";
+      label.textContent = "Earlier warnings omitted";
+      const note = document.createElement("div");
+      note.className = "progress-note";
+      note.textContent = `${entry.count} warning occurrence${entry.count === 1 ? " is" : "s are"} outside retained Progress history.`;
+      details.append(label, note);
+      item.append(marker, details);
+      progress.append(item);
+      continue;
+    }
+
     if (entry.kind === "warning") {
       const item = document.createElement("li");
       item.className = "progress-item warning";

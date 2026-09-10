@@ -114,6 +114,7 @@ function snapshot({
   hasWarnings = false,
   findings = [],
   warningTimeline = [],
+  warningTimelineOmitted = 0,
 }) {
   const result = {
     args,
@@ -135,6 +136,7 @@ function snapshot({
     dryRunIssues: [],
     findings,
     warningTimeline,
+    warningTimelineOmitted,
     hasWarnings,
     resources,
     resourceCleanupStatus,
@@ -1703,6 +1705,31 @@ test("Progress places structured warnings at their recorded time across run swit
   assert.equal(
     reloaded.elements.progress.children[1].children[1].children[2].textContent,
     "review limit reached",
+  );
+});
+
+test("Progress reports warning occurrences omitted by timeline retention", async () => {
+  const warned = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "",
+    progress: [{name: "latest step", status: "completed"}],
+    warningTimelineOmitted: 3,
+    hasWarnings: true,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1", hasWarnings: true}],
+    details: {1: warned},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  const omitted = elements.progress.children[0];
+  assert.equal(omitted.className, "progress-item warning omitted");
+  assert.equal(omitted.children[0].textContent, "⚠");
+  assert.equal(omitted.children[1].children[0].textContent, "Earlier warnings omitted");
+  assert.equal(
+    omitted.children[1].children[1].textContent,
+    "3 warning occurrences are outside retained Progress history.",
   );
 });
 
