@@ -35,6 +35,7 @@ def test_canonical_example_parses_and_uses_recommended_defaults() -> None:
 
     assert config.issues == (86, 99, 87, 84)
     assert config.max_reviews == 4
+    assert config.scope_max_reviews == 6
     assert config.merge_final is False
     assert config.implementer_agent == "codex"
     assert config.reviewer_agent == "claude"
@@ -85,12 +86,14 @@ def test_starter_and_template_use_recommended_review_limits_and_safe_delivery() 
     guide = guide_text()
 
     assert '"max_reviews": 4' in index
+    assert '"scope_max_reviews": 6' in index
     assert '"implementer_agent": "codex"' in index
     assert '"reviewer_agent": "codex"' in index
     assert '"merge_final": false' in index
     assert "MAX_REVIEWS = 4" in example
     assert "MAX_SCOPE_REVIEWS = 6" in example
-    assert "keeps the Scope limit\nat least as high as the Correctness limit" in guide
+    assert "`scope_max_reviews` (default 6)" in guide
+    assert "Correctness Review uses `max_reviews`" in guide
 
 
 def test_guide_avoids_removed_recovery_contract() -> None:
