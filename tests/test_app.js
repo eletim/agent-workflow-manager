@@ -112,6 +112,7 @@ function snapshot({
   checked = false,
   issueDrivenSummary = null,
   hasWarnings = false,
+  findings = [],
 }) {
   const result = {
     args,
@@ -131,7 +132,7 @@ function snapshot({
     dryRun: null,
     dryRunEligible: true,
     dryRunIssues: [],
-    findings: [],
+    findings,
     hasWarnings,
     resources,
     resourceCleanupStatus,
@@ -1626,6 +1627,68 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
     ),
     [completedAt, startedAt, failedAt],
   );
+});
+
+test("Progress places structured warnings at their recorded time across run switches", async () => {
+  const preparedAt = "2026-09-05T01:02:03.000000+00:00";
+  const warningAt = "2026-09-05T01:03:04.000000+00:00";
+  const reviewedAt = "2026-09-05T01:04:05.000000+00:00";
+  const warned = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "WARN: stdout is not a Finding\n",
+    progress: [
+      {name: "prepare", status: "completed", observedAt: preparedAt},
+      {name: "review", status: "completed", observedAt: reviewedAt},
+    ],
+    findings: [
+      {
+        category: "github", status: "warning", message: "review limit reached",
+        observedAt: warningAt,
+      },
+      {
+        category: "runtime", status: "info", message: "WARN: informational only",
+        observedAt: warningAt,
+      },
+    ],
+    hasWarnings: true,
+  });
+  const clean = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "clean",
+    progress: [{name: "clean step", status: "completed", observedAt: reviewedAt}],
+  });
+  const {elements, logDisplay} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1", hasWarnings: true},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: warned, 2: clean},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+
+  assert.deepEqual(
+    elements.progress.children.map((item) => item.children[1].children[0].textContent),
+    ["prepare", "Warning · github", "review"],
+  );
+  const warning = elements.progress.children[1];
+  assert.equal(warning.className, "progress-item warning");
+  assert.equal(warning.children[0].textContent, "⚠");
+  assert.equal(warning.children[1].children[1].textContent, logDisplay.formatObservedAt(warningAt));
+  assert.equal(warning.children[1].children[1].getAttribute("datetime"), warningAt);
+  assert.equal(warning.children[1].children[2].textContent, "review limit reached");
+
+  await runItem(elements, 2).dispatch("click");
+  assert.deepEqual(
+    elements.progress.children.map((item) => item.children[1].children[0].textContent),
+    ["clean step"],
+  );
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.progress.children[1].className, "progress-item warning");
+  assert.equal(elements.progress.children[1].children[1].children[2].textContent, "review limit reached");
 });
 
 test("selected run renders authoritative run and Progress PR links", async () => {

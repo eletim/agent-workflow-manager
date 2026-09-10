@@ -367,7 +367,7 @@ function renderRun(result) {
   checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
   checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
   renderOutline(result.outline || [], result.progress || []);
-  renderProgress(result.progress || []);
+  renderProgress(result.progress || [], result.findings || []);
   renderIntegrationPr(result.integrationPr || null);
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderIssueDrivenSummary(result.issueDrivenSummary || null);
@@ -817,7 +817,7 @@ function renderOutline(labels, events) {
   }
 }
 
-function renderProgress(events) {
+function renderProgress(events, findings = []) {
   const latest = new Map();
   for (const event of events) {
     const key = JSON.stringify([event.name, event.iteration, event.attempt]);
@@ -829,9 +829,56 @@ function renderProgress(events) {
     });
   }
 
+  const timeline = [
+    ...[...latest.values()].map((event) => ({kind: "progress", event})),
+    ...findings
+      .filter((finding) => finding.status === "warning")
+      .map((finding) => ({kind: "warning", finding})),
+  ];
+  timeline.sort((left, right) => {
+    const leftObservedAt = left.event?.observedAt ?? left.finding?.observedAt;
+    const rightObservedAt = right.event?.observedAt ?? right.finding?.observedAt;
+    if (typeof leftObservedAt !== "string" && typeof rightObservedAt !== "string") return 0;
+    if (typeof leftObservedAt !== "string") return 1;
+    if (typeof rightObservedAt !== "string") return -1;
+    return leftObservedAt.localeCompare(rightObservedAt);
+  });
+
   progress.replaceChildren();
-  progressEmpty.hidden = latest.size > 0;
-  for (const event of latest.values()) {
+  progressEmpty.hidden = timeline.length > 0;
+  for (const entry of timeline) {
+    if (entry.kind === "warning") {
+      const item = document.createElement("li");
+      item.className = "progress-item warning";
+
+      const marker = document.createElement("span");
+      marker.className = "progress-marker";
+      marker.textContent = "⚠";
+
+      const details = document.createElement("div");
+      details.className = "progress-details";
+      const label = document.createElement("div");
+      label.className = "progress-label";
+      label.textContent = `Warning · ${entry.finding.category}`;
+
+      const timestamp = document.createElement("time");
+      timestamp.className = "progress-time";
+      timestamp.textContent = runnerLogDisplay.formatObservedAt(entry.finding.observedAt);
+      if (typeof entry.finding.observedAt === "string") {
+        timestamp.setAttribute("datetime", entry.finding.observedAt);
+        timestamp.setAttribute("title", entry.finding.observedAt);
+      }
+
+      const note = document.createElement("div");
+      note.className = "progress-note";
+      note.textContent = entry.finding.message;
+      details.append(label, timestamp, note);
+      item.append(marker, details);
+      progress.append(item);
+      continue;
+    }
+
+    const event = entry.event;
     const item = document.createElement("li");
     item.className = `progress-item ${event.status}`;
 
