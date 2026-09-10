@@ -1019,7 +1019,7 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     outline_start = source.index("WORKFLOW_OUTLINE = [\n")
     outline_end = source.index("\n]", outline_start) + len("\n]")
     source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]
-    source = source.replace("MAX_REVIEWS = 5", f"MAX_REVIEWS = {config.max_reviews}", 1)
+    source = source.replace("MAX_REVIEWS = 4", f"MAX_REVIEWS = {config.max_reviews}", 1)
     source = source.replace(
         'IMPLEMENTER_AGENT = "codex"',
         f"IMPLEMENTER_AGENT = {config.implementer_agent!r}",

@@ -73,7 +73,7 @@ every other field is required.
 | `one_shot_issue` | integer | Positive source Issue for a manager-planned one-shot run. It starts with no work items and cannot be combined with `issues` or `work_items`. |
 | `issues` | array of integers | Legacy form for positive, unique GitHub Issue numbers, executed in the listed order. Do not combine it with `work_items`. |
 | `work_items` | array | Ordered GitHub Issue numbers and/or inline mini-task objects. A mini task is exactly `{"id": "lowercase-kebab-id", "task": "authoritative instruction"}` and does not require a GitHub Issue. |
-| `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 5 unless the user requests another value. |
+| `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 4 unless the user requests another value. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
 | `scenarios` | array of strings | Optional human-authored Scenario List for Whole Review. The numbered list may contain at most 100 items and 64,000 UTF-8 bytes; each item may contain at most 4,000 characters. The Scenario Gate selects a risk-relevant subset and uses AI to judge each scenario's Before/After behavioral difference. Requires `final_review: true`. |
@@ -84,13 +84,16 @@ every other field is required.
 Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
 
 Each implementation work item is reviewed in two ordered phases. A fixed internal
-limit of three Scope / Design reviews checks that the change is necessary,
+limit of six Scope / Design reviews checks that the change is necessary,
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
-safety, regressions, and tests. The counters and outcomes are independent. A
-phase that exhausts its limit may continue with an explicit warning after exact
-clean, pushed PR topology is revalidated; it is never recorded as approved.
-Whole-version Review remains a separate integration and cross-Issue review.
+safety, regressions, and tests. The recommended allocation keeps the Scope limit
+at least as high as the Correctness limit: six/four reserves Scope capacity for
+required rechecks whenever a Correctness fix changes the head. The counters and
+outcomes are independent. A phase that exhausts its limit may continue with an
+explicit warning after exact clean, pushed PR topology is revalidated; it is never
+recorded as approved. Whole-version Review remains a separate integration and
+cross-Issue review.
 
 When `scenarios` is present, Whole Review first runs a Scenario Gate against the
 exact final-base commit (Before) and integration-head commit (After). Each string
@@ -133,7 +136,7 @@ checks use live remote refs and perform no branch, PR, or repository mutation.
   "make_integration_branch": true,
   "policy_issue": 80,
   "issues": [86, 99, 87, 84],
-  "max_reviews": 5,
+  "max_reviews": 4,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
   "merge_to_integration": true,
@@ -158,7 +161,7 @@ To mix a GitHub Issue with a workflow-local task, replace `issues` with
       "task": "Clarify the New Run help text and cover the wording with its existing UI test."
     }
   ],
-  "max_reviews": 5,
+  "max_reviews": 4,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -175,7 +178,7 @@ To deliver one large Issue without preparing its work-item list, use
   "integration_branch": "dev/v0.3.0",
   "final_branch": "main",
   "one_shot_issue": 169,
-  "max_reviews": 5,
+  "max_reviews": 4,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -273,7 +276,9 @@ and the New Run draft do not display a premature or previous-run Summary.
   be created or validated as descending from the exact `final_branch` HEAD.
 - Use `policy_issue` only for shared version design context, never for workflow
   ordering or conditions, and never repeat it in `issues`.
-- Set `max_reviews` to 5 unless the user explicitly requests another value.
+- Set `max_reviews` to 4 unless the user explicitly requests another value. This
+  stays below the canonical six-review Scope limit so Correctness fixes can
+  trigger the required Scope rechecks without prematurely exhausting it.
 - Use only `codex` or `claude` for either agent role. Omit an agent field to use
   its `codex` default.
 - Set `merge_final` to false unless the user explicitly requests automatic final
