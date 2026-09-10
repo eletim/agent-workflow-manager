@@ -2502,9 +2502,13 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
     github = GitHub()
     findings: list[tuple[tuple[object, ...], dict[str, object]]] = []
     steps: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    terminal_events: list[tuple[str, str, str | None]] = []
     workflow["emit_finding"] = lambda *args, **kwargs: findings.append((args, kwargs))
     workflow["emit_step"] = lambda *args, **kwargs: steps.append((args, kwargs))
     workflow["emit_whole_review_result"] = lambda *args, **kwargs: None
+    workflow["terminal_progress"] = lambda event, subject, **kwargs: (
+        terminal_events.append((event, subject, kwargs.get("detail")))
+    )
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["create_agent"] = lambda *args, **kwargs: "planner"
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
@@ -2530,6 +2534,14 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
         kwargs.get("message") == "no implementation changes; no PR required"
         for _args, kwargs in steps
     )
+    assert terminal_events == [
+        ("PREPARE", "Final integration PR", "dev/v0.2.5 -> dev/v0.2.4"),
+        (
+            "DONE",
+            "Final integration PR",
+            "no implementation changes; no PR required",
+        ),
+    ]
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:

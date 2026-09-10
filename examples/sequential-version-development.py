@@ -2679,10 +2679,20 @@ def integration_delivery(
                 "completed",
                 message=f"delivery already merged as PR #{merged_pr.number}",
             )
+            terminal_progress(
+                "DONE",
+                "Whole-version review",
+                detail=f"delivery already merged as PR #{merged_pr.number}",
+            )
         emit_step(
             "Final integration PR",
             "completed",
             message=f"already merged as PR #{merged_pr.number}",
+        )
+        terminal_progress(
+            "DONE",
+            "Final integration PR",
+            detail=f"already merged as PR #{merged_pr.number}",
         )
         return merged_pr
     if pr is None:
@@ -2701,6 +2711,11 @@ def integration_delivery(
                 "Final integration PR",
                 "completed",
                 message="no implementation changes; no PR required",
+            )
+            terminal_progress(
+                "DONE",
+                "Final integration PR",
+                detail="no implementation changes; no PR required",
             )
             return None
         if pr.state == "MERGED":

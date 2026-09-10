@@ -2179,6 +2179,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     marker = workflow["encoded_policy_conflict_marker"](warning)
     merged = replace(merged_final_pr("new-head"), body=f"Base PR.\n\n{marker}")
     findings: list[tuple[str, str, str]] = []
+    terminal_events: list[tuple[str, str, str | None]] = []
 
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
@@ -2208,6 +2209,13 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
             (category, message, status)
         ),
     )
+    monkeypatch.setitem(
+        workflow_globals,
+        "terminal_progress",
+        lambda event, subject, **kwargs: terminal_events.append(
+            (event, subject, kwargs.get("detail"))
+        ),
+    )
 
     delivered = workflow["integration_delivery"](
         config, config.issues, object(), Repository(), GitHub()
@@ -2215,6 +2223,15 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
 
     assert delivered is merged
     assert ("policy_issue", warning, "warning") in findings
+    assert terminal_events == [
+        ("PREPARE", "Final integration PR", "dev/v1 -> main"),
+        (
+            "DONE",
+            "Whole-version review",
+            "delivery already merged as PR #17",
+        ),
+        ("DONE", "Final integration PR", "already merged as PR #17"),
+    ]
 
 
 def test_exact_merged_final_pr_requires_final_branch_containment() -> None:
