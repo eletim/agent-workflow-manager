@@ -92,7 +92,7 @@ def test_starter_and_template_use_recommended_review_limits_and_safe_delivery() 
     assert '"merge_final": false' in index
     assert "MAX_REVIEWS = 4" in example
     assert "MAX_SCOPE_REVIEWS = 6" in example
-    assert "`scope_max_reviews` (default 6)" in guide
+    assert "`scope_max_reviews` (default 3)" in guide
     assert "Correctness Review uses `max_reviews`" in guide
 
 

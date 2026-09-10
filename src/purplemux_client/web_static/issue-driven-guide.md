@@ -74,7 +74,7 @@ otherwise optional; every other field is required.
 | `issues` | array of integers | Legacy form for positive, unique GitHub Issue numbers, executed in the listed order. Do not combine it with `work_items`. |
 | `work_items` | array | Ordered GitHub Issue numbers and/or inline mini-task objects. A mini task is exactly `{"id": "lowercase-kebab-id", "task": "authoritative instruction"}` and does not require a GitHub Issue. |
 | `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 4 unless the user requests another value. |
-| `scope_max_reviews` | integer | Optional Scope / Design Review limit from 1 through 100; default 6. It does not affect Correctness or whole-version review. |
+| `scope_max_reviews` | integer | Optional Scope / Design Review limit from 1 through 100; default 3 when omitted, recommended value 6. It does not affect Correctness or whole-version review. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
 | `scenarios` | array of strings | Optional human-authored Scenario List for Whole Review. The numbered list may contain at most 100 items and 64,000 UTF-8 bytes; each item may contain at most 4,000 characters. The Scenario Gate selects a risk-relevant subset and uses AI to judge each scenario's Before/After behavioral difference. Requires `final_review: true`. |
@@ -85,7 +85,7 @@ otherwise optional; every other field is required.
 Do not add generic `if`, `while`, action, step, or arbitrary executable blocks.
 
 Each implementation work item is reviewed in two ordered phases. Scope / Design
-Review uses `scope_max_reviews` (default 6) to check that the change is necessary,
+Review uses `scope_max_reviews` (default 3) to check that the change is necessary,
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
 safety, regressions, and tests; Whole-version Review also uses `max_reviews`.
@@ -279,10 +279,10 @@ and the New Run draft do not display a premature or previous-run Summary.
   ordering or conditions, and never repeat it in `issues`.
 - Set `max_reviews` to 4 unless the user explicitly requests another value. This
   controls only Correctness and whole-version review.
-- Omit `scope_max_reviews` to use its default of 6, or set it to 6 unless the user
-  explicitly requests another Scope / Design Review limit. Keeping the recommended
-  Scope limit above `max_reviews` leaves capacity for rechecks after Correctness
-  fixes.
+- Omit `scope_max_reviews` to retain its default of 3, or set it to the recommended
+  value of 6 unless the user explicitly requests another Scope / Design Review
+  limit. Keeping the recommended Scope limit above `max_reviews` leaves capacity
+  for rechecks after Correctness fixes.
 - Use only `codex` or `claude` for either agent role. Omit an agent field to use
   its `codex` default.
 - Set `merge_final` to false unless the user explicitly requests automatic final

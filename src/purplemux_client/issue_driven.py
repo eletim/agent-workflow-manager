@@ -438,7 +438,7 @@ class IssueDrivenConfig:
     make_integration_branch: bool = False
     one_shot_issue: int | None = None
     scenarios: tuple[str, ...] = ()
-    scope_max_reviews: int = 6
+    scope_max_reviews: int = 3
 
     @property
     def issues(self) -> tuple[int, ...]:
@@ -818,7 +818,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(
             IssueDrivenFinding("$.max_reviews", "must be an integer from 1 to 100")
         )
-    scope_max_reviews = value.get("scope_max_reviews", 6)
+    scope_max_reviews = value.get("scope_max_reviews", 3)
     if (
         isinstance(scope_max_reviews, bool)
         or not isinstance(scope_max_reviews, int)
