@@ -2969,7 +2969,7 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
         scope="implementation Issue #90",
         issue_number=90,
     )
-    persisted = first_run["ensure_issue_pr_policy_conflicts"](  # type: ignore[operator]
+    persisted = first_run["ensure_issue_pr_metadata"](  # type: ignore[operator]
         ChildGitHub(), child_pr, issue, config
     )
     assert "agent-workflow-manager:policy-conflict:" in persisted.body
