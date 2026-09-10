@@ -29,8 +29,10 @@ yet. The workflow creates the isolated worktree at the exact remote
 `final_branch` HEAD, creates and pushes `integration_branch` from that commit,
 then uses it for Issue delivery. If the integration branch already exists, the
 same recovery path requires it to contain that exact final-branch HEAD and
-rejects unsafe remote movement or divergence. The final PR remains
-`integration_branch` to `final_branch`.
+rejects unsafe remote movement or divergence. Base PR creation is deferred while
+the authoritative remote heads are identical, then performed after the first
+Issue merge creates a difference; an existing Base PR retains its normal recovery
+semantics. The final PR remains `integration_branch` to `final_branch`.
 
 Correct:
 

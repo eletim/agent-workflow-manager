@@ -139,7 +139,10 @@ two agent fields, and `scenarios` are optional; every other field is required.
 With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal
-safe recovery checks. The final PR still targets `final_branch`. When set,
+safe recovery checks. While the two remote heads are identical, Base PR creation
+is deferred; it is created after the first Issue merge advances the integration
+branch. An existing Base PR is still recovered normally. The final PR still
+targets `final_branch`. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design
 context to every implementation, review, and fix turn and is referenced by the
 Base PR. It cannot also appear as an implementation GitHub Issue work item. Clear conflicts produce structured

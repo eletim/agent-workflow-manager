@@ -2060,6 +2060,91 @@ def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> No
     ]
 
 
+def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
+    workflow = load_generated_workflow(
+        issues=[90],
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.5",
+        "dev/v0.2.4",
+        (issue,),
+        "true",
+    )
+    final_sha = "f" * 40
+    integration_sha = final_sha
+    created: PullRequestState | None = None
+    create_calls: list[tuple[str, str]] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, integration_sha, integration_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.main_branch
+            return BranchState(branch, final_sha, final_sha, True)
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            assert (head, base) == (config.integration_branch, config.main_branch)
+            return created if created is not None and state == "OPEN" else None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert integration_sha != final_sha
+            create_calls.append((str(kwargs["head"]), str(kwargs["base"])))
+            created = replace(
+                topology_pr(
+                    number=182,
+                    head_sha=integration_sha,
+                    base_sha=final_sha,
+                    head_branch=config.integration_branch,
+                    body=str(kwargs["body"]),
+                ),
+                base_branch=config.main_branch,
+            )
+            return created
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert created is not None
+            assert kwargs["expected_head_sha"] == integration_sha
+            assert kwargs["expected_base_sha"] == final_sha
+            return created
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert created is not None and number == created.number
+            created = replace(created, body=str(kwargs["body"]))
+            return created
+
+    github = GitHub()
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, Repository(), github)
+
+    assert plan_pr is None
+    assert create_calls == []
+
+    assert plan.take_next() is issue
+    integration_sha = "a" * 40
+    plan_pr = workflow["persist_work_item_plan"](
+        plan, config, Repository(), github, plan_pr
+    )
+
+    assert plan_pr is created
+    assert create_calls == [(config.integration_branch, config.main_branch)]
+    recovered = workflow["work_item_plan_from_body"](plan_pr.body, config)
+    assert recovered.position == 1
+
+
 def test_human_handoff_prompt_and_validation_contract() -> None:
     secret_check_command = "API_TOKEN=sentinel-secret pytest"
     workflow = load_generated_workflow(
