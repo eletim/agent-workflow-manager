@@ -416,6 +416,24 @@ function appendPrLink(container, pr, prefix = "PR ") {
   container.append(link);
 }
 
+function appendPurpleMuxLink(container, terminal) {
+  const url = new URL(window.location.href);
+  url.protocol = "http:";
+  url.port = "8022";
+  url.pathname = "/";
+  url.search = "";
+  url.searchParams.set("workspace", terminal.workspaceId);
+  url.searchParams.set("tab", terminal.tabId);
+  url.hash = "";
+  const link = document.createElement("a");
+  link.className = "issue-summary-terminal-link";
+  link.href = url.href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = "Terminal";
+  container.append(document.createTextNode("  "), link);
+}
+
 function renderIssueDrivenSummary(summary) {
   issueSummaryPanel.hidden = summary == null;
   issueSummaryList.replaceChildren();
@@ -442,6 +460,7 @@ function renderIssueDrivenSummary(summary) {
     const label = result.label || `#${result.issue}`;
     line.append(document.createTextNode(`${label}  `));
     appendPrLink(line, result.pr);
+    if (result.terminal) appendPurpleMuxLink(line, result.terminal);
     line.append(document.createTextNode(`  Review ${result.reviews}`));
     if (result.outcome !== "approved") {
       line.append(document.createTextNode(`  ${result.outcome.replaceAll("_", " ")}`));

@@ -1725,6 +1725,8 @@ def process_issue(
             pr.url,
             warnings=warnings,
             label=issue.label,
+            workspace_id=client.workspace_id,
+            tab_id=implementer,
         )
         record_issue_handoff_result(
             issue.result_id, issue.label, pr, delivery.outcome, delivery.reviews, warnings
@@ -1749,6 +1751,8 @@ def process_issue(
         merged.pr.url,
         warnings=warnings,
         label=issue.label,
+        workspace_id=client.workspace_id,
+        tab_id=implementer,
     )
     record_issue_handoff_result(
         issue.result_id,

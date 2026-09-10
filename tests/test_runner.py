@@ -1572,7 +1572,7 @@ def test_issue_driven_summary_uses_durable_structured_results_not_progress() -> 
     emit_step, emit_whole_review_result,
 )
 emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
-emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", tab_id="tab-10")
 emit_finding("github", "review limit reached", status="warning")
 emit_issue_result(11, "continued_with_warning", 5, 41, "https://github.com/acme/project/pull/41", warnings=("review limit reached",))
 emit_issue_result("mini-task:refresh-help", "approved", 2, 42, "https://github.com/acme/project/pull/42", label="Mini task refresh-help")
@@ -1608,6 +1608,7 @@ for number in range(3):
                     "url": "https://github.com/acme/project/pull/40",
                 },
                 "warnings": [],
+                "terminal": {"workspaceId": "ws-run", "tabId": "tab-10"},
             },
             {
                 "issue": 11,
@@ -1637,6 +1638,37 @@ for number in range(3):
             "url": "https://github.com/acme/project/pull/50",
         },
     }
+
+
+def test_issue_driven_terminal_navigation_survives_runner_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_issue_driven_context, emit_issue_result
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", tab_id="tab-10")
+"""
+        )
+        expected = wait_until_finished(runner).as_json()["issueDrivenSummary"]
+    finally:
+        runner.close()
+
+    restored_runner = PythonRunner(
+        managed_workflows=False,
+        run_history_file=history_file,
+    )
+    try:
+        assert (
+            restored_runner.snapshot(run_id).as_json()["issueDrivenSummary"] == expected
+        )
+    finally:
+        restored_runner.close()
 
 
 def test_issue_driven_summary_is_hidden_while_running_and_scoped_to_run() -> None:

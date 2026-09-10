@@ -1780,6 +1780,7 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
         outcome: "continued_with_warning",
         reviews: 5,
         pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+        terminal: {workspaceId: "ws-run", tabId: "tab-implementer"},
         warnings: ["review limit reached"],
       },
     ],
@@ -1800,6 +1801,13 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
 
   assert.equal(elements["issue-summary-panel"].hidden, false);
   assert.equal(elements["issue-summary-list"].children.length, 1);
+  const terminalLink = elements["issue-summary-list"].children[0]
+    .children[1].children[0].children[4];
+  assert.equal(terminalLink.textContent, "Terminal");
+  assert.equal(
+    terminalLink.href,
+    "http://127.0.0.1:8022/?workspace=ws-run&tab=tab-implementer",
+  );
   assert.equal(
     elements["issue-summary-list"].children[0].children[1].children[0].children[0]
       .textContent,
