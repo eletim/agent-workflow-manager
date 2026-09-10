@@ -202,6 +202,7 @@ async function loadApp({
   runs,
   details,
   validation,
+  locationHref = "http://127.0.0.1:8765/",
   fetchOverride = null,
   clipboardOverride = null,
   confirmOverride = null,
@@ -325,6 +326,7 @@ async function loadApp({
       clearTimeout,
       confirm: confirmOverride || (() => true),
       EventSource: FakeEventSource,
+      location: {href: locationHref},
       setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
     },
@@ -374,6 +376,27 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Runner link selects the exact opaque Run identity", async () => {
+  const runs = [
+    {runId: 1, identity: "instance-a-1", state: "success", mode: "workflow", cwd: "/work/one"},
+    {runId: 2, identity: "instance-a-2", state: "success", mode: "workflow", cwd: "/work/two"},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "one"}),
+    2: snapshot({runId: 2, state: "success", stdout: "two"}),
+  };
+
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    locationHref: "http://127.0.0.1:8765/?run=instance-a-1",
+  });
+
+  assert.equal(selectedRun(elements).dataset.runId, "1");
+  assert.equal(elements.stdout.textContent, "one");
+});
 
 test("terminal run checked state toggles from detail and list without leaking", async () => {
   const runs = [

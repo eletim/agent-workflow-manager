@@ -141,7 +141,9 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         managed_workflows=True,
         runtime_factory=lambda: runtime,  # type: ignore[arg-type]
     )
-    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0), runner, host_aliases=("runner.example",)
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -154,6 +156,11 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         assert run.event_token is not None
         assert run.event_token not in client.request.command
         assert str(run.credential_path) in client.request.command
+        assert (
+            f"http://127.0.0.1:{server.server_address[1]}"
+            f"/api/runs/{run_id}/events"
+            in run.credential_path.read_text(encoding="utf-8")
+        )
         with pytest.raises(PermissionError, match="credential"):
             runner.accept_event(
                 run_id, "wrong-run-token", '{"name":"forged","status":"started"}'

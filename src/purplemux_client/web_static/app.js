@@ -113,6 +113,9 @@ const favicon = document.querySelector("#favicon");
 
 let requestToken = null;
 let eventSource = null;
+let requestedRunIdentity = typeof window.location?.href === "string"
+  ? new URL(window.location.href).searchParams.get("run")
+  : null;
 const guideTexts = {};
 let activeGuide = null;
 let guideCopyResetTimer = null;
@@ -1093,7 +1096,20 @@ async function refresh() {
   try {
     const {runs} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
-    if (activeRunId === null && !explicitNewRun && runs.length > 0) {
+    if (activeRunId === null && requestedRunIdentity !== null) {
+      const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
+      requestedRunIdentity = null;
+      if (linkedRun) {
+        captureDraftIfEditing();
+        activeRunId = linkedRun.runId;
+        activeRunSnapshot = null;
+        activeRunGeneration += 1;
+        selectionGeneration = activeRunGeneration;
+      } else {
+        explicitNewRun = true;
+        stderr.textContent = "The linked Run is no longer available.";
+      }
+    } else if (activeRunId === null && !explicitNewRun && runs.length > 0) {
       // A run just appeared (e.g. discovered via SSE) while the fields held
       // in-progress draft edits nobody submitted yet; retain them before
       // auto-selecting, exactly as an explicit run-list click would.

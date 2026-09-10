@@ -33,7 +33,11 @@ from purplemux_client.client import (
 )
 from purplemux_client.correlation import RUN_IDENTITY_ENV
 from purplemux_client.errors import MutationOutcomeUnknown
-from purplemux_client.notifier import NotificationResult, TerminalState
+from purplemux_client.notifier import (
+    NotificationMetadata,
+    NotificationResult,
+    TerminalState,
+)
 from purplemux_client.operations import DRY_RUN_BOUNDARY_EXIT_CODE, DRY_RUN_FD_ENV
 from purplemux_client.preflight import (
     ValidationIssue,
@@ -114,7 +118,12 @@ def _administrative_identity(path: Path) -> str:
 
 class TerminalNotifier(Protocol):
     def notify_terminal(
-        self, *, run_id: int, state: TerminalState, exit_code: int | None
+        self,
+        *,
+        run_id: int,
+        state: TerminalState,
+        exit_code: int | None,
+        metadata: NotificationMetadata,
     ) -> NotificationResult: ...
 
     def close(self) -> None: ...
@@ -348,6 +357,7 @@ class RunnerSnapshot:
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: tuple[IssueResult, ...] = ()
     whole_review_result: WholeReviewResult | None = None
+    identity: str | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -446,6 +456,7 @@ class RunnerSnapshot:
             "state": self.state,
             "exitCode": self.exit_code,
             "runId": self.run_id,
+            "identity": self.identity,
             "cwd": self.cwd,
             "executionContext": execution_context,
             "args": list(self.args),
@@ -576,6 +587,7 @@ class PythonRunner:
             else None
         )
         self._run_history_lock_descriptor: int | None = None
+        self._browser_origin: str | None = None
         self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
@@ -894,8 +906,17 @@ class PythonRunner:
                 f"terminal run history is unreadable: {path}"
             ) from exc
 
+    def configure_browser_origin(self, origin: str) -> None:
+        """Set the authoritative browser-navigation origin for this Runner."""
+        if not origin.startswith("http://") or "\0" in origin:
+            raise ValueError("browser origin must be a local HTTP URL")
+        with self._lock:
+            if any(run.state == "running" for run in self._runs.values()):
+                raise RuntimeError("browser origin cannot change while a run is active")
+            self._browser_origin = origin.rstrip("/")
+
     def configure_event_endpoint(self, base_url: str) -> None:
-        """Enable PurpleMux-hosted Workflow execution for an attached HTTP server."""
+        """Enable managed Workflow callbacks for an attached HTTP server."""
         if not base_url.startswith("http://") or "\0" in base_url:
             raise ValueError("event endpoint must be a local HTTP URL")
         with self._lock:
@@ -1591,6 +1612,7 @@ class PythonRunner:
             issue_driven_context=run.issue_driven_context,
             issue_results=tuple(run.issue_results.values()),
             whole_review_result=run.whole_review_result,
+            identity=self._run_identity(run.run_id),
         )
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
@@ -2698,9 +2720,7 @@ class PythonRunner:
                 self._mark_changed()
                 self._persist_run_history_locked()
 
-            self._notify_terminal(
-                run_id=run.run_id, state=terminal_state, exit_code=exit_code
-            )
+            self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
         finally:
             with self._lock:
                 self._wait_threads.discard(threading.current_thread())
@@ -2782,28 +2802,34 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
-        self._notify_terminal(
-            run_id=run.run_id, state=terminal_state, exit_code=exit_code
-        )
+        self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
 
     def _notify_terminal(
-        self, *, run_id: int | None, state: RunnerState, exit_code: int
+        self, run: _RunRecord, *, state: RunnerState, exit_code: int
     ) -> None:
         notifier = self._notifier
-        if (
-            notifier is None
-            or run_id is None
-            or state
-            not in (
-                "success",
-                "failed",
-                "stopped",
-            )
+        if notifier is None or state not in (
+            "success",
+            "failed",
+            "stopped",
         ):
             return
+        run_id = run.run_id
+        folder_name = Path(run.cwd).name or Path(run.cwd).anchor
+        click_url = (
+            f"{self._browser_origin}/?run={self._run_identity(run_id)}"
+            if self._browser_origin is not None
+            else None
+        )
         try:
             result = notifier.notify_terminal(
-                run_id=run_id, state=state, exit_code=exit_code
+                run_id=run_id,
+                state=state,
+                exit_code=exit_code,
+                metadata=NotificationMetadata(
+                    title=folder_name,
+                    click_url=click_url,
+                ),
             )
         except Exception:
             logger.warning(
