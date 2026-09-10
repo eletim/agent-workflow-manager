@@ -680,7 +680,9 @@ def test_correctness_fix_restarts_scope_before_final_correctness_review(
     )
     monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
 
-    result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    result = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     review_events = [name for name, _ in events if name.endswith("review")]
     assert review_events == [
@@ -918,7 +920,9 @@ def test_ready_issue_pr_is_redrafted_and_independently_reviewed(
         lambda *args, **kwargs: SimpleNamespace(pr=ready),
     )
 
-    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert events[0] == "set_draft:True"
     assert events.index("Issue #90 scope/design review") < events.index(
@@ -1031,7 +1035,9 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     )
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
-    workflow["process_issue"](issue, config, object(), repository, GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
+    )
 
     assert review_count == 3
     assert f"push:{cleanup_sha}" in events
@@ -1052,6 +1058,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     implementation_sha = "implementation-head"
     base_sha = "integration-head"
     events: list[str] = []
+    issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class Repository:
         def __init__(self) -> None:
@@ -1140,8 +1147,15 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_issue_result",
+        lambda *args, **kwargs: issue_results.append((args, kwargs)),
+    )
 
-    workflow["process_issue"](issue, config, object(), repository, GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
+    )
 
     commit_index = events.index(f"commit:{implementation_sha}")
     push_index = events.index(f"push:{implementation_sha}")
@@ -1149,6 +1163,16 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     verify_index = events.index(f"require_pr:{implementation_sha}")
     assert commit_index < push_index < draft_index < verify_index
     assert events[-1] == "ready"
+    assert issue_results[0][1]["workspace_id"] == "ws-test"
+    assert issue_results[0][1]["implementation_tab_id"] == (
+        f"{issue.label} implementer"
+    )
+    assert issue_results[0][1]["scope_review_tab_id"] == (
+        f"{issue.label} scope reviewer"
+    )
+    assert issue_results[0][1]["correctness_review_tab_id"] == (
+        f"{issue.label} correctness reviewer"
+    )
 
 
 def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
@@ -1249,7 +1273,9 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
     monkeypatch.setitem(workflow_globals, "review_issue_phase", review_issue_phase)
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
 
-    result = workflow["process_issue"](issue, config, object(), Repository(), github)
+    result = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), github
+    )
 
     assert result.body == f"{marker}\n\nAgent-created PR body"
     assert events == ["agent-created", "identity", "ready"]
@@ -1347,7 +1373,9 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         ),
     )
 
-    result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    result = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert result.is_draft is False
     assert events.count("Issue #134 scope/design review") == 2
@@ -1453,7 +1481,9 @@ def test_policy_conflict_from_fixer_is_persisted_after_pushed_head(
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
-    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert persisted_heads
     assert set(persisted_heads) == {fixed_sha}
@@ -1546,7 +1576,9 @@ def test_policy_conflict_from_changed_reviewer_uses_reacquired_child_head(
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
-    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert review_count == 3
     assert persisted_heads

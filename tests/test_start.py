@@ -58,6 +58,9 @@ def _start_environment(
     call_log = tmp_path / "calls.log"
     home = tmp_path / "home"
     home.mkdir()
+    purplemux_state = home / ".purplemux"
+    purplemux_state.mkdir()
+    (purplemux_state / "port").write_text("8022\n", encoding="utf-8")
     config_file = tmp_path / "config.sh"
     _executable(
         fake_bin / "uv",
@@ -142,6 +145,7 @@ def test_start_syncs_and_launches_runner_with_notify_disabled(
     assert calls[2].startswith(
         "uv run python -m purplemux_client.web --host 127.0.0.1 --port 8765"
     )
+    assert f"--purplemux-port-file {environment['HOME']}/.purplemux/port" in calls[2]
     assert (
         f"--runtime-config {environment['AGENT_WORKFLOW_MANAGER_CONFIG_FILE']}"
         in calls[2]
@@ -151,6 +155,18 @@ def test_start_syncs_and_launches_runner_with_notify_disabled(
         in calls[2]
     )
     assert "notifications disabled" in completed.stdout.lower()
+
+
+def test_start_passes_environment_selected_purplemux_port(tmp_path: Path) -> None:
+    environment, call_log, _ = _start_environment(tmp_path)
+    environment["PMUX_PORT"] = "9123"
+
+    completed = _run_start(environment)
+
+    assert completed.returncode == 0
+    calls = call_log.read_text(encoding="utf-8")
+    assert "--purplemux-port 9123" in calls
+    assert "--purplemux-port-file" not in calls
 
 
 def test_start_reports_custom_install_remediation_when_purplemux_is_missing(

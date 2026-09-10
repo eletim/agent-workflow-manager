@@ -86,6 +86,10 @@ def test_emit_issue_driven_results_write_narrow_structured_events(
             44,
             "https://github.com/acme/project/pull/44",
             warnings=("review limit reached",),
+            workspace_id="ws-issue-run",
+            implementation_tab_id="tab-implementer",
+            scope_review_tab_id="tab-scope",
+            correctness_review_tab_id="tab-correctness",
         )
         emit_whole_review_result("approved", 2)
     finally:
@@ -110,6 +114,10 @@ def test_emit_issue_driven_results_write_narrow_structured_events(
             "pr_number": 44,
             "pr_url": "https://github.com/acme/project/pull/44",
             "warnings": ["review limit reached"],
+            "workspace_id": "ws-issue-run",
+            "implementation_tab_id": "tab-implementer",
+            "scope_review_tab_id": "tab-scope",
+            "correctness_review_tab_id": "tab-correctness",
         },
         {
             "type": "whole_review_result",
@@ -148,6 +156,35 @@ def test_emit_issue_result_accepts_labeled_inline_work_item(
             "pr_url": "https://github.com/acme/project/pull/45",
             "warnings": [],
         }
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "implementation", "scope_review", "correctness_review"),
+    [
+        ("ws-1", None, "scope", "correctness"),
+        (None, "implementation", "scope", "correctness"),
+        ("", "implementation", "scope", "correctness"),
+        ("ws-1", "implementation", "", "correctness"),
+    ],
+)
+def test_emit_issue_result_rejects_incomplete_terminal_identity(
+    workspace_id: str | None,
+    implementation: str | None,
+    scope_review: str | None,
+    correctness_review: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="PurpleMux"):
+        emit_issue_result(
+            10,
+            "approved",
+            1,
+            45,
+            "https://github.com/acme/project/pull/45",
+            workspace_id=workspace_id,
+            implementation_tab_id=implementation,
+            scope_review_tab_id=scope_review,
+            correctness_review_tab_id=correctness_review,
+        )
 
 
 def test_emit_finding_writes_structured_warning(

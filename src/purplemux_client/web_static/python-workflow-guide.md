@@ -840,7 +840,12 @@ Generated Issue Driven workflows additionally use the specialized
 `emit_issue_driven_context()`, `emit_issue_result()`, and
 `emit_whole_review_result()` observation helpers. These retain narrow final
 facts for the terminal Summary without parsing Progress or stdout. They are not
-a general event store or a workflow control-flow API.
+a general event store or a workflow control-flow API. Generated workflows pass
+the shared `workspace_id` and the distinct `implementation_tab_id`,
+`scope_review_tab_id`, and `correctness_review_tab_id` to
+`emit_issue_result()` so the child PR can expose PurpleMux's canonical deep
+link for every role. The identities are retained with that work item and run;
+they are never derived from a session index, UI state, or tmux state.
 
 Findings and advanced resource registration use:
 

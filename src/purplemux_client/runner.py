@@ -154,6 +154,15 @@ class PullRequestNavigation:
 
 
 @dataclass(frozen=True)
+class PurpleMuxNavigation:
+    workspace_id: str
+    tab_id: str
+
+    def as_json(self) -> dict[str, str]:
+        return {"workspaceId": self.workspace_id, "tabId": self.tab_id}
+
+
+@dataclass(frozen=True)
 class TopologyFinding:
     category: Literal["runtime", "git", "github", "policy_issue"]
     status: Literal["passed", "warning", "failed", "info"]
@@ -169,6 +178,9 @@ class IssueResult:
     pr: PullRequestNavigation
     warnings: tuple[str, ...] = ()
     label: str | None = None
+    implementation_terminal: PurpleMuxNavigation | None = None
+    scope_review_terminal: PurpleMuxNavigation | None = None
+    correctness_review_terminal: PurpleMuxNavigation | None = None
 
 
 @dataclass(frozen=True)
@@ -434,6 +446,17 @@ class RunnerSnapshot:
             }
             if result.label is not None:
                 item["label"] = result.label
+            terminals = {
+                "implementation": result.implementation_terminal,
+                "scopeReview": result.scope_review_terminal,
+                "correctnessReview": result.correctness_review_terminal,
+            }
+            if any(terminal is not None for terminal in terminals.values()):
+                item["terminals"] = {
+                    role: terminal.as_json()
+                    for role, terminal in terminals.items()
+                    if terminal is not None
+                }
             issues.append(item)
         whole_review = self.whole_review_result
         return {
@@ -724,6 +747,17 @@ class PythonRunner:
             "integrationPr": (
                 asdict(run.integration_pr) if run.integration_pr is not None else None
             ),
+            "issueDrivenContext": (
+                asdict(run.issue_driven_context)
+                if run.issue_driven_context is not None
+                else None
+            ),
+            "issueResults": [asdict(result) for result in run.issue_results.values()],
+            "wholeReviewResult": (
+                asdict(run.whole_review_result)
+                if run.whole_review_result is not None
+                else None
+            ),
             "checked": run.checked,
         }
 
@@ -861,6 +895,61 @@ class PythonRunner:
             if integration_pr_value is None
             else self._history_dataclass(PullRequestNavigation, integration_pr_value)
         )
+        context_value = value.get("issueDrivenContext")
+        issue_driven_context = (
+            None
+            if context_value is None
+            else self._history_dataclass(IssueDrivenContext, context_value)
+        )
+        issue_result_values = value.get("issueResults", [])
+        if not isinstance(issue_result_values, list):
+            raise ValueError
+        issue_results: dict[int | str, IssueResult] = {}
+        for item in issue_result_values:
+            if not isinstance(item, dict):
+                raise ValueError
+            result_value = dict(item)
+            result_value["pr"] = self._history_dataclass(
+                PullRequestNavigation, result_value.get("pr")
+            )
+            legacy_terminal = result_value.pop("terminal", None)
+            terminal_fields = (
+                "implementation_terminal",
+                "scope_review_terminal",
+                "correctness_review_terminal",
+            )
+            for field_name in terminal_fields:
+                terminal_value = result_value.get(field_name)
+                result_value[field_name] = (
+                    None
+                    if terminal_value is None
+                    else self._history_dataclass(PurpleMuxNavigation, terminal_value)
+                )
+            if (
+                legacy_terminal is not None
+                and result_value["implementation_terminal"] is None
+            ):
+                result_value["implementation_terminal"] = self._history_dataclass(
+                    PurpleMuxNavigation, legacy_terminal
+                )
+            warnings_value = result_value.get("warnings")
+            if not isinstance(warnings_value, list) or any(
+                not isinstance(warning, str) for warning in warnings_value
+            ):
+                raise ValueError
+            result_value["warnings"] = tuple(warnings_value)
+            result = self._history_dataclass(IssueResult, result_value)
+            issue_results[result.issue] = result
+        whole_review_value = value.get("wholeReviewResult")
+        whole_review_result = (
+            None
+            if whole_review_value is None
+            else self._history_dataclass(WholeReviewResult, whole_review_value)
+        )
+        if whole_review_result is not None:
+            whole_review_result = replace(
+                whole_review_result, warnings=tuple(whole_review_result.warnings)
+            )
         stdout_truncated = value.get("stdoutTruncated")
         stderr_truncated = value.get("stderrTruncated")
         if not isinstance(stdout_truncated, bool) or not isinstance(
@@ -895,6 +984,9 @@ class PythonRunner:
             resources=resources,
             prompt=prompt,
             integration_pr=integration_pr,
+            issue_driven_context=issue_driven_context,
+            issue_results=issue_results,
+            whole_review_result=whole_review_result,
             checked=checked,
         )
 
@@ -2601,6 +2693,16 @@ class PythonRunner:
             label = value.get("label")
             pr_number = value.get("pr_number")
             pr_url = value.get("pr_url")
+            workspace_id = value.get("workspace_id")
+            implementation_tab_id = value.get("implementation_tab_id")
+            scope_review_tab_id = value.get("scope_review_tab_id")
+            correctness_review_tab_id = value.get("correctness_review_tab_id")
+            terminal_identities = (
+                workspace_id,
+                implementation_tab_id,
+                scope_review_tab_id,
+                correctness_review_tab_id,
+            )
             if (
                 isinstance(issue, bool)
                 or not isinstance(issue, (int, str))
@@ -2615,8 +2717,32 @@ class PythonRunner:
                     )
                 )
                 or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
+                or (
+                    any(identity is not None for identity in terminal_identities)
+                    and any(
+                        not isinstance(identity, str) or not identity.strip()
+                        for identity in terminal_identities
+                    )
+                )
             ):
                 return None
+            terminals: tuple[
+                PurpleMuxNavigation | None,
+                PurpleMuxNavigation | None,
+                PurpleMuxNavigation | None,
+            ] = (None, None, None)
+            if workspace_id is not None:
+                terminals = (
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, implementation_tab_id)
+                    ),
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, scope_review_tab_id)
+                    ),
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, correctness_review_tab_id)
+                    ),
+                )
             return "issue_result", IssueResult(
                 issue,
                 typed_outcome,
@@ -2624,6 +2750,7 @@ class PythonRunner:
                 PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
                 typed_warnings,
                 cast(str | None, label),
+                *terminals,
             )
         name = value.get("name")
         status = value.get("status")

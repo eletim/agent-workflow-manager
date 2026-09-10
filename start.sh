@@ -49,6 +49,36 @@ purplemux_remediation() {
         'Then verify ~/.purplemux/{port,cli-token} point to that runtime.' >&2
 }
 
+resolve_purplemux_port() {
+    local configured_port
+    local port_file="$HOME/.purplemux/port"
+
+    if [[ -n ${PMUX_PORT:-} ]]; then
+        configured_port=$PMUX_PORT
+        PURPLEMUX_PORT_OPTION=--purplemux-port
+        PURPLEMUX_PORT_VALUE=$PMUX_PORT
+    elif [[ -r $port_file ]]; then
+        configured_port=$(<"$port_file")
+        PURPLEMUX_PORT_OPTION=--purplemux-port-file
+        PURPLEMUX_PORT_VALUE=$port_file
+    else
+        printf '%s\n' \
+            'ERROR: PurpleMux runtime port is unavailable.' >&2
+        purplemux_remediation
+        exit 1
+    fi
+    if [[ ! $configured_port =~ ^[0-9]+$ ]] || \
+        ((10#$configured_port < 1 || 10#$configured_port > 65535)); then
+        printf 'ERROR: invalid PurpleMux runtime port: %s\n' \
+            "$configured_port" >&2
+        purplemux_remediation
+        exit 1
+    fi
+    if [[ $PURPLEMUX_PORT_OPTION == --purplemux-port ]]; then
+        PURPLEMUX_PORT_VALUE=$((10#$configured_port))
+    fi
+}
+
 validate_purplemux() {
     local help_output
     local help_status=0
@@ -537,6 +567,7 @@ export AGENT_WORKFLOW_MANAGER_CONFIG_FILE="$config_file"
 require_command uv
 printf 'Syncing Python dependencies...\n'
 uv sync --locked
+resolve_purplemux_port
 validate_purplemux
 
 notification_mode=$AGENT_WORKFLOW_MANAGER_NOTIFICATIONS
@@ -633,6 +664,7 @@ printf 'Notify config: %s\n' "$NOTIFY_CONFIG"
 exec uv run python -m purplemux_client.web \
     --host "$AGENT_WORKFLOW_MANAGER_HOST" \
     --port "$AGENT_WORKFLOW_MANAGER_PORT" \
+    "$PURPLEMUX_PORT_OPTION" "$PURPLEMUX_PORT_VALUE" \
     --host-aliases "$AGENT_WORKFLOW_MANAGER_HOST_ALIASES" \
     --runtime-config "$config_file" \
     --notify-config "$NOTIFY_CONFIG"
