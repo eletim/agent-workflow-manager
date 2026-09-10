@@ -97,6 +97,60 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+def test_outline_step_logs_terminal_progress_without_replacing_events(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_outline_step"].__globals__
+    events: list[tuple[str, str]] = []
+    monkeypatch.setitem(
+        globals_,
+        "emit_step",
+        lambda name, status, **kwargs: events.append((name, status)),
+    )
+
+    result = workflow["run_outline_step"]("Issue #190", lambda: "delivered")
+
+    assert result == "delivered"
+    assert events == [("Issue #190", "started"), ("Issue #190", "completed")]
+    assert capsys.readouterr().out.splitlines() == [
+        "[workflow] START Issue #190",
+        "[workflow] DONE Issue #190",
+    ]
+
+
+def test_terminal_progress_formats_iteration_and_detail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    terminal_progress = runpy.run_path(str(EXAMPLE))["terminal_progress"]
+
+    terminal_progress("START", "Issue #190 correctness review", iteration=2)
+    terminal_progress(
+        "IDENTIFIED",
+        "Final integration PR",
+        detail="PR #201 https://example.test/pull/201",
+    )
+
+    assert capsys.readouterr().out.splitlines() == [
+        "[workflow] START Issue #190 correctness review (iteration 2)",
+        "[workflow] IDENTIFIED Final integration PR: "
+        "PR #201 https://example.test/pull/201",
+    ]
+
+
+def test_canonical_workflow_logs_major_issue_driven_boundaries() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert 'terminal_progress("WORK ITEM", issue.label, detail=issue.branch)' in source
+    assert (
+        'terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")'
+        in source
+    )
+    assert 'terminal_progress("WARN CONTINUATION", "Whole-version review")' in source
+    assert '"PREPARE",\n        "Final integration PR"' in source
+    assert '"IDENTIFIED", "Final integration PR"' in source
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [
