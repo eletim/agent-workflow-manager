@@ -8,6 +8,7 @@ import pytest
 from purplemux_client import (
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_navigation,
     emit_issue_result,
     emit_run_pr,
     emit_step,
@@ -79,6 +80,15 @@ def test_emit_issue_driven_results_write_narrow_structured_events(
     monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
     try:
         emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
+        emit_issue_navigation(
+            10,
+            44,
+            "https://github.com/acme/project/pull/44",
+            workspace_id="ws-issue-run",
+            implementation_tab_id="tab-implementer",
+            scope_review_tab_id="tab-scope",
+            correctness_review_tab_id="tab-correctness",
+        )
         emit_issue_result(
             10,
             "continued_with_warning",
@@ -105,6 +115,16 @@ def test_emit_issue_driven_results_write_narrow_structured_events(
             "integration_branch": "dev/v1",
             "final_branch": "main",
             "policy_issue": 9,
+        },
+        {
+            "type": "issue_navigation",
+            "issue": 10,
+            "pr_number": 44,
+            "pr_url": "https://github.com/acme/project/pull/44",
+            "workspace_id": "ws-issue-run",
+            "implementation_tab_id": "tab-implementer",
+            "scope_review_tab_id": "tab-scope",
+            "correctness_review_tab_id": "tab-correctness",
         },
         {
             "type": "issue_result",

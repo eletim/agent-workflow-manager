@@ -846,15 +846,16 @@ structured GitHub result is the source of truth; `emit_run_pr()` and the optiona
 `emit_step()` fields only expose that known identity to the current run.
 
 Generated Issue Driven workflows additionally use the specialized
-`emit_issue_driven_context()`, `emit_issue_result()`, and
-`emit_whole_review_result()` observation helpers. These retain narrow final
-facts for the terminal Summary without parsing Progress or stdout. They are not
-a general event store or a workflow control-flow API. Generated workflows pass
-the shared `workspace_id` and the distinct `implementation_tab_id`,
-`scope_review_tab_id`, and `correctness_review_tab_id` to
-`emit_issue_result()` so the child PR can expose PurpleMux's canonical deep
-link for every role. The identities are retained with that work item and run;
-they are never derived from a session index, UI state, or tmux state.
+`emit_issue_driven_context()`, `emit_issue_navigation()`, `emit_issue_result()`,
+and `emit_whole_review_result()` observation helpers. These retain narrow
+structured facts without parsing Progress or stdout. They are not a general
+event store or a workflow control-flow API. As soon as a child PR and all three
+role tabs are known, generated workflows pass the PR identity, shared
+`workspace_id`, and distinct `implementation_tab_id`, `scope_review_tab_id`,
+and `correctness_review_tab_id` to `emit_issue_navigation()`. Final outcome and
+review data remain the responsibility of `emit_issue_result()`. The navigation
+identities survive later review or delivery failure and are never derived from
+a session index, UI state, or tmux state.
 
 Findings and advanced resource registration use:
 

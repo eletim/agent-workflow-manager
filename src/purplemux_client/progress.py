@@ -138,6 +138,50 @@ def emit_issue_result(
     _write_event(event)
 
 
+def emit_issue_navigation(
+    issue: int | str,
+    pr_number: int,
+    pr_url: str,
+    *,
+    workspace_id: str,
+    implementation_tab_id: str,
+    scope_review_tab_id: str,
+    correctness_review_tab_id: str,
+    label: str | None = None,
+) -> None:
+    """Publish durable work-item navigation independently of its final outcome."""
+    if isinstance(issue, bool) or not isinstance(issue, (int, str)):
+        raise ValueError("issue must be a positive number or non-empty string")
+    if isinstance(issue, int):
+        _validate_positive_number("issue", issue)
+    elif not issue.strip() or len(issue) > 100:
+        raise ValueError("issue must be a positive number or non-empty string")
+    if label is not None and (
+        not isinstance(label, str) or not label.strip() or len(label) > 100
+    ):
+        raise ValueError("label must be a non-empty string of at most 100 characters")
+    _validate_pr("issue navigation", pr_number, pr_url)
+    _validate_issue_terminals(
+        workspace_id,
+        implementation_tab_id,
+        scope_review_tab_id,
+        correctness_review_tab_id,
+    )
+    event: dict[str, object] = {
+        "type": "issue_navigation",
+        "issue": issue,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "workspace_id": workspace_id,
+        "implementation_tab_id": implementation_tab_id,
+        "scope_review_tab_id": scope_review_tab_id,
+        "correctness_review_tab_id": correctness_review_tab_id,
+    }
+    if label is not None:
+        event["label"] = label
+    _write_event(event)
+
+
 def emit_whole_review_result(
     outcome: IssueOutcome,
     reviews: int,

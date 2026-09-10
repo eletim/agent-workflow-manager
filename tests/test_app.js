@@ -381,6 +381,12 @@ function runItem(elements, runId) {
   );
 }
 
+function runCheckToggle(elements, runId) {
+  const item = runItem(elements, runId);
+  const index = elements["run-list"].children.indexOf(item);
+  return elements["run-list"].children[index + 1];
+}
+
 function markerState(elements, runId) {
   const item = runItem(elements, runId);
   assert.equal(item.children[0].className, "run-state-marker");
@@ -464,6 +470,80 @@ test("terminal run checked state toggles from detail and list without leaking", 
   assert.deepEqual(updates, [[1, true], [1, false]]);
   assert.equal(elements["checked-toggle"].textContent, "Mark checked");
   assert.equal(details[2].checked, false);
+});
+
+test("selected-run checked toggle suppresses duplicate pending requests", async () => {
+  const update = deferred();
+  const runs = [
+    {runId: 1, state: "success", mode: "workflow", cwd: "/work/one", checked: false},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done", checked: false}),
+  };
+  let requests = 0;
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/runs/1/checked") return undefined;
+      requests += 1;
+      return update.promise;
+    },
+  });
+
+  const pendingSelection = elements["checked-toggle"].dispatch("click");
+  assert.equal(elements["checked-toggle"].disabled, true);
+  assert.equal(elements["checked-toggle"].dataset.pending, "true");
+  await elements["checked-toggle"].dispatch("click");
+  assert.equal(requests, 1);
+
+  runs[0].checked = true;
+  details[1].checked = true;
+  update.resolve(response(details[1]));
+  await pendingSelection;
+
+  assert.equal(elements["checked-toggle"].disabled, false);
+  assert.equal(elements["checked-toggle"].dataset.pending, undefined);
+  assert.equal(elements["checked-toggle"].getAttribute("aria-pressed"), "true");
+  assert.equal(elements["checked-toggle"].textContent, "Mark unchecked");
+});
+
+test("history checked toggle restores authoritative state after failure", async () => {
+  const update = deferred();
+  const runs = [
+    {runId: 1, state: "success", mode: "workflow", cwd: "/work/one", checked: false},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done", checked: false}),
+  };
+  let requests = 0;
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/runs/1/checked") return undefined;
+      requests += 1;
+      return update.promise;
+    },
+  });
+
+  const toggle = runCheckToggle(elements, 1);
+  const pendingHistory = toggle.dispatch("click");
+  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.dataset.pending, "true");
+  await toggle.dispatch("click");
+  assert.equal(requests, 1);
+
+  update.resolve(response({error: "check failed"}, 500));
+  await pendingHistory;
+
+  const authoritativeToggle = runCheckToggle(elements, 1);
+  assert.equal(authoritativeToggle.disabled, false);
+  assert.equal(authoritativeToggle.getAttribute("aria-pressed"), "false");
+  assert.equal(authoritativeToggle.textContent, "Unchecked");
+  assert.match(elements.stderr.textContent, /check failed/);
 });
 
 test("checked run deletion shows the eligible count and clears deleted detail", async () => {
@@ -1989,6 +2069,50 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
 
   await elements["new-run"].dispatch("click");
   assert.equal(elements["issue-summary-panel"].hidden, true);
+});
+
+test("running Issue Driven Summary links an item before its outcome exists", async () => {
+  const detail = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    issueDrivenSummary: {
+      repository: "acme/project",
+      integrationBranch: "dev/v1",
+      finalBranch: "main",
+      terminalResult: "running",
+      warningCount: 0,
+      issues: [{
+        issue: 40,
+        label: "Issue #40",
+        pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+        terminals: {
+          implementation: {workspaceId: "ws-run", tabId: "tab-implementation"},
+          scopeReview: {workspaceId: "ws-run", tabId: "tab-scope"},
+          correctnessReview: {workspaceId: "ws-run", tabId: "tab-correctness"},
+        },
+        warnings: [],
+      }],
+      wholeReview: null,
+      basePr: null,
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+    locationHref: "http://127.0.0.1:8765/",
+  });
+
+  const line = elements["issue-summary-list"].children[0].children[1].children[0];
+  assert.equal(elements["issue-summary-panel"].hidden, false);
+  assert.equal(elements["issue-summary-list"].children[0].className, "issue-summary-item in_progress");
+  assert.equal(line.children[4].textContent, "Implementation");
+  assert.equal(
+    line.children[4].href,
+    "http://127.0.0.1:9123/?workspace=ws-run&tab=tab-implementation",
+  );
+  assert.equal(line.children.at(-1).textContent, "  in progress");
 });
 
 test("validation displays a valid draft outline before execution", async () => {

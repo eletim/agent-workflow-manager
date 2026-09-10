@@ -486,12 +486,15 @@ function renderIssueDrivenSummary(summary) {
   issueSummaryTerminal.textContent = `Run result: ${summary.terminalResult.replaceAll("_", " ")}`;
   for (const result of summary.issues || []) {
     const item = document.createElement("li");
-    item.className = `issue-summary-item ${result.outcome}`;
+    const outcome = result.outcome || "in_progress";
+    item.className = `issue-summary-item ${outcome}`;
     const marker = document.createElement("span");
     marker.className = "issue-summary-marker";
-    marker.textContent = result.outcome === "approved"
+    marker.textContent = outcome === "approved"
       ? "✓"
-      : (result.outcome === "continued_with_warning" ? "⚠" : "–");
+      : (outcome === "continued_with_warning"
+        ? "⚠"
+        : (outcome === "in_progress" ? "…" : "–"));
     const details = document.createElement("div");
     const line = document.createElement("div");
     const label = result.label || `#${result.issue}`;
@@ -507,9 +510,11 @@ function renderIssueDrivenSummary(summary) {
     if (terminals.correctnessReview) {
       appendPurpleMuxLink(line, "Correctness Review", terminals.correctnessReview);
     }
-    line.append(document.createTextNode(`  Review ${result.reviews}`));
-    if (result.outcome !== "approved") {
-      line.append(document.createTextNode(`  ${result.outcome.replaceAll("_", " ")}`));
+    if (result.reviews != null) {
+      line.append(document.createTextNode(`  Review ${result.reviews}`));
+    }
+    if (outcome !== "approved") {
+      line.append(document.createTextNode(`  ${outcome.replaceAll("_", " ")}`));
     }
     details.append(line);
     for (const warning of result.warnings || []) {
@@ -688,7 +693,9 @@ function renderRunList(runs) {
       );
       toggle.setAttribute("aria-pressed", String(Boolean(run.checked)));
       toggle.addEventListener("click", async () => {
-        await updateChecked(run.runId, !run.checked);
+        await withPendingButton(toggle, async () => {
+          await updateChecked(run.runId, !run.checked);
+        });
       });
       runList.append(toggle);
     }
@@ -1777,10 +1784,12 @@ cleanupButton.addEventListener("click", async () => {
 
 checkedToggle.addEventListener("click", async () => {
   if (activeRunId === null || checkedToggle.hidden) return;
-  await updateChecked(
-    activeRunId,
-    checkedToggle.getAttribute("aria-pressed") !== "true",
-  );
+  await withPendingButton(checkedToggle, async () => {
+    await updateChecked(
+      activeRunId,
+      checkedToggle.getAttribute("aria-pressed") !== "true",
+    );
+  });
 });
 
 settingsOpen.addEventListener("click", () => {

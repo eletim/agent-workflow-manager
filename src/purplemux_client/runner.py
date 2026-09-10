@@ -184,6 +184,16 @@ class IssueResult:
 
 
 @dataclass(frozen=True)
+class IssueNavigation:
+    issue: int | str
+    pr: PullRequestNavigation
+    implementation_terminal: PurpleMuxNavigation
+    scope_review_terminal: PurpleMuxNavigation
+    correctness_review_terminal: PurpleMuxNavigation
+    label: str | None = None
+
+
+@dataclass(frozen=True)
 class WholeReviewResult:
     outcome: Literal["approved", "continued_with_warning", "skipped"]
     reviews: int
@@ -374,6 +384,7 @@ class RunnerSnapshot:
     warning_count: int = 0
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: tuple[IssueResult, ...] = ()
+    issue_navigations: tuple[IssueNavigation, ...] = ()
     whole_review_result: WholeReviewResult | None = None
     identity: str | None = None
     issue_driven_json: str | None = None
@@ -405,6 +416,7 @@ class RunnerSnapshot:
         payload["warningCount"] = payload.pop("warning_count")
         payload.pop("issue_driven_context")
         payload.pop("issue_results")
+        payload.pop("issue_navigations")
         payload.pop("whole_review_result")
         payload["issueDrivenSummary"] = self._issue_driven_summary_json()
         payload["stdoutEntries"] = [
@@ -451,9 +463,16 @@ class RunnerSnapshot:
 
     def _issue_driven_summary_json(self) -> dict[str, object] | None:
         context = self.issue_driven_context
-        if context is None or self.state in ("idle", "running", "validation_failed"):
+        if context is None or self.state in ("idle", "validation_failed"):
+            return None
+        if self.state == "running" and not (
+            self.issue_results or self.issue_navigations
+        ):
             return None
         issues = []
+        navigations = {
+            navigation.issue: navigation for navigation in self.issue_navigations
+        }
         for result in self.issue_results:
             item = {
                 "issue": result.issue,
@@ -464,10 +483,14 @@ class RunnerSnapshot:
             }
             if result.label is not None:
                 item["label"] = result.label
+            navigation = navigations.pop(result.issue, None)
             terminals = {
-                "implementation": result.implementation_terminal,
-                "scopeReview": result.scope_review_terminal,
-                "correctnessReview": result.correctness_review_terminal,
+                "implementation": result.implementation_terminal
+                or (navigation.implementation_terminal if navigation else None),
+                "scopeReview": result.scope_review_terminal
+                or (navigation.scope_review_terminal if navigation else None),
+                "correctnessReview": result.correctness_review_terminal
+                or (navigation.correctness_review_terminal if navigation else None),
             }
             if any(terminal is not None for terminal in terminals.values()):
                 item["terminals"] = {
@@ -475,6 +498,20 @@ class RunnerSnapshot:
                     for role, terminal in terminals.items()
                     if terminal is not None
                 }
+            issues.append(item)
+        for navigation in navigations.values():
+            item = {
+                "issue": navigation.issue,
+                "pr": navigation.pr.as_json(),
+                "warnings": [],
+                "terminals": {
+                    "implementation": navigation.implementation_terminal.as_json(),
+                    "scopeReview": navigation.scope_review_terminal.as_json(),
+                    "correctnessReview": navigation.correctness_review_terminal.as_json(),
+                },
+            }
+            if navigation.label is not None:
+                item["label"] = navigation.label
             issues.append(item)
         whole_review = self.whole_review_result
         return {
@@ -592,6 +629,7 @@ class _RunRecord:
     checked: bool = False
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
+    issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
@@ -781,6 +819,9 @@ class PythonRunner:
                 else None
             ),
             "issueResults": [asdict(result) for result in run.issue_results.values()],
+            "issueNavigations": [
+                asdict(navigation) for navigation in run.issue_navigations.values()
+            ],
             "wholeReviewResult": (
                 asdict(run.whole_review_result)
                 if run.whole_review_result is not None
@@ -984,6 +1025,27 @@ class PythonRunner:
             result_value["warnings"] = tuple(warnings_value)
             result = self._history_dataclass(IssueResult, result_value)
             issue_results[result.issue] = result
+        issue_navigation_values = value.get("issueNavigations", [])
+        if not isinstance(issue_navigation_values, list):
+            raise ValueError
+        issue_navigations: dict[int | str, IssueNavigation] = {}
+        for item in issue_navigation_values:
+            if not isinstance(item, dict):
+                raise ValueError
+            navigation_value = dict(item)
+            navigation_value["pr"] = self._history_dataclass(
+                PullRequestNavigation, navigation_value.get("pr")
+            )
+            for field_name in (
+                "implementation_terminal",
+                "scope_review_terminal",
+                "correctness_review_terminal",
+            ):
+                navigation_value[field_name] = self._history_dataclass(
+                    PurpleMuxNavigation, navigation_value.get(field_name)
+                )
+            navigation = self._history_dataclass(IssueNavigation, navigation_value)
+            issue_navigations[navigation.issue] = navigation
         whole_review_value = value.get("wholeReviewResult")
         whole_review_result = (
             None
@@ -1030,6 +1092,7 @@ class PythonRunner:
             integration_pr=integration_pr,
             issue_driven_context=issue_driven_context,
             issue_results=issue_results,
+            issue_navigations=issue_navigations,
             whole_review_result=whole_review_result,
             checked=checked,
             issue_driven_json=issue_driven_json,
@@ -1839,6 +1902,7 @@ class PythonRunner:
             warning_count=run.warning_count,
             issue_driven_context=run.issue_driven_context,
             issue_results=tuple(run.issue_results.values()),
+            issue_navigations=tuple(run.issue_navigations.values()),
             whole_review_result=run.whole_review_result,
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
@@ -2619,6 +2683,9 @@ class PythonRunner:
         elif event_type == "issue_result":
             issue_result = cast(IssueResult, event)
             run.issue_results[issue_result.issue] = issue_result
+        elif event_type == "issue_navigation":
+            issue_navigation = cast(IssueNavigation, event)
+            run.issue_navigations[issue_navigation.issue] = issue_navigation
         elif event_type == "whole_review_result":
             run.whole_review_result = cast(WholeReviewResult, event)
         else:
@@ -2641,6 +2708,7 @@ class PythonRunner:
                 "resource_ownership",
                 "run_pr",
                 "issue_driven_context",
+                "issue_navigation",
                 "issue_result",
                 "whole_review_result",
             ],
@@ -2749,6 +2817,47 @@ class PythonRunner:
                 cast(str, integration_branch),
                 cast(str, final_branch),
                 cast(int | None, policy_issue),
+            )
+        if event_type == "issue_navigation":
+            issue = value.get("issue")
+            label = value.get("label")
+            pr_number = value.get("pr_number")
+            pr_url = value.get("pr_url")
+            workspace_id = value.get("workspace_id")
+            tab_ids = (
+                value.get("implementation_tab_id"),
+                value.get("scope_review_tab_id"),
+                value.get("correctness_review_tab_id"),
+            )
+            if (
+                isinstance(issue, bool)
+                or not isinstance(issue, (int, str))
+                or (isinstance(issue, int) and issue < 1)
+                or (isinstance(issue, str) and (not issue.strip() or len(issue) > 100))
+                or (
+                    label is not None
+                    and (
+                        not isinstance(label, str)
+                        or not label.strip()
+                        or len(label) > 100
+                    )
+                )
+                or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
+                or not isinstance(workspace_id, str)
+                or not workspace_id.strip()
+                or any(
+                    not isinstance(tab_id, str) or not tab_id.strip()
+                    for tab_id in tab_ids
+                )
+            ):
+                return None
+            return "issue_navigation", IssueNavigation(
+                issue,
+                PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
+                PurpleMuxNavigation(workspace_id, cast(str, tab_ids[0])),
+                PurpleMuxNavigation(workspace_id, cast(str, tab_ids[1])),
+                PurpleMuxNavigation(workspace_id, cast(str, tab_ids[2])),
+                cast(str | None, label),
             )
         if event_type in ("issue_result", "whole_review_result"):
             outcome = value.get("outcome")

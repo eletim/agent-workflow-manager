@@ -32,6 +32,7 @@ from purplemux_client import (
     WorkerFailure,
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_navigation,
     emit_issue_result,
     emit_run_pr,
     emit_step,
@@ -1606,6 +1607,17 @@ def process_issue(
         agent_type=REVIEWER_AGENT,
         name=f"{issue.label} correctness reviewer",
     )
+    if existing_pr is not None:
+        emit_issue_navigation(
+            issue.result_id,
+            existing_pr.number,
+            existing_pr.url,
+            label=issue.label,
+            workspace_id=client.workspace_id,
+            implementation_tab_id=implementer,
+            scope_review_tab_id=scope_reviewer,
+            correctness_review_tab_id=correctness_reviewer,
+        )
     implementation_prompt, scope_prompt, correctness_prompt = issue_prompts(
         issue, config
     )
@@ -1640,6 +1652,16 @@ def process_issue(
         config,
         expected_base_sha=integration.remote_sha,
         may_initialize_inline_identity=existing_pr is None,
+    )
+    emit_issue_navigation(
+        issue.result_id,
+        pr.number,
+        pr.url,
+        label=issue.label,
+        workspace_id=client.workspace_id,
+        implementation_tab_id=implementer,
+        scope_review_tab_id=scope_reviewer,
+        correctness_review_tab_id=correctness_reviewer,
     )
     pr = ensure_issue_pr_metadata(github, pr, issue, config)
     if pr.head_sha != implementation_sha:

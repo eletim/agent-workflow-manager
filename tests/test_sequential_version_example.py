@@ -1175,6 +1175,100 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     )
 
 
+@pytest.mark.parametrize(
+    "failure_phase", ["after_pr_creation", "scope/design", "correctness"]
+)
+def test_issue_navigation_precedes_post_pr_and_review_failures(
+    monkeypatch: pytest.MonkeyPatch, failure_phase: str
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](178, "feature/issue-178")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_sha = "implementation-head"
+    base_sha = "integration-head"
+    pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+    navigations: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, base_sha, base_sha, False)
+
+    def ensure_metadata(*args: object, **kwargs: object) -> PullRequestState:
+        if failure_phase == "after_pr_creation":
+            raise RuntimeError("metadata failure")
+        return pr
+
+    def review_phase(*args: object, **kwargs: object) -> object:
+        phase = str(kwargs["phase"])
+        if phase == failure_phase:
+            raise RuntimeError(f"{phase} failure")
+        assert phase == "scope/design"
+        return workflow["IssueReviewPhaseResult"](
+            pr, "approved", head_sha, base_sha, 1, ()
+        )
+
+    monkeypatch.setitem(
+        workflow_globals, "prepare_issue", lambda *args: (None, "start-head", False)
+    )
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", lambda *args, **kwargs: "done")
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (head_sha, False),
+    )
+    monkeypatch.setitem(workflow_globals, "ensure_issue_pr", lambda *args, **kwargs: pr)
+    monkeypatch.setitem(workflow_globals, "ensure_issue_pr_metadata", ensure_metadata)
+    monkeypatch.setitem(workflow_globals, "review_issue_phase", review_phase)
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_issue_navigation",
+        lambda *args, **kwargs: navigations.append((args, kwargs)),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_issue_result",
+        lambda *args, **kwargs: issue_results.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="failure"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            object(),
+        )
+
+    assert issue_results == []
+    assert navigations == [
+        (
+            (issue.result_id, pr.number, pr.url),
+            {
+                "label": issue.label,
+                "workspace_id": "ws-test",
+                "implementation_tab_id": f"{issue.label} implementer",
+                "scope_review_tab_id": f"{issue.label} scope reviewer",
+                "correctness_review_tab_id": f"{issue.label} correctness reviewer",
+            },
+        )
+    ]
+
+
 def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

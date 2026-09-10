@@ -50,6 +50,7 @@ from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_navigation,
     emit_issue_result,
     emit_run_pr,
     emit_step,
@@ -93,6 +94,7 @@ __all__ = [
     "emit_step",
     "emit_finding",
     "emit_issue_driven_context",
+    "emit_issue_navigation",
     "emit_issue_result",
     "emit_run_pr",
     "emit_whole_review_result",

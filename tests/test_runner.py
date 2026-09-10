@@ -1746,18 +1746,23 @@ emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/4
         restored_runner.close()
 
 
-def test_issue_driven_summary_is_hidden_while_running_and_scoped_to_run() -> None:
+def test_summary_exposes_completed_item_while_later_item_is_active() -> None:
     runner = PythonRunner(managed_workflows=False)
     try:
         first = runner.start(
-            """from purplemux_client import emit_issue_driven_context
+            """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_navigation, emit_issue_result,
+)
 import time
 emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_navigation(10, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-10-implementation", scope_review_tab_id="tab-10-scope", correctness_review_tab_id="tab-10-correctness")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40")
+emit_issue_navigation(11, 41, "https://github.com/acme/project/pull/41", workspace_id="ws-run", implementation_tab_id="tab-11-implementation", scope_review_tab_id="tab-11-scope", correctness_review_tab_id="tab-11-correctness")
 time.sleep(60)
 """
         )
         running = wait_for(
-            runner, lambda item: item.issue_driven_context is not None, run_id=first
+            runner, lambda item: len(item.issue_navigations) == 2, run_id=first
         )
         runner.stop(first)
         wait_for(runner, lambda item: item.state == "stopped", run_id=first)
@@ -1766,9 +1771,64 @@ time.sleep(60)
     finally:
         runner.close()
 
-    assert running.as_json()["issueDrivenSummary"] is None
+    summary = running.as_json()["issueDrivenSummary"]
+    assert summary is not None
+    assert summary["terminalResult"] == "running"
+    assert [item.get("outcome") for item in summary["issues"]] == ["approved", None]
+    assert summary["issues"][1]["terminals"]["scopeReview"] == {
+        "workspaceId": "ws-run",
+        "tabId": "tab-11-scope",
+    }
     assert runner.snapshot(first).as_json()["issueDrivenSummary"] is not None
     assert runner.snapshot(second).as_json()["issueDrivenSummary"] is None
+
+
+def test_failed_issue_run_persists_navigation_without_a_final_result(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_issue_driven_context, emit_issue_navigation
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_navigation(10, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-implementation", scope_review_tab_id="tab-scope", correctness_review_tab_id="tab-correctness")
+raise RuntimeError("review failed")
+"""
+        )
+        failed = wait_until_finished(runner)
+        assert failed.state == "failed"
+    finally:
+        runner.close()
+
+    restored_runner = PythonRunner(
+        managed_workflows=False, run_history_file=history_file
+    )
+    try:
+        summary = restored_runner.snapshot(run_id).as_json()["issueDrivenSummary"]
+    finally:
+        restored_runner.close()
+
+    assert summary is not None
+    assert summary["terminalResult"] == "failed"
+    assert summary["issues"] == [
+        {
+            "issue": 10,
+            "pr": {"number": 40, "url": "https://github.com/acme/project/pull/40"},
+            "warnings": [],
+            "terminals": {
+                "implementation": {
+                    "workspaceId": "ws-run",
+                    "tabId": "tab-implementation",
+                },
+                "scopeReview": {"workspaceId": "ws-run", "tabId": "tab-scope"},
+                "correctnessReview": {
+                    "workspaceId": "ws-run",
+                    "tabId": "tab-correctness",
+                },
+            },
+        }
+    ]
 
 
 def test_output_is_bounded_and_reports_truncation() -> None:
