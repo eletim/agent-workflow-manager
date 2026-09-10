@@ -29,7 +29,12 @@ yet. The workflow creates the isolated worktree at the exact remote
 `final_branch` HEAD, creates and pushes `integration_branch` from that commit,
 then uses it for Issue delivery. If the integration branch already exists, the
 same recovery path requires it to contain that exact final-branch HEAD and
-rejects unsafe remote movement or divergence. The final PR remains
+rejects unsafe remote movement or divergence. Base PR creation is deferred while
+the authoritative remote heads are identical, then performed after the first
+Issue merge creates a difference; an existing Base PR retains its normal recovery
+semantics. During deferral, the unchanged planner stores its decisions and
+dispatch position in an AWM-owned remote Git note without advancing either
+branch. This also supports dynamic and empty one-shot plans. The final PR remains
 `integration_branch` to `final_branch`.
 
 Correct:
@@ -215,6 +220,13 @@ flow. The effective final snapshot is passed explicitly to handoff generation;
 the immutable configuration is not changed. This remains ordinary Python
 control flow: planner prose, JSON input, Runner state, Progress, and the UI do not
 become scheduling authorities.
+
+When Base PR creation is deferred because a newly created integration branch is
+still identical to its final branch, an AWM-owned remote Git note anchored to the
+reviewed final commit temporarily holds the same seed-bound serialized plan. It
+is updated before every dispatch, so planner ordering and one-shot behavior stay
+unchanged. After the first Issue merge advances integration, the Base PR is
+created from that recovery state and becomes the normal authority again.
 
 When `policy_issue` is present, implementation, Issue review/fix, and
 whole-version review/fix agents read it first as shared design context. It is not

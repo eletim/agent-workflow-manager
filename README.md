@@ -76,10 +76,14 @@ serialized plan, including its largest possible dispatch position, is limited to
 Already-dispatched items cannot be revised and completed identities cannot be
 reused. The final plan snapshot is passed explicitly to
 handoff generation; configuration is never mutated. Before dispatch, every
-accepted decision is stored as seed-bound recovery state in the Draft Base PR,
-and each item is marked dispatched before child processing. A new run restores
-that exact plan, re-inspects dispatched dynamic open or merged child PRs, and
-fails closed if the state is missing, ambiguous, or belongs to a different seed.
+accepted decision is stored as seed-bound recovery state, and each item is marked
+dispatched before child processing. The Draft Base PR normally owns that state.
+While Base PR creation is deferred for identical integration/final heads, an
+AWM-owned remote Git note stores the same state without changing either branch;
+the Base PR takes over after the first merge creates a difference. A new run
+restores that exact plan, re-inspects dispatched dynamic open or merged child
+PRs, and fails closed if the state is missing, ambiguous, or belongs to a
+different seed.
 The Runner and progress events only observe these decisions, so the generated
 plain Python remains the control-flow source of truth.
 
@@ -139,7 +143,12 @@ two agent fields, and `scenarios` are optional; every other field is required.
 With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal
-safe recovery checks. The final PR still targets `final_branch`. When set,
+safe recovery checks. While the two remote heads are identical, Base PR creation
+is deferred; it is created after the first Issue merge advances the integration
+branch. An existing Base PR is still recovered normally. The final PR still
+targets `final_branch`. During deferral, planner decisions—including empty
+one-shot plans and dynamic items—use an AWM-owned remote Git note as authoritative
+recovery state without changing scheduling semantics. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design
 context to every implementation, review, and fix turn and is referenced by the
 Base PR. It cannot also appear as an implementation GitHub Issue work item. Clear conflicts produce structured
