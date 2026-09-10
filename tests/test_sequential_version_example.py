@@ -1281,6 +1281,97 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
     assert events == ["agent-created", "identity", "ready"]
 
 
+def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    task = "Refresh the New Run help."
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    branch = "feature/work-item-refresh-run-help"
+    issue = workflow["Issue"](None, branch, "refresh-run-help", task, fingerprint)
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue,),
+        "true",
+        one_shot_issue=204,
+    )
+    head_sha = "implementation-head"
+    base_sha = "integration-head"
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    bodies: list[str] = []
+
+    class Repository:
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, head_sha, None, True)
+
+        def ensure_pushed(
+            self, current: str, *, expected_local_sha: str
+        ) -> BranchState:
+            assert (current, expected_local_sha) == (branch, head_sha)
+            return BranchState(current, head_sha, head_sha, True)
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.pr: PullRequestState | None = None
+
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base, state) == (branch, config.integration_branch, "OPEN")
+            return self.pr
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            body = str(kwargs["body"])
+            bodies.append(body)
+            self.pr = replace(
+                open_pr(head=branch, base=config.integration_branch, draft=True),
+                head_sha=head_sha,
+                base_sha=base_sha,
+                body=body,
+            )
+            return self.pr
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert self.pr is not None
+            return self.pr
+
+        def update_pr_body(
+            self, number: int, *, body: str, **kwargs: object
+        ) -> PullRequestState:
+            assert self.pr is not None and number == self.pr.number
+            bodies.append(body)
+            self.pr = replace(self.pr, body=body)
+            return self.pr
+
+    github = GitHub()
+    created = workflow["ensure_issue_pr"](
+        Repository(), github, issue, config, expected_base_sha=base_sha
+    )
+    assert created.body.startswith(f"{marker}\n\n")
+
+    rewritten = replace(created, body="Updated child PR description")
+    github.pr = rewritten
+    updated = workflow["ensure_issue_pr_metadata"](github, rewritten, issue, config)
+
+    assert updated.body == f"{marker}\n\nUpdated child PR description"
+    assert bodies == [issue.pr_body, updated.body]
+
+
+def test_regular_issue_pr_body_metadata_maintenance_is_a_noop() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](204, "feature/issue-204")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pr = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+
+    class GitHub:
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            raise AssertionError("regular Issue PR body must not be updated")
+
+    assert workflow["ensure_issue_pr_metadata"](GitHub(), pr, issue, config) is pr
+
+
 def test_issue_review_limit_warns_without_starting_an_extra_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
