@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import runpy
 import subprocess
 from dataclasses import replace
@@ -182,11 +183,78 @@ def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> No
     assert "right boundaries" in source
 
 
+def test_scenario_gate_prompt_selects_and_compares_human_scenarios() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    prompt_globals = workflow["scenario_gate_prompt"].__globals__
+    prompt_globals["SCENARIOS"] = (
+        "Existing: prompt execution still succeeds.",
+        "New: scenario configuration is accepted.",
+        "Failure: malformed scenarios are rejected.",
+    )
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+
+    prompt = workflow["scenario_gate_prompt"](pr, config, config.issues)
+
+    assert pr.base_sha in prompt
+    assert pr.head_sha in prompt
+    assert "Select a small, risk-relevant subset" in prompt
+    assert "executing every scenario is not required" in prompt
+    assert "observe or inspect both Before and After" in prompt
+    assert "judge whether that difference\nis appropriate" in prompt
+    assert "1. Existing:" in prompt
+    assert "2. New:" in prompt
+    assert "3. Failure:" in prompt
+
+
+def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    prompt_globals = workflow["scenario_gate_prompt"].__globals__
+    prompt_globals["SCENARIOS"] = ("New: dynamically planned behavior works.",)
+    issue_type = workflow["Issue"]
+    revised_task = "Publish the revised dynamically planned release notes."
+    work_items = (
+        issue_type(91, "feature/custom-91"),
+        workflow["planner_inline_issue"]("release-notes", revised_task),
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        work_items,
+        "true",
+    )
+    one_shot_items = (work_items[1],)
+    one_shot_config = replace(config, issues=one_shot_items, one_shot_issue=169)
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+
+    dynamic_prompts = (
+        workflow["scenario_gate_prompt"](pr, config, work_items),
+        workflow["whole_version_review_prompt"](pr, config, work_items),
+    )
+
+    for prompt in dynamic_prompts:
+        assert "GitHub Issue #91, branch feature/custom-91" in prompt
+        assert "Mini task release-notes" in prompt
+        assert revised_task in prompt
+
+    one_shot_prompts = (
+        workflow["scenario_gate_prompt"](pr, one_shot_config, one_shot_items),
+        workflow["whole_version_review_prompt"](pr, one_shot_config, one_shot_items),
+    )
+    for prompt in one_shot_prompts:
+        assert revised_task in prompt
+        assert "One-shot source: GitHub Issue #169" in prompt
+
+
 def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert source.count("def decision(result: str) -> str:") == 1
-    assert source.count("decision(result)") == 2
+    assert source.count("decision(result)") == 3
 
 
 def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
@@ -258,13 +326,13 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
 
     # Initial implementation, cleanup/remediation, phase fixes, and whole-version
     # fixes are the four prompt-producing implementer paths.
-    assert isinstance(prompts["Issue # implementation"], ast.Name)
-    for label in ("Clean worktree", "Issue #  fixes", "Whole-version fixes"):
+    assert isinstance(prompts[" implementation"], ast.Name)
+    for label in ("Clean worktree", "  fixes", "Whole-version fixes"):
         prompt = prompts[label]
         assert isinstance(prompt, ast.Call)
         assert isinstance(prompt.func, ast.Name)
         assert prompt.func.id == "implementer_prompt"
-    for label in ("Issue #  review", "Whole-version reviewer turn"):
+    for label in ("  review", "Whole-version reviewer turn"):
         prompt = prompts[label]
         assert not (
             isinstance(prompt, ast.Call)
@@ -973,6 +1041,110 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     assert events[-1] == "ready"
 
 
+def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["process_issue"].__globals__
+    task = "Refresh the New Run help."
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    branch = "feature/work-item-refresh-run-help"
+    issue = workflow["Issue"](None, branch, "refresh-run-help", task, fingerprint)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    implementation_sha = "implementation-head"
+    base_sha = "integration-head"
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    events: list[str] = []
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, base_sha, base_sha, False)
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, implementation_sha, None, True)
+
+        def ensure_pushed(
+            self, current: str, *, expected_local_sha: str
+        ) -> BranchState:
+            assert (current, expected_local_sha) == (branch, implementation_sha)
+            return BranchState(current, implementation_sha, implementation_sha, True)
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.pr: PullRequestState | None = None
+
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base, state) == (branch, config.integration_branch, "OPEN")
+            return self.pr
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert self.pr is not None
+            assert kwargs["expected_head_sha"] == implementation_sha
+            assert kwargs["expected_base_sha"] == base_sha
+            return self.pr
+
+        def update_pr_body(
+            self, number: int, *, body: str, **kwargs: object
+        ) -> PullRequestState:
+            assert self.pr is not None and number == self.pr.number
+            assert body == f"{marker}\n\nAgent-created PR body"
+            events.append("identity")
+            self.pr = replace(self.pr, body=body)
+            return self.pr
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            assert self.pr is not None and number == self.pr.number
+            events.append("ready")
+            self.pr = replace(self.pr, is_draft=False)
+            return self.pr
+
+    github = GitHub()
+    agent_pr = replace(
+        open_pr(head=branch, base=config.integration_branch, draft=True),
+        head_sha=implementation_sha,
+        base_sha=base_sha,
+        body="Agent-created PR body",
+    )
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        github.pr = agent_pr
+        events.append("agent-created")
+        return "implemented, committed, pushed, and opened Draft PR"
+
+    def review_issue_phase(*args: object, **kwargs: object):
+        assert github.pr is not None and github.pr.body.startswith(marker)
+        return workflow["IssueReviewPhaseResult"](
+            github.pr, "approved", implementation_sha, base_sha, 1
+        )
+
+    monkeypatch.setitem(
+        workflow_globals, "prepare_issue", lambda *args: (None, "start-head", False)
+    )
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (implementation_sha, True),
+    )
+    monkeypatch.setitem(workflow_globals, "review_issue_phase", review_issue_phase)
+    monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
+
+    result = workflow["process_issue"](issue, config, object(), Repository(), github)
+
+    assert result.body == f"{marker}\n\nAgent-created PR body"
+    assert events == ["agent-created", "identity", "ready"]
+
+
 def test_issue_review_limit_warns_without_starting_an_extra_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1390,7 +1562,9 @@ def test_ready_final_pr_repeats_review_and_checks(
         lambda *args: events.append("final checks"),
     )
 
-    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+    result = workflow["integration_delivery"](
+        config, config.issues, object(), Repository(), GitHub()
+    )
 
     assert result.is_draft is False
     assert events == [
@@ -1467,7 +1641,7 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
     _, delivery = workflow["review_whole_version"](
-        config, object(), Repository(), GitHub(), current_pr
+        config, object(), Repository(), GitHub(), current_pr, config.issues
     )
 
     assert delivery.outcome == "approved"
@@ -1532,7 +1706,9 @@ def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
         lambda *args: events.append("final checks"),
     )
 
-    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+    result = workflow["integration_delivery"](
+        config, config.issues, object(), Repository(), GitHub()
+    )
 
     assert result.is_draft is True
     assert events.count("Whole-version reviewer turn") == 1
@@ -1615,7 +1791,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     )
 
     pr, delivery = workflow["review_whole_version"](
-        config, object(), Repository(), GitHub(), current_pr
+        config, object(), Repository(), GitHub(), current_pr, config.issues
     )
 
     assert pr.is_draft is True
@@ -1690,7 +1866,9 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
         lambda *args: pytest.fail("disabled final review must not run"),
     )
 
-    result = workflow["integration_delivery"](config, object(), Repository(), GitHub())
+    result = workflow["integration_delivery"](
+        config, config.issues, object(), Repository(), GitHub()
+    )
 
     assert result.is_draft is False
     assert outcomes == ["skipped"]
@@ -1811,7 +1989,9 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         lambda name, status, **kwargs: outline_events.append((name, status)),
     )
 
-    ready = workflow["integration_delivery"](config, object(), repository, GitHub())
+    ready = workflow["integration_delivery"](
+        config, config.issues, object(), repository, GitHub()
+    )
 
     assert ready.is_draft is False
     assert review_count == 2
@@ -1879,7 +2059,9 @@ def test_whole_version_outline_fails_when_final_checks_fail(
     )
 
     with pytest.raises(WorkerFailure, match="checks failed"):
-        workflow["integration_delivery"](config, object(), Repository(), GitHub())
+        workflow["integration_delivery"](
+            config, config.issues, object(), Repository(), GitHub()
+        )
 
     assert outline_events == [
         ("Whole-version review", "started"),
@@ -1923,7 +2105,7 @@ def test_historical_merged_final_pr_cannot_complete_newer_delivery() -> None:
 
     repository = Repository()
     with pytest.raises(WorkerFailure, match="historical merged final PR #17"):
-        integration_delivery(config, object(), repository, GitHub())
+        integration_delivery(config, config.issues, object(), repository, GitHub())
 
     assert repository.synchronized == ["dev/v1"]
 
@@ -1938,7 +2120,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     )
     warning = (
         "Policy Issue #200 conflicts with the integrated version: ownership "
-        "differs; continuing with the implementation Issue as the primary requirement."
+        "differs; continuing with the implementation work item as the primary requirement."
     )
     marker = workflow["encoded_policy_conflict_marker"](warning)
     merged = replace(merged_final_pr("new-head"), body=f"Base PR.\n\n{marker}")
@@ -1974,7 +2156,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     )
 
     delivered = workflow["integration_delivery"](
-        config, object(), Repository(), GitHub()
+        config, config.issues, object(), Repository(), GitHub()
     )
 
     assert delivered is merged
@@ -2010,7 +2192,7 @@ def test_exact_merged_final_pr_requires_final_branch_containment() -> None:
             return merged_final_pr("new-head")
 
     with pytest.raises(WorkerFailure, match="main does not contain new-head"):
-        integration_delivery(config, object(), Repository(), GitHub())
+        integration_delivery(config, config.issues, object(), Repository(), GitHub())
 
 
 def test_example_passes_static_validation() -> None:

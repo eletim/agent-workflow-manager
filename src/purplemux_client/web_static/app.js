@@ -429,7 +429,8 @@ function renderIssueDrivenSummary(summary) {
       : (result.outcome === "continued_with_warning" ? "⚠" : "–");
     const details = document.createElement("div");
     const line = document.createElement("div");
-    line.append(document.createTextNode(`#${result.issue}  `));
+    const label = result.label || `#${result.issue}`;
+    line.append(document.createTextNode(`${label}  `));
     appendPrLink(line, result.pr);
     line.append(document.createTextNode(`  Review ${result.reviews}`));
     if (result.outcome !== "approved") {

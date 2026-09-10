@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -19,7 +21,9 @@ from purplemux_client import (
     WorkerFailure,
 )
 from purplemux_client.issue_driven import (
+    _MAX_SCENARIO_LIST_BYTES,
     IssueDrivenValidationError,
+    classify_issue_topology,
     generate_issue_driven_workflow,
     parse_issue_driven_json,
 )
@@ -46,12 +50,632 @@ def parse(value: dict[str, object]):
     return parse_issue_driven_json(json.dumps(value))
 
 
+def topology_pr(
+    *,
+    number: int = 158,
+    state: str = "OPEN",
+    head_sha: str = "f" * 40,
+    base_sha: str = "b" * 40,
+    head_branch: str = "feature/issue-158",
+    body: str = "",
+) -> PullRequestState:
+    return PullRequestState(
+        number,
+        f"https://example.invalid/{number}",
+        state,  # type: ignore[arg-type]
+        True,
+        "acme/project",
+        head_branch,
+        head_sha,
+        "acme/project",
+        "dev/v1",
+        base_sha,
+        "m" * 40 if state == "MERGED" else None,
+        False,
+        None,
+        f"PR_{number}",
+        body,
+    )
+
+
+class TopologyGitHub:
+    def __init__(
+        self,
+        prs: tuple[PullRequestState, ...] = (),
+        contains: set[tuple[str, str]] | None = None,
+        failure: WorkerFailure | None = None,
+    ) -> None:
+        self.prs = prs
+        self.contains = contains or set()
+        self.failure = failure
+        self.comparison_calls: list[tuple[str, str]] = []
+
+    def find_pr(self, *, head: str, base: str, state: str):
+        if self.failure is not None:
+            raise self.failure
+        matches = [
+            pr
+            for pr in self.prs
+            if pr.head_branch == head and pr.base_branch == base and pr.state == state
+        ]
+        if len(matches) > 1:
+            raise WorkerFailure("ambiguous matching PRs")
+        return matches[0] if matches else None
+
+    def require_pr(self, **kwargs: object) -> PullRequestState:
+        pr = self.find_pr(
+            head=str(kwargs["head"]),
+            base=str(kwargs["base"]),
+            state=str(kwargs["state"]),
+        )
+        assert pr is not None
+        if kwargs.get("expected_head_sha") not in (None, pr.head_sha):
+            raise WorkerFailure("PR head SHA mismatch")
+        if kwargs.get("expected_base_sha") not in (None, pr.base_sha):
+            raise WorkerFailure("PR base SHA mismatch")
+        return pr
+
+    def compare_commits(self, *, base_sha: str, head_sha: str) -> str:
+        self.comparison_calls.append((base_sha, head_sha))
+        if base_sha == head_sha:
+            return "identical"
+        if (base_sha, head_sha) in self.contains:
+            return "ahead"
+        if (head_sha, base_sha) in self.contains:
+            return "behind"
+        return "diverged"
+
+
+def classify(
+    remote_sha: str | None,
+    github: TopologyGitHub,
+):
+    repository = SimpleNamespace(
+        inspect_branch=lambda branch: BranchState(
+            branch, "stale-local-sha", remote_sha, False
+        )
+    )
+    return classify_issue_topology(
+        repository,
+        github,
+        github,
+        issue=158,
+        branch="feature/issue-158",
+        integration_branch="dev/v1",
+        integration_sha="b" * 40,
+    )
+
+
+def test_issue_topology_without_remote_branch_is_new() -> None:
+    assert classify(None, TopologyGitHub()).classification == "new"
+
+
+def test_issue_topology_with_current_base_and_expected_pr_is_recoverable() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    result = classify(
+        feature_sha,
+        TopologyGitHub(
+            (topology_pr(head_sha=feature_sha, base_sha=base_sha),),
+            {(base_sha, feature_sha)},
+        ),
+    )
+
+    assert result.classification == "recoverable"
+    assert result.feature_sha == feature_sha
+
+
+def test_issue_topology_uses_one_comparison_for_existing_branch() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    github = TopologyGitHub(contains={(base_sha, feature_sha)})
+
+    assert classify(feature_sha, github).classification == "recoverable"
+    assert github.comparison_calls == [(base_sha, feature_sha)]
+
+
+def test_issue_topology_rejects_branch_that_lacks_current_base() -> None:
+    with pytest.raises(WorkerFailure, match=r"Issue #158:.*does not contain"):
+        classify("f" * 40, TopologyGitHub())
+
+
+def test_issue_topology_classifies_authoritatively_integrated_head() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+
+    result = classify(
+        feature_sha,
+        TopologyGitHub(
+            (topology_pr(state="MERGED", head_sha=feature_sha),),
+            {(feature_sha, base_sha)},
+        ),
+    )
+
+    assert result.classification == "already_integrated"
+
+
+def test_issue_topology_rejects_stale_merged_pr_not_contained_by_integration() -> None:
+    merged = topology_pr(state="MERGED", head_sha="f" * 40)
+
+    with pytest.raises(WorkerFailure, match="is not contained by current integration"):
+        classify(None, TopologyGitHub((merged,)))
+
+
+def test_issue_topology_rejects_closed_unmerged_pr() -> None:
+    closed = topology_pr(state="CLOSED")
+
+    with pytest.raises(WorkerFailure, match="closed unmerged PR"):
+        classify(None, TopologyGitHub((closed,)))
+
+
+@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
+def test_inline_task_topology_rejects_pr_fingerprint_mismatch(state: str) -> None:
+    expected = "a" * 64
+    branch = "feature/work-item-refresh-run-help"
+    pr = topology_pr(
+        state=state,
+        head_branch=branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    repository = SimpleNamespace(
+        inspect_branch=lambda _branch: BranchState(
+            branch, None, "f" * 40 if state == "OPEN" else None, False
+        )
+    )
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        classify_issue_topology(
+            repository,
+            TopologyGitHub((pr,)),
+            TopologyGitHub((pr,)),
+            issue="Mini task refresh-run-help",
+            branch=branch,
+            integration_branch="dev/v1",
+            integration_sha="b" * 40,
+            inline_task_fingerprint=expected,
+        )
+
+
+def test_issue_topology_rejects_pr_sha_mismatch_and_ambiguity() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    with pytest.raises(WorkerFailure, match="PR head SHA mismatch"):
+        classify(
+            feature_sha,
+            TopologyGitHub(
+                (topology_pr(head_sha="e" * 40),), {(base_sha, feature_sha)}
+            ),
+        )
+    with pytest.raises(WorkerFailure, match="ambiguous matching PRs"):
+        classify(
+            feature_sha,
+            TopologyGitHub(failure=WorkerFailure("ambiguous matching PRs")),
+        )
+
+
+def test_issue_topology_uses_remote_sha_instead_of_stale_local_ref() -> None:
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+
+    result = classify(
+        feature_sha,
+        TopologyGitHub(contains={(base_sha, feature_sha)}),
+    )
+
+    assert result.feature_sha == feature_sha
+    assert result.classification == "recoverable"
+
+
 def test_valid_json_preserves_issue_order() -> None:
     config = parse(payload(issues=[90, 89, 91]))
 
     assert config.issues == (90, 89, 91)
     assert config.merge_final is False
+    assert config.make_integration_branch is False
     assert config.policy_issue is None
+
+
+def test_ordered_work_items_mix_github_issues_and_inline_mini_tasks() -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        90,
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."},
+        91,
+    ]
+
+    config = parse(value)
+
+    assert [item.as_json() for item in config.work_items] == value["work_items"]
+    assert config.issues == (90, 91)
+    assert "issues" not in config.as_json()
+    assert parse(config.as_json()) == config
+
+
+def test_one_shot_issue_starts_with_an_empty_round_trip_plan() -> None:
+    value = payload()
+    value.pop("issues")
+    value["one_shot_issue"] = 169
+
+    config = parse(value)
+
+    assert config.one_shot_issue == 169
+    assert config.work_items == ()
+    assert config.issues == ()
+    assert "issues" not in config.as_json()
+    assert "work_items" not in config.as_json()
+    assert parse(config.as_json()) == config
+
+
+@pytest.mark.parametrize("one_shot_issue", [None, True, False, 0, -1, "169", 1.5])
+def test_one_shot_issue_must_be_a_positive_integer(one_shot_issue: object) -> None:
+    value = payload()
+    value.pop("issues")
+    value["one_shot_issue"] = one_shot_issue
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert ("$.one_shot_issue", "must be a positive integer") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
+
+
+@pytest.mark.parametrize("field", ["issues", "work_items"])
+def test_one_shot_issue_cannot_be_combined_with_seed_work_items(field: str) -> None:
+    value = payload(one_shot_issue=169)
+    if field == "work_items":
+        value.pop("issues")
+        value["work_items"] = [90]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.one_shot_issue",
+        "must not be combined with issues or work_items",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+@pytest.mark.parametrize(
+    ("work_item", "path"),
+    [
+        ({"id": "Bad ID", "task": "Do it"}, "$.work_items[0].id"),
+        ({"id": "docs", "task": ""}, "$.work_items[0].task"),
+        ({"id": "docs"}, "$.work_items[0].task"),
+        (
+            {"id": "docs", "task": "Do it", "branch": "custom"},
+            "$.work_items[0].branch",
+        ),
+    ],
+)
+def test_inline_mini_task_validation_is_structured(
+    work_item: object, path: str
+) -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [work_item]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert path in {finding.path for finding in caught.value.findings}
+
+
+def test_inline_mini_tasks_fit_the_persisted_plan_size_boundary() -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        {"id": f"task-{index}", "task": "x" * 4000} for index in range(7)
+    ]
+    value["work_items"].extend(
+        [
+            {"id": "task-7", "task": "x"},
+            {"id": "task-8", "task": "x"},
+            {"id": "task-9", "task": "x" * 3602},
+        ]
+    )
+
+    assert len(parse(value).work_items) == 10
+
+    value["work_items"][-1]["task"] += "x"
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.work_items",
+        "serialized recovery state must not exceed 32000 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+def test_issues_and_work_items_are_mutually_exclusive() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(work_items=[90]))
+
+    assert ("$.work_items", "must not be combined with issues") in {
+        (finding.path, finding.message) for finding in caught.value.findings
+    }
+
+
+def test_make_integration_branch_round_trips_when_enabled() -> None:
+    config = parse(payload(make_integration_branch=True))
+
+    assert config.make_integration_branch is True
+    assert config.as_json()["make_integration_branch"] is True
+    assert parse(config.as_json()) == config
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_make_integration_branch_must_be_boolean(value: object) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(make_integration_branch=value))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.make_integration_branch", "must be a boolean")
+    ]
+
+
+def test_generated_workflow_can_create_integration_from_final_branch() -> None:
+    config = parse(
+        payload(
+            integration_branch="dev/v0.2.5",
+            final_branch="dev/v0.2.4",
+            make_integration_branch=True,
+        )
+    )
+
+    code = generate_issue_driven_workflow(config)
+
+    assert "base_branch='dev/v0.2.4'" in code
+    assert "repository.prepare_feature_branch(\n        'dev/v0.2.5'," in code
+    assert "base='dev/v0.2.4'" in code
+    assert "expected_base_sha=context.base_sha" in code
+    assert "repository.ensure_pushed(\n        'dev/v0.2.5'," in code
+
+
+def test_generated_workflow_requires_existing_integration_by_default() -> None:
+    code = generate_issue_driven_workflow(parse(payload()))
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+
+    assert "base_branch='dev/v0.2.0'" in parse_args
+    assert "prepare_feature_branch(" not in parse_args
+    assert "ensure_pushed(" not in parse_args
+    assert parse_args.index("inspect_issue_driven_topology(") < parse_args.index(
+        "prepare_run_repository("
+    )
+
+
+def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() -> None:
+    value = payload()
+    value.pop("issues")
+    value["one_shot_issue"] = 169
+
+    code = generate_issue_driven_workflow(parse(value))
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+
+    assert "inspect_issue_driven_topology(" not in parse_args
+    assert '        (),\n        "git diff --check",' in parse_args
+    assert "        WORKFLOW_POLICY_ISSUE,\n        169," in parse_args
+    assert "gh issue view\n{config.one_shot_issue} --repo {config.slug}" in code
+    assert "short inline mini tasks" in code
+    assert "Do not create GitHub Issues" in code
+    assert "one_shot_issue" in code
+    assert "One-shot source Issue:" in code
+
+    result = WorkflowValidator(check_timeout=10).validate(code)
+    assert result.valid, result.issues
+    assert result.dry_run_issues == ()
+
+
+def test_one_shot_source_issue_is_part_of_recovery_identity() -> None:
+    first = load_generated_workflow(one_shot_issue=169)
+    second = load_generated_workflow(one_shot_issue=170)
+    config_type = first["Config"]
+    first_config = config_type(
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    second_config = config_type(
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 170
+    )
+
+    assert first["plan_seed_fingerprint"](first_config) != second[
+        "plan_seed_fingerprint"
+    ](second_config)
+
+
+def test_plan_recovery_fails_closed_when_policy_or_seed_branch_changes() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config_type = workflow["Config"]
+    issue_type = workflow["Issue"]
+    original = config_type(
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/custom-90"),),
+        "true",
+        200,
+    )
+    body = workflow["with_work_item_plan"](
+        "Base PR", workflow["WorkItemPlan"](original)
+    )
+
+    changed_policy = replace(original, policy_issue=201)
+    changed_branch = replace(original, issues=(issue_type(90, "feature/another-90"),))
+    for changed in (changed_policy, changed_branch):
+        with pytest.raises(WorkerFailure, match="does not match the workflow seed"):
+            workflow["work_item_plan_from_body"](body, changed)
+
+
+def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    decisions = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "add",
+                            "item": {
+                                "id": "focused-change",
+                                "task": "Implement the required behavior while preserving the public contract.",
+                            },
+                        }
+                    ],
+                    "complete": False,
+                    "policy_conflicts": [],
+                }
+            ),
+            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+        )
+    )
+    processed: list[object] = []
+    prompts: list[str] = []
+    inspected: list[object] = []
+    workflow["create_agent"] = lambda *args, **kwargs: "manager"
+    workflow["run_turn"] = lambda *_args, **kwargs: (
+        prompts.append(_args[3]) or next(decisions)
+    )
+    workflow["process_issue"] = lambda issue, *_args: processed.append(issue)
+    workflow["inspect_dynamic_work_item_topology"] = lambda issue, _config: (
+        inspected.append(issue)
+    )
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+    plan = workflow["WorkItemPlan"](config)
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        plan,
+    )
+
+    assert [item.key for item in processed] == ["focused-change"]
+    assert [item.key for item in inspected] == ["focused-change"]
+    assert [item.key for item in effective] == ["focused-change"]
+    assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
+
+
+def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    with pytest.raises(WorkerFailure, match="only inline mini tasks"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [{"action": "add", "item": 169}],
+                    "complete": False,
+                    "policy_conflicts": [],
+                }
+            ),
+        )
+
+    assert plan.snapshot == ()
+    assert plan.position == 0
+
+
+def test_planner_policy_conflicts_use_a_bounded_json_contract() -> None:
+    workflow = load_generated_workflow(issues=[90], policy_issue=200)
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (workflow["Issue"](90, "feature/issue-90"),),
+        "true",
+        200,
+    )
+    context = workflow["policy_context"](
+        config, scope="work-item planning", structured_conflicts=True
+    )
+    prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
+
+    assert "policy_conflicts array" in context
+    assert "starting with POLICY_CONFLICT:" not in context
+    assert 'keys "actions", "complete", and\n"policy_conflicts"' in prompt
+    with pytest.raises(WorkerFailure, match="planner policy conflict is invalid"):
+        workflow["apply_planner_decision"](
+            workflow["WorkItemPlan"](config),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": False,
+                    "policy_conflicts": ["x" * 501],
+                }
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "topology_error",
+    [
+        "merged PR head is not contained by current integration",
+        "closed unmerged PR exists for the dynamic task",
+    ],
+)
+def test_dynamic_topology_failure_remains_undispatched_for_recovery(
+    topology_error: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    stored_body = "Base PR"
+    workflow["create_agent"] = lambda *args, **kwargs: "manager"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {
+            "actions": [
+                {
+                    "action": "add",
+                    "item": {"id": "dynamic-task", "task": "Do the focused work."},
+                }
+            ],
+            "complete": False,
+            "policy_conflicts": [],
+        }
+    )
+
+    def persist(plan, *_args):
+        nonlocal stored_body
+        stored_body = workflow["with_work_item_plan"](stored_body, plan)
+        return _args[-1]
+
+    workflow["persist_work_item_plan"] = persist
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: (
+        _ for _ in ()
+    ).throw(WorkerFailure(topology_error))
+    workflow["process_issue"] = lambda *_args: pytest.fail(
+        "unsafe dynamic work item was dispatched"
+    )
+
+    with pytest.raises(WorkerFailure, match=topology_error):
+        workflow["process_work_items"](
+            config,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            workflow["WorkItemPlan"](config),
+        )
+
+    recovered = workflow["work_item_plan_from_body"](stored_body, config)
+    assert recovered.position == 0
+    assert [item.key for item in recovered.remaining] == ["dynamic-task"]
 
 
 def test_optional_policy_issue_round_trips_and_is_generated_deterministically() -> None:
@@ -66,7 +690,128 @@ def test_optional_policy_issue_round_trips_and_is_generated_deterministically() 
     assert '"git diff --check",\n        WORKFLOW_POLICY_ISSUE,' in first
 
 
-@pytest.mark.parametrize("policy_issue", [None, True, False, 0, -1, "200", 1.5])
+def test_optional_scenarios_round_trip_into_generated_scenario_gate() -> None:
+    scenarios = [
+        "Existing: a Prompt run still completes successfully.",
+        "New: a one-shot run plans its first mini task.",
+        "Failure: invalid planner output is rejected without dispatch.",
+    ]
+    config = parse(payload(scenarios=scenarios))
+
+    assert config.scenarios == tuple(scenarios)
+    assert config.as_json()["scenarios"] == scenarios
+    first = generate_issue_driven_workflow(config)
+    second = generate_issue_driven_workflow(parse(config.as_json()))
+    assert first == second
+    assert f"SCENARIOS: tuple[str, ...] = {tuple(scenarios)!r}" in first
+    assert "Select a small, risk-relevant subset" in first
+    assert "exact Before commit" in first
+    assert "exact\nAfter commit" in first
+    assert "Do not treat this as a fixed" in first
+    assert "expected-output test" in first
+
+
+@pytest.mark.parametrize(
+    ("scenarios", "path", "message"),
+    [
+        ("scenario", "$.scenarios", "must be an array"),
+        ([""], "$.scenarios[0]", "must be a non-empty trimmed string"),
+        (
+            [" duplicate", "duplicate"],
+            "$.scenarios[0]",
+            "must be a non-empty trimmed string",
+        ),
+        (["duplicate", "duplicate"], "$.scenarios[1]", "must be unique"),
+    ],
+)
+def test_scenarios_reject_invalid_human_authored_entries(
+    scenarios: object, path: str, message: str
+) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert any(
+        finding.path == path and message in finding.message
+        for finding in caught.value.findings
+    )
+
+
+def test_scenarios_require_whole_version_review() -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=["Existing behavior"], final_review=False))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.scenarios", "requires final_review to be true")
+    ]
+
+
+def test_scenario_list_boundary_produces_dispatchable_gate_prompt() -> None:
+    scenarios = [f"{'x' * (3999 - len(str(index)))}-{index}" for index in range(15)]
+    used = len(
+        "\n".join(
+            f"{index}. {scenario}" for index, scenario in enumerate(scenarios, 1)
+        ).encode()
+    )
+    final_prefix_bytes = len(f"\n{len(scenarios) + 1}. ".encode())
+    final_size = _MAX_SCENARIO_LIST_BYTES - used - final_prefix_bytes
+    scenarios.append("y" * final_size)
+
+    config = parse(payload(scenarios=scenarios))
+    code = generate_issue_driven_workflow(config)
+    module_name = "generated_scenario_boundary"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-scenario-boundary>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    runtime_config = module.__dict__["Config"](
+        Path("/repo"),
+        "acme/project",
+        config.integration_branch,
+        config.final_branch,
+        (module.__dict__["Issue"](90, "feature/issue-90"),),
+        "true",
+    )
+    prompt = module.__dict__["scenario_gate_prompt"](
+        topology_pr(head_sha="h" * 40, base_sha="b" * 40),
+        runtime_config,
+        runtime_config.issues,
+    )
+
+    assert _MAX_SCENARIO_LIST_BYTES < len(prompt.encode()) < 66_000
+    completed = subprocess.run(
+        [sys.executable, "-c", "import sys; assert sys.argv[1]", prompt],
+        check=False,
+    )
+    assert completed.returncode == 0
+
+    scenarios[-1] += "z"
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        (
+            "$.scenarios",
+            "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+        )
+    ]
+
+
+def test_scenario_list_aggregate_limit_counts_utf8_bytes() -> None:
+    scenarios = [f"{index}:{'界' * (3999 - len(str(index)))}" for index in range(6)]
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scenarios=scenarios))
+
+    assert (
+        "$.scenarios",
+        "numbered Scenario List must encode to at most 64000 UTF-8 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+@pytest.mark.parametrize(
+    "policy_issue", [None, True, False, 0, -1, "200", "\ud800", 1.5]
+)
 def test_policy_issue_must_be_a_positive_integer(policy_issue: object) -> None:
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(policy_issue=policy_issue))
@@ -144,30 +889,26 @@ def test_invalid_agent_selection_reports_exact_field_path(
     ]
 
 
-@pytest.mark.parametrize(
-    ("final_review", "maximum"),
-    [(True, MAX_OUTLINE_ITEMS - 2), (False, MAX_OUTLINE_ITEMS - 1)],
-)
-def test_issue_count_reserves_final_outline_entries(
-    final_review: bool, maximum: int
+@pytest.mark.parametrize("final_review", [True, False])
+def test_initial_work_item_count_is_bounded_independently_of_outline(
+    final_review: bool,
 ) -> None:
+    maximum = MAX_OUTLINE_ITEMS
     accepted = parse(
         payload(issues=list(range(1, maximum + 1)), final_review=final_review)
     )
 
     assert len(accepted.issues) == maximum
-    result = WorkflowValidator(check_timeout=10).validate(
-        generate_issue_driven_workflow(accepted)
-    )
-    assert result.valid, result.issues
-    assert len(result.outline) == MAX_OUTLINE_ITEMS
+    code = generate_issue_driven_workflow(accepted)
+    outline_issues: list[object] = []
+    outline = WorkflowValidator()._validate_outline(ast.parse(code), outline_issues)
+    assert outline_issues == []
+    assert len(outline) == (3 if final_review else 2)
 
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(issues=list(range(1, maximum + 2)), final_review=final_review))
 
-    expected_message = (
-        f"must contain at most {maximum} items when final_review is {final_review!r}"
-    )
+    expected_message = f"must contain at most {maximum} items"
     assert ("$.issues", expected_message) in {
         (finding.path, finding.message) for finding in caught.value.findings
     }
@@ -250,6 +991,115 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "MAX_REVIEWS = 5" in first
 
 
+def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        90,
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."},
+    ]
+    parsed = parse(value)
+    item = parsed.work_items[1]
+    assert item.task_fingerprint is not None
+    code = generate_issue_driven_workflow(parsed)
+    module_name = "generated_inline_work_item"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-work-item-workflow>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    mini = module.__dict__["Issue"](
+        None,
+        item.branch,
+        "refresh-run-help",
+        "Refresh the New Run help.",
+        item.task_fingerprint,
+    )
+    config = module.__dict__["parse_args"]()
+
+    implementation, scope_review, correctness_review = module.__dict__["issue_prompts"](
+        mini, config
+    )
+
+    assert code.index("Issue(90, 'feature/issue-90')") < code.index(
+        f"Issue(None, '{item.branch}'"
+    )
+    assert "'Mini task refresh-run-help'" in code
+    assert item.task_fingerprint in code
+    assert "Refresh the New Run help." in implementation
+    assert "Refresh the New Run help." in scope_review
+    assert "Refresh the New Run help." in correctness_review
+    assert "gh issue view" not in mini.requirement
+    assert item.task_fingerprint in mini.pr_body
+
+
+def test_inline_task_content_changes_topology_recovery_identity() -> None:
+    def inline_config(task: str):
+        value = payload()
+        value.pop("issues")
+        value["work_items"] = [{"id": "refresh-run-help", "task": task}]
+        return parse(value)
+
+    first = inline_config("Refresh the New Run help.")
+    changed = inline_config("Replace the New Run help.")
+    first_item = first.work_items[0]
+    changed_item = changed.work_items[0]
+
+    assert first_item.branch == changed_item.branch
+    assert first_item.task_fingerprint != changed_item.task_fingerprint
+    assert first_item.task_fingerprint in generate_issue_driven_workflow(first)
+    assert changed_item.task_fingerprint in generate_issue_driven_workflow(changed)
+
+
+@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
+def test_generated_inline_task_recovery_rejects_pr_fingerprint_mismatch(
+    state: str,
+) -> None:
+    value = payload()
+    value.pop("issues")
+    value["work_items"] = [
+        {"id": "refresh-run-help", "task": "Refresh the New Run help."}
+    ]
+    parsed = parse(value)
+    item = parsed.work_items[0]
+    assert item.task_fingerprint is not None
+    code = generate_issue_driven_workflow(parsed)
+    module_name = f"generated_inline_recovery_{state.lower()}"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-inline-recovery>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    issue = module.__dict__["Issue"](
+        None,
+        item.branch,
+        item.id,
+        item.task,
+        item.task_fingerprint,
+    )
+    config = module.__dict__["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.0",
+        "main",
+        (issue,),
+        "true",
+    )
+    pr = topology_pr(
+        state=state,
+        head_branch=item.branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    github = SimpleNamespace(
+        find_pr=lambda *, head, base, state: pr if state == pr.state else None
+    )
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        module.__dict__["prepare_issue"](SimpleNamespace(), github, issue, config)
+
+
 @pytest.mark.parametrize("final_review", [False, True])
 def test_generated_workflow_always_preserves_implementation_principle(
     final_review: bool,
@@ -308,12 +1158,14 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
             calls[text] = agent_type.id
 
     assert calls == {
-        "Issue  worktree cleanup": "IMPLEMENTER_AGENT",
-        "Issue  implementer": "IMPLEMENTER_AGENT",
-        "Issue  scope reviewer": "REVIEWER_AGENT",
-        "Issue  correctness reviewer": "REVIEWER_AGENT",
+        " worktree cleanup": "IMPLEMENTER_AGENT",
+        " implementer": "IMPLEMENTER_AGENT",
+        " scope reviewer": "REVIEWER_AGENT",
+        " correctness reviewer": "REVIEWER_AGENT",
+        "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
+        "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
     }
@@ -325,30 +1177,29 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         (
             True,
             (
-                "Issue #91",
-                "Issue #90",
-                "Issue #89",
+                "Work items",
                 "Whole-version review",
                 "Final integration PR",
             ),
         ),
         (
             False,
-            ("Issue #91", "Issue #90", "Issue #89", "Final integration PR"),
+            ("Work items", "Final integration PR"),
         ),
     ],
 )
-def test_generated_outline_uses_concrete_run_units(
+def test_generated_outline_keeps_dynamic_work_items_in_one_run_unit(
     final_review: bool, expected: tuple[str, ...]
 ) -> None:
     code = generate_issue_driven_workflow(
         parse(payload(issues=[91, 90, 89], final_review=final_review))
     )
 
-    result = WorkflowValidator(check_timeout=10).validate(code)
+    outline_issues: list[object] = []
+    outline = WorkflowValidator()._validate_outline(ast.parse(code), outline_issues)
 
-    assert result.valid, result.issues
-    assert result.outline == expected
+    assert outline_issues == []
+    assert outline == expected
     assert "Inspect authoritative Issue topology" not in code
     assert "Prepare or reuse the feature branch" not in code
     assert "Implement and independently review" not in code
@@ -417,7 +1268,7 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "You may push" not in code
     for prohibited in (
         "reset, rebase, stash, force-push",
-        "merge the Issue PR",
+        "merge the work-item PR",
         "create unrelated PRs",
         "discard ambiguous local work",
     ):
@@ -425,7 +1276,10 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
 
 
 def load_generated_workflow(**overrides: object) -> dict[str, object]:
-    code = generate_issue_driven_workflow(parse(payload(**overrides)))
+    value = payload(**overrides)
+    if "one_shot_issue" in overrides:
+        value.pop("issues")
+    code = generate_issue_driven_workflow(parse(value))
     module_name = f"generated_handoff_workflow_{len(sys.modules)}"
     module = ModuleType(module_name)
     sys.modules[module_name] = module
@@ -434,6 +1288,776 @@ def load_generated_workflow(**overrides: object) -> dict[str, object]:
     finally:
         del sys.modules[module_name]
     return module.__dict__
+
+
+def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config_type = workflow["Config"]
+    original_task = "Draft the release notes."
+    updated_task = "Draft concise release notes and cover the wording."
+    original = issue_type(
+        None,
+        "feature/work-item-release-notes",
+        "release-notes",
+        original_task,
+        hashlib.sha256(original_task.encode()).hexdigest(),
+    )
+    updated = issue_type(
+        None,
+        "feature/work-item-release-notes",
+        "release-notes",
+        updated_task,
+        hashlib.sha256(updated_task.encode()).hexdigest(),
+    )
+    config = config_type(
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (original, issue_type(90, "feature/issue-90")),
+        "true",
+    )
+    processed: list[object] = []
+    planner_decisions = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "update",
+                            "key": "release-notes",
+                            "task": updated_task,
+                        },
+                        {"action": "skip", "key": 90},
+                        {"action": "add", "item": 91},
+                    ],
+                    "complete": False,
+                    "policy_conflicts": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "actions": [{"action": "add", "item": 92}],
+                    "complete": False,
+                    "policy_conflicts": [],
+                }
+            ),
+            json.dumps({"actions": [], "complete": False, "policy_conflicts": []}),
+            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+        )
+    )
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: next(planner_decisions)
+    workflow["process_issue"] = lambda issue, _config, _client, _repo, _github: (
+        processed.append(issue)
+    )
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+    persisted: list[str] = []
+
+    def persist(plan, _config, _repo, _github, pr):
+        persisted.append(workflow["serialized_work_item_plan"](plan))
+        return pr
+
+    workflow["persist_work_item_plan"] = persist
+    plan = workflow["WorkItemPlan"](config)
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        plan,
+    )
+
+    assert [issue.key for issue in processed] == ["release-notes", 91, 92]
+    assert processed[0].task == updated_task
+    assert [issue.key for issue in effective] == ["release-notes", 91, 92]
+    assert [issue.key for issue in config.issues] == ["release-notes", 90]
+    assert len(persisted) == 7
+
+    plan = workflow["WorkItemPlan"](config)
+    assert plan.take_next() is original
+    with pytest.raises(ValueError, match="no unprocessed work item"):
+        plan.update("release-notes", updated)
+    with pytest.raises(WorkerFailure, match="unsupported shape"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [
+                        {"action": "add", "item": 91},
+                        {"action": "replace", "key": 90},
+                    ],
+                    "complete": False,
+                    "policy_conflicts": [],
+                }
+            ),
+        )
+    assert [issue.key for issue in plan.snapshot] == ["release-notes", 90]
+
+
+def test_planner_rejects_oversized_plan_transactionally() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    plan = workflow["WorkItemPlan"](config)
+    actions = [{"action": "skip", "key": 90}]
+    actions.extend(
+        {
+            "action": "add",
+            "item": {"id": f"task-{index}", "task": "x" * 4000},
+        }
+        for index in range(8)
+    )
+
+    with pytest.raises(WorkerFailure, match="recovery state exceeds"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps({"actions": actions, "complete": False, "policy_conflicts": []}),
+        )
+
+    assert [issue.key for issue in plan.snapshot] == [90]
+    assert plan.position == 0
+    assert plan.finalized is False
+
+
+def test_plan_size_boundary_reserves_multi_digit_dispatch_position() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3602]
+    issues = tuple(
+        workflow["planner_inline_issue"](f"task-{index}", task)
+        for index, task in enumerate(tasks)
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        issues,
+        "true",
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    for _ in range(9):
+        assert plan.take_next() is not None
+    workflow["serialized_work_item_plan"](plan)
+    assert plan.take_next() is not None
+    source = workflow["work_item_plan_source"](
+        plan, position=plan.position, finalized=False
+    )
+
+    assert plan.position == 10
+    assert len(source.encode()) == 32_000
+    workflow["serialized_work_item_plan"](plan)
+
+
+def test_planner_persists_undispatched_addition_before_interruption() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    task = "Add the missing recovery test."
+    decision = json.dumps(
+        {
+            "actions": [
+                {"action": "add", "item": {"id": "recovery-test", "task": task}}
+            ],
+            "complete": False,
+            "policy_conflicts": [],
+        }
+    )
+    stored_body = "Base PR"
+
+    def persist(plan, _config, _repo, _github, pr):
+        nonlocal stored_body
+        stored_body = workflow["with_work_item_plan"](stored_body, plan)
+        return pr
+
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: decision
+    workflow["persist_work_item_plan"] = persist
+    workflow["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
+        RuntimeError("interrupted")
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        workflow["process_work_items"](
+            config,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            plan,
+        )
+
+    recovered = workflow["work_item_plan_from_body"](stored_body, config)
+    assert recovered.position == 1
+    assert [issue.key for issue in recovered.snapshot] == [90, "recovery-test"]
+    assert [issue.key for issue in recovered.remaining] == ["recovery-test"]
+    assert recovered.remaining[0].task == task
+    with pytest.raises(WorkerFailure, match="missing work-item plan"):
+        workflow["work_item_plan_from_body"]("Base PR", config)
+
+
+def test_custom_issue_branch_round_trips_through_plan_recovery() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue = workflow["Issue"](90, "feature/custom-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.take_next()
+    body = workflow["with_work_item_plan"]("Base PR", plan)
+
+    recovered = workflow["work_item_plan_from_body"](body, config)
+
+    assert recovered.position == 1
+    assert recovered.snapshot[0].number == 90
+    assert recovered.snapshot[0].branch == "feature/custom-90"
+
+
+def test_planner_policy_conflict_is_persisted_before_dispatch_and_recovered() -> None:
+    code = generate_issue_driven_workflow(parse(payload(issues=[90], policy_issue=200)))
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-planner-policy>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    first = load_run("planner_policy_first")
+    issue = first["Issue"](90, "feature/issue-90")
+    config = first["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue,),
+        "true",
+        200,
+    )
+    plan = first["WorkItemPlan"](config)
+    current = replace(
+        topology_pr(head_branch=config.integration_branch),
+        base_branch=config.main_branch,
+        body=first["with_work_item_plan"]("Base PR", plan),
+    )
+
+    class GitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=str(kwargs["body"]))
+            return current
+
+    first["create_agent"] = lambda *args, **kwargs: "planner"
+    first["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {
+            "actions": [],
+            "complete": False,
+            "policy_conflicts": ["the policy requires a different owner"],
+        }
+    )
+    first["persist_work_item_plan"] = lambda active_plan, _config, _repo, github, pr: (
+        github.update_pr_body(
+            pr.number,
+            body=first["with_base_pr_policy_notes"](
+                first["with_work_item_plan"](pr.body, active_plan), _config
+            ),
+        )
+    )
+    first["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
+        RuntimeError("interrupted before dispatch")
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted before dispatch"):
+        first["process_work_items"](config, object(), object(), GitHub(), current, plan)
+
+    assert "agent-workflow-manager:policy-conflict:" in current.body
+    second = load_run("planner_policy_second")
+    second_config = second["Config"](
+        config.repo,
+        config.slug,
+        config.integration_branch,
+        config.main_branch,
+        (second["Issue"](90, "feature/issue-90"),),
+        config.check_command,
+        config.policy_issue,
+    )
+
+    class RecoveryRepository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, current.base_sha, current.base_sha, True)
+
+    class RecoveryGitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return current if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+    _, recovered = second["prepare_work_item_plan_pr"](
+        second_config, RecoveryRepository(), RecoveryGitHub()
+    )
+
+    assert recovered.position == 1
+    context = second["policy_context"](
+        second_config, scope="work-item planning", structured_conflicts=True
+    )
+    assert "different owner" in context
+
+
+def test_policy_plan_reacquires_base_pr_after_first_child_advances_integration() -> (
+    None
+):
+    workflow = load_generated_workflow(issues=[90, 91], policy_issue=200)
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (
+            issue_type(90, "feature/issue-90"),
+            issue_type(91, "feature/issue-91"),
+        ),
+        "true",
+        200,
+    )
+    plan = workflow["WorkItemPlan"](config)
+    integration_head = "a" * 40
+    main_head = "b" * 40
+    current = replace(
+        topology_pr(head_sha=integration_head, base_sha=main_head),
+        head_branch=config.integration_branch,
+        base_branch=config.main_branch,
+        body=workflow["with_work_item_plan"](
+            "Base PR" + workflow["policy_pr_notes"](config), plan
+        ),
+    )
+    updated_heads: list[str] = []
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, integration_head, integration_head, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.main_branch
+            return BranchState(branch, main_head, main_head, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == integration_head
+            return current
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            assert kwargs["expected_head_sha"] == integration_head
+            updated_heads.append(str(kwargs["expected_head_sha"]))
+            current = replace(current, body=str(kwargs["body"]))
+            return current
+
+    decisions = iter(
+        (
+            {"actions": [], "complete": False, "policy_conflicts": []},
+            {"actions": [], "complete": False, "policy_conflicts": []},
+            {"actions": [], "complete": True, "policy_conflicts": []},
+        )
+    )
+    processed: list[int] = []
+
+    def process(issue: object, *_args: object) -> None:
+        nonlocal current, integration_head
+        processed.append(issue.number)
+        if issue.number == 90:
+            integration_head = "c" * 40
+            current = replace(current, head_sha=integration_head)
+
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
+    workflow["process_issue"] = process
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    effective = workflow["process_work_items"](
+        config, object(), Repository(), GitHub(), current, plan
+    )
+
+    assert processed == [90, 91]
+    assert [item.number for item in effective] == [90, 91]
+    assert "a" * 40 in updated_heads
+    assert "c" * 40 in updated_heads
+
+
+def test_policy_conflicts_and_base_pr_body_have_aggregate_budgets() -> None:
+    workflow = load_generated_workflow(issues=[90], policy_issue=200)
+    limit = workflow["MAX_POLICY_CONFLICT_WARNINGS"]
+    for index in range(limit):
+        workflow["record_policy_conflict"](None, f"warning-{index}")
+
+    with pytest.raises(WorkerFailure, match="policy conflict warning limit"):
+        workflow["record_policy_conflict"](None, "one warning too many")
+    assert len(workflow["POLICY_CONFLICT_WARNINGS"]) == limit
+
+
+def test_near_max_plan_conflicts_and_handoff_fail_before_body_mutation() -> None:
+    workflow = load_generated_workflow(issues=[90], policy_issue=200)
+    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3602]
+    issues = tuple(
+        workflow["planner_inline_issue"](f"task-{index}", task)
+        for index, task in enumerate(tasks)
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", issues, "true", 200
+    )
+    for index in range(workflow["MAX_POLICY_CONFLICT_WARNINGS"]):
+        workflow["record_policy_conflict"](
+            None,
+            f"Policy Issue #200 conflicts with work-item planning: {index}-"
+            f"{'x' * 500}; continuing with the implementation work item as the "
+            "primary requirement.",
+        )
+    plan = workflow["WorkItemPlan"](config)
+    body = workflow["with_work_item_plan"](
+        "Base PR" + workflow["policy_pr_notes"](config), plan
+    )
+    pr = replace(
+        topology_pr(head_branch=config.integration_branch, body=body),
+        base_branch=config.main_branch,
+    )
+    handoff = f"""## 概要
+
+{"あ" * 11_000}
+
+## 主な変更
+
+https://github.com/acme/project/issues/200
+
+## 人間による確認
+
+- [ ] 表示を確認できる
+
+## 自動検証
+
+- passed
+
+## 注意事項
+
+- Policy conflict warnings are recorded."""
+    mutations: list[str] = []
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: handoff
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    class GitHub:
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            mutations.append("update")
+            return pr
+
+    validated = workflow["validate_human_handoff"](handoff, config, has_warnings=True)
+    with pytest.raises(WorkerFailure, match="Base PR body exceeds"):
+        workflow["with_human_handoff"](body, validated)
+
+    unchanged = workflow["update_base_pr_human_handoff"](
+        config,
+        issues,
+        object(),
+        GitHub(),
+        pr,
+        workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha),
+    )
+
+    assert unchanged is pr
+    assert mutations == []
+
+
+@pytest.mark.parametrize("child_state", ["OPEN", "MERGED"])
+def test_interrupted_dispatched_item_is_reinspected_before_planning(
+    child_state: str,
+) -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    stored_body = "Base PR"
+    events: list[str] = []
+    issue = config.issues[0]
+    child_pr = topology_pr(
+        number=190,
+        state=child_state,
+        head_branch=issue.branch,
+    )
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert head == issue.branch
+            assert base == config.integration_branch
+            return child_pr if state == child_state else None
+
+    repository = SimpleNamespace(
+        require_clean=lambda: None,
+        synchronize_branch=lambda branch: BranchState(
+            branch, child_pr.head_sha, child_pr.head_sha, True
+        ),
+        inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
+            base_is_ancestor=True
+        ),
+    )
+    github = GitHub()
+
+    def persist(plan, _config, _repo, _github, pr):
+        nonlocal stored_body
+        stored_body = workflow["with_work_item_plan"](stored_body, plan)
+        return pr
+
+    def interrupted_child(*_args):
+        events.append(f"child-{child_state.lower()}")
+        raise RuntimeError("interrupted after child mutation")
+
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": False, "policy_conflicts": []}
+    )
+    workflow["persist_work_item_plan"] = persist
+    workflow["process_issue"] = interrupted_child
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    with pytest.raises(RuntimeError, match="after child mutation"):
+        workflow["process_work_items"](
+            config,
+            SimpleNamespace(),
+            repository,
+            github,
+            SimpleNamespace(),
+            workflow["WorkItemPlan"](config),
+        )
+
+    recovered = workflow["work_item_plan_from_body"](stored_body, config)
+    assert recovered.position == 1
+    events.clear()
+    prepared: list[object] = []
+    prepare_issue = workflow["prepare_issue"]
+
+    def reinspect(*_args):
+        events.append(f"reinspect-{child_state.lower()}")
+        prepared.append(prepare_issue(repository, github, issue, config))
+
+    workflow["process_issue"] = reinspect
+    workflow["create_agent"] = lambda *args, **kwargs: events.append("planner") or "p"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": True, "policy_conflicts": []}
+    )
+
+    workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        repository,
+        github,
+        SimpleNamespace(),
+        recovered,
+    )
+
+    assert events == [f"reinspect-{child_state.lower()}", "planner"]
+    if child_state == "OPEN":
+        assert prepared[0][0] is child_pr
+    else:
+        assert prepared == [child_pr]
+
+
+def test_ready_base_pr_recovery_is_validated_before_draft_mutation() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    ready = replace(
+        topology_pr(
+            number=190,
+            head_branch=config.integration_branch,
+            body="Base PR without recovery state",
+        ),
+        is_draft=False,
+        base_branch=config.main_branch,
+    )
+    mutations: list[str] = []
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert head == config.integration_branch
+            assert base == config.main_branch
+            return ready if state == "OPEN" else None
+
+        def set_draft(self, *args, **kwargs):
+            mutations.append("set-draft")
+            return replace(ready, is_draft=True)
+
+    repository = SimpleNamespace(
+        synchronize_branch=lambda branch: BranchState(
+            branch, ready.head_sha, ready.head_sha, True
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, ready.base_sha, ready.base_sha, True
+        ),
+    )
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    with pytest.raises(WorkerFailure, match="missing work-item plan"):
+        workflow["prepare_work_item_plan_pr"](config, repository, GitHub())
+
+    assert mutations == []
+
+
+def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue_type = workflow["Issue"]
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue_type(90, "feature/issue-90"),),
+        "true",
+    )
+    task = "Document the recovered dynamic work."
+    dynamic_mini = workflow["planner_inline_issue"]("recovery-docs", task)
+    plan = workflow["WorkItemPlan"](config)
+    plan.skip(90)
+    plan.add(issue_type(91, "feature/issue-91"))
+    plan.add(dynamic_mini)
+    plan.position = len(plan.items)
+    plan.finalized = True
+    body = workflow["with_work_item_plan"]("Base PR", plan)
+    recovered = workflow["work_item_plan_from_body"](body, config)
+    dynamic_issue, recovered_mini = recovered.snapshot
+    open_dynamic = topology_pr(number=191, head_branch=dynamic_issue.branch)
+    merged_mini = topology_pr(
+        number=192,
+        state="MERGED",
+        head_branch=recovered_mini.branch,
+        body=recovered_mini.pr_body,
+    )
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert base == config.integration_branch
+            for pr in (open_dynamic, merged_mini):
+                if pr.head_branch == head and pr.state == state:
+                    return pr
+            return None
+
+    repository = SimpleNamespace(
+        require_clean=lambda: None,
+        synchronize_branch=lambda branch: BranchState(
+            branch,
+            open_dynamic.head_sha if branch == dynamic_issue.branch else "b" * 40,
+            open_dynamic.head_sha if branch == dynamic_issue.branch else "b" * 40,
+            True,
+        ),
+        inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
+            base_is_ancestor=True
+        ),
+    )
+
+    github = GitHub()
+    prepared: list[object] = []
+    prepare_issue = workflow["prepare_issue"]
+    workflow["process_issue"] = lambda issue, *_args: prepared.append(
+        prepare_issue(repository, github, issue, config)
+    )
+    workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail(
+        "a finalized recovered plan must not restart its planner"
+    )
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        repository,
+        github,
+        SimpleNamespace(),
+        recovered,
+    )
+
+    assert prepared[0][0] is open_dynamic
+    assert prepared[1] is merged_mini
+    assert [issue.key for issue in effective] == [91, "recovery-docs"]
+
+
+def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> None:
+    workflow = load_generated_workflow(
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    final_sha = "f" * 40
+    calls: list[tuple[object, ...]] = []
+    repository = SimpleNamespace(expected_github_slug="acme/project")
+
+    def prepare_feature_branch(
+        branch: str, *, base: str, expected_base_sha: str
+    ) -> BranchState:
+        calls.append(("prepare", branch, base, expected_base_sha))
+        return BranchState(branch, final_sha, None, True)
+
+    def ensure_pushed(branch: str, *, expected_local_sha: str) -> BranchState:
+        calls.append(("push", branch, expected_local_sha))
+        return BranchState(branch, final_sha, final_sha, True)
+
+    repository.prepare_feature_branch = prepare_feature_branch
+    repository.ensure_pushed = ensure_pushed
+    workflow["prepare_run_repository"] = lambda **kwargs: SimpleNamespace(
+        execution_root=Path("/run"), base_sha=final_sha
+    )
+    workflow["inspect_issue_driven_topology"] = lambda **kwargs: ()
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repository)
+
+    config = workflow["parse_args"]()  # type: ignore[operator]
+
+    assert config.integration_branch == "dev/v0.2.5"
+    assert config.main_branch == "dev/v0.2.4"
+    assert calls == [
+        ("prepare", "dev/v0.2.5", "dev/v0.2.4", final_sha),
+        ("push", "dev/v0.2.5", final_sha),
+    ]
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:
@@ -470,7 +2094,7 @@ def test_human_handoff_prompt_and_validation_contract() -> None:
     )
     delivery = workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha, 2)  # type: ignore[operator]
     prompt = workflow["human_handoff_prompt"](  # type: ignore[operator]
-        config, pr, delivery, ()
+        config, (issue,), pr, delivery, ()
     )
 
     assert "Reviewer role Agent selected by reviewer_agent" in prompt
@@ -611,7 +2235,7 @@ def test_handoff_updates_ready_or_warning_draft_without_changing_state(
             return replace(pr, body=str(kwargs["body"]))
 
     updated = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
-        config, object(), GitHub(), pr, delivery
+        config, (issue,), object(), GitHub(), pr, delivery
     )
 
     assert updated.is_draft is draft
@@ -652,7 +2276,7 @@ def test_handoff_failure_warns_but_mutation_unknown_remains_fail_closed() -> Non
     )
 
     unchanged = workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
-        config, object(), object(), pr, delivery
+        config, (issue,), object(), object(), pr, delivery
     )
     assert unchanged is pr
     assert findings[-1][2] == "warning"
@@ -681,7 +2305,7 @@ def test_handoff_failure_warns_but_mutation_unknown_remains_fail_closed() -> Non
 
     with pytest.raises(MutationOutcomeUnknown, match="response lost"):
         workflow["update_base_pr_human_handoff"](  # type: ignore[operator]
-            config, object(), UnknownGitHub(), pr, delivery
+            config, (issue,), object(), UnknownGitHub(), pr, delivery
         )
 
 
@@ -689,8 +2313,8 @@ def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() 
     code = generate_issue_driven_workflow(parse(payload(policy_issue=200)))
 
     assert "Before doing anything else, run `gh issue view" in code
-    assert 'policy_context(config, scope=f"Issue #{issue.number}")' in code
-    assert 'policy_context(config, scope=f"fixes for Issue #{issue.number}")' in code
+    assert "policy_context(config, scope=issue.label)" in code
+    assert 'policy_context(config, scope=f"fixes for {issue.label}")' in code
     assert 'policy_context(config, scope="the whole-version review")' in code
     assert 'policy_context(config, scope="whole-version fixes")' in code
     assert "https://github.com/{config.slug}/issues/{config.policy_issue}" in code
@@ -731,7 +2355,7 @@ def test_policy_conflict_marker_emits_warning_and_preserves_child_precedence() -
     assert findings[0][0] == "policy_issue"
     assert findings[0][2] == "warning"
     assert "child explicitly chooses the other API" in findings[0][1]
-    assert "implementation Issue as the primary requirement" in findings[0][1]
+    assert "implementation work item as the primary requirement" in findings[0][1]
 
 
 def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> None:
@@ -791,9 +2415,33 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
         ChildGitHub(), child_pr, issue, config
     )
     assert "agent-workflow-manager:policy-conflict:" in persisted.body
+    plan = first_run["WorkItemPlan"](config)  # type: ignore[operator]
+    base_pr = replace(
+        child_pr,
+        number=200,
+        head_branch=config.integration_branch,
+        head_sha="integration-head",
+        base_branch=config.main_branch,
+        base_sha="main-head",
+        body=first_run["with_work_item_plan"](  # type: ignore[operator]
+            "Sequential integration.", plan
+        ),
+    )
+
+    class FirstBaseGitHub:
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            assert number == base_pr.number
+            return replace(base_pr, body=str(kwargs["body"]))
+
+    base_pr = first_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
+        FirstBaseGitHub(), base_pr, config
+    )
+    assert "agent-workflow-manager:policy-conflict:" in base_pr.body
 
     # A new module models recovery after interruption; no process-local warning
-    # state crosses this boundary and the already-merged Issue is skipped.
+    # state crosses this boundary. Recover the Base PR before the already-merged
+    # Issue, as process_work_items does, so its copied marker is initially
+    # rehydrated without an Issue scope.
     second_run = load_run("generated_policy_second_run")
     recovered_issue = second_run["Issue"](90, "feature/issue-90")  # type: ignore[operator]
     recovered_config = second_run["Config"](  # type: ignore[operator]
@@ -807,11 +2455,37 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
     )
     merged = replace(persisted, state="MERGED", is_draft=False)
     findings: list[tuple[str, str, str]] = []
+    issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
     process_globals = second_run["process_issue"].__globals__  # type: ignore[attr-defined]
-    process_globals["prepare_issue"] = lambda *args: merged
     process_globals["emit_finding"] = lambda category, message, status="completed": (
         findings.append((category, message, status))
     )
+    process_globals["emit_issue_result"] = lambda *args, **kwargs: issue_results.append(
+        (args, kwargs)
+    )
+
+    class RecoveryRepository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == recovered_config.integration_branch
+            return BranchState(branch, base_pr.head_sha, base_pr.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == recovered_config.main_branch
+            return BranchState(branch, base_pr.base_sha, base_pr.base_sha, True)
+
+    class RecoveryGitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return base_pr if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return base_pr
+
+    second_run["prepare_work_item_plan_pr"](  # type: ignore[operator]
+        recovered_config, RecoveryRepository(), RecoveryGitHub()
+    )
+    process_globals["prepare_issue"] = lambda *args: merged
 
     class CleanRepository:
         def inspect_worktree(self) -> SimpleNamespace:
@@ -822,34 +2496,17 @@ def test_policy_conflict_survives_interrupted_run_and_merged_issue_skip() -> Non
     )
 
     assert recovered is merged
-    assert findings and findings[0][2] == "warning"
-    warning = findings[0][1]
+    warning = next(message for _, message, status in findings if status == "warning")
+    assert issue_results == [
+        (
+            (90, "skipped", 0, merged.number, merged.url),
+            {"warnings": (warning,), "label": "Issue #90"},
+        )
+    ]
     whole_review_context = second_run["policy_context"](  # type: ignore[operator]
         recovered_config, scope="the whole-version review"
     )
     assert warning in whole_review_context
-
-    base_pr = replace(
-        child_pr,
-        number=200,
-        head_branch=recovered_config.integration_branch,
-        head_sha="integration-head",
-        base_branch=recovered_config.main_branch,
-        base_sha="main-head",
-        body="Sequential integration.",
-    )
-    delivered_bodies: list[str] = []
-
-    class BaseGitHub:
-        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
-            assert number == base_pr.number
-            delivered_bodies.append(str(kwargs["body"]))
-            return replace(base_pr, body=delivered_bodies[-1])
-
-    second_run["ensure_base_pr_policy_notes"](  # type: ignore[operator]
-        BaseGitHub(), base_pr, recovered_config
-    )
-    assert delivered_bodies and warning in delivered_bodies[-1]
 
 
 def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() -> None:
@@ -969,11 +2626,11 @@ def test_whole_version_conflict_is_rehydrated_from_base_pr_after_interruption() 
 
     integration_globals["review_whole_version"] = recovered_review
     integration_globals["update_base_pr_human_handoff"] = (
-        lambda config, client, github, pr, delivery: pr
+        lambda config, work_items, client, github, pr, delivery: pr
     )
 
     delivered = second_run["integration_delivery"](  # type: ignore[operator]
-        second_config, object(), Repository(), SecondGitHub()
+        second_config, second_config.issues, object(), Repository(), SecondGitHub()
     )
 
     assert delivered.is_draft is False
@@ -1008,10 +2665,8 @@ def test_without_policy_issue_keeps_legacy_prompt_semantics() -> None:
     )
 
     assert implementation.startswith("Implement Issue #90")
-    assert scope_review.startswith("Perform only the Scope / Design Review for Issue")
-    assert correctness_review.startswith(
-        "Perform only the Correctness Review for Issue"
-    )
+    assert scope_review.startswith("Perform only the Scope / Design Review for")
+    assert correctness_review.startswith("Perform only the Correctness Review for")
     assert "policy Issue" not in implementation
     assert "POLICY_CONFLICT" not in scope_review
     assert "POLICY_CONFLICT" not in correctness_review
@@ -1182,7 +2837,7 @@ def test_generated_workflow_uses_run_scoped_correlation_without_ad_hoc_tokens() 
     assert "RUN_TOKEN" not in code
     assert "[awm:" not in code
     assert "CreateSessionRequest(" in code
-    assert 'name=f"Issue {issue.number} implementer"' in code
+    assert 'name=f"{issue.label} implementer"' in code
 
 
 def test_generated_workflow_has_no_in_place_recovery_state() -> None:
@@ -1203,7 +2858,7 @@ def test_merge_to_integration_policy_changes_only_issue_merge_path() -> None:
 
     assert "MERGE_TO_INTEGRATION = True" in merging
     assert "MERGE_TO_INTEGRATION = False" in ready_only
-    assert "Issue #{issue.number} PR is Ready" in ready_only
+    assert "{issue.label} PR is Ready" in ready_only
     assert 'delivery.outcome == "approved"' in ready_only
 
 

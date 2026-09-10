@@ -59,6 +59,41 @@ deterministically expands it into the canonical sequential plain-Python workflow
 The generated Python is visible for inspection and is then passed unchanged to the
 existing Static Validation, Dry Run, and Run path. JSON is configuration, not an
 executable DSL, and there is no Issue Driven runtime or UI-side control-flow model.
+The ordered `work_items` form may mix GitHub Issue numbers with inline mini tasks
+such as `{"id":"update-copy","task":"Update the empty-state copy and its test."}`.
+Inline tasks are embedded in the generated Python and do not require creating a
+GitHub Issue; the legacy Issue-only `issues` array remains supported.
+
+The immutable JSON-derived tuple seeds a separate workflow-owned `WorkItemPlan`;
+it is not frozen as the execution schedule. Before each dispatch, the generated
+Python asks a dedicated planning agent for one bounded JSON decision and applies
+it through `plan.add()`, `plan.update()`, or `plan.skip()`. A planner can add a
+pending Issue or mini task, refine a pending mini task while preserving its
+stable ID and branch, skip obsolete work, or declare the plan complete. Invalid,
+ambiguous, oversized, or unbounded decisions fail closed. The initial aggregate
+serialized plan, including its largest possible dispatch position, is limited to
+32,000 bytes while each inline task remains limited to 4,000 characters.
+Already-dispatched items cannot be revised and completed identities cannot be
+reused. The final plan snapshot is passed explicitly to
+handoff generation; configuration is never mutated. Before dispatch, every
+accepted decision is stored as seed-bound recovery state in the Draft Base PR,
+and each item is marked dispatched before child processing. A new run restores
+that exact plan, re-inspects dispatched dynamic open or merged child PRs, and
+fails closed if the state is missing, ambiguous, or belongs to a different seed.
+The Runner and progress events only observe these decisions, so the generated
+plain Python remains the control-flow source of truth.
+
+For one-shot delivery, replace the initial `issues` / `work_items` list with a
+single `one_shot_issue`. The generated workflow starts with an empty plan and its
+dedicated manager reads that source Issue before every planning turn, decomposes
+the remaining goal into short inline mini tasks, and adjusts the pending plan as
+implementation progresses. Each mini task records its purpose and indispensable
+design decisions, then enters the same implementation, independent review,
+recovery, and delivery flow as every other work item. The source Issue is part of
+the persisted plan identity and is referenced by the Base PR and final handoff.
+Numeric Issue additions are rejected in this mode, and every manager-created or
+revised mini task receives authoritative branch/PR topology validation before its
+dispatch is persisted.
 
 ```json
 {
@@ -66,32 +101,71 @@ executable DSL, and there is no Issue Driven runtime or UI-side control-flow mod
   "repository": "~/DevEnv/project",
   "integration_branch": "dev/v0.2.0",
   "final_branch": "main",
+  "make_integration_branch": false,
   "policy_issue": 88,
   "issues": [90, 89],
   "max_reviews": 5,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
+  "scenarios": [
+    "Existing: a normal Prompt run still completes and preserves its output.",
+    "Failure: malformed planner output is rejected without dispatching work."
+  ],
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
 }
 ```
 
-The fixed `mode` discriminator, `policy_issue`, and the two agent fields are
-optional; every other field is required. When set, `policy_issue` is a positive
-Issue number that supplies version-wide design context to every implementation,
-review, and fix turn and is referenced by the Base PR. It cannot also appear in
-`issues`. Clear conflicts produce structured warnings while the implementation
-Issue remains authoritative. Conflict records are persisted on the relevant
-child PR or Base PR so a recovery run can restore them for whole-version review,
-Summary, and Base PR handoff. `implementer_agent` selects implementation, fix,
-and cleanup turns, while `reviewer_agent` selects Issue and whole-version review
-turns plus the final Japanese Base PR handoff writer. Each
+A one-shot configuration uses the same delivery settings but needs only the
+original Issue as its work definition:
+
+```json
+{
+  "mode": "issue-driven",
+  "repository": "~/DevEnv/project",
+  "integration_branch": "dev/v0.3.0",
+  "final_branch": "main",
+  "one_shot_issue": 169,
+  "max_reviews": 5,
+  "merge_to_integration": true,
+  "final_review": true,
+  "merge_final": false
+}
+```
+
+The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`, the
+two agent fields, and `scenarios` are optional; every other field is required.
+With `make_integration_branch: true`, the workflow creates and pushes a missing
+integration branch from the exact remote `final_branch` HEAD. An existing branch
+is reused only when it contains that exact starting commit and passes the normal
+safe recovery checks. The final PR still targets `final_branch`. When set,
+`policy_issue` is a positive Issue number that supplies version-wide design
+context to every implementation, review, and fix turn and is referenced by the
+Base PR. It cannot also appear as an implementation GitHub Issue work item. Clear conflicts produce structured
+warnings while the implementation work item remains authoritative. Conflict records
+are persisted on the relevant child PR or Base PR so a recovery run can restore
+them for whole-version review, Summary, and Base PR handoff.
+`implementer_agent` selects implementation, fix, and cleanup turns, while
+`reviewer_agent` selects Issue and whole-version review turns plus the final
+Japanese Base PR handoff writer. Each
 accepts `codex` or `claude` and independently defaults to `codex`. Issue numbers
 are positive, unique, and retain their array order. Unknown fields are rejected so
 generic actions, conditions, loops, and nested executable blocks cannot grow into
 a second workflow language. With `merge_final: false`, the generated final control
 flow makes the integration PR Ready but contains no final merge call.
+
+`scenarios` is a list of unique, non-empty human-authored descriptions, bounded
+to 100 items, 4,000 characters per item, and 64,000 UTF-8 bytes for the complete
+numbered list. It requires `final_review: true`. Before ordinary Whole Review, a
+dedicated AI Scenario Gate selects a small risk-relevant subset, compares each
+scenario at the exact final-base commit (Before) and integration-head commit
+(After), and judges whether the behavioral difference is appropriate in the
+Issue context. Scenarios may cover existing behavior, new behavior, or failure
+paths; they are not fixed expected-output assertions and need not all be run. A
+requested change enters the existing Whole Review fix/re-review loop. The list
+and gate control flow are embedded in generated plain Python rather than modeled
+by the UI or a second runtime.
 
 ## Git and GitHub topology operations
 

@@ -85,31 +85,42 @@ def emit_run_pr(pr_number: int, pr_url: str) -> None:
 
 
 def emit_issue_result(
-    issue: int,
+    issue: int | str,
     outcome: IssueOutcome,
     reviews: int,
     pr_number: int,
     pr_url: str,
     *,
     warnings: tuple[str, ...] = (),
+    label: str | None = None,
 ) -> None:
-    """Publish one final, structured Issue outcome for the current run."""
-    _validate_positive_number("issue", issue)
+    """Publish one final, structured work-item outcome for the current run."""
+    if isinstance(issue, bool) or not isinstance(issue, (int, str)):
+        raise ValueError("issue must be a positive number or non-empty string")
+    if isinstance(issue, int):
+        _validate_positive_number("issue", issue)
+    elif not issue.strip() or len(issue) > 100:
+        raise ValueError("issue must be a positive number or non-empty string")
+    if label is not None and (
+        not isinstance(label, str) or not label.strip() or len(label) > 100
+    ):
+        raise ValueError("label must be a non-empty string of at most 100 characters")
     _validate_outcome(outcome)
     _validate_review_count(reviews)
     _validate_pr("issue result", pr_number, pr_url)
     _validate_warnings(warnings)
-    _write_event(
-        {
-            "type": "issue_result",
-            "issue": issue,
-            "outcome": outcome,
-            "reviews": reviews,
-            "pr_number": pr_number,
-            "pr_url": pr_url,
-            "warnings": list(warnings),
-        }
-    )
+    event: dict[str, object] = {
+        "type": "issue_result",
+        "issue": issue,
+        "outcome": outcome,
+        "reviews": reviews,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "warnings": list(warnings),
+    }
+    if label is not None:
+        event["label"] = label
+    _write_event(event)
 
 
 def emit_whole_review_result(
