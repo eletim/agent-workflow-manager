@@ -1632,6 +1632,122 @@ def test_planner_policy_conflict_is_persisted_before_dispatch_and_recovered() ->
     assert "different owner" in context
 
 
+def test_deferred_plan_rehydrates_policy_conflict_after_interruption() -> None:
+    code = generate_issue_driven_workflow(
+        parse(
+            payload(
+                issues=[90],
+                policy_issue=200,
+                integration_branch="dev/v0.2.5",
+                final_branch="dev/v0.2.4",
+                make_integration_branch=True,
+            )
+        )
+    )
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-deferred-policy>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    def make_config(workflow: dict[str, object]):
+        return workflow["Config"](
+            Path("/repo"),
+            "acme/project",
+            "dev/v0.2.5",
+            "dev/v0.2.4",
+            (workflow["Issue"](90, "feature/issue-90"),),
+            "true",
+            200,
+        )
+
+    same_sha = "f" * 40
+    recovery_note: str | None = None
+    create_calls = 0
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            assert object_sha == same_sha
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert object_sha == same_sha
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal create_calls
+            create_calls += 1
+            pytest.fail("Base PR must remain deferred while branch heads match")
+
+    first = load_run("deferred_policy_first")
+    first_config = make_config(first)
+    first["emit_finding"] = lambda *args, **kwargs: None
+    first["inspect_dynamic_work_item_topology"] = lambda *args: None
+    first["create_agent"] = lambda *args, **kwargs: "planner"
+    first["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {
+            "actions": [],
+            "complete": False,
+            "policy_conflicts": ["the policy requires a different owner"],
+        }
+    )
+    first["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
+        RuntimeError("interrupted before first merge")
+    )
+
+    plan_pr, plan = first["prepare_work_item_plan_pr"](
+        first_config, Repository(), GitHub()
+    )
+    with pytest.raises(RuntimeError, match="interrupted before first merge"):
+        first["process_work_items"](
+            first_config, object(), Repository(), GitHub(), plan_pr, plan
+        )
+
+    assert create_calls == 0
+    assert recovery_note is not None
+    assert "agent-workflow-manager:policy-conflict:" in recovery_note
+
+    second = load_run("deferred_policy_second")
+    second_config = make_config(second)
+    recovered_pr, recovered_plan = second["prepare_work_item_plan_pr"](
+        second_config, Repository(), GitHub()
+    )
+
+    assert recovered_pr is None
+    assert recovered_plan.position == 1
+    assert recovered_plan.persisted_source == recovery_note
+    context = second["policy_context"](
+        second_config, scope="work-item planning", structured_conflicts=True
+    )
+    assert "different owner" in context
+
+
 def test_policy_plan_reacquires_base_pr_after_first_child_advances_integration() -> (
     None
 ):

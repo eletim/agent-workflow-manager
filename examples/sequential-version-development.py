@@ -2082,11 +2082,12 @@ def prepare_work_item_plan_pr(
         recovery_body = repo.inspect_remote_note(
             deferred_work_item_plan_ref(config), final.remote_sha
         )
-        initial_plan = (
-            work_item_plan_from_body(recovery_body, config)
-            if recovery_body is not None
-            else WorkItemPlan(config)
-        )
+        if recovery_body is not None:
+            initial_plan = work_item_plan_from_body(recovery_body, config)
+            initial_plan.persisted_source = recovery_body
+            rehydrate_policy_conflicts(recovery_body, config, issue_number=None)
+        else:
+            initial_plan = WorkItemPlan(config)
         if integration.remote_sha == final.remote_sha:
             emit_finding(
                 "github",
@@ -2146,7 +2147,9 @@ def persist_work_item_plan(
             final = repo.inspect_branch(config.main_branch)
             if final.remote_sha is None:
                 raise WorkerFailure("final remote branch is missing")
-            source = serialized_work_item_plan(plan)
+            source = with_base_pr_policy_notes(
+                serialized_work_item_plan(plan), config
+            )
             repo.update_remote_note(
                 deferred_work_item_plan_ref(config),
                 final.remote_sha,
