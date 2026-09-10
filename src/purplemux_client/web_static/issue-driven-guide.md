@@ -32,7 +32,11 @@ same recovery path requires it to contain that exact final-branch HEAD and
 rejects unsafe remote movement or divergence. Base PR creation is deferred while
 the authoritative remote heads are identical, then performed after the first
 Issue merge creates a difference; an existing Base PR retains its normal recovery
-semantics. The final PR remains `integration_branch` to `final_branch`.
+semantics. During that bootstrap, the workflow processes only the first immutable
+JSON-seeded item before starting its planner. An interruption safely repeats that
+item through authoritative child Git/PR recovery. An empty one-shot plan instead
+fails before manager planning because its first decision cannot yet be persisted.
+The final PR remains `integration_branch` to `final_branch`.
 
 Correct:
 
@@ -217,6 +221,14 @@ flow. The effective final snapshot is passed explicitly to handoff generation;
 the immutable configuration is not changed. This remains ordinary Python
 control flow: planner prose, JSON input, Runner state, Progress, and the UI do not
 become scheduling authorities.
+
+When Base PR creation is deferred because a newly created integration branch is
+still identical to its final branch, the first immutable JSON-seeded item is the
+bootstrap recovery authority. It is processed before the planner runs, and its
+child branch/PR topology makes an interrupted attempt safe to repeat. The Base PR
+is created and records the dispatched position immediately after that merge.
+Because a one-shot plan has no immutable seed item, this exact topology fails
+closed before its manager can make an unpersisted decision.
 
 When `policy_issue` is present, implementation, Issue review/fix, and
 whole-version review/fix agents read it first as shared design context. It is not

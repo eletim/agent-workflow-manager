@@ -86,10 +86,16 @@ Workflow-owned business decisions that cannot be reconstructed from Git topology
 may be persisted by the plain Python workflow in an authoritative external
 resource. In Issue Driven mode, accepted work-item plan decisions and the last
 dispatched position are stored in the Draft Base PR before child processing or
-final delivery. Recovery validates that state against the immutable generated
-seed and re-inspects the recorded items' GitHub topology. This is domain state
-owned and interpreted by the workflow, not a Runner checkpoint or progress-event
-state machine.
+final delivery. When a newly created integration branch is still identical to
+the final branch and cannot have a Base PR, the workflow starts no planner and
+processes only its first immutable generated seed item. Recovery repeats that
+same item through authoritative child Git/PR inspection until its merge creates
+the Base PR difference; the dispatched position is then stored before planning
+continues. An empty one-shot plan fails closed before its manager can make an
+unpersisted decision. Recovery otherwise validates stored state against the
+immutable generated seed and re-inspects the recorded items' GitHub topology.
+This is domain state owned and interpreted by the workflow, not a Runner
+checkpoint or progress-event state machine.
 
 PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
 `purplemux_client` uses

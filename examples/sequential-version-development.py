@@ -2115,11 +2115,13 @@ def persist_work_item_plan(
     repo: GitRepository,
     github: GitHubRepository,
     pr: PullRequestState | None,
-) -> PullRequestState | None:
+) -> PullRequestState:
     if pr is None:
         pr, _initial_plan = prepare_work_item_plan_pr(config, repo, github)
         if pr is None:
-            return None
+            raise WorkerFailure(
+                "cannot persist work-item plan while Base PR creation is deferred"
+            )
     if pr.state == "MERGED":
         if with_work_item_plan(pr.body, plan) != pr.body:
             raise WorkerFailure("cannot change work-item plan after final PR merge")
@@ -2190,6 +2192,19 @@ def process_work_items(
                 issue, config, client, repo, github
             ),
         )
+    if plan_pr is None:
+        issue = plan.take_next()
+        if issue is None:
+            raise WorkerFailure(
+                "cannot safely plan an empty one-shot workflow while Base PR "
+                "creation is deferred"
+            )
+        inspect_dynamic_work_item_topology(issue, config)
+        run_outline_step(
+            issue.label,
+            lambda: process_issue(issue, config, client, repo, github),
+        )
+        plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     if plan.finalized:
         return plan.snapshot
     planner = create_agent(
@@ -2228,8 +2243,6 @@ def process_work_items(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
-        if plan_pr is None:
-            plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
 
 

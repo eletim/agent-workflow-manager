@@ -2080,6 +2080,8 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
     integration_sha = final_sha
     created: PullRequestState | None = None
     create_calls: list[tuple[str, str]] = []
+    processed: list[int] = []
+    planner_calls: list[str] = []
 
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
@@ -2127,22 +2129,94 @@ def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
 
     github = GitHub()
     workflow["emit_finding"] = lambda *args, **kwargs: None
+    workflow["inspect_dynamic_work_item_topology"] = lambda *args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    def process_issue(item: object, *_args: object) -> None:
+        nonlocal integration_sha
+        processed.append(item.number)
+        if len(processed) == 1:
+            raise RuntimeError("interrupted before first merge")
+        integration_sha = "a" * 40
+
+    workflow["process_issue"] = process_issue
+    workflow["create_agent"] = lambda *args, **kwargs: (
+        planner_calls.append("planner") or "planner"
+    )
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": True, "policy_conflicts": []}
+    )
 
     plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, Repository(), github)
 
     assert plan_pr is None
     assert create_calls == []
 
-    assert plan.take_next() is issue
-    integration_sha = "a" * 40
-    plan_pr = workflow["persist_work_item_plan"](
-        plan, config, Repository(), github, plan_pr
+    with pytest.raises(RuntimeError, match="interrupted before first merge"):
+        workflow["process_work_items"](
+            config, object(), Repository(), github, plan_pr, plan
+        )
+
+    assert create_calls == []
+    assert planner_calls == []
+
+    recovered_pr, recovered_plan = workflow["prepare_work_item_plan_pr"](
+        config, Repository(), github
+    )
+    effective = workflow["process_work_items"](
+        config, object(), Repository(), github, recovered_pr, recovered_plan
     )
 
-    assert plan_pr is created
     assert create_calls == [(config.integration_branch, config.main_branch)]
-    recovered = workflow["work_item_plan_from_body"](plan_pr.body, config)
+    assert processed == [90, 90]
+    assert planner_calls == ["planner"]
+    assert effective == (issue,)
+    assert created is not None
+    recovered = workflow["work_item_plan_from_body"](created.body, config)
     assert recovered.position == 1
+    assert recovered.finalized is True
+
+
+def test_deferred_empty_one_shot_plan_fails_before_manager_decision() -> None:
+    workflow = load_generated_workflow(
+        one_shot_issue=169,
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.5",
+        "dev/v0.2.4",
+        (),
+        "true",
+        None,
+        169,
+    )
+    same_sha = "f" * 40
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str) -> None:
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            pytest.fail("identical branches must not attempt Base PR creation")
+
+    repository = SimpleNamespace(
+        synchronize_branch=lambda branch: BranchState(branch, same_sha, same_sha, True),
+        inspect_branch=lambda branch: BranchState(branch, same_sha, same_sha, True),
+    )
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail(
+        "manager must not make an unpersisted decision"
+    )
+    plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, GitHub())
+
+    with pytest.raises(WorkerFailure, match="cannot safely plan an empty one-shot"):
+        workflow["process_work_items"](
+            config, object(), repository, GitHub(), plan_pr, plan
+        )
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:

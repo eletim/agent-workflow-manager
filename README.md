@@ -76,10 +76,17 @@ serialized plan, including its largest possible dispatch position, is limited to
 Already-dispatched items cannot be revised and completed identities cannot be
 reused. The final plan snapshot is passed explicitly to
 handoff generation; configuration is never mutated. Before dispatch, every
-accepted decision is stored as seed-bound recovery state in the Draft Base PR,
-and each item is marked dispatched before child processing. A new run restores
-that exact plan, re-inspects dispatched dynamic open or merged child PRs, and
-fails closed if the state is missing, ambiguous, or belongs to a different seed.
+accepted planner decision is stored as seed-bound recovery state in the Draft
+Base PR, and each planned item is marked dispatched before child processing. The
+only bootstrap exception is a newly created integration branch whose Base PR is
+deferred: the workflow processes its first immutable JSON-seeded item before it
+starts the planner, then creates the Base PR and records that position. If
+interrupted first, a new run repeats the same seed item and recovers from its
+authoritative child Git/PR topology. An empty one-shot plan fails closed before
+manager planning in this topology because no Base PR exists to persist its first
+business decision. A new run otherwise restores the exact plan, re-inspects
+dispatched dynamic open or merged child PRs, and fails closed if the state is
+missing, ambiguous, or belongs to a different seed.
 The Runner and progress events only observe these decisions, so the generated
 plain Python remains the control-flow source of truth.
 
@@ -142,7 +149,9 @@ is reused only when it contains that exact starting commit and passes the normal
 safe recovery checks. While the two remote heads are identical, Base PR creation
 is deferred; it is created after the first Issue merge advances the integration
 branch. An existing Base PR is still recovered normally. The final PR still
-targets `final_branch`. When set,
+targets `final_branch`. A deferred Base PR requires at least one JSON-seeded work
+item; an empty one-shot plan is rejected before manager planning because its first
+decision would have no authoritative recovery resource. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design
 context to every implementation, review, and fix turn and is referenced by the
 Base PR. It cannot also appear as an implementation GitHub Issue work item. Clear conflicts produce structured
