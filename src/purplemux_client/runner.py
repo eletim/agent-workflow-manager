@@ -270,6 +270,10 @@ class RunStopUncertainError(RuntimeError):
     """Raised when PurpleMux cannot prove that a stopped Workflow terminated."""
 
 
+class RunResumeNotAllowedError(RuntimeError):
+    """Raised when a run cannot be resumed as a new execution."""
+
+
 @dataclass(frozen=True)
 class RunResource:
     kind: str
@@ -372,11 +376,25 @@ class RunnerSnapshot:
     issue_results: tuple[IssueResult, ...] = ()
     whole_review_result: WholeReviewResult | None = None
     identity: str | None = None
+    issue_driven_json: str | None = None
+    resumed_from_run_id: int | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
         payload.pop("prompt")
-        payload["mode"] = "prompt" if self.prompt is not None else "workflow"
+        payload["mode"] = (
+            "prompt"
+            if self.prompt is not None
+            else "issue-driven"
+            if self.issue_driven_json is not None
+            else "workflow"
+        )
+        issue_driven_json = payload.pop("issue_driven_json")
+        resumed_from_run_id = payload.pop("resumed_from_run_id")
+        if issue_driven_json is not None:
+            payload["issueDrivenJson"] = issue_driven_json
+        if resumed_from_run_id is not None:
+            payload["resumedFromRunId"] = resumed_from_run_id
         if self.prompt is not None:
             payload["prompt"] = self.prompt.as_json()
             payload["repository"] = self.prompt.repository_json()
@@ -482,7 +500,13 @@ class RunnerSnapshot:
     def as_summary_json(self) -> dict[str, object]:
         execution_context = self._execution_context_json()
         payload: dict[str, object] = {
-            "mode": "prompt" if self.prompt is not None else "workflow",
+            "mode": (
+                "prompt"
+                if self.prompt is not None
+                else "issue-driven"
+                if self.issue_driven_json is not None
+                else "workflow"
+            ),
             "state": self.state,
             "exitCode": self.exit_code,
             "runId": self.run_id,
@@ -497,6 +521,8 @@ class RunnerSnapshot:
             "resourceCount": len(self.resources),
             "checked": self.checked,
         }
+        if self.resumed_from_run_id is not None:
+            payload["resumedFromRunId"] = self.resumed_from_run_id
         if self.prompt is not None:
             payload["prompt"] = {
                 "agent": self.prompt.agent,
@@ -567,6 +593,8 @@ class _RunRecord:
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
+    issue_driven_json: str | None = None
+    resumed_from_run_id: int | None = None
 
 
 class PythonRunner:
@@ -759,6 +787,8 @@ class PythonRunner:
                 else None
             ),
             "checked": run.checked,
+            "issueDrivenJson": run.issue_driven_json,
+            "resumedFromRunId": run.resumed_from_run_id,
         }
 
     def _write_run_history_locked(self) -> None:
@@ -828,6 +858,8 @@ class PythonRunner:
         args = value.get("args")
         outline = value.get("outline")
         exit_code = value.get("exitCode")
+        issue_driven_json = value.get("issueDrivenJson")
+        resumed_from_run_id = value.get("resumedFromRunId")
         if (
             isinstance(run_id, bool)
             or not isinstance(run_id, int)
@@ -843,6 +875,18 @@ class PythonRunner:
             or any(not isinstance(item, str) for item in outline)
             or isinstance(exit_code, bool)
             or not isinstance(exit_code, int)
+            or (
+                issue_driven_json is not None and not isinstance(issue_driven_json, str)
+            )
+            or (
+                resumed_from_run_id is not None
+                and (
+                    isinstance(resumed_from_run_id, bool)
+                    or not isinstance(resumed_from_run_id, int)
+                    or resumed_from_run_id < 1
+                    or resumed_from_run_id >= run_id
+                )
+            )
         ):
             raise ValueError
 
@@ -988,6 +1032,8 @@ class PythonRunner:
             issue_results=issue_results,
             whole_review_result=whole_review_result,
             checked=checked,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=resumed_from_run_id,
         )
 
     def _load_run_history(self) -> None:
@@ -1256,6 +1302,8 @@ class PythonRunner:
         *,
         args: Sequence[str] = (),
         prompt: PromptExecution | None = None,
+        issue_driven_json: str | None = None,
+        resumed_from_run_id: int | None = None,
     ) -> int:
         run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
@@ -1276,7 +1324,31 @@ class PythonRunner:
                     run_args=run_args,
                     child_env=child_env,
                     prompt=prompt,
+                    issue_driven_json=issue_driven_json,
+                    resumed_from_run_id=resumed_from_run_id,
                 )
+
+    def resume(self, run_id: int) -> int:
+        """Start a new run from one terminal run's immutable settings."""
+        with self._lock:
+            source = self._get_run(run_id)
+            if source.state not in ("failed", "stopped"):
+                raise RunResumeNotAllowedError(
+                    f"run {run_id} is {source.state}; only failed or stopped runs can be resumed"
+                )
+            if source.issue_driven_json is None:
+                raise RunResumeNotAllowedError(
+                    f"run {run_id} is not an Issue Driven run; only Issue Driven runs can be resumed"
+                )
+            code = source.code
+            args = source.args
+            issue_driven_json = source.issue_driven_json
+        return self.start(
+            code,
+            args=args,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=run_id,
+        )
 
     def _start_validated(
         self,
@@ -1287,6 +1359,8 @@ class PythonRunner:
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
+        issue_driven_json: str | None = None,
+        resumed_from_run_id: int | None = None,
     ) -> int:
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
@@ -1302,6 +1376,8 @@ class PythonRunner:
                 run_cwd=run_cwd,
                 run_args=run_args,
                 child_env=child_env,
+                issue_driven_json=issue_driven_json,
+                resumed_from_run_id=resumed_from_run_id,
             )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
@@ -1325,6 +1401,8 @@ class PythonRunner:
             findings=deque(maxlen=self._max_progress_events),
             warning_findings=deque(maxlen=self._max_progress_events),
             prompt=prompt,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
 
@@ -1352,6 +1430,8 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
+        issue_driven_json: str | None = None,
+        resumed_from_run_id: int | None = None,
     ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -1396,6 +1476,8 @@ class PythonRunner:
             warning_findings=deque(maxlen=self._max_progress_events),
             credential_path=credential_path,
             event_token=event_token,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
         correlation = self._run_identity(run_id)
@@ -1759,6 +1841,8 @@ class PythonRunner:
             issue_results=tuple(run.issue_results.values()),
             whole_review_result=run.whole_review_result,
             identity=self._run_identity(run.run_id),
+            issue_driven_json=run.issue_driven_json,
+            resumed_from_run_id=run.resumed_from_run_id,
         )
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:

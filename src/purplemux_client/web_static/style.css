@@ -249,6 +249,7 @@ a { color: #bcaaff; }
 .recovery-panel { margin-top: 14px; border-color: #6c5a2c; }
 .recovery-panel h2 { margin: 0 0 8px; }
 .recovery-panel p { margin: 0; color: #d7c68f; font-size: 13px; }
+.recovery-panel #resume-open { margin-top: 12px; }
 .attempt-history { margin-bottom: 0; color: #aab0bf; font-size: 13px; }
 
 .validation-panel.invalid { border-color: #7d4148; }
@@ -470,6 +471,11 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 .manual-copy-actions { display: flex; justify-content: flex-end; }
 
 .settings-dialog { width: min(720px, calc(100% - 32px)); height: auto; max-height: calc(100% - 32px); }
+.resume-dialog { width: min(720px, calc(100% - 32px)); height: auto; max-height: calc(100% - 32px); }
+.resume-dialog-content { padding: 18px; }
+.resume-dialog-content p { margin: 0 0 12px; color: #aab0bf; font-size: 13px; }
+#resume-settings { max-height: 50vh; min-height: 180px; overflow: auto; white-space: pre-wrap; }
+.resume-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .settings-dialog-toolbar {
   display: flex;
   align-items: center;

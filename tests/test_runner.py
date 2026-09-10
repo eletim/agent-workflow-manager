@@ -108,7 +108,6 @@ print(os.environ.get("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", "ignored"))
     assert result.run_id == run_id
     assert result.state == "success"
     assert result.stdout == "ignored\n"
-    assert not hasattr(runner, "resume")
     assert (
         PythonRunner._parse_runner_event('{"type":"checkpoint","name":"old","data":{}}')
         is None
@@ -396,6 +395,69 @@ def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
         assert successor.start("print('successor')") == run_id + 1
     finally:
         successor.close()
+
+
+def test_resume_reuses_immutable_settings_and_persists_run_relationship(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    source = '{"mode":"issue-driven","one_shot_issue":196}'
+    try:
+        first_id = runner.start(
+            "import sys; print(sys.argv[1]); raise SystemExit(7)",
+            args=("same-argument",),
+            issue_driven_json=source,
+        )
+        wait_for(runner, lambda item: item.state == "failed", run_id=first_id)
+
+        resumed_id = runner.resume(first_id)
+        resumed = wait_for(
+            runner, lambda item: item.state == "failed", run_id=resumed_id
+        )
+
+        assert resumed_id == first_id + 1
+        assert resumed.code == runner.snapshot(first_id).code
+        assert resumed.args == ("same-argument",)
+        assert resumed.issue_driven_json == source
+        assert resumed.resumed_from_run_id == first_id
+        assert resumed.as_json()["mode"] == "issue-driven"
+        assert resumed.as_summary_json()["resumedFromRunId"] == first_id
+    finally:
+        runner.close()
+
+    restored = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        resumed = restored.snapshot(resumed_id)
+        assert resumed.issue_driven_json == source
+        assert resumed.resumed_from_run_id == first_id
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("mode", ["prompt", "workflow"])
+def test_resume_rejects_non_issue_driven_runs(
+    runner: PythonRunner, tmp_path: Path, mode: str
+) -> None:
+    prompt = (
+        PromptExecution("codex", str(tmp_path), "answer") if mode == "prompt" else None
+    )
+    run_id = runner.start("raise SystemExit(7)", prompt=prompt)
+    wait_for(runner, lambda item: item.state == "failed", run_id=run_id)
+
+    with pytest.raises(
+        runner_module.RunResumeNotAllowedError,
+        match="not an Issue Driven run",
+    ):
+        runner.resume(run_id)
 
 
 def test_run_id_is_durably_reserved_before_launch_crash(
@@ -2215,6 +2277,10 @@ def request(
         ("not json", "invalid JSON"),
         ("[]", "JSON object required"),
         ('{"code": 42}', "code must be a string"),
+        (
+            '{"code":"", "issueDrivenJson":null}',
+            "issueDrivenJson is supported only for Run and must be a string",
+        ),
     ],
 )
 def test_malformed_run_request(
@@ -2520,6 +2586,59 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
+
+
+def test_run_api_rejects_non_issue_driven_and_nonterminal_resume(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "raise SystemExit(9)", "args": ["same"]}),
+        token=token,
+    )
+    assert status == 202
+    source_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{source_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{source_id}/resume",
+        token=token,
+    )
+    assert status == 409
+    assert "not an Issue Driven run" in rejected["error"]
+
+    status, successful = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "print('complete')"}),
+        token=token,
+    )
+    assert status == 202
+    successful_id = int(successful["runId"])
+    deadline = time.monotonic() + 5
+    while (
+        request(address, "GET", f"/api/runs/{successful_id}")[1]["state"] == "running"
+    ):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{successful_id}/resume",
+        token=token,
+    )
+    assert status == 409
+    assert "only failed or stopped runs" in rejected["error"]
 
 
 def test_run_api_updates_checked_metadata_only_for_terminal_run(
@@ -2836,9 +2955,12 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         "issue-driven-json",
         "issue-driven-python",
         "issue-driven-generate",
+        "resume-open",
+        "resume-dialog",
+        "resume-settings",
+        "resume-confirm",
     ):
         assert f'id="{element_id}"' in page
-    assert 'id="resume"' not in page
 
 
 def test_issue_driven_generation_api_is_distinct_from_python_validation(
@@ -2874,6 +2996,22 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert generated["config"]["implementer_agent"] == "claude"
     assert generated["config"]["reviewer_agent"] == "codex"
     ast.parse(generated["generatedCode"])
+
+    status, mismatch = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": generated["generatedCode"] + "\n# changed",
+                "args": [],
+                "issueDrivenJson": source,
+            }
+        ),
+        token=token,
+    )
+    assert status == 400
+    assert mismatch == {"error": "code does not match issueDrivenJson"}
 
     status, rejected = request(
         address,
@@ -3634,6 +3772,7 @@ def test_notification_settings_mutation_rejects_untrusted_request(
             "/api/run",
             "/api/validate",
             "/api/dry-run",
+            "/api/runs/1/resume",
             "/api/readiness/probe",
             "/api/readiness/reconcile",
         )

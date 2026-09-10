@@ -45,6 +45,7 @@ from purplemux_client.runner import (
     RunHistoryError,
     RunnerSnapshot,
     RunNotFoundError,
+    RunResumeNotAllowedError,
     RunStopUncertainError,
     WorkflowDryRunError,
     WorkflowValidationError,
@@ -741,6 +742,31 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     {"error": "args must be an array of strings"},
                 )
                 return
+            issue_driven_json = payload.get("issueDrivenJson")
+            if "issueDrivenJson" in payload:
+                if path != "/api/run" or not isinstance(issue_driven_json, str):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "issueDrivenJson is supported only for Run and must be a string"
+                        },
+                    )
+                    return
+                try:
+                    issue_driven_code = generate_issue_driven_workflow(
+                        parse_issue_driven_json(issue_driven_json)
+                    )
+                except IssueDrivenValidationError as exc:
+                    self._send_json(
+                        HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)}
+                    )
+                    return
+                if issue_driven_code != code:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "code does not match issueDrivenJson"},
+                    )
+                    return
             try:
                 if path == "/api/validate":
                     result = self.server.runner.validate(code, args=args)
@@ -762,7 +788,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         status, self.server.runner.validation_snapshot().as_json()
                     )
                     return
-                run_id = self.server.runner.start(code, args=args)
+                run_id = self.server.runner.start(
+                    code,
+                    args=args,
+                    issue_driven_json=issue_driven_json,
+                )
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -793,6 +823,38 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.ACCEPTED,
                 {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
+            )
+            return
+        resume_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/resume", path)
+        if resume_match is not None:
+            run_id = int(resume_match.group(1))
+            try:
+                resumed_run_id = self.server.runner.resume(run_id)
+                snapshot = self.server.runner.snapshot(resumed_run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except RunResumeNotAllowedError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except WorkflowValidationError:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "resumed workflow failed validation",
+                        **self.server.runner.validation_snapshot().as_json(),
+                    },
+                )
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            except AlreadyRunningError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {"runId": resumed_run_id, **snapshot.as_json()},
             )
             return
         if path == "/api/readiness/probe":
