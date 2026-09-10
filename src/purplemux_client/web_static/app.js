@@ -162,6 +162,22 @@ let directoryPickerCurrentPath = null;
 let directoryPickerParentPath = null;
 let directoryPickerRequestGeneration = 0;
 
+async function withPendingButton(button, action, onSettled = null) {
+  if (button.dataset.pending === "true") return;
+  const wasDisabled = button.disabled;
+  button.dataset.pending = "true";
+  button.setAttribute("aria-busy", "true");
+  button.disabled = true;
+  try {
+    return await action();
+  } finally {
+    delete button.dataset.pending;
+    button.removeAttribute("aria-busy");
+    button.disabled = wasDisabled;
+    if (onSettled !== null) await onSettled();
+  }
+}
+
 function runningFaviconHref() {
   if (runningFaviconHrefPromise === null) {
     runningFaviconHrefPromise = fetch(favicon.getAttribute("href"))
@@ -683,21 +699,26 @@ deleteCheckedRunsButton.addEventListener("click", async () => {
   const noun = count === 1 ? "run" : "runs";
   if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
 
-  deleteCheckedRunsButton.disabled = true;
-  try {
-    const result = await request("/api/runs/delete-checked", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({runIds: confirmedRunIds}),
-    });
-    if (result.deletedRunIds.includes(activeRunId)) {
-      showNewRunAfterHistoryDeletion();
+  await withPendingButton(deleteCheckedRunsButton, async () => {
+    try {
+      const result = await request("/api/runs/delete-checked", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({runIds: confirmedRunIds}),
+      });
+      if (result.deletedRunIds.includes(activeRunId)) {
+        showNewRunAfterHistoryDeletion();
+      }
+      await refresh();
+    } catch (error) {
+      stderr.textContent = String(error);
+      await refresh();
     }
-    await refresh();
-  } catch (error) {
-    stderr.textContent = String(error);
-    await refresh();
-  }
+  }, () => {
+    deleteCheckedRunsButton.disabled = Number(
+      deleteCheckedRunsButton.dataset.count || 0,
+    ) === 0;
+  });
 });
 
 function renderValidation(issues) {
@@ -1410,67 +1431,71 @@ async function workflowSubmissionPayload() {
 
 issueDrivenGenerate.addEventListener("click", async () => {
   if (activeRunId !== null) return;
-  try {
-    await generateIssueDrivenCode();
-  } catch (error) {
-    if (!Array.isArray(error.result?.issueDrivenValidation)) {
-      stderr.textContent = String(error);
+  await withPendingButton(issueDrivenGenerate, async () => {
+    try {
+      await generateIssueDrivenCode();
+    } catch (error) {
+      if (!Array.isArray(error.result?.issueDrivenValidation)) {
+        stderr.textContent = String(error);
+      }
     }
-  }
+  }, applyFieldMode);
 });
 
 runButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // must explicitly start a New run first
-  captureDraftIfEditing();
-  const submittedMode = currentMode;
-  const selectionGeneration = ++activeRunGeneration;
-  explicitNewRun = true;
-  const validationGeneration = ++validationRequestGeneration;
-  try {
-    const requestPath = submittedMode === "prompt" ? "/api/prompt" : "/api/run";
-    const payload = submittedMode === "prompt"
-      ? {
-        agent: promptAgent.value,
-        cwd: promptCwd.value,
-        prompt: promptText.value,
+  await withPendingButton(runButton, async () => {
+    captureDraftIfEditing();
+    const submittedMode = currentMode;
+    const selectionGeneration = ++activeRunGeneration;
+    explicitNewRun = true;
+    const validationGeneration = ++validationRequestGeneration;
+    try {
+      const requestPath = submittedMode === "prompt" ? "/api/prompt" : "/api/run";
+      const payload = submittedMode === "prompt"
+        ? {
+          agent: promptAgent.value,
+          cwd: promptCwd.value,
+          prompt: promptText.value,
+        }
+        : await workflowSubmissionPayload();
+      const result = await request(requestPath, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (selectionGeneration === activeRunGeneration) {
+        // The fields remain editable while the request is pending. Retain any
+        // changes made since submission before replacing them with the run's
+        // authoritative snapshot.
+        captureDraftIfEditing();
+        activeRunId = result.runId;
+        activeRunGeneration += 1;
+        explicitNewRun = false;
+        if (
+          submittedMode !== "prompt"
+          && validationGeneration === validationRequestGeneration
+        ) {
+          renderValidation(result.validation || []);
+        }
+        renderRun(result);
       }
-      : await workflowSubmissionPayload();
-    const result = await request(requestPath, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (selectionGeneration === activeRunGeneration) {
-      // The fields remain editable while the request is pending. Retain any
-      // changes made since submission before replacing them with the run's
-      // authoritative snapshot.
-      captureDraftIfEditing();
-      activeRunId = result.runId;
-      activeRunGeneration += 1;
-      explicitNewRun = false;
-      if (
-        submittedMode !== "prompt"
-        && validationGeneration === validationRequestGeneration
-      ) {
-        renderValidation(result.validation || []);
+      await refresh();
+    } catch (error) {
+      if (Array.isArray(error.result?.validation)) {
+        if (
+          validationGeneration === validationRequestGeneration
+          && selectionGeneration === activeRunGeneration
+          && activeRunId === null
+        ) {
+          renderValidation(error.result.validation);
+          renderOutline(error.result.outline || [], []);
+        }
+      } else if (selectionGeneration === activeRunGeneration) {
+        stderr.textContent = String(error);
       }
-      renderRun(result);
     }
-    await refresh();
-  } catch (error) {
-    if (Array.isArray(error.result?.validation)) {
-      if (
-        validationGeneration === validationRequestGeneration
-        && selectionGeneration === activeRunGeneration
-        && activeRunId === null
-      ) {
-        renderValidation(error.result.validation);
-        renderOutline(error.result.outline || [], []);
-      }
-    } else if (selectionGeneration === activeRunGeneration) {
-      stderr.textContent = String(error);
-    }
-  }
+  }, applyFieldMode);
 });
 
 newRunButton.addEventListener("click", async () => {
@@ -1491,161 +1516,167 @@ issueDrivenModeButton.addEventListener("click", async () => {
 
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
-  const requestGeneration = ++validationRequestGeneration;
-  const selectionGeneration = activeRunGeneration;
-  try {
-    const payload = await workflowSubmissionPayload();
-    const result = await request("/api/validate", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (
-      requestGeneration === validationRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null
-    ) {
-      renderValidation(result.validation || []);
-      renderOutline(result.outline || [], []);
+  await withPendingButton(validateButton, async () => {
+    const requestGeneration = ++validationRequestGeneration;
+    const selectionGeneration = activeRunGeneration;
+    try {
+      const payload = await workflowSubmissionPayload();
+      const result = await request("/api/validate", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
+        renderValidation(result.validation || []);
+        renderOutline(result.outline || [], []);
+      }
+    } catch (error) {
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+        && Array.isArray(error.result?.validation)
+      ) {
+        renderValidation(error.result.validation);
+        renderOutline(error.result.outline || [], []);
+      } else if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
+        stderr.textContent = String(error);
+      }
     }
-  } catch (error) {
-    if (
-      requestGeneration === validationRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null
-      && Array.isArray(error.result?.validation)
-    ) {
-      renderValidation(error.result.validation);
-      renderOutline(error.result.outline || [], []);
-    } else if (
-      requestGeneration === validationRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null
-    ) {
-      stderr.textContent = String(error);
-    }
-  }
+  }, applyFieldMode);
 });
 
 dryRunButton.addEventListener("click", async () => {
   if (activeRunId !== null) return;
-  const selectionGeneration = activeRunGeneration;
-  try {
-    const payload = await workflowSubmissionPayload();
-    const result = await request("/api/dry-run", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (selectionGeneration === activeRunGeneration && activeRunId === null) {
-      renderValidation(result.validation || []);
-      renderOutline(result.outline || [], []);
-      renderDryRun(result);
-    }
-  } catch (error) {
-    if (selectionGeneration === activeRunGeneration && activeRunId === null) {
-      if (error.result) {
-        renderValidation(error.result.validation || []);
-        renderDryRun(error.result);
-      } else {
-        stderr.textContent = String(error);
+  await withPendingButton(dryRunButton, async () => {
+    const selectionGeneration = activeRunGeneration;
+    try {
+      const payload = await workflowSubmissionPayload();
+      const result = await request("/api/dry-run", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+        renderValidation(result.validation || []);
+        renderOutline(result.outline || [], []);
+        renderDryRun(result);
+      }
+    } catch (error) {
+      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+        if (error.result) {
+          renderValidation(error.result.validation || []);
+          renderDryRun(error.result);
+        } else {
+          stderr.textContent = String(error);
+        }
       }
     }
-  }
+  }, applyFieldMode);
 });
 
-refreshReadinessButton.addEventListener("click", refreshReadiness);
+refreshReadinessButton.addEventListener("click", async () => {
+  await withPendingButton(refreshReadinessButton, refreshReadiness);
+});
 
 runReadinessButton.addEventListener("click", async () => {
   if (!readinessWorkspace.value) return;
-  runReadinessButton.disabled = true;
-  refreshReadinessButton.disabled = true;
-  readinessSummary.className = "readiness-summary";
-  readinessSummary.textContent = "Creating exactly one probe tab…";
-  try {
-    const result = await request("/api/readiness/probe", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        workspaceId: readinessWorkspace.value,
-        provider: readinessProvider.value,
-      }),
-    });
-    renderReadinessProbe(result.probe);
-  } catch (error) {
-    if (error.result?.probe) renderReadinessProbe(error.result.probe);
-    else {
-      readinessSummary.className = "readiness-summary failed";
-      readinessSummary.textContent = String(error);
+  await withPendingButton(runReadinessButton, async () => {
+    refreshReadinessButton.disabled = true;
+    readinessSummary.className = "readiness-summary";
+    readinessSummary.textContent = "Creating exactly one probe tab…";
+    try {
+      const result = await request("/api/readiness/probe", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          workspaceId: readinessWorkspace.value,
+          provider: readinessProvider.value,
+        }),
+      });
+      renderReadinessProbe(result.probe);
+    } catch (error) {
+      if (error.result?.probe) renderReadinessProbe(error.result.probe);
+      else {
+        readinessSummary.className = "readiness-summary failed";
+        readinessSummary.textContent = String(error);
+      }
+    } finally {
+      refreshReadinessButton.disabled = false;
     }
-  } finally {
-    refreshReadinessButton.disabled = false;
-    await refreshReadiness();
-  }
+  }, refreshReadiness);
 });
 
 reconcileReadinessButton.addEventListener("click", async () => {
-  reconcileReadinessButton.disabled = true;
-  readinessSummary.className = "readiness-summary";
-  readinessSummary.textContent = "Authoritatively inspecting the unresolved probe identity…";
-  try {
-    const result = await request("/api/readiness/reconcile", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    });
-    renderReadinessProbe(result.probe);
-  } catch (error) {
-    readinessSummary.className = "readiness-summary failed";
-    readinessSummary.textContent = String(error);
-  } finally {
-    await refreshReadiness();
-  }
+  await withPendingButton(reconcileReadinessButton, async () => {
+    readinessSummary.className = "readiness-summary";
+    readinessSummary.textContent = "Authoritatively inspecting the unresolved probe identity…";
+    try {
+      const result = await request("/api/readiness/reconcile", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}",
+      });
+      renderReadinessProbe(result.probe);
+    } catch (error) {
+      readinessSummary.className = "readiness-summary failed";
+      readinessSummary.textContent = String(error);
+    }
+  }, refreshReadiness);
 });
 
 stopButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
-  const targetRunId = activeRunId;
-  const selectionGeneration = ++activeRunGeneration;
-  try {
-    const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) {
-      activeRunGeneration += 1;
-      renderRun(result);
+  await withPendingButton(stopButton, async () => {
+    const targetRunId = activeRunId;
+    const selectionGeneration = ++activeRunGeneration;
+    try {
+      const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) {
+        activeRunGeneration += 1;
+        renderRun(result);
+      }
+    } catch (error) {
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) stderr.textContent = String(error);
     }
-    await refresh();
-  } catch (error) {
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) stderr.textContent = String(error);
-  }
+  }, refresh);
 });
 
 cleanupButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
-  const targetRunId = activeRunId;
-  const selectionGeneration = ++activeRunGeneration;
-  cleanupButton.disabled = true;
-  try {
-    const result = await request(`/api/runs/${targetRunId}/cleanup`, {method: "POST"});
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) {
-      activeRunGeneration += 1;
-      renderRun(result);
+  await withPendingButton(cleanupButton, async () => {
+    const targetRunId = activeRunId;
+    const selectionGeneration = ++activeRunGeneration;
+    try {
+      const result = await request(`/api/runs/${targetRunId}/cleanup`, {method: "POST"});
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) {
+        activeRunGeneration += 1;
+        renderRun(result);
+      }
+    } catch (error) {
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) stderr.textContent = String(error);
     }
-    await refresh();
-  } catch (error) {
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) stderr.textContent = String(error);
-  }
+  }, refresh);
 });
 
 checkedToggle.addEventListener("click", async () => {
@@ -1668,40 +1699,38 @@ notifyServer.addEventListener("input", () => renderNotifyServerLink(null));
 
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  saveSettingsButton.disabled = true;
-  showSettingsMessage("Saving…");
-  try {
-    const settings = await request("/api/settings/notifications", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(settingsPayload()),
-    });
-    replacementToken.value = "";
-    renderSettings(settings);
-    showSettingsMessage("Settings saved. Changes apply immediately.");
-  } catch (error) {
-    replacementToken.value = "";
-    showSettingsMessage(String(error), true);
-  } finally {
-    saveSettingsButton.disabled = false;
-  }
+  await withPendingButton(saveSettingsButton, async () => {
+    showSettingsMessage("Saving…");
+    try {
+      const settings = await request("/api/settings/notifications", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(settingsPayload()),
+      });
+      replacementToken.value = "";
+      renderSettings(settings);
+      showSettingsMessage("Settings saved. Changes apply immediately.");
+    } catch (error) {
+      replacementToken.value = "";
+      showSettingsMessage(String(error), true);
+    }
+  });
 });
 
 testNotificationButton.addEventListener("click", async () => {
-  testNotificationButton.disabled = true;
-  showSettingsMessage("Sending…");
-  try {
-    const result = await request("/api/settings/notifications/test", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    });
-    showSettingsMessage(result.message);
-  } catch (error) {
-    showSettingsMessage(String(error), true);
-  } finally {
-    testNotificationButton.disabled = false;
-  }
+  await withPendingButton(testNotificationButton, async () => {
+    showSettingsMessage("Sending…");
+    try {
+      const result = await request("/api/settings/notifications/test", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}",
+      });
+      showSettingsMessage(result.message);
+    } catch (error) {
+      showSettingsMessage(String(error), true);
+    }
+  });
 });
 
 async function initialize() {
