@@ -229,6 +229,13 @@ endpoint. Browser aliases are trusted Host and Origin alternatives but are not
 assumed to resolve from a workflow's execution environment. Event callback
 URLs therefore use the HTTP server's directly reachable bound address.
 
+Settings exposes the preferred remotely reachable browser origin for mobile
+connection when the Runner is bound to a non-loopback IPv4 address. A
+local-only preferred alias falls back to the direct bind URL. The selected URL
+is shown as text and encoded in a locally generated QR code; a local-only or
+wildcard bind does not offer either. This is display-only and does not alter
+the Host and Origin allowlist, request-token checks, or authentication semantics.
+
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
 notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,
 `AGENT_WORKFLOW_MANAGER_NOTIFY_FAILURE`, and

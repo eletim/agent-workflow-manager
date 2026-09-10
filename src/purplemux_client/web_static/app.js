@@ -97,6 +97,9 @@ const settingsDialog = document.querySelector("#settings-dialog");
 const settingsOpen = document.querySelector("#settings-open");
 const settingsClose = document.querySelector("#settings-close");
 const settingsForm = document.querySelector("#notification-settings");
+const mobileConnectionHelp = document.querySelector("#mobile-connection-help");
+const mobileConnectionUrl = document.querySelector("#mobile-connection-url");
+const mobileConnectionQr = document.querySelector("#mobile-connection-qr");
 const notificationsEnabled = document.querySelector("#notifications-enabled");
 const notifySuccess = document.querySelector("#notify-success");
 const notifyFailure = document.querySelector("#notify-failure");
@@ -1194,6 +1197,23 @@ function renderSettings(settings) {
   credentialStatus.className = `credential ${configured ? "configured" : "missing"}`;
 }
 
+function renderMobileConnection(connection) {
+  const available = typeof connection.url === "string" && connection.url !== "";
+  mobileConnectionUrl.hidden = !available;
+  mobileConnectionQr.hidden = !available;
+  if (!available) {
+    mobileConnectionHelp.textContent = "Mobile connection is unavailable while AWM is configured for local-only access.";
+    mobileConnectionUrl.textContent = "";
+    mobileConnectionUrl.removeAttribute("href");
+    mobileConnectionQr.removeAttribute("src");
+    return;
+  }
+  mobileConnectionHelp.textContent = "Scan this code from a device that can reach the configured trusted network.";
+  mobileConnectionUrl.textContent = connection.url;
+  mobileConnectionUrl.setAttribute("href", connection.url);
+  mobileConnectionQr.setAttribute("src", "/api/settings/mobile-connection/qr.svg");
+}
+
 function renderNotifyServerLink(serverUrl) {
   const available = typeof serverUrl === "string" && serverUrl !== "";
   notifyServerLink.hidden = !available;
@@ -1590,6 +1610,11 @@ async function initialize() {
     renderSettings(await request("/api/settings/notifications"));
   } catch (error) {
     showSettingsMessage(String(error), true);
+  }
+  try {
+    renderMobileConnection(await request("/api/settings/mobile-connection"));
+  } catch (error) {
+    renderMobileConnection({url: null});
   }
   await refreshReadiness();
 }

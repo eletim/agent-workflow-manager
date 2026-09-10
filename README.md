@@ -611,6 +611,12 @@ and every configured alias URL. Unknown Hosts and Origins remain rejected, and
 every mutation still requires the per-server request token. Network access is
 an outer trust boundary, not a replacement for these checks.
 
+Settings also shows the preferred configured remote URL as text and as a QR
+code for opening AWM from a mobile device on the same trusted network. A
+local-only bind never produces a QR code because its loopback URL cannot be
+reached from another device. This display does not change the configured bind,
+trusted hosts, request-token protection, or authentication behavior.
+
 Local, LAN, and private-VPN HTTP is a first-class Runner deployment mode, not a
 degraded compatibility mode. Core actions—guide and output copy, validation,
 Run, Stop, Continue after fix, settings, progress, and read APIs—must remain
