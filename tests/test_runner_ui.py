@@ -96,6 +96,18 @@ def test_notifications_are_reached_from_the_header_settings_dialog() -> None:
     assert 'rel="noopener noreferrer"' in html
 
 
+def test_mobile_connection_is_shown_in_the_settings_dialog() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    ancestors = _ancestors("mobile-connection-qr")
+
+    assert any(
+        tag == "dialog" and attributes.get("id") == "settings-dialog"
+        for tag, attributes in ancestors
+    )
+    assert 'id="mobile-connection-url"' in html
+    assert "QR code for the Agent Workflow Manager URL" in html
+
+
 def test_prompt_repository_navigation_is_read_only_and_safe() -> None:
     html = INDEX.read_text(encoding="utf-8")
 

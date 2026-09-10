@@ -229,15 +229,25 @@ emit_step("workspace create", "completed")</textarea>
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
       <div class="settings-dialog-toolbar">
         <div>
-          <p class="settings-path">Settings <span aria-hidden="true">›</span> Notifications</p>
-          <h2 id="settings-title">Notifications</h2>
+          <p class="settings-path">Runner configuration</p>
+          <h2 id="settings-title">Settings</h2>
         </div>
         <button id="settings-close" type="button">Close</button>
       </div>
       <div class="settings-dialog-content">
+        <section class="mobile-connection" aria-labelledby="mobile-connection-title">
+          <div>
+            <h3 id="mobile-connection-title">Connect from mobile</h3>
+            <p id="mobile-connection-help">Scan this code from a device that can reach the configured trusted network.</p>
+            <a id="mobile-connection-url" target="_blank" rel="noopener noreferrer" hidden></a>
+          </div>
+          <img id="mobile-connection-qr" alt="QR code for the Agent Workflow Manager URL" hidden>
+        </section>
+        <hr class="settings-divider">
         <form id="notification-settings">
           <div class="settings-heading">
             <div>
+              <h3>Notifications</h3>
               <p>Terminal-state policy and notify CLI delivery settings.</p>
             </div>
             <span id="credential-status" class="credential missing">Credentials: Missing</span>

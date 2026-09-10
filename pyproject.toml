@@ -10,7 +10,9 @@ authors = []
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "qrcode>=8.2,<9",
+]
 
 [dependency-groups]
 test = [

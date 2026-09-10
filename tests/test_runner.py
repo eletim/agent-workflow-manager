@@ -43,7 +43,12 @@ from purplemux_client.runner import (
     RunResource,
     TopologyFinding,
 )
-from purplemux_client.web import RunnerHTTPServer, build_parser, list_directory
+from purplemux_client.web import (
+    RunnerHTTPServer,
+    build_parser,
+    list_directory,
+    mobile_connection_url,
+)
 
 
 @pytest.fixture
@@ -3570,6 +3575,9 @@ def test_explicit_remote_bind_accepts_only_matching_host_origin_and_token() -> N
         status, token_payload = request(address, "GET", "/api/token")
         assert status == 200
         token = str(token_payload["token"])
+        status, connection = request(address, "GET", "/api/settings/mobile-connection")
+        assert status == 200
+        assert connection == {"url": None}
         status, _ = request(address, "GET", "/api/status")
         assert status == 200
 
@@ -3637,6 +3645,25 @@ def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
     args = build_parser().parse_args(["--host", "100.64.10.20"])
 
     assert args.host == "100.64.10.20"
+
+
+def test_mobile_connection_uses_remote_browser_origin_only() -> None:
+    alias_origin = "http://runner.example.ts.net:8765"
+
+    assert mobile_connection_url("100.64.10.20", alias_origin) == alias_origin
+    assert mobile_connection_url("192.168.50.20", alias_origin) == alias_origin
+    assert mobile_connection_url("127.0.0.1", alias_origin) is None
+    assert mobile_connection_url("localhost", alias_origin) is None
+    assert mobile_connection_url("0.0.0.0", alias_origin) is None
+
+
+def test_mobile_connection_qr_is_generated_as_svg() -> None:
+    url = "http://runner.example.ts.net:8765"
+
+    qr = RunnerHTTPServer._make_qr_svg(url)
+
+    assert b"<svg" in qr
+    assert b"<path" in qr
 
 
 @pytest.mark.parametrize(
@@ -3735,6 +3762,29 @@ def test_configured_hostname_alias_accepts_get_and_protected_post() -> None:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_local_only_server_does_not_offer_a_mobile_connection_qr() -> None:
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    address = (str(host), int(port))
+    try:
+        status, connection = request(address, "GET", "/api/settings/mobile-connection")
+        qr_status, qr_error = request(
+            address, "GET", "/api/settings/mobile-connection/qr.svg"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert status == 200
+    assert connection == {"url": None}
+    assert qr_status == 404
+    assert "local-only" in str(qr_error["error"])
 
 
 def test_server_allows_explicitly_requested_hostname() -> None:
