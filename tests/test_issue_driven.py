@@ -621,6 +621,50 @@ def test_planner_policy_conflicts_use_a_bounded_json_contract() -> None:
         )
 
 
+def test_planner_recovers_invalid_policy_conflicts_in_the_same_session() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    responses = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": ["conflict without a configured policy"],
+                }
+            ),
+            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+        )
+    )
+    turns: list[tuple[str, str]] = []
+    workflow["create_agent"] = lambda *args, **kwargs: "planner-session"
+
+    def run_turn(_client, tab, _name, prompt, **_kwargs):
+        turns.append((tab, prompt))
+        return next(responses)
+
+    workflow["run_turn"] = run_turn
+    workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        None,
+        workflow["WorkItemPlan"](config),
+    )
+
+    assert effective == ()
+    assert [tab for tab, _prompt in turns] == [
+        "planner-session",
+        "planner-session",
+    ]
+    assert "reported a policy conflict without a policy Issue" in turns[1][1]
+
+
 @pytest.mark.parametrize(
     "topology_error",
     [

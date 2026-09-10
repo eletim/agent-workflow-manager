@@ -190,6 +190,9 @@ def test_decision_accepts_bounded_reviewer_verdict_variations(
         "Introduction\nDetails\nMore details\nAPPROVED",
         "NOT APPROVED",
         "This review is APPROVED",
+        "Looks approved",
+        "APPROVE",
+        "No changes requested",
         "UNAPPROVED",
     ],
 )
@@ -308,7 +311,57 @@ def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert source.count("def decision(result: str) -> str:") == 1
-    assert source.count("decision(result)") == 3
+    assert "decision(result)" not in source
+    assert source.count("run_validated_turn(") == 5
+
+
+def test_machine_output_recovery_corrects_in_the_same_session() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    responses = iter(("Looks approved", "## APPROVED"))
+    turns: list[tuple[str, str, str]] = []
+
+    def run_turn(_client, tab, name, prompt, **_kwargs):
+        turns.append((tab, name, prompt))
+        return next(responses)
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+
+    result, verdict = workflow["run_validated_turn"](
+        object(), "reviewer-tab", "Scope review", "Review this.", workflow["decision"]
+    )
+
+    assert result == "## APPROVED"
+    assert verdict == "APPROVED"
+    assert [turn[0] for turn in turns] == ["reviewer-tab", "reviewer-tab"]
+    assert turns[1][1] == "Scope review output correction"
+    assert "reviewer must provide APPROVED or CHANGES_REQUESTED" in turns[1][2]
+    assert "complete corrected response only" in turns[1][2]
+
+
+def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    turns: list[str] = []
+
+    def run_turn(_client, _tab, name, _prompt, **_kwargs):
+        turns.append(name)
+        return "APPROVE"
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+
+    with pytest.raises(WorkerFailure, match="after 2 correction attempts"):
+        workflow["run_validated_turn"](
+            object(),
+            "reviewer-tab",
+            "Scenario Gate",
+            "Review this.",
+            workflow["decision"],
+        )
+
+    assert turns == [
+        "Scenario Gate",
+        "Scenario Gate output correction",
+        "Scenario Gate output correction",
+    ]
 
 
 def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
@@ -363,7 +416,10 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
     tree = ast.parse(EXAMPLE.read_text(encoding="utf-8"))
     prompts: dict[str, ast.expr] = {}
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
-        if not isinstance(call.func, ast.Name) or call.func.id != "run_turn":
+        if not isinstance(call.func, ast.Name) or call.func.id not in {
+            "run_turn",
+            "run_validated_turn",
+        }:
             continue
         name = call.args[2]
         if isinstance(name, ast.Constant):
