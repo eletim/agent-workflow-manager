@@ -482,11 +482,18 @@ github = GitHubRepository.open(
     "OWNER/REPO",
     executable="gh",
     command_timeout_seconds=30.0,
-    read_timeout_retries=1,
+    read_timeout_retries=2,
+    read_retry_backoff_seconds=0.25,
     page_size=100,
     max_pages=10,
 )
 ```
+
+Read-only GitHub calls retry timeouts, rate-limit-specific 403 responses, and
+transient HTTP responses such as 429, 502, 503, and 504 with a short exponential
+backoff. Each retry is logged, and the final GitHub error is reported when the
+configured retry limit is exhausted. Ordinary authorization failures and GitHub
+mutations are not retried by this setting.
 
 The supported Git inspection and assertion methods are:
 

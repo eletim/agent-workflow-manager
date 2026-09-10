@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import time
@@ -246,6 +247,196 @@ def repository(runner: FakeGitHubRunner, **kwargs: int) -> GitHubRepository:
         page_size=kwargs.get("page_size", 10),
         max_pages=kwargs.get("max_pages", 3),
     )
+
+
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
+def test_transient_github_read_errors_retry_with_backoff_and_logging(
+    status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = FakeGitHubRunner()
+    original_runner = runner
+    failures = 0
+    sleeps: list[float] = []
+
+    def transient_read(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal failures
+        if len(args) >= 3 and "pulls?" in args[2] and failures < 2:
+            failures += 1
+            return subprocess.CompletedProcess(
+                args, 1, "", f"gh: temporary failure (HTTP {status})"
+            )
+        return original_runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project",
+        runner=transient_read,
+        read_timeout_retries=2,
+        read_retry_backoff_seconds=0.1,
+        sleep=sleeps.append,
+    )
+    with caplog.at_level(logging.WARNING):
+        assert (
+            github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN") is None
+        )
+
+    assert failures == 2
+    assert sleeps == [0.1, 0.2]
+    assert caplog.text.count(f"HTTP {status}") == 2
+    assert "retrying attempt 2/3" in caplog.text
+    assert "retrying attempt 3/3" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+        "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+    ],
+)
+def test_rate_limit_specific_github_403_is_retried(detail: str) -> None:
+    runner = FakeGitHubRunner()
+    failures = 0
+    sleeps: list[float] = []
+
+    def rate_limited_read(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal failures
+        if len(args) >= 3 and "pulls?" in args[2] and failures == 0:
+            failures += 1
+            return subprocess.CompletedProcess(args, 1, "", detail)
+        return runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project",
+        runner=rate_limited_read,
+        read_retry_backoff_seconds=0.1,
+        sleep=sleeps.append,
+    )
+
+    assert github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN") is None
+    assert failures == 1
+    assert sleeps == [0.1]
+
+
+def test_transient_github_read_exhaustion_preserves_last_error() -> None:
+    runner = FakeGitHubRunner()
+    failures = 0
+
+    def unavailable_read(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal failures
+        if len(args) >= 3 and "pulls?" in args[2]:
+            failures += 1
+            return subprocess.CompletedProcess(
+                args, 1, "", f"gh: gateway failure {failures} (HTTP 504)"
+            )
+        return runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project",
+        runner=unavailable_read,
+        read_timeout_retries=2,
+        read_retry_backoff_seconds=0,
+    )
+
+    with pytest.raises(WorkerFailure, match=r"gateway failure 3 \(HTTP 504\)"):
+        github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+    assert failures == 3
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "gh: Not Found (HTTP 404)",
+        "gh: Resource not accessible by personal access token (HTTP 403)",
+    ],
+)
+def test_permanent_github_read_error_is_not_retried(detail: str) -> None:
+    runner = FakeGitHubRunner()
+    failures = 0
+
+    def rejected_read(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal failures
+        if len(args) >= 3 and "pulls?" in args[2]:
+            failures += 1
+            return subprocess.CompletedProcess(args, 1, "", detail)
+        return runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project", runner=rejected_read, read_timeout_retries=2
+    )
+
+    with pytest.raises(WorkerFailure, match=re.escape(detail)):
+        github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN")
+    assert failures == 1
+
+
+def test_github_read_timeout_retry_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = FakeGitHubRunner()
+    timed_out = False
+    sleeps: list[float] = []
+
+    def timeout_once(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal timed_out
+        if len(args) >= 3 and "pulls?" in args[2] and not timed_out:
+            timed_out = True
+            raise subprocess.TimeoutExpired(args, 30)
+        return runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project",
+        runner=timeout_once,
+        read_retry_backoff_seconds=0.1,
+        sleep=sleeps.append,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert (
+            github.find_pr(head="feature/65", base="dev/v0.1.4", state="OPEN") is None
+        )
+    assert sleeps == [0.1]
+    assert "failure (timeout); retrying attempt 2/3" in caplog.text
+
+
+def test_transient_github_mutation_error_is_not_retried() -> None:
+    runner = FakeGitHubRunner([pr_data(1)])
+    mutation_calls = 0
+
+    def unavailable_mutation(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal mutation_calls
+        if any("markPullRequestReadyForReview" in value for value in args):
+            mutation_calls += 1
+            return subprocess.CompletedProcess(
+                args, 1, "", "gh: Service Unavailable (HTTP 503)"
+            )
+        return runner(args, **kwargs)  # type: ignore[arg-type]
+
+    github = GitHubRepository.open(
+        "acme/project", runner=unavailable_mutation, read_retry_backoff_seconds=0
+    )
+
+    with pytest.raises(MutationOutcomeUnknown):
+        github.set_draft(
+            1,
+            draft=False,
+            expected_head="feature/65",
+            expected_head_sha=HEAD_SHA,
+            expected_base="dev/v0.1.4",
+            expected_base_sha=BASE_SHA,
+        )
+    assert mutation_calls == 1
 
 
 def test_open_discovery_rejects_wrong_base_and_ambiguity() -> None:
