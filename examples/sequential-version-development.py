@@ -13,9 +13,10 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -54,6 +55,7 @@ MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
 MAX_PLAN_STATE_CHARS = 32_000
+MAX_MACHINE_OUTPUT_CORRECTIONS = 2
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -438,6 +440,47 @@ def run_turn(
     )
     terminal_progress("DONE", name, iteration=iteration)
     return result
+
+
+ValidatedOutput = TypeVar("ValidatedOutput")
+
+
+def run_validated_turn(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    name: str,
+    prompt: str,
+    validator: Callable[[str], ValidatedOutput],
+    *,
+    iteration: int | None = None,
+    pr: PullRequestState | None = None,
+) -> tuple[str, ValidatedOutput]:
+    """Retry an invalid machine-readable response in the same agent session."""
+    result = run_turn(client, tab, name, prompt, iteration=iteration, pr=pr)
+    for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+        try:
+            return result, validator(result)
+        except WorkerFailure as exc:
+            if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
+                raise WorkerFailure(
+                    f"{name} returned invalid output after "
+                    f"{MAX_MACHINE_OUTPUT_CORRECTIONS} correction attempts: "
+                    f"{short_error(exc)}"
+                ) from exc
+            validation_error = short_error(exc)
+            result = run_turn(
+                client,
+                tab,
+                f"{name} output correction",
+                "The previous response violated its machine-readable output "
+                f"contract: {validation_error}\n\n"
+                "Return the complete corrected response only, following the "
+                "original response contract. Correct the output in this same "
+                "session; do not repeat the underlying task or mutate any state.",
+                iteration=correction + 1,
+                pr=pr,
+            )
+    raise AssertionError("unreachable")
 
 
 def implementer_prompt(prompt: str) -> str:
@@ -1320,11 +1363,12 @@ def review_issue_phase(
             (warning,),
         )
     for review_number in range(review_offset + 1, max_reviews + 1):
-        result = run_turn(
+        result, verdict = run_validated_turn(
             client,
             reviewer,
             f"{issue.label} {phase} review",
             f"{prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
+            decision,
             iteration=review_number,
             pr=pr,
         )
@@ -1376,7 +1420,7 @@ def review_issue_phase(
                 )
             continue
         current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
-        if decision(result) == "APPROVED":
+        if verdict == "APPROVED":
             return IssueReviewPhaseResult(
                 current, "approved", current.head_sha, current.base_sha, review_number
             )
@@ -2260,7 +2304,7 @@ def process_work_items(
         name="Work-item planner",
     )
     for planner_turn in range(1, MAX_PLANNER_TURNS + 1):
-        decision = run_turn(
+        _, planner_decision = run_validated_turn(
             client,
             planner,
             "Work-item planning",
@@ -2268,9 +2312,9 @@ def process_work_items(
                 config, scope="work-item planning", structured_conflicts=True
             )
             + planner_prompt(plan, config),
+            lambda source: apply_planner_decision(plan, source),
             iteration=planner_turn,
         )
-        planner_decision = apply_planner_decision(plan, decision)
         for conflict in planner_decision.policy_conflicts:
             record_policy_conflict(
                 None,
@@ -2411,12 +2455,13 @@ def review_whole_version(
     for review_number in range(1, MAX_REVIEWS + 1):
         result: str
         if scenario_reviewer is not None:
-            result = run_turn(
+            result, verdict = run_validated_turn(
                 client,
                 scenario_reviewer,
                 "Scenario Gate reviewer turn",
                 policy_context(config, scope="the whole-version Scenario Gate")
                 + scenario_gate_prompt(pr, config, work_items),
+                decision,
                 iteration=review_number,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
@@ -2452,13 +2497,15 @@ def review_whole_version(
                 continue
         else:
             result = "APPROVED\nScenario Gate not configured."
-        if decision(result) == "APPROVED":
-            result = run_turn(
+            verdict = "APPROVED"
+        if verdict == "APPROVED":
+            result, verdict = run_validated_turn(
                 client,
                 reviewer,
                 "Whole-version reviewer turn",
                 policy_context(config, scope="the whole-version review")
                 + whole_version_review_prompt(pr, config, work_items),
+                decision,
                 iteration=review_number,
             )
         emit_policy_conflicts(result, config, scope="the integrated version")
@@ -2502,7 +2549,6 @@ def review_whole_version(
             draft=True,
         )
         current = ensure_base_pr_policy_notes(github, current, config)
-        verdict = decision(result)
         warning: str | None = None
         if verdict == "CHANGES_REQUESTED":
             if review_number == MAX_REVIEWS:
