@@ -157,7 +157,7 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         assert run.event_token not in client.request.command
         assert str(run.credential_path) in client.request.command
         assert (
-            f"http://runner.example:{server.server_address[1]}"
+            f"http://127.0.0.1:{server.server_address[1]}"
             f"/api/runs/{run_id}/events"
             in run.credential_path.read_text(encoding="utf-8")
         )
@@ -219,7 +219,7 @@ def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) 
         workflow_cwd=tmp_path,
         runtime_factory=lambda: runtime,  # type: ignore[arg-type]
     )
-    runner.configure_runner_origin("http://127.0.0.1:1")
+    runner.configure_event_endpoint("http://127.0.0.1:1")
     try:
         run_id = runner.start("import time; time.sleep(60)")
         assert runner.stop(run_id) is True
@@ -239,7 +239,7 @@ def test_transient_result_error_is_retried_without_stop(tmp_path: Path) -> None:
         workflow_cwd=tmp_path,
         runtime_factory=lambda: runtime,  # type: ignore[arg-type]
     )
-    runner.configure_runner_origin("http://127.0.0.1:1")
+    runner.configure_event_endpoint("http://127.0.0.1:1")
     try:
         run_id = runner.start("print('completed')")
 
@@ -315,7 +315,7 @@ def test_authoritative_start_failure_tracks_created_tab_and_result(
         workflow_cwd=tmp_path,
         runtime_factory=lambda: runtime,  # type: ignore[arg-type]
     )
-    runner.configure_runner_origin("http://127.0.0.1:1")
+    runner.configure_event_endpoint("http://127.0.0.1:1")
     try:
         run_id = runner.start("print('not started')")
         failed = runner.snapshot(run_id)

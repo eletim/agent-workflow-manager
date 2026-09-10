@@ -587,7 +587,8 @@ class PythonRunner:
             else None
         )
         self._run_history_lock_descriptor: int | None = None
-        self._runner_origin: str | None = None
+        self._browser_origin: str | None = None
+        self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
         self._closed = False
         try:
@@ -905,14 +906,23 @@ class PythonRunner:
                 f"terminal run history is unreadable: {path}"
             ) from exc
 
-    def configure_runner_origin(self, origin: str) -> None:
-        """Set the shared browser and event origin for an attached HTTP server."""
+    def configure_browser_origin(self, origin: str) -> None:
+        """Set the authoritative browser-navigation origin for this Runner."""
         if not origin.startswith("http://") or "\0" in origin:
-            raise ValueError("Runner origin must be a local HTTP URL")
+            raise ValueError("browser origin must be a local HTTP URL")
         with self._lock:
             if any(run.state == "running" for run in self._runs.values()):
-                raise RuntimeError("Runner origin cannot change while a run is active")
-            self._runner_origin = origin.rstrip("/")
+                raise RuntimeError("browser origin cannot change while a run is active")
+            self._browser_origin = origin.rstrip("/")
+
+    def configure_event_endpoint(self, base_url: str) -> None:
+        """Enable managed Workflow callbacks for an attached HTTP server."""
+        if not base_url.startswith("http://") or "\0" in base_url:
+            raise ValueError("event endpoint must be a local HTTP URL")
+        with self._lock:
+            if any(run.state == "running" for run in self._runs.values()):
+                raise RuntimeError("event endpoint cannot change while a run is active")
+            self._event_base_url = base_url.rstrip("/")
 
     def validate(
         self,
@@ -1139,9 +1149,9 @@ class PythonRunner:
         prompt: PromptExecution | None = None,
     ) -> int:
         if prompt is None and self.managed_workflows:
-            if self._runner_origin is None:
+            if self._event_base_url is None:
                 raise RuntimeError(
-                    "managed Workflow execution requires an attached Runner origin"
+                    "managed Workflow execution requires an attached event endpoint"
                 )
         run_id = self._reserve_run_id_locked()
         if prompt is None and self.managed_workflows:
@@ -1214,7 +1224,7 @@ class PythonRunner:
         credential = tempfile.NamedTemporaryFile(
             mode="w", suffix=".env", encoding="utf-8", delete=False
         )
-        event_url = f"{self._runner_origin}/api/runs/{run_id}/events"
+        event_url = f"{self._event_base_url}/api/runs/{run_id}/events"
         managed_env = dict(child_env)
         managed_env.pop(PROGRESS_FD_ENV, None)
         managed_env.pop(RESOURCE_ACK_FD_ENV, None)
@@ -2807,8 +2817,8 @@ class PythonRunner:
         run_id = run.run_id
         folder_name = Path(run.cwd).name or Path(run.cwd).anchor
         click_url = (
-            f"{self._runner_origin}/?run={self._run_identity(run_id)}"
-            if self._runner_origin is not None
+            f"{self._browser_origin}/?run={self._run_identity(run_id)}"
+            if self._browser_origin is not None
             else None
         )
         try:

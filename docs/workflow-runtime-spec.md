@@ -217,13 +217,17 @@ not drive workflow control flow and do not participate in orchestration.
 
 The title and Runner link are common notification metadata, independent of the
 delivery device or transport. The title contains only the basename of the
-Run's authoritative working directory. Every HTTP-attached Runner has one
-authoritative origin, using the first configured browser hostname alias when
-present and otherwise the requested bind host. Notification navigation and
-managed Workflow event callbacks derive their distinct paths from that shared
-origin. The link includes the opaque, persisted Run identity; opening it
-selects that exact Run, and the UI does not infer navigation from the title or
-other display text.
+Run's authoritative working directory. Every HTTP-attached Runner has an
+authoritative browser-navigation origin, using the first configured browser
+hostname alias when present and otherwise the requested bind host. The link
+includes the opaque, persisted Run identity; opening it selects that exact
+Run, and the UI does not infer navigation from the title or other display
+text.
+
+The browser-navigation origin is distinct from the managed Workflow event
+endpoint. Browser aliases are trusted Host and Origin alternatives but are not
+assumed to resolve from a workflow's execution environment. Event callback
+URLs therefore use the HTTP server's directly reachable bound address.
 
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
 notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,

@@ -208,7 +208,10 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             else None
         )
         self.runner = runner or PythonRunner(notifier=notifier, managed_workflows=True)
-        self.runner.configure_runner_origin(f"http://{browser_host}:{bound_port}")
+        self.runner.configure_browser_origin(f"http://{browser_host}:{bound_port}")
+        if self.runner.managed_workflows:
+            event_host = "127.0.0.1" if bound_host == "0.0.0.0" else bound_host
+            self.runner.configure_event_endpoint(f"http://{event_host}:{bound_port}")
         self.notification_settings = notification_settings or NotificationSettings(
             runtime_config=Path(
                 os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")
