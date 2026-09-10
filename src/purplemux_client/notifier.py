@@ -18,6 +18,14 @@ class NotificationResult:
     diagnostic: str
 
 
+@dataclass(frozen=True)
+class NotificationMetadata:
+    """Run navigation metadata shared by terminal notification transports."""
+
+    title: str
+    click_url: str | None
+
+
 class NotifyCLI:
     """Best-effort terminal notifications through the public ``notify`` CLI."""
 
@@ -95,7 +103,12 @@ class NotifyCLI:
                 self._transport_overrides["NOTIFY_TOKEN"] = replacement_token
 
     def notify_terminal(
-        self, *, run_id: int, state: TerminalState, exit_code: int | None
+        self,
+        *,
+        run_id: int,
+        state: TerminalState,
+        exit_code: int | None,
+        metadata: NotificationMetadata,
     ) -> NotificationResult:
         enabled, notify_success, notify_failure, notify_stopped = self.policy()
         if not enabled:
@@ -107,13 +120,19 @@ class NotifyCLI:
         if state == "stopped" and not notify_stopped:
             return NotificationResult(False, False, "stopped notifications disabled")
 
-        title, message = _terminal_message(run_id, state, exit_code)
-        return self._send(title=title, message=message)
+        message = _terminal_message(run_id, state, exit_code)
+        return self._send(
+            title=metadata.title,
+            message=message,
+            click_url=metadata.click_url,
+        )
 
     def send_test(self) -> NotificationResult:
         return self._send(title="Agent Workflow Manager", message="Test notification")
 
-    def _send(self, *, title: str, message: str) -> NotificationResult:
+    def _send(
+        self, *, title: str, message: str, click_url: str | None = None
+    ) -> NotificationResult:
         executable = shutil.which(self.executable)
         if executable is None:
             return NotificationResult(True, False, "notify command unavailable")
@@ -128,8 +147,18 @@ class NotifyCLI:
                     environment["NOTIFY_CONFIG"] = self.config_path
                 environment.update(self._transport_overrides)
             try:
+                command = [
+                    executable,
+                    "send",
+                    "--title",
+                    title,
+                    "--message",
+                    message,
+                ]
+                if click_url is not None:
+                    command.extend(("--click", click_url))
                 process = subprocess.Popen(
-                    [executable, "send", "--title", title, "--message", message],
+                    command,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -172,18 +201,13 @@ class NotifyCLI:
             pass
 
 
-def _terminal_message(
-    run_id: int, state: TerminalState, exit_code: int | None
-) -> tuple[str, str]:
+def _terminal_message(run_id: int, state: TerminalState, exit_code: int | None) -> str:
     if state == "success":
-        return "Workflow completed", f"Run {run_id} finished with state: success"
+        return f"Run {run_id} finished with state: success"
     if state == "failed":
         exit_detail = f" and exit code {exit_code}" if exit_code is not None else ""
-        return (
-            "Workflow failed",
-            f"Run {run_id} finished with state: failed{exit_detail}",
-        )
-    return "Workflow stopped", f"Run {run_id} finished with state: stopped"
+        return f"Run {run_id} finished with state: failed{exit_detail}"
+    return f"Run {run_id} finished with state: stopped"
 
 
 def _environment_flag(name: str, default: bool) -> bool:

@@ -179,6 +179,7 @@ class WorkItemPlan:
     items: list[Issue] = field(init=False)
     position: int = 0
     finalized: bool = False
+    persisted_source: str | None = None
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -2005,7 +2006,23 @@ def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
     plan.finalized = finalized
     if finalized and position != len(plan.items):
         raise WorkerFailure("Base PR work-item plan completion state is inconsistent")
+    plan.persisted_source = serialized_work_item_plan(plan)
     return plan
+
+
+def deferred_work_item_plan_ref(config: Config) -> str:
+    identity = json.dumps(
+        {
+            "repository": config.slug.lower(),
+            "integration_branch": config.integration_branch,
+            "final_branch": config.main_branch,
+            "seed": plan_seed_fingerprint(config),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return f"refs/notes/agent-workflow-manager/work-item-plan-{digest}"
 
 
 def with_work_item_plan(body: str, plan: WorkItemPlan) -> str:
@@ -2030,7 +2047,7 @@ def prepare_work_item_plan_pr(
     config: Config,
     repo: GitRepository,
     github: GitHubRepository,
-) -> tuple[PullRequestState, WorkItemPlan]:
+) -> tuple[PullRequestState | None, WorkItemPlan]:
     integration = repo.synchronize_branch(config.integration_branch)
     final = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or final.remote_sha is None:
@@ -2062,7 +2079,23 @@ def prepare_work_item_plan_pr(
         rehydrate_policy_conflicts(merged.body, config, issue_number=None)
         return merged, plan
     if pr is None:
-        initial_plan = WorkItemPlan(config)
+        recovery_body = repo.inspect_remote_note(
+            deferred_work_item_plan_ref(config), final.remote_sha
+        )
+        if recovery_body is not None:
+            initial_plan = work_item_plan_from_body(recovery_body, config)
+            initial_plan.persisted_source = recovery_body
+            rehydrate_policy_conflicts(recovery_body, config, issue_number=None)
+        else:
+            initial_plan = WorkItemPlan(config)
+        if integration.remote_sha == final.remote_sha:
+            emit_finding(
+                "github",
+                "Base PR creation deferred until the integration branch "
+                "differs from the final branch",
+                status="info",
+            )
+            return None, initial_plan
         pr = github.create_draft_pr(
             head=config.integration_branch,
             base=config.main_branch,
@@ -2106,8 +2139,25 @@ def persist_work_item_plan(
     config: Config,
     repo: GitRepository,
     github: GitHubRepository,
-    pr: PullRequestState,
-) -> PullRequestState:
+    pr: PullRequestState | None,
+) -> PullRequestState | None:
+    if pr is None:
+        pr, _initial_plan = prepare_work_item_plan_pr(config, repo, github)
+        if pr is None:
+            final = repo.inspect_branch(config.main_branch)
+            if final.remote_sha is None:
+                raise WorkerFailure("final remote branch is missing")
+            source = with_base_pr_policy_notes(
+                serialized_work_item_plan(plan), config
+            )
+            repo.update_remote_note(
+                deferred_work_item_plan_ref(config),
+                final.remote_sha,
+                source,
+                expected_body=plan.persisted_source,
+            )
+            plan.persisted_source = source
+            return None
     if pr.state == "MERGED":
         if with_work_item_plan(pr.body, plan) != pr.body:
             raise WorkerFailure("cannot change work-item plan after final PR merge")
@@ -2167,7 +2217,7 @@ def process_work_items(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
-    plan_pr: PullRequestState,
+    plan_pr: PullRequestState | None,
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
@@ -2216,6 +2266,8 @@ def process_work_items(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
+        if plan_pr is None:
+            plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
 
 
@@ -2551,7 +2603,7 @@ def integration_delivery(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
-) -> PullRequestState:
+) -> PullRequestState | None:
     integration = repo.synchronize_branch(config.integration_branch)
     main = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or main.remote_sha is None:
@@ -2605,19 +2657,27 @@ def integration_delivery(
         )
         return merged_pr
     if pr is None:
-        pr = github.create_draft_pr(
-            head=config.integration_branch,
-            base=config.main_branch,
-            expected_head_sha=integration.remote_sha,
-            expected_base_sha=main.remote_sha,
-            title=f"Integrate {config.integration_branch}",
-            body=(
-                "Sequential integration; Ready only after whole-version checks."
-                f"{one_shot_pr_notes(config)}"
-                f"{policy_pr_notes(config)}"
-            ),
-            correlation_id=run_correlation("integration-pr"),
-        )
+        pr, finalized_plan = prepare_work_item_plan_pr(config, repo, github)
+        if not finalized_plan.finalized or finalized_plan.snapshot != work_items:
+            raise WorkerFailure(
+                "final delivery work items do not match the finalized persisted plan"
+            )
+        if pr is None:
+            emit_whole_review_result(
+                "skipped",
+                0,
+                warnings=summary_warnings(None),
+            )
+            emit_step(
+                "Final integration PR",
+                "completed",
+                message="no implementation changes; no PR required",
+            )
+            return None
+        if pr.state == "MERGED":
+            raise WorkerFailure(
+                "final delivery was merged while its deferred PR was being acquired"
+            )
     else:
         pr = return_to_draft_for_review(
             github,
@@ -2763,6 +2823,9 @@ def main() -> None:
         lambda: process_work_items(config, client, repo, github, plan_pr, plan),
     )
     ready = integration_delivery(config, work_items, client, repo, github)
+    if ready is None:
+        print("No implementation changes; no whole-version PR is required.", flush=True)
+        return
     if ready.state == "MERGED":
         outcome = "Merged"
     elif ready.is_draft:

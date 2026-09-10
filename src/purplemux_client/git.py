@@ -271,6 +271,73 @@ class GitRepository:
             result[branch] = fields[0]
         return result
 
+    def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+        """Read a note from an AWM-owned remote ref without changing branch heads."""
+        self._validate_identity()
+        self._validate_note_ref(ref)
+        self._validate_sha(object_sha)
+        remote_sha = self._remote_ref_sha(ref)
+        if remote_sha is None:
+            return None
+        cache_ref = self._note_cache_ref(ref)
+        self._git_mutation(
+            ["fetch", "--no-tags", self.remote, f"+{ref}:{cache_ref}"],
+            operation="fetch workflow recovery note",
+            target=f"{self.remote}/{ref}",
+            pre_state=self._optional_ref_sha(cache_ref),
+            observe=lambda: self._optional_ref_sha(cache_ref),
+            desired=lambda: self._optional_ref_sha(cache_ref) == remote_sha,
+            pre_dispatch=lambda: self._require_remote_ref(ref, remote_sha),
+        )
+        return self._local_note(cache_ref, object_sha)
+
+    def update_remote_note(
+        self,
+        ref: str,
+        object_sha: str,
+        body: str,
+        *,
+        expected_body: str | None,
+    ) -> str:
+        """Create or update exact AWM recovery state with remote-ref CAS checks."""
+        self._validate_identity()
+        self._validate_note_ref(ref)
+        self._validate_sha(object_sha)
+        if not body or "\0" in body:
+            raise ValueError("note body must be non-empty and contain no null bytes")
+        current = self.inspect_remote_note(ref, object_sha)
+        if current != expected_body:
+            raise WorkerFailure("remote workflow recovery note changed")
+        if current == body:
+            return body
+        remote_before = self._remote_ref_sha(ref)
+        cache_ref = self._note_cache_ref(ref)
+        local_before = self._local_note(cache_ref, object_sha)
+        self._git_mutation(
+            ["notes", f"--ref={cache_ref}", "add", "-f", "-m", body, object_sha],
+            operation="update workflow recovery note",
+            target=ref,
+            pre_state=local_before,
+            observe=lambda: self._local_note(cache_ref, object_sha),
+            desired=lambda: self._local_note(cache_ref, object_sha) == body,
+        )
+        local_sha = self._optional_ref_sha(cache_ref)
+        assert local_sha is not None
+        self._git_mutation(
+            ["push", self.remote, f"{cache_ref}:{ref}"],
+            operation="push workflow recovery note",
+            target=f"{self.remote}/{ref}",
+            pre_state=remote_before,
+            observe=lambda: self._remote_ref_sha(ref),
+            desired=lambda: self._remote_ref_sha(ref) == local_sha,
+            pre_dispatch=lambda: self._require_remote_ref(ref, remote_before),
+        )
+        result = self.inspect_remote_note(ref, object_sha)
+        if result != body:
+            raise WorkerFailure("workflow recovery note postcondition failed")
+        assert result is not None
+        return result
+
     def inspect_feature_preparation(
         self,
         branch: str,
@@ -819,6 +886,14 @@ class GitRepository:
         if completed.returncode != 0:
             raise ValueError(f"invalid branch name: {branch!r}")
 
+    def _validate_note_ref(self, ref: str) -> None:
+        prefix = "refs/notes/agent-workflow-manager/"
+        if not ref.startswith(prefix) or "\0" in ref:
+            raise ValueError("note ref must be AWM-owned")
+        completed = self._command(["check-ref-format", ref], {0, 1})
+        if completed.returncode != 0:
+            raise ValueError(f"invalid note ref: {ref!r}")
+
     def _validate_distinct_branches(self, branch: str, base: str) -> None:
         self._validate_branch(branch)
         self._validate_branch(base)
@@ -938,6 +1013,36 @@ class GitRepository:
         if len(fields) != 2 or fields[1] != f"refs/heads/{branch}":
             raise WorkerFailure(f"unexpected ls-remote result for branch {branch!r}")
         return fields[0]
+
+    def _remote_ref_sha(self, ref: str) -> str | None:
+        completed = self._command(
+            ["ls-remote", "--exit-code", "--refs", self.remote, ref], {0, 2}
+        )
+        if completed.returncode == 2:
+            return None
+        fields = completed.stdout.strip().split()
+        if (
+            len(fields) != 2
+            or fields[1] != ref
+            or not _OBJECT_ID_RE.fullmatch(fields[0])
+        ):
+            raise WorkerFailure(f"unexpected ls-remote result for ref {ref!r}")
+        return fields[0]
+
+    def _require_remote_ref(self, ref: str, expected_sha: str | None) -> None:
+        actual = self._remote_ref_sha(ref)
+        if actual != expected_sha:
+            raise WorkerFailure(
+                f"remote ref {ref!r} changed: expected {expected_sha}, found {actual}"
+            )
+
+    def _note_cache_ref(self, ref: str) -> str:
+        identity = hashlib.sha256(f"{self.root}\0{ref}".encode()).hexdigest()
+        return f"refs/notes/agent-workflow-manager-cache/{identity}"
+
+    def _local_note(self, ref: str, object_sha: str) -> str | None:
+        completed = self._command(["notes", f"--ref={ref}", "show", object_sha], {0, 1})
+        return completed.stdout.rstrip("\n") if completed.returncode == 0 else None
 
     def _current_branch(self) -> str | None:
         completed = self._command(

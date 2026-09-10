@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import ipaddress
 import json
 import os
@@ -11,6 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
+
+import qrcode
+from qrcode.image.svg import SvgPathImage
 
 from purplemux_client.errors import TerminalSessionError
 from purplemux_client.issue_driven import (
@@ -178,6 +182,38 @@ def _parse_host_aliases(value: str) -> tuple[str, ...]:
     return tuple(aliases)
 
 
+def mobile_connection_url(bind_host: str, browser_origin: str) -> str | None:
+    """Choose an externally reachable browser URL for mobile devices."""
+    try:
+        address = ipaddress.IPv4Address(bind_host)
+    except ipaddress.AddressValueError:
+        return None
+    if address.is_loopback or address.is_unspecified:
+        return None
+
+    parsed = urlparse(browser_origin)
+    try:
+        selected_host = parsed.hostname
+        selected_port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or selected_host is None or selected_port is None:
+        return None
+    local_hostname = selected_host == "localhost" or selected_host.endswith(
+        ".localhost"
+    )
+    try:
+        selected_address = ipaddress.ip_address(selected_host)
+    except ValueError:
+        selected_address = None
+    if local_hostname or (
+        selected_address is not None
+        and (selected_address.is_loopback or selected_address.is_unspecified)
+    ):
+        return f"http://{address}:{selected_port}"
+    return browser_origin
+
+
 class RunnerHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -191,21 +227,37 @@ class RunnerHTTPServer(ThreadingHTTPServer):
     ) -> None:
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
+        bound_host, bound_port = cast(tuple[str, int], self.server_address)
+        normalized_host_aliases = tuple(
+            normalize_host_alias(alias) for alias in host_aliases
+        )
+        browser_host = (
+            normalized_host_aliases[0]
+            if normalized_host_aliases
+            else requested_host
+            if requested_host != "0.0.0.0"
+            else "127.0.0.1"
+        )
+        browser_origin = f"http://{browser_host}:{bound_port}"
+        self.mobile_connection_url = mobile_connection_url(
+            requested_host, browser_origin
+        )
+        reachable_browser_origin = self.mobile_connection_url or browser_origin
+        self.mobile_connection_qr = (
+            self._make_qr_svg(self.mobile_connection_url)
+            if self.mobile_connection_url is not None
+            else None
+        )
         notifier = (
             NotifyCLI.from_environment()
             if runner is None or notification_settings is None
             else None
         )
         self.runner = runner or PythonRunner(notifier=notifier, managed_workflows=True)
+        self.runner.configure_browser_origin(reachable_browser_origin)
         if self.runner.managed_workflows:
-            event_host = bound_event_host = cast(tuple[str, int], self.server_address)[
-                0
-            ]
-            if event_host == "0.0.0.0":
-                bound_event_host = "127.0.0.1"
-            self.runner.configure_event_endpoint(
-                f"http://{bound_event_host}:{self.server_address[1]}"
-            )
+            event_host = "127.0.0.1" if bound_host == "0.0.0.0" else bound_host
+            self.runner.configure_event_endpoint(f"http://{event_host}:{bound_port}")
         self.notification_settings = notification_settings or NotificationSettings(
             runtime_config=Path(
                 os.environ.get("AGENT_WORKFLOW_MANAGER_CONFIG_FILE", "config.sh")
@@ -222,19 +274,30 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             notifier if runner is not None and notification_settings is None else None
         )
         self.request_token = secrets.token_urlsafe(32)
-        bound_host, bound_port = cast(tuple[str, int], self.server_address)
         self.allowed_hosts = {
             f"{requested_host}:{bound_port}",
             f"{bound_host}:{bound_port}",
         }
         if bound_host == "127.0.0.1":
             self.allowed_hosts.add(f"localhost:{bound_port}")
-        self.host_aliases = frozenset(
-            normalize_host_alias(alias) for alias in host_aliases
-        )
+        self.host_aliases = frozenset(normalized_host_aliases)
         self.allowed_hosts.update(
             f"{alias}:{bound_port}" for alias in self.host_aliases
         )
+
+    @staticmethod
+    def _make_qr_svg(url: str) -> bytes:
+        code = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=4,
+        )
+        code.add_data(url)
+        code.make(fit=True)
+        image = code.make_image(image_factory=SvgPathImage)
+        output = io.BytesIO()
+        image.save(output)
+        return output.getvalue()
 
     def is_allowed_host(self, host: str | None) -> bool:
         return self._canonical_authority(host) is not None
@@ -340,6 +403,27 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, settings.as_json())
+            return
+        if path == "/api/settings/mobile-connection":
+            self._send_json(
+                HTTPStatus.OK,
+                {"url": self.server.mobile_connection_url},
+            )
+            return
+        if path == "/api/settings/mobile-connection/qr.svg":
+            qr = self.server.mobile_connection_qr
+            if qr is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "mobile connection is unavailable for a local-only URL"},
+                )
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(qr)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(qr)
             return
         if path == "/api/readiness":
             try:

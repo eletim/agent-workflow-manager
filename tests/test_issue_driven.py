@@ -1632,6 +1632,122 @@ def test_planner_policy_conflict_is_persisted_before_dispatch_and_recovered() ->
     assert "different owner" in context
 
 
+def test_deferred_plan_rehydrates_policy_conflict_after_interruption() -> None:
+    code = generate_issue_driven_workflow(
+        parse(
+            payload(
+                issues=[90],
+                policy_issue=200,
+                integration_branch="dev/v0.2.5",
+                final_branch="dev/v0.2.4",
+                make_integration_branch=True,
+            )
+        )
+    )
+
+    def load_run(name: str) -> dict[str, object]:
+        module = ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, "<generated-deferred-policy>", "exec"), module.__dict__)
+        finally:
+            del sys.modules[name]
+        return module.__dict__
+
+    def make_config(workflow: dict[str, object]):
+        return workflow["Config"](
+            Path("/repo"),
+            "acme/project",
+            "dev/v0.2.5",
+            "dev/v0.2.4",
+            (workflow["Issue"](90, "feature/issue-90"),),
+            "true",
+            200,
+        )
+
+    same_sha = "f" * 40
+    recovery_note: str | None = None
+    create_calls = 0
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            assert object_sha == same_sha
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert object_sha == same_sha
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal create_calls
+            create_calls += 1
+            pytest.fail("Base PR must remain deferred while branch heads match")
+
+    first = load_run("deferred_policy_first")
+    first_config = make_config(first)
+    first["emit_finding"] = lambda *args, **kwargs: None
+    first["inspect_dynamic_work_item_topology"] = lambda *args: None
+    first["create_agent"] = lambda *args, **kwargs: "planner"
+    first["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {
+            "actions": [],
+            "complete": False,
+            "policy_conflicts": ["the policy requires a different owner"],
+        }
+    )
+    first["run_outline_step"] = lambda _name, _action: (_ for _ in ()).throw(
+        RuntimeError("interrupted before first merge")
+    )
+
+    plan_pr, plan = first["prepare_work_item_plan_pr"](
+        first_config, Repository(), GitHub()
+    )
+    with pytest.raises(RuntimeError, match="interrupted before first merge"):
+        first["process_work_items"](
+            first_config, object(), Repository(), GitHub(), plan_pr, plan
+        )
+
+    assert create_calls == 0
+    assert recovery_note is not None
+    assert "agent-workflow-manager:policy-conflict:" in recovery_note
+
+    second = load_run("deferred_policy_second")
+    second_config = make_config(second)
+    recovered_pr, recovered_plan = second["prepare_work_item_plan_pr"](
+        second_config, Repository(), GitHub()
+    )
+
+    assert recovered_pr is None
+    assert recovered_plan.position == 1
+    assert recovered_plan.persisted_source == recovery_note
+    context = second["policy_context"](
+        second_config, scope="work-item planning", structured_conflicts=True
+    )
+    assert "different owner" in context
+
+
 def test_policy_plan_reacquires_base_pr_after_first_child_advances_integration() -> (
     None
 ):
@@ -2058,6 +2174,362 @@ def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> No
         ("prepare", "dev/v0.2.5", "dev/v0.2.4", final_sha),
         ("push", "dev/v0.2.5", final_sha),
     ]
+
+
+def test_new_integration_defers_base_pr_until_first_issue_merge() -> None:
+    workflow = load_generated_workflow(
+        issues=[90],
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.5",
+        "dev/v0.2.4",
+        (issue,),
+        "true",
+    )
+    final_sha = "f" * 40
+    integration_sha = final_sha
+    created: PullRequestState | None = None
+    create_calls: list[tuple[str, str]] = []
+    processed: list[int] = []
+    planner_calls: list[str] = []
+    recovery_note: str | None = None
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, integration_sha, integration_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.main_branch
+            return BranchState(branch, final_sha, final_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            assert object_sha == final_sha
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert object_sha == final_sha
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            assert (head, base) == (config.integration_branch, config.main_branch)
+            return created if created is not None and state == "OPEN" else None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert integration_sha != final_sha
+            create_calls.append((str(kwargs["head"]), str(kwargs["base"])))
+            created = replace(
+                topology_pr(
+                    number=182,
+                    head_sha=integration_sha,
+                    base_sha=final_sha,
+                    head_branch=config.integration_branch,
+                    body=str(kwargs["body"]),
+                ),
+                base_branch=config.main_branch,
+            )
+            return created
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert created is not None
+            assert kwargs["expected_head_sha"] == integration_sha
+            assert kwargs["expected_base_sha"] == final_sha
+            return created
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert created is not None and number == created.number
+            created = replace(created, body=str(kwargs["body"]))
+            return created
+
+    github = GitHub()
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+    workflow["inspect_dynamic_work_item_topology"] = lambda *args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+
+    def process_issue(item: object, *_args: object) -> None:
+        nonlocal integration_sha
+        processed.append(item.number)
+        if len(processed) == 1:
+            raise RuntimeError("interrupted before first merge")
+        integration_sha = "a" * 40
+
+    workflow["process_issue"] = process_issue
+    workflow["create_agent"] = lambda *args, **kwargs: (
+        planner_calls.append("planner") or "planner"
+    )
+    decisions = iter(
+        (
+            {"actions": [], "complete": False, "policy_conflicts": []},
+            {"actions": [], "complete": True, "policy_conflicts": []},
+        )
+    )
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
+
+    plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, Repository(), github)
+
+    assert plan_pr is None
+    assert create_calls == []
+
+    with pytest.raises(RuntimeError, match="interrupted before first merge"):
+        workflow["process_work_items"](
+            config, object(), Repository(), github, plan_pr, plan
+        )
+
+    assert create_calls == []
+    assert planner_calls == ["planner"]
+    assert recovery_note is not None
+    interrupted = workflow["work_item_plan_from_body"](recovery_note, config)
+    assert interrupted.position == 1
+
+    recovered_pr, recovered_plan = workflow["prepare_work_item_plan_pr"](
+        config, Repository(), github
+    )
+    effective = workflow["process_work_items"](
+        config, object(), Repository(), github, recovered_pr, recovered_plan
+    )
+
+    assert create_calls == [(config.integration_branch, config.main_branch)]
+    assert processed == [90, 90]
+    assert planner_calls == ["planner", "planner"]
+    assert effective == (issue,)
+    assert created is not None
+    recovered = workflow["work_item_plan_from_body"](created.body, config)
+    assert recovered.position == 1
+    assert recovered.finalized is True
+
+
+def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
+    workflow = load_generated_workflow(
+        one_shot_issue=169,
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.5",
+        "dev/v0.2.4",
+        (),
+        "true",
+        None,
+        169,
+    )
+    same_sha = "f" * 40
+    integration_sha = same_sha
+    recovery_note: str | None = None
+    created: PullRequestState | None = None
+    planner_calls: list[str] = []
+    processed: list[str] = []
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            return created if created is not None and state == "OPEN" else None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert integration_sha != same_sha
+            created = replace(
+                topology_pr(
+                    number=182,
+                    head_sha=integration_sha,
+                    base_sha=same_sha,
+                    head_branch=config.integration_branch,
+                    body=str(kwargs["body"]),
+                ),
+                base_branch=config.main_branch,
+            )
+            return created
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert created is not None
+            return created
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert created is not None
+            created = replace(created, body=str(kwargs["body"]))
+            return created
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, integration_sha, integration_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    repository = Repository()
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+    workflow["inspect_dynamic_work_item_topology"] = lambda *args: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["create_agent"] = lambda *args, **kwargs: (
+        planner_calls.append("planner") or "planner"
+    )
+    decisions = iter(
+        (
+            {
+                "actions": [
+                    {
+                        "action": "add",
+                        "item": {"id": "first-task", "task": "Do the first task."},
+                    }
+                ],
+                "complete": False,
+                "policy_conflicts": [],
+            },
+            {"actions": [], "complete": True, "policy_conflicts": []},
+        )
+    )
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
+
+    def process_issue(item: object, *_args: object) -> None:
+        nonlocal integration_sha
+        assert recovery_note is not None
+        persisted = workflow["work_item_plan_from_body"](recovery_note, config)
+        assert persisted.position == 1
+        processed.append(item.task_id)
+        integration_sha = "a" * 40
+
+    workflow["process_issue"] = process_issue
+    plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, GitHub())
+
+    effective = workflow["process_work_items"](
+        config, object(), repository, GitHub(), plan_pr, plan
+    )
+
+    assert processed == ["first-task"]
+    assert planner_calls == ["planner"]
+    assert [item.task_id for item in effective] == ["first-task"]
+    assert created is not None
+
+
+def test_deferred_one_shot_plan_can_complete_without_implementation_changes() -> None:
+    workflow = load_generated_workflow(
+        one_shot_issue=169,
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.5",
+        "dev/v0.2.4",
+        (),
+        "true",
+        None,
+        169,
+    )
+    same_sha = "f" * 40
+    recovery_note: str | None = None
+    create_calls = 0
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.main_branch
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            assert object_sha == same_sha
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert object_sha == same_sha
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base) == (config.integration_branch, config.main_branch)
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal create_calls
+            create_calls += 1
+            pytest.fail("an identical branch pair cannot have a pull request")
+
+    repository = Repository()
+    github = GitHub()
+    findings: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    steps: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    workflow["emit_finding"] = lambda *args, **kwargs: findings.append((args, kwargs))
+    workflow["emit_step"] = lambda *args, **kwargs: steps.append((args, kwargs))
+    workflow["emit_whole_review_result"] = lambda *args, **kwargs: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": True, "policy_conflicts": []}
+    )
+
+    plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, github)
+    work_items = workflow["process_work_items"](
+        config, object(), repository, github, plan_pr, plan
+    )
+    delivered = workflow["integration_delivery"](
+        config, work_items, object(), repository, github
+    )
+
+    assert delivered is None
+    assert work_items == ()
+    assert create_calls == 0
+    assert recovery_note is not None
+    recovered = workflow["work_item_plan_from_body"](recovery_note, config)
+    assert recovered.finalized is True
+    assert recovered.snapshot == ()
+    assert any(
+        kwargs.get("message") == "no implementation changes; no PR required"
+        for _args, kwargs in steps
+    )
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:

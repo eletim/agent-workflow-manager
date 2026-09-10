@@ -97,6 +97,9 @@ const settingsDialog = document.querySelector("#settings-dialog");
 const settingsOpen = document.querySelector("#settings-open");
 const settingsClose = document.querySelector("#settings-close");
 const settingsForm = document.querySelector("#notification-settings");
+const mobileConnectionHelp = document.querySelector("#mobile-connection-help");
+const mobileConnectionUrl = document.querySelector("#mobile-connection-url");
+const mobileConnectionQr = document.querySelector("#mobile-connection-qr");
 const notificationsEnabled = document.querySelector("#notifications-enabled");
 const notifySuccess = document.querySelector("#notify-success");
 const notifyFailure = document.querySelector("#notify-failure");
@@ -113,6 +116,9 @@ const favicon = document.querySelector("#favicon");
 
 let requestToken = null;
 let eventSource = null;
+let requestedRunIdentity = typeof window.location?.href === "string"
+  ? new URL(window.location.href).searchParams.get("run")
+  : null;
 const guideTexts = {};
 let activeGuide = null;
 let guideCopyResetTimer = null;
@@ -1093,7 +1099,20 @@ async function refresh() {
   try {
     const {runs} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
-    if (activeRunId === null && !explicitNewRun && runs.length > 0) {
+    if (activeRunId === null && requestedRunIdentity !== null) {
+      const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
+      requestedRunIdentity = null;
+      if (linkedRun) {
+        captureDraftIfEditing();
+        activeRunId = linkedRun.runId;
+        activeRunSnapshot = null;
+        activeRunGeneration += 1;
+        selectionGeneration = activeRunGeneration;
+      } else {
+        explicitNewRun = true;
+        stderr.textContent = "The linked Run is no longer available.";
+      }
+    } else if (activeRunId === null && !explicitNewRun && runs.length > 0) {
       // A run just appeared (e.g. discovered via SSE) while the fields held
       // in-progress draft edits nobody submitted yet; retain them before
       // auto-selecting, exactly as an explicit run-list click would.
@@ -1176,6 +1195,23 @@ function renderSettings(settings) {
   const configured = settings.credentialStatus === "configured";
   credentialStatus.textContent = `Credentials: ${configured ? "Configured" : "Missing"}`;
   credentialStatus.className = `credential ${configured ? "configured" : "missing"}`;
+}
+
+function renderMobileConnection(connection) {
+  const available = typeof connection.url === "string" && connection.url !== "";
+  mobileConnectionUrl.hidden = !available;
+  mobileConnectionQr.hidden = !available;
+  if (!available) {
+    mobileConnectionHelp.textContent = "Mobile connection is unavailable while AWM is configured for local-only access.";
+    mobileConnectionUrl.textContent = "";
+    mobileConnectionUrl.removeAttribute("href");
+    mobileConnectionQr.removeAttribute("src");
+    return;
+  }
+  mobileConnectionHelp.textContent = "Scan this code from a device that can reach the configured trusted network.";
+  mobileConnectionUrl.textContent = connection.url;
+  mobileConnectionUrl.setAttribute("href", connection.url);
+  mobileConnectionQr.setAttribute("src", "/api/settings/mobile-connection/qr.svg");
 }
 
 function renderNotifyServerLink(serverUrl) {
@@ -1574,6 +1610,11 @@ async function initialize() {
     renderSettings(await request("/api/settings/notifications"));
   } catch (error) {
     showSettingsMessage(String(error), true);
+  }
+  try {
+    renderMobileConnection(await request("/api/settings/mobile-connection"));
+  } catch (error) {
+    renderMobileConnection({url: null});
   }
   await refreshReadiness();
 }

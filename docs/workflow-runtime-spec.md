@@ -85,11 +85,17 @@ must never trigger replay.
 Workflow-owned business decisions that cannot be reconstructed from Git topology
 may be persisted by the plain Python workflow in an authoritative external
 resource. In Issue Driven mode, accepted work-item plan decisions and the last
-dispatched position are stored in the Draft Base PR before child processing or
-final delivery. Recovery validates that state against the immutable generated
-seed and re-inspects the recorded items' GitHub topology. This is domain state
-owned and interpreted by the workflow, not a Runner checkpoint or progress-event
-state machine.
+dispatched position are stored before child processing or final delivery. The
+Draft Base PR normally owns this state. When its creation is deferred because the
+integration and final branches are identical, the same serialized state is kept
+in an AWM-owned remote Git note anchored to the reviewed final commit. This does
+not advance either branch, and preserves planner-before-dispatch behavior for
+seeded, dynamic, and one-shot plans. Recovery validates the state against the
+immutable generated seed and re-inspects the recorded items' GitHub topology.
+After an Issue merge creates a difference, the Base PR is created with the
+recovered state and resumes its normal authority. This is domain state owned and
+interpreted by the workflow, not a Runner checkpoint or progress-event state
+machine.
 
 PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
 `purplemux_client` uses
@@ -211,9 +217,30 @@ not drive workflow control flow and do not participate in orchestration.
 
 | State | Title | Message |
 | --- | --- | --- |
-| `success` | `Workflow completed` | Includes the run ID and `success` state. |
-| `failed` | `Workflow failed` | Includes the run ID, `failed` state, and exit code when available. |
-| `stopped` | `Workflow stopped` | Includes the run ID and `stopped` state; disabled by default. |
+| `success` | Target folder name | Includes the run ID and `success` state. |
+| `failed` | Target folder name | Includes the run ID, `failed` state, and exit code when available. |
+| `stopped` | Target folder name | Includes the run ID and `stopped` state; disabled by default. |
+
+The title and Runner link are common notification metadata, independent of the
+delivery device or transport. The title contains only the basename of the
+Run's authoritative working directory. Every HTTP-attached Runner has an
+authoritative browser-navigation origin, using the first configured browser
+hostname alias when present and otherwise the requested bind host. The link
+includes the opaque, persisted Run identity; opening it selects that exact
+Run, and the UI does not infer navigation from the title or other display
+text.
+
+The browser-navigation origin is distinct from the managed Workflow event
+endpoint. Browser aliases are trusted Host and Origin alternatives but are not
+assumed to resolve from a workflow's execution environment. Event callback
+URLs therefore use the HTTP server's directly reachable bound address.
+
+Settings exposes the preferred remotely reachable browser origin for mobile
+connection when the Runner is bound to a non-loopback IPv4 address. A
+local-only preferred alias falls back to the direct bind URL. The selected URL
+is shown as text and encoded in a locally generated QR code; a local-only or
+wildcard bind does not offer either. This is display-only and does not alter
+the Host and Origin allowlist, request-token checks, or authentication semantics.
 
 At runtime, `AGENT_WORKFLOW_MANAGER_NOTIFICATIONS=1` enables terminal
 notifications. `AGENT_WORKFLOW_MANAGER_NOTIFY_SUCCESS`,

@@ -202,6 +202,7 @@ async function loadApp({
   runs,
   details,
   validation,
+  locationHref = "http://127.0.0.1:8765/",
   fetchOverride = null,
   clipboardOverride = null,
   confirmOverride = null,
@@ -234,6 +235,7 @@ async function loadApp({
     "guide-open", "guide-close", "guide-copy", "guide-title", "guide-raw",
     "guide-content", "manual-copy-dialog", "manual-copy-content",
     "manual-copy-close", "settings-dialog", "settings-open", "settings-close",
+    "mobile-connection-help", "mobile-connection-url", "mobile-connection-qr",
     "notification-settings", "notifications-enabled",
     "notify-success", "notify-failure", "notify-stopped", "notify-server",
     "notify-server-link", "notify-topic", "replacement-token", "credential-status", "settings-message",
@@ -282,6 +284,7 @@ async function loadApp({
       return response('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
     }
     if (url === "/api/settings/notifications") return response(settings);
+    if (url === "/api/settings/mobile-connection") return response({url: null});
     if (url === "/api/readiness") return response({workspaces: [], running: false, probe: null});
     if (url === "/api/validate") {
       return response(validation.body, validation.status);
@@ -325,6 +328,7 @@ async function loadApp({
       clearTimeout,
       confirm: confirmOverride || (() => true),
       EventSource: FakeEventSource,
+      location: {href: locationHref},
       setInterval() { assert.fail("fixed polling must not be used"); },
       setTimeout,
     },
@@ -374,6 +378,27 @@ function markerState(elements, runId) {
 function outlineLabels(elements) {
   return elements.outline.children.map((item) => item.children[1].textContent);
 }
+
+test("Runner link selects the exact opaque Run identity", async () => {
+  const runs = [
+    {runId: 1, identity: "instance-a-1", state: "success", mode: "workflow", cwd: "/work/one"},
+    {runId: 2, identity: "instance-a-2", state: "success", mode: "workflow", cwd: "/work/two"},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "one"}),
+    2: snapshot({runId: 2, state: "success", stdout: "two"}),
+  };
+
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    locationHref: "http://127.0.0.1:8765/?run=instance-a-1",
+  });
+
+  assert.equal(selectedRun(elements).dataset.runId, "1");
+  assert.equal(elements.stdout.textContent, "one");
+});
 
 test("terminal run checked state toggles from detail and list without leaking", async () => {
   const runs = [
@@ -574,6 +599,44 @@ test("Settings opens Notifications repeatedly without losing form state", async 
   await elements["settings-open"].dispatch("click");
   assert.equal(elements["settings-dialog"].open, true);
   assert.equal(elements["notify-topic"].value, "edited-topic");
+});
+
+test("Settings shows the configured remote URL and its QR code", async () => {
+  const remoteUrl = "http://runner.example.ts.net:8765";
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/settings/mobile-connection") {
+        return response({url: remoteUrl});
+      }
+      return undefined;
+    },
+  });
+
+  assert.equal(elements["mobile-connection-url"].hidden, false);
+  assert.equal(elements["mobile-connection-url"].textContent, remoteUrl);
+  assert.equal(elements["mobile-connection-url"].getAttribute("href"), remoteUrl);
+  assert.equal(elements["mobile-connection-qr"].hidden, false);
+  assert.equal(
+    elements["mobile-connection-qr"].getAttribute("src"),
+    "/api/settings/mobile-connection/qr.svg",
+  );
+});
+
+test("Settings does not expose a loopback URL for mobile connection", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+  });
+
+  assert.equal(elements["mobile-connection-url"].hidden, true);
+  assert.equal(elements["mobile-connection-url"].getAttribute("href"), undefined);
+  assert.equal(elements["mobile-connection-qr"].hidden, true);
+  assert.equal(elements["mobile-connection-qr"].getAttribute("src"), undefined);
+  assert.match(elements["mobile-connection-help"].textContent, /local-only/);
 });
 
 test("Notify server link is exposed only for safe HTTP URLs", async () => {

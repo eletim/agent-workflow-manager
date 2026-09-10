@@ -457,6 +457,12 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 .settings-path { margin: 0; color: #9ba3b5; font-size: 12px; }
 .settings-path span { margin: 0 4px; }
 .settings-dialog-content { padding: 18px; }
+.mobile-connection { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.mobile-connection h3, .settings-heading h3 { margin: 0 0 6px; font-size: 16px; }
+.mobile-connection p { max-width: 440px; margin: 0 0 8px; color: #9ba3b5; font-size: 13px; }
+.mobile-connection a { overflow-wrap: anywhere; }
+.mobile-connection img { width: 176px; height: 176px; padding: 8px; border-radius: 8px; background: white; }
+.settings-divider { margin: 18px 0; border: 0; border-top: 1px solid #303746; }
 .settings-heading { justify-content: space-between; }
 .settings-heading p { margin: 0; color: #9ba3b5; font-size: 13px; }
 .credential {
@@ -525,6 +531,8 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .directory-picker-list { height: calc(100% - 220px); }
   .directory-picker-actions button { width: 100%; }
   .settings-heading { align-items: flex-start; }
+  .mobile-connection { align-items: flex-start; flex-direction: column; }
+  .mobile-connection img { align-self: center; width: min(176px, 100%); height: auto; aspect-ratio: 1; }
   .toggle-grid { grid-template-columns: 1fr 1fr; }
   .readiness-heading, .readiness-controls { align-items: stretch; flex-direction: column; }
   .readiness-controls select { width: 100%; }

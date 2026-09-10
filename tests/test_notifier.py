@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import logging
+import socketserver
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from purplemux_client.notifier import NotificationResult, NotifyCLI
+from purplemux_client.notifier import (
+    NotificationMetadata,
+    NotificationResult,
+    NotifyCLI,
+)
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
+from purplemux_client.web import RunnerHTTPServer
 
 
 class FinishedProcess:
@@ -46,13 +52,18 @@ def _wait_until_finished(runner: PythonRunner) -> RunnerSnapshot:
 
 class RecordingNotifier:
     def __init__(self, result: NotificationResult | None = None) -> None:
-        self.calls: list[tuple[int, str, int | None]] = []
+        self.calls: list[tuple[int, str, int | None, NotificationMetadata]] = []
         self.result = result or NotificationResult(True, True, "notification sent")
 
     def notify_terminal(
-        self, *, run_id: int, state: str, exit_code: int | None
+        self,
+        *,
+        run_id: int,
+        state: str,
+        exit_code: int | None,
+        metadata: NotificationMetadata,
     ) -> NotificationResult:
-        self.calls.append((run_id, state, exit_code))
+        self.calls.append((run_id, state, exit_code, metadata))
         return self.result
 
     def close(self) -> None:
@@ -80,7 +91,88 @@ def test_terminal_result_attempts_exactly_one_notification(
         runner.close()
 
     assert result.state == expected_state
-    assert notifier.calls == [(run_id, expected_state, expected_exit_code)]
+    assert [call[:3] for call in notifier.calls] == [
+        (run_id, expected_state, expected_exit_code)
+    ]
+    assert notifier.calls[0][3].title == Path.cwd().name
+    assert notifier.calls[0][3].click_url is None
+
+
+def test_http_server_builds_notification_metadata_for_unmanaged_runner(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "nested" / "project-name"
+    project.mkdir(parents=True)
+    notifier = RecordingNotifier()
+    runner = PythonRunner(
+        managed_workflows=False,
+        notifier=notifier,
+        workflow_cwd=project,
+    )
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        host_aliases=("Runner.Example.",),
+    )
+    port = server.server_address[1]
+    try:
+        run_id = runner.start('print("ok")')
+        _wait_until_finished(runner)
+        for _ in range(100):
+            if notifier.calls:
+                break
+            time.sleep(0.01)
+    finally:
+        server.server_close()
+
+    assert notifier.calls == [
+        (
+            run_id,
+            "success",
+            0,
+            NotificationMetadata(
+                title="project-name",
+                click_url=(
+                    f"http://runner.example:{port}/?run=" + runner._run_identity(run_id)
+                ),
+            ),
+        )
+    ]
+
+
+def test_remote_bind_fallback_is_used_for_notification_clicks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def bind_remote_address(
+        server: RunnerHTTPServer,
+        server_address: tuple[str, int],
+        handler: object,
+    ) -> None:
+        assert server_address == ("100.64.10.20", 0)
+        server.server_address = (server_address[0], 8765)
+
+    monkeypatch.setattr(socketserver.TCPServer, "__init__", bind_remote_address)
+    notifier = RecordingNotifier()
+    runner = PythonRunner(managed_workflows=False, notifier=notifier)
+    server = RunnerHTTPServer(
+        ("100.64.10.20", 0),
+        runner,
+        host_aliases=("localhost",),
+    )
+    try:
+        run_id = runner.start('print("ok")')
+        _wait_until_finished(runner)
+        for _ in range(100):
+            if notifier.calls:
+                break
+            time.sleep(0.01)
+    finally:
+        runner.close()
+
+    assert server.mobile_connection_url == "http://100.64.10.20:8765"
+    assert notifier.calls[0][3].click_url == (
+        f"http://100.64.10.20:8765/?run={runner._run_identity(run_id)}"
+    )
 
 
 def test_stopped_notification_is_disabled_by_default(
@@ -91,7 +183,12 @@ def test_stopped_notification_is_disabled_by_default(
     _record_process_start(monkeypatch, calls)
     notifier = NotifyCLI(enabled=True)
 
-    result = notifier.notify_terminal(run_id=4, state="stopped", exit_code=-15)
+    result = notifier.notify_terminal(
+        run_id=4,
+        state="stopped",
+        exit_code=-15,
+        metadata=NotificationMetadata("project", "http://runner/?run=identity-4"),
+    )
 
     assert result.attempted is False
     assert calls == []
@@ -103,12 +200,18 @@ def test_stopped_notification_can_be_enabled(monkeypatch: pytest.MonkeyPatch) ->
     _record_process_start(monkeypatch, calls)
     notifier = NotifyCLI(enabled=True, notify_stopped=True)
 
-    result = notifier.notify_terminal(run_id=4, state="stopped", exit_code=-15)
+    result = notifier.notify_terminal(
+        run_id=4,
+        state="stopped",
+        exit_code=-15,
+        metadata=NotificationMetadata("project", "http://runner/?run=identity-4"),
+    )
 
     assert result.delivered is True
     assert len(calls) == 1
     assert calls[0][0:2] == ["/usr/bin/notify", "send"]
-    assert "Workflow stopped" in calls[0]
+    assert "project" in calls[0]
+    assert "http://runner/?run=identity-4" in calls[0]
 
 
 @pytest.mark.parametrize(
@@ -133,6 +236,7 @@ def test_terminal_policy_can_disable_each_state(
         run_id=4,
         state=state,
         exit_code=0,  # type: ignore[arg-type]
+        metadata=NotificationMetadata("project", None),
     )
 
     assert result == NotificationResult(False, False, diagnostic)
@@ -165,7 +269,12 @@ def test_notify_command_failure_does_not_change_runner_state(
 def test_notify_unavailable_is_safe() -> None:
     notifier = NotifyCLI(enabled=True, executable="definitely-not-installed-notify")
 
-    result = notifier.notify_terminal(run_id=1, state="success", exit_code=0)
+    result = notifier.notify_terminal(
+        run_id=1,
+        state="success",
+        exit_code=0,
+        metadata=NotificationMetadata("project", None),
+    )
 
     assert result == NotificationResult(True, False, "notify command unavailable")
 
@@ -173,7 +282,12 @@ def test_notify_unavailable_is_safe() -> None:
 def test_disabled_notify_is_safe() -> None:
     notifier = NotifyCLI(enabled=False)
 
-    result = notifier.notify_terminal(run_id=1, state="success", exit_code=0)
+    result = notifier.notify_terminal(
+        run_id=1,
+        state="success",
+        exit_code=0,
+        metadata=NotificationMetadata("project", None),
+    )
 
     assert result == NotificationResult(False, False, "notifications disabled")
 
@@ -218,16 +332,26 @@ def test_notify_command_contains_required_success_message(
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
     _record_process_start(monkeypatch, calls)
 
-    NotifyCLI(enabled=True).notify_terminal(run_id=12, state="success", exit_code=0)
+    NotifyCLI(enabled=True).notify_terminal(
+        run_id=12,
+        state="success",
+        exit_code=0,
+        metadata=NotificationMetadata(
+            "agent-workflow-manager",
+            "http://runner.example/?run=opaque-12",
+        ),
+    )
 
     assert calls == [
         [
             "/usr/bin/notify",
             "send",
             "--title",
-            "Workflow completed",
+            "agent-workflow-manager",
             "--message",
             "Run 12 finished with state: success",
+            "--click",
+            "http://runner.example/?run=opaque-12",
         ]
     ]
 
@@ -239,9 +363,14 @@ def test_notify_command_contains_required_failure_message(
     monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/notify")
     _record_process_start(monkeypatch, calls)
 
-    NotifyCLI(enabled=True).notify_terminal(run_id=13, state="failed", exit_code=9)
+    NotifyCLI(enabled=True).notify_terminal(
+        run_id=13,
+        state="failed",
+        exit_code=9,
+        metadata=NotificationMetadata("project", None),
+    )
 
-    assert "Workflow failed" in calls[0]
+    assert "project" in calls[0]
     assert "Run 13 finished with state: failed and exit code 9" in calls[0]
 
 
@@ -315,7 +444,12 @@ def test_notify_timeout_kills_child_process_group(tmp_path: Path) -> None:
 
     result = NotifyCLI(
         enabled=True, executable=str(executable), timeout=0.2
-    ).notify_terminal(run_id=1, state="success", exit_code=0)
+    ).notify_terminal(
+        run_id=1,
+        state="success",
+        exit_code=0,
+        metadata=NotificationMetadata("project", None),
+    )
 
     assert result == NotificationResult(True, False, "notify command timed out")
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
