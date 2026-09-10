@@ -242,6 +242,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self.mobile_connection_url = mobile_connection_url(
             requested_host, browser_origin
         )
+        reachable_browser_origin = self.mobile_connection_url or browser_origin
         self.mobile_connection_qr = (
             self._make_qr_svg(self.mobile_connection_url)
             if self.mobile_connection_url is not None
@@ -253,7 +254,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
             else None
         )
         self.runner = runner or PythonRunner(notifier=notifier, managed_workflows=True)
-        self.runner.configure_browser_origin(browser_origin)
+        self.runner.configure_browser_origin(reachable_browser_origin)
         if self.runner.managed_workflows:
             event_host = "127.0.0.1" if bound_host == "0.0.0.0" else bound_host
             self.runner.configure_event_endpoint(f"http://{event_host}:{bound_port}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import socketserver
 import subprocess
 import time
 from pathlib import Path
@@ -137,6 +138,41 @@ def test_http_server_builds_notification_metadata_for_unmanaged_runner(
             ),
         )
     ]
+
+
+def test_remote_bind_fallback_is_used_for_notification_clicks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def bind_remote_address(
+        server: RunnerHTTPServer,
+        server_address: tuple[str, int],
+        handler: object,
+    ) -> None:
+        assert server_address == ("100.64.10.20", 0)
+        server.server_address = (server_address[0], 8765)
+
+    monkeypatch.setattr(socketserver.TCPServer, "__init__", bind_remote_address)
+    notifier = RecordingNotifier()
+    runner = PythonRunner(managed_workflows=False, notifier=notifier)
+    server = RunnerHTTPServer(
+        ("100.64.10.20", 0),
+        runner,
+        host_aliases=("localhost",),
+    )
+    try:
+        run_id = runner.start('print("ok")')
+        _wait_until_finished(runner)
+        for _ in range(100):
+            if notifier.calls:
+                break
+            time.sleep(0.01)
+    finally:
+        runner.close()
+
+    assert server.mobile_connection_url == "http://100.64.10.20:8765"
+    assert notifier.calls[0][3].click_url == (
+        f"http://100.64.10.20:8765/?run={runner._run_identity(run_id)}"
+    )
 
 
 def test_stopped_notification_is_disabled_by_default(

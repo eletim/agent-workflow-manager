@@ -2440,6 +2440,98 @@ def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
     assert created is not None
 
 
+def test_deferred_one_shot_plan_can_complete_without_implementation_changes() -> None:
+    workflow = load_generated_workflow(
+        one_shot_issue=169,
+        integration_branch="dev/v0.2.5",
+        final_branch="dev/v0.2.4",
+        make_integration_branch=True,
+    )
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.2.5",
+        "dev/v0.2.4",
+        (),
+        "true",
+        None,
+        169,
+    )
+    same_sha = "f" * 40
+    recovery_note: str | None = None
+    create_calls = 0
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.main_branch
+            return BranchState(branch, same_sha, same_sha, True)
+
+        def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
+            assert object_sha == same_sha
+            return recovery_note
+
+        def update_remote_note(
+            self,
+            ref: str,
+            object_sha: str,
+            body: str,
+            *,
+            expected_body: str | None,
+        ) -> str:
+            nonlocal recovery_note
+            assert object_sha == same_sha
+            assert expected_body == recovery_note
+            recovery_note = body
+            return body
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base) == (config.integration_branch, config.main_branch)
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal create_calls
+            create_calls += 1
+            pytest.fail("an identical branch pair cannot have a pull request")
+
+    repository = Repository()
+    github = GitHub()
+    findings: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    steps: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    workflow["emit_finding"] = lambda *args, **kwargs: findings.append((args, kwargs))
+    workflow["emit_step"] = lambda *args, **kwargs: steps.append((args, kwargs))
+    workflow["emit_whole_review_result"] = lambda *args, **kwargs: None
+    workflow["run_outline_step"] = lambda _name, action: action()
+    workflow["create_agent"] = lambda *args, **kwargs: "planner"
+    workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
+        {"actions": [], "complete": True, "policy_conflicts": []}
+    )
+
+    plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, github)
+    work_items = workflow["process_work_items"](
+        config, object(), repository, github, plan_pr, plan
+    )
+    delivered = workflow["integration_delivery"](
+        config, work_items, object(), repository, github
+    )
+
+    assert delivered is None
+    assert work_items == ()
+    assert create_calls == 0
+    assert recovery_note is not None
+    recovered = workflow["work_item_plan_from_body"](recovery_note, config)
+    assert recovered.finalized is True
+    assert recovered.snapshot == ()
+    assert any(
+        kwargs.get("message") == "no implementation changes; no PR required"
+        for _args, kwargs in steps
+    )
+
+
 def test_human_handoff_prompt_and_validation_contract() -> None:
     secret_check_command = "API_TOKEN=sentinel-secret pytest"
     workflow = load_generated_workflow(

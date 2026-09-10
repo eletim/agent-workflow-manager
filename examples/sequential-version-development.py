@@ -2603,7 +2603,7 @@ def integration_delivery(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
-) -> PullRequestState:
+) -> PullRequestState | None:
     integration = repo.synchronize_branch(config.integration_branch)
     main = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or main.remote_sha is None:
@@ -2657,19 +2657,27 @@ def integration_delivery(
         )
         return merged_pr
     if pr is None:
-        pr = github.create_draft_pr(
-            head=config.integration_branch,
-            base=config.main_branch,
-            expected_head_sha=integration.remote_sha,
-            expected_base_sha=main.remote_sha,
-            title=f"Integrate {config.integration_branch}",
-            body=(
-                "Sequential integration; Ready only after whole-version checks."
-                f"{one_shot_pr_notes(config)}"
-                f"{policy_pr_notes(config)}"
-            ),
-            correlation_id=run_correlation("integration-pr"),
-        )
+        pr, finalized_plan = prepare_work_item_plan_pr(config, repo, github)
+        if not finalized_plan.finalized or finalized_plan.snapshot != work_items:
+            raise WorkerFailure(
+                "final delivery work items do not match the finalized persisted plan"
+            )
+        if pr is None:
+            emit_whole_review_result(
+                "skipped",
+                0,
+                warnings=summary_warnings(None),
+            )
+            emit_step(
+                "Final integration PR",
+                "completed",
+                message="no implementation changes; no PR required",
+            )
+            return None
+        if pr.state == "MERGED":
+            raise WorkerFailure(
+                "final delivery was merged while its deferred PR was being acquired"
+            )
     else:
         pr = return_to_draft_for_review(
             github,
@@ -2815,6 +2823,9 @@ def main() -> None:
         lambda: process_work_items(config, client, repo, github, plan_pr, plan),
     )
     ready = integration_delivery(config, work_items, client, repo, github)
+    if ready is None:
+        print("No implementation changes; no whole-version PR is required.", flush=True)
+        return
     if ready.state == "MERGED":
         outcome = "Merged"
     elif ready.is_draft:
