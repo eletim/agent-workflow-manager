@@ -1004,6 +1004,51 @@ test("Issue Driven repository editor adds and edits repository declarations", as
   assert.equal(elements["issue-driven-python"].value, "");
 });
 
+test("Add and Remove invalidate Issue Driven validation feedback", async () => {
+  let generation = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/issue-driven/generate") return undefined;
+      generation += 1;
+      if (generation === 1) {
+        return response({generatedCode: "# valid", issueDrivenValidation: []});
+      }
+      return response({
+        error: "issue-driven JSON validation failed",
+        issueDrivenValidation: [{path: "$.repositories[1].repository", message: "required"}],
+      }, 400);
+    },
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    repository: "/work/api", integration_branch: "dev/v1",
+    final_branch: "main", issues: [10],
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  await elements["issue-driven-generate"].dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, false);
+  assert.equal(elements["issue-driven-python"].value, "# valid");
+
+  await elements["repository-config-add"].dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, true);
+  assert.equal(elements["issue-driven-validation"].children.length, 0);
+  assert.equal(elements["issue-driven-python"].value, "");
+
+  await elements["issue-driven-generate"].dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, true);
+  assert.equal(elements["issue-driven-validation"].children.length, 1);
+
+  const remove = elements["repository-config-list"].children[1].children[0].children[1];
+  await remove.dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, true);
+  assert.equal(elements["issue-driven-validation"].children.length, 0);
+  assert.equal(elements["issue-driven-python"].value, "");
+});
+
 test("Issue Driven repository cards show mixed Issue and mini-task work items", async () => {
   const {elements} = await loadApp({
     runs: [], details: {}, validation: {status: 200, body: {validation: []}},

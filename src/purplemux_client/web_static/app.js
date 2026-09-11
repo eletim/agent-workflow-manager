@@ -209,6 +209,14 @@ function issueDrivenRepositories(config) {
   return [];
 }
 
+function invalidateIssueDrivenDraft() {
+  issueDrivenRequestGeneration += 1;
+  issueDrivenPython.value = "";
+  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+  issueDrivenSuccess.hidden = true;
+  issueDrivenValidation.replaceChildren();
+}
+
 function updateRepositoryConfig(index, key, value) {
   let config;
   try {
@@ -221,10 +229,7 @@ function updateRepositoryConfig(index, key, value) {
   if (repository == null || typeof repository !== "object") return;
   repository[key] = value;
   issueDrivenJson.value = JSON.stringify(config, null, 2);
-  issueDrivenPython.value = "";
-  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
-  issueDrivenSuccess.hidden = true;
-  issueDrivenValidation.replaceChildren();
+  invalidateIssueDrivenDraft();
 }
 
 function repositoryField(card, labelText, value, onInput, className = "") {
@@ -304,8 +309,7 @@ function renderRepositoryConfigs() {
           Object.assign(config, remaining);
         }
         issueDrivenJson.value = JSON.stringify(config, null, 2);
-        issueDrivenPython.value = "";
-        issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+        invalidateIssueDrivenDraft();
         renderRepositoryConfigs();
       });
       heading.append(remove);
@@ -1718,10 +1722,7 @@ issueDrivenGenerate.addEventListener("click", async () => {
 });
 
 issueDrivenJson.addEventListener("input", () => {
-  issueDrivenPython.value = "";
-  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
-  issueDrivenSuccess.hidden = true;
-  issueDrivenValidation.replaceChildren();
+  invalidateIssueDrivenDraft();
   renderRepositoryConfigs();
 });
 
@@ -1774,8 +1775,7 @@ repositoryConfigAdd.addEventListener("click", () => {
     issues: [],
   });
   issueDrivenJson.value = JSON.stringify(config, null, 2);
-  issueDrivenPython.value = "";
-  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+  invalidateIssueDrivenDraft();
   renderRepositoryConfigs();
 });
 
