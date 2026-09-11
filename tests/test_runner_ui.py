@@ -118,6 +118,17 @@ def test_prompt_repository_navigation_is_read_only_and_safe() -> None:
     assert 'target="_blank" rel="noopener noreferrer"' in html
 
 
+def test_issue_driven_repository_editor_is_available_in_new_run_ui() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    ancestors = _ancestors("repository-config-list")
+
+    assert any(
+        attributes.get("id") == "issue-driven-fields" for _tag, attributes in ancestors
+    )
+    assert 'id="repository-config-add"' in html
+    assert 'id="repository-config-message"' in html
+
+
 def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     ancestors = _ancestors("run-list")
 

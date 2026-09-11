@@ -224,6 +224,7 @@ async function loadApp({
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
+    "repository-config-add", "repository-config-list", "repository-config-message",
     "workflow-fields", "prompt-agent", "prompt-cwd", "prompt-text",
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
@@ -967,6 +968,78 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
   assert.equal(elements["issue-driven-success"].hidden, false);
   assert.deepEqual(outlineLabels(elements), ["generated"]);
+});
+
+test("Issue Driven repository editor adds and edits repository declarations", async () => {
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    mode: "issue-driven", repository: "/work/api",
+    integration_branch: "dev/v1", final_branch: "main", issues: [10],
+    max_reviews: 4, merge_to_integration: true, final_review: true, merge_final: false,
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  assert.equal(elements["repository-config-list"].children.length, 1);
+  await elements["repository-config-add"].dispatch("click");
+  let config = JSON.parse(elements["issue-driven-json"].value);
+  assert.equal(config.repository, undefined);
+  assert.deepEqual(config.repositories, [
+    {repository: "/work/api", integration_branch: "dev/v1", final_branch: "main", issues: [10]},
+    {repository: "", integration_branch: "dev/v1", final_branch: "main", issues: []},
+  ]);
+
+  const secondCard = elements["repository-config-list"].children[1];
+  const repositoryInput = secondCard.children[1].children[0].children[1];
+  const issuesInput = secondCard.children[1].children[3].children[1];
+  repositoryInput.value = "/work/web";
+  await repositoryInput.dispatch("input");
+  issuesInput.value = "10, 11";
+  await issuesInput.dispatch("input");
+  config = JSON.parse(elements["issue-driven-json"].value);
+  assert.equal(config.repositories[1].repository, "/work/web");
+  assert.deepEqual(config.repositories[1].issues, [10, 11]);
+  assert.equal(elements["issue-driven-python"].value, "");
+});
+
+test("viewed multi-repository run shows repository states and PR destinations", async () => {
+  const issueDrivenJson = JSON.stringify({
+    repositories: [
+      {repository: "/work/api", integration_branch: "dev/api", final_branch: "main", issues: [10]},
+      {repository: "/work/web", integration_branch: "dev/web", final_branch: "main", issues: [20]},
+    ],
+  });
+  const issueDrivenSummary = {
+    terminalResult: "running", warningCount: 0,
+    repositories: [
+      {
+        repository: "acme/api", state: "success", integrationBranch: "dev/api", finalBranch: "main",
+        issues: [{issue: 10, label: "Issue #10", pr: {number: 30, url: "https://github.com/acme/api/pull/30"}}],
+        basePr: {number: 31, url: "https://github.com/acme/api/pull/31"},
+      },
+      {
+        repository: "acme/web", state: "running", integrationBranch: "dev/web", finalBranch: "main",
+        issues: [{issue: 20}], basePr: null,
+      },
+    ],
+  };
+  const detail = snapshot({
+    runId: 1, state: "running", mode: "issue-driven", issueDrivenJson, issueDrivenSummary,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: detail}, validation: {status: 200, body: {validation: []}},
+  });
+
+  const cards = elements["repository-config-list"].children;
+  assert.equal(cards.length, 2);
+  assert.equal(cards[0].children[0].children[0].children[1].textContent, "success");
+  assert.equal(cards[1].children[0].children[0].children[1].textContent, "running");
+  assert.equal(cards[0].children[2].children[0].href, "https://github.com/acme/api/pull/30");
+  assert.equal(cards[0].children[2].children[1].href, "https://github.com/acme/api/pull/31");
+  assert.equal(elements["repository-config-add"].disabled, true);
 });
 
 test("Issue Driven mode opens and copies its dedicated guide", async () => {
@@ -3077,6 +3150,36 @@ test("Issue Driven inherits a selected run's authoritative source repository onl
   assert.deepEqual(inherited.issues, [90, 89]);
   assert.equal(elements["issue-driven-python"].value, "");
   assert.equal(elements.stdout.textContent, "");
+});
+
+test("Issue Driven inheritance keeps multi-repository JSON shape", async () => {
+  const sourceRepository = "/source/repository-a";
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    executionContext: {sourceRepository},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+  await elements["new-run"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    repositories: [
+      {repository: "/old/a", integration_branch: "dev/a", final_branch: "main", issues: [1]},
+      {repository: "/old/b", integration_branch: "dev/b", final_branch: "main", issues: [2]},
+    ],
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  const inherited = JSON.parse(elements["issue-driven-json"].value);
+  assert.equal(inherited.repository, undefined);
+  assert.equal(inherited.repositories[0].repository, sourceRepository);
+  assert.equal(inherited.repositories[1].repository, "/old/b");
 });
 
 test("New run immediately clears every run-owned surface without changing history", async () => {
