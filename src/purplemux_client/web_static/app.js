@@ -968,7 +968,7 @@ function renderOutline(labels, events) {
 function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips = []) {
   const latest = new Map();
   for (const event of events) {
-    const key = JSON.stringify([event.name, event.iteration, event.attempt]);
+    const key = JSON.stringify([event.repository, event.name, event.iteration, event.attempt]);
     const previous = latest.get(key);
     latest.set(key, {
       ...event,
@@ -1062,7 +1062,8 @@ function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips
       details.className = "progress-details";
       const label = document.createElement("div");
       label.className = "progress-label";
-      label.textContent = `SKIPPED · ${entry.skip.label || `#${entry.skip.issue}`}`;
+      const repository = entry.skip.repository ? `${entry.skip.repository} · ` : "";
+      label.textContent = `${repository}SKIPPED · ${entry.skip.label || `#${entry.skip.issue}`}`;
       const timestamp = document.createElement("time");
       timestamp.className = "progress-time";
       timestamp.textContent = runnerLogDisplay.formatObservedAt(entry.skip.observedAt);
@@ -1092,7 +1093,8 @@ function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips
     const label = document.createElement("div");
     label.className = "progress-label";
     const number = event.iteration ?? event.attempt;
-    label.textContent = `${event.name}${number == null ? "" : ` #${number}`}`;
+    const repository = event.repository ? `${event.repository} · ` : "";
+    label.textContent = `${repository}${event.name}${number == null ? "" : ` #${number}`}`;
 
     const timestamp = document.createElement("time");
     timestamp.className = "progress-time";

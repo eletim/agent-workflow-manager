@@ -2130,6 +2130,33 @@ test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped
   assert.equal(elements["issue-summary-base"].children[4].textContent, "#150");
 });
 
+test("multi-repository Progress keeps repeated steps and skips scoped", async () => {
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    progress: [
+      {name: "Work items", status: "completed", repository: "acme/api"},
+      {name: "Work items", status: "completed", repository: "acme/web"},
+    ],
+    plannerSkips: [
+      {issue: 10, reason: "API skip", repository: "acme/api"},
+      {issue: 10, reason: "Web skip", repository: "acme/web"},
+    ],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  const items = elements.progress.children;
+  assert.equal(items.length, 4);
+  assert.equal(items[0].children[1].children[0].textContent, "acme/api · Work items");
+  assert.equal(items[1].children[1].children[0].textContent, "acme/web · Work items");
+  assert.equal(items[2].children[1].children[0].textContent, "acme/api · SKIPPED · #10");
+  assert.equal(items[3].children[1].children[0].textContent, "acme/web · SKIPPED · #10");
+});
+
 test("running Issue Driven Summary links an item before its outcome exists", async () => {
   const detail = snapshot({
     runId: 1,

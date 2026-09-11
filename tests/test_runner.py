@@ -1755,15 +1755,17 @@ def test_multi_repository_summary_scopes_duplicate_issues_and_survives_history(
         run_id = runner.start(
             """from purplemux_client import (
     emit_issue_driven_context, emit_issue_navigation, emit_issue_result,
-    emit_planner_skip, emit_run_pr, emit_whole_review_result,
+    emit_planner_skip, emit_run_pr, emit_step, emit_whole_review_result,
 )
 emit_issue_driven_context("acme/api", "dev/api", "main")
+emit_step("Work items", "completed")
 emit_issue_navigation(10, 40, "https://github.com/acme/api/pull/40", workspace_id="ws-api", implementation_tab_id="api-implementation", scope_review_tab_id="api-scope", correctness_review_tab_id="api-correctness")
 emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/api/pull/40")
 emit_planner_skip(11, "Already covered in API.")
 emit_whole_review_result("approved", 1)
 emit_run_pr(50, "https://github.com/acme/api/pull/50")
 emit_issue_driven_context("acme/web", "dev/web", "main")
+emit_step("Work items", "completed")
 emit_issue_navigation(10, 140, "https://github.com/acme/web/pull/140", workspace_id="ws-web", implementation_tab_id="web-implementation", scope_review_tab_id="web-scope", correctness_review_tab_id="web-correctness")
 emit_issue_result(10, "continued_with_warning", 4, 140, "https://github.com/acme/web/pull/140", warnings=("review limit reached",))
 emit_planner_skip(11, "Already covered in Web.")
@@ -1777,6 +1779,10 @@ emit_run_pr(150, "https://github.com/acme/web/pull/150")
         runner.close()
 
     assert summary["terminalResult"] == "success"
+    assert [event["repository"] for event in result["progress"]] == [
+        "acme/api",
+        "acme/web",
+    ]
     repositories = summary["repositories"]
     assert [repository["repository"] for repository in repositories] == [
         "acme/api",
@@ -1824,6 +1830,7 @@ emit_run_pr(150, "https://github.com/acme/web/pull/150")
 
     assert restored_result["issueDrivenSummary"] == summary
     assert restored_result["plannerSkips"] == result["plannerSkips"]
+    assert restored_result["progress"] == result["progress"]
 
 
 def test_planner_skip_reason_is_durable_and_part_of_issue_summary(

@@ -141,6 +141,7 @@ class ProgressEvent:
     tab: str | None = None
     pr_number: int | None = None
     pr_url: str | None = None
+    repository: str | None = None
     observed_at: str | None = None
 
 
@@ -371,11 +372,16 @@ class OutputEntry:
     text: str
 
 
-def _progress_json(event: ProgressEvent) -> dict[str, object]:
+def _progress_json(
+    event: ProgressEvent, *, include_repository: bool = False
+) -> dict[str, object]:
     payload = asdict(event)
     observed_at = payload.pop("observed_at")
+    repository = payload.pop("repository")
     if observed_at is not None:
         payload["observedAt"] = observed_at
+    if include_repository and repository is not None:
+        payload["repository"] = repository
     return payload
 
 
@@ -497,7 +503,10 @@ class RunnerSnapshot:
         ]
         payload.pop("stdout_entries")
         payload.pop("stderr_entries")
-        payload["progress"] = [_progress_json(event) for event in self.progress]
+        payload["progress"] = [
+            _progress_json(event, include_repository=multiple_repositories)
+            for event in self.progress
+        ]
         payload["findings"] = [_finding_json(item) for item in self.findings]
         payload["warningTimeline"] = [
             _finding_json(item) for item in self.warning_findings
@@ -724,7 +733,7 @@ class _RunRecord:
     progress: deque[ProgressEvent] = field(default_factory=deque)
     # One latest PR-bearing event per authoritative PR survives eviction from
     # the bounded diagnostic stream so historical Issue navigation remains.
-    progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
+    progress_prs: dict[str, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     # Warning positions are durable run history, independent of the bounded
     # diagnostic Finding stream used for the general inspection surface.
@@ -922,7 +931,7 @@ class PythonRunner:
             "exitCode": run.exit_code,
             "progress": [asdict(event) for event in run.progress],
             "progressPrs": {
-                str(number): asdict(event) for number, event in run.progress_prs.items()
+                key: asdict(event) for key, event in run.progress_prs.items()
             },
             "findings": [asdict(finding) for finding in run.findings],
             "warningFindings": [asdict(finding) for finding in run.warning_findings],
@@ -1112,8 +1121,8 @@ class PythonRunner:
         if not isinstance(progress_pr_values, dict):
             raise ValueError
         progress_prs = {
-            int(number): self._history_dataclass(ProgressEvent, event)
-            for number, event in progress_pr_values.items()
+            str(key): self._history_dataclass(ProgressEvent, event)
+            for key, event in progress_pr_values.items()
         }
         prompt_value = value.get("prompt")
         integration_pr_value = value.get("integrationPr")
@@ -2104,12 +2113,14 @@ class PythonRunner:
         stderr_entries = self._render_output_entries(run.stderr, run.stderr_truncated)
         progress = tuple(run.progress)
         visible_prs = {
-            event.pr_number for event in progress if event.pr_number is not None
+            (event.repository, event.pr_number)
+            for event in progress
+            if event.pr_number is not None
         }
         durable_pr_progress = tuple(
             event
-            for number, event in run.progress_prs.items()
-            if number not in visible_prs
+            for event in run.progress_prs.values()
+            if (event.repository, event.pr_number) not in visible_prs
         )
         return RunnerSnapshot(
             state=run.state,
@@ -2961,10 +2972,19 @@ class PythonRunner:
                 ].whole_review_result = run.whole_review_result
         else:
             progress = cast(ProgressEvent, event)
-            accepted = replace(progress, observed_at=self._accepted_at())
+            repository = (
+                run.issue_driven_repositories[-1].context.repository
+                if run.issue_driven_repositories
+                else None
+            )
+            accepted = replace(
+                progress,
+                repository=repository,
+                observed_at=self._accepted_at(),
+            )
             run.progress.append(accepted)
-            if accepted.pr_number is not None:
-                run.progress_prs[accepted.pr_number] = accepted
+            if accepted.pr_url is not None:
+                run.progress_prs[accepted.pr_url] = accepted
         return True
 
     @staticmethod
