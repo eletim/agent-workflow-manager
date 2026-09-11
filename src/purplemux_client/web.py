@@ -43,7 +43,9 @@ from purplemux_client.runner import (
     RunCleanupNotAllowedError,
     RunDeletionNotAllowedError,
     RunHistoryError,
+    RunnerSnapshot,
     RunNotFoundError,
+    RunResumeNotAllowedError,
     RunStopUncertainError,
     WorkflowDryRunError,
     WorkflowValidationError,
@@ -224,7 +226,19 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         notification_settings: NotificationSettings | None = None,
         host_aliases: tuple[str, ...] = (),
         readiness_service: AgentReadinessService | None = None,
+        purplemux_port: int | None = None,
+        purplemux_port_file: Path | None = None,
     ) -> None:
+        if purplemux_port is not None and purplemux_port_file is not None:
+            raise ValueError("PurpleMux port and port file are mutually exclusive")
+        self._purplemux_port_file = purplemux_port_file
+        self._purplemux_port = (
+            self._read_purplemux_port_file(purplemux_port_file)
+            if purplemux_port_file is not None
+            else self._validate_purplemux_port(
+                8022 if purplemux_port is None else purplemux_port
+            )
+        )
         requested_host, _ = server_address
         super().__init__(server_address, RunnerRequestHandler)
         bound_host, bound_port = cast(tuple[str, int], self.server_address)
@@ -284,6 +298,34 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self.allowed_hosts.update(
             f"{alias}:{bound_port}" for alias in self.host_aliases
         )
+
+    @staticmethod
+    def _validate_purplemux_port(port: int) -> int:
+        if (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError("PurpleMux port must be an integer from 1 to 65535")
+        return port
+
+    @classmethod
+    def _read_purplemux_port_file(cls, path: Path) -> int:
+        value = path.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise ValueError("PurpleMux port file must contain a decimal TCP port")
+        return cls._validate_purplemux_port(int(value, 10))
+
+    @property
+    def purplemux_port(self) -> int:
+        if self._purplemux_port_file is not None:
+            try:
+                self._purplemux_port = self._read_purplemux_port_file(
+                    self._purplemux_port_file
+                )
+            except (OSError, ValueError):
+                pass
+        return self._purplemux_port
 
     @staticmethod
     def _make_qr_svg(url: str) -> bytes:
@@ -375,7 +417,10 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"token": self.server.request_token})
             return
         if path in {"/api/status", "/api/output"}:
-            self._send_json(HTTPStatus.OK, self.server.runner.snapshot().as_json())
+            self._send_json(
+                HTTPStatus.OK,
+                self._snapshot_json(self.server.runner.snapshot()),
+            )
             return
         if path == "/api/runs":
             self._send_json(
@@ -394,7 +439,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             except RunNotFoundError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
-            self._send_json(HTTPStatus.OK, snapshot.as_json())
+            self._send_json(HTTPStatus.OK, self._snapshot_json(snapshot))
             return
         if path == "/api/settings/notifications":
             try:
@@ -477,6 +522,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    def _snapshot_json(self, snapshot: RunnerSnapshot) -> dict[str, object]:
+        payload = snapshot.as_json()
+        payload["purplemuxPort"] = self.server.purplemux_port
+        return payload
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -692,6 +742,31 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     {"error": "args must be an array of strings"},
                 )
                 return
+            issue_driven_json = payload.get("issueDrivenJson")
+            if "issueDrivenJson" in payload:
+                if path != "/api/run" or not isinstance(issue_driven_json, str):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "issueDrivenJson is supported only for Run and must be a string"
+                        },
+                    )
+                    return
+                try:
+                    issue_driven_code = generate_issue_driven_workflow(
+                        parse_issue_driven_json(issue_driven_json)
+                    )
+                except IssueDrivenValidationError as exc:
+                    self._send_json(
+                        HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)}
+                    )
+                    return
+                if issue_driven_code != code:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "code does not match issueDrivenJson"},
+                    )
+                    return
             try:
                 if path == "/api/validate":
                     result = self.server.runner.validate(code, args=args)
@@ -713,7 +788,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         status, self.server.runner.validation_snapshot().as_json()
                     )
                     return
-                run_id = self.server.runner.start(code, args=args)
+                run_id = self.server.runner.start(
+                    code,
+                    args=args,
+                    issue_driven_json=issue_driven_json,
+                )
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -744,6 +823,38 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.ACCEPTED,
                 {"runId": run_id, **self.server.runner.snapshot(run_id).as_json()},
+            )
+            return
+        resume_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/resume", path)
+        if resume_match is not None:
+            run_id = int(resume_match.group(1))
+            try:
+                resumed_run_id = self.server.runner.resume(run_id)
+                snapshot = self.server.runner.snapshot(resumed_run_id)
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except RunResumeNotAllowedError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except WorkflowValidationError:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "resumed workflow failed validation",
+                        **self.server.runner.validation_snapshot().as_json(),
+                    },
+                )
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            except AlreadyRunningError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {"runId": resumed_run_id, **snapshot.as_json()},
             )
             return
         if path == "/api/readiness/probe":
@@ -982,6 +1093,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trusted Python runner UI")
     parser.add_argument("--host", default="127.0.0.1", type=_parse_bind_host)
     parser.add_argument("--port", default=8765, type=int)
+    purplemux_port = parser.add_mutually_exclusive_group()
+    purplemux_port.add_argument("--purplemux-port", type=int)
+    purplemux_port.add_argument("--purplemux-port-file", type=Path)
     parser.add_argument(
         "--host-aliases",
         default=(),
@@ -1005,6 +1119,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    purplemux_port_file = args.purplemux_port_file
+    if args.purplemux_port is None and purplemux_port_file is None:
+        purplemux_port_file = Path.home() / ".purplemux" / "port"
     notifier = NotifyCLI.from_environment()
     notifier.config_path = str(args.notify_config)
     notification_settings = NotificationSettings(
@@ -1017,6 +1134,8 @@ def main() -> None:
         runner=PythonRunner(notifier=notifier, managed_workflows=True),
         notification_settings=notification_settings,
         host_aliases=args.host_aliases,
+        purplemux_port=args.purplemux_port,
+        purplemux_port_file=purplemux_port_file,
     )
     print(f"Python Runner UI: http://{args.host}:{args.port}")
     print("Trusted-network use only: this server executes arbitrary Python code.")

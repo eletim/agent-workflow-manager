@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -25,6 +27,11 @@ CommitComparison = Literal["ahead", "behind", "diverged", "identical"]
 _TOPOLOGY_READ_WORKERS = 16
 _CORRELATION_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _HTTP_REJECTION_RE = re.compile(r"\bHTTP (4\d\d)\b", re.IGNORECASE)
+_HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(r"\brate limit(?:ed|ing)?\b", re.IGNORECASE)
+_TRANSIENT_READ_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_READ_RETRY_MAX_BACKOFF_SECONDS = 2.0
+logger = logging.getLogger(__name__)
 _READY_MUTATION = """
 mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){
 pullRequest{id}}}
@@ -251,17 +258,21 @@ class GitHubRepository:
         executable: str,
         command_timeout_seconds: float,
         read_timeout_retries: int,
+        read_retry_backoff_seconds: float,
         page_size: int,
         max_pages: int,
         runner: GitHubCommandRunner,
+        sleep: Callable[[float], None],
     ) -> None:
         self.slug = slug
         self.executable = executable
         self.command_timeout_seconds = command_timeout_seconds
         self.read_timeout_retries = read_timeout_retries
+        self.read_retry_backoff_seconds = read_retry_backoff_seconds
         self.page_size = page_size
         self.max_pages = max_pages
         self._runner = runner
+        self._sleep = sleep
         self._identity_validated = False
 
     @classmethod
@@ -271,16 +282,20 @@ class GitHubRepository:
         *,
         executable: str = "gh",
         command_timeout_seconds: float = 30.0,
-        read_timeout_retries: int = 1,
+        read_timeout_retries: int = 2,
+        read_retry_backoff_seconds: float = 0.25,
         page_size: int = 100,
         max_pages: int = 10,
         runner: GitHubCommandRunner = subprocess.run,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> GitHubRepository:
         _require_slug(slug)
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
         if read_timeout_retries < 0:
             raise ValueError("read_timeout_retries must not be negative")
+        if read_retry_backoff_seconds < 0:
+            raise ValueError("read_retry_backoff_seconds must not be negative")
         if not 1 <= page_size <= 100 or max_pages < 1:
             raise ValueError("page_size must be 1..100 and max_pages must be positive")
         repository = cls(
@@ -288,9 +303,11 @@ class GitHubRepository:
             executable=executable,
             command_timeout_seconds=command_timeout_seconds,
             read_timeout_retries=read_timeout_retries,
+            read_retry_backoff_seconds=read_retry_backoff_seconds,
             page_size=page_size,
             max_pages=max_pages,
             runner=runner,
+            sleep=sleep,
         )
         repository._validate_identity()
         return repository
@@ -1137,6 +1154,7 @@ class GitHubRepository:
                 )
             except subprocess.TimeoutExpired as exc:
                 if attempt + 1 < attempts:
+                    self._backoff_read_retry(args, attempt, attempts, "timeout")
                     continue
                 raise WorkerFailure(
                     f"read-only GitHub {' '.join(args)} timed out"
@@ -1147,9 +1165,43 @@ class GitHubRepository:
                 detail = (
                     completed.stderr.strip() or completed.stdout.strip() or "no output"
                 )
+                match = _HTTP_STATUS_RE.search(detail)
+                status = int(match.group(1)) if match else None
+                if (
+                    status is not None
+                    and (
+                        status in _TRANSIENT_READ_HTTP_STATUSES
+                        or (status == 403 and _RATE_LIMIT_RE.search(detail))
+                    )
+                    and attempt + 1 < attempts
+                ):
+                    self._backoff_read_retry(args, attempt, attempts, f"HTTP {status}")
+                    continue
                 raise WorkerFailure(f"GitHub {' '.join(args)} failed: {detail}")
             return completed.stdout
         raise AssertionError("unreachable")
+
+    def _backoff_read_retry(
+        self,
+        args: Sequence[str],
+        attempt: int,
+        attempts: int,
+        reason: str,
+    ) -> None:
+        delay = min(
+            self.read_retry_backoff_seconds * (2**attempt),
+            _READ_RETRY_MAX_BACKOFF_SECONDS,
+        )
+        logger.warning(
+            "Transient read-only GitHub %s failure (%s); retrying attempt %d/%d "
+            "in %.2fs",
+            " ".join(args[:2]),
+            reason,
+            attempt + 2,
+            attempts,
+            delay,
+        )
+        self._sleep(delay)
 
 
 class _PostconditionAbsent(WorkerFailure):

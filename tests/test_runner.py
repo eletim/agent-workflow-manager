@@ -108,7 +108,6 @@ print(os.environ.get("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", "ignored"))
     assert result.run_id == run_id
     assert result.state == "success"
     assert result.stdout == "ignored\n"
-    assert not hasattr(runner, "resume")
     assert (
         PythonRunner._parse_runner_event('{"type":"checkpoint","name":"old","data":{}}')
         is None
@@ -396,6 +395,69 @@ def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
         assert successor.start("print('successor')") == run_id + 1
     finally:
         successor.close()
+
+
+def test_resume_reuses_immutable_settings_and_persists_run_relationship(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    source = '{"mode":"issue-driven","one_shot_issue":196}'
+    try:
+        first_id = runner.start(
+            "import sys; print(sys.argv[1]); raise SystemExit(7)",
+            args=("same-argument",),
+            issue_driven_json=source,
+        )
+        wait_for(runner, lambda item: item.state == "failed", run_id=first_id)
+
+        resumed_id = runner.resume(first_id)
+        resumed = wait_for(
+            runner, lambda item: item.state == "failed", run_id=resumed_id
+        )
+
+        assert resumed_id == first_id + 1
+        assert resumed.code == runner.snapshot(first_id).code
+        assert resumed.args == ("same-argument",)
+        assert resumed.issue_driven_json == source
+        assert resumed.resumed_from_run_id == first_id
+        assert resumed.as_json()["mode"] == "issue-driven"
+        assert resumed.as_summary_json()["resumedFromRunId"] == first_id
+    finally:
+        runner.close()
+
+    restored = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        resumed = restored.snapshot(resumed_id)
+        assert resumed.issue_driven_json == source
+        assert resumed.resumed_from_run_id == first_id
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("mode", ["prompt", "workflow"])
+def test_resume_rejects_non_issue_driven_runs(
+    runner: PythonRunner, tmp_path: Path, mode: str
+) -> None:
+    prompt = (
+        PromptExecution("codex", str(tmp_path), "answer") if mode == "prompt" else None
+    )
+    run_id = runner.start("raise SystemExit(7)", prompt=prompt)
+    wait_for(runner, lambda item: item.state == "failed", run_id=run_id)
+
+    with pytest.raises(
+        runner_module.RunResumeNotAllowedError,
+        match="not an Issue Driven run",
+    ):
+        runner.resume(run_id)
 
 
 def test_run_id_is_durably_reserved_before_launch_crash(
@@ -1572,7 +1634,7 @@ def test_issue_driven_summary_uses_durable_structured_results_not_progress() -> 
     emit_step, emit_whole_review_result,
 )
 emit_issue_driven_context("acme/project", "dev/v1", "main", policy_issue=9)
-emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-10-implementation", scope_review_tab_id="tab-10-scope", correctness_review_tab_id="tab-10-correctness")
 emit_finding("github", "review limit reached", status="warning")
 emit_issue_result(11, "continued_with_warning", 5, 41, "https://github.com/acme/project/pull/41", warnings=("review limit reached",))
 emit_issue_result("mini-task:refresh-help", "approved", 2, 42, "https://github.com/acme/project/pull/42", label="Mini task refresh-help")
@@ -1608,6 +1670,20 @@ for number in range(3):
                     "url": "https://github.com/acme/project/pull/40",
                 },
                 "warnings": [],
+                "terminals": {
+                    "implementation": {
+                        "workspaceId": "ws-run",
+                        "tabId": "tab-10-implementation",
+                    },
+                    "scopeReview": {
+                        "workspaceId": "ws-run",
+                        "tabId": "tab-10-scope",
+                    },
+                    "correctnessReview": {
+                        "workspaceId": "ws-run",
+                        "tabId": "tab-10-correctness",
+                    },
+                },
             },
             {
                 "issue": 11,
@@ -1639,18 +1715,54 @@ for number in range(3):
     }
 
 
-def test_issue_driven_summary_is_hidden_while_running_and_scoped_to_run() -> None:
+def test_issue_driven_terminal_navigation_survives_runner_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_issue_driven_context, emit_issue_result
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-10-implementation", scope_review_tab_id="tab-10-scope", correctness_review_tab_id="tab-10-correctness")
+"""
+        )
+        expected = wait_until_finished(runner).as_json()["issueDrivenSummary"]
+    finally:
+        runner.close()
+
+    restored_runner = PythonRunner(
+        managed_workflows=False,
+        run_history_file=history_file,
+    )
+    try:
+        assert (
+            restored_runner.snapshot(run_id).as_json()["issueDrivenSummary"] == expected
+        )
+    finally:
+        restored_runner.close()
+
+
+def test_summary_exposes_completed_item_while_later_item_is_active() -> None:
     runner = PythonRunner(managed_workflows=False)
     try:
         first = runner.start(
-            """from purplemux_client import emit_issue_driven_context
+            """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_navigation, emit_issue_result,
+)
 import time
 emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_navigation(10, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-10-implementation", scope_review_tab_id="tab-10-scope", correctness_review_tab_id="tab-10-correctness")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/40")
+emit_issue_navigation(11, 41, "https://github.com/acme/project/pull/41", workspace_id="ws-run", implementation_tab_id="tab-11-implementation", scope_review_tab_id="tab-11-scope", correctness_review_tab_id="tab-11-correctness")
 time.sleep(60)
 """
         )
         running = wait_for(
-            runner, lambda item: item.issue_driven_context is not None, run_id=first
+            runner, lambda item: len(item.issue_navigations) == 2, run_id=first
         )
         runner.stop(first)
         wait_for(runner, lambda item: item.state == "stopped", run_id=first)
@@ -1659,9 +1771,64 @@ time.sleep(60)
     finally:
         runner.close()
 
-    assert running.as_json()["issueDrivenSummary"] is None
+    summary = running.as_json()["issueDrivenSummary"]
+    assert summary is not None
+    assert summary["terminalResult"] == "running"
+    assert [item.get("outcome") for item in summary["issues"]] == ["approved", None]
+    assert summary["issues"][1]["terminals"]["scopeReview"] == {
+        "workspaceId": "ws-run",
+        "tabId": "tab-11-scope",
+    }
     assert runner.snapshot(first).as_json()["issueDrivenSummary"] is not None
     assert runner.snapshot(second).as_json()["issueDrivenSummary"] is None
+
+
+def test_failed_issue_run_persists_navigation_without_a_final_result(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_issue_driven_context, emit_issue_navigation
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_navigation(10, 40, "https://github.com/acme/project/pull/40", workspace_id="ws-run", implementation_tab_id="tab-implementation", scope_review_tab_id="tab-scope", correctness_review_tab_id="tab-correctness")
+raise RuntimeError("review failed")
+"""
+        )
+        failed = wait_until_finished(runner)
+        assert failed.state == "failed"
+    finally:
+        runner.close()
+
+    restored_runner = PythonRunner(
+        managed_workflows=False, run_history_file=history_file
+    )
+    try:
+        summary = restored_runner.snapshot(run_id).as_json()["issueDrivenSummary"]
+    finally:
+        restored_runner.close()
+
+    assert summary is not None
+    assert summary["terminalResult"] == "failed"
+    assert summary["issues"] == [
+        {
+            "issue": 10,
+            "pr": {"number": 40, "url": "https://github.com/acme/project/pull/40"},
+            "warnings": [],
+            "terminals": {
+                "implementation": {
+                    "workspaceId": "ws-run",
+                    "tabId": "tab-implementation",
+                },
+                "scopeReview": {"workspaceId": "ws-run", "tabId": "tab-scope"},
+                "correctnessReview": {
+                    "workspaceId": "ws-run",
+                    "tabId": "tab-correctness",
+                },
+            },
+        }
+    ]
 
 
 def test_output_is_bounded_and_reports_truncation() -> None:
@@ -2170,6 +2337,10 @@ def request(
         ("not json", "invalid JSON"),
         ("[]", "JSON object required"),
         ('{"code": 42}', "code must be a string"),
+        (
+            '{"code":"", "issueDrivenJson":null}',
+            "issueDrivenJson is supported only for Run and must be a string",
+        ),
     ],
 )
 def test_malformed_run_request(
@@ -2234,6 +2405,7 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "integrationPr": None,
         "issueDrivenSummary": None,
+        "purplemuxPort": 8022,
         "cwd": str(Path.cwd()),
         "args": [],
         "attempts": [
@@ -2474,6 +2646,59 @@ def test_run_api_returns_not_found_for_unknown_run(
     assert request(address, "POST", "/api/runs/999/stop", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/cleanup", token=token)[0] == 404
     assert request(address, "POST", "/api/runs/999/resume", token=token)[0] == 404
+
+
+def test_run_api_rejects_non_issue_driven_and_nonterminal_resume(
+    web_server: tuple[tuple[str, int], str],
+) -> None:
+    address, token = web_server
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "raise SystemExit(9)", "args": ["same"]}),
+        token=token,
+    )
+    assert status == 202
+    source_id = int(started["runId"])
+    deadline = time.monotonic() + 5
+    while request(address, "GET", f"/api/runs/{source_id}")[1]["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{source_id}/resume",
+        token=token,
+    )
+    assert status == 409
+    assert "not an Issue Driven run" in rejected["error"]
+
+    status, successful = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "print('complete')"}),
+        token=token,
+    )
+    assert status == 202
+    successful_id = int(successful["runId"])
+    deadline = time.monotonic() + 5
+    while (
+        request(address, "GET", f"/api/runs/{successful_id}")[1]["state"] == "running"
+    ):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    status, rejected = request(
+        address,
+        "POST",
+        f"/api/runs/{successful_id}/resume",
+        token=token,
+    )
+    assert status == 409
+    assert "only failed or stopped runs" in rejected["error"]
 
 
 def test_run_api_updates_checked_metadata_only_for_terminal_run(
@@ -2790,9 +3015,12 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         "issue-driven-json",
         "issue-driven-python",
         "issue-driven-generate",
+        "resume-open",
+        "resume-dialog",
+        "resume-settings",
+        "resume-confirm",
     ):
         assert f'id="{element_id}"' in page
-    assert 'id="resume"' not in page
 
 
 def test_issue_driven_generation_api_is_distinct_from_python_validation(
@@ -2828,6 +3056,22 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert generated["config"]["implementer_agent"] == "claude"
     assert generated["config"]["reviewer_agent"] == "codex"
     ast.parse(generated["generatedCode"])
+
+    status, mismatch = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps(
+            {
+                "code": generated["generatedCode"] + "\n# changed",
+                "args": [],
+                "issueDrivenJson": source,
+            }
+        ),
+        token=token,
+    )
+    assert status == 400
+    assert mismatch == {"error": "code does not match issueDrivenJson"}
 
     status, rejected = request(
         address,
@@ -3588,6 +3832,7 @@ def test_notification_settings_mutation_rejects_untrusted_request(
             "/api/run",
             "/api/validate",
             "/api/dry-run",
+            "/api/runs/1/resume",
             "/api/readiness/probe",
             "/api/readiness/reconcile",
         )
@@ -3745,6 +3990,19 @@ def test_web_cli_accepts_explicit_remote_ipv4_bind() -> None:
     assert args.host == "100.64.10.20"
 
 
+def test_web_cli_accepts_configured_purplemux_port() -> None:
+    args = build_parser().parse_args(["--purplemux-port", "9123"])
+
+    assert args.purplemux_port == 9123
+
+
+def test_web_cli_accepts_purplemux_port_file(tmp_path: Path) -> None:
+    port_file = tmp_path / "port"
+    args = build_parser().parse_args(["--purplemux-port-file", str(port_file)])
+
+    assert args.purplemux_port_file == port_file
+
+
 def test_mobile_connection_uses_remote_browser_origin_only() -> None:
     alias_origin = "http://runner.example.ts.net:8765"
 
@@ -3753,6 +4011,45 @@ def test_mobile_connection_uses_remote_browser_origin_only() -> None:
     assert mobile_connection_url("127.0.0.1", alias_origin) is None
     assert mobile_connection_url("localhost", alias_origin) is None
     assert mobile_connection_url("0.0.0.0", alias_origin) is None
+
+
+def test_purplemux_server_exposes_configured_runtime_port() -> None:
+    runner = PythonRunner(managed_workflows=False)
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        runner,
+        host_aliases=("runner.example.ts.net",),
+        purplemux_port=9123,
+    )
+    try:
+        assert server.purplemux_port == 9123
+    finally:
+        server.server_close()
+
+
+def test_purplemux_server_refreshes_port_file_for_each_snapshot(
+    tmp_path: Path,
+) -> None:
+    port_file = tmp_path / "port"
+    port_file.write_text("8022\n", encoding="utf-8")
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        PythonRunner(managed_workflows=False),
+        purplemux_port_file=port_file,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    try:
+        assert request(address, "GET", "/api/status")[1]["purplemuxPort"] == 8022
+
+        port_file.write_text("9123\n", encoding="utf-8")
+
+        assert request(address, "GET", "/api/status")[1]["purplemuxPort"] == 9123
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_mobile_connection_falls_back_from_localhost_alias_to_remote_bind() -> None:

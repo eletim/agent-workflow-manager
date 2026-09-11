@@ -680,7 +680,9 @@ def test_correctness_fix_restarts_scope_before_final_correctness_review(
     )
     monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
 
-    result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    result = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     review_events = [name for name, _ in events if name.endswith("review")]
     assert review_events == [
@@ -918,7 +920,9 @@ def test_ready_issue_pr_is_redrafted_and_independently_reviewed(
         lambda *args, **kwargs: SimpleNamespace(pr=ready),
     )
 
-    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert events[0] == "set_draft:True"
     assert events.index("Issue #90 scope/design review") < events.index(
@@ -1031,7 +1035,9 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     )
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
-    workflow["process_issue"](issue, config, object(), repository, GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
+    )
 
     assert review_count == 3
     assert f"push:{cleanup_sha}" in events
@@ -1052,6 +1058,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     implementation_sha = "implementation-head"
     base_sha = "integration-head"
     events: list[str] = []
+    issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class Repository:
         def __init__(self) -> None:
@@ -1140,8 +1147,15 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_issue_result",
+        lambda *args, **kwargs: issue_results.append((args, kwargs)),
+    )
 
-    workflow["process_issue"](issue, config, object(), repository, GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
+    )
 
     commit_index = events.index(f"commit:{implementation_sha}")
     push_index = events.index(f"push:{implementation_sha}")
@@ -1149,6 +1163,110 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     verify_index = events.index(f"require_pr:{implementation_sha}")
     assert commit_index < push_index < draft_index < verify_index
     assert events[-1] == "ready"
+    assert issue_results[0][1]["workspace_id"] == "ws-test"
+    assert issue_results[0][1]["implementation_tab_id"] == (
+        f"{issue.label} implementer"
+    )
+    assert issue_results[0][1]["scope_review_tab_id"] == (
+        f"{issue.label} scope reviewer"
+    )
+    assert issue_results[0][1]["correctness_review_tab_id"] == (
+        f"{issue.label} correctness reviewer"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_phase", ["after_pr_creation", "scope/design", "correctness"]
+)
+def test_issue_navigation_precedes_post_pr_and_review_failures(
+    monkeypatch: pytest.MonkeyPatch, failure_phase: str
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](178, "feature/issue-178")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_sha = "implementation-head"
+    base_sha = "integration-head"
+    pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+    navigations: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, base_sha, base_sha, False)
+
+    def ensure_metadata(*args: object, **kwargs: object) -> PullRequestState:
+        if failure_phase == "after_pr_creation":
+            raise RuntimeError("metadata failure")
+        return pr
+
+    def review_phase(*args: object, **kwargs: object) -> object:
+        phase = str(kwargs["phase"])
+        if phase == failure_phase:
+            raise RuntimeError(f"{phase} failure")
+        assert phase == "scope/design"
+        return workflow["IssueReviewPhaseResult"](
+            pr, "approved", head_sha, base_sha, 1, ()
+        )
+
+    monkeypatch.setitem(
+        workflow_globals, "prepare_issue", lambda *args: (None, "start-head", False)
+    )
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", lambda *args, **kwargs: "done")
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (head_sha, False),
+    )
+    monkeypatch.setitem(workflow_globals, "ensure_issue_pr", lambda *args, **kwargs: pr)
+    monkeypatch.setitem(workflow_globals, "ensure_issue_pr_metadata", ensure_metadata)
+    monkeypatch.setitem(workflow_globals, "review_issue_phase", review_phase)
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_issue_navigation",
+        lambda *args, **kwargs: navigations.append((args, kwargs)),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "emit_issue_result",
+        lambda *args, **kwargs: issue_results.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="failure"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            object(),
+        )
+
+    assert issue_results == []
+    assert navigations == [
+        (
+            (issue.result_id, pr.number, pr.url),
+            {
+                "label": issue.label,
+                "workspace_id": "ws-test",
+                "implementation_tab_id": f"{issue.label} implementer",
+                "scope_review_tab_id": f"{issue.label} scope reviewer",
+                "correctness_review_tab_id": f"{issue.label} correctness reviewer",
+            },
+        )
+    ]
 
 
 def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
@@ -1249,10 +1367,103 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
     monkeypatch.setitem(workflow_globals, "review_issue_phase", review_issue_phase)
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
 
-    result = workflow["process_issue"](issue, config, object(), Repository(), github)
+    result = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), github
+    )
 
     assert result.body == f"{marker}\n\nAgent-created PR body"
     assert events == ["agent-created", "identity", "ready"]
+
+
+def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    task = "Refresh the New Run help."
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    branch = "feature/work-item-refresh-run-help"
+    issue = workflow["Issue"](None, branch, "refresh-run-help", task, fingerprint)
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue,),
+        "true",
+        one_shot_issue=204,
+    )
+    head_sha = "implementation-head"
+    base_sha = "integration-head"
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    bodies: list[str] = []
+
+    class Repository:
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, head_sha, None, True)
+
+        def ensure_pushed(
+            self, current: str, *, expected_local_sha: str
+        ) -> BranchState:
+            assert (current, expected_local_sha) == (branch, head_sha)
+            return BranchState(current, head_sha, head_sha, True)
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.pr: PullRequestState | None = None
+
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base, state) == (branch, config.integration_branch, "OPEN")
+            return self.pr
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            body = str(kwargs["body"])
+            bodies.append(body)
+            self.pr = replace(
+                open_pr(head=branch, base=config.integration_branch, draft=True),
+                head_sha=head_sha,
+                base_sha=base_sha,
+                body=body,
+            )
+            return self.pr
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert self.pr is not None
+            return self.pr
+
+        def update_pr_body(
+            self, number: int, *, body: str, **kwargs: object
+        ) -> PullRequestState:
+            assert self.pr is not None and number == self.pr.number
+            bodies.append(body)
+            self.pr = replace(self.pr, body=body)
+            return self.pr
+
+    github = GitHub()
+    created = workflow["ensure_issue_pr"](
+        Repository(), github, issue, config, expected_base_sha=base_sha
+    )
+    assert created.body.startswith(f"{marker}\n\n")
+
+    rewritten = replace(created, body="Updated child PR description")
+    github.pr = rewritten
+    updated = workflow["ensure_issue_pr_metadata"](github, rewritten, issue, config)
+
+    assert updated.body == f"{marker}\n\nUpdated child PR description"
+    assert bodies == [issue.pr_body, updated.body]
+
+
+def test_regular_issue_pr_body_metadata_maintenance_is_a_noop() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](204, "feature/issue-204")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pr = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+
+    class GitHub:
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            raise AssertionError("regular Issue PR body must not be updated")
+
+    assert workflow["ensure_issue_pr_metadata"](GitHub(), pr, issue, config) is pr
 
 
 def test_issue_review_limit_warns_without_starting_an_extra_fix(
@@ -1347,7 +1558,9 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         ),
     )
 
-    result = workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    result = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert result.is_draft is False
     assert events.count("Issue #134 scope/design review") == 2
@@ -1453,7 +1666,9 @@ def test_policy_conflict_from_fixer_is_persisted_after_pushed_head(
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
-    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert persisted_heads
     assert set(persisted_heads) == {fixed_sha}
@@ -1546,7 +1761,9 @@ def test_policy_conflict_from_changed_reviewer_uses_reacquired_child_head(
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
 
-    workflow["process_issue"](issue, config, object(), Repository(), GitHub())
+    workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+    )
 
     assert review_count == 3
     assert persisted_heads

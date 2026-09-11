@@ -87,6 +87,13 @@ different seed.
 The Runner and progress events only observe these decisions, so the generated
 plain Python remains the control-flow source of truth.
 
+Failed and stopped Issue Driven runs expose `Review & Resume` in the UI. The
+confirmation shows the original immutable settings, then starts a distinct run
+with the same generated workflow. Run history records the source run, while the
+workflow's normal authoritative Git, GitHub, and PurpleMux inspection recovers
+existing Base PR, plan, and child-PR state; the terminated Python process is not
+restored. Prompt and custom Python Workflow runs continue to use manual recovery.
+
 For one-shot delivery, replace the initial `issues` / `work_items` list with a
 single `one_shot_issue`. The generated workflow starts with an empty plan and its
 dedicated manager reads that source Issue before every planning turn, decomposes

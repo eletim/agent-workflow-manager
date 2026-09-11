@@ -32,6 +32,7 @@ from purplemux_client import (
     WorkerFailure,
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_navigation,
     emit_issue_result,
     emit_run_pr,
     emit_step,
@@ -868,22 +869,25 @@ def rehydrate_policy_conflicts(
         record_policy_conflict(issue_number, warning)
 
 
-def ensure_issue_pr_policy_conflicts(
+def ensure_issue_pr_metadata(
     github: GitHubRepository,
     pr: PullRequestState,
     issue: Issue,
     config: Config,
 ) -> PullRequestState:
-    if config.policy_issue is None:
+    body = with_inline_task_pr_identity(pr, issue)
+    if config.policy_issue is not None:
+        for issue_number, warning in POLICY_CONFLICT_WARNINGS:
+            if issue_number != issue.result_id:
+                continue
+            marker = encoded_policy_conflict_marker(warning)
+            if marker not in body:
+                body = (
+                    f"{body.rstrip()}\n\nPolicy conflict warning: {warning}\n{marker}"
+                )
+    if body == pr.body:
         return pr
-    body = pr.body
-    for issue_number, warning in POLICY_CONFLICT_WARNINGS:
-        if issue_number != issue.result_id:
-            continue
-        marker = encoded_policy_conflict_marker(warning)
-        if marker not in body:
-            body = f"{body.rstrip()}\n\nPolicy conflict warning: {warning}\n{marker}"
-    return github.update_pr_body(
+    current = github.update_pr_body(
         pr.number,
         body=body,
         expected_head=issue.branch,
@@ -891,6 +895,7 @@ def ensure_issue_pr_policy_conflicts(
         expected_base=config.integration_branch,
         expected_base_sha=pr.base_sha,
     )
+    return require_inline_task_pr_identity(current, issue)
 
 
 def policy_pr_notes(config: Config) -> str:
@@ -1121,6 +1126,17 @@ def inline_task_pr_fingerprint(pr: PullRequestState) -> str | None:
     return marker[len(prefix) : -len(suffix)] if marker.endswith(suffix) else ""
 
 
+def with_inline_task_pr_identity(pr: PullRequestState, issue: Issue) -> str:
+    if issue.task_fingerprint is None:
+        return pr.body
+    fingerprint = inline_task_pr_fingerprint(pr)
+    if fingerprint is not None:
+        require_inline_task_pr_identity(pr, issue)
+        return pr.body
+    marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{issue.task_fingerprint} -->"
+    return f"{marker}\n\n{pr.body}" if pr.body else marker
+
+
 def prepare_issue(
     repo: GitRepository,
     github: GitHubRepository,
@@ -1239,11 +1255,9 @@ def ensure_issue_pr(
         and issue.task_fingerprint is not None
         and inline_task_pr_fingerprint(current) is None
     ):
-        marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{issue.task_fingerprint} -->"
-        body = f"{marker}\n\n{current.body}" if current.body else marker
         current = github.update_pr_body(
             current.number,
-            body=body,
+            body=with_inline_task_pr_identity(current, issue),
             expected_head=issue.branch,
             expected_head_sha=feature.remote_sha,
             expected_base=config.integration_branch,
@@ -1408,7 +1422,7 @@ def review_issue_phase(
                 expected_base_sha=current.base_sha,
                 draft=True,
             )
-            pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
+            pr = ensure_issue_pr_metadata(github, pr, issue, config)
             emit_finding(
                 "git",
                 f"{phase} review changed {issue.branch}; outcome invalidated at "
@@ -1419,7 +1433,7 @@ def review_issue_phase(
                     pr, "head_changed", pr.head_sha, pr.base_sha, review_number
                 )
             continue
-        current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
+        current = ensure_issue_pr_metadata(github, current, issue, config)
         if verdict == "APPROVED":
             return IssueReviewPhaseResult(
                 current, "approved", current.head_sha, current.base_sha, review_number
@@ -1514,7 +1528,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             expected_base_sha=current.base_sha,
             draft=True,
         )
-        pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
+        pr = ensure_issue_pr_metadata(github, pr, issue, config)
         if restart_scope_on_change:
             return IssueReviewPhaseResult(
                 pr, "head_changed", pr.head_sha, pr.base_sha, review_number
@@ -1593,6 +1607,17 @@ def process_issue(
         agent_type=REVIEWER_AGENT,
         name=f"{issue.label} correctness reviewer",
     )
+    if existing_pr is not None:
+        emit_issue_navigation(
+            issue.result_id,
+            existing_pr.number,
+            existing_pr.url,
+            label=issue.label,
+            workspace_id=client.workspace_id,
+            implementation_tab_id=implementer,
+            scope_review_tab_id=scope_reviewer,
+            correctness_review_tab_id=correctness_reviewer,
+        )
     implementation_prompt, scope_prompt, correctness_prompt = issue_prompts(
         issue, config
     )
@@ -1628,7 +1653,17 @@ def process_issue(
         expected_base_sha=integration.remote_sha,
         may_initialize_inline_identity=existing_pr is None,
     )
-    pr = ensure_issue_pr_policy_conflicts(github, pr, issue, config)
+    emit_issue_navigation(
+        issue.result_id,
+        pr.number,
+        pr.url,
+        label=issue.label,
+        workspace_id=client.workspace_id,
+        implementation_tab_id=implementer,
+        scope_review_tab_id=scope_reviewer,
+        correctness_review_tab_id=correctness_reviewer,
+    )
+    pr = ensure_issue_pr_metadata(github, pr, issue, config)
     if pr.head_sha != implementation_sha:
         raise WorkerFailure("delivered PR head does not match committed result")
     emit_step(
@@ -1725,6 +1760,10 @@ def process_issue(
             pr.url,
             warnings=warnings,
             label=issue.label,
+            workspace_id=client.workspace_id,
+            implementation_tab_id=implementer,
+            scope_review_tab_id=scope_reviewer,
+            correctness_review_tab_id=correctness_reviewer,
         )
         record_issue_handoff_result(
             issue.result_id, issue.label, pr, delivery.outcome, delivery.reviews, warnings
@@ -1749,6 +1788,10 @@ def process_issue(
         merged.pr.url,
         warnings=warnings,
         label=issue.label,
+        workspace_id=client.workspace_id,
+        implementation_tab_id=implementer,
+        scope_review_tab_id=scope_reviewer,
+        correctness_review_tab_id=correctness_reviewer,
     )
     record_issue_handoff_result(
         issue.result_id,

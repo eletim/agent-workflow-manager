@@ -115,6 +115,9 @@ function snapshot({
   findings = [],
   warningTimeline = [],
   warningTimelineOmitted = 0,
+  purplemuxPort = 9123,
+  issueDrivenJson = undefined,
+  resumedFromRunId = null,
 }) {
   const result = {
     args,
@@ -146,9 +149,12 @@ function snapshot({
     integrationPr,
     checked,
     issueDrivenSummary,
+    purplemuxPort,
+    resumedFromRunId,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
+  if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
   return result;
 }
 
@@ -229,6 +235,8 @@ async function loadApp({
     "issue-summary-list", "issue-summary-whole", "issue-summary-base",
     "issue-summary-policy", "issue-summary-warnings",
     "recovery-panel", "recovery-summary", "attempt-history", "resources-panel",
+    "resume-open", "resume-dialog", "resume-source", "resume-settings",
+    "resume-cancel", "resume-confirm",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
     "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
@@ -373,6 +381,12 @@ function runItem(elements, runId) {
   );
 }
 
+function runCheckToggle(elements, runId) {
+  const item = runItem(elements, runId);
+  const index = elements["run-list"].children.indexOf(item);
+  return elements["run-list"].children[index + 1];
+}
+
 function markerState(elements, runId) {
   const item = runItem(elements, runId);
   assert.equal(item.children[0].className, "run-state-marker");
@@ -456,6 +470,80 @@ test("terminal run checked state toggles from detail and list without leaking", 
   assert.deepEqual(updates, [[1, true], [1, false]]);
   assert.equal(elements["checked-toggle"].textContent, "Mark checked");
   assert.equal(details[2].checked, false);
+});
+
+test("selected-run checked toggle suppresses duplicate pending requests", async () => {
+  const update = deferred();
+  const runs = [
+    {runId: 1, state: "success", mode: "workflow", cwd: "/work/one", checked: false},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done", checked: false}),
+  };
+  let requests = 0;
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/runs/1/checked") return undefined;
+      requests += 1;
+      return update.promise;
+    },
+  });
+
+  const pendingSelection = elements["checked-toggle"].dispatch("click");
+  assert.equal(elements["checked-toggle"].disabled, true);
+  assert.equal(elements["checked-toggle"].dataset.pending, "true");
+  await elements["checked-toggle"].dispatch("click");
+  assert.equal(requests, 1);
+
+  runs[0].checked = true;
+  details[1].checked = true;
+  update.resolve(response(details[1]));
+  await pendingSelection;
+
+  assert.equal(elements["checked-toggle"].disabled, false);
+  assert.equal(elements["checked-toggle"].dataset.pending, undefined);
+  assert.equal(elements["checked-toggle"].getAttribute("aria-pressed"), "true");
+  assert.equal(elements["checked-toggle"].textContent, "Mark unchecked");
+});
+
+test("history checked toggle restores authoritative state after failure", async () => {
+  const update = deferred();
+  const runs = [
+    {runId: 1, state: "success", mode: "workflow", cwd: "/work/one", checked: false},
+  ];
+  const details = {
+    1: snapshot({runId: 1, state: "success", stdout: "done", checked: false}),
+  };
+  let requests = 0;
+  const {elements} = await loadApp({
+    runs,
+    details,
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/runs/1/checked") return undefined;
+      requests += 1;
+      return update.promise;
+    },
+  });
+
+  const toggle = runCheckToggle(elements, 1);
+  const pendingHistory = toggle.dispatch("click");
+  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.dataset.pending, "true");
+  await toggle.dispatch("click");
+  assert.equal(requests, 1);
+
+  update.resolve(response({error: "check failed"}, 500));
+  await pendingHistory;
+
+  const authoritativeToggle = runCheckToggle(elements, 1);
+  assert.equal(authoritativeToggle.disabled, false);
+  assert.equal(authoritativeToggle.getAttribute("aria-pressed"), "false");
+  assert.equal(authoritativeToggle.textContent, "Unchecked");
+  assert.match(elements.stderr.textContent, /check failed/);
 });
 
 test("checked run deletion shows the eligible count and clears deleted detail", async () => {
@@ -939,9 +1027,8 @@ test("stale guide failure cannot replace the active guide", async () => {
   assert.equal(elements["guide-copy"].disabled, false);
 });
 
-test("stale Issue Driven generation cannot replace newer JSON and Python", async () => {
-  const first = deferred();
-  const second = deferred();
+test("Issue Driven generation immediately enters pending and suppresses repeat clicks", async () => {
+  const generation = deferred();
   let requestNumber = 0;
   const {elements} = await loadApp({
     runs: [],
@@ -950,28 +1037,90 @@ test("stale Issue Driven generation cannot replace newer JSON and Python", async
     fetchOverride(url) {
       if (url !== "/api/issue-driven/generate") return undefined;
       requestNumber += 1;
-      return requestNumber === 1 ? first.promise : second.promise;
+      return generation.promise;
     },
   });
 
   await elements["issue-driven-mode"].dispatch("click");
   elements["issue-driven-json"].value = '{"issues":[90]}';
-  const firstGeneration = elements["issue-driven-generate"].dispatch("click");
-  elements["issue-driven-json"].value = '{"issues":[91]}';
-  const secondGeneration = elements["issue-driven-generate"].dispatch("click");
-  second.resolve(response({
-    generatedCode: "# generated for 91",
-    issueDrivenValidation: [],
-  }));
-  await secondGeneration;
-  first.resolve(response({
+  const pendingGeneration = elements["issue-driven-generate"].dispatch("click");
+
+  assert.equal(elements["issue-driven-generate"].disabled, true);
+  assert.equal(elements["issue-driven-generate"].dataset.pending, "true");
+  assert.equal(elements["issue-driven-generate"].getAttribute("aria-busy"), "true");
+  await elements["issue-driven-generate"].dispatch("click");
+  assert.equal(requestNumber, 1);
+
+  generation.resolve(response({
     generatedCode: "# generated for 90",
     issueDrivenValidation: [],
   }));
-  await firstGeneration;
+  await pendingGeneration;
 
-  assert.equal(elements["issue-driven-json"].value, '{"issues":[91]}');
-  assert.equal(elements["issue-driven-python"].value, "# generated for 91");
+  assert.equal(elements["issue-driven-python"].value, "# generated for 90");
+  assert.equal(elements["issue-driven-generate"].disabled, false);
+  assert.equal(elements["issue-driven-generate"].dataset.pending, undefined);
+  assert.equal(elements["issue-driven-generate"].getAttribute("aria-busy"), undefined);
+});
+
+test("Run pending feedback clears after failure and permits a retry", async () => {
+  const firstRun = deferred();
+  let runRequests = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/run") return undefined;
+      runRequests += 1;
+      return runRequests === 1
+        ? firstRun.promise
+        : response({error: "retry also failed"}, 500);
+    },
+  });
+
+  const pendingRun = elements.run.dispatch("click");
+  assert.equal(elements.run.disabled, true);
+  assert.equal(elements.run.dataset.pending, "true");
+  assert.equal(elements.run.getAttribute("aria-busy"), "true");
+  await elements.run.dispatch("click");
+  assert.equal(runRequests, 1);
+
+  firstRun.resolve(response({error: "start failed"}, 500));
+  await pendingRun;
+  assert.equal(elements.run.disabled, false);
+  assert.equal(elements.run.dataset.pending, undefined);
+  assert.equal(elements.run.getAttribute("aria-busy"), undefined);
+  assert.match(elements.stderr.textContent, /start failed/);
+
+  await elements.run.dispatch("click");
+  assert.equal(runRequests, 2);
+});
+
+test("non-Run async actions use the same pending feedback", async () => {
+  const notification = deferred();
+  let notificationRequests = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/settings/notifications/test") return undefined;
+      notificationRequests += 1;
+      return notification.promise;
+    },
+  });
+
+  const pendingNotification = elements["test-notification"].dispatch("click");
+  assert.equal(elements["test-notification"].disabled, true);
+  assert.equal(elements["test-notification"].dataset.pending, "true");
+  await elements["test-notification"].dispatch("click");
+  assert.equal(notificationRequests, 1);
+
+  notification.resolve(response({message: "Test notification sent."}));
+  await pendingNotification;
+  assert.equal(elements["test-notification"].disabled, false);
+  assert.equal(elements["test-notification"].dataset.pending, undefined);
 });
 
 test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async () => {
@@ -1014,9 +1163,90 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
 
   assert.deepEqual(submissions, [
     ["/api/dry-run", {code: generatedCode, args: []}],
-    ["/api/run", {code: generatedCode, args: []}],
+    ["/api/run", {code: generatedCode, args: [], issueDrivenJson: "{}"}],
   ]);
   assert.match(elements["active-context"].textContent, /Workflow Run #12/);
+  assert.equal(elements.run.dataset.pending, undefined);
+  assert.equal(elements.run.getAttribute("aria-busy"), undefined);
+  assert.equal(elements.run.disabled, true);
+});
+
+test("failed Issue Driven run previews immutable settings and resumes as a new run", async () => {
+  const source = '{\n  "mode": "issue-driven",\n  "one_shot_issue": 196\n}';
+  const failed = snapshot({
+    runId: 4,
+    state: "failed",
+    stdout: "failed",
+    mode: "issue-driven",
+    issueDrivenJson: source,
+  });
+  const resumed = snapshot({
+    runId: 5,
+    state: "running",
+    stdout: "",
+    mode: "issue-driven",
+    issueDrivenJson: source,
+    resumedFromRunId: 4,
+  });
+  const runs = [{runId: 4, state: "failed", mode: "issue-driven"}];
+  const details = {4: failed};
+  const {calls, elements} = await loadApp({
+    runs,
+    details,
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url !== "/api/runs/4/resume") return undefined;
+      assert.equal(options.method, "POST");
+      runs.push({
+        runId: 5,
+        state: "running",
+        mode: "issue-driven",
+        resumedFromRunId: 4,
+      });
+      details[5] = resumed;
+      return response(resumed, 202);
+    },
+  });
+
+  await elements["resume-open"].dispatch("click");
+  assert.equal(elements["resume-dialog"].open, true);
+  assert.equal(elements["resume-settings"].textContent, source);
+  assert.match(elements["resume-source"].textContent, /Run #4/);
+
+  await elements["resume-confirm"].dispatch("click");
+
+  assert.equal(elements["resume-dialog"].open, false);
+  assert.ok(calls.some(([url, method]) => (
+    url === "/api/runs/4/resume" && method === "POST"
+  )));
+  assert.match(elements["active-context"].textContent, /Issue Driven Run #5/);
+  assert.match(elements["active-context"].textContent, /resumed from Run #4/);
+  assert.match(runItem(elements, 5).textContent, /Resume of #4/);
+});
+
+test("failed Prompt and custom Workflow runs do not offer Resume", async () => {
+  for (const mode of ["prompt", "workflow"]) {
+    const failed = snapshot({
+      runId: 4,
+      state: "failed",
+      stdout: "failed",
+      mode,
+      prompt: mode === "prompt"
+        ? {agent: "codex", cwd: "/work/project", prompt: "answer"}
+        : undefined,
+    });
+    const {calls, elements} = await loadApp({
+      runs: [{runId: 4, state: "failed", mode}],
+      details: {4: failed},
+      validation: {body: {}, status: 200},
+    });
+
+    assert.equal(elements["resume-open"].hidden, true);
+    assert.equal(elements["resume-open"].disabled, true);
+    await elements["resume-open"].dispatch("click");
+    assert.equal(elements["resume-dialog"].open, false);
+    assert.equal(calls.some(([url]) => url.endsWith("/resume")), false);
+  }
 });
 
 test("Prompt directory picker navigates and selects its resolved current path", async () => {
@@ -1780,6 +2010,11 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
         outcome: "continued_with_warning",
         reviews: 5,
         pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+        terminals: {
+          implementation: {workspaceId: "ws-run", tabId: "tab-implementer"},
+          scopeReview: {workspaceId: "ws-run", tabId: "tab-scope"},
+          correctnessReview: {workspaceId: "ws-run", tabId: "tab-correctness"},
+        },
         warnings: ["review limit reached"],
       },
     ],
@@ -1796,10 +2031,32 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
     runs: [{runId: 1, state: "success"}],
     details: {1: detail},
     validation: {status: 200, body: {validation: []}},
+    locationHref: "http://100.64.10.20:8765/",
   });
 
   assert.equal(elements["issue-summary-panel"].hidden, false);
   assert.equal(elements["issue-summary-list"].children.length, 1);
+  const implementationLink = elements["issue-summary-list"].children[0]
+    .children[1].children[0].children[4];
+  const scopeLink = elements["issue-summary-list"].children[0]
+    .children[1].children[0].children[6];
+  const correctnessLink = elements["issue-summary-list"].children[0]
+    .children[1].children[0].children[8];
+  assert.equal(implementationLink.textContent, "Implementation");
+  assert.equal(
+    implementationLink.href,
+    "http://100.64.10.20:9123/?workspace=ws-run&tab=tab-implementer",
+  );
+  assert.equal(scopeLink.textContent, "Scope Review");
+  assert.equal(
+    scopeLink.href,
+    "http://100.64.10.20:9123/?workspace=ws-run&tab=tab-scope",
+  );
+  assert.equal(correctnessLink.textContent, "Correctness Review");
+  assert.equal(
+    correctnessLink.href,
+    "http://100.64.10.20:9123/?workspace=ws-run&tab=tab-correctness",
+  );
   assert.equal(
     elements["issue-summary-list"].children[0].children[1].children[0].children[0]
       .textContent,
@@ -1812,6 +2069,50 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
 
   await elements["new-run"].dispatch("click");
   assert.equal(elements["issue-summary-panel"].hidden, true);
+});
+
+test("running Issue Driven Summary links an item before its outcome exists", async () => {
+  const detail = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    issueDrivenSummary: {
+      repository: "acme/project",
+      integrationBranch: "dev/v1",
+      finalBranch: "main",
+      terminalResult: "running",
+      warningCount: 0,
+      issues: [{
+        issue: 40,
+        label: "Issue #40",
+        pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+        terminals: {
+          implementation: {workspaceId: "ws-run", tabId: "tab-implementation"},
+          scopeReview: {workspaceId: "ws-run", tabId: "tab-scope"},
+          correctnessReview: {workspaceId: "ws-run", tabId: "tab-correctness"},
+        },
+        warnings: [],
+      }],
+      wholeReview: null,
+      basePr: null,
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+    locationHref: "http://127.0.0.1:8765/",
+  });
+
+  const line = elements["issue-summary-list"].children[0].children[1].children[0];
+  assert.equal(elements["issue-summary-panel"].hidden, false);
+  assert.equal(elements["issue-summary-list"].children[0].className, "issue-summary-item in_progress");
+  assert.equal(line.children[4].textContent, "Implementation");
+  assert.equal(
+    line.children[4].href,
+    "http://127.0.0.1:9123/?workspace=ws-run&tab=tab-implementation",
+  );
+  assert.equal(line.children.at(-1).textContent, "  in progress");
 });
 
 test("validation displays a valid draft outline before execution", async () => {
@@ -2234,7 +2535,7 @@ test("slow run action cannot replace a newly selected run", async () => {
   assert.equal(elements.stop.disabled, true);
 });
 
-test("slow validation response cannot replace a newer validation result", async () => {
+test("slow validation suppresses a duplicate request until it settles", async () => {
   const delayedValidation = deferred();
   let validationCalls = 0;
   const {elements} = await loadApp({
@@ -2253,18 +2554,19 @@ test("slow validation response cannot replace a newer validation result", async 
   const slowValidation = elements.validate.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
   await elements.validate.dispatch("click");
-  assert.equal(elements["validation-success"].hidden, false);
-  assert.equal(elements["validation-success"].textContent, "✓ Valid");
+  assert.equal(validationCalls, 1);
+  assert.equal(elements.validate.disabled, true);
 
   delayedValidation.resolve(response({
     error: "workflow validation failed",
-    validation: [{line: 2, column: null, message: "stale result"}],
+    validation: [{line: 2, column: null, message: "first result"}],
   }, 422));
   await slowValidation;
 
-  assert.equal(elements["validation-success"].hidden, false);
-  assert.equal(elements["validation-success"].textContent, "✓ Valid");
-  assert.equal(elements.validation.children.length, 0);
+  assert.equal(elements.validate.disabled, false);
+  assert.equal(elements["validation-success"].hidden, true);
+  assert.equal(elements.validation.children.length, 1);
+  assert.match(elements.validation.children[0].textContent, /first result/);
 });
 
 test("slow draft validation cannot replace a selected run outline", async () => {

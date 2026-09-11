@@ -124,6 +124,7 @@ emit_step("workspace create", "completed")</textarea>
         <h2>Recovery</h2>
         <p id="recovery-summary"></p>
         <ol id="attempt-history" class="attempt-history"></ol>
+        <button id="resume-open" type="button" class="primary">Review &amp; Resume</button>
       </section>
 
       <section id="resources-panel" class="panel recovery-panel" aria-live="polite" hidden>
@@ -226,6 +227,23 @@ emit_step("workspace create", "completed")</textarea>
       </details>
 
     </main>
+
+    <dialog id="resume-dialog" class="resume-dialog" aria-labelledby="resume-title">
+      <div class="settings-dialog-toolbar">
+        <div>
+          <p id="resume-source" class="settings-path"></p>
+          <h2 id="resume-title">Review resume settings</h2>
+        </div>
+        <button id="resume-cancel" type="button">Cancel</button>
+      </div>
+      <div class="resume-dialog-content">
+        <p>The new run will reuse these immutable settings. Its workflow will inspect authoritative Git, GitHub, and PurpleMux state before continuing.</p>
+        <pre id="resume-settings"></pre>
+        <div class="resume-actions">
+          <button id="resume-confirm" type="button" class="primary">Resume as new run</button>
+        </div>
+      </div>
+    </dialog>
 
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
       <div class="settings-dialog-toolbar">
