@@ -1746,6 +1746,46 @@ emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/4
         restored_runner.close()
 
 
+def test_planner_skip_reason_is_durable_and_part_of_issue_summary(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_issue_driven_context, emit_planner_skip
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_planner_skip(197, "Already implemented by Issue #196.", label="Issue #197")
+"""
+        )
+        result = wait_until_finished(runner).as_json()
+    finally:
+        runner.close()
+
+    skip = {
+        "issue": 197,
+        "label": "Issue #197",
+        "reason": "Already implemented by Issue #196.",
+    }
+    planner_skip = result["plannerSkips"][0]
+    assert {key: planner_skip[key] for key in skip} == skip
+    assert datetime.fromisoformat(planner_skip["observedAt"]).tzinfo is not None
+    assert result["issueDrivenSummary"]["issues"] == [
+        {**skip, "outcome": "skipped", "warnings": []}
+    ]
+
+    restored_runner = PythonRunner(
+        managed_workflows=False, run_history_file=history_file
+    )
+    try:
+        restored = restored_runner.snapshot(run_id).as_json()
+    finally:
+        restored_runner.close()
+
+    assert restored["plannerSkips"] == result["plannerSkips"]
+    assert restored["issueDrivenSummary"] == result["issueDrivenSummary"]
+
+
 def test_summary_exposes_completed_item_while_later_item_is_active() -> None:
     runner = PythonRunner(managed_workflows=False)
     try:
@@ -2405,6 +2445,7 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "integrationPr": None,
         "issueDrivenSummary": None,
+        "plannerSkips": [],
         "purplemuxPort": 8022,
         "cwd": str(Path.cwd()),
         "args": [],

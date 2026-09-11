@@ -225,6 +225,11 @@ the immutable configuration is not changed. This remains ordinary Python
 control flow: planner prose, JSON input, Runner state, Progress, and the UI do not
 become scheduling authorities.
 
+Each `skip` action also supplies a concise reason. The workflow emits the
+accepted decision as structured data, and Progress and the Issue Driven Summary
+retain `SKIPPED` and its reason when viewing or reloading historical runs; stdout
+is not used to infer it.
+
 When Base PR creation is deferred because a newly created integration branch is
 still identical to its final branch, an AWM-owned remote Git note anchored to the
 reviewed final commit temporarily holds the same seed-bound serialized plan. It

@@ -182,6 +182,42 @@ def emit_issue_navigation(
     _write_event(event)
 
 
+def emit_planner_skip(
+    issue: int | str,
+    reason: str,
+    *,
+    label: str | None = None,
+) -> None:
+    """Publish an authoritative planner decision to skip one work item."""
+    if isinstance(issue, bool) or not isinstance(issue, (int, str)):
+        raise ValueError("issue must be a positive number or non-empty string")
+    if isinstance(issue, int):
+        _validate_positive_number("issue", issue)
+    elif not issue.strip() or len(issue) > 100:
+        raise ValueError("issue must be a positive number or non-empty string")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or reason != reason.strip()
+        or "\0" in reason
+        or len(reason) > 500
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in reason)
+    ):
+        raise ValueError("reason must be a non-empty string of at most 500 characters")
+    if label is not None and (
+        not isinstance(label, str) or not label.strip() or len(label) > 100
+    ):
+        raise ValueError("label must be a non-empty string of at most 100 characters")
+    event: dict[str, object] = {
+        "type": "planner_skip",
+        "issue": issue,
+        "reason": reason,
+    }
+    if label is not None:
+        event["label"] = label
+    _write_event(event, drop_oversized=True)
+
+
 def emit_whole_review_result(
     outcome: IssueOutcome,
     reviews: int,

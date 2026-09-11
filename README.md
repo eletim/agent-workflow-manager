@@ -86,6 +86,9 @@ PRs, and fails closed if the state is missing, ambiguous, or belongs to a
 different seed.
 The Runner and progress events only observe these decisions, so the generated
 plain Python remains the control-flow source of truth.
+Every skip includes a concise authoritative reason. The Runner retains that
+structured decision independently of stdout and shows `SKIPPED` plus the reason
+in both Progress and the Issue Driven Summary, including historical runs.
 
 Failed and stopped Issue Driven runs expose `Review & Resume` in the UI. The
 confirmation shows the original immutable settings, then starts a distinct run

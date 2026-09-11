@@ -115,6 +115,7 @@ function snapshot({
   findings = [],
   warningTimeline = [],
   warningTimelineOmitted = 0,
+  plannerSkips = [],
   purplemuxPort = 9123,
   issueDrivenJson = undefined,
   resumedFromRunId = null,
@@ -126,7 +127,7 @@ function snapshot({
     cwd,
     exitCode: state === "running" ? null : 1,
     outline,
-    progress: progress || [{name: `step-${runId}`, status: "completed"}],
+    progress: progress ?? [{name: `step-${runId}`, status: "completed"}],
     runId,
     state,
     stderr: `stderr-${runId}`,
@@ -140,6 +141,7 @@ function snapshot({
     findings,
     warningTimeline,
     warningTimelineOmitted,
+    plannerSkips,
     hasWarnings,
     resources,
     resourceCleanupStatus,
@@ -2113,6 +2115,51 @@ test("running Issue Driven Summary links an item before its outcome exists", asy
     "http://127.0.0.1:9123/?workspace=ws-run&tab=tab-implementation",
   );
   assert.equal(line.children.at(-1).textContent, "  in progress");
+});
+
+test("planner skips render their authoritative reason in Progress and Summary", async () => {
+  const skip = {
+    issue: 197,
+    label: "Issue #197",
+    reason: "Already implemented by Issue #196.",
+    observedAt: "2026-09-11T01:02:03+00:00",
+  };
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "",
+    progress: [],
+    plannerSkips: [skip],
+    issueDrivenSummary: {
+      repository: "acme/project",
+      integrationBranch: "dev/v1",
+      finalBranch: "main",
+      terminalResult: "success",
+      warningCount: 0,
+      issues: [{...skip, outcome: "skipped", warnings: []}],
+      wholeReview: null,
+      basePr: null,
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements.progress.children.length, 1);
+  assert.equal(elements.progress.children[0].className, "progress-item skipped");
+  assert.equal(
+    elements.progress.children[0].children[1].children[0].textContent,
+    "SKIPPED · Issue #197",
+  );
+  assert.equal(
+    elements.progress.children[0].children[1].children[2].textContent,
+    skip.reason,
+  );
+  const summaryItem = elements["issue-summary-list"].children[0];
+  assert.equal(summaryItem.className, "issue-summary-item skipped");
+  assert.equal(summaryItem.children[1].children[1].textContent, skip.reason);
 });
 
 test("validation displays a valid draft outline before execution", async () => {

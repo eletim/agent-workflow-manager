@@ -34,6 +34,7 @@ from purplemux_client import (
     emit_issue_driven_context,
     emit_issue_navigation,
     emit_issue_result,
+    emit_planner_skip,
     emit_run_pr,
     emit_step,
     emit_whole_review_result,
@@ -187,6 +188,12 @@ class Config:
     one_shot_issue: int | None = None
 
 
+@dataclass(frozen=True)
+class PlannerSkip:
+    issue: Issue
+    reason: str
+
+
 @dataclass
 class WorkItemPlan:
     """Mutable work-item order owned by this plain-Python workflow."""
@@ -196,6 +203,7 @@ class WorkItemPlan:
     position: int = 0
     finalized: bool = False
     persisted_source: str | None = None
+    skipped: list[PlannerSkip] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -239,8 +247,11 @@ class WorkItemPlan:
         self._validate(candidate)
         self.items[index] = issue
 
-    def skip(self, identity: int | str) -> Issue:
-        return self.items.pop(self._remaining_index(identity))
+    def skip(self, identity: int | str, reason: str | None = None) -> Issue:
+        issue = self.items.pop(self._remaining_index(identity))
+        if reason is not None:
+            self.skipped.append(PlannerSkip(issue, reason))
+        return issue
 
     def take_next(self) -> Issue | None:
         if self.position == len(self.items):
@@ -277,6 +288,7 @@ class ReviewDelivery:
 class PlannerDecision:
     complete: bool
     policy_conflicts: tuple[str, ...] = ()
+    skipped: tuple[PlannerSkip, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1846,8 +1858,8 @@ conflict exists. Actions run in order and have one of these exact shapes:
 - {{"action":"add","item":123}}
 - {{"action":"add","item":{{"id":"task-id","task":"instruction"}}}}
 - {{"action":"update","key":"task-id","task":"revised instruction"}}
-- {{"action":"skip","key":123}}
-- {{"action":"skip","key":"task-id"}}
+- {{"action":"skip","key":123,"reason":"already implemented by #456"}}
+- {{"action":"skip","key":"task-id","reason":"concise reason"}}
 Use complete=true only when no pending or newly added work remains and the
 workflow should proceed to whole-version delivery. Otherwise use complete=false.
 Do not use Markdown fences or add explanation outside the JSON object."""
@@ -1965,6 +1977,8 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     candidate = WorkItemPlan(plan.config)
     candidate.items = list(plan.items)
     candidate.position = plan.position
+    candidate.skipped = list(plan.skipped)
+    skipped_before = len(candidate.skipped)
     try:
         for action in actions:
             if not isinstance(action, dict) or not isinstance(
@@ -1983,8 +1997,21 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 candidate.update(
                     key, planner_inline_issue(current.task_id, action["task"])
                 )
-            elif kind == "skip" and set(action) == {"action", "key"}:
-                candidate.skip(planner_key(action["key"]))
+            elif kind == "skip" and set(action) == {"action", "key", "reason"}:
+                reason = action["reason"]
+                reason_has_surrogate = isinstance(reason, str) and any(
+                    0xD800 <= ord(character) <= 0xDFFF for character in reason
+                )
+                if (
+                    not isinstance(reason, str)
+                    or not reason
+                    or reason != reason.strip()
+                    or "\0" in reason
+                    or len(reason) > 500
+                    or reason_has_surrogate
+                ):
+                    raise WorkerFailure("planner skip reason is invalid")
+                candidate.skip(planner_key(action["key"]), reason)
             else:
                 raise WorkerFailure("planner action has an unsupported shape")
     except ValueError as exc:
@@ -1997,8 +2024,13 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     candidate.finalized = complete
     validate_work_item_plan_capacity(candidate)
     plan.items = candidate.items
+    plan.skipped = candidate.skipped
     plan.finalized = complete
-    return PlannerDecision(complete, tuple(policy_conflicts))
+    return PlannerDecision(
+        complete,
+        tuple(policy_conflicts),
+        tuple(candidate.skipped[skipped_before:]),
+    )
 
 
 def plan_seed_fingerprint(config: Config) -> str:
@@ -2364,6 +2396,12 @@ def process_work_items(
                 f"Policy Issue #{config.policy_issue} conflicts with work-item "
                 f"planning: {conflict}; continuing with the implementation work "
                 "item as the primary requirement.",
+            )
+        for skipped in planner_decision.skipped:
+            emit_planner_skip(
+                skipped.issue.result_id,
+                skipped.reason,
+                label=skipped.issue.label,
             )
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:

@@ -847,7 +847,7 @@ structured GitHub result is the source of truth; `emit_run_pr()` and the optiona
 
 Generated Issue Driven workflows additionally use the specialized
 `emit_issue_driven_context()`, `emit_issue_navigation()`, `emit_issue_result()`,
-and `emit_whole_review_result()` observation helpers. These retain narrow
+`emit_planner_skip()`, and `emit_whole_review_result()` observation helpers. These retain narrow
 structured facts without parsing Progress or stdout. They are not a general
 event store or a workflow control-flow API. As soon as a child PR and all three
 role tabs are known, generated workflows pass the PR identity, shared
@@ -856,6 +856,10 @@ and `correctness_review_tab_id` to `emit_issue_navigation()`. Final outcome and
 review data remain the responsibility of `emit_issue_result()`. The navigation
 identities survive later review or delivery failure and are never derived from
 a session index, UI state, or tmux state.
+When the authoritative planner skips a pending work item, the generated workflow
+passes its identity, label, and required concise reason to
+`emit_planner_skip()`. This preserves the decision in Progress and the Issue
+Driven Summary without interpreting planner prose or stdout.
 
 Findings and advanced resource registration use:
 

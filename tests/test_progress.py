@@ -10,6 +10,7 @@ from purplemux_client import (
     emit_issue_driven_context,
     emit_issue_navigation,
     emit_issue_result,
+    emit_planner_skip,
     emit_run_pr,
     emit_step,
     emit_whole_review_result,
@@ -176,6 +177,32 @@ def test_emit_issue_result_accepts_labeled_inline_work_item(
             "pr_url": "https://github.com/acme/project/pull/45",
             "warnings": [],
         }
+
+
+def test_emit_planner_skip_writes_authoritative_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_planner_skip(197, "Already implemented by Issue #196.", label="Issue #197")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "planner_skip",
+            "issue": 197,
+            "label": "Issue #197",
+            "reason": "Already implemented by Issue #196.",
+        }
+
+
+def test_emit_planner_skip_rejects_missing_or_oversized_reason() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        emit_planner_skip(197, "")
+    with pytest.raises(ValueError, match="reason"):
+        emit_planner_skip(197, "x" * 501)
 
 
 @pytest.mark.parametrize(
