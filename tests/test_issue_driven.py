@@ -356,6 +356,9 @@ def test_multi_repository_generation_prepares_each_config_lazily_in_order() -> N
     module.__dict__["emit_issue_driven_repositories"] = lambda repositories: (
         events.append("declare repositories")
     )
+    module.__dict__["emit_issue_driven_repository"] = lambda index, status: (
+        events.append(f"repository {index} {status}")
+    )
     module.__dict__["run_repository"] = lambda config, deliveries: events.append(
         "run first" if config is first else "run second"
     )
@@ -367,10 +370,14 @@ def test_multi_repository_generation_prepares_each_config_lazily_in_order() -> N
 
     assert events == [
         "declare repositories",
+        "repository 1 started",
         "prepare first",
         "run first",
+        "repository 1 completed",
+        "repository 2 started",
         "prepare second",
         "run second",
+        "repository 2 completed",
         "finalize repositories",
     ]
 

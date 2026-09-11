@@ -847,7 +847,8 @@ structured GitHub result is the source of truth; `emit_run_pr()` and the optiona
 `emit_step()` fields only expose that known identity to the current run.
 
 Generated Issue Driven workflows additionally use the specialized
-`emit_issue_driven_repositories()`, `emit_issue_driven_context()`,
+`emit_issue_driven_repositories()`, `emit_issue_driven_repository()`,
+`emit_issue_driven_context()`,
 `emit_issue_navigation()`, `emit_issue_result()`,
 `emit_planner_skip()`, and `emit_whole_review_result()` observation helpers. These retain narrow
 structured facts without parsing Progress or stdout. They are not a general
@@ -861,9 +862,12 @@ a session index, UI state, or tmux state.
 For a multi-repository Run, the workflow first calls
 `emit_issue_driven_repositories()` with the complete ordered set of repository,
 integration branch, final branch, and optional Policy Issue tuples. It then
-calls `emit_issue_driven_context()` as each repository starts. This lets the
-Runner retain pending repositories and distinguish their progress even when an
-earlier repository fails or the Run is stopped.
+calls `emit_issue_driven_repository(index, "started")` before each repository's
+fallible preparation, followed by `"completed"` only after its execution
+returns. `emit_issue_driven_context()` supplies the prepared repository identity.
+This lets the Runner retain pending repositories and attribute failures or stops
+to repository preparation without treating final cross-repository work as part
+of the last repository.
 When the authoritative planner skips a pending work item, the generated workflow
 passes its identity, label, and required concise reason to
 `emit_planner_skip()`. This preserves the decision in Progress and the Issue

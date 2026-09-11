@@ -228,6 +228,12 @@ class IssueDrivenRepositoryDeclaration:
 
 
 @dataclass(frozen=True)
+class IssueDrivenRepositoryLifecycle:
+    repository_index: int
+    status: Literal["started", "completed"]
+
+
+@dataclass(frozen=True)
 class IssueDrivenRepositorySummary:
     context: IssueDrivenContext
     state: IssueDrivenRepositoryState = "pending"
@@ -784,6 +790,7 @@ class _RunRecord:
     issue_driven_repositories: list[_IssueDrivenRepositoryRecord] = field(
         default_factory=list
     )
+    issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
 
@@ -2973,6 +2980,22 @@ class PythonRunner:
                 _IssueDrivenRepositoryRecord(context=context)
                 for context in declaration.repositories
             ]
+        elif event_type == "issue_driven_repository":
+            lifecycle = cast(IssueDrivenRepositoryLifecycle, event)
+            index = lifecycle.repository_index - 1
+            if index >= len(run.issue_driven_repositories):
+                return False
+            repository = run.issue_driven_repositories[index]
+            active = self._active_issue_driven_repository(run)
+            if lifecycle.status == "started":
+                if active is not None or repository.state != "pending":
+                    return False
+                repository.state = "running"
+            elif active is not repository or repository.state != "running":
+                return False
+            else:
+                repository.state = "success"
+            run.issue_driven_explicit_lifecycle = True
         elif event_type == "run_pr":
             run.integration_pr = cast(PullRequestNavigation, event)
             repository = self._active_issue_driven_repository(run)
@@ -2980,16 +3003,22 @@ class PythonRunner:
                 repository.integration_pr = run.integration_pr
         elif event_type == "issue_driven_context":
             context = cast(IssueDrivenContext, event)
-            pending = next(
-                (
-                    repository
-                    for repository in run.issue_driven_repositories
-                    if repository.state == "pending"
-                ),
-                None,
-            )
-            if pending is not None:
-                declared = pending.context
+            active = self._active_issue_driven_repository(run)
+            if run.issue_driven_explicit_lifecycle:
+                if active is None:
+                    return False
+                target = active
+            else:
+                target = next(
+                    (
+                        repository
+                        for repository in run.issue_driven_repositories
+                        if repository.state == "pending"
+                    ),
+                    None,
+                )
+            if target is not None:
+                declared = target.context
                 if (
                     declared.integration_branch != context.integration_branch
                     or declared.final_branch != context.final_branch
@@ -3002,15 +3031,14 @@ class PythonRunner:
             run.issue_navigations = {}
             run.planner_skips = {}
             run.whole_review_result = None
-            active = self._active_issue_driven_repository(run)
-            if active is not None:
+            if not run.issue_driven_explicit_lifecycle and active is not None:
                 active.state = "success"
-            if pending is None:
-                pending = _IssueDrivenRepositoryRecord(run.issue_driven_context)
-                run.issue_driven_repositories.append(pending)
+            if target is None:
+                target = _IssueDrivenRepositoryRecord(run.issue_driven_context)
+                run.issue_driven_repositories.append(target)
             else:
-                pending.context = context
-            pending.state = "running"
+                target.context = context
+            target.state = "running"
         elif event_type == "issue_result":
             issue_result = cast(IssueResult, event)
             run.issue_results[issue_result.issue] = issue_result
@@ -3070,14 +3098,11 @@ class PythonRunner:
     def _finish_active_repository(cls, run: _RunRecord) -> None:
         repository = cls._active_issue_driven_repository(run)
         if repository is None:
-            repository = next(
-                (
-                    candidate
-                    for candidate in run.issue_driven_repositories
-                    if candidate.state == "pending"
-                ),
-                None,
-            )
+            repositories = run.issue_driven_repositories
+            if repositories and all(
+                candidate.state == "pending" for candidate in repositories
+            ):
+                repository = repositories[0]
         if repository is not None and run.state in ("success", "failed", "stopped"):
             repository.state = run.state
 
@@ -3093,6 +3118,7 @@ class PythonRunner:
                 "resource_ownership",
                 "run_pr",
                 "issue_driven_repositories",
+                "issue_driven_repository",
                 "issue_driven_context",
                 "issue_navigation",
                 "planner_skip",
@@ -3222,6 +3248,20 @@ class PythonRunner:
                 )
             return "issue_driven_repositories", IssueDrivenRepositoryDeclaration(
                 tuple(repositories)
+            )
+        if event_type == "issue_driven_repository":
+            repository_index = value.get("repository_index")
+            status = value.get("status")
+            if (
+                isinstance(repository_index, bool)
+                or not isinstance(repository_index, int)
+                or repository_index < 1
+                or status not in ("started", "completed")
+            ):
+                return None
+            return "issue_driven_repository", IssueDrivenRepositoryLifecycle(
+                repository_index,
+                cast(Literal["started", "completed"], status),
             )
         if event_type == "issue_driven_context":
             repository = value.get("repository")

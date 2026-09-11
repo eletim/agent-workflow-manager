@@ -1754,7 +1754,8 @@ def test_multi_repository_summary_scopes_duplicate_issues_and_survives_history(
     try:
         run_id = runner.start(
             """from purplemux_client import (
-    emit_issue_driven_context, emit_issue_driven_repositories,
+    emit_issue_driven_context, emit_issue_driven_repository,
+    emit_issue_driven_repositories,
     emit_issue_navigation, emit_issue_result,
     emit_planner_skip, emit_run_pr, emit_step, emit_whole_review_result,
 )
@@ -1762,6 +1763,7 @@ emit_issue_driven_repositories((
     ("acme/api", "dev/api", "main", None),
     ("acme/web", "dev/web", "main", None),
 ))
+emit_issue_driven_repository(1, "started")
 emit_issue_driven_context("acme/api", "dev/api", "main")
 emit_step("Work items", "completed")
 emit_issue_navigation(10, 40, "https://github.com/acme/api/pull/40", workspace_id="ws-api", implementation_tab_id="api-implementation", scope_review_tab_id="api-scope", correctness_review_tab_id="api-correctness")
@@ -1769,6 +1771,8 @@ emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/api/pull/40")
 emit_planner_skip(11, "Already covered in API.")
 emit_whole_review_result("approved", 1)
 emit_run_pr(50, "https://github.com/acme/api/pull/50")
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
 emit_issue_driven_context("acme/web", "dev/web", "main")
 emit_step("Work items", "completed")
 emit_issue_navigation(10, 140, "https://github.com/acme/web/pull/140", workspace_id="ws-web", implementation_tab_id="web-implementation", scope_review_tab_id="web-scope", correctness_review_tab_id="web-correctness")
@@ -1776,6 +1780,7 @@ emit_issue_result(10, "continued_with_warning", 4, 140, "https://github.com/acme
 emit_planner_skip(11, "Already covered in Web.")
 emit_whole_review_result("skipped", 0)
 emit_run_pr(150, "https://github.com/acme/web/pull/150")
+emit_issue_driven_repository(2, "completed")
 """
         )
         result = wait_until_finished(runner).as_json()
@@ -1884,6 +1889,62 @@ emit_issue_driven_context("acme/api", "dev/api", "main")
         terminal,
         "pending",
     ]
+
+
+@pytest.mark.parametrize("terminal", ["failed", "stopped"])
+@pytest.mark.parametrize("phase", ["later_preparation", "final_processing"])
+def test_multi_repository_lifecycle_attributes_terminal_state_to_active_work(
+    runner: PythonRunner, terminal: str, phase: str
+) -> None:
+    code = """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_driven_repository,
+    emit_issue_driven_repositories,
+)
+import time
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+emit_issue_driven_context("acme/api", "dev/api", "main")
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+"""
+    expected_before_terminal = ["success", "running"]
+    expected_after_terminal = ["success", terminal]
+    if phase == "final_processing":
+        code += """emit_issue_driven_context("acme/web", "dev/web", "main")
+emit_issue_driven_repository(2, "completed")
+"""
+        expected_before_terminal = ["success", "success"]
+        expected_after_terminal = ["success", "success"]
+    if terminal == "failed":
+        code += 'raise RuntimeError("terminal workflow phase failed")\n'
+    else:
+        code += "time.sleep(60)\n"
+
+    run_id = runner.start(code)
+    if terminal == "stopped":
+        wait_for(
+            runner,
+            lambda snapshot: (
+                [repository.state for repository in snapshot.issue_driven_repositories]
+                == expected_before_terminal
+            ),
+            run_id=run_id,
+        )
+        runner.stop(run_id)
+    snapshot = wait_for(
+        runner,
+        lambda candidate: candidate.state != "running",
+        run_id=run_id,
+    )
+
+    summary = snapshot.as_json()["issueDrivenSummary"]
+    assert summary["terminalResult"] == terminal
+    assert [
+        repository["state"] for repository in summary["repositories"]
+    ] == expected_after_terminal
 
 
 def test_planner_skip_reason_is_durable_and_part_of_issue_summary(

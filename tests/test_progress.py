@@ -9,6 +9,7 @@ from purplemux_client import (
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
+    emit_issue_driven_repository,
     emit_issue_navigation,
     emit_issue_result,
     emit_planner_skip,
@@ -106,6 +107,24 @@ def test_emit_issue_driven_repositories_declares_ordered_contexts(
                     "policy_issue": 9,
                 },
             ],
+        }
+
+
+def test_emit_issue_driven_repository_writes_lifecycle_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_repository(2, "started")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "issue_driven_repository",
+            "repository_index": 2,
+            "status": "started",
         }
 
 
