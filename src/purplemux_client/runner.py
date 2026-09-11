@@ -349,15 +349,19 @@ class RunResource:
     metadata: dict[str, str]
     cleanup_state: ResourceCleanupState = "retained"
     cleanup_error: str | None = None
+    repository_index: int | None = None
 
     def as_json(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "kind": self.kind,
             "identity": self.identity,
             "metadata": dict(self.metadata),
             "cleanupState": self.cleanup_state,
             "cleanupError": self.cleanup_error,
         }
+        if self.repository_index is not None:
+            result["repositoryIndex"] = self.repository_index
+        return result
 
 
 def _is_verified_repository_context(resource: RunResource) -> bool:
@@ -1149,6 +1153,16 @@ class PythonRunner:
             raise ValueError
         attempts = load_many(RunAttempt, "attempts")
         resources = load_many(RunResource, "resources")
+        if any(
+            resource.repository_index is not None
+            and (
+                isinstance(resource.repository_index, bool)
+                or not isinstance(resource.repository_index, int)
+                or resource.repository_index < 1
+            )
+            for resource in resources
+        ):
+            raise ValueError
         progress_pr_values = value.get("progressPrs")
         if not isinstance(progress_pr_values, dict):
             raise ValueError
@@ -1343,6 +1357,12 @@ class PythonRunner:
                     whole_review_result=whole_review_result,
                 )
             )
+        if any(
+            resource.repository_index is not None
+            and resource.repository_index > len(issue_driven_repositories)
+            for resource in resources
+        ):
+            raise ValueError
         stdout_truncated = value.get("stdoutTruncated")
         stderr_truncated = value.get("stderrTruncated")
         if not isinstance(stdout_truncated, bool) or not isinstance(
@@ -2391,15 +2411,16 @@ class PythonRunner:
                     ),
                 )
 
-            failed_priority: int | None = None
+            failed_priorities: dict[int | None, int] = {}
             for index, original in ordered:
                 priority = self._resource_cleanup_priority(original)
-                if failed_priority is not None and priority > failed_priority:
-                    break
                 with self._lock:
                     current = run.resources[index]
                     if current.cleanup_state == "cleaned":
                         continue
+                failed_priority = failed_priorities.get(current.repository_index)
+                if failed_priority is not None and priority > failed_priority:
+                    continue
                 if current.cleanup_state in ("cleanup_pending", "blocked"):
                     try:
                         absent = self._resource_is_absent(current)
@@ -2412,10 +2433,11 @@ class PythonRunner:
                                 current.identity,
                                 current.metadata,
                                 "cleaned",
+                                repository_index=current.repository_index,
                             )
                             self._mark_changed()
                     else:
-                        failed_priority = priority
+                        failed_priorities[current.repository_index] = priority
                     continue
                 with self._lock:
                     pending = RunResource(
@@ -2423,6 +2445,7 @@ class PythonRunner:
                         current.identity,
                         current.metadata,
                         "cleanup_pending",
+                        repository_index=current.repository_index,
                     )
                     run.resources[index] = pending
                     self._mark_changed()
@@ -2441,9 +2464,10 @@ class PythonRunner:
                             pending.metadata,
                             cleanup_state,
                             str(exc),
+                            pending.repository_index,
                         )
                         self._mark_changed()
-                    failed_priority = priority
+                    failed_priorities[current.repository_index] = priority
                 else:
                     with self._lock:
                         run.resources[index] = RunResource(
@@ -2451,6 +2475,7 @@ class PythonRunner:
                             pending.identity,
                             pending.metadata,
                             "cleaned",
+                            repository_index=pending.repository_index,
                         )
                         self._mark_changed()
             with self._lock:
@@ -2967,10 +2992,17 @@ class PythonRunner:
                 run.has_warnings = True
                 run.warning_count += 1
         elif event_type == "resource":
-            self._register_resource(run, cast(RunResource, event))
+            self._register_resource(
+                run, self._with_resource_repository(run, cast(RunResource, event))
+            )
         elif event_type == "resource_ownership":
+            ownership = cast(_ResourceOwnershipEvent, event)
             return self._register_owned_resource(
-                run, cast(_ResourceOwnershipEvent, event)
+                run,
+                replace(
+                    ownership,
+                    resource=self._with_resource_repository(run, ownership.resource),
+                ),
             )
         elif event_type == "issue_driven_repositories":
             declaration = cast(IssueDrivenRepositoryDeclaration, event)
@@ -3497,7 +3529,10 @@ class PythonRunner:
             ):
                 # Repeated registration is idempotent only when the ownership
                 # evidence remains exactly the same.
-                if existing.metadata != resource.metadata:
+                if (
+                    existing.metadata != resource.metadata
+                    or existing.repository_index != resource.repository_index
+                ):
                     logger.warning(
                         "Ignored conflicting registration for run %s resource %s/%s",
                         run.run_id,
@@ -3506,6 +3541,66 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+
+    @classmethod
+    def _with_resource_repository(
+        cls, run: _RunRecord, resource: RunResource
+    ) -> RunResource:
+        """Bind owned resources to the active repository or its ownership chain."""
+        repository_index = cls._resource_repository_index(run, resource)
+        if repository_index is None:
+            return resource
+        return replace(resource, repository_index=repository_index)
+
+    @classmethod
+    def _resource_repository_index(
+        cls, run: _RunRecord, resource: RunResource
+    ) -> int | None:
+        if resource.repository_index is not None:
+            return resource.repository_index
+        if resource.kind == "managed_shell_result":
+            tab_id = resource.metadata.get("tab_id")
+            parent = next(
+                (
+                    candidate
+                    for candidate in run.resources
+                    if candidate.kind == "purplemux_tab"
+                    and candidate.identity == tab_id
+                ),
+                None,
+            )
+            if parent is not None:
+                return parent.repository_index
+        elif resource.kind == "purplemux_tab":
+            workspace_id = resource.metadata.get("workspace_id")
+            parent = next(
+                (
+                    candidate
+                    for candidate in run.resources
+                    if candidate.kind == "purplemux_workspace"
+                    and candidate.identity == workspace_id
+                ),
+                None,
+            )
+            if parent is not None:
+                return parent.repository_index
+        elif resource.kind == "purplemux_workspace":
+            directories = resource.metadata.get("directories", "").splitlines()
+            parent = next(
+                (
+                    candidate
+                    for candidate in run.resources
+                    if candidate.kind == "git_worktree"
+                    and candidate.identity in directories
+                ),
+                None,
+            )
+            if parent is not None:
+                return parent.repository_index
+        active = cls._active_issue_driven_repository(run)
+        if active is None or not run.issue_driven_explicit_lifecycle:
+            return None
+        return run.issue_driven_repositories.index(active) + 1
 
     @staticmethod
     def _register_owned_resource(
@@ -3516,15 +3611,25 @@ class PythonRunner:
             if existing.kind != resource.kind or existing.identity != resource.identity:
                 continue
             if ownership.phase == "pending":
-                return existing.metadata == resource.metadata
-            if existing.metadata == resource.metadata:
+                return (
+                    existing.metadata == resource.metadata
+                    and existing.repository_index == resource.repository_index
+                )
+            if (
+                existing.metadata == resource.metadata
+                and existing.repository_index == resource.repository_index
+            ):
                 return True
-            if existing.metadata.get("registration_state") != "pending" or any(
-                key == "registration_state"
-                and resource.metadata.get(key) != "verified"
-                or key != "registration_state"
-                and resource.metadata.get(key) != value
-                for key, value in existing.metadata.items()
+            if (
+                existing.repository_index != resource.repository_index
+                or existing.metadata.get("registration_state") != "pending"
+                or any(
+                    key == "registration_state"
+                    and resource.metadata.get(key) != "verified"
+                    or key != "registration_state"
+                    and resource.metadata.get(key) != value
+                    for key, value in existing.metadata.items()
+                )
             ):
                 return False
             run.resources[index] = resource
