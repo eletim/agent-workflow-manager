@@ -230,7 +230,7 @@ from purplemux_client import (
 ```
 
 These are the workflow-facing exports. `IssueDrivenConfig`,
-`IssueDrivenFinding`, `IssueDrivenValidationError`,
+`IssueDrivenRepositoryConfig`, `IssueDrivenFinding`, `IssueDrivenValidationError`,
 `parse_issue_driven_json()`, and `generate_issue_driven_workflow()` are also
 public, but they author workflows before execution; generated workflows do not
 use them as runtime orchestration primitives. Names from package submodules that

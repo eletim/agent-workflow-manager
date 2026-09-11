@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -423,6 +423,26 @@ class WorkItem:
 
 
 @dataclass(frozen=True)
+class IssueDrivenRepositoryConfig:
+    repository: str
+    integration_branch: str
+    final_branch: str
+    work_items: tuple[WorkItem, ...]
+
+    @property
+    def issues(self) -> tuple[int, ...]:
+        return tuple(item.issue for item in self.work_items if item.issue is not None)
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "repository": self.repository,
+            "integration_branch": self.integration_branch,
+            "final_branch": self.final_branch,
+            "issues": list(self.issues),
+        }
+
+
+@dataclass(frozen=True)
 class IssueDrivenConfig:
     repository: str
     integration_branch: str
@@ -439,6 +459,23 @@ class IssueDrivenConfig:
     one_shot_issue: int | None = None
     scenarios: tuple[str, ...] = ()
     scope_max_reviews: int = 3
+    repositories: tuple[IssueDrivenRepositoryConfig, ...] = ()
+    _repositories_form: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.repositories:
+            object.__setattr__(
+                self,
+                "repositories",
+                (
+                    IssueDrivenRepositoryConfig(
+                        self.repository,
+                        self.integration_branch,
+                        self.final_branch,
+                        self.work_items,
+                    ),
+                ),
+            )
 
     @property
     def issues(self) -> tuple[int, ...]:
@@ -448,9 +485,6 @@ class IssueDrivenConfig:
     def as_json(self) -> dict[str, object]:
         result: dict[str, object] = {
             "mode": "issue-driven",
-            "repository": self.repository,
-            "integration_branch": self.integration_branch,
-            "final_branch": self.final_branch,
             "make_integration_branch": self.make_integration_branch,
             "max_reviews": self.max_reviews,
             "scope_max_reviews": self.scope_max_reviews,
@@ -460,11 +494,23 @@ class IssueDrivenConfig:
             "implementer_agent": self.implementer_agent,
             "reviewer_agent": self.reviewer_agent,
         }
+        if self._repositories_form:
+            result["repositories"] = [item.as_json() for item in self.repositories]
+        else:
+            result.update(
+                {
+                    "repository": self.repository,
+                    "integration_branch": self.integration_branch,
+                    "final_branch": self.final_branch,
+                }
+            )
         if self.policy_issue is not None:
             result["policy_issue"] = self.policy_issue
         if self.scenarios:
             result["scenarios"] = list(self.scenarios)
-        if self.one_shot_issue is not None:
+        if self._repositories_form:
+            pass
+        elif self.one_shot_issue is not None:
             result["one_shot_issue"] = self.one_shot_issue
         elif all(item.issue is not None for item in self.work_items):
             result["issues"] = [item.issue for item in self.work_items]
@@ -493,6 +539,7 @@ _OPTIONAL_FIELDS = {
     "work_items",
     "one_shot_issue",
     "scenarios",
+    "repositories",
 }
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _SUPPORTED_AGENTS = {"codex", "claude"}
@@ -564,7 +611,7 @@ def _valid_branch_name(value: str) -> bool:
     )
 
 
-def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
+def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
     """Parse the intentionally small Issue Driven configuration."""
     if not isinstance(source, str):
         raise TypeError("source must be a string")
@@ -921,6 +968,139 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     )
 
 
+_REPOSITORY_FIELDS = {
+    "repository",
+    "integration_branch",
+    "final_branch",
+    "issues",
+}
+_MULTI_REQUIRED_FIELDS = _REQUIRED_FIELDS - _REPOSITORY_FIELDS | {"repositories"}
+_MULTI_ALLOWED_FIELDS = (
+    _ALLOWED_FIELDS - _REPOSITORY_FIELDS - {"work_items", "one_shot_issue"}
+) | {"repositories"}
+
+
+def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
+    """Parse single- or multi-repository Issue Driven configuration."""
+    if not isinstance(source, str):
+        raise TypeError("source must be a string")
+
+    class ParsedObject(dict[str, Any]):
+        def __init__(self, pairs: list[tuple[str, Any]]) -> None:
+            super().__init__()
+            duplicates: list[str] = []
+            for key, item in pairs:
+                if key in self:
+                    duplicates.append(key)
+                self[key] = item
+            self.duplicates = tuple(duplicates)
+
+    try:
+        value = json.loads(source, object_pairs_hook=ParsedObject)
+    except json.JSONDecodeError:
+        return _parse_single_issue_driven_json(source)
+    if not isinstance(value, dict) or "repositories" not in value:
+        return _parse_single_issue_driven_json(source)
+
+    findings: list[IssueDrivenFinding] = []
+    for key in sorted(set(value.duplicates)):
+        findings.append(IssueDrivenFinding(f"$.{key}", "field is duplicated"))
+    for key in sorted(_MULTI_REQUIRED_FIELDS - set(value)):
+        findings.append(IssueDrivenFinding(f"$.{key}", "required field is missing"))
+    for key in sorted(set(value) - _MULTI_ALLOWED_FIELDS):
+        findings.append(IssueDrivenFinding(f"$.{key}", "unknown field is not allowed"))
+    raw_repositories = value.get("repositories")
+    if not isinstance(raw_repositories, list) or not raw_repositories:
+        findings.append(
+            IssueDrivenFinding("$.repositories", "must be a non-empty array")
+        )
+        raw_repositories = []
+
+    shared = {key: item for key, item in value.items() if key != "repositories"}
+    parsed: list[IssueDrivenConfig] = []
+    for index, declaration in enumerate(raw_repositories):
+        path = f"$.repositories[{index}]"
+        if not isinstance(declaration, dict):
+            findings.append(IssueDrivenFinding(path, "must be an object"))
+            continue
+        if isinstance(declaration, ParsedObject):
+            for key in sorted(set(declaration.duplicates)):
+                findings.append(
+                    IssueDrivenFinding(f"{path}.{key}", "field is duplicated")
+                )
+        for key in sorted(_REPOSITORY_FIELDS - set(declaration)):
+            findings.append(
+                IssueDrivenFinding(f"{path}.{key}", "required field is missing")
+            )
+        for key in sorted(set(declaration) - _REPOSITORY_FIELDS):
+            findings.append(
+                IssueDrivenFinding(f"{path}.{key}", "unknown field is not allowed")
+            )
+        if set(declaration) != _REPOSITORY_FIELDS:
+            continue
+        candidate = {**shared, **declaration}
+        try:
+            parsed.append(
+                _parse_single_issue_driven_json(
+                    json.dumps(candidate, ensure_ascii=False)
+                )
+            )
+        except IssueDrivenValidationError as exc:
+            for finding in exc.findings:
+                field = finding.path.removeprefix("$.")
+                finding_path = (
+                    f"{path}.{field}"
+                    if any(
+                        field == repository_field
+                        or field.startswith(f"{repository_field}[")
+                        for repository_field in _REPOSITORY_FIELDS
+                    )
+                    else finding.path
+                )
+                findings.append(IssueDrivenFinding(finding_path, finding.message))
+
+    repositories = [
+        IssueDrivenRepositoryConfig(
+            item.repository,
+            item.integration_branch,
+            item.final_branch,
+            item.work_items,
+        )
+        for item in parsed
+    ]
+    seen_repositories: set[str] = set()
+    for index, repository in enumerate(repositories):
+        if repository.repository in seen_repositories:
+            findings.append(
+                IssueDrivenFinding(
+                    f"$.repositories[{index}].repository", "must be unique"
+                )
+            )
+        seen_repositories.add(repository.repository)
+    if findings:
+        raise IssueDrivenValidationError(findings)
+
+    first = parsed[0]
+    return IssueDrivenConfig(
+        repository=first.repository,
+        integration_branch=first.integration_branch,
+        final_branch=first.final_branch,
+        make_integration_branch=first.make_integration_branch,
+        work_items=first.work_items,
+        max_reviews=first.max_reviews,
+        merge_to_integration=first.merge_to_integration,
+        final_review=first.final_review,
+        merge_final=first.merge_final,
+        scope_max_reviews=first.scope_max_reviews,
+        implementer_agent=first.implementer_agent,
+        reviewer_agent=first.reviewer_agent,
+        policy_issue=first.policy_issue,
+        scenarios=first.scenarios,
+        repositories=tuple(repositories),
+        _repositories_form=True,
+    )
+
+
 def _canonical_source() -> str:
     development_copy = (
         Path(__file__).resolve().parents[2]
@@ -935,7 +1115,9 @@ def _canonical_source() -> str:
     return packaged.read_text(encoding="utf-8")
 
 
-def _fixed_config_function(config: IssueDrivenConfig) -> str:
+def _fixed_config_function(
+    config: IssueDrivenConfig, *, function_name: str = "parse_args"
+) -> str:
     issues = ",\n        ".join(
         (
             f"Issue({item.issue}, {item.branch!r})"
@@ -989,7 +1171,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         prospective_base_branch={prospective!r},
     )
 """
-    return f"""def parse_args() -> Config:
+    return f"""def {function_name}() -> Config:
 {topology_inspection}    context = prepare_run_repository(
         repo={config.repository!r},
         base_branch={base_branch!r},
@@ -1011,6 +1193,41 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
 
 
 """
+
+
+def _fixed_config_functions(config: IssueDrivenConfig) -> str:
+    if not config._repositories_form:
+        return _fixed_config_function(config)
+    functions: list[str] = []
+    names: list[str] = []
+    for index, repository in enumerate(config.repositories, 1):
+        name = f"parse_repository_{index}"
+        names.append(name)
+        functions.append(
+            _fixed_config_function(
+                replace(
+                    config,
+                    repository=repository.repository,
+                    integration_branch=repository.integration_branch,
+                    final_branch=repository.final_branch,
+                    work_items=repository.work_items,
+                    repositories=(repository,),
+                    _repositories_form=False,
+                ),
+                function_name=name,
+            )
+        )
+    entries = "\n".join(f"        {name}()," for name in names)
+    functions.append(
+        f"""def parse_args() -> tuple[Config, ...]:
+    return (
+{entries}
+    )
+
+
+"""
+    )
+    return "".join(functions)
 
 
 def _workflow_outline(config: IssueDrivenConfig) -> str:
@@ -1073,4 +1290,4 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     )
     start = source.index("def parse_args() -> Config:\n")
     end = source.index("def short_error(", start)
-    return source[:start] + _fixed_config_function(config) + source[end:]
+    return source[:start] + _fixed_config_functions(config) + source[end:]
