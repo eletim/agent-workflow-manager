@@ -41,8 +41,10 @@ For a multi-repository run, replace the four top-level repository fields with a
 `repositories` array. Each entry independently declares `repository`,
 `integration_branch`, `final_branch`, and `issues`. Their order is significant.
 The other settings remain at the top level and apply to every entry. The
-generated plain Python contains an explicit `Config` declaration for every
-repository; the JSON remains configuration rather than runtime control flow.
+generated plain Python contains the complete `ISSUE_DRIVEN_REPOSITORIES`
+representation. Multi-repository execution is rejected explicitly until its
+serial consumer is implemented; the JSON remains configuration rather than
+runtime control flow.
 
 Correct:
 
@@ -75,7 +77,7 @@ the run-wide review and delivery fields are always required.
 | --- | --- | --- |
 | `mode` | string | Optional discriminator; when present it must be `issue-driven`. |
 | `repository` | string | Existing source repository path in the backward-compatible single-repository form. |
-| `repositories` | array | Multi-repository form: a non-empty ordered array whose entries contain exactly `repository`, `integration_branch`, `final_branch`, and `issues`. Do not combine it with the corresponding top-level fields, `work_items`, or `one_shot_issue`. Repository paths must be unique. |
+| `repositories` | array | Multi-repository form: an ordered array of at least two entries containing exactly `repository`, `integration_branch`, `final_branch`, and `issues`. Do not combine it with the corresponding top-level fields, `work_items`, or `one_shot_issue`. Repository paths must be unique. |
 | `integration_branch` | string | Remote/integration branch used as the development base; it may be created when `make_integration_branch` is true. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `make_integration_branch` | boolean | Create/recover `integration_branch` from the exact remote `final_branch` HEAD; default `false`. |

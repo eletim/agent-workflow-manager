@@ -309,6 +309,10 @@ def test_multi_repository_json_round_trips_in_declared_order() -> None:
         (90, 89, 91),
         (12, 14),
     ]
+    reordered = replace(config, repositories=tuple(reversed(config.repositories)))
+    assert reordered.repository == "/tmp/second-project"
+    assert reordered.integration_branch == "dev/v1"
+    assert reordered.work_items == config.repositories[1].work_items
     assert parse(config.as_json()) == config
 
 
@@ -318,12 +322,40 @@ def test_multi_repository_generation_keeps_each_config_in_plain_python() -> None
     code = generate_issue_driven_workflow(config)
 
     ast.parse(code)
-    assert "def parse_args() -> tuple[Config, ...]:" in code
+    assert "ISSUE_DRIVEN_REPOSITORIES = (" in code
+    assert "def parse_args() -> Config:" in code
+    assert "multi-repository execution is not supported" in code
     assert code.index(repr(config.repositories[0].repository)) < code.index(
         repr(config.repositories[1].repository)
     )
     assert "Issue(12, 'feature/issue-12')" in code
     assert "Issue(14, 'feature/issue-14')" in code
+
+    module_name = "generated_multi_repository_config"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-multi-repository>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    assert len(module.__dict__["ISSUE_DRIVEN_REPOSITORIES"]) == 2
+    with pytest.raises(WorkerFailure, match="multi-repository execution"):
+        module.__dict__["parse_args"]()
+
+
+def test_repositories_form_requires_multiple_repository_declarations() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    value["repositories"] = repositories[:1]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories",
+        "must contain at least two repositories",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
 @pytest.mark.parametrize(
