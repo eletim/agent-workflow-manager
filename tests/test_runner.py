@@ -814,6 +814,87 @@ register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
     assert attempted == ["tab-2", "tab-1"]
 
 
+def test_cleanup_failure_blocks_only_its_multi_repository_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    first = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = first.start(
+            """
+from purplemux_client import (
+    emit_issue_driven_repositories,
+    emit_issue_driven_repository,
+    register_run_resource,
+)
+
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+register_run_resource("git_worktree", "/run/api", {"repository": "/src/api"})
+register_run_resource("purplemux_workspace", "ws-api", {
+    "directories": "/run/api"
+})
+register_run_resource("purplemux_tab", "tab-api", {"workspace_id": "ws-api"})
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+register_run_resource("git_worktree", "/run/web", {"repository": "/src/web"})
+register_run_resource("purplemux_workspace", "ws-web", {
+    "directories": "/run/web"
+})
+register_run_resource("purplemux_tab", "tab-web", {"workspace_id": "ws-web"})
+emit_issue_driven_repository(2, "completed")
+register_run_resource("purplemux_tab", "tab-api-handoff", {
+    "workspace_id": "ws-api"
+})
+register_run_resource("managed_shell_result", "/result/api-handoff", {
+    "tab_id": "tab-api-handoff"
+})
+"""
+        )
+        wait_for(first, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        first.close()
+
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    attempted: list[str] = []
+
+    def cleanup(resource: RunResource) -> None:
+        attempted.append(resource.identity)
+        if resource.identity == "tab-api":
+            raise MutationOutcomeUnknown("API tab close is uncertain")
+
+    try:
+        monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+        after = runner.cleanup(run_id)
+
+        assert attempted == [
+            "tab-api-handoff",
+            "tab-web",
+            "tab-api",
+            "ws-web",
+            "/run/web",
+        ]
+        assert {
+            resource.identity: (resource.cleanup_state, resource.repository_index)
+            for resource in after.resources
+        } == {
+            "/run/api": ("retained", 1),
+            "ws-api": ("retained", 1),
+            "tab-api": ("blocked", 1),
+            "/run/web": ("cleaned", 2),
+            "ws-web": ("cleaned", 2),
+            "tab-web": ("cleaned", 2),
+            "tab-api-handoff": ("cleaned", 1),
+            "/result/api-handoff": ("retained", 1),
+        }
+    finally:
+        runner.close()
+
+
 def test_cleanup_retries_precondition_failure_after_remediation(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1746,6 +1827,247 @@ emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/project/pull/4
         restored_runner.close()
 
 
+def test_multi_repository_summary_scopes_duplicate_issues_and_survives_history(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = runner.start(
+            """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_driven_repository,
+    emit_issue_driven_repositories,
+    emit_issue_navigation, emit_issue_result,
+    emit_planner_skip, emit_run_pr, emit_step, emit_whole_review_result,
+)
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+emit_issue_driven_context("acme/api", "dev/api", "main")
+emit_step("Work items", "completed")
+emit_issue_navigation(10, 40, "https://github.com/acme/api/pull/40", workspace_id="ws-api", implementation_tab_id="api-implementation", scope_review_tab_id="api-scope", correctness_review_tab_id="api-correctness")
+emit_issue_result(10, "approved", 2, 40, "https://github.com/acme/api/pull/40")
+emit_planner_skip(11, "Already covered in API.")
+emit_whole_review_result("approved", 1)
+emit_run_pr(50, "https://github.com/acme/api/pull/50")
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+emit_issue_driven_context("acme/web", "dev/web", "main")
+emit_step("Work items", "completed")
+emit_issue_navigation(10, 140, "https://github.com/acme/web/pull/140", workspace_id="ws-web", implementation_tab_id="web-implementation", scope_review_tab_id="web-scope", correctness_review_tab_id="web-correctness")
+emit_issue_result(10, "continued_with_warning", 4, 140, "https://github.com/acme/web/pull/140", warnings=("review limit reached",))
+emit_planner_skip(11, "Already covered in Web.")
+emit_whole_review_result("skipped", 0)
+emit_run_pr(150, "https://github.com/acme/web/pull/150")
+emit_issue_driven_repository(2, "completed")
+"""
+        )
+        result = wait_until_finished(runner).as_json()
+        summary = result["issueDrivenSummary"]
+    finally:
+        runner.close()
+
+    assert summary["terminalResult"] == "success"
+    assert [event["repository"] for event in result["progress"]] == [
+        "acme/api",
+        "acme/web",
+    ]
+    repositories = summary["repositories"]
+    assert [repository["repository"] for repository in repositories] == [
+        "acme/api",
+        "acme/web",
+    ]
+    assert [repository["state"] for repository in repositories] == [
+        "success",
+        "success",
+    ]
+    assert [repository["issues"][0]["issue"] for repository in repositories] == [
+        10,
+        10,
+    ]
+    assert [repository["issues"][1]["reason"] for repository in repositories] == [
+        "Already covered in API.",
+        "Already covered in Web.",
+    ]
+    assert [repository["basePr"]["number"] for repository in repositories] == [
+        50,
+        150,
+    ]
+    assert [repository["wholeReview"]["outcome"] for repository in repositories] == [
+        "approved",
+        "skipped",
+    ]
+    assert repositories[0]["issues"][0]["terminals"]["implementation"] == {
+        "workspaceId": "ws-api",
+        "tabId": "api-implementation",
+    }
+    assert repositories[1]["issues"][0]["terminals"]["implementation"] == {
+        "workspaceId": "ws-web",
+        "tabId": "web-implementation",
+    }
+    assert [
+        (skip["repository"], skip["issue"], skip["reason"])
+        for skip in result["plannerSkips"]
+    ] == [
+        ("acme/api", 11, "Already covered in API."),
+        ("acme/web", 11, "Already covered in Web."),
+    ]
+
+    restored_runner = PythonRunner(
+        managed_workflows=False, run_history_file=history_file
+    )
+    try:
+        restored_result = restored_runner.snapshot(run_id).as_json()
+    finally:
+        restored_runner.close()
+
+    assert restored_result["issueDrivenSummary"] == summary
+    assert restored_result["plannerSkips"] == result["plannerSkips"]
+    assert restored_result["progress"] == result["progress"]
+
+
+@pytest.mark.parametrize("terminal", ["failed", "stopped"])
+def test_multi_repository_summary_retains_pending_repositories_after_early_terminal(
+    runner: PythonRunner, terminal: str
+) -> None:
+    code = """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_driven_repositories,
+)
+import time
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_context("acme/api", "dev/api", "main")
+"""
+    if terminal == "failed":
+        code += 'raise RuntimeError("first repository failed")\n'
+    else:
+        code += "time.sleep(60)\n"
+    run_id = runner.start(code)
+    if terminal == "stopped":
+        wait_for(
+            runner,
+            lambda snapshot: bool(snapshot.issue_driven_repositories),
+            run_id=run_id,
+        )
+        runner.stop(run_id)
+    snapshot = wait_for(
+        runner,
+        lambda candidate: candidate.state != "running",
+        run_id=run_id,
+    )
+
+    summary = snapshot.as_json()["issueDrivenSummary"]
+    assert summary["terminalResult"] == terminal
+    assert [repository["repository"] for repository in summary["repositories"]] == [
+        "acme/api",
+        "acme/web",
+    ]
+    assert [repository["state"] for repository in summary["repositories"]] == [
+        terminal,
+        "pending",
+    ]
+
+
+@pytest.mark.parametrize("terminal", ["failed", "stopped"])
+@pytest.mark.parametrize("phase", ["later_preparation", "final_processing"])
+def test_multi_repository_lifecycle_attributes_terminal_state_to_active_work(
+    runner: PythonRunner, terminal: str, phase: str
+) -> None:
+    code = """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_driven_repository,
+    emit_issue_driven_repositories,
+)
+import time
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+emit_issue_driven_context("acme/api", "dev/api", "main")
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+"""
+    expected_before_terminal = ["success", "running"]
+    expected_after_terminal = ["success", terminal]
+    if phase == "final_processing":
+        code += """emit_issue_driven_context("acme/web", "dev/web", "main")
+emit_issue_driven_repository(2, "completed")
+"""
+        expected_before_terminal = ["success", "success"]
+        expected_after_terminal = ["success", "success"]
+    if terminal == "failed":
+        code += 'raise RuntimeError("terminal workflow phase failed")\n'
+    else:
+        code += "time.sleep(60)\n"
+
+    run_id = runner.start(code)
+    if terminal == "stopped":
+        wait_for(
+            runner,
+            lambda snapshot: (
+                [repository.state for repository in snapshot.issue_driven_repositories]
+                == expected_before_terminal
+            ),
+            run_id=run_id,
+        )
+        runner.stop(run_id)
+    snapshot = wait_for(
+        runner,
+        lambda candidate: candidate.state != "running",
+        run_id=run_id,
+    )
+
+    summary = snapshot.as_json()["issueDrivenSummary"]
+    assert summary["terminalResult"] == terminal
+    assert [
+        repository["state"] for repository in summary["repositories"]
+    ] == expected_after_terminal
+
+
+def test_planner_skip_reason_is_durable_and_part_of_issue_summary(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_issue_driven_context, emit_planner_skip
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_planner_skip(197, "Already implemented by Issue #196.", label="Issue #197")
+"""
+        )
+        result = wait_until_finished(runner).as_json()
+    finally:
+        runner.close()
+
+    skip = {
+        "issue": 197,
+        "label": "Issue #197",
+        "reason": "Already implemented by Issue #196.",
+    }
+    planner_skip = result["plannerSkips"][0]
+    assert {key: planner_skip[key] for key in skip} == skip
+    assert datetime.fromisoformat(planner_skip["observedAt"]).tzinfo is not None
+    assert result["issueDrivenSummary"]["issues"] == [
+        {**skip, "outcome": "skipped", "warnings": []}
+    ]
+
+    restored_runner = PythonRunner(
+        managed_workflows=False, run_history_file=history_file
+    )
+    try:
+        restored = restored_runner.snapshot(run_id).as_json()
+    finally:
+        restored_runner.close()
+
+    assert restored["plannerSkips"] == result["plannerSkips"]
+    assert restored["issueDrivenSummary"] == result["issueDrivenSummary"]
+
+
 def test_summary_exposes_completed_item_while_later_item_is_active() -> None:
     runner = PythonRunner(managed_workflows=False)
     try:
@@ -2405,6 +2727,7 @@ def test_runner_http_lifecycle(
         "runId": 1,
         "integrationPr": None,
         "issueDrivenSummary": None,
+        "plannerSkips": [],
         "purplemuxPort": 8022,
         "cwd": str(Path.cwd()),
         "args": [],

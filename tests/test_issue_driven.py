@@ -50,6 +50,27 @@ def parse(value: dict[str, object]):
     return parse_issue_driven_json(json.dumps(value))
 
 
+def multi_payload(**overrides: object) -> dict[str, object]:
+    value = payload()
+    repositories = [
+        {
+            "repository": value.pop("repository"),
+            "integration_branch": value.pop("integration_branch"),
+            "final_branch": value.pop("final_branch"),
+            "issues": value.pop("issues"),
+        },
+        {
+            "repository": "/tmp/second-project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "issues": [12, 14],
+        },
+    ]
+    value["repositories"] = repositories
+    value.update(overrides)
+    return value
+
+
 def topology_pr(
     *,
     number: int = 158,
@@ -273,6 +294,198 @@ def test_valid_json_preserves_issue_order() -> None:
     assert config.merge_final is False
     assert config.make_integration_branch is False
     assert config.policy_issue is None
+
+
+def test_multi_repository_json_round_trips_in_declared_order() -> None:
+    value = multi_payload()
+
+    config = parse(value)
+
+    assert [repository.repository for repository in config.repositories] == [
+        str(Path(__file__).parents[1]),
+        "/tmp/second-project",
+    ]
+    assert [repository.issues for repository in config.repositories] == [
+        (90, 89, 91),
+        (12, 14),
+    ]
+    reordered = replace(config, repositories=tuple(reversed(config.repositories)))
+    assert reordered.repository == "/tmp/second-project"
+    assert reordered.integration_branch == "dev/v1"
+    assert reordered.work_items == config.repositories[1].work_items
+    assert parse(config.as_json()) == config
+
+
+def test_multi_repository_generation_prepares_each_config_lazily_in_order() -> None:
+    config = parse(multi_payload())
+
+    code = generate_issue_driven_workflow(config)
+
+    ast.parse(code)
+    assert "ISSUE_DRIVEN_REPOSITORIES = (" in code
+    assert "def parse_args() -> Config:" in code
+    assert "def parse_repository_1() -> Config:" in code
+    assert "def parse_repository_2() -> Config:" in code
+    assert "def parse_repository_configs():" in code
+    assert "def issue_driven_repository_declarations():" in code
+    assert "emit_issue_driven_repositories(declarations)" in code
+    assert "finalize_multi_repository_deliveries(deliveries)" in code
+    assert code.index(repr(config.repositories[0].repository)) < code.index(
+        repr(config.repositories[1].repository)
+    )
+    assert "Issue(12, 'feature/issue-12')" in code
+    assert "Issue(14, 'feature/issue-14')" in code
+
+    module_name = "generated_multi_repository_config"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-multi-repository>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    assert len(module.__dict__["ISSUE_DRIVEN_REPOSITORIES"]) == 2
+    events: list[str] = []
+    first = object()
+    second = object()
+    module.__dict__["parse_repository_1"] = lambda: (
+        events.append("prepare first") or first
+    )
+    module.__dict__["parse_repository_2"] = lambda: (
+        events.append("prepare second") or second
+    )
+    module.__dict__["emit_issue_driven_repositories"] = lambda repositories: (
+        events.append("declare repositories")
+    )
+    module.__dict__["emit_issue_driven_repository"] = lambda index, status: (
+        events.append(f"repository {index} {status}")
+    )
+    module.__dict__["run_repository"] = lambda config, deliveries: events.append(
+        "run first" if config is first else "run second"
+    )
+    module.__dict__["finalize_multi_repository_deliveries"] = lambda deliveries: (
+        events.append("finalize repositories")
+    )
+
+    module.__dict__["main"]()
+
+    assert events == [
+        "declare repositories",
+        "repository 1 started",
+        "prepare first",
+        "run first",
+        "repository 1 completed",
+        "repository 2 started",
+        "prepare second",
+        "run second",
+        "repository 2 completed",
+        "finalize repositories",
+    ]
+
+
+def test_repositories_form_requires_multiple_repository_declarations() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    value["repositories"] = repositories[:1]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories",
+        "must contain at least two repositories",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+def test_multi_repository_declaration_must_fit_progress_event() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    template = repositories[0]
+    assert isinstance(template, dict)
+    value["repositories"] = [
+        {**template, "repository": f"/tmp/project-{index}"} for index in range(100)
+    ]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories",
+        "declaration event must encode to at most 4096 UTF-8 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+@pytest.mark.parametrize(
+    ("change", "path"),
+    [
+        ({"repository": "duplicate"}, "$.repository"),
+        ({"work_items": [90]}, "$.work_items"),
+        ({"one_shot_issue": 90}, "$.one_shot_issue"),
+    ],
+)
+def test_multi_repository_form_rejects_single_repository_fields(
+    change: dict[str, object], path: str
+) -> None:
+    value = multi_payload(**change)
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert path in {finding.path for finding in caught.value.findings}
+
+
+def test_multi_repository_validation_uses_nested_paths() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    declaration = repositories[1]
+    assert isinstance(declaration, dict)
+    declaration["issues"] = [12, 12]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories[1].issues[1]",
+        "must be unique",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+def test_duplicate_repository_path_retains_source_index_after_invalid_entry() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    first = repositories[0]
+    assert isinstance(first, dict)
+    repositories[1] = {"repository": "/tmp/invalid"}
+    repositories.append(dict(first))
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    findings = {(finding.path, finding.message) for finding in caught.value.findings}
+    assert (
+        "$.repositories[1].issues",
+        "required field is missing",
+    ) in findings
+    assert ("$.repositories[2].repository", "must be unique") in findings
+    assert ("$.repositories[1].repository", "must be unique") not in findings
+
+
+def test_multi_repository_rejects_duplicate_nested_field() -> None:
+    source = json.dumps(multi_payload()).replace(
+        '"repository": "/tmp/second-project",',
+        '"repository": "/tmp/second-project", "repository": "/tmp/other",',
+    )
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse_issue_driven_json(source)
+
+    assert (
+        "$.repositories[1].repository",
+        "field is duplicated",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
 def test_ordered_work_items_mix_github_issues_and_inline_mini_tasks() -> None:
@@ -584,6 +797,35 @@ def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
                 }
             ),
         )
+
+
+def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(workflow["planner_inline_issue"]("obsolete-docs", "Update old docs."))
+
+    decision = workflow["apply_planner_decision"](
+        plan,
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "action": "skip",
+                        "key": "obsolete-docs",
+                        "reason": "The current documentation already covers it.",
+                    }
+                ],
+                "complete": True,
+                "policy_conflicts": [],
+            }
+        ),
+    )
+
+    assert decision.skipped[0].issue.result_id == "mini-task:obsolete-docs"
+    assert decision.skipped[0].reason == "The current documentation already covers it."
 
     assert plan.snapshot == ()
     assert plan.position == 0
@@ -1242,6 +1484,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
+        "Multi-repository human handoff writer": "REVIEWER_AGENT",
     }
 
 
@@ -1403,7 +1646,11 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
                             "key": "release-notes",
                             "task": updated_task,
                         },
-                        {"action": "skip", "key": 90},
+                        {
+                            "action": "skip",
+                            "key": 90,
+                            "reason": "Already delivered by the release-notes task.",
+                        },
                         {"action": "add", "item": 91},
                     ],
                     "complete": False,
@@ -1428,6 +1675,10 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
     )
     workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
     workflow["run_outline_step"] = lambda _name, action: action()
+    planner_skips: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    workflow["emit_planner_skip"] = lambda *args, **kwargs: planner_skips.append(
+        (args, kwargs)
+    )
     persisted: list[str] = []
 
     def persist(plan, _config, _repo, _github, pr):
@@ -1451,6 +1702,12 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
     assert [issue.key for issue in effective] == ["release-notes", 91, 92]
     assert [issue.key for issue in config.issues] == ["release-notes", 90]
     assert len(persisted) == 7
+    assert planner_skips == [
+        (
+            (90, "Already delivered by the release-notes task."),
+            {"label": "Issue #90"},
+        )
+    ]
 
     plan = workflow["WorkItemPlan"](config)
     assert plan.take_next() is original
@@ -1485,7 +1742,7 @@ def test_planner_rejects_oversized_plan_transactionally() -> None:
         "true",
     )
     plan = workflow["WorkItemPlan"](config)
-    actions = [{"action": "skip", "key": 90}]
+    actions = [{"action": "skip", "key": 90, "reason": "Superseded by mini tasks."}]
     actions.extend(
         {
             "action": "add",
@@ -2732,6 +2989,124 @@ def test_managed_handoff_replacement_preserves_existing_metadata() -> None:
     assert updated.count(start) == updated.count(end) == 1
     assert "create-pr:run-1" in updated
     assert "policy-conflict:c2FmZQ==" in updated
+
+
+def test_multi_repository_handoff_updates_each_base_pr_with_all_results() -> None:
+    code = generate_issue_driven_workflow(parse(multi_payload()))
+    module = ModuleType("generated_multi_repository_handoff")
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(code, "<generated-multi-handoff>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module.__name__]
+    workflow = module.__dict__
+    config_type = workflow["Config"]
+    issue_type = workflow["Issue"]
+    result_type = workflow["IssueHandoffResult"]
+    delivery_type = workflow["RepositoryDelivery"]
+    review_type = workflow["ReviewDelivery"]
+    configs = (
+        config_type(
+            Path("/api"),
+            "acme/api",
+            "dev/api",
+            "main",
+            (issue_type(10, "feature/api-10"),),
+            "true",
+        ),
+        config_type(
+            Path("/web"),
+            "acme/web",
+            "dev/web",
+            "main",
+            (issue_type(10, "feature/web-10"),),
+            "true",
+        ),
+    )
+
+    def base_pr(config: object, number: int) -> PullRequestState:
+        return PullRequestState(
+            number,
+            f"https://github.com/{config.slug}/pull/{number}",
+            "OPEN",
+            False,
+            config.slug,
+            config.integration_branch,
+            str(number) * 40,
+            config.slug,
+            config.main_branch,
+            "b" * 40,
+            None,
+            False,
+            None,
+            f"PR_{number}",
+            f"metadata for {config.slug}",
+        )
+
+    prs = (base_pr(configs[0], 50), base_pr(configs[1], 150))
+    updates: list[tuple[int, str]] = []
+
+    class GitHub:
+        def __init__(self, pr: PullRequestState) -> None:
+            self.pr = pr
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            body = str(kwargs["body"])
+            updates.append((number, body))
+            self.pr = replace(self.pr, body=body)
+            return self.pr
+
+    deliveries = []
+    for config, pr in zip(configs, prs, strict=True):
+        issue_pr = pr.number - 10
+        issue_result = result_type(
+            10,
+            "Issue #10",
+            issue_pr,
+            f"https://github.com/{config.slug}/pull/{issue_pr}",
+            "approved",
+            1,
+        )
+        review = review_type("approved", pr.head_sha, pr.base_sha, 1)
+        deliveries.append(
+            delivery_type(
+                config,
+                config.issues,
+                object(),
+                object(),
+                GitHub(pr),
+                pr,
+                review,
+                (issue_result,),
+                (),
+            )
+        )
+
+    markdown = """## 概要
+
+複数リポジトリの結果をまとめます。
+
+## 主な変更
+
+- acme/api: https://github.com/acme/api/pull/50 と https://github.com/acme/api/pull/40
+- acme/web: https://github.com/acme/web/pull/150 と https://github.com/acme/web/pull/140
+
+## 人間による確認
+
+- [ ] ブラウザで両方のBase PRリンクを開ける
+
+## 自動検証
+
+- 各リポジトリの設定済みチェックに合格"""
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: markdown
+
+    workflow["update_multi_repository_human_handoffs"](deliveries)
+
+    assert [number for number, _body in updates] == [50, 150]
+    assert all(markdown in body for _number, body in updates)
+    assert all("github.com/acme/api/pull/40" in body for _number, body in updates)
+    assert all("github.com/acme/web/pull/140" in body for _number, body in updates)
 
 
 @pytest.mark.parametrize(

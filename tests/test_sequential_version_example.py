@@ -859,7 +859,7 @@ def test_example_revalidates_ready_prs_and_preserves_terminal_delivery() -> None
     assert 'ready.state == "MERGED"' in source
     assert "Draft (warning continuation)" in source
     assert "base branch {base!r} changed before approved merge" in source
-    assert source.count("merge_pr_and_advance(") == 3
+    assert source.count("merge_pr_and_advance(") == 4
 
 
 def test_ready_issue_pr_is_redrafted_and_independently_reviewed(

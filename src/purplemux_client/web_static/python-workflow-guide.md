@@ -222,6 +222,7 @@ from purplemux_client import (
     WorktreeState,
     emit_step,
     emit_finding,
+    emit_issue_driven_repositories,
     inspect_run_repository,
     prepare_run_repository,
     register_run_resource,
@@ -230,7 +231,7 @@ from purplemux_client import (
 ```
 
 These are the workflow-facing exports. `IssueDrivenConfig`,
-`IssueDrivenFinding`, `IssueDrivenValidationError`,
+`IssueDrivenRepositoryConfig`, `IssueDrivenFinding`, `IssueDrivenValidationError`,
 `parse_issue_driven_json()`, and `generate_issue_driven_workflow()` are also
 public, but they author workflows before execution; generated workflows do not
 use them as runtime orchestration primitives. Names from package submodules that
@@ -846,8 +847,10 @@ structured GitHub result is the source of truth; `emit_run_pr()` and the optiona
 `emit_step()` fields only expose that known identity to the current run.
 
 Generated Issue Driven workflows additionally use the specialized
-`emit_issue_driven_context()`, `emit_issue_navigation()`, `emit_issue_result()`,
-and `emit_whole_review_result()` observation helpers. These retain narrow
+`emit_issue_driven_repositories()`, `emit_issue_driven_repository()`,
+`emit_issue_driven_context()`,
+`emit_issue_navigation()`, `emit_issue_result()`,
+`emit_planner_skip()`, and `emit_whole_review_result()` observation helpers. These retain narrow
 structured facts without parsing Progress or stdout. They are not a general
 event store or a workflow control-flow API. As soon as a child PR and all three
 role tabs are known, generated workflows pass the PR identity, shared
@@ -856,6 +859,19 @@ and `correctness_review_tab_id` to `emit_issue_navigation()`. Final outcome and
 review data remain the responsibility of `emit_issue_result()`. The navigation
 identities survive later review or delivery failure and are never derived from
 a session index, UI state, or tmux state.
+For a multi-repository Run, the workflow first calls
+`emit_issue_driven_repositories()` with the complete ordered set of repository,
+integration branch, final branch, and optional Policy Issue tuples. It then
+calls `emit_issue_driven_repository(index, "started")` before each repository's
+fallible preparation, followed by `"completed"` only after its execution
+returns. `emit_issue_driven_context()` supplies the prepared repository identity.
+This lets the Runner retain pending repositories and attribute failures or stops
+to repository preparation without treating final cross-repository work as part
+of the last repository.
+When the authoritative planner skips a pending work item, the generated workflow
+passes its identity, label, and required concise reason to
+`emit_planner_skip()`. This preserves the decision in Progress and the Issue
+Driven Summary without interpreting planner prose or stdout.
 
 Findings and advanced resource registration use:
 
