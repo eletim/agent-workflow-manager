@@ -483,73 +483,117 @@ function renderIssueDrivenSummary(summary) {
   issueSummaryWarnings.textContent = "";
   if (summary == null) return;
 
-  issueSummaryContext.textContent = `${summary.repository} — ${summary.integrationBranch} → ${summary.finalBranch}`;
+  const repositories = summary.repositories || [summary];
+  issueSummaryContext.textContent = repositories.length === 1
+    ? `${repositories[0].repository} — ${repositories[0].integrationBranch} → ${repositories[0].finalBranch}`
+    : `${repositories.length} repositories (serial execution)`;
   issueSummaryTerminal.textContent = `Run result: ${summary.terminalResult.replaceAll("_", " ")}`;
-  for (const result of summary.issues || []) {
-    const item = document.createElement("li");
-    const outcome = result.outcome || "in_progress";
-    item.className = `issue-summary-item ${outcome}`;
-    const marker = document.createElement("span");
-    marker.className = "issue-summary-marker";
-    marker.textContent = outcome === "approved"
-      ? "✓"
-      : (outcome === "continued_with_warning"
-        ? "⚠"
-        : (outcome === "in_progress" ? "…" : "–"));
-    const details = document.createElement("div");
-    const line = document.createElement("div");
-    const label = result.label || `#${result.issue}`;
-    line.append(document.createTextNode(`${label}  `));
-    if (result.pr) appendPrLink(line, result.pr);
-    const terminals = result.terminals || {};
-    if (terminals.implementation) {
-      appendPurpleMuxLink(line, "Implementation", terminals.implementation);
+  for (const repository of repositories) {
+    if (repositories.length > 1) {
+      const heading = document.createElement("li");
+      heading.className = "issue-summary-repository";
+      heading.textContent = `${repository.repository} — ${repository.integrationBranch} → ${repository.finalBranch}`;
+      issueSummaryList.append(heading);
     }
-    if (terminals.scopeReview) {
-      appendPurpleMuxLink(line, "Scope Review", terminals.scopeReview);
+    for (const result of repository.issues || []) {
+      const item = document.createElement("li");
+      const outcome = result.outcome || "in_progress";
+      item.className = `issue-summary-item ${outcome}`;
+      const marker = document.createElement("span");
+      marker.className = "issue-summary-marker";
+      marker.textContent = outcome === "approved"
+        ? "✓"
+        : (outcome === "continued_with_warning"
+          ? "⚠"
+          : (outcome === "in_progress" ? "…" : "–"));
+      const details = document.createElement("div");
+      const line = document.createElement("div");
+      const label = result.label || `#${result.issue}`;
+      line.append(document.createTextNode(`${label}  `));
+      if (result.pr) appendPrLink(line, result.pr);
+      const terminals = result.terminals || {};
+      if (terminals.implementation) {
+        appendPurpleMuxLink(line, "Implementation", terminals.implementation);
+      }
+      if (terminals.scopeReview) {
+        appendPurpleMuxLink(line, "Scope Review", terminals.scopeReview);
+      }
+      if (terminals.correctnessReview) {
+        appendPurpleMuxLink(line, "Correctness Review", terminals.correctnessReview);
+      }
+      if (result.reviews != null) {
+        line.append(document.createTextNode(`  Review ${result.reviews}`));
+      }
+      if (outcome !== "approved") {
+        const outcomeLabel = outcome === "skipped"
+          ? "SKIPPED"
+          : outcome.replaceAll("_", " ");
+        line.append(document.createTextNode(`  ${outcomeLabel}`));
+      }
+      details.append(line);
+      if (result.reason) {
+        const note = document.createElement("div");
+        note.className = "issue-summary-skip-reason";
+        note.textContent = result.reason;
+        details.append(note);
+      }
+      for (const warning of result.warnings || []) {
+        const note = document.createElement("div");
+        note.className = "issue-summary-warning";
+        note.textContent = warning;
+        details.append(note);
+      }
+      item.append(marker, details);
+      issueSummaryList.append(item);
     }
-    if (terminals.correctnessReview) {
-      appendPurpleMuxLink(line, "Correctness Review", terminals.correctnessReview);
-    }
-    if (result.reviews != null) {
-      line.append(document.createTextNode(`  Review ${result.reviews}`));
-    }
-    if (outcome !== "approved") {
-      const outcomeLabel = outcome === "skipped"
-        ? "SKIPPED"
-        : outcome.replaceAll("_", " ");
-      line.append(document.createTextNode(`  ${outcomeLabel}`));
-    }
-    details.append(line);
-    if (result.reason) {
-      const note = document.createElement("div");
-      note.className = "issue-summary-skip-reason";
-      note.textContent = result.reason;
-      details.append(note);
-    }
-    for (const warning of result.warnings || []) {
-      const note = document.createElement("div");
-      note.className = "issue-summary-warning";
-      note.textContent = warning;
-      details.append(note);
-    }
-    item.append(marker, details);
-    issueSummaryList.append(item);
   }
-  const whole = summary.wholeReview;
-  issueSummaryWhole.textContent = whole == null
-    ? "Whole Review: no final result"
-    : `Whole Review: ${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
-  if (summary.basePr) appendPrLink(issueSummaryBase, summary.basePr, "Base PR: ");
-  else issueSummaryBase.textContent = "Base PR: not recorded";
-  if (summary.policyIssue != null) {
-    issueSummaryPolicy.append(document.createTextNode("Policy Issue: "));
-    const link = document.createElement("a");
-    link.href = `https://github.com/${summary.repository}/issues/${summary.policyIssue}`;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = `#${summary.policyIssue}`;
-    issueSummaryPolicy.append(link);
+  if (repositories.length === 1) {
+    const repository = repositories[0];
+    const whole = repository.wholeReview;
+    issueSummaryWhole.textContent = whole == null
+      ? "Whole Review: no final result"
+      : `Whole Review: ${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
+    if (repository.basePr) appendPrLink(issueSummaryBase, repository.basePr, "Base PR: ");
+    else issueSummaryBase.textContent = "Base PR: not recorded";
+    if (repository.policyIssue != null) {
+      issueSummaryPolicy.append(document.createTextNode("Policy Issue: "));
+      const link = document.createElement("a");
+      link.href = `https://github.com/${repository.repository}/issues/${repository.policyIssue}`;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `#${repository.policyIssue}`;
+      issueSummaryPolicy.append(link);
+    }
+  } else {
+    issueSummaryWhole.textContent = repositories.map((repository) => {
+      const whole = repository.wholeReview;
+      const result = whole == null
+        ? "no final result"
+        : `${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
+      return `${repository.repository}: ${result}`;
+    }).join(" · ");
+    for (const repository of repositories) {
+      if (issueSummaryBase.children.length || issueSummaryBase.textContent) {
+        issueSummaryBase.append(document.createTextNode(" · "));
+      }
+      if (repository.basePr) {
+        appendPrLink(issueSummaryBase, repository.basePr, `${repository.repository}: `);
+      } else {
+        issueSummaryBase.append(document.createTextNode(`${repository.repository}: not recorded`));
+      }
+      if (repository.policyIssue != null) {
+        if (issueSummaryPolicy.children.length || issueSummaryPolicy.textContent) {
+          issueSummaryPolicy.append(document.createTextNode(" · "));
+        }
+        issueSummaryPolicy.append(document.createTextNode(`${repository.repository}: `));
+        const link = document.createElement("a");
+        link.href = `https://github.com/${repository.repository}/issues/${repository.policyIssue}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = `#${repository.policyIssue}`;
+        issueSummaryPolicy.append(link);
+      }
+    }
   }
   issueSummaryWarnings.textContent = `Warnings: ${summary.warningCount}`;
 }

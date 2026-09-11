@@ -217,6 +217,36 @@ class IssueDrivenContext:
 
 
 @dataclass(frozen=True)
+class IssueDrivenRepositorySummary:
+    context: IssueDrivenContext
+    integration_pr: PullRequestNavigation | None = None
+    issue_results: tuple[IssueResult, ...] = ()
+    issue_navigations: tuple[IssueNavigation, ...] = ()
+    planner_skips: tuple[PlannerSkip, ...] = ()
+    whole_review_result: WholeReviewResult | None = None
+
+
+@dataclass
+class _IssueDrivenRepositoryRecord:
+    context: IssueDrivenContext
+    integration_pr: PullRequestNavigation | None = None
+    issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
+    issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
+    planner_skips: dict[int | str, PlannerSkip] = field(default_factory=dict)
+    whole_review_result: WholeReviewResult | None = None
+
+    def snapshot(self) -> IssueDrivenRepositorySummary:
+        return IssueDrivenRepositorySummary(
+            self.context,
+            self.integration_pr,
+            tuple(self.issue_results.values()),
+            tuple(self.issue_navigations.values()),
+            tuple(self.planner_skips.values()),
+            self.whole_review_result,
+        )
+
+
+@dataclass(frozen=True)
 class DryRunResult:
     status: Literal["frontier", "complete", "failed", "ineligible"]
     stdout: str = ""
@@ -395,6 +425,7 @@ class RunnerSnapshot:
     issue_navigations: tuple[IssueNavigation, ...] = ()
     planner_skips: tuple[PlannerSkip, ...] = ()
     whole_review_result: WholeReviewResult | None = None
+    issue_driven_repositories: tuple[IssueDrivenRepositorySummary, ...] = ()
     identity: str | None = None
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
@@ -428,11 +459,25 @@ class RunnerSnapshot:
         payload.pop("issue_navigations")
         payload.pop("planner_skips")
         payload.pop("whole_review_result")
+        payload.pop("issue_driven_repositories")
         payload["issueDrivenSummary"] = self._issue_driven_summary_json()
+        scoped_planner_skips = [
+            (repository.context.repository, skip)
+            for repository in self.issue_driven_repositories
+            for skip in repository.planner_skips
+        ]
+        if not scoped_planner_skips:
+            scoped_planner_skips = [(None, skip) for skip in self.planner_skips]
+        multiple_repositories = len(self.issue_driven_repositories) > 1
         payload["plannerSkips"] = [
             {
                 "issue": skip.issue,
                 "reason": skip.reason,
+                **(
+                    {"repository": repository}
+                    if multiple_repositories and repository is not None
+                    else {}
+                ),
                 **({"label": skip.label} if skip.label is not None else {}),
                 **(
                     {"observedAt": skip.observed_at}
@@ -440,7 +485,7 @@ class RunnerSnapshot:
                     else {}
                 ),
             }
-            for skip in self.planner_skips
+            for repository, skip in scoped_planner_skips
         ]
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
@@ -485,18 +530,54 @@ class RunnerSnapshot:
         return payload
 
     def _issue_driven_summary_json(self) -> dict[str, object] | None:
-        context = self.issue_driven_context
-        if context is None or self.state in ("idle", "validation_failed"):
+        repositories = self.issue_driven_repositories
+        if not repositories and self.issue_driven_context is not None:
+            repositories = (
+                IssueDrivenRepositorySummary(
+                    self.issue_driven_context,
+                    self.integration_pr,
+                    self.issue_results,
+                    self.issue_navigations,
+                    self.planner_skips,
+                    self.whole_review_result,
+                ),
+            )
+        if not repositories or self.state in ("idle", "validation_failed"):
             return None
         if self.state == "running" and not (
-            self.issue_results or self.issue_navigations or self.planner_skips
+            any(
+                repository.issue_results
+                or repository.issue_navigations
+                or repository.planner_skips
+                for repository in repositories
+            )
         ):
             return None
+        repository_summaries = [
+            self._repository_summary_json(repository) for repository in repositories
+        ]
+        if len(repository_summaries) > 1:
+            return {
+                "terminalResult": self.state,
+                "warningCount": self.warning_count,
+                "repositories": repository_summaries,
+            }
+        return {
+            **repository_summaries[0],
+            "terminalResult": self.state,
+            "warningCount": self.warning_count,
+        }
+
+    @staticmethod
+    def _repository_summary_json(
+        repository: IssueDrivenRepositorySummary,
+    ) -> dict[str, object]:
+        context = repository.context
         issues = []
         navigations = {
-            navigation.issue: navigation for navigation in self.issue_navigations
+            navigation.issue: navigation for navigation in repository.issue_navigations
         }
-        for result in self.issue_results:
+        for result in repository.issue_results:
             item = {
                 "issue": result.issue,
                 "outcome": result.outcome,
@@ -536,7 +617,7 @@ class RunnerSnapshot:
             if navigation.label is not None:
                 item["label"] = navigation.label
             issues.append(item)
-        for skip in self.planner_skips:
+        for skip in repository.planner_skips:
             item = {
                 "issue": skip.issue,
                 "outcome": "skipped",
@@ -546,13 +627,11 @@ class RunnerSnapshot:
             if skip.label is not None:
                 item["label"] = skip.label
             issues.append(item)
-        whole_review = self.whole_review_result
+        whole_review = repository.whole_review_result
         return {
             "repository": context.repository,
             "integrationBranch": context.integration_branch,
             "finalBranch": context.final_branch,
-            "terminalResult": self.state,
-            "warningCount": self.warning_count,
             "policyIssue": context.policy_issue,
             "issues": issues,
             "wholeReview": (
@@ -564,7 +643,11 @@ class RunnerSnapshot:
                 if whole_review is not None
                 else None
             ),
-            "basePr": self.integration_pr.as_json() if self.integration_pr else None,
+            "basePr": (
+                repository.integration_pr.as_json()
+                if repository.integration_pr
+                else None
+            ),
         }
 
     def as_summary_json(self) -> dict[str, object]:
@@ -665,6 +748,9 @@ class _RunRecord:
     issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
     planner_skips: dict[int | str, PlannerSkip] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
+    issue_driven_repositories: list[_IssueDrivenRepositoryRecord] = field(
+        default_factory=list
+    )
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
 
@@ -862,6 +948,32 @@ class PythonRunner:
                 if run.whole_review_result is not None
                 else None
             ),
+            "issueDrivenRepositories": [
+                {
+                    "context": asdict(repository.context),
+                    "integrationPr": (
+                        asdict(repository.integration_pr)
+                        if repository.integration_pr is not None
+                        else None
+                    ),
+                    "issueResults": [
+                        asdict(result) for result in repository.issue_results.values()
+                    ],
+                    "issueNavigations": [
+                        asdict(navigation)
+                        for navigation in repository.issue_navigations.values()
+                    ],
+                    "plannerSkips": [
+                        asdict(skip) for skip in repository.planner_skips.values()
+                    ],
+                    "wholeReviewResult": (
+                        asdict(repository.whole_review_result)
+                        if repository.whole_review_result is not None
+                        else None
+                    ),
+                }
+                for repository in run.issue_driven_repositories
+            ],
             "checked": run.checked,
             "issueDrivenJson": run.issue_driven_json,
             "resumedFromRunId": run.resumed_from_run_id,
@@ -1021,11 +1133,8 @@ class PythonRunner:
             if context_value is None
             else self._history_dataclass(IssueDrivenContext, context_value)
         )
-        issue_result_values = value.get("issueResults", [])
-        if not isinstance(issue_result_values, list):
-            raise ValueError
-        issue_results: dict[int | str, IssueResult] = {}
-        for item in issue_result_values:
+
+        def load_issue_result(item: object) -> IssueResult:
             if not isinstance(item, dict):
                 raise ValueError
             result_value = dict(item)
@@ -1058,13 +1167,17 @@ class PythonRunner:
             ):
                 raise ValueError
             result_value["warnings"] = tuple(warnings_value)
-            result = self._history_dataclass(IssueResult, result_value)
-            issue_results[result.issue] = result
-        issue_navigation_values = value.get("issueNavigations", [])
-        if not isinstance(issue_navigation_values, list):
+            return self._history_dataclass(IssueResult, result_value)
+
+        issue_result_values = value.get("issueResults", [])
+        if not isinstance(issue_result_values, list):
             raise ValueError
-        issue_navigations: dict[int | str, IssueNavigation] = {}
-        for item in issue_navigation_values:
+        issue_results: dict[int | str, IssueResult] = {}
+        for item in issue_result_values:
+            result = load_issue_result(item)
+            issue_results[result.issue] = result
+
+        def load_issue_navigation(item: object) -> IssueNavigation:
             if not isinstance(item, dict):
                 raise ValueError
             navigation_value = dict(item)
@@ -1079,7 +1192,14 @@ class PythonRunner:
                 navigation_value[field_name] = self._history_dataclass(
                     PurpleMuxNavigation, navigation_value.get(field_name)
                 )
-            navigation = self._history_dataclass(IssueNavigation, navigation_value)
+            return self._history_dataclass(IssueNavigation, navigation_value)
+
+        issue_navigation_values = value.get("issueNavigations", [])
+        if not isinstance(issue_navigation_values, list):
+            raise ValueError
+        issue_navigations: dict[int | str, IssueNavigation] = {}
+        for item in issue_navigation_values:
+            navigation = load_issue_navigation(item)
             issue_navigations[navigation.issue] = navigation
         planner_skip_values = value.get("plannerSkips", [])
         if not isinstance(planner_skip_values, list):
@@ -1097,6 +1217,79 @@ class PythonRunner:
         if whole_review_result is not None:
             whole_review_result = replace(
                 whole_review_result, warnings=tuple(whole_review_result.warnings)
+            )
+        repository_values = value.get("issueDrivenRepositories")
+        issue_driven_repositories: list[_IssueDrivenRepositoryRecord] = []
+        if repository_values is not None:
+            if not isinstance(repository_values, list):
+                raise ValueError
+            for repository_value in repository_values:
+                if not isinstance(repository_value, dict):
+                    raise ValueError
+                repository_context = self._history_dataclass(
+                    IssueDrivenContext, repository_value.get("context")
+                )
+                repository_pr_value = repository_value.get("integrationPr")
+                repository_pr = (
+                    None
+                    if repository_pr_value is None
+                    else self._history_dataclass(
+                        PullRequestNavigation, repository_pr_value
+                    )
+                )
+                result_values = repository_value.get("issueResults")
+                navigation_values = repository_value.get("issueNavigations")
+                skip_values = repository_value.get("plannerSkips")
+                if not all(
+                    isinstance(items, list)
+                    for items in (result_values, navigation_values, skip_values)
+                ):
+                    raise ValueError
+                repository_results: dict[int | str, IssueResult] = {}
+                for item in cast(list[object], result_values):
+                    result = load_issue_result(item)
+                    repository_results[result.issue] = result
+                repository_navigations: dict[int | str, IssueNavigation] = {}
+                for item in cast(list[object], navigation_values):
+                    navigation = load_issue_navigation(item)
+                    repository_navigations[navigation.issue] = navigation
+                repository_skips: dict[int | str, PlannerSkip] = {}
+                for item in cast(list[object], skip_values):
+                    skip = self._history_dataclass(PlannerSkip, item)
+                    repository_skips[skip.issue] = skip
+                repository_review_value = repository_value.get("wholeReviewResult")
+                repository_review = (
+                    None
+                    if repository_review_value is None
+                    else self._history_dataclass(
+                        WholeReviewResult, repository_review_value
+                    )
+                )
+                if repository_review is not None:
+                    repository_review = replace(
+                        repository_review,
+                        warnings=tuple(repository_review.warnings),
+                    )
+                issue_driven_repositories.append(
+                    _IssueDrivenRepositoryRecord(
+                        repository_context,
+                        repository_pr,
+                        repository_results,
+                        repository_navigations,
+                        repository_skips,
+                        repository_review,
+                    )
+                )
+        elif issue_driven_context is not None:
+            issue_driven_repositories.append(
+                _IssueDrivenRepositoryRecord(
+                    issue_driven_context,
+                    integration_pr,
+                    issue_results,
+                    issue_navigations,
+                    planner_skips,
+                    whole_review_result,
+                )
             )
         stdout_truncated = value.get("stdoutTruncated")
         stderr_truncated = value.get("stderrTruncated")
@@ -1137,6 +1330,7 @@ class PythonRunner:
             issue_navigations=issue_navigations,
             planner_skips=planner_skips,
             whole_review_result=whole_review_result,
+            issue_driven_repositories=issue_driven_repositories,
             checked=checked,
             issue_driven_json=issue_driven_json,
             resumed_from_run_id=resumed_from_run_id,
@@ -1948,6 +2142,9 @@ class PythonRunner:
             issue_navigations=tuple(run.issue_navigations.values()),
             planner_skips=tuple(run.planner_skips.values()),
             whole_review_result=run.whole_review_result,
+            issue_driven_repositories=tuple(
+                repository.snapshot() for repository in run.issue_driven_repositories
+            ),
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
             resumed_from_run_id=run.resumed_from_run_id,
@@ -2722,20 +2919,46 @@ class PythonRunner:
             )
         elif event_type == "run_pr":
             run.integration_pr = cast(PullRequestNavigation, event)
+            if run.issue_driven_repositories:
+                run.issue_driven_repositories[-1].integration_pr = run.integration_pr
         elif event_type == "issue_driven_context":
             run.issue_driven_context = cast(IssueDrivenContext, event)
+            run.integration_pr = None
+            run.issue_results = {}
+            run.issue_navigations = {}
+            run.planner_skips = {}
+            run.whole_review_result = None
+            run.issue_driven_repositories.append(
+                _IssueDrivenRepositoryRecord(run.issue_driven_context)
+            )
         elif event_type == "issue_result":
             issue_result = cast(IssueResult, event)
             run.issue_results[issue_result.issue] = issue_result
+            if run.issue_driven_repositories:
+                run.issue_driven_repositories[-1].issue_results[issue_result.issue] = (
+                    issue_result
+                )
         elif event_type == "issue_navigation":
             issue_navigation = cast(IssueNavigation, event)
             run.issue_navigations[issue_navigation.issue] = issue_navigation
+            if run.issue_driven_repositories:
+                run.issue_driven_repositories[-1].issue_navigations[
+                    issue_navigation.issue
+                ] = issue_navigation
         elif event_type == "planner_skip":
             planner_skip = cast(PlannerSkip, event)
             accepted = replace(planner_skip, observed_at=self._accepted_at())
             run.planner_skips[accepted.issue] = accepted
+            if run.issue_driven_repositories:
+                run.issue_driven_repositories[-1].planner_skips[accepted.issue] = (
+                    accepted
+                )
         elif event_type == "whole_review_result":
             run.whole_review_result = cast(WholeReviewResult, event)
+            if run.issue_driven_repositories:
+                run.issue_driven_repositories[
+                    -1
+                ].whole_review_result = run.whole_review_result
         else:
             progress = cast(ProgressEvent, event)
             accepted = replace(progress, observed_at=self._accepted_at())
