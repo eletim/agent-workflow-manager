@@ -112,6 +112,9 @@ function snapshot({
   checked = false,
   issueDrivenSummary = null,
   hasWarnings = false,
+  findings = [],
+  warningTimeline = [],
+  warningTimelineOmitted = 0,
 }) {
   const result = {
     args,
@@ -131,7 +134,9 @@ function snapshot({
     dryRun: null,
     dryRunEligible: true,
     dryRunIssues: [],
-    findings: [],
+    findings,
+    warningTimeline,
+    warningTimelineOmitted,
     hasWarnings,
     resources,
     resourceCleanupStatus,
@@ -1625,6 +1630,106 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
       (item) => item.children[1].children[1].getAttribute("datetime"),
     ),
     [completedAt, startedAt, failedAt],
+  );
+});
+
+test("Progress places structured warnings at their recorded time across run switches", async () => {
+  const preparedAt = "2026-09-05T01:02:03.000000+00:00";
+  const warningAt = "2026-09-05T01:03:04.000000+00:00";
+  const reviewedAt = "2026-09-05T01:04:05.000000+00:00";
+  const warned = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "WARN: stdout is not a Finding\n",
+    progress: [
+      {name: "prepare", status: "completed", observedAt: preparedAt},
+      {name: "review", status: "completed", observedAt: reviewedAt},
+    ],
+    findings: [
+      {
+        category: "runtime", status: "info", message: "WARN: informational only",
+        observedAt: warningAt,
+      },
+    ],
+    warningTimeline: [
+      {
+        category: "github", status: "warning", message: "review limit reached",
+        observedAt: warningAt,
+      },
+    ],
+    hasWarnings: true,
+  });
+  const clean = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "clean",
+    progress: [{name: "clean step", status: "completed", observedAt: reviewedAt}],
+  });
+  const {elements, logDisplay} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", cwd: "/work/run-1", hasWarnings: true},
+      {runId: 2, state: "success", cwd: "/work/run-2"},
+    ],
+    details: {1: warned, 2: clean},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await runItem(elements, 1).dispatch("click");
+
+  assert.deepEqual(
+    elements.progress.children.map((item) => item.children[1].children[0].textContent),
+    ["prepare", "Warning · github", "review"],
+  );
+  const warning = elements.progress.children[1];
+  assert.equal(warning.className, "progress-item warning");
+  assert.equal(warning.children[0].textContent, "⚠");
+  assert.equal(warning.children[1].children[1].textContent, logDisplay.formatObservedAt(warningAt));
+  assert.equal(warning.children[1].children[1].getAttribute("datetime"), warningAt);
+  assert.equal(warning.children[1].children[2].textContent, "review limit reached");
+
+  await runItem(elements, 2).dispatch("click");
+  assert.deepEqual(
+    elements.progress.children.map((item) => item.children[1].children[0].textContent),
+    ["clean step"],
+  );
+  await runItem(elements, 1).dispatch("click");
+  assert.equal(elements.progress.children[1].className, "progress-item warning");
+  assert.equal(elements.progress.children[1].children[1].children[2].textContent, "review limit reached");
+
+  const reloaded = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1", hasWarnings: true}],
+    details: {1: warned},
+    validation: {status: 200, body: {validation: []}},
+  });
+  assert.equal(reloaded.elements.progress.children[1].className, "progress-item warning");
+  assert.equal(
+    reloaded.elements.progress.children[1].children[1].children[2].textContent,
+    "review limit reached",
+  );
+});
+
+test("Progress reports warning occurrences omitted by timeline retention", async () => {
+  const warned = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "",
+    progress: [{name: "latest step", status: "completed"}],
+    warningTimelineOmitted: 3,
+    hasWarnings: true,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", cwd: "/work/run-1", hasWarnings: true}],
+    details: {1: warned},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  const omitted = elements.progress.children[0];
+  assert.equal(omitted.className, "progress-item warning omitted");
+  assert.equal(omitted.children[0].textContent, "⚠");
+  assert.equal(omitted.children[1].children[0].textContent, "Earlier warnings omitted");
+  assert.equal(
+    omitted.children[1].children[1].textContent,
+    "3 warning occurrences are outside retained Progress history.",
   );
 });
 

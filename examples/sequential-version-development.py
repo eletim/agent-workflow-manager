@@ -13,9 +13,10 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -48,12 +49,13 @@ WORKFLOW_OUTLINE = [
     "Deliver the exact Issue topology",
     "Review and deliver the whole version",
 ]
-MAX_REVIEWS = 5
-MAX_SCOPE_REVIEWS = 3
+MAX_REVIEWS = 4
+MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
 MAX_PLAN_STATE_CHARS = 32_000
+MAX_MACHINE_OUTPUT_CORRECTIONS = 2
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -83,6 +85,19 @@ MAX_PLANNER_POLICY_CONFLICTS = 3
 MAX_POLICY_CONFLICT_DETAIL_CHARS = 500
 MAX_POLICY_CONFLICT_WARNINGS = 8
 MAX_BASE_PR_BODY_BYTES = 65_536
+
+
+def terminal_progress(
+    event: str,
+    subject: str,
+    *,
+    iteration: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """Show concise human progress without making terminal output authoritative."""
+    iteration_text = f" (iteration {iteration})" if iteration is not None else ""
+    detail_text = f": {detail}" if detail is not None else ""
+    print(f"[workflow] {event} {subject}{iteration_text}{detail_text}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -397,6 +412,7 @@ def run_turn(
         tab=tab,
         **navigation,
     )
+    terminal_progress("START", name, iteration=iteration)
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
@@ -412,6 +428,7 @@ def run_turn(
             tab=tab,
             **navigation,
         )
+        terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
         raise
     emit_step(
         name,
@@ -421,7 +438,49 @@ def run_turn(
         tab=tab,
         **navigation,
     )
+    terminal_progress("DONE", name, iteration=iteration)
     return result
+
+
+ValidatedOutput = TypeVar("ValidatedOutput")
+
+
+def run_validated_turn(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    name: str,
+    prompt: str,
+    validator: Callable[[str], ValidatedOutput],
+    *,
+    iteration: int | None = None,
+    pr: PullRequestState | None = None,
+) -> tuple[str, ValidatedOutput]:
+    """Retry an invalid machine-readable response in the same agent session."""
+    result = run_turn(client, tab, name, prompt, iteration=iteration, pr=pr)
+    for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+        try:
+            return result, validator(result)
+        except WorkerFailure as exc:
+            if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
+                raise WorkerFailure(
+                    f"{name} returned invalid output after "
+                    f"{MAX_MACHINE_OUTPUT_CORRECTIONS} correction attempts: "
+                    f"{short_error(exc)}"
+                ) from exc
+            validation_error = short_error(exc)
+            result = run_turn(
+                client,
+                tab,
+                f"{name} output correction",
+                "The previous response violated its machine-readable output "
+                f"contract: {validation_error}\n\n"
+                "Return the complete corrected response only, following the "
+                "original response contract. Correct the output in this same "
+                "session; do not repeat the underlying task or mutate any state.",
+                iteration=correction + 1,
+                pr=pr,
+            )
+    raise AssertionError("unreachable")
 
 
 def implementer_prompt(prompt: str) -> str:
@@ -432,10 +491,12 @@ def implementer_prompt(prompt: str) -> str:
 def run_outline_step(name: str, action):
     """Run one concrete outline unit while retaining detailed nested progress."""
     emit_step(name, "started")
+    terminal_progress("START", name)
     try:
         result = action()
     except BaseException as exc:
         emit_step(name, "failed", error=short_error(exc))
+        terminal_progress("FAILED", name, detail=short_error(exc))
         raise
     navigation = (
         {"pr_number": result.number, "pr_url": result.url}
@@ -443,6 +504,7 @@ def run_outline_step(name: str, action):
         else {}
     )
     emit_step(name, "completed", **navigation)
+    terminal_progress("DONE", name)
     return result
 
 
@@ -1290,6 +1352,7 @@ def review_issue_phase(
             expected_base_sha=pr.base_sha,
         )
         print(f"WARN: {warning}", flush=True)
+        terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
         emit_finding("git", warning, status="warning")
         return IssueReviewPhaseResult(
             current,
@@ -1300,11 +1363,12 @@ def review_issue_phase(
             (warning,),
         )
     for review_number in range(review_offset + 1, max_reviews + 1):
-        result = run_turn(
+        result, verdict = run_validated_turn(
             client,
             reviewer,
             f"{issue.label} {phase} review",
             f"{prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
+            decision,
             iteration=review_number,
             pr=pr,
         )
@@ -1356,7 +1420,7 @@ def review_issue_phase(
                 )
             continue
         current = ensure_issue_pr_policy_conflicts(github, current, issue, config)
-        if decision(result) == "APPROVED":
+        if verdict == "APPROVED":
             return IssueReviewPhaseResult(
                 current, "approved", current.head_sha, current.base_sha, review_number
             )
@@ -1375,6 +1439,7 @@ def review_issue_phase(
                 expected_base_sha=current.base_sha,
             )
             print(f"WARN: {warning}", flush=True)
+            terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
             return IssueReviewPhaseResult(
                 current,
@@ -1428,6 +1493,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
                 expected_base_sha=current.base_sha,
             )
             print(f"WARN: {warning}", flush=True)
+            terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
             return IssueReviewPhaseResult(
                 current,
@@ -1463,6 +1529,7 @@ def process_issue(
     repo: GitRepository,
     github: GitHubRepository,
 ) -> PullRequestState:
+    terminal_progress("WORK ITEM", issue.label, detail=issue.branch)
     if repo.inspect_worktree().dirty:
         cleanup = create_agent(
             client,
@@ -2237,7 +2304,7 @@ def process_work_items(
         name="Work-item planner",
     )
     for planner_turn in range(1, MAX_PLANNER_TURNS + 1):
-        decision = run_turn(
+        _, planner_decision = run_validated_turn(
             client,
             planner,
             "Work-item planning",
@@ -2245,9 +2312,9 @@ def process_work_items(
                 config, scope="work-item planning", structured_conflicts=True
             )
             + planner_prompt(plan, config),
+            lambda source: apply_planner_decision(plan, source),
             iteration=planner_turn,
         )
-        planner_decision = apply_planner_decision(plan, decision)
         for conflict in planner_decision.policy_conflicts:
             record_policy_conflict(
                 None,
@@ -2388,12 +2455,13 @@ def review_whole_version(
     for review_number in range(1, MAX_REVIEWS + 1):
         result: str
         if scenario_reviewer is not None:
-            result = run_turn(
+            result, verdict = run_validated_turn(
                 client,
                 scenario_reviewer,
                 "Scenario Gate reviewer turn",
                 policy_context(config, scope="the whole-version Scenario Gate")
                 + scenario_gate_prompt(pr, config, work_items),
+                decision,
                 iteration=review_number,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
@@ -2429,13 +2497,15 @@ def review_whole_version(
                 continue
         else:
             result = "APPROVED\nScenario Gate not configured."
-        if decision(result) == "APPROVED":
-            result = run_turn(
+            verdict = "APPROVED"
+        if verdict == "APPROVED":
+            result, verdict = run_validated_turn(
                 client,
                 reviewer,
                 "Whole-version reviewer turn",
                 policy_context(config, scope="the whole-version review")
                 + whole_version_review_prompt(pr, config, work_items),
+                decision,
                 iteration=review_number,
             )
         emit_policy_conflicts(result, config, scope="the integrated version")
@@ -2479,7 +2549,6 @@ def review_whole_version(
             draft=True,
         )
         current = ensure_base_pr_policy_notes(github, current, config)
-        verdict = decision(result)
         warning: str | None = None
         if verdict == "CHANGES_REQUESTED":
             if review_number == MAX_REVIEWS:
@@ -2583,6 +2652,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 expected_base_sha=current.base_sha,
             )
             print(f"WARN: {warning}", flush=True)
+            terminal_progress("WARN CONTINUATION", "Whole-version review")
             emit_finding("github", warning, status="warning")
             delivery = ReviewDelivery(
                 "continued_with_warning",
@@ -2604,6 +2674,11 @@ def integration_delivery(
     repo: GitRepository,
     github: GitHubRepository,
 ) -> PullRequestState | None:
+    terminal_progress(
+        "PREPARE",
+        "Final integration PR",
+        detail=f"{config.integration_branch} -> {config.main_branch}",
+    )
     integration = repo.synchronize_branch(config.integration_branch)
     main = repo.inspect_branch(config.main_branch)
     if integration.remote_sha is None or main.remote_sha is None:
@@ -2650,10 +2725,20 @@ def integration_delivery(
                 "completed",
                 message=f"delivery already merged as PR #{merged_pr.number}",
             )
+            terminal_progress(
+                "DONE",
+                "Whole-version review",
+                detail=f"delivery already merged as PR #{merged_pr.number}",
+            )
         emit_step(
             "Final integration PR",
             "completed",
             message=f"already merged as PR #{merged_pr.number}",
+        )
+        terminal_progress(
+            "DONE",
+            "Final integration PR",
+            detail=f"already merged as PR #{merged_pr.number}",
         )
         return merged_pr
     if pr is None:
@@ -2672,6 +2757,11 @@ def integration_delivery(
                 "Final integration PR",
                 "completed",
                 message="no implementation changes; no PR required",
+            )
+            terminal_progress(
+                "DONE",
+                "Final integration PR",
+                detail="no implementation changes; no PR required",
             )
             return None
         if pr.state == "MERGED":
@@ -2697,6 +2787,9 @@ def integration_delivery(
     rehydrate_policy_conflicts(pr.body, config, issue_number=None)
     pr = ensure_base_pr_policy_notes(github, pr, config)
     emit_run_pr(pr.number, pr.url)
+    terminal_progress(
+        "IDENTIFIED", "Final integration PR", detail=f"PR #{pr.number} {pr.url}"
+    )
     if FINAL_REVIEW:
         pr, delivery = run_outline_step(
             "Whole-version review",

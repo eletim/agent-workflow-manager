@@ -47,3 +47,11 @@ def test_guide_rejects_in_place_pending_marker_resume() -> None:
     assert "`resume_shell()` operation" in guide
     assert "A `*_pending` marker alone never satisfies that rule" in guide
     assert "approval/final-check" in guide
+
+
+def test_guide_keeps_terminal_progress_observational() -> None:
+    guide = GUIDE.read_text(encoding="utf-8")
+
+    assert "concise `[workflow]` lines" in guide
+    assert "Never parse stdout to determine workflow state" in guide
+    assert "structured\nProgress, Findings, result events" in guide

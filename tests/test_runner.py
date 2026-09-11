@@ -1444,8 +1444,15 @@ print("WARN: stdout text")
     assert info_result.as_summary_json()["hasWarnings"] is False
 
 
-def test_warning_aggregate_survives_finding_eviction_and_run_switching() -> None:
-    runner = PythonRunner(managed_workflows=False, max_progress_events=1)
+def test_warning_timeline_survives_eviction_switching_and_reconstruction(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        max_progress_events=1,
+        run_history_file=history_file,
+    )
     try:
         warning_id = runner.start(
             """from purplemux_client import emit_finding
@@ -1463,8 +1470,97 @@ emit_finding("git", "later fact", status="passed")
         runner.close()
 
     assert [finding.status for finding in warning_result.findings] == ["passed"]
+    assert [finding.message for finding in warning_result.warning_findings] == [
+        "review required"
+    ]
+    assert warning_result.warning_findings[0].observed_at is not None
+    assert warning_result.as_json()["warningTimeline"] == [
+        {
+            "category": "git",
+            "status": "warning",
+            "message": "review required",
+            "observedAt": warning_result.warning_findings[0].observed_at,
+        }
+    ]
     assert warning_result.has_warnings is True
     assert clean_result.has_warnings is False
+
+    restored_runner = PythonRunner(
+        managed_workflows=False,
+        max_progress_events=1,
+        run_history_file=history_file,
+    )
+    try:
+        restored = restored_runner.snapshot(warning_id)
+    finally:
+        restored_runner.close()
+
+    assert [finding.status for finding in restored.findings] == ["passed"]
+    assert restored.warning_findings == warning_result.warning_findings
+    assert restored.has_warnings is True
+    assert restored.warning_count == 1
+
+
+def test_warning_timeline_bounds_floods_and_rejects_oversized_history(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        max_progress_events=2,
+        run_history_file=history_file,
+    )
+    try:
+        run_id = runner.start(
+            """from purplemux_client import emit_finding
+for number in range(5):
+    emit_finding("git", f"warning {number}", status="warning")
+emit_finding("git", "later fact", status="passed")
+"""
+        )
+        result = wait_until_finished(runner)
+    finally:
+        runner.close()
+
+    assert [finding.message for finding in result.findings] == [
+        "warning 4",
+        "later fact",
+    ]
+    assert [finding.message for finding in result.warning_findings] == [
+        "warning 3",
+        "warning 4",
+    ]
+    assert result.warning_findings_omitted == 3
+    assert result.warning_count == 5
+    assert result.as_json()["warningTimelineOmitted"] == 3
+    saved_runs = json.loads(history_file.read_text(encoding="utf-8"))["runs"]
+    saved_run = next(iter(saved_runs.values()))
+    assert len(saved_run["warningFindings"]) == 2
+    assert saved_run["warningFindingsOmitted"] == 3
+
+    restored_runner = PythonRunner(
+        managed_workflows=False,
+        max_progress_events=2,
+        run_history_file=history_file,
+    )
+    try:
+        restored = restored_runner.snapshot(run_id)
+    finally:
+        restored_runner.close()
+
+    assert restored.warning_findings == result.warning_findings
+    assert restored.warning_findings_omitted == 3
+    assert restored.warning_count == 5
+
+    with pytest.raises(
+        runner_module.RunHistoryError,
+        match="terminal run history is unreadable",
+    ):
+        PythonRunner(
+            managed_workflows=False,
+            max_progress_events=1,
+            run_history_file=history_file,
+        )
 
 
 def test_issue_driven_summary_uses_durable_structured_results_not_progress() -> None:
@@ -2130,6 +2226,8 @@ def test_runner_http_lifecycle(
         "dryRunIssues": [],
         "executionContext": None,
         "findings": [],
+        "warningTimeline": [],
+        "warningTimelineOmitted": 0,
         "hasWarnings": False,
         "warningCount": 0,
         "exitCode": 0,

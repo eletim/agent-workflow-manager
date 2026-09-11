@@ -438,6 +438,7 @@ class IssueDrivenConfig:
     make_integration_branch: bool = False
     one_shot_issue: int | None = None
     scenarios: tuple[str, ...] = ()
+    scope_max_reviews: int = 3
 
     @property
     def issues(self) -> tuple[int, ...]:
@@ -452,6 +453,7 @@ class IssueDrivenConfig:
             "final_branch": self.final_branch,
             "make_integration_branch": self.make_integration_branch,
             "max_reviews": self.max_reviews,
+            "scope_max_reviews": self.scope_max_reviews,
             "merge_to_integration": self.merge_to_integration,
             "final_review": self.final_review,
             "merge_final": self.merge_final,
@@ -483,6 +485,7 @@ _REQUIRED_FIELDS = {
 _OPTIONAL_FIELDS = {
     "mode",
     "make_integration_branch",
+    "scope_max_reviews",
     "implementer_agent",
     "reviewer_agent",
     "policy_issue",
@@ -815,6 +818,17 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(
             IssueDrivenFinding("$.max_reviews", "must be an integer from 1 to 100")
         )
+    scope_max_reviews = value.get("scope_max_reviews", 3)
+    if (
+        isinstance(scope_max_reviews, bool)
+        or not isinstance(scope_max_reviews, int)
+        or not 1 <= scope_max_reviews <= 100
+    ):
+        findings.append(
+            IssueDrivenFinding(
+                "$.scope_max_reviews", "must be an integer from 1 to 100"
+            )
+        )
     for key in (
         "make_integration_branch",
         "merge_to_integration",
@@ -898,6 +912,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         merge_to_integration=value["merge_to_integration"],
         final_review=value["final_review"],
         merge_final=value["merge_final"],
+        scope_max_reviews=scope_max_reviews,
         implementer_agent=value.get("implementer_agent", "codex"),
         reviewer_agent=value.get("reviewer_agent", "codex"),
         policy_issue=policy_issue,
@@ -1019,7 +1034,12 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     outline_start = source.index("WORKFLOW_OUTLINE = [\n")
     outline_end = source.index("\n]", outline_start) + len("\n]")
     source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]
-    source = source.replace("MAX_REVIEWS = 5", f"MAX_REVIEWS = {config.max_reviews}", 1)
+    source = source.replace("MAX_REVIEWS = 4", f"MAX_REVIEWS = {config.max_reviews}", 1)
+    source = source.replace(
+        "MAX_SCOPE_REVIEWS = 6",
+        f"MAX_SCOPE_REVIEWS = {config.scope_max_reviews}",
+        1,
+    )
     source = source.replace(
         'IMPLEMENTER_AGENT = "codex"',
         f"IMPLEMENTER_AGENT = {config.implementer_agent!r}",

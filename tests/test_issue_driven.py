@@ -621,6 +621,50 @@ def test_planner_policy_conflicts_use_a_bounded_json_contract() -> None:
         )
 
 
+def test_planner_recovers_invalid_policy_conflicts_in_the_same_session() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    responses = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": ["conflict without a configured policy"],
+                }
+            ),
+            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+        )
+    )
+    turns: list[tuple[str, str]] = []
+    workflow["create_agent"] = lambda *args, **kwargs: "planner-session"
+
+    def run_turn(_client, tab, _name, prompt, **_kwargs):
+        turns.append((tab, prompt))
+        return next(responses)
+
+    workflow["run_turn"] = run_turn
+    workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+
+    effective = workflow["process_work_items"](
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        None,
+        workflow["WorkItemPlan"](config),
+    )
+
+    assert effective == ()
+    assert [tab for tab, _prompt in turns] == [
+        "planner-session",
+        "planner-session",
+    ]
+    assert "reported a policy conflict without a policy Issue" in turns[1][1]
+
+
 @pytest.mark.parametrize(
     "topology_error",
     [
@@ -989,6 +1033,36 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     ]
     assert positions == sorted(positions)
     assert "MAX_REVIEWS = 5" in first
+    assert config.scope_max_reviews == 3
+    assert "MAX_SCOPE_REVIEWS = 3" in first
+
+
+@pytest.mark.parametrize("scope_max_reviews", [6, 8])
+def test_optional_scope_review_limit_round_trips_and_only_changes_scope(
+    scope_max_reviews: int,
+) -> None:
+    config = parse(payload(scope_max_reviews=scope_max_reviews))
+
+    assert config.scope_max_reviews == scope_max_reviews
+    assert config.as_json()["scope_max_reviews"] == scope_max_reviews
+    assert parse(config.as_json()) == config
+
+    code = generate_issue_driven_workflow(config)
+
+    assert f"MAX_SCOPE_REVIEWS = {scope_max_reviews}" in code
+    assert "MAX_REVIEWS = 5" in code
+
+
+@pytest.mark.parametrize("scope_max_reviews", [True, 0, 101, 1.5, "6"])
+def test_scope_review_limit_must_be_an_integer_in_range(
+    scope_max_reviews: object,
+) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(scope_max_reviews=scope_max_reviews))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.scope_max_reviews", "must be an integer from 1 to 100")
+    ]
 
 
 def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> None:
@@ -2502,9 +2576,13 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
     github = GitHub()
     findings: list[tuple[tuple[object, ...], dict[str, object]]] = []
     steps: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    terminal_events: list[tuple[str, str, str | None]] = []
     workflow["emit_finding"] = lambda *args, **kwargs: findings.append((args, kwargs))
     workflow["emit_step"] = lambda *args, **kwargs: steps.append((args, kwargs))
     workflow["emit_whole_review_result"] = lambda *args, **kwargs: None
+    workflow["terminal_progress"] = lambda event, subject, **kwargs: (
+        terminal_events.append((event, subject, kwargs.get("detail")))
+    )
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["create_agent"] = lambda *args, **kwargs: "planner"
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
@@ -2530,6 +2608,14 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
         kwargs.get("message") == "no implementation changes; no PR required"
         for _args, kwargs in steps
     )
+    assert terminal_events == [
+        ("PREPARE", "Final integration PR", "dev/v0.2.5 -> dev/v0.2.4"),
+        (
+            "DONE",
+            "Final integration PR",
+            "no implementation changes; no PR required",
+        ),
+    ]
 
 
 def test_human_handoff_prompt_and_validation_contract() -> None:

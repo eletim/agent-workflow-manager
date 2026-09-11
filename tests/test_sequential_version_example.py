@@ -97,6 +97,60 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+def test_outline_step_logs_terminal_progress_without_replacing_events(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_outline_step"].__globals__
+    events: list[tuple[str, str]] = []
+    monkeypatch.setitem(
+        globals_,
+        "emit_step",
+        lambda name, status, **kwargs: events.append((name, status)),
+    )
+
+    result = workflow["run_outline_step"]("Issue #190", lambda: "delivered")
+
+    assert result == "delivered"
+    assert events == [("Issue #190", "started"), ("Issue #190", "completed")]
+    assert capsys.readouterr().out.splitlines() == [
+        "[workflow] START Issue #190",
+        "[workflow] DONE Issue #190",
+    ]
+
+
+def test_terminal_progress_formats_iteration_and_detail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    terminal_progress = runpy.run_path(str(EXAMPLE))["terminal_progress"]
+
+    terminal_progress("START", "Issue #190 correctness review", iteration=2)
+    terminal_progress(
+        "IDENTIFIED",
+        "Final integration PR",
+        detail="PR #201 https://example.test/pull/201",
+    )
+
+    assert capsys.readouterr().out.splitlines() == [
+        "[workflow] START Issue #190 correctness review (iteration 2)",
+        "[workflow] IDENTIFIED Final integration PR: "
+        "PR #201 https://example.test/pull/201",
+    ]
+
+
+def test_canonical_workflow_logs_major_issue_driven_boundaries() -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+
+    assert 'terminal_progress("WORK ITEM", issue.label, detail=issue.branch)' in source
+    assert (
+        'terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")'
+        in source
+    )
+    assert 'terminal_progress("WARN CONTINUATION", "Whole-version review")' in source
+    assert '"PREPARE",\n        "Final integration PR"' in source
+    assert '"IDENTIFIED", "Final integration PR"' in source
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [
@@ -136,6 +190,9 @@ def test_decision_accepts_bounded_reviewer_verdict_variations(
         "Introduction\nDetails\nMore details\nAPPROVED",
         "NOT APPROVED",
         "This review is APPROVED",
+        "Looks approved",
+        "APPROVE",
+        "No changes requested",
         "UNAPPROVED",
     ],
 )
@@ -254,7 +311,57 @@ def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert source.count("def decision(result: str) -> str:") == 1
-    assert source.count("decision(result)") == 3
+    assert "decision(result)" not in source
+    assert source.count("run_validated_turn(") == 5
+
+
+def test_machine_output_recovery_corrects_in_the_same_session() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    responses = iter(("Looks approved", "## APPROVED"))
+    turns: list[tuple[str, str, str]] = []
+
+    def run_turn(_client, tab, name, prompt, **_kwargs):
+        turns.append((tab, name, prompt))
+        return next(responses)
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+
+    result, verdict = workflow["run_validated_turn"](
+        object(), "reviewer-tab", "Scope review", "Review this.", workflow["decision"]
+    )
+
+    assert result == "## APPROVED"
+    assert verdict == "APPROVED"
+    assert [turn[0] for turn in turns] == ["reviewer-tab", "reviewer-tab"]
+    assert turns[1][1] == "Scope review output correction"
+    assert "reviewer must provide APPROVED or CHANGES_REQUESTED" in turns[1][2]
+    assert "complete corrected response only" in turns[1][2]
+
+
+def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    turns: list[str] = []
+
+    def run_turn(_client, _tab, name, _prompt, **_kwargs):
+        turns.append(name)
+        return "APPROVE"
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+
+    with pytest.raises(WorkerFailure, match="after 2 correction attempts"):
+        workflow["run_validated_turn"](
+            object(),
+            "reviewer-tab",
+            "Scenario Gate",
+            "Review this.",
+            workflow["decision"],
+        )
+
+    assert turns == [
+        "Scenario Gate",
+        "Scenario Gate output correction",
+        "Scenario Gate output correction",
+    ]
 
 
 def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
@@ -293,7 +400,7 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
 def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
-    assert "MAX_SCOPE_REVIEWS = 3" in source
+    assert "MAX_SCOPE_REVIEWS = 6" in source
     assert "max_reviews=MAX_SCOPE_REVIEWS" in source
     assert "max_reviews=MAX_REVIEWS" in source
     for field in (
@@ -309,7 +416,10 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
     tree = ast.parse(EXAMPLE.read_text(encoding="utf-8"))
     prompts: dict[str, ast.expr] = {}
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
-        if not isinstance(call.func, ast.Name) or call.func.id != "run_turn":
+        if not isinstance(call.func, ast.Name) or call.func.id not in {
+            "run_turn",
+            "run_validated_turn",
+        }:
             continue
         name = call.args[2]
         if isinstance(name, ast.Constant):
@@ -2125,6 +2235,7 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
     marker = workflow["encoded_policy_conflict_marker"](warning)
     merged = replace(merged_final_pr("new-head"), body=f"Base PR.\n\n{marker}")
     findings: list[tuple[str, str, str]] = []
+    terminal_events: list[tuple[str, str, str | None]] = []
 
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
@@ -2154,6 +2265,13 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
             (category, message, status)
         ),
     )
+    monkeypatch.setitem(
+        workflow_globals,
+        "terminal_progress",
+        lambda event, subject, **kwargs: terminal_events.append(
+            (event, subject, kwargs.get("detail"))
+        ),
+    )
 
     delivered = workflow["integration_delivery"](
         config, config.issues, object(), Repository(), GitHub()
@@ -2161,6 +2279,15 @@ def test_exact_merged_final_pr_rehydrates_policy_conflict_summary(
 
     assert delivered is merged
     assert ("policy_issue", warning, "warning") in findings
+    assert terminal_events == [
+        ("PREPARE", "Final integration PR", "dev/v1 -> main"),
+        (
+            "DONE",
+            "Whole-version review",
+            "delivery already merged as PR #17",
+        ),
+        ("DONE", "Final integration PR", "already merged as PR #17"),
+    ]
 
 
 def test_exact_merged_final_pr_requires_final_branch_containment() -> None:
