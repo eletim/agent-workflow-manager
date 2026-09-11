@@ -814,6 +814,87 @@ register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
     assert attempted == ["tab-2", "tab-1"]
 
 
+def test_cleanup_failure_blocks_only_its_multi_repository_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    first = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = first.start(
+            """
+from purplemux_client import (
+    emit_issue_driven_repositories,
+    emit_issue_driven_repository,
+    register_run_resource,
+)
+
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+register_run_resource("git_worktree", "/run/api", {"repository": "/src/api"})
+register_run_resource("purplemux_workspace", "ws-api", {
+    "directories": "/run/api"
+})
+register_run_resource("purplemux_tab", "tab-api", {"workspace_id": "ws-api"})
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+register_run_resource("git_worktree", "/run/web", {"repository": "/src/web"})
+register_run_resource("purplemux_workspace", "ws-web", {
+    "directories": "/run/web"
+})
+register_run_resource("purplemux_tab", "tab-web", {"workspace_id": "ws-web"})
+emit_issue_driven_repository(2, "completed")
+register_run_resource("purplemux_tab", "tab-api-handoff", {
+    "workspace_id": "ws-api"
+})
+register_run_resource("managed_shell_result", "/result/api-handoff", {
+    "tab_id": "tab-api-handoff"
+})
+"""
+        )
+        wait_for(first, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        first.close()
+
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    attempted: list[str] = []
+
+    def cleanup(resource: RunResource) -> None:
+        attempted.append(resource.identity)
+        if resource.identity == "tab-api":
+            raise MutationOutcomeUnknown("API tab close is uncertain")
+
+    try:
+        monkeypatch.setattr(runner, "_cleanup_resource", cleanup)
+
+        after = runner.cleanup(run_id)
+
+        assert attempted == [
+            "tab-api-handoff",
+            "tab-web",
+            "tab-api",
+            "ws-web",
+            "/run/web",
+        ]
+        assert {
+            resource.identity: (resource.cleanup_state, resource.repository_index)
+            for resource in after.resources
+        } == {
+            "/run/api": ("retained", 1),
+            "ws-api": ("retained", 1),
+            "tab-api": ("blocked", 1),
+            "/run/web": ("cleaned", 2),
+            "ws-web": ("cleaned", 2),
+            "tab-web": ("cleaned", 2),
+            "tab-api-handoff": ("cleaned", 1),
+            "/result/api-handoff": ("retained", 1),
+        }
+    finally:
+        runner.close()
+
+
 def test_cleanup_retries_precondition_failure_after_remediation(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
