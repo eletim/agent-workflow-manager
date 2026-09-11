@@ -110,6 +110,27 @@ def test_emit_issue_driven_repositories_declares_ordered_contexts(
         }
 
 
+def test_accepted_issue_driven_repository_declaration_fits_event_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repositories = (
+        ("acme/api", "dev/api", "main", None),
+        ("x" * 3800, "dev/web", "main", 9),
+    )
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_repositories(repositories)
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, "rb") as stream:
+        encoded = stream.read()
+
+    assert len(encoded) <= MAX_PROGRESS_EVENT_BYTES
+    assert json.loads(encoded)["repositories"][1]["repository"] == "x" * 3800
+
+
 def test_emit_issue_driven_repository_writes_lifecycle_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -397,6 +397,25 @@ def test_repositories_form_requires_multiple_repository_declarations() -> None:
     ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
+def test_multi_repository_declaration_must_fit_progress_event() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    template = repositories[0]
+    assert isinstance(template, dict)
+    value["repositories"] = [
+        {**template, "repository": f"/tmp/project-{index}"} for index in range(100)
+    ]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories",
+        "declaration event must encode to at most 4096 UTF-8 bytes",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
 @pytest.mark.parametrize(
     ("change", "path"),
     [

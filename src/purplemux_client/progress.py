@@ -271,6 +271,12 @@ def emit_issue_driven_repositories(
     repositories: tuple[tuple[str, str, str, int | None], ...],
 ) -> None:
     """Declare the complete ordered repository set for one Issue Driven run."""
+    _write_event(_issue_driven_repositories_event(repositories))
+
+
+def _issue_driven_repositories_event(
+    repositories: tuple[tuple[str, str, str, int | None], ...],
+) -> dict[str, object]:
     if not isinstance(repositories, tuple) or len(repositories) < 2:
         raise ValueError("repositories must be a tuple containing at least two items")
     declared: list[dict[str, object]] = []
@@ -299,7 +305,17 @@ def emit_issue_driven_repositories(
         if policy_issue is not None:
             declaration["policy_issue"] = policy_issue
         declared.append(declaration)
-    _write_event({"type": "issue_driven_repositories", "repositories": declared})
+    return {"type": "issue_driven_repositories", "repositories": declared}
+
+
+def _issue_driven_repositories_event_fits(
+    repositories: tuple[tuple[str, str, str, int | None], ...],
+) -> bool:
+    event = _issue_driven_repositories_event(repositories)
+    try:
+        return len(_encode_event(event)) <= MAX_PROGRESS_EVENT_BYTES
+    except UnicodeEncodeError:
+        return False
 
 
 def emit_issue_driven_repository(

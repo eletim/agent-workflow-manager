@@ -78,7 +78,7 @@ the run-wide review and delivery fields are always required.
 | --- | --- | --- |
 | `mode` | string | Optional discriminator; when present it must be `issue-driven`. |
 | `repository` | string | Existing source repository path in the backward-compatible single-repository form. |
-| `repositories` | array | Multi-repository form: an ordered array of at least two entries containing exactly `repository`, `integration_branch`, `final_branch`, and `issues`. Do not combine it with the corresponding top-level fields, `work_items`, or `one_shot_issue`. Repository paths must be unique. |
+| `repositories` | array | Multi-repository form: an ordered array of at least two entries containing exactly `repository`, `integration_branch`, `final_branch`, and `issues`. Do not combine it with the corresponding top-level fields, `work_items`, or `one_shot_issue`. Repository paths must be unique, and their declaration event must encode to at most 4,096 UTF-8 bytes. |
 | `integration_branch` | string | Remote/integration branch used as the development base; it may be created when `make_integration_branch` is true. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `make_integration_branch` | boolean | Create/recover `integration_branch` from the exact remote `final_branch` HEAD; default `false`. |

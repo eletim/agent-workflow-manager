@@ -16,7 +16,10 @@ from purplemux_client.github import (
     PullRequestSnapshot,
     PullRequestState,
 )
-from purplemux_client.progress import emit_finding
+from purplemux_client.progress import (
+    _issue_driven_repositories_event_fits,
+    emit_finding,
+)
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1082,24 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
 
     repositories = tuple(repository for _index, repository in indexed_repositories)
     first = parsed[0][1]
+    declarations = tuple(
+        (
+            repository.repository,
+            repository.integration_branch,
+            repository.final_branch,
+            first.policy_issue,
+        )
+        for repository in repositories
+    )
+    if not _issue_driven_repositories_event_fits(declarations):
+        raise IssueDrivenValidationError(
+            [
+                IssueDrivenFinding(
+                    "$.repositories",
+                    "declaration event must encode to at most 4096 UTF-8 bytes",
+                )
+            ]
+        )
     return IssueDrivenConfig(
         repositories=repositories,
         make_integration_branch=first.make_integration_branch,
