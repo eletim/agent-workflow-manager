@@ -550,6 +550,7 @@ _MAX_WORK_ITEM_PLAN_STATE_BYTES = 32_000
 _MAX_SCENARIOS = 100
 _MAX_SCENARIO_CHARS = 4_000
 _MAX_SCENARIO_LIST_BYTES = 64_000
+_MAX_TURN_TIMEOUT = 2**53 - 1
 _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -882,10 +883,13 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
     if (
         isinstance(turn_timeout, bool)
         or not isinstance(turn_timeout, int)
-        or turn_timeout < 1
+        or not 1 <= turn_timeout <= _MAX_TURN_TIMEOUT
     ):
         findings.append(
-            IssueDrivenFinding("$.turn_timeout", "must be a positive integer")
+            IssueDrivenFinding(
+                "$.turn_timeout",
+                f"must be an integer from 1 to {_MAX_TURN_TIMEOUT}",
+            )
         )
     for key in (
         "make_integration_branch",

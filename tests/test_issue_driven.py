@@ -22,6 +22,7 @@ from purplemux_client import (
 )
 from purplemux_client.issue_driven import (
     _MAX_SCENARIO_LIST_BYTES,
+    _MAX_TURN_TIMEOUT,
     IssueDrivenValidationError,
     classify_issue_topology,
     generate_issue_driven_workflow,
@@ -1281,7 +1282,7 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "TURN_TIMEOUT = 7200" in first
 
 
-@pytest.mark.parametrize("turn_timeout", [7200, 10800])
+@pytest.mark.parametrize("turn_timeout", [7200, 10800, _MAX_TURN_TIMEOUT])
 def test_optional_turn_timeout_round_trips_and_configures_generated_workflow(
     turn_timeout: int,
 ) -> None:
@@ -1293,13 +1294,18 @@ def test_optional_turn_timeout_round_trips_and_configures_generated_workflow(
     assert f"TURN_TIMEOUT = {turn_timeout}" in generate_issue_driven_workflow(config)
 
 
-@pytest.mark.parametrize("turn_timeout", [True, 0, -1, 1.5, "7200"])
-def test_turn_timeout_must_be_a_positive_integer(turn_timeout: object) -> None:
+@pytest.mark.parametrize(
+    "turn_timeout", [True, 0, -1, 1.5, "7200", _MAX_TURN_TIMEOUT + 1, 10**309]
+)
+def test_turn_timeout_must_be_a_safe_positive_integer(turn_timeout: object) -> None:
     with pytest.raises(IssueDrivenValidationError) as caught:
         parse(payload(turn_timeout=turn_timeout))
 
     assert [(finding.path, finding.message) for finding in caught.value.findings] == [
-        ("$.turn_timeout", "must be a positive integer")
+        (
+            "$.turn_timeout",
+            f"must be an integer from 1 to {_MAX_TURN_TIMEOUT}",
+        )
     ]
 
 

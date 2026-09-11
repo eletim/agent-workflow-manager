@@ -88,7 +88,7 @@ the run-wide review and delivery fields are always required.
 | `work_items` | array | Ordered GitHub Issue numbers and/or inline mini-task objects. A mini task is exactly `{"id": "lowercase-kebab-id", "task": "authoritative instruction"}` and does not require a GitHub Issue. |
 | `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 4 unless the user requests another value. |
 | `scope_max_reviews` | integer | Optional Scope / Design Review limit from 1 through 100; default 3 when omitted, recommended value 6. It does not affect Correctness or whole-version review. |
-| `turn_timeout` | integer | Optional positive agent-turn timeout in seconds; default 7200. For longer turns, values such as 10800 are supported. |
+| `turn_timeout` | integer | Optional agent-turn timeout in seconds from 1 through 9,007,199,254,740,991; default 7200. For longer turns, values such as 10800 are supported. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
 | `scenarios` | array of strings | Optional human-authored Scenario List for Whole Review. The numbered list may contain at most 100 items and 64,000 UTF-8 bytes; each item may contain at most 4,000 characters. The Scenario Gate selects a risk-relevant subset and uses AI to judge each scenario's Before/After behavioral difference. Requires `final_review: true`. |
