@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import purplemux_client.issue_driven as issue_driven
 from purplemux_client import (
     BranchState,
     GitHubRepository,
@@ -20,6 +21,7 @@ from purplemux_client import (
     PullRequestState,
     WorkerFailure,
 )
+from purplemux_client.github import PullRequestSnapshot
 from purplemux_client.issue_driven import (
     _MAX_SCENARIO_LIST_BYTES,
     _MAX_TURN_TIMEOUT,
@@ -1451,21 +1453,92 @@ def test_generated_inline_task_recovery_rejects_pr_fingerprint_mismatch(
         module.__dict__["prepare_issue"](SimpleNamespace(), github, issue, config)
 
 
-def test_resume_uses_dispatched_inline_task_identity_after_planner_update() -> None:
+def test_resume_uses_dispatched_inline_task_identity_after_planner_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     original_task = "Refresh the New Run help."
     workflow = load_generated_workflow(
         work_items=[{"id": "refresh-run-help", "task": original_task}]
     )
-    original = workflow["planner_inline_issue"]("refresh-run-help", original_task)
-    config = workflow["Config"](
-        Path("/repo"),
-        "acme/project",
-        "dev/v1",
-        "main",
-        (original,),
-        "true",
-    )
     revised_task = "Refresh the New Run help and document Resume behavior."
+    revised = workflow["planner_inline_issue"]("refresh-run-help", revised_task)
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    child_pr = replace(
+        topology_pr(
+            head_sha=feature_sha,
+            head_branch=revised.branch,
+            body=revised.pr_body,
+        ),
+        base_branch="dev/v0.2.0",
+        base_sha=base_sha,
+    )
+
+    class TopologyInspection:
+        def inspect_pr_snapshot(self, heads: tuple[str, ...]) -> PullRequestSnapshot:
+            assert heads == (revised.branch,)
+            return PullRequestSnapshot("acme/project", (child_pr,))
+
+        def inspect_comparisons(self, pairs: list[tuple[str, str]]):
+            assert pairs == [(base_sha, feature_sha)]
+            return TopologyGitHub(contains={(base_sha, feature_sha)})
+
+    repository = SimpleNamespace(
+        expected_github_slug="acme/project",
+        inspect_remote_branches=lambda branches: {
+            branch: base_sha if branch == "dev/v0.2.0" else feature_sha
+            for branch in branches
+        },
+    )
+    github = SimpleNamespace(topology_inspection=TopologyInspection)
+    monkeypatch.setattr(
+        issue_driven,
+        "_inspect_repository_declaration",
+        lambda **kwargs: SimpleNamespace(
+            source_repository=Path("/repo"), base_sha=base_sha
+        ),
+    )
+    monkeypatch.setattr(
+        issue_driven.GitRepository, "open", lambda *args, **kwargs: repository
+    )
+    monkeypatch.setattr(
+        issue_driven.GitHubRepository, "open", lambda *args, **kwargs: github
+    )
+    workflow["prepare_run_repository"] = lambda **kwargs: SimpleNamespace(
+        execution_root=Path("/repo"), base_sha=base_sha
+    )
+
+    inspections: list[dict[str, object]] = []
+    inspect_topology = issue_driven.inspect_issue_driven_topology
+
+    def recorded_inspection(**kwargs: object):
+        inspections.append(kwargs)
+        return inspect_topology(**kwargs)
+
+    monkeypatch.setattr(
+        issue_driven, "inspect_issue_driven_topology", recorded_inspection
+    )
+    workflow["inspect_issue_driven_topology"] = recorded_inspection
+
+    config = workflow["parse_args"]()
+    original = config.issues[0]
+    assert original.task_fingerprint != revised.task_fingerprint
+    assert inspections == [
+        {
+            "repo": str(Path(__file__).parents[1]),
+            "integration_branch": config.integration_branch,
+            "issues": (
+                (
+                    "Mini task refresh-run-help",
+                    original.branch,
+                    original.task_fingerprint,
+                ),
+            ),
+            "prospective_base_branch": None,
+            "defer_inline_task_fingerprints": True,
+        }
+    ]
+
     plan = workflow["WorkItemPlan"](config)
     workflow["apply_planner_decision"](
         plan,
@@ -1488,32 +1561,25 @@ def test_resume_uses_dispatched_inline_task_identity_after_planner_update() -> N
     body = workflow["with_work_item_plan"]("Base PR", plan)
     recovered = workflow["work_item_plan_from_body"](body, config)
     recovered_issue = recovered.snapshot[0]
-    child_pr = topology_pr(
-        head_branch=recovered_issue.branch,
-        body=recovered_issue.pr_body,
-    )
-
-    class GitHub:
-        def find_pr(self, *, head: str, base: str, state: str):
-            assert (head, base) == (recovered_issue.branch, config.integration_branch)
-            return child_pr if state == "OPEN" else None
-
-    repository = SimpleNamespace(
-        require_clean=lambda: None,
-        synchronize_branch=lambda branch: BranchState(
-            branch, child_pr.head_sha, child_pr.head_sha, True
-        ),
-        inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
-            base_is_ancestor=True
-        ),
-    )
-
-    prepared = workflow["prepare_issue"](repository, GitHub(), recovered_issue, config)
 
     assert recovered_issue.task == revised_task
     assert recovered_issue.task_fingerprint == dispatched.task_fingerprint
-    assert recovered_issue.task_fingerprint != original.task_fingerprint
-    assert prepared[0] is child_pr
+    workflow["inspect_dynamic_work_item_topology"](recovered_issue, config)
+    assert inspections[-1]["issues"] == (
+        (
+            "Mini task refresh-run-help",
+            recovered_issue.branch,
+            recovered_issue.task_fingerprint,
+        ),
+    )
+    assert "defer_inline_task_fingerprints" not in inspections[-1]
+
+    child_pr = replace(
+        child_pr,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        workflow["inspect_dynamic_work_item_topology"](recovered_issue, config)
 
 
 @pytest.mark.parametrize("final_review", [False, True])
