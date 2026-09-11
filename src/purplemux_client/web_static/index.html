@@ -69,6 +69,15 @@
         </div>
 
         <div id="issue-driven-fields" hidden>
+          <div class="repository-config-heading">
+            <div>
+              <h2>Repositories</h2>
+              <p>Repositories run serially in the order shown.</p>
+            </div>
+            <button id="repository-config-add" type="button">Add repository</button>
+          </div>
+          <div id="repository-config-list" class="repository-config-list"></div>
+          <p id="repository-config-message" class="repository-config-message" hidden></p>
           <label for="issue-driven-json">Issue Driven JSON</label>
           <textarea id="issue-driven-json" spellcheck="false">{
   "mode": "issue-driven",

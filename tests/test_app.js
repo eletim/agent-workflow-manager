@@ -224,6 +224,7 @@ async function loadApp({
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
+    "repository-config-add", "repository-config-list", "repository-config-message",
     "workflow-fields", "prompt-agent", "prompt-cwd", "prompt-text",
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
@@ -967,6 +968,149 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
   assert.equal(elements["issue-driven-success"].hidden, false);
   assert.deepEqual(outlineLabels(elements), ["generated"]);
+});
+
+test("Issue Driven repository editor adds and edits repository declarations", async () => {
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    mode: "issue-driven", repository: "/work/api",
+    integration_branch: "dev/v1", final_branch: "main", issues: [10],
+    max_reviews: 4, merge_to_integration: true, final_review: true, merge_final: false,
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  assert.equal(elements["repository-config-list"].children.length, 1);
+  await elements["repository-config-add"].dispatch("click");
+  let config = JSON.parse(elements["issue-driven-json"].value);
+  assert.equal(config.repository, undefined);
+  assert.deepEqual(config.repositories, [
+    {repository: "/work/api", integration_branch: "dev/v1", final_branch: "main", issues: [10]},
+    {repository: "", integration_branch: "dev/v1", final_branch: "main", issues: []},
+  ]);
+
+  const secondCard = elements["repository-config-list"].children[1];
+  const repositoryInput = secondCard.children[1].children[0].children[1];
+  const issuesInput = secondCard.children[1].children[3].children[1];
+  repositoryInput.value = "/work/web";
+  await repositoryInput.dispatch("input");
+  issuesInput.value = "10, 11";
+  await issuesInput.dispatch("input");
+  config = JSON.parse(elements["issue-driven-json"].value);
+  assert.equal(config.repositories[1].repository, "/work/web");
+  assert.deepEqual(config.repositories[1].issues, [10, 11]);
+  assert.equal(elements["issue-driven-python"].value, "");
+});
+
+test("Add and Remove invalidate Issue Driven validation feedback", async () => {
+  let generation = 0;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/issue-driven/generate") return undefined;
+      generation += 1;
+      if (generation === 1) {
+        return response({generatedCode: "# valid", issueDrivenValidation: []});
+      }
+      return response({
+        error: "issue-driven JSON validation failed",
+        issueDrivenValidation: [{path: "$.repositories[1].repository", message: "required"}],
+      }, 400);
+    },
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    repository: "/work/api", integration_branch: "dev/v1",
+    final_branch: "main", issues: [10],
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  await elements["issue-driven-generate"].dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, false);
+  assert.equal(elements["issue-driven-python"].value, "# valid");
+
+  await elements["repository-config-add"].dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, true);
+  assert.equal(elements["issue-driven-validation"].children.length, 0);
+  assert.equal(elements["issue-driven-python"].value, "");
+
+  await elements["issue-driven-generate"].dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, true);
+  assert.equal(elements["issue-driven-validation"].children.length, 1);
+
+  const remove = elements["repository-config-list"].children[1].children[0].children[1];
+  await remove.dispatch("click");
+  assert.equal(elements["issue-driven-success"].hidden, true);
+  assert.equal(elements["issue-driven-validation"].children.length, 0);
+  assert.equal(elements["issue-driven-python"].value, "");
+});
+
+test("Issue Driven repository cards show mixed Issue and mini-task work items", async () => {
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    repository: "/work/api",
+    integration_branch: "dev/v1",
+    final_branch: "main",
+    work_items: [90, {id: "docs", task: "Refresh the documentation"}],
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  const workItems = elements["repository-config-list"].children[0]
+    .children[1].children[3].children[1];
+  assert.equal(workItems.value, "90, docs");
+  assert.equal(workItems.readOnly, true);
+});
+
+test("parseable invalid repository shapes leave raw JSON available for validation", async () => {
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  const invalidSources = [
+    JSON.stringify({repository: "/work/api", work_items: {}}),
+    JSON.stringify({repositories: [null, {repository: "/work/web", issues: [20]}]}),
+  ];
+
+  for (const source of invalidSources) {
+    elements["issue-driven-json"].value = source;
+    await elements["issue-driven-json"].dispatch("input");
+    assert.equal(elements["issue-driven-json"].value, source);
+    assert.equal(elements["repository-config-list"].children.length, 0);
+    assert.equal(elements["repository-config-message"].hidden, false);
+    assert.match(elements["repository-config-message"].textContent, /Fix the JSON/);
+  }
+});
+
+test("viewed multi-repository run shows immutable repository configuration", async () => {
+  const issueDrivenJson = JSON.stringify({
+    repositories: [
+      {repository: "/work/api", integration_branch: "dev/api", final_branch: "main", issues: [10]},
+      {repository: "/work/web", integration_branch: "dev/web", final_branch: "main", issues: [20]},
+    ],
+  });
+  const detail = snapshot({
+    runId: 1, state: "running", mode: "issue-driven", issueDrivenJson,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: detail}, validation: {status: 200, body: {validation: []}},
+  });
+
+  const cards = elements["repository-config-list"].children;
+  assert.equal(cards.length, 2);
+  assert.equal(cards[0].children[0].children[0].textContent, "Repository 1 · /work/api");
+  assert.equal(cards[1].children[0].children[0].textContent, "Repository 2 · /work/web");
+  assert.equal(cards[0].children[1].children[1].children[1].value, "dev/api");
+  assert.equal(cards[1].children[1].children[3].children[1].value, "20");
+  assert.equal(cards[0].children[1].children[0].children[1].readOnly, true);
+  assert.equal(elements["repository-config-add"].disabled, true);
 });
 
 test("Issue Driven mode opens and copies its dedicated guide", async () => {
@@ -3077,6 +3221,36 @@ test("Issue Driven inherits a selected run's authoritative source repository onl
   assert.deepEqual(inherited.issues, [90, 89]);
   assert.equal(elements["issue-driven-python"].value, "");
   assert.equal(elements.stdout.textContent, "");
+});
+
+test("Issue Driven inheritance keeps multi-repository JSON shape", async () => {
+  const sourceRepository = "/source/repository-a";
+  const detail = snapshot({
+    runId: 1,
+    state: "success",
+    executionContext: {sourceRepository},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+  });
+  await elements["new-run"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    repositories: [
+      {repository: "/old/a", integration_branch: "dev/a", final_branch: "main", issues: [1]},
+      {repository: "/old/b", integration_branch: "dev/b", final_branch: "main", issues: [2]},
+    ],
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  const inherited = JSON.parse(elements["issue-driven-json"].value);
+  assert.equal(inherited.repository, undefined);
+  assert.equal(inherited.repositories[0].repository, sourceRepository);
+  assert.equal(inherited.repositories[1].repository, "/old/b");
 });
 
 test("New run immediately clears every run-owned surface without changing history", async () => {

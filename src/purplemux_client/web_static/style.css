@@ -171,6 +171,41 @@ textarea {
 #prompt-text { min-height: 220px; }
 #issue-driven-json { min-height: 260px; }
 #issue-driven-python { min-height: 330px; margin-top: 8px; }
+.repository-config-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 4px 0 10px;
+}
+.repository-config-heading h2, .repository-config-heading p { margin: 0; }
+.repository-config-heading p, .repository-config-message {
+  color: #9ba3b5;
+  font-size: 12px;
+}
+.repository-config-list { display: grid; gap: 10px; margin-bottom: 14px; }
+.repository-config-card {
+  padding: 12px;
+  border: 1px solid #303746;
+  border-radius: 8px;
+  background: #12161e;
+}
+.repository-config-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.repository-config-title { font-size: 13px; font-weight: 650; }
+.repository-config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+.repository-config-issues { grid-column: 1 / -1; }
+.repository-config-remove { padding: 5px 9px; color: #ff9ca8; font-size: 12px; }
+.repository-config-message { margin: 0 0 12px; color: #ffb3bc; }
 .generated-heading {
   display: flex;
   align-items: center;
@@ -547,6 +582,9 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
   .editor-mode-bar #new-run { align-self: stretch; }
   .repository-navigation { align-items: flex-start; flex-direction: column; }
+  .repository-config-heading { align-items: stretch; flex-direction: column; }
+  .repository-config-grid { grid-template-columns: 1fr; }
+  .repository-config-issues { grid-column: auto; }
   button, select, input[type="text"], input[type="url"], input[type="password"] { min-height: 44px; }
   .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .controls button { width: 100%; padding-inline: 8px; }

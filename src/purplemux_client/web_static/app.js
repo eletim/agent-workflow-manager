@@ -11,6 +11,9 @@ const issueDrivenPython = document.querySelector("#issue-driven-python");
 const issueDrivenGenerate = document.querySelector("#issue-driven-generate");
 const issueDrivenSuccess = document.querySelector("#issue-driven-success");
 const issueDrivenValidation = document.querySelector("#issue-driven-validation");
+const repositoryConfigAdd = document.querySelector("#repository-config-add");
+const repositoryConfigList = document.querySelector("#repository-config-list");
+const repositoryConfigMessage = document.querySelector("#repository-config-message");
 const promptAgent = document.querySelector("#prompt-agent");
 const promptCwd = document.querySelector("#prompt-cwd");
 const promptText = document.querySelector("#prompt-text");
@@ -200,6 +203,146 @@ function runningFaviconHref() {
   return runningFaviconHrefPromise;
 }
 
+function issueDrivenRepositories(config) {
+  if (Array.isArray(config?.repositories)) return config.repositories;
+  if (config && typeof config === "object" && "repository" in config) return [config];
+  return [];
+}
+
+function invalidateIssueDrivenDraft() {
+  issueDrivenRequestGeneration += 1;
+  issueDrivenPython.value = "";
+  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+  issueDrivenSuccess.hidden = true;
+  issueDrivenValidation.replaceChildren();
+}
+
+function updateRepositoryConfig(index, key, value) {
+  let config;
+  try {
+    config = JSON.parse(issueDrivenJson.value);
+  } catch {
+    return;
+  }
+  const repositories = issueDrivenRepositories(config);
+  const repository = repositories[index];
+  if (repository == null || typeof repository !== "object") return;
+  repository[key] = value;
+  issueDrivenJson.value = JSON.stringify(config, null, 2);
+  invalidateIssueDrivenDraft();
+}
+
+function repositoryField(card, labelText, value, onInput, className = "") {
+  const field = document.createElement("div");
+  field.className = `context-field ${className}`.trim();
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value;
+  input.readOnly = activeRunId !== null;
+  input.addEventListener("input", () => onInput(input.value));
+  field.append(label, input);
+  card.append(field);
+  return input;
+}
+
+function renderRepositoryConfigs() {
+  repositoryConfigList.replaceChildren();
+  repositoryConfigMessage.hidden = true;
+  repositoryConfigMessage.textContent = "";
+  repositoryConfigAdd.disabled = activeRunId !== null;
+  let config;
+  try {
+    config = JSON.parse(issueDrivenJson.value);
+  } catch {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON to edit repository settings here.";
+    return;
+  }
+  const repositories = issueDrivenRepositories(config);
+  if (repositories.length === 0) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Add a repository declaration to the Issue Driven JSON.";
+    return;
+  }
+  const renderable = repositories.every((repository) => (
+    repository !== null
+    && typeof repository === "object"
+    && !Array.isArray(repository)
+    && (
+      !("work_items" in repository)
+      || (
+        Array.isArray(repository.work_items)
+        && repository.work_items.every((item) => (
+          typeof item === "number"
+          || (item !== null && typeof item === "object" && !Array.isArray(item))
+        ))
+      )
+    )
+  ));
+  if (!renderable) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON to edit repository settings here.";
+    return;
+  }
+  repositories.forEach((repository, index) => {
+    const card = document.createElement("section");
+    card.className = "repository-config-card";
+    const heading = document.createElement("div");
+    heading.className = "repository-config-card-heading";
+    const title = document.createElement("span");
+    title.className = "repository-config-title";
+    const repositoryName = repository.repository;
+    title.textContent = `Repository ${index + 1}${repositoryName ? ` · ${repositoryName}` : ""}`;
+    heading.append(title);
+    if (activeRunId === null && repositories.length > 1) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "repository-config-remove";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", () => {
+        repositories.splice(index, 1);
+        if (repositories.length === 1) {
+          const remaining = repositories[0];
+          delete config.repositories;
+          Object.assign(config, remaining);
+        }
+        issueDrivenJson.value = JSON.stringify(config, null, 2);
+        invalidateIssueDrivenDraft();
+        renderRepositoryConfigs();
+      });
+      heading.append(remove);
+    }
+    card.append(heading);
+    const grid = document.createElement("div");
+    grid.className = "repository-config-grid";
+    repositoryField(grid, "Repository", String(repository.repository ?? ""),
+      (value) => updateRepositoryConfig(index, "repository", value));
+    repositoryField(grid, "Integration branch", String(repository.integration_branch ?? ""),
+      (value) => updateRepositoryConfig(index, "integration_branch", value));
+    repositoryField(grid, "Final branch", String(repository.final_branch ?? ""),
+      (value) => updateRepositoryConfig(index, "final_branch", value));
+    const editableIssues = Array.isArray(repository.issues);
+    const issues = editableIssues
+      ? repository.issues.join(", ")
+      : (repository.one_shot_issue != null
+        ? String(repository.one_shot_issue)
+        : (repository.work_items || []).map((item) => (
+          typeof item === "number" ? item : item.id
+        )).join(", "));
+    const issuesInput = repositoryField(grid, editableIssues ? "Issues (comma separated)" : "Work items", issues,
+      (value) => updateRepositoryConfig(index, "issues", value.split(",").map((item) => {
+        const token = item.trim();
+        return /^\d+$/.test(token) ? Number(token) : token;
+      }).filter((item) => item !== "")), "repository-config-issues");
+    if (!editableIssues) issuesInput.readOnly = true;
+    card.append(grid);
+
+    repositoryConfigList.append(card);
+  });
+}
+
 function renderFavicon(runs) {
   faviconRunning = runs.some((run) => run.state === "running");
   if (!faviconRunning) {
@@ -226,11 +369,13 @@ function applyFieldMode() {
   promptText.readOnly = !drafting;
   issueDrivenJson.readOnly = !drafting;
   issueDrivenGenerate.disabled = !drafting;
+  repositoryConfigAdd.disabled = !drafting;
   directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
   dryRunButton.disabled = !drafting;
   applyModeVisibility();
+  renderRepositoryConfigs();
 }
 
 function applyModeVisibility() {
@@ -299,7 +444,11 @@ function inheritFolderIntoDraft(snapshot, mode) {
   try {
     const config = JSON.parse(issueDrivenDraft.json);
     if (config === null || Array.isArray(config) || typeof config !== "object") return;
-    config.repository = folder;
+    if (Array.isArray(config.repositories) && config.repositories.length > 0) {
+      config.repositories[0].repository = folder;
+    } else {
+      config.repository = folder;
+    }
     issueDrivenDraft = {
       ...issueDrivenDraft,
       json: JSON.stringify(config, null, 2),
@@ -1570,6 +1719,64 @@ issueDrivenGenerate.addEventListener("click", async () => {
       }
     }
   }, applyFieldMode);
+});
+
+issueDrivenJson.addEventListener("input", () => {
+  invalidateIssueDrivenDraft();
+  renderRepositoryConfigs();
+});
+
+repositoryConfigAdd.addEventListener("click", () => {
+  if (activeRunId !== null) return;
+  let config;
+  try {
+    config = JSON.parse(issueDrivenJson.value);
+  } catch {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON before adding a repository.";
+    return;
+  }
+  const repositories = issueDrivenRepositories(config);
+  if (repositories.length === 0) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Add a valid repository declaration before adding another.";
+    return;
+  }
+  if (!Array.isArray(config.repositories)) {
+    if (!Array.isArray(config.issues)) {
+      repositoryConfigMessage.hidden = false;
+      repositoryConfigMessage.textContent = "Multiple repositories require an Issues list for each repository.";
+      return;
+    }
+    const first = {
+      repository: config.repository,
+      integration_branch: config.integration_branch,
+      final_branch: config.final_branch,
+      issues: config.issues,
+    };
+    delete config.repository;
+    delete config.integration_branch;
+    delete config.final_branch;
+    delete config.issues;
+    delete config.work_items;
+    delete config.one_shot_issue;
+    config.repositories = [first];
+  }
+  const previous = config.repositories.at(-1);
+  if (previous == null || typeof previous !== "object" || Array.isArray(previous)) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the existing repository declarations before adding another.";
+    return;
+  }
+  config.repositories.push({
+    repository: "",
+    integration_branch: previous.integration_branch || "",
+    final_branch: previous.final_branch || "",
+    issues: [],
+  });
+  issueDrivenJson.value = JSON.stringify(config, null, 2);
+  invalidateIssueDrivenDraft();
+  renderRepositoryConfigs();
 });
 
 function resumeSettingsText(snapshot) {
