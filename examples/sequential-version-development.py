@@ -2043,6 +2043,13 @@ work, refine a pending inline mini task, or skip obsolete/redundant pending work
 Never update or skip a processed item. GitHub Issue work uses its positive number;
 inline work uses a stable lowercase kebab-case ID and a concise authoritative task.
 
+Before skipping a pending GitHub Issue as already implemented, read its current
+Issue body and directly compare every requirement with the code on the current
+integration branch. Treat earlier Issues and pull requests only as supporting
+context; the existence of a related pull request is not sufficient evidence for
+a skip. The skip reason must briefly identify evidence in the current integration
+branch, such as the files, symbols, or tests that satisfy the Issue requirements.
+
 {one_shot_context}Repository: {config.slug}
 Integration branch: {config.integration_branch}
 Processed work items: {json.dumps(processed, ensure_ascii=False)}
@@ -2056,7 +2063,7 @@ conflict exists. Actions run in order and have one of these exact shapes:
 - {{"action":"add","item":123}}
 - {{"action":"add","item":{{"id":"task-id","task":"instruction"}}}}
 - {{"action":"update","key":"task-id","task":"revised instruction"}}
-- {{"action":"skip","key":123,"reason":"already implemented by #456"}}
+- {{"action":"skip","key":123,"reason":"integration branch path/to/file.py and its tests satisfy the requirements"}}
 - {{"action":"skip","key":"task-id","reason":"concise reason"}}
 Use complete=true only when no pending or newly added work remains and the
 workflow should proceed to whole-version delivery. Otherwise use complete=false.
