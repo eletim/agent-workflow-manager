@@ -1277,6 +1277,30 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "MAX_REVIEWS = 5" in first
     assert config.scope_max_reviews == 3
     assert "MAX_SCOPE_REVIEWS = 3" in first
+    assert config.turn_timeout == 7200
+    assert "TURN_TIMEOUT = 7200" in first
+
+
+@pytest.mark.parametrize("turn_timeout", [7200, 10800])
+def test_optional_turn_timeout_round_trips_and_configures_generated_workflow(
+    turn_timeout: int,
+) -> None:
+    config = parse(payload(turn_timeout=turn_timeout))
+
+    assert config.turn_timeout == turn_timeout
+    assert config.as_json()["turn_timeout"] == turn_timeout
+    assert parse(config.as_json()) == config
+    assert f"TURN_TIMEOUT = {turn_timeout}" in generate_issue_driven_workflow(config)
+
+
+@pytest.mark.parametrize("turn_timeout", [True, 0, -1, 1.5, "7200"])
+def test_turn_timeout_must_be_a_positive_integer(turn_timeout: object) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(turn_timeout=turn_timeout))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        ("$.turn_timeout", "must be a positive integer")
+    ]
 
 
 @pytest.mark.parametrize("scope_max_reviews", [6, 8])

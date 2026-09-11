@@ -998,7 +998,7 @@ BASE_BRANCH = "dev/v0.1.0"
 FEATURE_BRANCH = "feature/issue-123"
 MAX_REVIEWS = 5
 READY_TIMEOUT = 60
-TURN_TIMEOUT = 900
+TURN_TIMEOUT = 7200
 WORKFLOW_DRY_RUN = 1
 
 repository = GitRepository.open(
