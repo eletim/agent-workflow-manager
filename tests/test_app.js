@@ -1004,6 +1004,45 @@ test("Issue Driven repository editor adds and edits repository declarations", as
   assert.equal(elements["issue-driven-python"].value, "");
 });
 
+test("Issue Driven repository cards show mixed Issue and mini-task work items", async () => {
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = JSON.stringify({
+    repository: "/work/api",
+    integration_branch: "dev/v1",
+    final_branch: "main",
+    work_items: [90, {id: "docs", task: "Refresh the documentation"}],
+  });
+  await elements["issue-driven-json"].dispatch("input");
+
+  const workItems = elements["repository-config-list"].children[0]
+    .children[1].children[3].children[1];
+  assert.equal(workItems.value, "90, docs");
+  assert.equal(workItems.readOnly, true);
+});
+
+test("parseable invalid repository shapes leave raw JSON available for validation", async () => {
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+  });
+  await elements["issue-driven-mode"].dispatch("click");
+  const invalidSources = [
+    JSON.stringify({repository: "/work/api", work_items: {}}),
+    JSON.stringify({repositories: [null, {repository: "/work/web", issues: [20]}]}),
+  ];
+
+  for (const source of invalidSources) {
+    elements["issue-driven-json"].value = source;
+    await elements["issue-driven-json"].dispatch("input");
+    assert.equal(elements["issue-driven-json"].value, source);
+    assert.equal(elements["repository-config-list"].children.length, 0);
+    assert.equal(elements["repository-config-message"].hidden, false);
+    assert.match(elements["repository-config-message"].textContent, /Fix the JSON/);
+  }
+});
+
 test("viewed multi-repository run shows immutable repository configuration", async () => {
   const issueDrivenJson = JSON.stringify({
     repositories: [

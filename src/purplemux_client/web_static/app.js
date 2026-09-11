@@ -261,8 +261,27 @@ function renderRepositoryConfigs() {
     repositoryConfigMessage.textContent = "Add a repository declaration to the Issue Driven JSON.";
     return;
   }
+  const renderable = repositories.every((repository) => (
+    repository !== null
+    && typeof repository === "object"
+    && !Array.isArray(repository)
+    && (
+      !("work_items" in repository)
+      || (
+        Array.isArray(repository.work_items)
+        && repository.work_items.every((item) => (
+          typeof item === "number"
+          || (item !== null && typeof item === "object" && !Array.isArray(item))
+        ))
+      )
+    )
+  ));
+  if (!renderable) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON to edit repository settings here.";
+    return;
+  }
   repositories.forEach((repository, index) => {
-    if (repository == null || typeof repository !== "object") return;
     const card = document.createElement("section");
     card.className = "repository-config-card";
     const heading = document.createElement("div");
@@ -305,7 +324,9 @@ function renderRepositoryConfigs() {
       ? repository.issues.join(", ")
       : (repository.one_shot_issue != null
         ? String(repository.one_shot_issue)
-        : (repository.work_items || []).map((item) => item.issue || item.id).join(", "));
+        : (repository.work_items || []).map((item) => (
+          typeof item === "number" ? item : item.id
+        )).join(", "));
     const issuesInput = repositoryField(grid, editableIssues ? "Issues (comma separated)" : "Work items", issues,
       (value) => updateRepositoryConfig(index, "issues", value.split(",").map((item) => {
         const token = item.trim();
