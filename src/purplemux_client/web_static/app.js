@@ -242,7 +242,7 @@ function repositoryField(card, labelText, value, onInput, className = "") {
   return input;
 }
 
-function renderRepositoryConfigs(summary = null) {
+function renderRepositoryConfigs() {
   repositoryConfigList.replaceChildren();
   repositoryConfigMessage.hidden = true;
   repositoryConfigMessage.textContent = "";
@@ -261,24 +261,16 @@ function renderRepositoryConfigs(summary = null) {
     repositoryConfigMessage.textContent = "Add a repository declaration to the Issue Driven JSON.";
     return;
   }
-  const summaries = summary?.repositories || (summary ? [summary] : []);
   repositories.forEach((repository, index) => {
     if (repository == null || typeof repository !== "object") return;
-    const repositorySummary = summaries[index] || null;
     const card = document.createElement("section");
     card.className = "repository-config-card";
     const heading = document.createElement("div");
     heading.className = "repository-config-card-heading";
     const title = document.createElement("span");
     title.className = "repository-config-title";
-    const repositoryName = repositorySummary?.repository || repository.repository;
+    const repositoryName = repository.repository;
     title.textContent = `Repository ${index + 1}${repositoryName ? ` · ${repositoryName}` : ""}`;
-    if (repositorySummary?.state) {
-      const state = document.createElement("span");
-      state.className = "repository-config-state";
-      state.textContent = repositorySummary.state.replaceAll("_", " ");
-      title.append(" ", state);
-    }
     heading.append(title);
     if (activeRunId === null && repositories.length > 1) {
       const remove = document.createElement("button");
@@ -322,28 +314,6 @@ function renderRepositoryConfigs(summary = null) {
     if (!editableIssues) issuesInput.readOnly = true;
     card.append(grid);
 
-    if (repositorySummary) {
-      const links = document.createElement("p");
-      links.className = "repository-config-issue-links";
-      for (const item of repositorySummary.issues || []) {
-        if (!item.pr) continue;
-        const link = document.createElement("a");
-        link.href = item.pr.url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `${item.label || `Issue #${item.issue}`} · PR #${item.pr.number}`;
-        links.append(link);
-      }
-      if (repositorySummary.basePr) {
-        const link = document.createElement("a");
-        link.href = repositorySummary.basePr.url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `Base PR #${repositorySummary.basePr.number}`;
-        links.append(link);
-      }
-      if (links.children.length > 0) card.append(links);
-    }
     repositoryConfigList.append(card);
   });
 }
@@ -380,9 +350,7 @@ function applyFieldMode() {
   validateButton.disabled = !drafting;
   dryRunButton.disabled = !drafting;
   applyModeVisibility();
-  renderRepositoryConfigs(
-    activeRunId === null ? null : activeRunSnapshot?.issueDrivenSummary || null,
-  );
+  renderRepositoryConfigs();
 }
 
 function applyModeVisibility() {

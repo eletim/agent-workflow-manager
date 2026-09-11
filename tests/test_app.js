@@ -1004,29 +1004,15 @@ test("Issue Driven repository editor adds and edits repository declarations", as
   assert.equal(elements["issue-driven-python"].value, "");
 });
 
-test("viewed multi-repository run shows repository states and PR destinations", async () => {
+test("viewed multi-repository run shows immutable repository configuration", async () => {
   const issueDrivenJson = JSON.stringify({
     repositories: [
       {repository: "/work/api", integration_branch: "dev/api", final_branch: "main", issues: [10]},
       {repository: "/work/web", integration_branch: "dev/web", final_branch: "main", issues: [20]},
     ],
   });
-  const issueDrivenSummary = {
-    terminalResult: "running", warningCount: 0,
-    repositories: [
-      {
-        repository: "acme/api", state: "success", integrationBranch: "dev/api", finalBranch: "main",
-        issues: [{issue: 10, label: "Issue #10", pr: {number: 30, url: "https://github.com/acme/api/pull/30"}}],
-        basePr: {number: 31, url: "https://github.com/acme/api/pull/31"},
-      },
-      {
-        repository: "acme/web", state: "running", integrationBranch: "dev/web", finalBranch: "main",
-        issues: [{issue: 20}], basePr: null,
-      },
-    ],
-  };
   const detail = snapshot({
-    runId: 1, state: "running", mode: "issue-driven", issueDrivenJson, issueDrivenSummary,
+    runId: 1, state: "running", mode: "issue-driven", issueDrivenJson,
   });
   const {elements} = await loadApp({
     runs: [{runId: 1, state: "running", mode: "issue-driven"}],
@@ -1035,10 +1021,11 @@ test("viewed multi-repository run shows repository states and PR destinations", 
 
   const cards = elements["repository-config-list"].children;
   assert.equal(cards.length, 2);
-  assert.equal(cards[0].children[0].children[0].children[1].textContent, "success");
-  assert.equal(cards[1].children[0].children[0].children[1].textContent, "running");
-  assert.equal(cards[0].children[2].children[0].href, "https://github.com/acme/api/pull/30");
-  assert.equal(cards[0].children[2].children[1].href, "https://github.com/acme/api/pull/31");
+  assert.equal(cards[0].children[0].children[0].textContent, "Repository 1 · /work/api");
+  assert.equal(cards[1].children[0].children[0].textContent, "Repository 2 · /work/web");
+  assert.equal(cards[0].children[1].children[1].children[1].value, "dev/api");
+  assert.equal(cards[1].children[1].children[3].children[1].value, "20");
+  assert.equal(cards[0].children[1].children[0].children[1].readOnly, true);
   assert.equal(elements["repository-config-add"].disabled, true);
 });
 

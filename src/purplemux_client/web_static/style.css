@@ -198,20 +198,12 @@ textarea {
   margin-bottom: 10px;
 }
 .repository-config-title { font-size: 13px; font-weight: 650; }
-.repository-config-state {
-  margin-left: 8px;
-  color: #aab0bf;
-  font: 11px ui-monospace, monospace;
-  text-transform: uppercase;
-}
 .repository-config-grid {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
 }
 .repository-config-issues { grid-column: 1 / -1; }
-.repository-config-issue-links { margin: 9px 0 0; color: #aab0bf; font-size: 12px; }
-.repository-config-issue-links a { margin-right: 10px; }
 .repository-config-remove { padding: 5px 9px; color: #ff9ca8; font-size: 12px; }
 .repository-config-message { margin: 0 0 12px; color: #ffb3bc; }
 .generated-heading {
