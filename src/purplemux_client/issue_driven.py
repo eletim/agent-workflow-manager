@@ -241,6 +241,7 @@ def inspect_issue_driven_topology(
     prospective_base_branch: str | None = None,
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
+    defer_inline_task_fingerprints: bool = False,
     _cwd: Path | None = None,
 ) -> tuple[IssueTopologyState, ...]:
     """Inspect all Issue branches and PRs before any workflow mutation."""
@@ -336,7 +337,11 @@ def inspect_issue_driven_topology(
             branch=branch,
             integration_branch=integration_branch,
             integration_sha=integration_sha,
-            inline_task_fingerprint=fingerprint,
+            inline_task_fingerprint=(
+                None
+                if defer_inline_task_fingerprints and isinstance(number, str)
+                else fingerprint
+            ),
         )
         for number, branch, fingerprint in normalized
     )
@@ -459,6 +464,7 @@ class IssueDrivenConfig:
     one_shot_issue: int | None = None
     scenarios: tuple[str, ...] = ()
     scope_max_reviews: int = 3
+    turn_timeout: int = 7200
 
     @property
     def repository(self) -> str:
@@ -487,6 +493,7 @@ class IssueDrivenConfig:
             "make_integration_branch": self.make_integration_branch,
             "max_reviews": self.max_reviews,
             "scope_max_reviews": self.scope_max_reviews,
+            "turn_timeout": self.turn_timeout,
             "merge_to_integration": self.merge_to_integration,
             "final_review": self.final_review,
             "merge_final": self.merge_final,
@@ -531,6 +538,7 @@ _OPTIONAL_FIELDS = {
     "mode",
     "make_integration_branch",
     "scope_max_reviews",
+    "turn_timeout",
     "implementer_agent",
     "reviewer_agent",
     "policy_issue",
@@ -547,6 +555,7 @@ _MAX_WORK_ITEM_PLAN_STATE_BYTES = 32_000
 _MAX_SCENARIOS = 100
 _MAX_SCENARIO_CHARS = 4_000
 _MAX_SCENARIO_LIST_BYTES = 64_000
+_MAX_TURN_TIMEOUT = 2**53 - 1
 _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -875,6 +884,18 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
                 "$.scope_max_reviews", "must be an integer from 1 to 100"
             )
         )
+    turn_timeout = value.get("turn_timeout", 7200)
+    if (
+        isinstance(turn_timeout, bool)
+        or not isinstance(turn_timeout, int)
+        or not 1 <= turn_timeout <= _MAX_TURN_TIMEOUT
+    ):
+        findings.append(
+            IssueDrivenFinding(
+                "$.turn_timeout",
+                f"must be an integer from 1 to {_MAX_TURN_TIMEOUT}",
+            )
+        )
     for key in (
         "make_integration_branch",
         "merge_to_integration",
@@ -968,6 +989,7 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
         policy_issue=policy_issue,
         one_shot_issue=one_shot_issue,
         scenarios=tuple(scenarios),
+        turn_timeout=turn_timeout,
     )
 
 
@@ -1112,6 +1134,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         reviewer_agent=first.reviewer_agent,
         policy_issue=first.policy_issue,
         scenarios=first.scenarios,
+        turn_timeout=first.turn_timeout,
     )
 
 
@@ -1183,6 +1206,7 @@ def _fixed_config_function(
         {topology_issues},
         ),
         prospective_base_branch={prospective!r},
+        defer_inline_task_fingerprints=True,
     )
 """
     return f"""def {function_name}() -> Config:
@@ -1307,6 +1331,9 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
         "MAX_SCOPE_REVIEWS = 6",
         f"MAX_SCOPE_REVIEWS = {config.scope_max_reviews}",
         1,
+    )
+    source = source.replace(
+        "TURN_TIMEOUT = 7200", f"TURN_TIMEOUT = {config.turn_timeout}", 1
     )
     source = source.replace(
         'IMPLEMENTER_AGENT = "codex"',

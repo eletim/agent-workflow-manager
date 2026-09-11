@@ -123,6 +123,7 @@ dispatch is persisted.
   "issues": [90, 89],
   "max_reviews": 4,
   "scope_max_reviews": 6,
+  "turn_timeout": 7200,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
   "scenarios": [
@@ -154,10 +155,14 @@ original Issue as its work definition:
 ```
 
 The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`,
-`scope_max_reviews`, the two agent fields, and `scenarios` are optional; every
+`scope_max_reviews`, `turn_timeout`, the two agent fields, and `scenarios` are optional; every
 other field is required. When omitted, `scope_max_reviews` retains the existing
 limit of 3 and controls only Scope / Design Review; the recommended samples set
 it to 6. `max_reviews` controls Correctness and whole-version review.
+`turn_timeout` is the agent-turn timeout in seconds from 1 through
+9,007,199,254,740,991 and defaults to 7200 when omitted; longer runs can set it
+to values such as 10800. A timeout continues to fail the active workflow step
+through the existing failure path.
 With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal
