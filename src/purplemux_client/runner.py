@@ -194,6 +194,14 @@ class IssueNavigation:
 
 
 @dataclass(frozen=True)
+class PlannerSkip:
+    issue: int | str
+    reason: str
+    label: str | None = None
+    observed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class WholeReviewResult:
     outcome: Literal["approved", "continued_with_warning", "skipped"]
     reviews: int
@@ -385,6 +393,7 @@ class RunnerSnapshot:
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: tuple[IssueResult, ...] = ()
     issue_navigations: tuple[IssueNavigation, ...] = ()
+    planner_skips: tuple[PlannerSkip, ...] = ()
     whole_review_result: WholeReviewResult | None = None
     identity: str | None = None
     issue_driven_json: str | None = None
@@ -417,8 +426,22 @@ class RunnerSnapshot:
         payload.pop("issue_driven_context")
         payload.pop("issue_results")
         payload.pop("issue_navigations")
+        payload.pop("planner_skips")
         payload.pop("whole_review_result")
         payload["issueDrivenSummary"] = self._issue_driven_summary_json()
+        payload["plannerSkips"] = [
+            {
+                "issue": skip.issue,
+                "reason": skip.reason,
+                **({"label": skip.label} if skip.label is not None else {}),
+                **(
+                    {"observedAt": skip.observed_at}
+                    if skip.observed_at is not None
+                    else {}
+                ),
+            }
+            for skip in self.planner_skips
+        ]
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -466,7 +489,7 @@ class RunnerSnapshot:
         if context is None or self.state in ("idle", "validation_failed"):
             return None
         if self.state == "running" and not (
-            self.issue_results or self.issue_navigations
+            self.issue_results or self.issue_navigations or self.planner_skips
         ):
             return None
         issues = []
@@ -512,6 +535,16 @@ class RunnerSnapshot:
             }
             if navigation.label is not None:
                 item["label"] = navigation.label
+            issues.append(item)
+        for skip in self.planner_skips:
+            item = {
+                "issue": skip.issue,
+                "outcome": "skipped",
+                "reason": skip.reason,
+                "warnings": [],
+            }
+            if skip.label is not None:
+                item["label"] = skip.label
             issues.append(item)
         whole_review = self.whole_review_result
         return {
@@ -630,6 +663,7 @@ class _RunRecord:
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
     issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
+    planner_skips: dict[int | str, PlannerSkip] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
@@ -822,6 +856,7 @@ class PythonRunner:
             "issueNavigations": [
                 asdict(navigation) for navigation in run.issue_navigations.values()
             ],
+            "plannerSkips": [asdict(skip) for skip in run.planner_skips.values()],
             "wholeReviewResult": (
                 asdict(run.whole_review_result)
                 if run.whole_review_result is not None
@@ -1046,6 +1081,13 @@ class PythonRunner:
                 )
             navigation = self._history_dataclass(IssueNavigation, navigation_value)
             issue_navigations[navigation.issue] = navigation
+        planner_skip_values = value.get("plannerSkips", [])
+        if not isinstance(planner_skip_values, list):
+            raise ValueError
+        planner_skips: dict[int | str, PlannerSkip] = {}
+        for item in planner_skip_values:
+            skip = self._history_dataclass(PlannerSkip, item)
+            planner_skips[skip.issue] = skip
         whole_review_value = value.get("wholeReviewResult")
         whole_review_result = (
             None
@@ -1093,6 +1135,7 @@ class PythonRunner:
             issue_driven_context=issue_driven_context,
             issue_results=issue_results,
             issue_navigations=issue_navigations,
+            planner_skips=planner_skips,
             whole_review_result=whole_review_result,
             checked=checked,
             issue_driven_json=issue_driven_json,
@@ -1903,6 +1946,7 @@ class PythonRunner:
             issue_driven_context=run.issue_driven_context,
             issue_results=tuple(run.issue_results.values()),
             issue_navigations=tuple(run.issue_navigations.values()),
+            planner_skips=tuple(run.planner_skips.values()),
             whole_review_result=run.whole_review_result,
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
@@ -2686,6 +2730,10 @@ class PythonRunner:
         elif event_type == "issue_navigation":
             issue_navigation = cast(IssueNavigation, event)
             run.issue_navigations[issue_navigation.issue] = issue_navigation
+        elif event_type == "planner_skip":
+            planner_skip = cast(PlannerSkip, event)
+            accepted = replace(planner_skip, observed_at=self._accepted_at())
+            run.planner_skips[accepted.issue] = accepted
         elif event_type == "whole_review_result":
             run.whole_review_result = cast(WholeReviewResult, event)
         else:
@@ -2709,6 +2757,7 @@ class PythonRunner:
                 "run_pr",
                 "issue_driven_context",
                 "issue_navigation",
+                "planner_skip",
                 "issue_result",
                 "whole_review_result",
             ],
@@ -2859,6 +2908,32 @@ class PythonRunner:
                 PurpleMuxNavigation(workspace_id, cast(str, tab_ids[2])),
                 cast(str | None, label),
             )
+        if event_type == "planner_skip":
+            issue = value.get("issue")
+            reason = value.get("reason")
+            label = value.get("label")
+            if (
+                isinstance(issue, bool)
+                or not isinstance(issue, (int, str))
+                or (isinstance(issue, int) and issue < 1)
+                or (isinstance(issue, str) and (not issue.strip() or len(issue) > 100))
+                or not isinstance(reason, str)
+                or not reason
+                or reason != reason.strip()
+                or "\0" in reason
+                or len(reason) > 500
+                or any(0xD800 <= ord(character) <= 0xDFFF for character in reason)
+                or (
+                    label is not None
+                    and (
+                        not isinstance(label, str)
+                        or not label.strip()
+                        or len(label) > 100
+                    )
+                )
+            ):
+                return None
+            return "planner_skip", PlannerSkip(issue, reason, cast(str | None, label))
         if event_type in ("issue_result", "whole_review_result"):
             outcome = value.get("outcome")
             reviews = value.get("reviews")

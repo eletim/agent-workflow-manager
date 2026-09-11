@@ -400,6 +400,7 @@ function renderRun(result) {
     result.progress || [],
     result.warningTimeline || [],
     result.warningTimelineOmitted || 0,
+    result.plannerSkips || [],
   );
   renderIntegrationPr(result.integrationPr || null);
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
@@ -499,7 +500,7 @@ function renderIssueDrivenSummary(summary) {
     const line = document.createElement("div");
     const label = result.label || `#${result.issue}`;
     line.append(document.createTextNode(`${label}  `));
-    appendPrLink(line, result.pr);
+    if (result.pr) appendPrLink(line, result.pr);
     const terminals = result.terminals || {};
     if (terminals.implementation) {
       appendPurpleMuxLink(line, "Implementation", terminals.implementation);
@@ -514,9 +515,18 @@ function renderIssueDrivenSummary(summary) {
       line.append(document.createTextNode(`  Review ${result.reviews}`));
     }
     if (outcome !== "approved") {
-      line.append(document.createTextNode(`  ${outcome.replaceAll("_", " ")}`));
+      const outcomeLabel = outcome === "skipped"
+        ? "SKIPPED"
+        : outcome.replaceAll("_", " ");
+      line.append(document.createTextNode(`  ${outcomeLabel}`));
     }
     details.append(line);
+    if (result.reason) {
+      const note = document.createElement("div");
+      note.className = "issue-summary-skip-reason";
+      note.textContent = result.reason;
+      details.append(note);
+    }
     for (const warning of result.warnings || []) {
       const note = document.createElement("div");
       note.className = "issue-summary-warning";
@@ -911,7 +921,7 @@ function renderOutline(labels, events) {
   }
 }
 
-function renderProgress(events, findings = [], warningsOmitted = 0) {
+function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips = []) {
   const latest = new Map();
   for (const event of events) {
     const key = JSON.stringify([event.name, event.iteration, event.attempt]);
@@ -928,10 +938,11 @@ function renderProgress(events, findings = [], warningsOmitted = 0) {
     ...findings
       .filter((finding) => finding.status === "warning")
       .map((finding) => ({kind: "warning", finding})),
+    ...plannerSkips.map((skip) => ({kind: "planner-skip", skip})),
   ];
   timeline.sort((left, right) => {
-    const leftObservedAt = left.event?.observedAt ?? left.finding?.observedAt;
-    const rightObservedAt = right.event?.observedAt ?? right.finding?.observedAt;
+    const leftObservedAt = left.event?.observedAt ?? left.finding?.observedAt ?? left.skip?.observedAt;
+    const rightObservedAt = right.event?.observedAt ?? right.finding?.observedAt ?? right.skip?.observedAt;
     if (typeof leftObservedAt !== "string" && typeof rightObservedAt !== "string") return 0;
     if (typeof leftObservedAt !== "string") return 1;
     if (typeof rightObservedAt !== "string") return -1;
@@ -991,6 +1002,33 @@ function renderProgress(events, findings = [], warningsOmitted = 0) {
       const note = document.createElement("div");
       note.className = "progress-note";
       note.textContent = entry.finding.message;
+      details.append(label, timestamp, note);
+      item.append(marker, details);
+      progress.append(item);
+      continue;
+    }
+
+    if (entry.kind === "planner-skip") {
+      const item = document.createElement("li");
+      item.className = "progress-item skipped";
+      const marker = document.createElement("span");
+      marker.className = "progress-marker";
+      marker.textContent = "–";
+      const details = document.createElement("div");
+      details.className = "progress-details";
+      const label = document.createElement("div");
+      label.className = "progress-label";
+      label.textContent = `SKIPPED · ${entry.skip.label || `#${entry.skip.issue}`}`;
+      const timestamp = document.createElement("time");
+      timestamp.className = "progress-time";
+      timestamp.textContent = runnerLogDisplay.formatObservedAt(entry.skip.observedAt);
+      if (typeof entry.skip.observedAt === "string") {
+        timestamp.setAttribute("datetime", entry.skip.observedAt);
+        timestamp.setAttribute("title", entry.skip.observedAt);
+      }
+      const note = document.createElement("div");
+      note.className = "progress-note";
+      note.textContent = entry.skip.reason;
       details.append(label, timestamp, note);
       item.append(marker, details);
       progress.append(item);

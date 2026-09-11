@@ -325,7 +325,10 @@ a { color: #bcaaff; }
 .issue-summary-marker { color: #9ba3b5; text-align: center; }
 .issue-summary-item.approved .issue-summary-marker { color: #75e2a8; }
 .issue-summary-item.continued_with_warning .issue-summary-marker { color: #ffd66b; }
+.issue-summary-item.skipped .issue-summary-marker,
+.progress-item.skipped .progress-marker { color: #9ba3b5; }
 .issue-summary-warning { margin-top: 3px; color: #ffd66b; font-size: 12px; overflow-wrap: anywhere; }
+.issue-summary-skip-reason { margin-top: 3px; color: #aab0bf; font-size: 12px; overflow-wrap: anywhere; }
 .issue-summary-terminal-link { white-space: nowrap; }
 .progress-panel h2 { margin: 0 0 10px; }
 .empty-progress { margin: 0; color: #737d91; font-size: 13px; }

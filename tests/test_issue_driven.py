@@ -585,6 +585,35 @@ def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
             ),
         )
 
+
+def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(workflow["planner_inline_issue"]("obsolete-docs", "Update old docs."))
+
+    decision = workflow["apply_planner_decision"](
+        plan,
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "action": "skip",
+                        "key": "obsolete-docs",
+                        "reason": "The current documentation already covers it.",
+                    }
+                ],
+                "complete": True,
+                "policy_conflicts": [],
+            }
+        ),
+    )
+
+    assert decision.skipped[0].issue.result_id == "mini-task:obsolete-docs"
+    assert decision.skipped[0].reason == "The current documentation already covers it."
+
     assert plan.snapshot == ()
     assert plan.position == 0
 
@@ -1403,7 +1432,11 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
                             "key": "release-notes",
                             "task": updated_task,
                         },
-                        {"action": "skip", "key": 90},
+                        {
+                            "action": "skip",
+                            "key": 90,
+                            "reason": "Already delivered by the release-notes task.",
+                        },
                         {"action": "add", "item": 91},
                     ],
                     "complete": False,
@@ -1428,6 +1461,10 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
     )
     workflow["inspect_dynamic_work_item_topology"] = lambda *_args: None
     workflow["run_outline_step"] = lambda _name, action: action()
+    planner_skips: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    workflow["emit_planner_skip"] = lambda *args, **kwargs: planner_skips.append(
+        (args, kwargs)
+    )
     persisted: list[str] = []
 
     def persist(plan, _config, _repo, _github, pr):
@@ -1451,6 +1488,12 @@ def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None
     assert [issue.key for issue in effective] == ["release-notes", 91, 92]
     assert [issue.key for issue in config.issues] == ["release-notes", 90]
     assert len(persisted) == 7
+    assert planner_skips == [
+        (
+            (90, "Already delivered by the release-notes task."),
+            {"label": "Issue #90"},
+        )
+    ]
 
     plan = workflow["WorkItemPlan"](config)
     assert plan.take_next() is original
@@ -1485,7 +1528,7 @@ def test_planner_rejects_oversized_plan_transactionally() -> None:
         "true",
     )
     plan = workflow["WorkItemPlan"](config)
-    actions = [{"action": "skip", "key": 90}]
+    actions = [{"action": "skip", "key": 90, "reason": "Superseded by mini tasks."}]
     actions.extend(
         {
             "action": "add",
