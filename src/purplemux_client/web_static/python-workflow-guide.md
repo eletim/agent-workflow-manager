@@ -96,11 +96,16 @@ Generated Issue Driven workflows also call `inspect_issue_driven_topology` with
 literal repository, integration branch, and work-item branch declarations. Static
 Validation evaluates that read-only declaration, and Dry Run repeats it to emit
 recoverable or already-integrated findings before the worktree mutation frontier.
+Because the Planner may refine a pending inline task, this initial seed inspection
+defers its fingerprint comparison while retaining the other branch and PR topology
+checks. The workflow compares the child PR with the exact plan-owned inline task
+identity immediately before dispatch and again when replaying a dispatched item
+on Resume.
 When a generated workflow accepts a work item at runtime, it calls
 `inspect_issue_driven_work_item_topology` with that single dynamic declaration
 before persisting its dispatch. This applies the same authoritative remote branch,
 OPEN/MERGED/CLOSED PR, SHA-containment, and inline-fingerprint checks that the
-static batch uses.
+static batch uses outside that deliberate seed-fingerprint deferral.
 
 The helper resolves the source repository and exact current remote base SHA,
 creates and verifies a fresh detached run worktree under the AWM-owned data

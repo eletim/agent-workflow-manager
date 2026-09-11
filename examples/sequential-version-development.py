@@ -2531,8 +2531,8 @@ def persist_work_item_plan(
 
 
 def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
-    """Validate a non-seed item authoritatively before recording its dispatch."""
-    if issue in config.issues:
+    """Validate the plan-owned identity before recording its dispatch."""
+    if issue.number is not None and issue in config.issues:
         return
     declaration: tuple[int | str, str] | tuple[int | str, str, str]
     if issue.number is not None:

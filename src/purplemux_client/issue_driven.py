@@ -241,6 +241,7 @@ def inspect_issue_driven_topology(
     prospective_base_branch: str | None = None,
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
+    defer_inline_task_fingerprints: bool = False,
     _cwd: Path | None = None,
 ) -> tuple[IssueTopologyState, ...]:
     """Inspect all Issue branches and PRs before any workflow mutation."""
@@ -336,7 +337,11 @@ def inspect_issue_driven_topology(
             branch=branch,
             integration_branch=integration_branch,
             integration_sha=integration_sha,
-            inline_task_fingerprint=fingerprint,
+            inline_task_fingerprint=(
+                None
+                if defer_inline_task_fingerprints and isinstance(number, str)
+                else fingerprint
+            ),
         )
         for number, branch, fingerprint in normalized
     )
@@ -1201,6 +1206,7 @@ def _fixed_config_function(
         {topology_issues},
         ),
         prospective_base_branch={prospective!r},
+        defer_inline_task_fingerprints=True,
     )
 """
     return f"""def {function_name}() -> Config:
