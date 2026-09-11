@@ -1371,7 +1371,12 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     assert code.index("Issue(90, 'feature/issue-90')") < code.index(
         f"Issue(None, '{item.branch}'"
     )
-    assert "'Mini task refresh-run-help'" in code
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+    assert "'Mini task refresh-run-help'" in parse_args
+    assert "(90, 'feature/issue-90')" in parse_args
+    assert "defer_inline_task_fingerprints=True" in parse_args
     assert item.task_fingerprint in code
     assert "Refresh the New Run help." in implementation
     assert "Refresh the New Run help." in scope_review
@@ -1444,6 +1449,71 @@ def test_generated_inline_task_recovery_rejects_pr_fingerprint_mismatch(
 
     with pytest.raises(WorkerFailure, match="inline task fingerprint"):
         module.__dict__["prepare_issue"](SimpleNamespace(), github, issue, config)
+
+
+def test_resume_uses_dispatched_inline_task_identity_after_planner_update() -> None:
+    original_task = "Refresh the New Run help."
+    workflow = load_generated_workflow(
+        work_items=[{"id": "refresh-run-help", "task": original_task}]
+    )
+    original = workflow["planner_inline_issue"]("refresh-run-help", original_task)
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (original,),
+        "true",
+    )
+    revised_task = "Refresh the New Run help and document Resume behavior."
+    plan = workflow["WorkItemPlan"](config)
+    workflow["apply_planner_decision"](
+        plan,
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "action": "update",
+                        "key": "refresh-run-help",
+                        "task": revised_task,
+                    }
+                ],
+                "complete": False,
+                "policy_conflicts": [],
+            }
+        ),
+    )
+    dispatched = plan.take_next()
+    assert dispatched is not None
+    body = workflow["with_work_item_plan"]("Base PR", plan)
+    recovered = workflow["work_item_plan_from_body"](body, config)
+    recovered_issue = recovered.snapshot[0]
+    child_pr = topology_pr(
+        head_branch=recovered_issue.branch,
+        body=recovered_issue.pr_body,
+    )
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base) == (recovered_issue.branch, config.integration_branch)
+            return child_pr if state == "OPEN" else None
+
+    repository = SimpleNamespace(
+        require_clean=lambda: None,
+        synchronize_branch=lambda branch: BranchState(
+            branch, child_pr.head_sha, child_pr.head_sha, True
+        ),
+        inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
+            base_is_ancestor=True
+        ),
+    )
+
+    prepared = workflow["prepare_issue"](repository, GitHub(), recovered_issue, config)
+
+    assert recovered_issue.task == revised_task
+    assert recovered_issue.task_fingerprint == dispatched.task_fingerprint
+    assert recovered_issue.task_fingerprint != original.task_fingerprint
+    assert prepared[0] is child_pr
 
 
 @pytest.mark.parametrize("final_review", [False, True])
@@ -1624,7 +1694,7 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
 
 def load_generated_workflow(**overrides: object) -> dict[str, object]:
     value = payload(**overrides)
-    if "one_shot_issue" in overrides:
+    if "one_shot_issue" in overrides or "work_items" in overrides:
         value.pop("issues")
     code = generate_issue_driven_workflow(parse(value))
     module_name = f"generated_handoff_workflow_{len(sys.modules)}"
