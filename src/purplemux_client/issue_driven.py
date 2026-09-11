@@ -1194,6 +1194,8 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
             _fixed_config_function(config)
             + "def parse_repository_configs():\n"
             + "    yield parse_args()\n\n\n"
+            + "def issue_driven_repository_declarations():\n"
+            + "    return ()\n\n\n"
         )
     declarations: list[str] = []
     functions: list[str] = []
@@ -1208,6 +1210,7 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
             f'        "repository": {repository.repository!r},\n'
             f'        "integration_branch": {repository.integration_branch!r},\n'
             f'        "final_branch": {repository.final_branch!r},\n'
+            f'        "policy_issue": {config.policy_issue!r},\n'
             f'        "issues": {issue_tuple},\n'
             "    },"
         )
@@ -1232,6 +1235,16 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
         "def parse_repository_configs():\n"
         "    yield parse_args()\n"
         f"{remaining_yields}\n\n"
+        "def issue_driven_repository_declarations():\n"
+        "    return tuple(\n"
+        "        (\n"
+        "            item['repository'],\n"
+        "            item['integration_branch'],\n"
+        "            item['final_branch'],\n"
+        "            item['policy_issue'],\n"
+        "        )\n"
+        "        for item in ISSUE_DRIVEN_REPOSITORIES\n"
+        "    )\n\n\n"
     )
 
 

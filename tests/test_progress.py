@@ -8,6 +8,7 @@ import pytest
 from purplemux_client import (
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_driven_repositories,
     emit_issue_navigation,
     emit_issue_result,
     emit_planner_skip,
@@ -71,6 +72,40 @@ def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) ->
             "type": "run_pr",
             "pr_number": 17,
             "pr_url": "https://github.com/example/repo/pull/17",
+        }
+
+
+def test_emit_issue_driven_repositories_declares_ordered_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_repositories(
+            (
+                ("acme/api", "dev/api", "main", None),
+                ("acme/web", "dev/web", "main", 9),
+            )
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "issue_driven_repositories",
+            "repositories": [
+                {
+                    "repository": "acme/api",
+                    "integration_branch": "dev/api",
+                    "final_branch": "main",
+                },
+                {
+                    "repository": "acme/web",
+                    "integration_branch": "dev/web",
+                    "final_branch": "main",
+                    "policy_issue": 9,
+                },
+            ],
         }
 
 

@@ -217,9 +217,20 @@ class IssueDrivenContext:
     policy_issue: int | None = None
 
 
+IssueDrivenRepositoryState = Literal[
+    "pending", "running", "success", "failed", "stopped"
+]
+
+
+@dataclass(frozen=True)
+class IssueDrivenRepositoryDeclaration:
+    repositories: tuple[IssueDrivenContext, ...]
+
+
 @dataclass(frozen=True)
 class IssueDrivenRepositorySummary:
     context: IssueDrivenContext
+    state: IssueDrivenRepositoryState = "pending"
     integration_pr: PullRequestNavigation | None = None
     issue_results: tuple[IssueResult, ...] = ()
     issue_navigations: tuple[IssueNavigation, ...] = ()
@@ -230,6 +241,7 @@ class IssueDrivenRepositorySummary:
 @dataclass
 class _IssueDrivenRepositoryRecord:
     context: IssueDrivenContext
+    state: IssueDrivenRepositoryState = "pending"
     integration_pr: PullRequestNavigation | None = None
     issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
     issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
@@ -239,6 +251,7 @@ class _IssueDrivenRepositoryRecord:
     def snapshot(self) -> IssueDrivenRepositorySummary:
         return IssueDrivenRepositorySummary(
             self.context,
+            self.state,
             self.integration_pr,
             tuple(self.issue_results.values()),
             tuple(self.issue_navigations.values()),
@@ -544,6 +557,7 @@ class RunnerSnapshot:
             repositories = (
                 IssueDrivenRepositorySummary(
                     self.issue_driven_context,
+                    cast(IssueDrivenRepositoryState, self.state),
                     self.integration_pr,
                     self.issue_results,
                     self.issue_navigations,
@@ -553,17 +567,24 @@ class RunnerSnapshot:
             )
         if not repositories or self.state in ("idle", "validation_failed"):
             return None
-        if self.state == "running" and not (
-            any(
-                repository.issue_results
-                or repository.issue_navigations
-                or repository.planner_skips
-                for repository in repositories
+        if (
+            len(repositories) == 1
+            and self.state == "running"
+            and not (
+                any(
+                    repository.issue_results
+                    or repository.issue_navigations
+                    or repository.planner_skips
+                    for repository in repositories
+                )
             )
         ):
             return None
         repository_summaries = [
-            self._repository_summary_json(repository) for repository in repositories
+            self._repository_summary_json(
+                repository, include_state=len(repositories) > 1
+            )
+            for repository in repositories
         ]
         if len(repository_summaries) > 1:
             return {
@@ -580,6 +601,8 @@ class RunnerSnapshot:
     @staticmethod
     def _repository_summary_json(
         repository: IssueDrivenRepositorySummary,
+        *,
+        include_state: bool = False,
     ) -> dict[str, object]:
         context = repository.context
         issues = []
@@ -639,6 +662,7 @@ class RunnerSnapshot:
         whole_review = repository.whole_review_result
         return {
             "repository": context.repository,
+            **({"state": repository.state} if include_state else {}),
             "integrationBranch": context.integration_branch,
             "finalBranch": context.final_branch,
             "policyIssue": context.policy_issue,
@@ -960,6 +984,7 @@ class PythonRunner:
             "issueDrivenRepositories": [
                 {
                     "context": asdict(repository.context),
+                    "state": repository.state,
                     "integrationPr": (
                         asdict(repository.integration_pr)
                         if repository.integration_pr is not None
@@ -1238,6 +1263,15 @@ class PythonRunner:
                 repository_context = self._history_dataclass(
                     IssueDrivenContext, repository_value.get("context")
                 )
+                repository_state = repository_value.get("state", "success")
+                if repository_state not in (
+                    "pending",
+                    "running",
+                    "success",
+                    "failed",
+                    "stopped",
+                ):
+                    raise ValueError
                 repository_pr_value = repository_value.get("integrationPr")
                 repository_pr = (
                     None
@@ -1281,23 +1315,25 @@ class PythonRunner:
                     )
                 issue_driven_repositories.append(
                     _IssueDrivenRepositoryRecord(
-                        repository_context,
-                        repository_pr,
-                        repository_results,
-                        repository_navigations,
-                        repository_skips,
-                        repository_review,
+                        context=repository_context,
+                        state=cast(IssueDrivenRepositoryState, repository_state),
+                        integration_pr=repository_pr,
+                        issue_results=repository_results,
+                        issue_navigations=repository_navigations,
+                        planner_skips=repository_skips,
+                        whole_review_result=repository_review,
                     )
                 )
         elif issue_driven_context is not None:
             issue_driven_repositories.append(
                 _IssueDrivenRepositoryRecord(
-                    issue_driven_context,
-                    integration_pr,
-                    issue_results,
-                    issue_navigations,
-                    planner_skips,
-                    whole_review_result,
+                    context=issue_driven_context,
+                    state=cast(IssueDrivenRepositoryState, state),
+                    integration_pr=integration_pr,
+                    issue_results=issue_results,
+                    issue_navigations=issue_navigations,
+                    planner_skips=planner_skips,
+                    whole_review_result=whole_review_result,
                 )
             )
         stdout_truncated = value.get("stdoutTruncated")
@@ -1890,6 +1926,7 @@ class PythonRunner:
             run.credential_path.unlink(missing_ok=True)
         run.exit_code = 1
         run.state = "failed"
+        self._finish_active_repository(run)
         self._append_output(
             run, "stderr", f"Workflow launch failed: {exc}\n", lock_held=True
         )
@@ -2928,53 +2965,82 @@ class PythonRunner:
             return self._register_owned_resource(
                 run, cast(_ResourceOwnershipEvent, event)
             )
+        elif event_type == "issue_driven_repositories":
+            declaration = cast(IssueDrivenRepositoryDeclaration, event)
+            if run.issue_driven_repositories or run.issue_driven_context is not None:
+                return False
+            run.issue_driven_repositories = [
+                _IssueDrivenRepositoryRecord(context=context)
+                for context in declaration.repositories
+            ]
         elif event_type == "run_pr":
             run.integration_pr = cast(PullRequestNavigation, event)
-            if run.issue_driven_repositories:
-                run.issue_driven_repositories[-1].integration_pr = run.integration_pr
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.integration_pr = run.integration_pr
         elif event_type == "issue_driven_context":
-            run.issue_driven_context = cast(IssueDrivenContext, event)
+            context = cast(IssueDrivenContext, event)
+            pending = next(
+                (
+                    repository
+                    for repository in run.issue_driven_repositories
+                    if repository.state == "pending"
+                ),
+                None,
+            )
+            if pending is not None:
+                declared = pending.context
+                if (
+                    declared.integration_branch != context.integration_branch
+                    or declared.final_branch != context.final_branch
+                    or declared.policy_issue != context.policy_issue
+                ):
+                    return False
+            run.issue_driven_context = context
             run.integration_pr = None
             run.issue_results = {}
             run.issue_navigations = {}
             run.planner_skips = {}
             run.whole_review_result = None
-            run.issue_driven_repositories.append(
-                _IssueDrivenRepositoryRecord(run.issue_driven_context)
-            )
+            active = self._active_issue_driven_repository(run)
+            if active is not None:
+                active.state = "success"
+            if pending is None:
+                pending = _IssueDrivenRepositoryRecord(run.issue_driven_context)
+                run.issue_driven_repositories.append(pending)
+            else:
+                pending.context = context
+            pending.state = "running"
         elif event_type == "issue_result":
             issue_result = cast(IssueResult, event)
             run.issue_results[issue_result.issue] = issue_result
-            if run.issue_driven_repositories:
-                run.issue_driven_repositories[-1].issue_results[issue_result.issue] = (
-                    issue_result
-                )
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.issue_results[issue_result.issue] = issue_result
         elif event_type == "issue_navigation":
             issue_navigation = cast(IssueNavigation, event)
             run.issue_navigations[issue_navigation.issue] = issue_navigation
-            if run.issue_driven_repositories:
-                run.issue_driven_repositories[-1].issue_navigations[
-                    issue_navigation.issue
-                ] = issue_navigation
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.issue_navigations[issue_navigation.issue] = issue_navigation
         elif event_type == "planner_skip":
             planner_skip = cast(PlannerSkip, event)
             accepted = replace(planner_skip, observed_at=self._accepted_at())
             run.planner_skips[accepted.issue] = accepted
-            if run.issue_driven_repositories:
-                run.issue_driven_repositories[-1].planner_skips[accepted.issue] = (
-                    accepted
-                )
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.planner_skips[accepted.issue] = accepted
         elif event_type == "whole_review_result":
             run.whole_review_result = cast(WholeReviewResult, event)
-            if run.issue_driven_repositories:
-                run.issue_driven_repositories[
-                    -1
-                ].whole_review_result = run.whole_review_result
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.whole_review_result = run.whole_review_result
         else:
             progress = cast(ProgressEvent, event)
+            active_repository = self._active_issue_driven_repository(run)
             repository = (
-                run.issue_driven_repositories[-1].context.repository
-                if run.issue_driven_repositories
+                active_repository.context.repository
+                if active_repository is not None
                 else None
             )
             accepted = replace(
@@ -2988,6 +3054,34 @@ class PythonRunner:
         return True
 
     @staticmethod
+    def _active_issue_driven_repository(
+        run: _RunRecord,
+    ) -> _IssueDrivenRepositoryRecord | None:
+        return next(
+            (
+                repository
+                for repository in reversed(run.issue_driven_repositories)
+                if repository.state == "running"
+            ),
+            None,
+        )
+
+    @classmethod
+    def _finish_active_repository(cls, run: _RunRecord) -> None:
+        repository = cls._active_issue_driven_repository(run)
+        if repository is None:
+            repository = next(
+                (
+                    candidate
+                    for candidate in run.issue_driven_repositories
+                    if candidate.state == "pending"
+                ),
+                None,
+            )
+        if repository is not None and run.state in ("success", "failed", "stopped"):
+            repository.state = run.state
+
+    @staticmethod
     def _parse_runner_event(
         line: str,
     ) -> (
@@ -2998,6 +3092,7 @@ class PythonRunner:
                 "resource",
                 "resource_ownership",
                 "run_pr",
+                "issue_driven_repositories",
                 "issue_driven_context",
                 "issue_navigation",
                 "planner_skip",
@@ -3087,6 +3182,47 @@ class PythonRunner:
             if not PythonRunner._valid_pr_navigation(pr_number, pr_url):
                 return None
             return "run_pr", PullRequestNavigation(pr_number, pr_url)
+        if event_type == "issue_driven_repositories":
+            repository_values = value.get("repositories")
+            if not isinstance(repository_values, list) or len(repository_values) < 2:
+                return None
+            repositories: list[IssueDrivenContext] = []
+            seen: set[str] = set()
+            for repository_value in repository_values:
+                if not isinstance(repository_value, dict):
+                    return None
+                repository = repository_value.get("repository")
+                integration_branch = repository_value.get("integration_branch")
+                final_branch = repository_value.get("final_branch")
+                policy_issue = repository_value.get("policy_issue")
+                if (
+                    any(
+                        not isinstance(item, str) or not item.strip()
+                        for item in (repository, integration_branch, final_branch)
+                    )
+                    or cast(str, repository) in seen
+                    or (
+                        policy_issue is not None
+                        and (
+                            isinstance(policy_issue, bool)
+                            or not isinstance(policy_issue, int)
+                            or policy_issue < 1
+                        )
+                    )
+                ):
+                    return None
+                seen.add(cast(str, repository))
+                repositories.append(
+                    IssueDrivenContext(
+                        cast(str, repository),
+                        cast(str, integration_branch),
+                        cast(str, final_branch),
+                        cast(int | None, policy_issue),
+                    )
+                )
+            return "issue_driven_repositories", IssueDrivenRepositoryDeclaration(
+                tuple(repositories)
+            )
         if event_type == "issue_driven_context":
             repository = value.get("repository")
             integration_branch = value.get("integration_branch")
@@ -3404,6 +3540,7 @@ class PythonRunner:
                     if exit_code == 0
                     else "failed"
                 )
+                self._finish_active_repository(run)
                 attempt_state = run.state
                 run.attempts.append(
                     RunAttempt(
@@ -3483,6 +3620,7 @@ class PythonRunner:
                 if exit_code == 0
                 else "failed"
             )
+            self._finish_active_repository(run)
             if diagnostic:
                 self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
             run.attempts.append(

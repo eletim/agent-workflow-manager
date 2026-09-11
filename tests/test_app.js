@@ -2080,6 +2080,7 @@ test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped
     repositories: [
       {
         repository: "acme/api",
+        state: "success",
         integrationBranch: "dev/api",
         finalBranch: "main",
         policyIssue: null,
@@ -2095,6 +2096,7 @@ test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped
       },
       {
         repository: "acme/web",
+        state: "success",
         integrationBranch: "dev/web",
         finalBranch: "main",
         policyIssue: null,
@@ -2120,9 +2122,9 @@ test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped
   const items = elements["issue-summary-list"].children;
   assert.equal(elements["issue-summary-context"].textContent, "2 repositories (serial execution)");
   assert.equal(items.length, 4);
-  assert.equal(items[0].textContent, "acme/api — dev/api → main");
+  assert.equal(items[0].textContent, "acme/api — dev/api → main · SUCCESS");
   assert.equal(items[1].children[1].children[0].children[2].textContent, "#40");
-  assert.equal(items[2].textContent, "acme/web — dev/web → main");
+  assert.equal(items[2].textContent, "acme/web — dev/web → main · SUCCESS");
   assert.equal(items[3].children[1].children[0].children[2].textContent, "#140");
   assert.match(elements["issue-summary-whole"].textContent, /acme\/api: APPROVED/);
   assert.match(elements["issue-summary-whole"].textContent, /acme\/web: SKIPPED/);

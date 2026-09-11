@@ -1754,9 +1754,14 @@ def test_multi_repository_summary_scopes_duplicate_issues_and_survives_history(
     try:
         run_id = runner.start(
             """from purplemux_client import (
-    emit_issue_driven_context, emit_issue_navigation, emit_issue_result,
+    emit_issue_driven_context, emit_issue_driven_repositories,
+    emit_issue_navigation, emit_issue_result,
     emit_planner_skip, emit_run_pr, emit_step, emit_whole_review_result,
 )
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
 emit_issue_driven_context("acme/api", "dev/api", "main")
 emit_step("Work items", "completed")
 emit_issue_navigation(10, 40, "https://github.com/acme/api/pull/40", workspace_id="ws-api", implementation_tab_id="api-implementation", scope_review_tab_id="api-scope", correctness_review_tab_id="api-correctness")
@@ -1787,6 +1792,10 @@ emit_run_pr(150, "https://github.com/acme/web/pull/150")
     assert [repository["repository"] for repository in repositories] == [
         "acme/api",
         "acme/web",
+    ]
+    assert [repository["state"] for repository in repositories] == [
+        "success",
+        "success",
     ]
     assert [repository["issues"][0]["issue"] for repository in repositories] == [
         10,
@@ -1831,6 +1840,50 @@ emit_run_pr(150, "https://github.com/acme/web/pull/150")
     assert restored_result["issueDrivenSummary"] == summary
     assert restored_result["plannerSkips"] == result["plannerSkips"]
     assert restored_result["progress"] == result["progress"]
+
+
+@pytest.mark.parametrize("terminal", ["failed", "stopped"])
+def test_multi_repository_summary_retains_pending_repositories_after_early_terminal(
+    runner: PythonRunner, terminal: str
+) -> None:
+    code = """from purplemux_client import (
+    emit_issue_driven_context, emit_issue_driven_repositories,
+)
+import time
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_context("acme/api", "dev/api", "main")
+"""
+    if terminal == "failed":
+        code += 'raise RuntimeError("first repository failed")\n'
+    else:
+        code += "time.sleep(60)\n"
+    run_id = runner.start(code)
+    if terminal == "stopped":
+        wait_for(
+            runner,
+            lambda snapshot: bool(snapshot.issue_driven_repositories),
+            run_id=run_id,
+        )
+        runner.stop(run_id)
+    snapshot = wait_for(
+        runner,
+        lambda candidate: candidate.state != "running",
+        run_id=run_id,
+    )
+
+    summary = snapshot.as_json()["issueDrivenSummary"]
+    assert summary["terminalResult"] == terminal
+    assert [repository["repository"] for repository in summary["repositories"]] == [
+        "acme/api",
+        "acme/web",
+    ]
+    assert [repository["state"] for repository in summary["repositories"]] == [
+        terminal,
+        "pending",
+    ]
 
 
 def test_planner_skip_reason_is_durable_and_part_of_issue_summary(

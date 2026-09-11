@@ -492,7 +492,10 @@ function renderIssueDrivenSummary(summary) {
     if (repositories.length > 1) {
       const heading = document.createElement("li");
       heading.className = "issue-summary-repository";
-      heading.textContent = `${repository.repository} — ${repository.integrationBranch} → ${repository.finalBranch}`;
+      const state = repository.state
+        ? ` · ${repository.state.replaceAll("_", " ").toUpperCase()}`
+        : "";
+      heading.textContent = `${repository.repository} — ${repository.integrationBranch} → ${repository.finalBranch}${state}`;
       issueSummaryList.append(heading);
     }
     for (const result of repository.issues || []) {

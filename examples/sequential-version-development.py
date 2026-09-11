@@ -32,6 +32,7 @@ from purplemux_client import (
     WorkerFailure,
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_driven_repositories,
     emit_issue_navigation,
     emit_issue_result,
     emit_planner_skip,
@@ -302,6 +303,19 @@ class IssueHandoffResult:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass
+class RepositoryDelivery:
+    config: Config
+    work_items: tuple[Issue, ...]
+    client: PurpleMuxCLIClient
+    repo: GitRepository
+    github: GitHubRepository
+    pr: PullRequestState | None
+    review: ReviewDelivery
+    issue_results: tuple[IssueHandoffResult, ...]
+    warnings: tuple[str, ...]
+
+
 ISSUE_HANDOFF_RESULTS: list[IssueHandoffResult] = []
 
 
@@ -365,6 +379,10 @@ def parse_args() -> Config:
 
 def parse_repository_configs():
     yield parse_args()
+
+
+def issue_driven_repository_declarations():
+    return ()
 
 
 def short_error(exc: BaseException) -> str:
@@ -865,6 +883,182 @@ def update_base_pr_human_handoff(
     except WorkerFailure as exc:
         warn_human_handoff(short_error(exc))
         return pr
+
+
+def multi_repository_handoff_prompt(
+    deliveries: tuple[RepositoryDelivery, ...],
+) -> str:
+    repositories = []
+    for delivery in deliveries:
+        config = delivery.config
+        base_pr = (
+            f"#{delivery.pr.number} {delivery.pr.url}; "
+            f"state={'Draft' if delivery.pr.is_draft else delivery.pr.state}"
+            if delivery.pr is not None
+            else "not created (no implementation changes)"
+        )
+        issues = "\n".join(
+            f"  - {item.label}: PR #{item.pr_number} ({item.pr_url}), "
+            f"outcome={item.outcome}, reviews={item.reviews}, "
+            f"warning_count={len(item.warnings)}"
+            for item in delivery.issue_results
+        ) or "  - No implementation Issue result was recorded."
+        policy = (
+            f"https://github.com/{config.slug}/issues/{config.policy_issue}"
+            if config.policy_issue is not None
+            else "none"
+        )
+        one_shot = (
+            f"https://github.com/{config.slug}/issues/{config.one_shot_issue}"
+            if config.one_shot_issue is not None
+            else "none"
+        )
+        repositories.append(
+            f"- repository: {config.slug}\n"
+            f"  integration/final: {config.integration_branch} -> {config.main_branch}\n"
+            f"  Base PR: {base_pr}\n"
+            f"  whole review: outcome={delivery.review.outcome}, "
+            f"reviews={delivery.review.reviews}\n"
+            f"  one-shot source Issue: {one_shot}\n"
+            f"  Policy Issue: {policy}\n"
+            f"  implementation results:\n{issues}"
+        )
+    warning_lines = "\n".join(
+        f"- {warning}"
+        for warning in dict.fromkeys(
+            warning
+            for delivery in deliveries
+            for warning in delivery.warnings
+        )
+    ) or "- none"
+    return f"""Create one final human handoff Markdown for this multi-repository Run.
+You are the Reviewer role Agent selected by reviewer_agent. This turn generates
+prose only and does not change any review verdict. Do not edit files, run GitHub
+mutations, or change Git/PR state.
+
+Read referenced GitHub Issue bodies and inspect the listed PR diffs when useful.
+Do not include raw logs, environment values, credentials, tokens, or secrets.
+The handoff must summarize every repository separately and retain every Base PR
+and implementation PR URL below.
+
+Authoritative handoff context:
+{chr(10).join(repositories)}
+- automated verification: each repository's configured final checks passed on
+  its exact reviewed head
+- warnings:
+{warning_lines}
+
+Return only Japanese Markdown, with these headings exactly once and in order:
+## 概要
+## 主な変更
+## 人間による確認
+## 自動検証
+Add `## 注意事項` only when warnings are listed above. Under 主な変更, group
+results by repository. Under 人間による確認, use 1 to 12 unchecked `- [ ]`
+items. Each item must describe one concrete, quickly answerable Yes/No
+observation, primarily in a browser or real environment. Do not ask a human to
+rerun checks already covered by automation and do not require terminal commands.
+Keep the entire response concise and under {MAX_HUMAN_HANDOFF_CHARS} characters.
+Do not emit HTML comments, code fences, prefaces, or extra headings."""
+
+
+def update_multi_repository_human_handoffs(
+    deliveries: list[RepositoryDelivery],
+) -> None:
+    open_deliveries = [
+        delivery
+        for delivery in deliveries
+        if delivery.pr is not None and delivery.pr.state == "OPEN"
+    ]
+    if not open_deliveries:
+        return
+    warnings = tuple(
+        dict.fromkeys(
+            warning
+            for delivery in deliveries
+            for warning in delivery.warnings
+        )
+    )[:12]
+    writer_delivery = open_deliveries[-1]
+    assert writer_delivery.pr is not None
+    try:
+        writer = create_agent(
+            writer_delivery.client,
+            writer_delivery.config,
+            agent_type=REVIEWER_AGENT,
+            name="Multi-repository human handoff writer",
+        )
+        result = run_turn(
+            writer_delivery.client,
+            writer,
+            "Multi-repository human handoff",
+            multi_repository_handoff_prompt(tuple(deliveries)),
+            pr=writer_delivery.pr,
+        )
+        handoff = validate_human_handoff(
+            result,
+            writer_delivery.config,
+            has_warnings=bool(warnings),
+        )
+        required_context = {
+            item.config.slug for item in deliveries
+        } | {
+            item.pr.url
+            for item in deliveries
+            if item.pr is not None
+        } | {
+            result.pr_url
+            for item in deliveries
+            for result in item.issue_results
+        }
+        if any(value not in handoff for value in required_context):
+            raise WorkerFailure(
+                "multi-repository handoff lacks a repository or relevant PR URL"
+            )
+    except Exception as exc:
+        warn_human_handoff(short_error(exc))
+        return
+
+    for delivery in open_deliveries:
+        assert delivery.pr is not None
+        try:
+            body = with_human_handoff(delivery.pr.body, handoff)
+            delivery.pr = delivery.github.update_pr_body(
+                delivery.pr.number,
+                body=body,
+                expected_head=delivery.config.integration_branch,
+                expected_head_sha=delivery.pr.head_sha,
+                expected_base=delivery.config.main_branch,
+                expected_base_sha=delivery.pr.base_sha,
+            )
+        except MutationOutcomeUnknown:
+            raise
+        except WorkerFailure as exc:
+            warn_human_handoff(
+                f"{delivery.config.slug}: {short_error(exc)}"
+            )
+
+
+def finalize_multi_repository_deliveries(
+    deliveries: list[RepositoryDelivery],
+) -> None:
+    update_multi_repository_human_handoffs(deliveries)
+    if not MERGE_FINAL:
+        return
+    for delivery in deliveries:
+        pr = delivery.pr
+        if pr is None or pr.state != "OPEN" or delivery.review.outcome != "approved":
+            continue
+        merged = merge_pr_and_advance(
+            delivery.repo,
+            delivery.github,
+            number=pr.number,
+            head=delivery.config.integration_branch,
+            head_sha=delivery.review.head_sha,
+            base=delivery.config.main_branch,
+            base_sha=delivery.review.base_sha,
+        )
+        delivery.pr = merged.pr
 
 
 def rehydrate_policy_conflicts(
@@ -2758,6 +2952,7 @@ def integration_delivery(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
+    deferred_deliveries: list[RepositoryDelivery] | None = None,
 ) -> PullRequestState | None:
     terminal_progress(
         "PREPARE",
@@ -2799,11 +2994,10 @@ def integration_delivery(
             f"{integration.remote_sha}",
         )
         emit_run_pr(merged_pr.number, merged_pr.url)
-        emit_whole_review_result(
-            "skipped",
-            0,
-            warnings=summary_warnings(None),
+        delivery = ReviewDelivery(
+            "skipped", merged_pr.head_sha, merged_pr.base_sha, 0
         )
+        emit_whole_review_result("skipped", 0, warnings=summary_warnings(None))
         if FINAL_REVIEW:
             emit_step(
                 "Whole-version review",
@@ -2825,6 +3019,20 @@ def integration_delivery(
             "Final integration PR",
             detail=f"already merged as PR #{merged_pr.number}",
         )
+        if deferred_deliveries is not None:
+            deferred_deliveries.append(
+                RepositoryDelivery(
+                    config,
+                    work_items,
+                    client,
+                    repo,
+                    github,
+                    merged_pr,
+                    delivery,
+                    tuple(ISSUE_HANDOFF_RESULTS),
+                    human_handoff_warnings(delivery),
+                )
+            )
         return merged_pr
     if pr is None:
         pr, finalized_plan = prepare_work_item_plan_pr(config, repo, github)
@@ -2833,11 +3041,10 @@ def integration_delivery(
                 "final delivery work items do not match the finalized persisted plan"
             )
         if pr is None:
-            emit_whole_review_result(
-                "skipped",
-                0,
-                warnings=summary_warnings(None),
+            delivery = ReviewDelivery(
+                "skipped", integration.remote_sha, main.remote_sha, 0
             )
+            emit_whole_review_result("skipped", 0, warnings=summary_warnings(None))
             emit_step(
                 "Final integration PR",
                 "completed",
@@ -2848,6 +3055,20 @@ def integration_delivery(
                 "Final integration PR",
                 detail="no implementation changes; no PR required",
             )
+            if deferred_deliveries is not None:
+                deferred_deliveries.append(
+                    RepositoryDelivery(
+                        config,
+                        work_items,
+                        client,
+                        repo,
+                        github,
+                        None,
+                        delivery,
+                        tuple(ISSUE_HANDOFF_RESULTS),
+                        human_handoff_warnings(delivery),
+                    )
+                )
             return None
         if pr.state == "MERGED":
             raise WorkerFailure(
@@ -2959,6 +3180,21 @@ def integration_delivery(
                 expected_base=config.main_branch,
                 expected_base_sha=delivery.base_sha,
             )
+        if deferred_deliveries is not None:
+            deferred_deliveries.append(
+                RepositoryDelivery(
+                    config,
+                    work_items,
+                    client,
+                    repo,
+                    github,
+                    delivered,
+                    delivery,
+                    tuple(ISSUE_HANDOFF_RESULTS),
+                    human_handoff_warnings(delivery),
+                )
+            )
+            return delivered
         delivered = update_base_pr_human_handoff(
             config, work_items, client, github, delivered, delivery
         )
@@ -2980,7 +3216,25 @@ def integration_delivery(
     return run_outline_step("Final integration PR", finalize)
 
 
-def run_repository(config: Config) -> None:
+def report_repository_delivery(config: Config, ready: PullRequestState | None) -> None:
+    if ready is None:
+        print("No implementation changes; no whole-version PR is required.", flush=True)
+        return
+    if ready.state == "MERGED":
+        outcome = "Merged"
+    elif ready.is_draft:
+        outcome = "Draft (warning continuation)"
+    else:
+        outcome = "Ready (not merged)"
+    print(f"Whole-version PR is {outcome}: {ready.url}", flush=True)
+    if config.policy_issue is not None:
+        print(f"Policy Issue: {config.slug}#{config.policy_issue}", flush=True)
+
+
+def run_repository(
+    config: Config,
+    deferred_deliveries: list[RepositoryDelivery] | None = None,
+) -> PullRequestState | None:
     POLICY_CONFLICT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
     emit_issue_driven_context(
@@ -3001,24 +3255,26 @@ def run_repository(config: Config) -> None:
         "Work items",
         lambda: process_work_items(config, client, repo, github, plan_pr, plan),
     )
-    ready = integration_delivery(config, work_items, client, repo, github)
-    if ready is None:
-        print("No implementation changes; no whole-version PR is required.", flush=True)
-        return
-    if ready.state == "MERGED":
-        outcome = "Merged"
-    elif ready.is_draft:
-        outcome = "Draft (warning continuation)"
-    else:
-        outcome = "Ready (not merged)"
-    print(f"Whole-version PR is {outcome}: {ready.url}", flush=True)
-    if config.policy_issue is not None:
-        print(f"Policy Issue: {config.slug}#{config.policy_issue}", flush=True)
+    ready = integration_delivery(
+        config, work_items, client, repo, github, deferred_deliveries
+    )
+    if deferred_deliveries is None:
+        report_repository_delivery(config, ready)
+    return ready
 
 
 def main() -> None:
+    declarations = issue_driven_repository_declarations()
+    deliveries: list[RepositoryDelivery] | None = None
+    if declarations:
+        emit_issue_driven_repositories(declarations)
+        deliveries = []
     for config in parse_repository_configs():
-        run_repository(config)
+        run_repository(config, deliveries)
+    if deliveries is not None:
+        finalize_multi_repository_deliveries(deliveries)
+        for delivery in deliveries:
+            report_repository_delivery(delivery.config, delivery.pr)
 
 
 if __name__ == "__main__":

@@ -266,6 +266,41 @@ def emit_issue_driven_context(
     _write_event(event)
 
 
+def emit_issue_driven_repositories(
+    repositories: tuple[tuple[str, str, str, int | None], ...],
+) -> None:
+    """Declare the complete ordered repository set for one Issue Driven run."""
+    if not isinstance(repositories, tuple) or len(repositories) < 2:
+        raise ValueError("repositories must be a tuple containing at least two items")
+    declared: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in repositories:
+        if not isinstance(item, tuple) or len(item) != 4:
+            raise TypeError("each repository must be a four-item tuple")
+        repository, integration_branch, final_branch, policy_issue = item
+        for name, value in (
+            ("repository", repository),
+            ("integration_branch", integration_branch),
+            ("final_branch", final_branch),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if repository in seen:
+            raise ValueError("repository declarations must be unique")
+        if policy_issue is not None:
+            _validate_positive_number("policy_issue", policy_issue)
+        seen.add(repository)
+        declaration: dict[str, object] = {
+            "repository": repository,
+            "integration_branch": integration_branch,
+            "final_branch": final_branch,
+        }
+        if policy_issue is not None:
+            declaration["policy_issue"] = policy_issue
+        declared.append(declaration)
+    _write_event({"type": "issue_driven_repositories", "repositories": declared})
+
+
 def _validate_positive_number(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be positive")
