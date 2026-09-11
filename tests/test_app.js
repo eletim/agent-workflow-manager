@@ -2073,63 +2073,6 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
   assert.equal(elements["issue-summary-panel"].hidden, true);
 });
 
-test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped", async () => {
-  const issueDrivenSummary = {
-    terminalResult: "success",
-    warningCount: 0,
-    repositories: [
-      {
-        repository: "acme/api",
-        integrationBranch: "dev/api",
-        finalBranch: "main",
-        policyIssue: null,
-        issues: [{
-          issue: 10,
-          outcome: "approved",
-          reviews: 1,
-          pr: {number: 40, url: "https://github.com/acme/api/pull/40"},
-          warnings: [],
-        }],
-        wholeReview: {outcome: "approved", reviews: 1, warnings: []},
-        basePr: {number: 50, url: "https://github.com/acme/api/pull/50"},
-      },
-      {
-        repository: "acme/web",
-        integrationBranch: "dev/web",
-        finalBranch: "main",
-        policyIssue: null,
-        issues: [{
-          issue: 10,
-          outcome: "approved",
-          reviews: 2,
-          pr: {number: 140, url: "https://github.com/acme/web/pull/140"},
-          warnings: [],
-        }],
-        wholeReview: {outcome: "skipped", reviews: 0, warnings: []},
-        basePr: {number: 150, url: "https://github.com/acme/web/pull/150"},
-      },
-    ],
-  };
-  const detail = snapshot({runId: 1, state: "success", issueDrivenSummary});
-  const {elements} = await loadApp({
-    runs: [{runId: 1, state: "success"}],
-    details: {1: detail},
-    validation: {status: 200, body: {validation: []}},
-  });
-
-  const items = elements["issue-summary-list"].children;
-  assert.equal(elements["issue-summary-context"].textContent, "2 repositories (serial execution)");
-  assert.equal(items.length, 4);
-  assert.equal(items[0].textContent, "acme/api — dev/api → main");
-  assert.equal(items[1].children[1].children[0].children[2].textContent, "#40");
-  assert.equal(items[2].textContent, "acme/web — dev/web → main");
-  assert.equal(items[3].children[1].children[0].children[2].textContent, "#140");
-  assert.match(elements["issue-summary-whole"].textContent, /acme\/api: APPROVED/);
-  assert.match(elements["issue-summary-whole"].textContent, /acme\/web: SKIPPED/);
-  assert.equal(elements["issue-summary-base"].children[1].textContent, "#50");
-  assert.equal(elements["issue-summary-base"].children[4].textContent, "#150");
-});
-
 test("running Issue Driven Summary links an item before its outcome exists", async () => {
   const detail = snapshot({
     runId: 1,

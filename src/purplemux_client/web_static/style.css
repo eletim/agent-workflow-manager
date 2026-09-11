@@ -322,7 +322,6 @@ a { color: #bcaaff; }
   list-style: none;
 }
 .issue-summary-item { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 6px; }
-.issue-summary-repository { margin-top: 4px; color: #c8d0df; font-weight: 700; }
 .issue-summary-marker { color: #9ba3b5; text-align: center; }
 .issue-summary-item.approved .issue-summary-marker { color: #75e2a8; }
 .issue-summary-item.continued_with_warning .issue-summary-marker { color: #ffd66b; }
