@@ -363,6 +363,10 @@ def parse_args() -> Config:
     )
 
 
+def parse_repository_configs():
+    yield parse_args()
+
+
 def short_error(exc: BaseException) -> str:
     return str(exc).replace("\n", " ")[:500]
 
@@ -2976,8 +2980,9 @@ def integration_delivery(
     return run_outline_step("Final integration PR", finalize)
 
 
-def main() -> None:
-    config = parse_args()
+def run_repository(config: Config) -> None:
+    POLICY_CONFLICT_WARNINGS.clear()
+    ISSUE_HANDOFF_RESULTS.clear()
     emit_issue_driven_context(
         config.slug,
         config.integration_branch,
@@ -3009,6 +3014,11 @@ def main() -> None:
     print(f"Whole-version PR is {outcome}: {ready.url}", flush=True)
     if config.policy_issue is not None:
         print(f"Policy Issue: {config.slug}#{config.policy_issue}", flush=True)
+
+
+def main() -> None:
+    for config in parse_repository_configs():
+        run_repository(config)
 
 
 if __name__ == "__main__":

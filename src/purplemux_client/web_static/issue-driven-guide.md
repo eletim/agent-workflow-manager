@@ -42,9 +42,10 @@ For a multi-repository run, replace the four top-level repository fields with a
 `integration_branch`, `final_branch`, and `issues`. Their order is significant.
 The other settings remain at the top level and apply to every entry. The
 generated plain Python contains the complete `ISSUE_DRIVEN_REPOSITORIES`
-representation. Multi-repository execution is rejected explicitly until its
-serial consumer is implemented; the JSON remains configuration rather than
-runtime control flow.
+representation and invokes the existing single-repository flow for each entry
+in declared order. Each repository's inspection, worktree preparation, work
+items, review, and final delivery complete before the next repository is
+prepared. The JSON remains configuration rather than runtime control flow.
 
 Correct:
 
