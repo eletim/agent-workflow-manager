@@ -1194,6 +1194,8 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
             _fixed_config_function(config)
             + "def parse_repository_configs():\n"
             + "    yield parse_args()\n\n\n"
+            + "def issue_driven_repository_declarations():\n"
+            + "    return ()\n\n\n"
         )
     declarations: list[str] = []
     functions: list[str] = []
@@ -1208,6 +1210,7 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
             f'        "repository": {repository.repository!r},\n'
             f'        "integration_branch": {repository.integration_branch!r},\n'
             f'        "final_branch": {repository.final_branch!r},\n'
+            f'        "policy_issue": {config.policy_issue!r},\n'
             f'        "issues": {issue_tuple},\n'
             "    },"
         )
@@ -1219,8 +1222,15 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
         )
     repository_tuple = "\n".join(declarations)
     preparation_functions = "".join(functions)
-    remaining_yields = "".join(
-        f"    yield {function_name}()\n" for function_name in function_names[1:]
+    repository_yields = "".join(
+        "    emit_issue_driven_repository(\n"
+        f'        {index}, "started"\n'
+        "    )\n"
+        f"    yield {'parse_args' if index == 1 else function_name}()\n"
+        "    emit_issue_driven_repository(\n"
+        f'        {index}, "completed"\n'
+        "    )\n"
+        for index, function_name in enumerate(function_names, 1)
     )
     return (
         "ISSUE_DRIVEN_REPOSITORIES = (\n"
@@ -1230,8 +1240,17 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
         "def parse_args() -> Config:\n"
         f"    return {function_names[0]}()\n\n\n"
         "def parse_repository_configs():\n"
-        "    yield parse_args()\n"
-        f"{remaining_yields}\n\n"
+        f"{repository_yields}\n\n"
+        "def issue_driven_repository_declarations():\n"
+        "    return tuple(\n"
+        "        (\n"
+        "            item['repository'],\n"
+        "            item['integration_branch'],\n"
+        "            item['final_branch'],\n"
+        "            item['policy_issue'],\n"
+        "        )\n"
+        "        for item in ISSUE_DRIVEN_REPOSITORIES\n"
+        "    )\n\n\n"
     )
 
 
@@ -1253,6 +1272,12 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
         "    prepare_run_repository,\n",
         1,
     )
+    if len(config.repositories) > 1:
+        source = source.replace(
+            "    emit_issue_driven_repositories,\n",
+            "    emit_issue_driven_repositories,\n    emit_issue_driven_repository,\n",
+            1,
+        )
     outline_start = source.index("WORKFLOW_OUTLINE = [\n")
     outline_end = source.index("\n]", outline_start) + len("\n]")
     source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]

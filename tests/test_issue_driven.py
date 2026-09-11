@@ -327,6 +327,9 @@ def test_multi_repository_generation_prepares_each_config_lazily_in_order() -> N
     assert "def parse_repository_1() -> Config:" in code
     assert "def parse_repository_2() -> Config:" in code
     assert "def parse_repository_configs():" in code
+    assert "def issue_driven_repository_declarations():" in code
+    assert "emit_issue_driven_repositories(declarations)" in code
+    assert "finalize_multi_repository_deliveries(deliveries)" in code
     assert code.index(repr(config.repositories[0].repository)) < code.index(
         repr(config.repositories[1].repository)
     )
@@ -350,13 +353,33 @@ def test_multi_repository_generation_prepares_each_config_lazily_in_order() -> N
     module.__dict__["parse_repository_2"] = lambda: (
         events.append("prepare second") or second
     )
-    module.__dict__["run_repository"] = lambda config: events.append(
+    module.__dict__["emit_issue_driven_repositories"] = lambda repositories: (
+        events.append("declare repositories")
+    )
+    module.__dict__["emit_issue_driven_repository"] = lambda index, status: (
+        events.append(f"repository {index} {status}")
+    )
+    module.__dict__["run_repository"] = lambda config, deliveries: events.append(
         "run first" if config is first else "run second"
+    )
+    module.__dict__["finalize_multi_repository_deliveries"] = lambda deliveries: (
+        events.append("finalize repositories")
     )
 
     module.__dict__["main"]()
 
-    assert events == ["prepare first", "run first", "prepare second", "run second"]
+    assert events == [
+        "declare repositories",
+        "repository 1 started",
+        "prepare first",
+        "run first",
+        "repository 1 completed",
+        "repository 2 started",
+        "prepare second",
+        "run second",
+        "repository 2 completed",
+        "finalize repositories",
+    ]
 
 
 def test_repositories_form_requires_multiple_repository_declarations() -> None:
@@ -1442,6 +1465,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
+        "Multi-repository human handoff writer": "REVIEWER_AGENT",
     }
 
 
@@ -2946,6 +2970,124 @@ def test_managed_handoff_replacement_preserves_existing_metadata() -> None:
     assert updated.count(start) == updated.count(end) == 1
     assert "create-pr:run-1" in updated
     assert "policy-conflict:c2FmZQ==" in updated
+
+
+def test_multi_repository_handoff_updates_each_base_pr_with_all_results() -> None:
+    code = generate_issue_driven_workflow(parse(multi_payload()))
+    module = ModuleType("generated_multi_repository_handoff")
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(code, "<generated-multi-handoff>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module.__name__]
+    workflow = module.__dict__
+    config_type = workflow["Config"]
+    issue_type = workflow["Issue"]
+    result_type = workflow["IssueHandoffResult"]
+    delivery_type = workflow["RepositoryDelivery"]
+    review_type = workflow["ReviewDelivery"]
+    configs = (
+        config_type(
+            Path("/api"),
+            "acme/api",
+            "dev/api",
+            "main",
+            (issue_type(10, "feature/api-10"),),
+            "true",
+        ),
+        config_type(
+            Path("/web"),
+            "acme/web",
+            "dev/web",
+            "main",
+            (issue_type(10, "feature/web-10"),),
+            "true",
+        ),
+    )
+
+    def base_pr(config: object, number: int) -> PullRequestState:
+        return PullRequestState(
+            number,
+            f"https://github.com/{config.slug}/pull/{number}",
+            "OPEN",
+            False,
+            config.slug,
+            config.integration_branch,
+            str(number) * 40,
+            config.slug,
+            config.main_branch,
+            "b" * 40,
+            None,
+            False,
+            None,
+            f"PR_{number}",
+            f"metadata for {config.slug}",
+        )
+
+    prs = (base_pr(configs[0], 50), base_pr(configs[1], 150))
+    updates: list[tuple[int, str]] = []
+
+    class GitHub:
+        def __init__(self, pr: PullRequestState) -> None:
+            self.pr = pr
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            body = str(kwargs["body"])
+            updates.append((number, body))
+            self.pr = replace(self.pr, body=body)
+            return self.pr
+
+    deliveries = []
+    for config, pr in zip(configs, prs, strict=True):
+        issue_pr = pr.number - 10
+        issue_result = result_type(
+            10,
+            "Issue #10",
+            issue_pr,
+            f"https://github.com/{config.slug}/pull/{issue_pr}",
+            "approved",
+            1,
+        )
+        review = review_type("approved", pr.head_sha, pr.base_sha, 1)
+        deliveries.append(
+            delivery_type(
+                config,
+                config.issues,
+                object(),
+                object(),
+                GitHub(pr),
+                pr,
+                review,
+                (issue_result,),
+                (),
+            )
+        )
+
+    markdown = """## 概要
+
+複数リポジトリの結果をまとめます。
+
+## 主な変更
+
+- acme/api: https://github.com/acme/api/pull/50 と https://github.com/acme/api/pull/40
+- acme/web: https://github.com/acme/web/pull/150 と https://github.com/acme/web/pull/140
+
+## 人間による確認
+
+- [ ] ブラウザで両方のBase PRリンクを開ける
+
+## 自動検証
+
+- 各リポジトリの設定済みチェックに合格"""
+    workflow["create_agent"] = lambda *args, **kwargs: "writer"
+    workflow["run_turn"] = lambda *args, **kwargs: markdown
+
+    workflow["update_multi_repository_human_handoffs"](deliveries)
+
+    assert [number for number, _body in updates] == [50, 150]
+    assert all(markdown in body for _number, body in updates)
+    assert all("github.com/acme/api/pull/40" in body for _number, body in updates)
+    assert all("github.com/acme/web/pull/140" in body for _number, body in updates)
 
 
 @pytest.mark.parametrize(
