@@ -1019,7 +1019,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         raw_repositories = []
 
     shared = {key: item for key, item in value.items() if key != "repositories"}
-    parsed: list[IssueDrivenConfig] = []
+    parsed: list[tuple[int, IssueDrivenConfig]] = []
     for index, declaration in enumerate(raw_repositories):
         path = f"$.repositories[{index}]"
         if not isinstance(declaration, dict):
@@ -1043,8 +1043,11 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         candidate = {**shared, **declaration}
         try:
             parsed.append(
-                _parse_single_issue_driven_json(
-                    json.dumps(candidate, ensure_ascii=False)
+                (
+                    index,
+                    _parse_single_issue_driven_json(
+                        json.dumps(candidate, ensure_ascii=False)
+                    ),
                 )
             )
         except IssueDrivenValidationError as exc:
@@ -1061,9 +1064,9 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                 )
                 findings.append(IssueDrivenFinding(finding_path, finding.message))
 
-    repositories = [item.repositories[0] for item in parsed]
+    indexed_repositories = [(index, item.repositories[0]) for index, item in parsed]
     seen_repositories: set[str] = set()
-    for index, repository in enumerate(repositories):
+    for index, repository in indexed_repositories:
         if repository.repository in seen_repositories:
             findings.append(
                 IssueDrivenFinding(
@@ -1074,9 +1077,10 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     if findings:
         raise IssueDrivenValidationError(findings)
 
-    first = parsed[0]
+    repositories = tuple(repository for _index, repository in indexed_repositories)
+    first = parsed[0][1]
     return IssueDrivenConfig(
-        repositories=tuple(repositories),
+        repositories=repositories,
         make_integration_branch=first.make_integration_branch,
         max_reviews=first.max_reviews,
         merge_to_integration=first.merge_to_integration,

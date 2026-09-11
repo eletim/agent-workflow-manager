@@ -394,6 +394,27 @@ def test_multi_repository_validation_uses_nested_paths() -> None:
     ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
+def test_duplicate_repository_path_retains_source_index_after_invalid_entry() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    first = repositories[0]
+    assert isinstance(first, dict)
+    repositories[1] = {"repository": "/tmp/invalid"}
+    repositories.append(dict(first))
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    findings = {(finding.path, finding.message) for finding in caught.value.findings}
+    assert (
+        "$.repositories[1].issues",
+        "required field is missing",
+    ) in findings
+    assert ("$.repositories[2].repository", "must be unique") in findings
+    assert ("$.repositories[1].repository", "must be unique") not in findings
+
+
 def test_multi_repository_rejects_duplicate_nested_field() -> None:
     source = json.dumps(multi_payload()).replace(
         '"repository": "/tmp/second-project",',
