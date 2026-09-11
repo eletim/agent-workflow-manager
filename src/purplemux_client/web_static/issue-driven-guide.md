@@ -37,6 +37,15 @@ dispatch position in an AWM-owned remote Git note without advancing either
 branch. This also supports dynamic and empty one-shot plans. The final PR remains
 `integration_branch` to `final_branch`.
 
+For a multi-repository run, replace the four top-level repository fields with a
+`repositories` array. Each entry independently declares `repository`,
+`integration_branch`, `final_branch`, and `issues`. Their order is significant.
+The other settings remain at the top level and apply to every entry. The
+generated plain Python contains the complete `ISSUE_DRIVEN_REPOSITORIES`
+representation. Multi-repository execution is rejected explicitly until its
+serial consumer is implemented; the JSON remains configuration rather than
+runtime control flow.
+
 Correct:
 
 ```json
@@ -57,15 +66,18 @@ Incorrect when that version worktree does not already exist:
 
 ## Supported schema
 
-Unknown fields are rejected. Provide exactly one of `one_shot_issue`, `work_items`,
-or the legacy `issues` field. `mode`, `make_integration_branch`, `policy_issue`,
-`scope_max_reviews`, `implementer_agent`, `reviewer_agent`, and `scenarios` are
-otherwise optional; every other field is required.
+Unknown fields are rejected. The single-repository form provides exactly one of
+`one_shot_issue`, `work_items`, or the legacy `issues` field together with its
+three repository fields. The multi-repository form provides `repositories`
+instead. `mode`, `make_integration_branch`, `policy_issue`, `scope_max_reviews`,
+`implementer_agent`, `reviewer_agent`, and `scenarios` are otherwise optional;
+the run-wide review and delivery fields are always required.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `mode` | string | Optional discriminator; when present it must be `issue-driven`. |
-| `repository` | string | Existing source repository path. |
+| `repository` | string | Existing source repository path in the backward-compatible single-repository form. |
+| `repositories` | array | Multi-repository form: an ordered array of at least two entries containing exactly `repository`, `integration_branch`, `final_branch`, and `issues`. Do not combine it with the corresponding top-level fields, `work_items`, or `one_shot_issue`. Repository paths must be unique. |
 | `integration_branch` | string | Remote/integration branch used as the development base; it may be created when `make_integration_branch` is true. |
 | `final_branch` | string | Branch targeted by final delivery; it must differ from `integration_branch`. |
 | `make_integration_branch` | boolean | Create/recover `integration_branch` from the exact remote `final_branch` HEAD; default `false`. |
@@ -136,6 +148,36 @@ checks use live remote refs and perform no branch, PR, or repository mutation.
   "make_integration_branch": true,
   "policy_issue": 80,
   "issues": [86, 99, 87, 84],
+  "max_reviews": 4,
+  "scope_max_reviews": 6,
+  "implementer_agent": "codex",
+  "reviewer_agent": "claude",
+  "merge_to_integration": true,
+  "final_review": true,
+  "merge_final": false
+}
+```
+
+The equivalent multi-repository shape keeps the run-wide behavior at the top
+level and moves the four repository-specific fields into ordered entries:
+
+```json
+{
+  "mode": "issue-driven",
+  "repositories": [
+    {
+      "repository": "~/DevEnv/api",
+      "integration_branch": "dev/v1.4.0",
+      "final_branch": "main",
+      "issues": [41, 44]
+    },
+    {
+      "repository": "~/DevEnv/web",
+      "integration_branch": "dev/v2.1.0",
+      "final_branch": "main",
+      "issues": [72]
+    }
+  ],
   "max_reviews": 4,
   "scope_max_reviews": 6,
   "implementer_agent": "codex",

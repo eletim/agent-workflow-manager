@@ -40,6 +40,7 @@ from purplemux_client.github import (
 from purplemux_client.issue_driven import (
     IssueDrivenConfig,
     IssueDrivenFinding,
+    IssueDrivenRepositoryConfig,
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
     inspect_issue_driven_topology,
@@ -71,6 +72,7 @@ __all__ = [
     "IncompletePullRequestEnumeration",
     "IssueDrivenConfig",
     "IssueDrivenFinding",
+    "IssueDrivenRepositoryConfig",
     "IssueDrivenValidationError",
     "MergeResult",
     "MutationConflict",

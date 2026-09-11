@@ -50,6 +50,27 @@ def parse(value: dict[str, object]):
     return parse_issue_driven_json(json.dumps(value))
 
 
+def multi_payload(**overrides: object) -> dict[str, object]:
+    value = payload()
+    repositories = [
+        {
+            "repository": value.pop("repository"),
+            "integration_branch": value.pop("integration_branch"),
+            "final_branch": value.pop("final_branch"),
+            "issues": value.pop("issues"),
+        },
+        {
+            "repository": "/tmp/second-project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "issues": [12, 14],
+        },
+    ]
+    value["repositories"] = repositories
+    value.update(overrides)
+    return value
+
+
 def topology_pr(
     *,
     number: int = 158,
@@ -273,6 +294,140 @@ def test_valid_json_preserves_issue_order() -> None:
     assert config.merge_final is False
     assert config.make_integration_branch is False
     assert config.policy_issue is None
+
+
+def test_multi_repository_json_round_trips_in_declared_order() -> None:
+    value = multi_payload()
+
+    config = parse(value)
+
+    assert [repository.repository for repository in config.repositories] == [
+        str(Path(__file__).parents[1]),
+        "/tmp/second-project",
+    ]
+    assert [repository.issues for repository in config.repositories] == [
+        (90, 89, 91),
+        (12, 14),
+    ]
+    reordered = replace(config, repositories=tuple(reversed(config.repositories)))
+    assert reordered.repository == "/tmp/second-project"
+    assert reordered.integration_branch == "dev/v1"
+    assert reordered.work_items == config.repositories[1].work_items
+    assert parse(config.as_json()) == config
+
+
+def test_multi_repository_generation_keeps_each_config_in_plain_python() -> None:
+    config = parse(multi_payload())
+
+    code = generate_issue_driven_workflow(config)
+
+    ast.parse(code)
+    assert "ISSUE_DRIVEN_REPOSITORIES = (" in code
+    assert "def parse_args() -> Config:" in code
+    assert "multi-repository execution is not supported" in code
+    assert code.index(repr(config.repositories[0].repository)) < code.index(
+        repr(config.repositories[1].repository)
+    )
+    assert "Issue(12, 'feature/issue-12')" in code
+    assert "Issue(14, 'feature/issue-14')" in code
+
+    module_name = "generated_multi_repository_config"
+    module = ModuleType(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(code, "<generated-multi-repository>", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module_name]
+    assert len(module.__dict__["ISSUE_DRIVEN_REPOSITORIES"]) == 2
+    with pytest.raises(WorkerFailure, match="multi-repository execution"):
+        module.__dict__["parse_args"]()
+
+
+def test_repositories_form_requires_multiple_repository_declarations() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    value["repositories"] = repositories[:1]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories",
+        "must contain at least two repositories",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+@pytest.mark.parametrize(
+    ("change", "path"),
+    [
+        ({"repository": "duplicate"}, "$.repository"),
+        ({"work_items": [90]}, "$.work_items"),
+        ({"one_shot_issue": 90}, "$.one_shot_issue"),
+    ],
+)
+def test_multi_repository_form_rejects_single_repository_fields(
+    change: dict[str, object], path: str
+) -> None:
+    value = multi_payload(**change)
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert path in {finding.path for finding in caught.value.findings}
+
+
+def test_multi_repository_validation_uses_nested_paths() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    declaration = repositories[1]
+    assert isinstance(declaration, dict)
+    declaration["issues"] = [12, 12]
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    assert (
+        "$.repositories[1].issues[1]",
+        "must be unique",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
+
+
+def test_duplicate_repository_path_retains_source_index_after_invalid_entry() -> None:
+    value = multi_payload()
+    repositories = value["repositories"]
+    assert isinstance(repositories, list)
+    first = repositories[0]
+    assert isinstance(first, dict)
+    repositories[1] = {"repository": "/tmp/invalid"}
+    repositories.append(dict(first))
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(value)
+
+    findings = {(finding.path, finding.message) for finding in caught.value.findings}
+    assert (
+        "$.repositories[1].issues",
+        "required field is missing",
+    ) in findings
+    assert ("$.repositories[2].repository", "must be unique") in findings
+    assert ("$.repositories[1].repository", "must be unique") not in findings
+
+
+def test_multi_repository_rejects_duplicate_nested_field() -> None:
+    source = json.dumps(multi_payload()).replace(
+        '"repository": "/tmp/second-project",',
+        '"repository": "/tmp/second-project", "repository": "/tmp/other",',
+    )
+
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse_issue_driven_json(source)
+
+    assert (
+        "$.repositories[1].repository",
+        "field is duplicated",
+    ) in {(finding.path, finding.message) for finding in caught.value.findings}
 
 
 def test_ordered_work_items_mix_github_issues_and_inline_mini_tasks() -> None:
