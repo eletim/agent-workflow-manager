@@ -316,7 +316,7 @@ def test_multi_repository_json_round_trips_in_declared_order() -> None:
     assert parse(config.as_json()) == config
 
 
-def test_multi_repository_generation_keeps_each_config_in_plain_python() -> None:
+def test_multi_repository_generation_prepares_each_config_lazily_in_order() -> None:
     config = parse(multi_payload())
 
     code = generate_issue_driven_workflow(config)
@@ -324,7 +324,9 @@ def test_multi_repository_generation_keeps_each_config_in_plain_python() -> None
     ast.parse(code)
     assert "ISSUE_DRIVEN_REPOSITORIES = (" in code
     assert "def parse_args() -> Config:" in code
-    assert "multi-repository execution is not supported" in code
+    assert "def parse_repository_1() -> Config:" in code
+    assert "def parse_repository_2() -> Config:" in code
+    assert "def parse_repository_configs():" in code
     assert code.index(repr(config.repositories[0].repository)) < code.index(
         repr(config.repositories[1].repository)
     )
@@ -339,8 +341,22 @@ def test_multi_repository_generation_keeps_each_config_in_plain_python() -> None
     finally:
         del sys.modules[module_name]
     assert len(module.__dict__["ISSUE_DRIVEN_REPOSITORIES"]) == 2
-    with pytest.raises(WorkerFailure, match="multi-repository execution"):
-        module.__dict__["parse_args"]()
+    events: list[str] = []
+    first = object()
+    second = object()
+    module.__dict__["parse_repository_1"] = lambda: (
+        events.append("prepare first") or first
+    )
+    module.__dict__["parse_repository_2"] = lambda: (
+        events.append("prepare second") or second
+    )
+    module.__dict__["run_repository"] = lambda config: events.append(
+        "run first" if config is first else "run second"
+    )
+
+    module.__dict__["main"]()
+
+    assert events == ["prepare first", "run first", "prepare second", "run second"]
 
 
 def test_repositories_form_requires_multiple_repository_declarations() -> None:

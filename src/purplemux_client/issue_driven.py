@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -1108,7 +1108,9 @@ def _canonical_source() -> str:
     return packaged.read_text(encoding="utf-8")
 
 
-def _fixed_config_function(config: IssueDrivenConfig) -> str:
+def _fixed_config_function(
+    config: IssueDrivenConfig, *, function_name: str = "parse_args"
+) -> str:
     issues = ",\n        ".join(
         (
             f"Issue({item.issue}, {item.branch!r})"
@@ -1162,7 +1164,7 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
         prospective_base_branch={prospective!r},
     )
 """
-    return f"""def parse_args() -> Config:
+    return f"""def {function_name}() -> Config:
 {topology_inspection}    context = prepare_run_repository(
         repo={config.repository!r},
         base_branch={base_branch!r},
@@ -1188,9 +1190,15 @@ def _fixed_config_function(config: IssueDrivenConfig) -> str:
 
 def _fixed_config_functions(config: IssueDrivenConfig) -> str:
     if len(config.repositories) == 1:
-        return _fixed_config_function(config)
+        return (
+            _fixed_config_function(config)
+            + "def parse_repository_configs():\n"
+            + "    yield parse_args()\n\n\n"
+        )
     declarations: list[str] = []
-    for repository in config.repositories:
+    functions: list[str] = []
+    function_names: list[str] = []
+    for index, repository in enumerate(config.repositories, 1):
         issues = ", ".join(
             f"Issue({item.issue}, {item.branch!r})" for item in repository.work_items
         )
@@ -1203,16 +1211,27 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
             f'        "issues": {issue_tuple},\n'
             "    },"
         )
+        repository_config = replace(config, repositories=(repository,))
+        function_name = f"parse_repository_{index}"
+        function_names.append(function_name)
+        functions.append(
+            _fixed_config_function(repository_config, function_name=function_name)
+        )
     repository_tuple = "\n".join(declarations)
+    preparation_functions = "".join(functions)
+    remaining_yields = "".join(
+        f"    yield {function_name}()\n" for function_name in function_names[1:]
+    )
     return (
         "ISSUE_DRIVEN_REPOSITORIES = (\n"
         f"{repository_tuple}\n"
         ")\n\n\n"
+        f"{preparation_functions}"
         "def parse_args() -> Config:\n"
-        "    raise WorkerFailure(\n"
-        '        "multi-repository execution is not supported by this workflow; "\n'
-        '        "generate serial execution support before running it"\n'
-        "    )\n\n\n"
+        f"    return {function_names[0]}()\n\n\n"
+        "def parse_repository_configs():\n"
+        "    yield parse_args()\n"
+        f"{remaining_yields}\n\n"
     )
 
 
