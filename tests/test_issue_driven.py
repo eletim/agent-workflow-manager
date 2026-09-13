@@ -1675,6 +1675,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
+        "Version / README reviewer": "REVIEWER_AGENT",
         "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
