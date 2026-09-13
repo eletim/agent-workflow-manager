@@ -32,7 +32,7 @@ from purplemux_client.operations import (
     Reconciliation,
     execute_mutation,
 )
-from purplemux_client.progress import register_run_resource
+from purplemux_client.progress import emit_finding, register_run_resource
 
 
 @dataclass(frozen=True)
@@ -180,6 +180,7 @@ _RESULT_STATUSES = {
 }
 _SHELL_DIAGNOSTIC_MAX_LINES = 40
 _SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
+_TURN_RESULT_PUBLICATION_GRACE_SECONDS = 30.0
 WORKFLOW_HOST_WORKSPACE_ENV = "AGENT_WORKFLOW_MANAGER_HOST_WORKSPACE_ID"
 
 
@@ -1020,14 +1021,28 @@ class PurpleMuxCLIClient:
         self._turn_baselines[session_id] = baseline
         self._completed_turns.pop(session_id, None)
 
-    def wait_for_turn_completion(self, session_id: str, timeout_seconds: float) -> None:
-        """Wait for a fresh completed turn and its structured result."""
+    def wait_for_turn_completion(
+        self,
+        session_id: str,
+        timeout_seconds: float,
+        *,
+        on_busy_timeout: Callable[[str], None] | None = None,
+    ) -> None:
+        """Wait for a fresh completed turn and its structured result.
+
+        The timeout is a warning threshold while the authoritative session state
+        remains busy. Once crossed in that state, monitoring continues while it
+        stays busy. A subsequent non-busy state gets a bounded grace period to
+        publish a fresh result; returning to busy cancels that grace period.
+        """
         deadline = self._monotonic() + timeout_seconds
         baseline = self._turn_baselines.get(session_id)
         if baseline is None:
             raise WorkerFailure(f"session {session_id} has no pending input")
         saw_busy = False
         last_state = "unknown"
+        busy_timeout_reported = False
+        result_publication_deadline: float | None = None
         while True:
             status = self._status(session_id)
             state = self._state(status, session_id)
@@ -1035,6 +1050,13 @@ class PurpleMuxCLIClient:
             self._raise_abnormal_state(session_id, state, status)
             if self._is_fresh_interrupt(status, baseline):
                 raise WorkerInterrupted(f"session {session_id} turn was interrupted")
+            if busy_timeout_reported:
+                if state == "busy":
+                    result_publication_deadline = None
+                elif result_publication_deadline is None:
+                    result_publication_deadline = (
+                        self._monotonic() + _TURN_RESULT_PUBLICATION_GRACE_SECONDS
+                    )
             if state == "busy":
                 saw_busy = True
             elif state == "inactive":
@@ -1055,7 +1077,32 @@ class PurpleMuxCLIClient:
                     raise WorkerInterrupted(
                         f"session {session_id} turn was interrupted"
                     )
-            if self._monotonic() >= deadline:
+            if busy_timeout_reported:
+                if (
+                    result_publication_deadline is not None
+                    and self._monotonic() >= result_publication_deadline
+                ):
+                    raise WorkerFailure(
+                        f"session {session_id} did not publish a fresh result within "
+                        f"{_TURN_RESULT_PUBLICATION_GRACE_SECONDS:g}s after leaving "
+                        f"busy (last cliState={state})"
+                    )
+                self._sleep(self.poll_interval_seconds)
+                continue
+            if not busy_timeout_reported and self._monotonic() >= deadline:
+                if state == "busy":
+                    warning = (
+                        f"session {session_id} exceeded the agent turn timeout of "
+                        f"{timeout_seconds}s while still busy; continuing to monitor "
+                        "while the session remains busy"
+                    )
+                    if on_busy_timeout is None:
+                        emit_finding("runtime", warning, status="warning")
+                    else:
+                        on_busy_timeout(warning)
+                    busy_timeout_reported = True
+                    self._sleep(self.poll_interval_seconds)
+                    continue
                 raise WorkerFailure(
                     f"session {session_id} did not complete a turn within "
                     f"{timeout_seconds}s (saw_busy={saw_busy}, "

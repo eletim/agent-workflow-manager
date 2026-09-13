@@ -834,6 +834,255 @@ def test_wait_for_completion_correlates_busy_ready_and_result() -> None:
     assert cli.read_result("tab-1") == "done"
 
 
+def test_busy_turn_timeout_warns_once_and_continues_until_completion() -> None:
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(
+                {
+                    "cliState": "ready-for-review",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": 200,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "eventually done",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    warnings: list[str] = []
+    times = iter([0.0, 1.0, 2.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=warnings.append)
+
+    assert cli.read_result("tab-1") == "eventually done"
+    assert len(warnings) == 1
+    assert "while still busy; continuing to monitor" in warnings[0]
+
+
+def test_busy_turn_timeout_emits_structured_warning_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(
+                {
+                    "cliState": "ready-for-review",
+                    "alive": True,
+                    "eventSeq": 3,
+                    "readyForReviewAt": 200,
+                    "lastEvent": {"name": "stop", "seq": 3},
+                }
+            ),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "done",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    findings: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        client_module,
+        "emit_finding",
+        lambda category, message, *, status: findings.append(
+            (category, message, status)
+        ),
+    )
+    times = iter([0.0, 1.0, 2.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1)
+
+    assert findings == [
+        (
+            "runtime",
+            "session tab-1 exceeded the agent turn timeout of 1s while still busy; "
+            "continuing to monitor while the session remains busy",
+            "warning",
+        )
+    ]
+
+
+def test_authoritative_failure_after_busy_timeout_still_fails() -> None:
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed({"cliState": "dead", "alive": False, "eventSeq": 3}),
+        ]
+    )
+    warnings: list[str] = []
+    times = iter([0.0, 1.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="entered dead"):
+        cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=warnings.append)
+
+    assert len(warnings) == 1
+
+
+def test_idle_with_stale_result_after_busy_timeout_fails_after_grace() -> None:
+    stale_idle = {
+        "cliState": "idle",
+        "alive": True,
+        "eventSeq": 1,
+        "lastEvent": {"name": "stop", "seq": 1},
+    }
+    stale_result = {
+        "status": "completed",
+        "text": "stale",
+        "completionTimestamp": 1,
+    }
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(stale_idle),
+            completed(stale_result),
+            completed(stale_idle),
+            completed(stale_result),
+        ]
+    )
+    times = iter([0.0, 1.0, 2.0, 3.0, 32.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="within 30s after leaving busy"):
+        cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=lambda _: None)
+
+
+def test_ready_result_lag_after_busy_timeout_eventually_completes() -> None:
+    ready = {
+        "cliState": "ready-for-review",
+        "alive": True,
+        "eventSeq": 3,
+        "readyForReviewAt": 200,
+        "lastEvent": {"name": "stop", "seq": 3},
+    }
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(ready),
+            completed({"status": "not-ready", "completionTimestamp": None}),
+            completed(ready),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "published after lag",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    times = iter([0.0, 1.0, 2.0, 3.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=lambda _: None)
+
+    assert cli.read_result("tab-1") == "published after lag"
+
+
+@pytest.mark.parametrize("transient_state", ["ready-for-review", "idle"])
+def test_post_timeout_return_to_busy_cancels_result_grace(
+    transient_state: str,
+) -> None:
+    transient = {
+        "cliState": transient_state,
+        "alive": True,
+        "eventSeq": 3,
+        "readyForReviewAt": 200 if transient_state == "ready-for-review" else None,
+        "lastEvent": {"name": "stop", "seq": 3},
+    }
+    completed_status = {
+        "cliState": "ready-for-review",
+        "alive": True,
+        "eventSeq": 5,
+        "readyForReviewAt": 300,
+        "lastEvent": {"name": "stop", "seq": 5},
+    }
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(transient),
+            completed({"status": "not-ready", "completionTimestamp": None}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 4}),
+            completed(completed_status),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "completed after returning to busy",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    warnings: list[str] = []
+    # The final non-busy observation is beyond the first grace deadline. It must
+    # start a new grace period because an authoritative busy state intervened.
+    times = iter([0.0, 1.0, 2.0, 3.0, 40.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=warnings.append)
+
+    assert cli.read_result("tab-1") == "completed after returning to busy"
+    assert len(warnings) == 1
+
+
+def test_ready_result_lag_after_busy_timeout_fails_when_grace_expires() -> None:
+    ready = {
+        "cliState": "ready-for-review",
+        "alive": True,
+        "eventSeq": 3,
+        "readyForReviewAt": 200,
+        "lastEvent": {"name": "stop", "seq": 3},
+    }
+    not_ready = {"status": "not-ready", "completionTimestamp": None}
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(ready),
+            completed(not_ready),
+            completed(ready),
+            completed(not_ready),
+        ]
+    )
+    times = iter([0.0, 1.0, 2.0, 3.0, 32.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="within 30s after leaving busy"):
+        cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=lambda _: None)
+
+
 def test_stale_ready_state_is_rejected_until_fresh_event_and_result() -> None:
     runner = FakeRunner(
         [
