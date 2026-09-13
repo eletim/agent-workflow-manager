@@ -157,7 +157,8 @@ let explicitNewRun = false;
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
-let deletableRunIds = [];
+let checkedRunIds = [];
+let checkedRunDeletionRequiresCleanup = false;
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
@@ -846,10 +847,12 @@ function renderRunList(runs) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
-  deletableRunIds = runs
-    .filter((run) => run.checked && run.resourceCleanupStatus === "cleaned")
-    .map((run) => run.runId);
-  const checkedRunCount = deletableRunIds.length;
+  const checkedRuns = runs.filter((run) => run.checked);
+  checkedRunIds = checkedRuns.map((run) => run.runId);
+  checkedRunDeletionRequiresCleanup = checkedRuns.some(
+    (run) => run.resourceCleanupStatus !== "cleaned",
+  );
+  const checkedRunCount = checkedRunIds.length;
   deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;
   deleteCheckedRunsButton.disabled = checkedRunCount === 0;
   deleteCheckedRunsButton.dataset.count = String(checkedRunCount);
@@ -936,9 +939,12 @@ function showNewRunAfterHistoryDeletion() {
 deleteCheckedRunsButton.addEventListener("click", async () => {
   const count = Number(deleteCheckedRunsButton.dataset.count || 0);
   if (count < 1) return;
-  const confirmedRunIds = [...deletableRunIds];
+  const confirmedRunIds = [...checkedRunIds];
   const noun = count === 1 ? "run" : "runs";
-  if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
+  const confirmation = checkedRunDeletionRequiresCleanup
+    ? `Cleanup owned resources, then delete ${count} checked ${noun} from local history? If any cleanup cannot be completed, all run history will be preserved.`
+    : `Delete ${count} checked ${noun} from local history?`;
+  if (!window.confirm(confirmation)) return;
 
   await withPendingButton(deleteCheckedRunsButton, async () => {
     try {

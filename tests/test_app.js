@@ -628,7 +628,7 @@ test("checked run deletion stops when confirmation is cancelled", async () => {
   assert.match(selectedRun(elements).textContent, /#1/);
 });
 
-test("checked run deletion preserves older runs with retained resources", async () => {
+test("checked run deletion confirms cleanup for every checked run", async () => {
   const retained = {
     runId: 1, state: "success", cwd: "/work/one", checked: true,
     resourceCleanupStatus: "retained",
@@ -638,6 +638,7 @@ test("checked run deletion preserves older runs with retained resources", async 
     resourceCleanupStatus: "cleaned",
   };
   const runs = [retained, cleaned];
+  const confirmations = [];
   const {calls, elements, eventSource} = await loadApp({
     runs,
     details: {
@@ -645,15 +646,19 @@ test("checked run deletion preserves older runs with retained resources", async 
       2: snapshot(cleaned),
     },
     validation: {status: 200, body: {validation: []}},
+    confirmOverride(message) {
+      confirmations.push(message);
+      return true;
+    },
     fetchOverride(url, options) {
       if (url !== "/api/runs/delete-checked") return undefined;
-      assert.deepEqual(JSON.parse(options.body), {runIds: [2]});
-      runs.splice(1, 1);
-      return response({deletedCount: 1, deletedRunIds: [2]});
+      assert.deepEqual(JSON.parse(options.body), {runIds: [1, 2]});
+      runs.splice(0, runs.length);
+      return response({deletedCount: 2, deletedRunIds: [1, 2]});
     },
   });
 
-  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (1)");
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
   await runItem(elements, 1).dispatch("click");
   assert.match(selectedRun(elements).textContent, /#1/);
   const listRequestsBeforeReload = calls.filter(([url]) => url === "/api/runs").length;
@@ -661,14 +666,16 @@ test("checked run deletion preserves older runs with retained resources", async 
   await waitFor(() => (
     calls.filter(([url]) => url === "/api/runs").length > listRequestsBeforeReload
   ));
-  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (1)");
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
   await elements["delete-checked-runs"].dispatch("click");
+  assert.deepEqual(confirmations, [
+    "Cleanup owned resources, then delete 2 checked runs from local history? If any cleanup cannot be completed, all run history will be preserved.",
+  ]);
   assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
   assert.equal(
     elements["run-list"].children.filter((item) => item.dataset.runId).length,
-    1,
+    0,
   );
-  assert.match(selectedRun(elements).textContent, /#1/);
 });
 
 test("external checked history deletion clears stale selected detail", async () => {
