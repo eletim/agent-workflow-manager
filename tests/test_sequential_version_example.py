@@ -240,6 +240,25 @@ def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> No
     assert "right boundaries" in source
 
 
+def test_version_readme_review_prompt_has_an_independent_documentation_scope() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+
+    prompt = workflow["version_readme_review_prompt"](pr, config, config.issues)
+
+    assert pr.base_sha in prompt
+    assert pr.head_sha in prompt
+    assert "version declarations and version references" in prompt
+    assert "README documentation agrees with the current behavior" in prompt
+    assert "removed features" in prompt
+    assert "obsolete CLI or API usage" in prompt
+    assert "outdated configuration examples" in prompt
+    assert "independent documentation/version review" in prompt
+
+
 def test_scenario_gate_prompt_selects_and_compares_human_scenarios() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     prompt_globals = workflow["scenario_gate_prompt"].__globals__
@@ -291,6 +310,7 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
     dynamic_prompts = (
         workflow["scenario_gate_prompt"](pr, config, work_items),
         workflow["whole_version_review_prompt"](pr, config, work_items),
+        workflow["version_readme_review_prompt"](pr, config, work_items),
     )
 
     for prompt in dynamic_prompts:
@@ -301,6 +321,7 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
     one_shot_prompts = (
         workflow["scenario_gate_prompt"](pr, one_shot_config, one_shot_items),
         workflow["whole_version_review_prompt"](pr, one_shot_config, one_shot_items),
+        workflow["version_readme_review_prompt"](pr, one_shot_config, one_shot_items),
     )
     for prompt in one_shot_prompts:
         assert revised_task in prompt
@@ -312,7 +333,7 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 5
+    assert source.count("run_validated_turn(") == 6
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:
@@ -442,7 +463,11 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
         assert isinstance(prompt, ast.Call)
         assert isinstance(prompt.func, ast.Name)
         assert prompt.func.id == "implementer_prompt"
-    for label in ("  review", "Whole-version reviewer turn"):
+    for label in (
+        "  review",
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ):
         prompt = prompts[label]
         assert not (
             isinstance(prompt, ast.Call)
@@ -1898,6 +1923,7 @@ def test_ready_final_pr_repeats_review_and_checks(
         "set_draft:True",
         "require_review_head",
         "Whole-version reviewer turn",
+        "Version / README reviewer turn",
         "require_review_head",
         "final checks",
         "set_draft:False",
@@ -1945,7 +1971,14 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
             current_pr = replace(current_pr, body=body)
             return current_pr
 
-    results = iter(((reviewed_sha, True), (reviewed_sha, False), (reviewed_sha, False)))
+    results = iter(
+        (
+            (reviewed_sha, True),
+            (reviewed_sha, False),
+            (reviewed_sha, False),
+            (reviewed_sha, False),
+        )
+    )
     review_count = 0
 
     def run_turn(*args: object, **kwargs: object) -> str:
@@ -1972,7 +2005,7 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
     )
 
     assert delivery.outcome == "approved"
-    assert review_count == 2
+    assert review_count == 3
     assert persisted_heads
     assert set(persisted_heads) == {reviewed_sha}
 
@@ -2044,6 +2077,86 @@ def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
     assert events.index("Whole-version fixes") < events.index("final checks")
     assert events.count("require_pushed") == 2
     assert "ready" not in events
+
+
+def test_version_readme_findings_are_fixed_and_all_reviews_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    initial_sha = "integration-head"
+    fixed_sha = "documented-head"
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha=initial_sha,
+    )
+    events: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (
+                config.integration_branch,
+                fixed_sha,
+            )
+            return BranchState(branch, fixed_sha, fixed_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+    agent_results = iter(
+        (
+            (initial_sha, False),
+            (initial_sha, False),
+            (fixed_sha, True),
+            (fixed_sha, False),
+            (fixed_sha, False),
+            (fixed_sha, False),
+        )
+    )
+    version_reviews = 0
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        nonlocal version_reviews
+        name = str(args[2])
+        events.append(name)
+        if name == "Version / README reviewer turn":
+            version_reviews += 1
+            if version_reviews == 1:
+                return "CHANGES_REQUESTED\nRemove the obsolete CLI example."
+        return "APPROVED"
+
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(agent_results),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    _, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current_pr, config.issues
+    )
+
+    assert delivery.outcome == "approved"
+    assert delivery.reviews == 2
+    assert delivery.head_sha == fixed_sha
+    assert events == [
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+        "Whole-version fixes",
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ]
 
 
 def test_whole_version_review_limit_warns_without_an_extra_fix(
@@ -2289,6 +2402,8 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         events.append(name)
         if name == "Whole-version reviewer turn":
             review_count += 1
+            return "APPROVED"
+        if name == "Version / README reviewer turn":
             return "APPROVED"
         if name == "Clean worktree":
             assert repository.dirty

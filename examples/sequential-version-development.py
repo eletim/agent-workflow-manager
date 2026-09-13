@@ -2706,6 +2706,23 @@ def whole_version_review_prompt(
     )
 
 
+def version_readme_review_prompt(
+    pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
+) -> str:
+    return (
+        f"Review version and README consistency at exact head {pr.head_sha} "
+        f"against final base {pr.base_sha}. Check that version declarations and "
+        "version references agree with the integrated implementation and intended "
+        "release, and that README documentation agrees with the current behavior "
+        "and specification. Look specifically for remnants of removed features, "
+        "obsolete CLI or API usage, and outdated configuration examples. Keep this "
+        "as an independent documentation/version review; do not repeat the general "
+        "whole-version review. Return APPROVED or CHANGES_REQUESTED first, followed "
+        "by actionable findings; do not mutate anything.\n\n"
+        + final_work_item_context(config, work_items)
+    )
+
+
 def review_whole_version(
     config: Config,
     client: PurpleMuxCLIClient,
@@ -2726,6 +2743,12 @@ def review_whole_version(
         config,
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
+    )
+    version_readme_reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name="Version / README reviewer",
     )
     scenario_reviewer = (
         create_agent(
@@ -2825,6 +2848,47 @@ def review_whole_version(
                 f"approval invalidated at {reviewed_sha}",
             )
             continue
+        if verdict == "APPROVED":
+            result, verdict = run_validated_turn(
+                client,
+                version_readme_reviewer,
+                "Version / README reviewer turn",
+                policy_context(config, scope="the version and README review")
+                + version_readme_review_prompt(pr, config, work_items),
+                decision,
+                iteration=review_number,
+            )
+            emit_policy_conflicts(result, config, scope="the integrated version")
+            reviewed_sha, reviewer_changed = require_agent_result(
+                repo,
+                client,
+                fixer,
+                config.integration_branch,
+                pr.head_sha,
+                allow_unchanged=True,
+                iteration=review_number,
+            )
+            if reviewer_changed:
+                pushed = repo.ensure_pushed(
+                    config.integration_branch, expected_local_sha=reviewed_sha
+                )
+                assert pushed.remote_sha is not None
+                pr = github.require_pr(
+                    number=pr.number,
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="OPEN",
+                    expected_head_sha=pushed.remote_sha,
+                    expected_base_sha=pr.base_sha,
+                    draft=True,
+                )
+                pr = ensure_base_pr_policy_notes(github, pr, config)
+                emit_finding(
+                    "git",
+                    "version and README review changed the integration branch; "
+                    f"approval invalidated at {reviewed_sha}",
+                )
+                continue
         current = github.require_pr(
             number=pr.number,
             head=config.integration_branch,
