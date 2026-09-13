@@ -2017,6 +2017,22 @@ class PythonRunner:
                 },
             ),
         )
+        initial_tab = workspace.initial_tab
+        if initial_tab is not None:
+            self._register_resource(
+                run,
+                RunResource(
+                    "purplemux_tab",
+                    initial_tab.id,
+                    {
+                        "workspace_id": initial_tab.workspace_id,
+                        "name": initial_tab.name,
+                        "panel_type": initial_tab.panel_type or "",
+                        "provider": initial_tab.provider or "",
+                        "origin": "workspace_initial",
+                    },
+                ),
+            )
 
     def _run_identity(self, run_id: int) -> str:
         return f"{self._correlation_instance}-{run_id}"

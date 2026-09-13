@@ -59,6 +59,13 @@ class RuntimeRunner:
                 "directories": [command[command.index("--cwd") + 1]],
             }
             self.workspaces["ws-new"] = workspace
+            self.tabs["tab-initial"] = {
+                "tabId": "tab-initial",
+                "workspaceId": "ws-new",
+                "name": "",
+                "panelType": None,
+                "agentProviderId": None,
+            }
             if self.mode == "workspace-timeout-after-apply":
                 raise subprocess.TimeoutExpired(command, timeout)
             if self.mode == "workspace-nonzero-after-apply":
@@ -565,10 +572,66 @@ def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) ->
     )
 
     assert result.id == "ws-new"
+    assert result.initial_tab == TabState("tab-initial", "ws-new", "", None, None)
     assert (
         len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
         == 1
     )
+
+
+def test_owned_workspace_registers_its_authoritative_initial_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = RuntimeRunner()
+    registered: list[tuple[str, str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        "purplemux_client.client.register_run_resource",
+        lambda kind, identity, metadata: registered.append(
+            (kind, identity, dict(metadata))
+        ),
+    )
+
+    PurpleMuxRuntime(runner=runner, owned_by_run=True).create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+
+    assert [(kind, identity) for kind, identity, _metadata in registered] == [
+        ("purplemux_workspace", "ws-new"),
+        ("purplemux_tab", "tab-initial"),
+    ]
+    assert registered[1][2] == {
+        "workspace_id": "ws-new",
+        "name": "",
+        "panel_type": "",
+        "provider": "",
+        "origin": "workspace_initial",
+    }
+
+
+def test_workspace_creation_does_not_claim_ambiguous_initial_tabs(
+    tmp_path: Path,
+) -> None:
+    runner = RuntimeRunner()
+    original = runner.__call__
+
+    def create_with_extra_tab(*args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original(*args, **kwargs)
+        command = list(args[0])
+        if command[1:3] == ["workspace", "create"]:
+            runner.tabs["tab-user"] = {
+                "tabId": "tab-user",
+                "workspaceId": "ws-new",
+                "name": "User tab",
+                "panelType": "terminal",
+                "agentProviderId": None,
+            }
+        return result
+
+    workspace = PurpleMuxRuntime(runner=create_with_extra_tab).create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+
+    assert workspace.initial_tab is None
 
 
 def test_new_run_does_not_collide_with_retained_logical_workspace(

@@ -251,7 +251,7 @@ CreateWorkspaceRequest(cwd, name, correlation_id=None)
 CreateSessionRequest(worker, cwd, command, metadata={}, name=None, correlation_id=None)
 ShellCommandRequest(command, cwd, name, correlation_id=None)
 
-WorkspaceState(id, name, directories)
+WorkspaceState(id, name, directories, initial_tab=None)
 TabState(id, workspace_id, name, panel_type, provider, alive=None, cli_state=None)
 ShellResult(
     exit_code,
@@ -732,9 +732,11 @@ and commits change both after a detached worktree is created.
 Do not automatically close a Workflow run's tabs on success or failure. The
 Runner retains the structured inventory on the run record and exposes one manual
 Cleanup action after execution ends. Cleanup verifies identities, closes child
-tabs in reverse deterministic order, removes managed-shell result directories,
-deletes an identity-verified empty workspace through PurpleMux's public atomic
-`workspace delete -w ID --if-empty` contract, and then handles the Git worktree.
+tabs in reverse deterministic order (including the separately tracked canonical
+initial/default tab of a newly created run-owned workspace), removes managed-shell
+result directories, deletes an identity-verified empty workspace through
+PurpleMux's public atomic `workspace delete -w ID --if-empty` contract, and then
+handles the Git worktree.
 Startup rejects PurpleMux versions without that contract. Only its structured
 `not-empty` response proves rejection; transport errors and other nonzero exits
 remain uncertain until authoritative workspace listing reconciles them.

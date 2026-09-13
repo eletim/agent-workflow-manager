@@ -780,6 +780,9 @@ def test_explicit_cleanup_uses_dependency_order_and_keeps_run_history(
         """
 from purplemux_client import register_run_resource
 register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-initial", {
+    "workspace_id": "ws-1", "origin": "workspace_initial"
+})
 register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
 register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
 register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo"})
@@ -798,6 +801,7 @@ register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo
     assert cleaned == [
         ("purplemux_tab", "tab-2"),
         ("purplemux_tab", "tab-1"),
+        ("purplemux_tab", "tab-initial"),
         ("purplemux_workspace", "ws-1"),
         ("git_worktree", "/tmp/worktree"),
     ]

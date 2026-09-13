@@ -99,7 +99,12 @@ class _ManagedRuntime:
 
     def create_workspace(self, request: CreateWorkspaceRequest) -> WorkspaceState:
         self.request = request
-        return WorkspaceState("ws-workflow", request.name, (request.cwd,))
+        return WorkspaceState(
+            "ws-workflow",
+            request.name,
+            (request.cwd,),
+            TabState("tab-initial", "ws-workflow", "", None, None),
+        )
 
     def workspace(self, workspace_id: str) -> _ManagedClient:
         assert workspace_id == "ws-workflow"
@@ -153,6 +158,13 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         assert runtime.request.cwd == str(tmp_path)
         assert client.request is not None
         assert client.request.name == f"Workflow {run_id}: Python"
+        assert [
+            (resource.kind, resource.identity) for resource in run.resources[:2]
+        ] == [
+            ("purplemux_workspace", "ws-workflow"),
+            ("purplemux_tab", "tab-initial"),
+        ]
+        assert run.resources[1].metadata["origin"] == "workspace_initial"
         assert run.event_token is not None
         assert run.event_token not in client.request.command
         assert str(run.credential_path) in client.request.command
@@ -195,8 +207,9 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         progress_json = snapshot.as_json()["progress"]
         assert isinstance(progress_json, list)
         assert progress_json[0]["observedAt"] == snapshot.progress[0].observed_at
-        assert [resource.kind for resource in snapshot.resources[:3]] == [
+        assert [resource.kind for resource in snapshot.resources[:4]] == [
             "purplemux_workspace",
+            "purplemux_tab",
             "purplemux_tab",
             "managed_shell_result",
         ]
@@ -324,11 +337,12 @@ def test_authoritative_start_failure_tracks_created_tab_and_result(
         assert [resource.kind for resource in failed.resources] == [
             "purplemux_workspace",
             "purplemux_tab",
+            "purplemux_tab",
             "managed_shell_result",
         ]
         assert failed.as_json()["cleanupAvailable"] is True
     finally:
-        snapshot = runner.snapshot()
-        if len(snapshot.resources) >= 3:
-            shutil.rmtree(snapshot.resources[2].identity, ignore_errors=True)
+        for resource in runner.snapshot().resources:
+            if resource.kind == "managed_shell_result":
+                shutil.rmtree(resource.identity, ignore_errors=True)
         runner.close()

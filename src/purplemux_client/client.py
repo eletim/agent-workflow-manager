@@ -63,13 +63,6 @@ class CreateWorkspaceRequest:
 
 
 @dataclass(frozen=True)
-class WorkspaceState:
-    id: str
-    name: str
-    directories: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class TabState:
     id: str
     workspace_id: str
@@ -78,6 +71,16 @@ class TabState:
     provider: str | None
     alive: bool | None = None
     cli_state: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceState:
+    id: str
+    name: str
+    directories: tuple[str, ...]
+    # Present only on the result of a successful create. Workspace listings do
+    # not claim provenance for tabs that may have been created independently.
+    initial_tab: TabState | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -333,6 +336,26 @@ class PurpleMuxRuntime:
             reconcile=reconcile,
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
         )
+        initial_tab: TabState | None = None
+        try:
+            initial_tabs = self.workspace(workspace.id).list_sessions()
+        except WorkerFailure:
+            # The workspace identity is already authoritative and must remain in
+            # the run inventory. Without a complete tab read, claim no tab.
+            pass
+        else:
+            if len(initial_tabs) == 1:
+                candidate = initial_tabs[0]
+                if (
+                    candidate.workspace_id == workspace.id
+                    and not candidate.name
+                    and candidate.panel_type is None
+                    and candidate.provider is None
+                ):
+                    initial_tab = candidate
+        workspace = WorkspaceState(
+            workspace.id, workspace.name, workspace.directories, initial_tab
+        )
         if self.owned_by_run:
             register_run_resource(
                 "purplemux_workspace",
@@ -343,7 +366,23 @@ class PurpleMuxRuntime:
                     "correlation_id": correlation_id,
                 },
             )
+            if initial_tab is not None:
+                self._register_initial_tab(initial_tab)
         return workspace
+
+    @staticmethod
+    def _register_initial_tab(tab: TabState) -> None:
+        register_run_resource(
+            "purplemux_tab",
+            tab.id,
+            {
+                "workspace_id": tab.workspace_id,
+                "name": tab.name,
+                "panel_type": tab.panel_type or "",
+                "provider": tab.provider or "",
+                "origin": "workspace_initial",
+            },
+        )
 
     def delete_workspace(
         self, workspace_id: str, *, expected_state: WorkspaceState
