@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import purplemux_client.issue_driven as issue_driven
 from purplemux_client import (
     BranchState,
     GitHubRepository,
@@ -20,8 +21,10 @@ from purplemux_client import (
     PullRequestState,
     WorkerFailure,
 )
+from purplemux_client.github import PullRequestSnapshot
 from purplemux_client.issue_driven import (
     _MAX_SCENARIO_LIST_BYTES,
+    _MAX_TURN_TIMEOUT,
     IssueDrivenValidationError,
     classify_issue_topology,
     generate_issue_driven_workflow,
@@ -1277,6 +1280,35 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     assert "MAX_REVIEWS = 5" in first
     assert config.scope_max_reviews == 3
     assert "MAX_SCOPE_REVIEWS = 3" in first
+    assert config.turn_timeout == 7200
+    assert "TURN_TIMEOUT = 7200" in first
+
+
+@pytest.mark.parametrize("turn_timeout", [7200, 10800, _MAX_TURN_TIMEOUT])
+def test_optional_turn_timeout_round_trips_and_configures_generated_workflow(
+    turn_timeout: int,
+) -> None:
+    config = parse(payload(turn_timeout=turn_timeout))
+
+    assert config.turn_timeout == turn_timeout
+    assert config.as_json()["turn_timeout"] == turn_timeout
+    assert parse(config.as_json()) == config
+    assert f"TURN_TIMEOUT = {turn_timeout}" in generate_issue_driven_workflow(config)
+
+
+@pytest.mark.parametrize(
+    "turn_timeout", [True, 0, -1, 1.5, "7200", _MAX_TURN_TIMEOUT + 1, 10**309]
+)
+def test_turn_timeout_must_be_a_safe_positive_integer(turn_timeout: object) -> None:
+    with pytest.raises(IssueDrivenValidationError) as caught:
+        parse(payload(turn_timeout=turn_timeout))
+
+    assert [(finding.path, finding.message) for finding in caught.value.findings] == [
+        (
+            "$.turn_timeout",
+            f"must be an integer from 1 to {_MAX_TURN_TIMEOUT}",
+        )
+    ]
 
 
 @pytest.mark.parametrize("scope_max_reviews", [6, 8])
@@ -1341,7 +1373,12 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     assert code.index("Issue(90, 'feature/issue-90')") < code.index(
         f"Issue(None, '{item.branch}'"
     )
-    assert "'Mini task refresh-run-help'" in code
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+    assert "'Mini task refresh-run-help'" in parse_args
+    assert "(90, 'feature/issue-90')" in parse_args
+    assert "defer_inline_task_fingerprints=True" in parse_args
     assert item.task_fingerprint in code
     assert "Refresh the New Run help." in implementation
     assert "Refresh the New Run help." in scope_review
@@ -1414,6 +1451,135 @@ def test_generated_inline_task_recovery_rejects_pr_fingerprint_mismatch(
 
     with pytest.raises(WorkerFailure, match="inline task fingerprint"):
         module.__dict__["prepare_issue"](SimpleNamespace(), github, issue, config)
+
+
+def test_resume_uses_dispatched_inline_task_identity_after_planner_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_task = "Refresh the New Run help."
+    workflow = load_generated_workflow(
+        work_items=[{"id": "refresh-run-help", "task": original_task}]
+    )
+    revised_task = "Refresh the New Run help and document Resume behavior."
+    revised = workflow["planner_inline_issue"]("refresh-run-help", revised_task)
+    base_sha = "b" * 40
+    feature_sha = "f" * 40
+    child_pr = replace(
+        topology_pr(
+            head_sha=feature_sha,
+            head_branch=revised.branch,
+            body=revised.pr_body,
+        ),
+        base_branch="dev/v0.2.0",
+        base_sha=base_sha,
+    )
+
+    class TopologyInspection:
+        def inspect_pr_snapshot(self, heads: tuple[str, ...]) -> PullRequestSnapshot:
+            assert heads == (revised.branch,)
+            return PullRequestSnapshot("acme/project", (child_pr,))
+
+        def inspect_comparisons(self, pairs: list[tuple[str, str]]):
+            assert pairs == [(base_sha, feature_sha)]
+            return TopologyGitHub(contains={(base_sha, feature_sha)})
+
+    repository = SimpleNamespace(
+        expected_github_slug="acme/project",
+        inspect_remote_branches=lambda branches: {
+            branch: base_sha if branch == "dev/v0.2.0" else feature_sha
+            for branch in branches
+        },
+    )
+    github = SimpleNamespace(topology_inspection=TopologyInspection)
+    monkeypatch.setattr(
+        issue_driven,
+        "_inspect_repository_declaration",
+        lambda **kwargs: SimpleNamespace(
+            source_repository=Path("/repo"), base_sha=base_sha
+        ),
+    )
+    monkeypatch.setattr(
+        issue_driven.GitRepository, "open", lambda *args, **kwargs: repository
+    )
+    monkeypatch.setattr(
+        issue_driven.GitHubRepository, "open", lambda *args, **kwargs: github
+    )
+    workflow["prepare_run_repository"] = lambda **kwargs: SimpleNamespace(
+        execution_root=Path("/repo"), base_sha=base_sha
+    )
+
+    inspections: list[dict[str, object]] = []
+    inspect_topology = issue_driven.inspect_issue_driven_topology
+
+    def recorded_inspection(**kwargs: object):
+        inspections.append(kwargs)
+        return inspect_topology(**kwargs)
+
+    monkeypatch.setattr(
+        issue_driven, "inspect_issue_driven_topology", recorded_inspection
+    )
+    workflow["inspect_issue_driven_topology"] = recorded_inspection
+
+    config = workflow["parse_args"]()
+    original = config.issues[0]
+    assert original.task_fingerprint != revised.task_fingerprint
+    assert inspections == [
+        {
+            "repo": str(Path(__file__).parents[1]),
+            "integration_branch": config.integration_branch,
+            "issues": (
+                (
+                    "Mini task refresh-run-help",
+                    original.branch,
+                    original.task_fingerprint,
+                ),
+            ),
+            "prospective_base_branch": None,
+            "defer_inline_task_fingerprints": True,
+        }
+    ]
+
+    plan = workflow["WorkItemPlan"](config)
+    workflow["apply_planner_decision"](
+        plan,
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "action": "update",
+                        "key": "refresh-run-help",
+                        "task": revised_task,
+                    }
+                ],
+                "complete": False,
+                "policy_conflicts": [],
+            }
+        ),
+    )
+    dispatched = plan.take_next()
+    assert dispatched is not None
+    body = workflow["with_work_item_plan"]("Base PR", plan)
+    recovered = workflow["work_item_plan_from_body"](body, config)
+    recovered_issue = recovered.snapshot[0]
+
+    assert recovered_issue.task == revised_task
+    assert recovered_issue.task_fingerprint == dispatched.task_fingerprint
+    workflow["inspect_dynamic_work_item_topology"](recovered_issue, config)
+    assert inspections[-1]["issues"] == (
+        (
+            "Mini task refresh-run-help",
+            recovered_issue.branch,
+            recovered_issue.task_fingerprint,
+        ),
+    )
+    assert "defer_inline_task_fingerprints" not in inspections[-1]
+
+    child_pr = replace(
+        child_pr,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+    )
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        workflow["inspect_dynamic_work_item_topology"](recovered_issue, config)
 
 
 @pytest.mark.parametrize("final_review", [False, True])
@@ -1594,7 +1760,7 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
 
 def load_generated_workflow(**overrides: object) -> dict[str, object]:
     value = payload(**overrides)
-    if "one_shot_issue" in overrides:
+    if "one_shot_issue" in overrides or "work_items" in overrides:
         value.pop("issues")
     code = generate_issue_driven_workflow(parse(value))
     module_name = f"generated_handoff_workflow_{len(sys.modules)}"

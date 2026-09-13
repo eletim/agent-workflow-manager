@@ -64,7 +64,7 @@ REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
 SCENARIOS: tuple[str, ...] = ()
 READY_TIMEOUT = 120
-TURN_TIMEOUT = 3600
+TURN_TIMEOUT = 7200
 SHELL_TIMEOUT = 1800
 COMMAND_TIMEOUT = 30
 MERGE_TO_INTEGRATION = True
@@ -2531,8 +2531,8 @@ def persist_work_item_plan(
 
 
 def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
-    """Validate a non-seed item authoritatively before recording its dispatch."""
-    if issue in config.issues:
+    """Validate the plan-owned identity before recording its dispatch."""
+    if issue.number is not None and issue in config.issues:
         return
     declaration: tuple[int | str, str] | tuple[int | str, str, str]
     if issue.number is not None:

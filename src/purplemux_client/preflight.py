@@ -395,6 +395,7 @@ class WorkflowValidator:
                 "prospective_base_branch",
                 "remote",
                 "command_timeout_seconds",
+                "defer_inline_task_fingerprints",
             }
             for keyword in node.keywords:
                 if keyword.arg is None or keyword.arg not in allowed:
@@ -425,6 +426,9 @@ class WorkflowValidator:
             prospective = values.get("prospective_base_branch")
             remote = values.get("remote", "origin")
             timeout = values.get("command_timeout_seconds", 30.0)
+            defer_inline_task_fingerprints = values.get(
+                "defer_inline_task_fingerprints", False
+            )
             if (
                 not isinstance(repo, str)
                 or not isinstance(integration_branch, str)
@@ -433,6 +437,7 @@ class WorkflowValidator:
                 or not isinstance(remote, str)
                 or isinstance(timeout, bool)
                 or not isinstance(timeout, (int, float))
+                or not isinstance(defer_inline_task_fingerprints, bool)
             ):
                 issues.append(
                     ValidationIssue(
@@ -451,6 +456,7 @@ class WorkflowValidator:
                     prospective_base_branch=prospective,
                     remote=remote,
                     command_timeout_seconds=float(timeout),
+                    defer_inline_task_fingerprints=defer_inline_task_fingerprints,
                     _cwd=self._cwd,
                 )
             except (OSError, TypeError, ValueError, RuntimeError) as exc:
