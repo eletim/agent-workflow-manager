@@ -267,8 +267,11 @@ check implementation quality. Scope Review uses `scope_max_reviews`, which
 defaults to three when omitted; the recommended values are six for Scope Review
 and four for the Correctness and whole-version review limit. The higher
 recommended Scope limit reserves capacity for the required rechecks after
-Correctness fixes change the head. Whole-version Review retains its integration
-and cross-Issue responsibility.
+Correctness fixes change the head. Whole Review first applies any configured
+Scenario Gate, then runs both the integration/cross-Issue Whole-version reviewer
+and the independent Version / README reviewer on every eligible head. Findings
+from both reviewers are aggregated into one fix turn, and any changed head is
+reviewed again in the same order within the bounded whole-review loop.
 If a Correctness reviewer or fix changes the head,
 the prior Scope outcome is invalidated and the ordered Scope then Correctness
 sequence restarts on the new commit within the separate cumulative limits.

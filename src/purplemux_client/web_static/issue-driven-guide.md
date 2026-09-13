@@ -102,7 +102,11 @@ Each implementation work item is reviewed in two ordered phases. Scope / Design
 Review uses `scope_max_reviews` (default 3) to check that the change is necessary,
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
-safety, regressions, and tests; Whole-version Review also uses `max_reviews`.
+safety, regressions, and tests; Whole Review also uses `max_reviews`. After any
+configured Scenario Gate, each eligible integration head receives both the
+cross-Issue Whole-version review and an independent Version / README review, in
+that order. Their findings are aggregated into one fix turn, and a changed head
+repeats both reviews within the bounded loop.
 The recommended six/four allocation reserves Scope capacity for required rechecks
 whenever a Correctness fix changes the head. The counters and outcomes are
 independent. A phase that exhausts its limit may continue with an explicit warning

@@ -2247,38 +2247,47 @@ class PythonRunner:
             return self._snapshot_run(run)
 
     def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
-        """Delete only checked terminal-run records, without cleaning resources."""
+        """Delete checked terminal history after all owned resources are cleaned."""
         run_ids = tuple(confirmed_run_ids)
         if any(
             isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
             for run_id in run_ids
         ) or len(set(run_ids)) != len(run_ids):
             raise ValueError("run IDs must be unique positive integers")
+        confirmed_run_id_set = set(run_ids)
         with self._lock:
-            checked_terminal_run_ids = tuple(
+            cleaning_run_ids = tuple(
                 run.run_id
                 for run in self._runs.values()
-                if run.checked and run.state in ("success", "failed", "stopped")
-            )
-            cleaning_run_ids = tuple(
-                run_id
-                for run_id in checked_terminal_run_ids
-                if self._runs[run_id].cleanup_lock.locked()
+                if run.run_id in confirmed_run_id_set
+                and run.checked
+                and run.state in ("success", "failed", "stopped")
+                and run.cleanup_lock.locked()
             )
             if cleaning_run_ids:
                 raise RunDeletionNotAllowedError(
                     "cleanup is active for confirmed run(s): "
                     + ", ".join(str(run_id) for run_id in cleaning_run_ids)
                 )
-            if set(run_ids) != set(checked_terminal_run_ids):
-                raise RunDeletionNotAllowedError(
-                    "checked terminal runs changed; refresh and confirm deletion again"
+            deletable_run_ids = tuple(
+                run.run_id
+                for run in self._runs.values()
+                if run.checked
+                and run.state in ("success", "failed", "stopped")
+                and all(
+                    resource.cleanup_state == "cleaned" for resource in run.resources
                 )
-            if not checked_terminal_run_ids:
+            )
+            if confirmed_run_id_set != set(deletable_run_ids):
+                raise RunDeletionNotAllowedError(
+                    "only checked terminal runs with fully cleaned resources can be "
+                    "deleted; refresh and confirm deletion again"
+                )
+            if not deletable_run_ids:
                 return ()
 
             previous_runs = self._runs.copy()
-            for run_id in checked_terminal_run_ids:
+            for run_id in deletable_run_ids:
                 del self._runs[run_id]
             try:
                 self._write_run_history_locked()
@@ -2286,7 +2295,7 @@ class PythonRunner:
                 self._runs = previous_runs
                 raise
             self._mark_changed()
-            return checked_terminal_run_ids
+            return deletable_run_ids
 
     def _get_run(self, run_id: int) -> _RunRecord:
         try:

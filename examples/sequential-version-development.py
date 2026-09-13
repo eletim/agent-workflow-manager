@@ -2763,6 +2763,8 @@ def review_whole_version(
     delivery: ReviewDelivery | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
         result: str
+        review_results: list[str] = []
+        changes_requested = False
         if scenario_reviewer is not None:
             result, verdict = run_validated_turn(
                 client,
@@ -2804,6 +2806,8 @@ def review_whole_version(
                     f"approval invalidated at {scenario_sha}",
                 )
                 continue
+            review_results.append(result)
+            changes_requested = verdict == "CHANGES_REQUESTED"
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
@@ -2817,6 +2821,8 @@ def review_whole_version(
                 decision,
                 iteration=review_number,
             )
+            review_results.append(result)
+            changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
         emit_policy_conflicts(result, config, scope="the integrated version")
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
@@ -2848,47 +2854,54 @@ def review_whole_version(
                 f"approval invalidated at {reviewed_sha}",
             )
             continue
-        if verdict == "APPROVED":
-            result, verdict = run_validated_turn(
-                client,
-                version_readme_reviewer,
-                "Version / README reviewer turn",
-                policy_context(config, scope="the version and README review")
-                + version_readme_review_prompt(pr, config, work_items),
-                decision,
-                iteration=review_number,
+        version_result, version_verdict = run_validated_turn(
+            client,
+            version_readme_reviewer,
+            "Version / README reviewer turn",
+            policy_context(config, scope="the version and README review")
+            + version_readme_review_prompt(pr, config, work_items),
+            decision,
+            iteration=review_number,
+        )
+        review_results.append(version_result)
+        changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
+        emit_policy_conflicts(version_result, config, scope="the integrated version")
+        reviewed_sha, reviewer_changed = require_agent_result(
+            repo,
+            client,
+            fixer,
+            config.integration_branch,
+            pr.head_sha,
+            allow_unchanged=True,
+            iteration=review_number,
+        )
+        if reviewer_changed:
+            pushed = repo.ensure_pushed(
+                config.integration_branch, expected_local_sha=reviewed_sha
             )
-            emit_policy_conflicts(result, config, scope="the integrated version")
-            reviewed_sha, reviewer_changed = require_agent_result(
-                repo,
-                client,
-                fixer,
-                config.integration_branch,
-                pr.head_sha,
-                allow_unchanged=True,
-                iteration=review_number,
+            assert pushed.remote_sha is not None
+            pr = github.require_pr(
+                number=pr.number,
+                head=config.integration_branch,
+                base=config.main_branch,
+                state="OPEN",
+                expected_head_sha=pushed.remote_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
             )
-            if reviewer_changed:
-                pushed = repo.ensure_pushed(
-                    config.integration_branch, expected_local_sha=reviewed_sha
-                )
-                assert pushed.remote_sha is not None
-                pr = github.require_pr(
-                    number=pr.number,
-                    head=config.integration_branch,
-                    base=config.main_branch,
-                    state="OPEN",
-                    expected_head_sha=pushed.remote_sha,
-                    expected_base_sha=pr.base_sha,
-                    draft=True,
-                )
-                pr = ensure_base_pr_policy_notes(github, pr, config)
-                emit_finding(
-                    "git",
-                    "version and README review changed the integration branch; "
-                    f"approval invalidated at {reviewed_sha}",
-                )
-                continue
+            pr = ensure_base_pr_policy_notes(github, pr, config)
+            emit_finding(
+                "git",
+                "version and README review changed the integration branch; "
+                f"approval invalidated at {reviewed_sha}",
+            )
+            continue
+        result = "\n\n".join(
+            review_result
+            for review_result in review_results
+            if decision(review_result) == "CHANGES_REQUESTED"
+        )
+        verdict = "CHANGES_REQUESTED" if changes_requested else "APPROVED"
         current = github.require_pr(
             number=pr.number,
             head=config.integration_branch,

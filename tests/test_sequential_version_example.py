@@ -2079,7 +2079,7 @@ def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
     assert "ready" not in events
 
 
-def test_version_readme_findings_are_fixed_and_all_reviews_repeat(
+def test_whole_failures_do_not_consume_version_readme_review_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
@@ -2120,15 +2120,23 @@ def test_version_readme_findings_are_fixed_and_all_reviews_repeat(
         )
     )
     version_reviews = 0
+    whole_reviews = 0
+    fix_prompts: list[str] = []
 
     def run_turn(*args: object, **kwargs: object) -> str:
-        nonlocal version_reviews
+        nonlocal version_reviews, whole_reviews
         name = str(args[2])
         events.append(name)
+        if name == "Whole-version reviewer turn":
+            whole_reviews += 1
+            if whole_reviews == 1:
+                return "CHANGES_REQUESTED\nRepair the cross-Issue integration."
         if name == "Version / README reviewer turn":
             version_reviews += 1
             if version_reviews == 1:
                 return "CHANGES_REQUESTED\nRemove the obsolete CLI example."
+        if name == "Whole-version fixes":
+            fix_prompts.append(str(args[3]))
         return "APPROVED"
 
     monkeypatch.setitem(
@@ -2150,6 +2158,9 @@ def test_version_readme_findings_are_fixed_and_all_reviews_repeat(
     assert delivery.outcome == "approved"
     assert delivery.reviews == 2
     assert delivery.head_sha == fixed_sha
+    assert len(fix_prompts) == 1
+    assert "Repair the cross-Issue integration." in fix_prompts[0]
+    assert "Remove the obsolete CLI example." in fix_prompts[0]
     assert events == [
         "Whole-version reviewer turn",
         "Version / README reviewer turn",
@@ -2190,7 +2201,9 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     result_calls = iter(
         (
             (initial_sha, False),
+            (initial_sha, False),
             (fixed_sha, True),
+            (fixed_sha, False),
             (fixed_sha, False),
             (fixed_sha, False),
         )
@@ -2238,6 +2251,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     assert delivery.outcome == "continued_with_warning"
     assert delivery.head_sha == fixed_sha
     assert events.count("Whole-version reviewer turn") == 2
+    assert events.count("Version / README reviewer turn") == 2
     assert events.count("Whole-version fixes") == 1
     assert events[-2:] == ["final checks", f"safe:{fixed_sha}"]
     assert any(
