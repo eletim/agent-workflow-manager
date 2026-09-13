@@ -1030,8 +1030,8 @@ class PurpleMuxCLIClient:
         """Wait for a fresh completed turn and its structured result.
 
         The timeout is a warning threshold while the authoritative session state
-        remains busy. Once crossed in that state, monitoring continues until a
-        fresh completion or an authoritative failure is observed.
+        remains busy. Once crossed in that state, monitoring continues while it
+        stays busy. A subsequent non-busy state must publish a fresh result.
         """
         deadline = self._monotonic() + timeout_seconds
         baseline = self._turn_baselines.get(session_id)
@@ -1067,12 +1067,17 @@ class PurpleMuxCLIClient:
                     raise WorkerInterrupted(
                         f"session {session_id} turn was interrupted"
                     )
+            if busy_timeout_reported and state != "busy":
+                raise WorkerFailure(
+                    f"session {session_id} left busy after exceeding the agent "
+                    f"turn timeout without a fresh result (last cliState={state})"
+                )
             if not busy_timeout_reported and self._monotonic() >= deadline:
                 if state == "busy":
                     warning = (
                         f"session {session_id} exceeded the agent turn timeout of "
                         f"{timeout_seconds}s while still busy; continuing to monitor "
-                        "until completion or authoritative failure"
+                        "while the session remains busy"
                     )
                     if on_busy_timeout is None:
                         emit_finding("runtime", warning, status="warning")
