@@ -834,6 +834,34 @@ def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
     assert plan.position == 0
 
 
+@pytest.mark.parametrize("issue_number", [197, 225])
+def test_planner_already_implemented_skip_requires_current_code_evidence(
+    issue_number: int,
+) -> None:
+    workflow = load_generated_workflow(issues=[issue_number])
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (workflow["Issue"](issue_number, f"feature/issue-{issue_number}"),),
+        "true",
+    )
+
+    prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
+
+    assert f'"issue": {issue_number}' in prompt
+    assert "read its current\nIssue body" in prompt
+    assert (
+        "compare every requirement with the code on the current\nintegration branch"
+        in prompt
+    )
+    assert "earlier Issues and pull requests only as supporting\ncontext" in prompt
+    assert "existence of a related pull request is not sufficient evidence" in prompt
+    assert "files, symbols, or tests that satisfy the Issue requirements" in prompt
+    assert '"reason":"already implemented by #456"' not in prompt
+
+
 def test_planner_policy_conflicts_use_a_bounded_json_contract() -> None:
     workflow = load_generated_workflow(issues=[90], policy_issue=200)
     config = workflow["Config"](
