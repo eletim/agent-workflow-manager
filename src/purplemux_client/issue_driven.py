@@ -49,6 +49,7 @@ class IssueTopologyState:
     classification: IssueTopologyClassification
     feature_sha: str | None
     integration_sha: str
+    open_pr_number: int | None = None
 
 
 class _IssueGitRepository(Protocol):
@@ -194,7 +195,12 @@ def classify_issue_topology(
                 f"integration base {integration_sha} and is not already integrated"
             )
         return IssueTopologyState(
-            issue, branch, "recoverable", feature_sha, integration_sha
+            issue,
+            branch,
+            "recoverable",
+            feature_sha,
+            integration_sha,
+            open_pr.number if open_pr is not None else None,
         )
     except WorkerFailure as exc:
         label = _work_item_label(issue)
@@ -419,7 +425,11 @@ def recover_issue_driven_work_item_topology(
         _allow_missing_inline_task_fingerprints=True,
     )[0]
     label, branch, fingerprint = issue
-    if state.classification != "recoverable" or state.feature_sha is None:
+    if (
+        state.classification != "recoverable"
+        or state.feature_sha is None
+        or state.open_pr_number is None
+    ):
         return state
 
     preparation = _inspect_repository_declaration(
@@ -437,17 +447,19 @@ def recover_issue_driven_work_item_topology(
         repository.expected_github_slug,
         command_timeout_seconds=command_timeout_seconds,
     )
-    pr = github.find_pr(head=branch, base=integration_branch, state="OPEN")
-    if pr is None:
-        raise WorkerFailure(f"{label}: recoverable open PR disappeared")
-    current = github.require_pr(
-        number=pr.number,
-        head=branch,
-        base=integration_branch,
-        state="OPEN",
-        expected_head_sha=state.feature_sha,
-        expected_base_sha=state.integration_sha,
-    )
+    try:
+        current = github.require_pr(
+            number=state.open_pr_number,
+            head=branch,
+            base=integration_branch,
+            state="OPEN",
+            expected_head_sha=state.feature_sha,
+            expected_base_sha=state.integration_sha,
+        )
+    except WorkerFailure as exc:
+        raise WorkerFailure(
+            f"{label}: recoverable open PR #{state.open_pr_number} changed or disappeared"
+        ) from exc
     try:
         _require_inline_task_fingerprint(current, fingerprint)
         return state

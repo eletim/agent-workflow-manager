@@ -186,7 +186,37 @@ def test_issue_topology_with_current_base_and_expected_pr_is_recoverable() -> No
     )
 
     assert result.classification == "recoverable"
+    assert result.open_pr_number == 158
     assert result.feature_sha == feature_sha
+
+
+def test_recover_inline_task_topology_preserves_branch_only_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    branch = "feature/work-item-refresh-run-help"
+    state = issue_driven.IssueTopologyState(
+        "Mini task refresh-run-help",
+        branch,
+        "recoverable",
+        "f" * 40,
+        "b" * 40,
+    )
+    monkeypatch.setattr(
+        issue_driven, "inspect_issue_driven_topology", lambda **kwargs: (state,)
+    )
+    monkeypatch.setattr(
+        issue_driven,
+        "_inspect_repository_declaration",
+        lambda **kwargs: pytest.fail("branch-only recovery must not inspect a PR"),
+    )
+
+    recovered = issue_driven.recover_issue_driven_work_item_topology(
+        repo="acme/project",
+        integration_branch="dev/v1",
+        issue=("Mini task refresh-run-help", branch, "a" * 64),
+    )
+
+    assert recovered == state
 
 
 def test_issue_topology_uses_one_comparison_for_existing_branch() -> None:
@@ -312,6 +342,7 @@ def test_recover_inline_task_topology_restores_missing_fingerprint(
         "recoverable",
         pr.head_sha,
         pr.base_sha,
+        pr.number,
     )
     updates: list[str] = []
 
@@ -374,6 +405,7 @@ def test_recover_inline_task_topology_rejects_existing_different_fingerprint(
         "recoverable",
         pr.head_sha,
         pr.base_sha,
+        pr.number,
     )
     github = SimpleNamespace(
         find_pr=lambda **kwargs: pr,
@@ -398,6 +430,48 @@ def test_recover_inline_task_topology_rejects_existing_different_fingerprint(
     )
 
     with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        issue_driven.recover_issue_driven_work_item_topology(
+            repo="acme/project",
+            integration_branch="dev/v1",
+            issue=("Mini task refresh-run-help", branch, "a" * 64),
+        )
+
+
+def test_recover_inline_task_topology_detects_observed_pr_disappearance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    branch = "feature/work-item-refresh-run-help"
+    state = issue_driven.IssueTopologyState(
+        "Mini task refresh-run-help",
+        branch,
+        "recoverable",
+        "f" * 40,
+        "b" * 40,
+        158,
+    )
+    github = SimpleNamespace(
+        require_pr=lambda **kwargs: (_ for _ in ()).throw(
+            WorkerFailure("open PR does not exist")
+        )
+    )
+    monkeypatch.setattr(
+        issue_driven, "inspect_issue_driven_topology", lambda **kwargs: (state,)
+    )
+    monkeypatch.setattr(
+        issue_driven,
+        "_inspect_repository_declaration",
+        lambda **kwargs: SimpleNamespace(source_repository=Path("/repo")),
+    )
+    monkeypatch.setattr(
+        issue_driven.GitRepository,
+        "open",
+        lambda *args, **kwargs: SimpleNamespace(expected_github_slug="acme/project"),
+    )
+    monkeypatch.setattr(
+        issue_driven.GitHubRepository, "open", lambda *args, **kwargs: github
+    )
+
+    with pytest.raises(WorkerFailure, match="open PR #158 changed or disappeared"):
         issue_driven.recover_issue_driven_work_item_topology(
             repo="acme/project",
             integration_branch="dev/v1",
