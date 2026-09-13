@@ -164,8 +164,10 @@ it to 6. `max_reviews` controls Correctness and whole-version review.
 to values such as 10800. If the timeout is reached while PurpleMux still reports
 the Agent as `busy`, the workflow records a structured warning and continues
 monitoring while that state remains `busy`. When the Agent leaves `busy`, a fresh
-correlated result completes the turn; a missing or stale result fails the active
-workflow step. A timeout reached in any other non-complete state also fails it.
+correlated result completes the turn; the client allows up to 30 seconds for
+asynchronous result publication, then fails the active workflow step if the
+result remains missing or stale. A timeout reached in any other non-complete
+state also fails it.
 With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal

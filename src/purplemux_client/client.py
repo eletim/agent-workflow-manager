@@ -180,6 +180,7 @@ _RESULT_STATUSES = {
 }
 _SHELL_DIAGNOSTIC_MAX_LINES = 40
 _SHELL_DIAGNOSTIC_MAX_BYTES = 2_500
+_TURN_RESULT_PUBLICATION_GRACE_SECONDS = 30.0
 WORKFLOW_HOST_WORKSPACE_ENV = "AGENT_WORKFLOW_MANAGER_HOST_WORKSPACE_ID"
 
 
@@ -1031,7 +1032,8 @@ class PurpleMuxCLIClient:
 
         The timeout is a warning threshold while the authoritative session state
         remains busy. Once crossed in that state, monitoring continues while it
-        stays busy. A subsequent non-busy state must publish a fresh result.
+        stays busy. A subsequent non-busy state gets a bounded grace period to
+        publish a fresh result.
         """
         deadline = self._monotonic() + timeout_seconds
         baseline = self._turn_baselines.get(session_id)
@@ -1040,6 +1042,7 @@ class PurpleMuxCLIClient:
         saw_busy = False
         last_state = "unknown"
         busy_timeout_reported = False
+        result_publication_deadline: float | None = None
         while True:
             status = self._status(session_id)
             state = self._state(status, session_id)
@@ -1047,6 +1050,14 @@ class PurpleMuxCLIClient:
             self._raise_abnormal_state(session_id, state, status)
             if self._is_fresh_interrupt(status, baseline):
                 raise WorkerInterrupted(f"session {session_id} turn was interrupted")
+            if (
+                busy_timeout_reported
+                and result_publication_deadline is None
+                and state != "busy"
+            ):
+                result_publication_deadline = (
+                    self._monotonic() + _TURN_RESULT_PUBLICATION_GRACE_SECONDS
+                )
             if state == "busy":
                 saw_busy = True
             elif state == "inactive":
@@ -1067,11 +1078,18 @@ class PurpleMuxCLIClient:
                     raise WorkerInterrupted(
                         f"session {session_id} turn was interrupted"
                     )
-            if busy_timeout_reported and state != "busy":
-                raise WorkerFailure(
-                    f"session {session_id} left busy after exceeding the agent "
-                    f"turn timeout without a fresh result (last cliState={state})"
-                )
+            if busy_timeout_reported:
+                if (
+                    result_publication_deadline is not None
+                    and self._monotonic() >= result_publication_deadline
+                ):
+                    raise WorkerFailure(
+                        f"session {session_id} did not publish a fresh result within "
+                        f"{_TURN_RESULT_PUBLICATION_GRACE_SECONDS:g}s after leaving "
+                        f"busy (last cliState={state})"
+                    )
+                self._sleep(self.poll_interval_seconds)
+                continue
             if not busy_timeout_reported and self._monotonic() >= deadline:
                 if state == "busy":
                     warning = (

@@ -905,7 +905,7 @@ def test_busy_turn_timeout_emits_structured_warning_by_default(
             (category, message, status)
         ),
     )
-    times = iter([0.0, 1.0])
+    times = iter([0.0, 1.0, 2.0])
     cli = client(runner, monotonic=lambda: next(times))
 
     cli.send_input("tab-1", "work")
@@ -941,38 +941,38 @@ def test_authoritative_failure_after_busy_timeout_still_fails() -> None:
     assert len(warnings) == 1
 
 
-def test_idle_with_stale_result_after_busy_timeout_fails() -> None:
+def test_idle_with_stale_result_after_busy_timeout_fails_after_grace() -> None:
+    stale_idle = {
+        "cliState": "idle",
+        "alive": True,
+        "eventSeq": 1,
+        "lastEvent": {"name": "stop", "seq": 1},
+    }
+    stale_result = {
+        "status": "completed",
+        "text": "stale",
+        "completionTimestamp": 1,
+    }
     runner = FakeRunner(
         [
             *baseline(),
             completed({"status": "sent"}),
             completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
-            completed(
-                {
-                    "cliState": "idle",
-                    "alive": True,
-                    "eventSeq": 1,
-                    "lastEvent": {"name": "stop", "seq": 1},
-                }
-            ),
-            completed(
-                {
-                    "status": "completed",
-                    "text": "stale",
-                    "completionTimestamp": 1,
-                }
-            ),
+            completed(stale_idle),
+            completed(stale_result),
+            completed(stale_idle),
+            completed(stale_result),
         ]
     )
-    times = iter([0.0, 1.0])
+    times = iter([0.0, 1.0, 2.0, 3.0, 32.0])
     cli = client(runner, monotonic=lambda: next(times))
 
     cli.send_input("tab-1", "work")
-    with pytest.raises(WorkerFailure, match="left busy.*without a fresh result"):
+    with pytest.raises(WorkerFailure, match="within 30s after leaving busy"):
         cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=lambda _: None)
 
 
-def test_ready_without_published_result_after_busy_timeout_fails() -> None:
+def test_ready_result_lag_after_busy_timeout_eventually_completes() -> None:
     ready = {
         "cliState": "ready-for-review",
         "alive": True,
@@ -987,13 +987,50 @@ def test_ready_without_published_result_after_busy_timeout_fails() -> None:
             completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
             completed(ready),
             completed({"status": "not-ready", "completionTimestamp": None}),
+            completed(ready),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "published after lag",
+                    "completionTimestamp": 2,
+                }
+            ),
         ]
     )
-    times = iter([0.0, 1.0])
+    times = iter([0.0, 1.0, 2.0, 3.0])
     cli = client(runner, monotonic=lambda: next(times))
 
     cli.send_input("tab-1", "work")
-    with pytest.raises(WorkerFailure, match="left busy.*without a fresh result"):
+    cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=lambda _: None)
+
+    assert cli.read_result("tab-1") == "published after lag"
+
+
+def test_ready_result_lag_after_busy_timeout_fails_when_grace_expires() -> None:
+    ready = {
+        "cliState": "ready-for-review",
+        "alive": True,
+        "eventSeq": 3,
+        "readyForReviewAt": 200,
+        "lastEvent": {"name": "stop", "seq": 3},
+    }
+    not_ready = {"status": "not-ready", "completionTimestamp": None}
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(ready),
+            completed(not_ready),
+            completed(ready),
+            completed(not_ready),
+        ]
+    )
+    times = iter([0.0, 1.0, 2.0, 3.0, 32.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="within 30s after leaving busy"):
         cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=lambda _: None)
 
 

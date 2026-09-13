@@ -704,9 +704,10 @@ interrupted, unavailable, or not-ready results.
 
 The turn timeout is a warning threshold when the authoritative `cliState` is
 still `busy`: the client emits a structured warning and keeps monitoring until
-the session leaves `busy`. It then accepts a fresh correlated result or fails if
-the result is missing or stale. Pass `on_busy_timeout` when the workflow also
-needs to retain the warning in its own summary or human handoff data.
+the session leaves `busy`. It then allows up to 30 seconds for a fresh correlated
+result to be published before failing on missing or stale data. Pass
+`on_busy_timeout` when the workflow also needs to retain the warning in its own
+summary or human handoff data.
 
 `capture_screen` is diagnostic pane text only. It may be printed or retained for
 failure inspection, but never parse it to decide completion, approval, or the
