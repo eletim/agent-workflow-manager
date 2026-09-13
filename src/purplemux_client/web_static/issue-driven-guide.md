@@ -249,8 +249,11 @@ SHA-containment, and fingerprint checks before its dispatch is persisted.
 The generated Python embeds the mini-task instruction and uses the deterministic
 branch `feature/work-item-refresh-run-help`. Its recovery declaration and Draft
 PR record the SHA-256 fingerprint of the authoritative task text, and recovery
-fails if the PR fingerprint is missing or different. Implementers and both review
-phases receive that embedded instruction instead of running `gh issue view`.
+fails if the PR fingerprint is different. During Review & Resume, a dispatched
+task recovered from the persisted `WorkItemPlan` may restore a completely missing
+marker after its branch, PR head/base, and integration topology all match. Fresh
+dispatches and malformed or different markers still fail closed. Implementers and
+both review phases receive that embedded instruction instead of running `gh issue view`.
 GitHub Issue work items continue to use `feature/issue-N` and read Issue `N` with
 `gh`. Both forms use the same recovery, Draft PR, review, and delivery functions.
 

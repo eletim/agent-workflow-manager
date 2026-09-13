@@ -40,6 +40,7 @@ from purplemux_client import (
     emit_step,
     emit_whole_review_result,
     inspect_issue_driven_work_item_topology,
+    recover_issue_driven_work_item_topology,
     run_correlation,
 )
 
@@ -187,6 +188,16 @@ class Config:
     check_command: str
     policy_issue: int | None = None
     one_shot_issue: int | None = None
+
+
+@dataclass(frozen=True)
+class AgentTurnTimeoutWarning:
+    result_scope: int | str | None
+    turn_name: str
+    message: str
+
+
+AGENT_TURN_TIMEOUT_WARNINGS: list[AgentTurnTimeoutWarning] = []
 
 
 @dataclass(frozen=True)
@@ -437,6 +448,7 @@ def run_turn(
     *,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
 ) -> str:
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
@@ -448,10 +460,22 @@ def run_turn(
         **navigation,
     )
     terminal_progress("START", name, iteration=iteration)
+
+    def warn_busy_timeout(warning: str) -> None:
+        contextual = AgentTurnTimeoutWarning(
+            warning_scope, name, f"{name}: {warning}"
+        )
+        if contextual not in AGENT_TURN_TIMEOUT_WARNINGS:
+            AGENT_TURN_TIMEOUT_WARNINGS.append(contextual)
+        print(f"WARN: {contextual.message}", flush=True)
+        emit_finding("runtime", contextual.message, status="warning")
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
-        client.wait_for_turn_completion(tab, TURN_TIMEOUT)
+        client.wait_for_turn_completion(
+            tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
+        )
         result = client.read_result(tab)
     except BaseException as exc:
         emit_step(
@@ -489,9 +513,18 @@ def run_validated_turn(
     *,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
-    result = run_turn(client, tab, name, prompt, iteration=iteration, pr=pr)
+    result = run_turn(
+        client,
+        tab,
+        name,
+        prompt,
+        iteration=iteration,
+        pr=pr,
+        warning_scope=warning_scope,
+    )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
         try:
             return result, validator(result)
@@ -514,6 +547,7 @@ def run_validated_turn(
                 "session; do not repeat the underlying task or mutate any state.",
                 iteration=correction + 1,
                 pr=pr,
+                warning_scope=warning_scope,
             )
     raise AssertionError("unreachable")
 
@@ -653,6 +687,11 @@ def summary_warnings(
 ) -> tuple[str, ...]:
     """Keep the result event narrow while retaining its primary warnings."""
     warnings = list(additional)
+    warnings.extend(
+        warning.message
+        for warning in AGENT_TURN_TIMEOUT_WARNINGS
+        if warning.result_scope == issue_number
+    )
     warnings.extend(
         warning
         for warning_issue, warning in POLICY_CONFLICT_WARNINGS
@@ -831,7 +870,8 @@ def warn_human_handoff(message: str) -> None:
 
 
 def human_handoff_warnings(delivery: ReviewDelivery) -> tuple[str, ...]:
-    warnings = list(delivery.warnings)
+    warnings = [warning.message for warning in AGENT_TURN_TIMEOUT_WARNINGS]
+    warnings.extend(delivery.warnings)
     for item in ISSUE_HANDOFF_RESULTS:
         warnings.extend(item.warnings)
     warnings.extend(warning for _, warning in POLICY_CONFLICT_WARNINGS)
@@ -1201,6 +1241,7 @@ def require_clean_worktree(
     *,
     context: str,
     iteration: int | None = None,
+    warning_scope: int | str | None = None,
 ) -> None:
     state = repo.inspect_worktree()
     if not state.dirty:
@@ -1223,6 +1264,7 @@ and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve."""),
         iteration=iteration,
+        warning_scope=warning_scope,
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -1245,6 +1287,7 @@ def require_agent_result(
     *,
     allow_unchanged: bool,
     iteration: int | None = None,
+    warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
     repo.require_current_branch(branch)
     require_clean_worktree(
@@ -1253,6 +1296,7 @@ def require_agent_result(
         tab,
         context=f"verifying the coding result on {branch!r}",
         iteration=iteration,
+        warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
         branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
@@ -1595,6 +1639,7 @@ def review_issue_phase(
             decision,
             iteration=review_number,
             pr=pr,
+            warning_scope=issue.result_id,
         )
         emit_policy_conflicts(
             result,
@@ -1619,6 +1664,7 @@ def review_issue_phase(
             current.head_sha,
             allow_unchanged=True,
             iteration=review_number,
+            warning_scope=issue.result_id,
         )
         if reviewer_changed:
             pushed = repo.ensure_pushed(issue.branch, expected_local_sha=reviewed_sha)
@@ -1685,6 +1731,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             ),
             iteration=review_number,
             pr=pr,
+            warning_scope=issue.result_id,
         )
         emit_policy_conflicts(
             fix_result,
@@ -1700,6 +1747,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             current.head_sha,
             allow_unchanged=True,
             iteration=review_number,
+            warning_scope=issue.result_id,
         )
         if not changed:
             warning = (
@@ -1766,6 +1814,7 @@ def process_issue(
             client,
             cleanup,
             context=f"preparing {issue.label}",
+            warning_scope=issue.result_id,
         )
     prepared = prepare_issue(repo, github, issue, config)
     if isinstance(prepared, PullRequestState):
@@ -1837,6 +1886,7 @@ def process_issue(
         f"{issue.label} implementation",
         implementation_prompt,
         pr=existing_pr,
+        warning_scope=issue.result_id,
     )
     emit_policy_conflicts(
         implementation_result,
@@ -1851,6 +1901,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
     if integration.remote_sha is None:
@@ -2537,7 +2588,9 @@ def persist_work_item_plan(
     )
 
 
-def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
+def inspect_dynamic_work_item_topology(
+    issue: Issue, config: Config, *, recover_missing_inline_identity: bool = False
+) -> None:
     """Validate the plan-owned identity before recording its dispatch."""
     if issue.number is not None and issue in config.issues:
         return
@@ -2551,7 +2604,12 @@ def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
             issue.branch,
             issue.task_fingerprint,
         )
-    inspect_issue_driven_work_item_topology(
+    inspect_topology = (
+        recover_issue_driven_work_item_topology
+        if recover_missing_inline_identity and issue.number is None
+        else inspect_issue_driven_work_item_topology
+    )
+    inspect_topology(
         repo=str(config.repo),
         integration_branch=config.integration_branch,
         issue=declaration,
@@ -2568,7 +2626,9 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
-        inspect_dynamic_work_item_topology(recovered_issue, config)
+        inspect_dynamic_work_item_topology(
+            recovered_issue, config, recover_missing_inline_identity=True
+        )
         run_outline_step(
             recovered_issue.label,
             lambda issue=recovered_issue: process_issue(
@@ -3320,6 +3380,7 @@ def run_repository(
     deferred_deliveries: list[RepositoryDelivery] | None = None,
 ) -> PullRequestState | None:
     POLICY_CONFLICT_WARNINGS.clear()
+    AGENT_TURN_TIMEOUT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
     emit_issue_driven_context(
         config.slug,

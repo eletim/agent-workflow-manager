@@ -2005,16 +2005,28 @@ class PythonRunner:
     def _register_managed_workspace(
         self, run: _RunRecord, workspace: WorkspaceState, correlation: str
     ) -> None:
+        workspace_metadata = {
+            "name": workspace.name,
+            "directories": "\n".join(workspace.directories),
+            "correlation_id": correlation,
+        }
+        if workspace.initial_tab_discovery_pending:
+            workspace_metadata["initial_tab_discovery"] = "pending"
+        elif workspace.initial_tab is not None:
+            workspace_metadata.update(
+                {
+                    "initial_tab_id": workspace.initial_tab.id,
+                    "initial_tab_name": workspace.initial_tab.name,
+                    "initial_tab_panel_type": workspace.initial_tab.panel_type or "",
+                    "initial_tab_provider": workspace.initial_tab.provider or "",
+                }
+            )
         self._register_resource(
             run,
             RunResource(
                 "purplemux_workspace",
                 workspace.id,
-                {
-                    "name": workspace.name,
-                    "directories": "\n".join(workspace.directories),
-                    "correlation_id": correlation,
-                },
+                workspace_metadata,
             ),
         )
 
@@ -2530,12 +2542,20 @@ class PythonRunner:
     def _resource_cleanup_priority(resource: RunResource) -> int:
         return {
             "purplemux_tab": 0,
-            "managed_shell_result": 1,
-            "purplemux_workspace": 2,
-            "git_worktree": 3,
-        }.get(resource.kind, 3)
+            "purplemux_initial_tab": 1,
+            "managed_shell_result": 2,
+            "purplemux_workspace": 3,
+            "git_worktree": 4,
+        }.get(resource.kind, 4)
 
     def _cleanup_resource(self, resource: RunResource) -> None:
+        if resource.kind == "purplemux_initial_tab":
+            if self._unresolved_initial_tab_is_absent(resource):
+                return
+            raise OSError(
+                "PurpleMux initial tab identity was not returned by workspace creation; "
+                "refusing shape-based cleanup"
+            )
         if resource.kind == "purplemux_tab":
             workspace_id = resource.metadata.get("workspace_id")
             if not workspace_id:
@@ -2600,6 +2620,8 @@ class PythonRunner:
 
     @staticmethod
     def _resource_is_absent(resource: RunResource) -> bool:
+        if resource.kind == "purplemux_initial_tab":
+            return PythonRunner._unresolved_initial_tab_is_absent(resource)
         if resource.kind == "purplemux_tab":
             workspace_id = resource.metadata.get("workspace_id")
             if not workspace_id:
@@ -2637,6 +2659,34 @@ class PythonRunner:
             )
             return not registered and not os.path.lexists(resource.identity)
         raise OSError(f"unsupported run resource kind: {resource.kind}")
+
+    @staticmethod
+    def _unresolved_initial_tab_is_absent(resource: RunResource) -> bool:
+        workspace_id = resource.metadata.get("workspace_id")
+        if not workspace_id or workspace_id != resource.identity:
+            raise OSError("PurpleMux initial tab checkpoint lacks workspace identity")
+        selected = next(
+            (
+                workspace
+                for workspace in PurpleMuxRuntime().list_workspaces()
+                if workspace.id == workspace_id
+            ),
+            None,
+        )
+        if selected is None:
+            return True
+        if selected.name != resource.metadata.get("workspace_name"):
+            raise OSError(
+                "PurpleMux workspace name changed before initial tab reconciliation"
+            )
+        expected_directories = resource.metadata.get("workspace_directories")
+        if expected_directories is None or selected.directories != tuple(
+            expected_directories.splitlines()
+        ):
+            raise OSError(
+                "PurpleMux workspace directories changed before initial tab reconciliation"
+            )
+        return not PurpleMuxCLIClient(workspace_id).list_sessions()
 
     @staticmethod
     def _cleanup_managed_shell_result(resource: RunResource) -> None:
@@ -3583,6 +3633,36 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+        if resource.kind != "purplemux_workspace":
+            return
+        if resource.metadata.get("initial_tab_discovery") == "pending":
+            initial_resource = RunResource(
+                "purplemux_initial_tab",
+                resource.identity,
+                {
+                    "workspace_id": resource.identity,
+                    "workspace_name": resource.metadata.get("name", ""),
+                    "workspace_directories": resource.metadata.get("directories", ""),
+                },
+                repository_index=resource.repository_index,
+            )
+        else:
+            initial_tab_id = resource.metadata.get("initial_tab_id")
+            if not initial_tab_id:
+                return
+            initial_resource = RunResource(
+                "purplemux_tab",
+                initial_tab_id,
+                {
+                    "workspace_id": resource.identity,
+                    "name": resource.metadata.get("initial_tab_name", ""),
+                    "panel_type": resource.metadata.get("initial_tab_panel_type", ""),
+                    "provider": resource.metadata.get("initial_tab_provider", ""),
+                    "origin": "workspace_initial",
+                },
+                repository_index=resource.repository_index,
+            )
+        run.resources.append(initial_resource)
 
     @classmethod
     def _with_resource_repository(
@@ -3613,7 +3693,7 @@ class PythonRunner:
             )
             if parent is not None:
                 return parent.repository_index
-        elif resource.kind == "purplemux_tab":
+        elif resource.kind in ("purplemux_tab", "purplemux_initial_tab"):
             workspace_id = resource.metadata.get("workspace_id")
             parent = next(
                 (

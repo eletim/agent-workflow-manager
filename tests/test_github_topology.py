@@ -746,6 +746,39 @@ def test_update_pr_body_preserves_exact_review_topology(draft: bool) -> None:
     assert any("PATCH" in call for call in runner.calls)
 
 
+def test_update_pr_body_rechecks_required_draft_state_before_dispatch() -> None:
+    runner = FakeGitHubRunner([pr_data(1, body="Old")])
+    queue_checks = 0
+
+    def become_ready_after_initial_check(
+        args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal queue_checks
+        completed = runner(args, **kwargs)  # type: ignore[arg-type]
+        if any("mergeQueueEntry" in value for value in args):
+            queue_checks += 1
+            if queue_checks == 1:
+                runner.prs[0]["draft"] = False
+        return completed
+
+    repo = repository(runner)
+    repo._runner = become_ready_after_initial_check  # type: ignore[assignment]
+
+    with pytest.raises(PullRequestTopologyError, match="Draft state"):
+        repo.update_pr_body(
+            1,
+            body="New policy context",
+            expected_head="feature/65",
+            expected_head_sha=HEAD_SHA,
+            expected_base="dev/v0.1.4",
+            expected_base_sha=BASE_SHA,
+            draft=True,
+        )
+
+    assert runner.prs[0]["body"] == "Old"
+    assert not any("PATCH" in call for call in runner.calls)
+
+
 @pytest.mark.parametrize(
     "outcome",
     ["timeout_after_apply", "malformed_after_apply", "nonzero_after_apply"],

@@ -161,8 +161,14 @@ limit of 3 and controls only Scope / Design Review; the recommended samples set
 it to 6. `max_reviews` controls Correctness and whole-version review.
 `turn_timeout` is the agent-turn timeout in seconds from 1 through
 9,007,199,254,740,991 and defaults to 7200 when omitted; longer runs can set it
-to values such as 10800. A timeout continues to fail the active workflow step
-through the existing failure path.
+to values such as 10800. If the timeout is reached while PurpleMux still reports
+the Agent as `busy`, the workflow records a structured warning and continues
+monitoring while that state remains `busy`. When the Agent leaves `busy`, a fresh
+correlated result completes the turn; the client allows up to 30 seconds for
+asynchronous result publication, then fails the active workflow step if the
+result remains missing or stale. Returning to `busy` cancels that grace window;
+the next transition out starts a new one. A timeout reached in any other
+non-complete state also fails the step.
 With `make_integration_branch: true`, the workflow creates and pushes a missing
 integration branch from the exact remote `final_branch` HEAD. An existing branch
 is reused only when it contains that exact starting commit and passes the normal
@@ -333,7 +339,10 @@ create. The adapter supports:
 Turn completion is correlated with `eventSeq`, `readyForReviewAt`, and
 `completionTimestamp`. Stale results are rejected, including when the
 ready-for-review UI is dismissed back to idle. Needs-input, dead/error states,
-and interruptions are explicit. Read-only CLI timeouts can be retried;
+and interruptions are explicit. The turn timeout is a warning threshold while
+the authoritative state remains `busy`; the optional `on_busy_timeout` callback
+can retain that warning in workflow-specific summaries and handoffs. Read-only
+CLI timeouts can be retried;
 mutation timeouts raise `MutationOutcomeUnknown` because the remote outcome is
 unknown. Screen capture is never used to decide completion or as a result
 fallback.
@@ -482,13 +491,21 @@ registration-free by default. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/cleanup` releases registered resources without deleting
-run history. Workspace release requires
-PurpleMux's public atomic `workspace delete -w ID --if-empty` CLI contract;
-startup rejects unsupported versions so canonical Cleanup cannot be stranded
-behind an incompatible runtime. Multi-repository resources retain their repository
-ownership: a cleanup failure blocks dependent resources in that repository while
-cleanup of the other repositories continues. Single-repository and unscoped
-resource cleanup keeps the same dependency ordering and failure behavior. The
+run history. For a newly created run-owned workspace, AWM records the single
+canonical initial/default tab separately, closes it after explicitly created
+run tabs, and does not claim ambiguous or non-default tabs. The required public
+workspace-create response supplies that initial tab identity, which is persisted
+atomically with workspace ownership. If the response is lost or omits it,
+Cleanup retains an unresolved result instead of inferring ownership from the
+shape of a later tab listing. That result is cleared only when authoritative
+state proves the workspace absent or empty. Workspace release
+requires PurpleMux's public atomic
+`workspace delete -w ID --if-empty` CLI contract; startup rejects unsupported
+versions so canonical Cleanup cannot be stranded behind an incompatible runtime.
+Multi-repository resources retain their repository ownership: a cleanup failure
+blocks dependent resources in that repository while cleanup of the other
+repositories continues. Single-repository and unscoped resource cleanup keeps
+the same dependency ordering and failure behavior. The
 original `/api/status`, `/api/output`, and `/api/stop` routes remain available and
 address the most recently created run. `GET /api/events` streams revision-only
 SSE change notifications; initial load, notifications, and reconnects all

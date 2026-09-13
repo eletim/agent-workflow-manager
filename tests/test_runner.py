@@ -773,6 +773,38 @@ register_run_resource("purplemux_tab", "tab-1", {
     assert result.as_json()["resourceCleanupStatus"] == "retained"
 
 
+def test_workspace_event_atomically_expands_authoritative_initial_tab(
+    runner: PythonRunner,
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-1", {
+    "name": "Owned",
+    "directories": "/tmp/worktree",
+    "initial_tab_id": "tab-initial",
+    "initial_tab_name": "",
+    "initial_tab_panel_type": "",
+    "initial_tab_provider": "",
+})
+"""
+    )
+
+    result = wait_until_finished(runner)
+
+    assert [(item.kind, item.identity) for item in result.resources] == [
+        ("purplemux_workspace", "ws-1"),
+        ("purplemux_tab", "tab-initial"),
+    ]
+    assert result.resources[1].metadata == {
+        "workspace_id": "ws-1",
+        "name": "",
+        "panel_type": "",
+        "provider": "",
+        "origin": "workspace_initial",
+    }
+
+
 def test_explicit_cleanup_uses_dependency_order_and_keeps_run_history(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -780,6 +812,9 @@ def test_explicit_cleanup_uses_dependency_order_and_keeps_run_history(
         """
 from purplemux_client import register_run_resource
 register_run_resource("purplemux_workspace", "ws-1", {"name": "Owned"})
+register_run_resource("purplemux_tab", "tab-initial", {
+    "workspace_id": "ws-1", "origin": "workspace_initial"
+})
 register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
 register_run_resource("purplemux_tab", "tab-2", {"workspace_id": "ws-1"})
 register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo"})
@@ -798,6 +833,7 @@ register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo
     assert cleaned == [
         ("purplemux_tab", "tab-2"),
         ("purplemux_tab", "tab-1"),
+        ("purplemux_tab", "tab-initial"),
         ("purplemux_workspace", "ws-1"),
         ("git_worktree", "/tmp/worktree"),
     ]
