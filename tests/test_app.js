@@ -549,7 +549,7 @@ test("history checked toggle restores authoritative state after failure", async 
   assert.match(elements.stderr.textContent, /check failed/);
 });
 
-test("checked run deletion shows the eligible count and clears deleted detail", async () => {
+test("checked run deletion shows the checked count and clears deleted detail", async () => {
   const runs = [
     {
       runId: 1, state: "success", cwd: "/work/one", checked: true,
@@ -628,7 +628,7 @@ test("checked run deletion stops when confirmation is cancelled", async () => {
   assert.match(selectedRun(elements).textContent, /#1/);
 });
 
-test("checked run deletion excludes runs with retained resources", async () => {
+test("checked run deletion includes older runs with retained resources", async () => {
   const retained = {
     runId: 1, state: "success", cwd: "/work/one", checked: true,
     resourceCleanupStatus: "retained",
@@ -638,7 +638,7 @@ test("checked run deletion excludes runs with retained resources", async () => {
     resourceCleanupStatus: "cleaned",
   };
   const runs = [retained, cleaned];
-  const {elements} = await loadApp({
+  const {calls, elements, eventSource} = await loadApp({
     runs,
     details: {
       1: snapshot(retained),
@@ -647,16 +647,24 @@ test("checked run deletion excludes runs with retained resources", async () => {
     validation: {status: 200, body: {validation: []}},
     fetchOverride(url, options) {
       if (url !== "/api/runs/delete-checked") return undefined;
-      assert.deepEqual(JSON.parse(options.body), {runIds: [2]});
-      runs.pop();
-      return response({deletedCount: 1, deletedRunIds: [2]});
+      assert.deepEqual(JSON.parse(options.body), {runIds: [1, 2]});
+      runs.splice(0, runs.length);
+      return response({deletedCount: 2, deletedRunIds: [1, 2]});
     },
   });
 
-  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (1)");
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
+  await runItem(elements, 1).dispatch("click");
+  assert.match(selectedRun(elements).textContent, /#1/);
+  const listRequestsBeforeReload = calls.filter(([url]) => url === "/api/runs").length;
+  eventSource.emit("runner-change");
+  await waitFor(() => (
+    calls.filter(([url]) => url === "/api/runs").length > listRequestsBeforeReload
+  ));
+  assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
   await elements["delete-checked-runs"].dispatch("click");
   assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
-  assert.match(runItem(elements, 1).textContent, /#1/);
+  assert.equal(elements["run-list"].children.length, 0);
 });
 
 test("external checked history deletion clears stale selected detail", async () => {
