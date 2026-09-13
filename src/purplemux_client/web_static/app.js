@@ -11,6 +11,9 @@ const issueDrivenPython = document.querySelector("#issue-driven-python");
 const issueDrivenGenerate = document.querySelector("#issue-driven-generate");
 const issueDrivenSuccess = document.querySelector("#issue-driven-success");
 const issueDrivenValidation = document.querySelector("#issue-driven-validation");
+const repositoryConfigAdd = document.querySelector("#repository-config-add");
+const repositoryConfigList = document.querySelector("#repository-config-list");
+const repositoryConfigMessage = document.querySelector("#repository-config-message");
 const promptAgent = document.querySelector("#prompt-agent");
 const promptCwd = document.querySelector("#prompt-cwd");
 const promptText = document.querySelector("#prompt-text");
@@ -200,6 +203,146 @@ function runningFaviconHref() {
   return runningFaviconHrefPromise;
 }
 
+function issueDrivenRepositories(config) {
+  if (Array.isArray(config?.repositories)) return config.repositories;
+  if (config && typeof config === "object" && "repository" in config) return [config];
+  return [];
+}
+
+function invalidateIssueDrivenDraft() {
+  issueDrivenRequestGeneration += 1;
+  issueDrivenPython.value = "";
+  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+  issueDrivenSuccess.hidden = true;
+  issueDrivenValidation.replaceChildren();
+}
+
+function updateRepositoryConfig(index, key, value) {
+  let config;
+  try {
+    config = JSON.parse(issueDrivenJson.value);
+  } catch {
+    return;
+  }
+  const repositories = issueDrivenRepositories(config);
+  const repository = repositories[index];
+  if (repository == null || typeof repository !== "object") return;
+  repository[key] = value;
+  issueDrivenJson.value = JSON.stringify(config, null, 2);
+  invalidateIssueDrivenDraft();
+}
+
+function repositoryField(card, labelText, value, onInput, className = "") {
+  const field = document.createElement("div");
+  field.className = `context-field ${className}`.trim();
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value;
+  input.readOnly = activeRunId !== null;
+  input.addEventListener("input", () => onInput(input.value));
+  field.append(label, input);
+  card.append(field);
+  return input;
+}
+
+function renderRepositoryConfigs() {
+  repositoryConfigList.replaceChildren();
+  repositoryConfigMessage.hidden = true;
+  repositoryConfigMessage.textContent = "";
+  repositoryConfigAdd.disabled = activeRunId !== null;
+  let config;
+  try {
+    config = JSON.parse(issueDrivenJson.value);
+  } catch {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON to edit repository settings here.";
+    return;
+  }
+  const repositories = issueDrivenRepositories(config);
+  if (repositories.length === 0) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Add a repository declaration to the Issue Driven JSON.";
+    return;
+  }
+  const renderable = repositories.every((repository) => (
+    repository !== null
+    && typeof repository === "object"
+    && !Array.isArray(repository)
+    && (
+      !("work_items" in repository)
+      || (
+        Array.isArray(repository.work_items)
+        && repository.work_items.every((item) => (
+          typeof item === "number"
+          || (item !== null && typeof item === "object" && !Array.isArray(item))
+        ))
+      )
+    )
+  ));
+  if (!renderable) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON to edit repository settings here.";
+    return;
+  }
+  repositories.forEach((repository, index) => {
+    const card = document.createElement("section");
+    card.className = "repository-config-card";
+    const heading = document.createElement("div");
+    heading.className = "repository-config-card-heading";
+    const title = document.createElement("span");
+    title.className = "repository-config-title";
+    const repositoryName = repository.repository;
+    title.textContent = `Repository ${index + 1}${repositoryName ? ` · ${repositoryName}` : ""}`;
+    heading.append(title);
+    if (activeRunId === null && repositories.length > 1) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "repository-config-remove";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", () => {
+        repositories.splice(index, 1);
+        if (repositories.length === 1) {
+          const remaining = repositories[0];
+          delete config.repositories;
+          Object.assign(config, remaining);
+        }
+        issueDrivenJson.value = JSON.stringify(config, null, 2);
+        invalidateIssueDrivenDraft();
+        renderRepositoryConfigs();
+      });
+      heading.append(remove);
+    }
+    card.append(heading);
+    const grid = document.createElement("div");
+    grid.className = "repository-config-grid";
+    repositoryField(grid, "Repository", String(repository.repository ?? ""),
+      (value) => updateRepositoryConfig(index, "repository", value));
+    repositoryField(grid, "Integration branch", String(repository.integration_branch ?? ""),
+      (value) => updateRepositoryConfig(index, "integration_branch", value));
+    repositoryField(grid, "Final branch", String(repository.final_branch ?? ""),
+      (value) => updateRepositoryConfig(index, "final_branch", value));
+    const editableIssues = Array.isArray(repository.issues);
+    const issues = editableIssues
+      ? repository.issues.join(", ")
+      : (repository.one_shot_issue != null
+        ? String(repository.one_shot_issue)
+        : (repository.work_items || []).map((item) => (
+          typeof item === "number" ? item : item.id
+        )).join(", "));
+    const issuesInput = repositoryField(grid, editableIssues ? "Issues (comma separated)" : "Work items", issues,
+      (value) => updateRepositoryConfig(index, "issues", value.split(",").map((item) => {
+        const token = item.trim();
+        return /^\d+$/.test(token) ? Number(token) : token;
+      }).filter((item) => item !== "")), "repository-config-issues");
+    if (!editableIssues) issuesInput.readOnly = true;
+    card.append(grid);
+
+    repositoryConfigList.append(card);
+  });
+}
+
 function renderFavicon(runs) {
   faviconRunning = runs.some((run) => run.state === "running");
   if (!faviconRunning) {
@@ -226,11 +369,13 @@ function applyFieldMode() {
   promptText.readOnly = !drafting;
   issueDrivenJson.readOnly = !drafting;
   issueDrivenGenerate.disabled = !drafting;
+  repositoryConfigAdd.disabled = !drafting;
   directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
   validateButton.disabled = !drafting;
   dryRunButton.disabled = !drafting;
   applyModeVisibility();
+  renderRepositoryConfigs();
 }
 
 function applyModeVisibility() {
@@ -299,7 +444,11 @@ function inheritFolderIntoDraft(snapshot, mode) {
   try {
     const config = JSON.parse(issueDrivenDraft.json);
     if (config === null || Array.isArray(config) || typeof config !== "object") return;
-    config.repository = folder;
+    if (Array.isArray(config.repositories) && config.repositories.length > 0) {
+      config.repositories[0].repository = folder;
+    } else {
+      config.repository = folder;
+    }
     issueDrivenDraft = {
       ...issueDrivenDraft,
       json: JSON.stringify(config, null, 2),
@@ -400,6 +549,7 @@ function renderRun(result) {
     result.progress || [],
     result.warningTimeline || [],
     result.warningTimelineOmitted || 0,
+    result.plannerSkips || [],
   );
   renderIntegrationPr(result.integrationPr || null);
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
@@ -482,64 +632,120 @@ function renderIssueDrivenSummary(summary) {
   issueSummaryWarnings.textContent = "";
   if (summary == null) return;
 
-  issueSummaryContext.textContent = `${summary.repository} — ${summary.integrationBranch} → ${summary.finalBranch}`;
+  const repositories = summary.repositories || [summary];
+  issueSummaryContext.textContent = repositories.length === 1
+    ? `${repositories[0].repository} — ${repositories[0].integrationBranch} → ${repositories[0].finalBranch}`
+    : `${repositories.length} repositories (serial execution)`;
   issueSummaryTerminal.textContent = `Run result: ${summary.terminalResult.replaceAll("_", " ")}`;
-  for (const result of summary.issues || []) {
-    const item = document.createElement("li");
-    const outcome = result.outcome || "in_progress";
-    item.className = `issue-summary-item ${outcome}`;
-    const marker = document.createElement("span");
-    marker.className = "issue-summary-marker";
-    marker.textContent = outcome === "approved"
-      ? "✓"
-      : (outcome === "continued_with_warning"
-        ? "⚠"
-        : (outcome === "in_progress" ? "…" : "–"));
-    const details = document.createElement("div");
-    const line = document.createElement("div");
-    const label = result.label || `#${result.issue}`;
-    line.append(document.createTextNode(`${label}  `));
-    appendPrLink(line, result.pr);
-    const terminals = result.terminals || {};
-    if (terminals.implementation) {
-      appendPurpleMuxLink(line, "Implementation", terminals.implementation);
+  for (const repository of repositories) {
+    if (repositories.length > 1) {
+      const heading = document.createElement("li");
+      heading.className = "issue-summary-repository";
+      const state = repository.state
+        ? ` · ${repository.state.replaceAll("_", " ").toUpperCase()}`
+        : "";
+      heading.textContent = `${repository.repository} — ${repository.integrationBranch} → ${repository.finalBranch}${state}`;
+      issueSummaryList.append(heading);
     }
-    if (terminals.scopeReview) {
-      appendPurpleMuxLink(line, "Scope Review", terminals.scopeReview);
+    for (const result of repository.issues || []) {
+      const item = document.createElement("li");
+      const outcome = result.outcome || "in_progress";
+      item.className = `issue-summary-item ${outcome}`;
+      const marker = document.createElement("span");
+      marker.className = "issue-summary-marker";
+      marker.textContent = outcome === "approved"
+        ? "✓"
+        : (outcome === "continued_with_warning"
+          ? "⚠"
+          : (outcome === "in_progress" ? "…" : "–"));
+      const details = document.createElement("div");
+      const line = document.createElement("div");
+      const label = result.label || `#${result.issue}`;
+      line.append(document.createTextNode(`${label}  `));
+      if (result.pr) appendPrLink(line, result.pr);
+      const terminals = result.terminals || {};
+      if (terminals.implementation) {
+        appendPurpleMuxLink(line, "Implementation", terminals.implementation);
+      }
+      if (terminals.scopeReview) {
+        appendPurpleMuxLink(line, "Scope Review", terminals.scopeReview);
+      }
+      if (terminals.correctnessReview) {
+        appendPurpleMuxLink(line, "Correctness Review", terminals.correctnessReview);
+      }
+      if (result.reviews != null) {
+        line.append(document.createTextNode(`  Review ${result.reviews}`));
+      }
+      if (outcome !== "approved") {
+        const outcomeLabel = outcome === "skipped"
+          ? "SKIPPED"
+          : outcome.replaceAll("_", " ");
+        line.append(document.createTextNode(`  ${outcomeLabel}`));
+      }
+      details.append(line);
+      if (result.reason) {
+        const note = document.createElement("div");
+        note.className = "issue-summary-skip-reason";
+        note.textContent = result.reason;
+        details.append(note);
+      }
+      for (const warning of result.warnings || []) {
+        const note = document.createElement("div");
+        note.className = "issue-summary-warning";
+        note.textContent = warning;
+        details.append(note);
+      }
+      item.append(marker, details);
+      issueSummaryList.append(item);
     }
-    if (terminals.correctnessReview) {
-      appendPurpleMuxLink(line, "Correctness Review", terminals.correctnessReview);
-    }
-    if (result.reviews != null) {
-      line.append(document.createTextNode(`  Review ${result.reviews}`));
-    }
-    if (outcome !== "approved") {
-      line.append(document.createTextNode(`  ${outcome.replaceAll("_", " ")}`));
-    }
-    details.append(line);
-    for (const warning of result.warnings || []) {
-      const note = document.createElement("div");
-      note.className = "issue-summary-warning";
-      note.textContent = warning;
-      details.append(note);
-    }
-    item.append(marker, details);
-    issueSummaryList.append(item);
   }
-  const whole = summary.wholeReview;
-  issueSummaryWhole.textContent = whole == null
-    ? "Whole Review: no final result"
-    : `Whole Review: ${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
-  if (summary.basePr) appendPrLink(issueSummaryBase, summary.basePr, "Base PR: ");
-  else issueSummaryBase.textContent = "Base PR: not recorded";
-  if (summary.policyIssue != null) {
-    issueSummaryPolicy.append(document.createTextNode("Policy Issue: "));
-    const link = document.createElement("a");
-    link.href = `https://github.com/${summary.repository}/issues/${summary.policyIssue}`;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = `#${summary.policyIssue}`;
-    issueSummaryPolicy.append(link);
+  if (repositories.length === 1) {
+    const repository = repositories[0];
+    const whole = repository.wholeReview;
+    issueSummaryWhole.textContent = whole == null
+      ? "Whole Review: no final result"
+      : `Whole Review: ${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
+    if (repository.basePr) appendPrLink(issueSummaryBase, repository.basePr, "Base PR: ");
+    else issueSummaryBase.textContent = "Base PR: not recorded";
+    if (repository.policyIssue != null) {
+      issueSummaryPolicy.append(document.createTextNode("Policy Issue: "));
+      const link = document.createElement("a");
+      link.href = `https://github.com/${repository.repository}/issues/${repository.policyIssue}`;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `#${repository.policyIssue}`;
+      issueSummaryPolicy.append(link);
+    }
+  } else {
+    issueSummaryWhole.textContent = repositories.map((repository) => {
+      const whole = repository.wholeReview;
+      const result = whole == null
+        ? "no final result"
+        : `${whole.outcome.replaceAll("_", " ").toUpperCase()} (${whole.reviews} reviews)`;
+      return `${repository.repository}: ${result}`;
+    }).join(" · ");
+    for (const repository of repositories) {
+      if (issueSummaryBase.children.length || issueSummaryBase.textContent) {
+        issueSummaryBase.append(document.createTextNode(" · "));
+      }
+      if (repository.basePr) {
+        appendPrLink(issueSummaryBase, repository.basePr, `${repository.repository}: `);
+      } else {
+        issueSummaryBase.append(document.createTextNode(`${repository.repository}: not recorded`));
+      }
+      if (repository.policyIssue != null) {
+        if (issueSummaryPolicy.children.length || issueSummaryPolicy.textContent) {
+          issueSummaryPolicy.append(document.createTextNode(" · "));
+        }
+        issueSummaryPolicy.append(document.createTextNode(`${repository.repository}: `));
+        const link = document.createElement("a");
+        link.href = `https://github.com/${repository.repository}/issues/${repository.policyIssue}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = `#${repository.policyIssue}`;
+        issueSummaryPolicy.append(link);
+      }
+    }
   }
   issueSummaryWarnings.textContent = `Warnings: ${summary.warningCount}`;
 }
@@ -911,10 +1117,10 @@ function renderOutline(labels, events) {
   }
 }
 
-function renderProgress(events, findings = [], warningsOmitted = 0) {
+function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips = []) {
   const latest = new Map();
   for (const event of events) {
-    const key = JSON.stringify([event.name, event.iteration, event.attempt]);
+    const key = JSON.stringify([event.repository, event.name, event.iteration, event.attempt]);
     const previous = latest.get(key);
     latest.set(key, {
       ...event,
@@ -928,10 +1134,11 @@ function renderProgress(events, findings = [], warningsOmitted = 0) {
     ...findings
       .filter((finding) => finding.status === "warning")
       .map((finding) => ({kind: "warning", finding})),
+    ...plannerSkips.map((skip) => ({kind: "planner-skip", skip})),
   ];
   timeline.sort((left, right) => {
-    const leftObservedAt = left.event?.observedAt ?? left.finding?.observedAt;
-    const rightObservedAt = right.event?.observedAt ?? right.finding?.observedAt;
+    const leftObservedAt = left.event?.observedAt ?? left.finding?.observedAt ?? left.skip?.observedAt;
+    const rightObservedAt = right.event?.observedAt ?? right.finding?.observedAt ?? right.skip?.observedAt;
     if (typeof leftObservedAt !== "string" && typeof rightObservedAt !== "string") return 0;
     if (typeof leftObservedAt !== "string") return 1;
     if (typeof rightObservedAt !== "string") return -1;
@@ -997,6 +1204,34 @@ function renderProgress(events, findings = [], warningsOmitted = 0) {
       continue;
     }
 
+    if (entry.kind === "planner-skip") {
+      const item = document.createElement("li");
+      item.className = "progress-item skipped";
+      const marker = document.createElement("span");
+      marker.className = "progress-marker";
+      marker.textContent = "–";
+      const details = document.createElement("div");
+      details.className = "progress-details";
+      const label = document.createElement("div");
+      label.className = "progress-label";
+      const repository = entry.skip.repository ? `${entry.skip.repository} · ` : "";
+      label.textContent = `${repository}SKIPPED · ${entry.skip.label || `#${entry.skip.issue}`}`;
+      const timestamp = document.createElement("time");
+      timestamp.className = "progress-time";
+      timestamp.textContent = runnerLogDisplay.formatObservedAt(entry.skip.observedAt);
+      if (typeof entry.skip.observedAt === "string") {
+        timestamp.setAttribute("datetime", entry.skip.observedAt);
+        timestamp.setAttribute("title", entry.skip.observedAt);
+      }
+      const note = document.createElement("div");
+      note.className = "progress-note";
+      note.textContent = entry.skip.reason;
+      details.append(label, timestamp, note);
+      item.append(marker, details);
+      progress.append(item);
+      continue;
+    }
+
     const event = entry.event;
     const item = document.createElement("li");
     item.className = `progress-item ${event.status}`;
@@ -1010,7 +1245,8 @@ function renderProgress(events, findings = [], warningsOmitted = 0) {
     const label = document.createElement("div");
     label.className = "progress-label";
     const number = event.iteration ?? event.attempt;
-    label.textContent = `${event.name}${number == null ? "" : ` #${number}`}`;
+    const repository = event.repository ? `${event.repository} · ` : "";
+    label.textContent = `${repository}${event.name}${number == null ? "" : ` #${number}`}`;
 
     const timestamp = document.createElement("time");
     timestamp.className = "progress-time";
@@ -1483,6 +1719,64 @@ issueDrivenGenerate.addEventListener("click", async () => {
       }
     }
   }, applyFieldMode);
+});
+
+issueDrivenJson.addEventListener("input", () => {
+  invalidateIssueDrivenDraft();
+  renderRepositoryConfigs();
+});
+
+repositoryConfigAdd.addEventListener("click", () => {
+  if (activeRunId !== null) return;
+  let config;
+  try {
+    config = JSON.parse(issueDrivenJson.value);
+  } catch {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the JSON before adding a repository.";
+    return;
+  }
+  const repositories = issueDrivenRepositories(config);
+  if (repositories.length === 0) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Add a valid repository declaration before adding another.";
+    return;
+  }
+  if (!Array.isArray(config.repositories)) {
+    if (!Array.isArray(config.issues)) {
+      repositoryConfigMessage.hidden = false;
+      repositoryConfigMessage.textContent = "Multiple repositories require an Issues list for each repository.";
+      return;
+    }
+    const first = {
+      repository: config.repository,
+      integration_branch: config.integration_branch,
+      final_branch: config.final_branch,
+      issues: config.issues,
+    };
+    delete config.repository;
+    delete config.integration_branch;
+    delete config.final_branch;
+    delete config.issues;
+    delete config.work_items;
+    delete config.one_shot_issue;
+    config.repositories = [first];
+  }
+  const previous = config.repositories.at(-1);
+  if (previous == null || typeof previous !== "object" || Array.isArray(previous)) {
+    repositoryConfigMessage.hidden = false;
+    repositoryConfigMessage.textContent = "Fix the existing repository declarations before adding another.";
+    return;
+  }
+  config.repositories.push({
+    repository: "",
+    integration_branch: previous.integration_branch || "",
+    final_branch: previous.final_branch || "",
+    issues: [],
+  });
+  issueDrivenJson.value = JSON.stringify(config, null, 2);
+  invalidateIssueDrivenDraft();
+  renderRepositoryConfigs();
 });
 
 function resumeSettingsText(snapshot) {

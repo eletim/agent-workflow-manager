@@ -141,6 +141,7 @@ class ProgressEvent:
     tab: str | None = None
     pr_number: int | None = None
     pr_url: str | None = None
+    repository: str | None = None
     observed_at: str | None = None
 
 
@@ -194,6 +195,14 @@ class IssueNavigation:
 
 
 @dataclass(frozen=True)
+class PlannerSkip:
+    issue: int | str
+    reason: str
+    label: str | None = None
+    observed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class WholeReviewResult:
     outcome: Literal["approved", "continued_with_warning", "skipped"]
     reviews: int
@@ -206,6 +215,55 @@ class IssueDrivenContext:
     integration_branch: str
     final_branch: str
     policy_issue: int | None = None
+
+
+IssueDrivenRepositoryState = Literal[
+    "pending", "running", "success", "failed", "stopped"
+]
+
+
+@dataclass(frozen=True)
+class IssueDrivenRepositoryDeclaration:
+    repositories: tuple[IssueDrivenContext, ...]
+
+
+@dataclass(frozen=True)
+class IssueDrivenRepositoryLifecycle:
+    repository_index: int
+    status: Literal["started", "completed"]
+
+
+@dataclass(frozen=True)
+class IssueDrivenRepositorySummary:
+    context: IssueDrivenContext
+    state: IssueDrivenRepositoryState = "pending"
+    integration_pr: PullRequestNavigation | None = None
+    issue_results: tuple[IssueResult, ...] = ()
+    issue_navigations: tuple[IssueNavigation, ...] = ()
+    planner_skips: tuple[PlannerSkip, ...] = ()
+    whole_review_result: WholeReviewResult | None = None
+
+
+@dataclass
+class _IssueDrivenRepositoryRecord:
+    context: IssueDrivenContext
+    state: IssueDrivenRepositoryState = "pending"
+    integration_pr: PullRequestNavigation | None = None
+    issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
+    issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
+    planner_skips: dict[int | str, PlannerSkip] = field(default_factory=dict)
+    whole_review_result: WholeReviewResult | None = None
+
+    def snapshot(self) -> IssueDrivenRepositorySummary:
+        return IssueDrivenRepositorySummary(
+            self.context,
+            self.state,
+            self.integration_pr,
+            tuple(self.issue_results.values()),
+            tuple(self.issue_navigations.values()),
+            tuple(self.planner_skips.values()),
+            self.whole_review_result,
+        )
 
 
 @dataclass(frozen=True)
@@ -291,15 +349,19 @@ class RunResource:
     metadata: dict[str, str]
     cleanup_state: ResourceCleanupState = "retained"
     cleanup_error: str | None = None
+    repository_index: int | None = None
 
     def as_json(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "kind": self.kind,
             "identity": self.identity,
             "metadata": dict(self.metadata),
             "cleanupState": self.cleanup_state,
             "cleanupError": self.cleanup_error,
         }
+        if self.repository_index is not None:
+            result["repositoryIndex"] = self.repository_index
+        return result
 
 
 def _is_verified_repository_context(resource: RunResource) -> bool:
@@ -333,11 +395,16 @@ class OutputEntry:
     text: str
 
 
-def _progress_json(event: ProgressEvent) -> dict[str, object]:
+def _progress_json(
+    event: ProgressEvent, *, include_repository: bool = False
+) -> dict[str, object]:
     payload = asdict(event)
     observed_at = payload.pop("observed_at")
+    repository = payload.pop("repository")
     if observed_at is not None:
         payload["observedAt"] = observed_at
+    if include_repository and repository is not None:
+        payload["repository"] = repository
     return payload
 
 
@@ -385,7 +452,9 @@ class RunnerSnapshot:
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: tuple[IssueResult, ...] = ()
     issue_navigations: tuple[IssueNavigation, ...] = ()
+    planner_skips: tuple[PlannerSkip, ...] = ()
     whole_review_result: WholeReviewResult | None = None
+    issue_driven_repositories: tuple[IssueDrivenRepositorySummary, ...] = ()
     identity: str | None = None
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
@@ -417,8 +486,36 @@ class RunnerSnapshot:
         payload.pop("issue_driven_context")
         payload.pop("issue_results")
         payload.pop("issue_navigations")
+        payload.pop("planner_skips")
         payload.pop("whole_review_result")
+        payload.pop("issue_driven_repositories")
         payload["issueDrivenSummary"] = self._issue_driven_summary_json()
+        scoped_planner_skips = [
+            (repository.context.repository, skip)
+            for repository in self.issue_driven_repositories
+            for skip in repository.planner_skips
+        ]
+        if not scoped_planner_skips:
+            scoped_planner_skips = [(None, skip) for skip in self.planner_skips]
+        multiple_repositories = len(self.issue_driven_repositories) > 1
+        payload["plannerSkips"] = [
+            {
+                "issue": skip.issue,
+                "reason": skip.reason,
+                **(
+                    {"repository": repository}
+                    if multiple_repositories and repository is not None
+                    else {}
+                ),
+                **({"label": skip.label} if skip.label is not None else {}),
+                **(
+                    {"observedAt": skip.observed_at}
+                    if skip.observed_at is not None
+                    else {}
+                ),
+            }
+            for repository, skip in scoped_planner_skips
+        ]
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -429,7 +526,10 @@ class RunnerSnapshot:
         ]
         payload.pop("stdout_entries")
         payload.pop("stderr_entries")
-        payload["progress"] = [_progress_json(event) for event in self.progress]
+        payload["progress"] = [
+            _progress_json(event, include_repository=multiple_repositories)
+            for event in self.progress
+        ]
         payload["findings"] = [_finding_json(item) for item in self.findings]
         payload["warningTimeline"] = [
             _finding_json(item) for item in self.warning_findings
@@ -462,18 +562,64 @@ class RunnerSnapshot:
         return payload
 
     def _issue_driven_summary_json(self) -> dict[str, object] | None:
-        context = self.issue_driven_context
-        if context is None or self.state in ("idle", "validation_failed"):
+        repositories = self.issue_driven_repositories
+        if not repositories and self.issue_driven_context is not None:
+            repositories = (
+                IssueDrivenRepositorySummary(
+                    self.issue_driven_context,
+                    cast(IssueDrivenRepositoryState, self.state),
+                    self.integration_pr,
+                    self.issue_results,
+                    self.issue_navigations,
+                    self.planner_skips,
+                    self.whole_review_result,
+                ),
+            )
+        if not repositories or self.state in ("idle", "validation_failed"):
             return None
-        if self.state == "running" and not (
-            self.issue_results or self.issue_navigations
+        if (
+            len(repositories) == 1
+            and self.state == "running"
+            and not (
+                any(
+                    repository.issue_results
+                    or repository.issue_navigations
+                    or repository.planner_skips
+                    for repository in repositories
+                )
+            )
         ):
             return None
+        repository_summaries = [
+            self._repository_summary_json(
+                repository, include_state=len(repositories) > 1
+            )
+            for repository in repositories
+        ]
+        if len(repository_summaries) > 1:
+            return {
+                "terminalResult": self.state,
+                "warningCount": self.warning_count,
+                "repositories": repository_summaries,
+            }
+        return {
+            **repository_summaries[0],
+            "terminalResult": self.state,
+            "warningCount": self.warning_count,
+        }
+
+    @staticmethod
+    def _repository_summary_json(
+        repository: IssueDrivenRepositorySummary,
+        *,
+        include_state: bool = False,
+    ) -> dict[str, object]:
+        context = repository.context
         issues = []
         navigations = {
-            navigation.issue: navigation for navigation in self.issue_navigations
+            navigation.issue: navigation for navigation in repository.issue_navigations
         }
-        for result in self.issue_results:
+        for result in repository.issue_results:
             item = {
                 "issue": result.issue,
                 "outcome": result.outcome,
@@ -513,13 +659,22 @@ class RunnerSnapshot:
             if navigation.label is not None:
                 item["label"] = navigation.label
             issues.append(item)
-        whole_review = self.whole_review_result
+        for skip in repository.planner_skips:
+            item = {
+                "issue": skip.issue,
+                "outcome": "skipped",
+                "reason": skip.reason,
+                "warnings": [],
+            }
+            if skip.label is not None:
+                item["label"] = skip.label
+            issues.append(item)
+        whole_review = repository.whole_review_result
         return {
             "repository": context.repository,
+            **({"state": repository.state} if include_state else {}),
             "integrationBranch": context.integration_branch,
             "finalBranch": context.final_branch,
-            "terminalResult": self.state,
-            "warningCount": self.warning_count,
             "policyIssue": context.policy_issue,
             "issues": issues,
             "wholeReview": (
@@ -531,7 +686,11 @@ class RunnerSnapshot:
                 if whole_review is not None
                 else None
             ),
-            "basePr": self.integration_pr.as_json() if self.integration_pr else None,
+            "basePr": (
+                repository.integration_pr.as_json()
+                if repository.integration_pr
+                else None
+            ),
         }
 
     def as_summary_json(self) -> dict[str, object]:
@@ -608,7 +767,7 @@ class _RunRecord:
     progress: deque[ProgressEvent] = field(default_factory=deque)
     # One latest PR-bearing event per authoritative PR survives eviction from
     # the bounded diagnostic stream so historical Issue navigation remains.
-    progress_prs: dict[int, ProgressEvent] = field(default_factory=dict)
+    progress_prs: dict[str, ProgressEvent] = field(default_factory=dict)
     findings: deque[TopologyFinding] = field(default_factory=deque)
     # Warning positions are durable run history, independent of the bounded
     # diagnostic Finding stream used for the general inspection surface.
@@ -630,7 +789,12 @@ class _RunRecord:
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
     issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
+    planner_skips: dict[int | str, PlannerSkip] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
+    issue_driven_repositories: list[_IssueDrivenRepositoryRecord] = field(
+        default_factory=list
+    )
+    issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
 
@@ -802,7 +966,7 @@ class PythonRunner:
             "exitCode": run.exit_code,
             "progress": [asdict(event) for event in run.progress],
             "progressPrs": {
-                str(number): asdict(event) for number, event in run.progress_prs.items()
+                key: asdict(event) for key, event in run.progress_prs.items()
             },
             "findings": [asdict(finding) for finding in run.findings],
             "warningFindings": [asdict(finding) for finding in run.warning_findings],
@@ -822,11 +986,39 @@ class PythonRunner:
             "issueNavigations": [
                 asdict(navigation) for navigation in run.issue_navigations.values()
             ],
+            "plannerSkips": [asdict(skip) for skip in run.planner_skips.values()],
             "wholeReviewResult": (
                 asdict(run.whole_review_result)
                 if run.whole_review_result is not None
                 else None
             ),
+            "issueDrivenRepositories": [
+                {
+                    "context": asdict(repository.context),
+                    "state": repository.state,
+                    "integrationPr": (
+                        asdict(repository.integration_pr)
+                        if repository.integration_pr is not None
+                        else None
+                    ),
+                    "issueResults": [
+                        asdict(result) for result in repository.issue_results.values()
+                    ],
+                    "issueNavigations": [
+                        asdict(navigation)
+                        for navigation in repository.issue_navigations.values()
+                    ],
+                    "plannerSkips": [
+                        asdict(skip) for skip in repository.planner_skips.values()
+                    ],
+                    "wholeReviewResult": (
+                        asdict(repository.whole_review_result)
+                        if repository.whole_review_result is not None
+                        else None
+                    ),
+                }
+                for repository in run.issue_driven_repositories
+            ],
             "checked": run.checked,
             "issueDrivenJson": run.issue_driven_json,
             "resumedFromRunId": run.resumed_from_run_id,
@@ -961,12 +1153,22 @@ class PythonRunner:
             raise ValueError
         attempts = load_many(RunAttempt, "attempts")
         resources = load_many(RunResource, "resources")
+        if any(
+            resource.repository_index is not None
+            and (
+                isinstance(resource.repository_index, bool)
+                or not isinstance(resource.repository_index, int)
+                or resource.repository_index < 1
+            )
+            for resource in resources
+        ):
+            raise ValueError
         progress_pr_values = value.get("progressPrs")
         if not isinstance(progress_pr_values, dict):
             raise ValueError
         progress_prs = {
-            int(number): self._history_dataclass(ProgressEvent, event)
-            for number, event in progress_pr_values.items()
+            str(key): self._history_dataclass(ProgressEvent, event)
+            for key, event in progress_pr_values.items()
         }
         prompt_value = value.get("prompt")
         integration_pr_value = value.get("integrationPr")
@@ -986,11 +1188,8 @@ class PythonRunner:
             if context_value is None
             else self._history_dataclass(IssueDrivenContext, context_value)
         )
-        issue_result_values = value.get("issueResults", [])
-        if not isinstance(issue_result_values, list):
-            raise ValueError
-        issue_results: dict[int | str, IssueResult] = {}
-        for item in issue_result_values:
+
+        def load_issue_result(item: object) -> IssueResult:
             if not isinstance(item, dict):
                 raise ValueError
             result_value = dict(item)
@@ -1023,13 +1222,17 @@ class PythonRunner:
             ):
                 raise ValueError
             result_value["warnings"] = tuple(warnings_value)
-            result = self._history_dataclass(IssueResult, result_value)
-            issue_results[result.issue] = result
-        issue_navigation_values = value.get("issueNavigations", [])
-        if not isinstance(issue_navigation_values, list):
+            return self._history_dataclass(IssueResult, result_value)
+
+        issue_result_values = value.get("issueResults", [])
+        if not isinstance(issue_result_values, list):
             raise ValueError
-        issue_navigations: dict[int | str, IssueNavigation] = {}
-        for item in issue_navigation_values:
+        issue_results: dict[int | str, IssueResult] = {}
+        for item in issue_result_values:
+            result = load_issue_result(item)
+            issue_results[result.issue] = result
+
+        def load_issue_navigation(item: object) -> IssueNavigation:
             if not isinstance(item, dict):
                 raise ValueError
             navigation_value = dict(item)
@@ -1044,8 +1247,22 @@ class PythonRunner:
                 navigation_value[field_name] = self._history_dataclass(
                     PurpleMuxNavigation, navigation_value.get(field_name)
                 )
-            navigation = self._history_dataclass(IssueNavigation, navigation_value)
+            return self._history_dataclass(IssueNavigation, navigation_value)
+
+        issue_navigation_values = value.get("issueNavigations", [])
+        if not isinstance(issue_navigation_values, list):
+            raise ValueError
+        issue_navigations: dict[int | str, IssueNavigation] = {}
+        for item in issue_navigation_values:
+            navigation = load_issue_navigation(item)
             issue_navigations[navigation.issue] = navigation
+        planner_skip_values = value.get("plannerSkips", [])
+        if not isinstance(planner_skip_values, list):
+            raise ValueError
+        planner_skips: dict[int | str, PlannerSkip] = {}
+        for item in planner_skip_values:
+            skip = self._history_dataclass(PlannerSkip, item)
+            planner_skips[skip.issue] = skip
         whole_review_value = value.get("wholeReviewResult")
         whole_review_result = (
             None
@@ -1056,6 +1273,96 @@ class PythonRunner:
             whole_review_result = replace(
                 whole_review_result, warnings=tuple(whole_review_result.warnings)
             )
+        repository_values = value.get("issueDrivenRepositories")
+        issue_driven_repositories: list[_IssueDrivenRepositoryRecord] = []
+        if repository_values is not None:
+            if not isinstance(repository_values, list):
+                raise ValueError
+            for repository_value in repository_values:
+                if not isinstance(repository_value, dict):
+                    raise ValueError
+                repository_context = self._history_dataclass(
+                    IssueDrivenContext, repository_value.get("context")
+                )
+                repository_state = repository_value.get("state", "success")
+                if repository_state not in (
+                    "pending",
+                    "running",
+                    "success",
+                    "failed",
+                    "stopped",
+                ):
+                    raise ValueError
+                repository_pr_value = repository_value.get("integrationPr")
+                repository_pr = (
+                    None
+                    if repository_pr_value is None
+                    else self._history_dataclass(
+                        PullRequestNavigation, repository_pr_value
+                    )
+                )
+                result_values = repository_value.get("issueResults")
+                navigation_values = repository_value.get("issueNavigations")
+                skip_values = repository_value.get("plannerSkips")
+                if not all(
+                    isinstance(items, list)
+                    for items in (result_values, navigation_values, skip_values)
+                ):
+                    raise ValueError
+                repository_results: dict[int | str, IssueResult] = {}
+                for item in cast(list[object], result_values):
+                    result = load_issue_result(item)
+                    repository_results[result.issue] = result
+                repository_navigations: dict[int | str, IssueNavigation] = {}
+                for item in cast(list[object], navigation_values):
+                    navigation = load_issue_navigation(item)
+                    repository_navigations[navigation.issue] = navigation
+                repository_skips: dict[int | str, PlannerSkip] = {}
+                for item in cast(list[object], skip_values):
+                    skip = self._history_dataclass(PlannerSkip, item)
+                    repository_skips[skip.issue] = skip
+                repository_review_value = repository_value.get("wholeReviewResult")
+                repository_review = (
+                    None
+                    if repository_review_value is None
+                    else self._history_dataclass(
+                        WholeReviewResult, repository_review_value
+                    )
+                )
+                if repository_review is not None:
+                    repository_review = replace(
+                        repository_review,
+                        warnings=tuple(repository_review.warnings),
+                    )
+                issue_driven_repositories.append(
+                    _IssueDrivenRepositoryRecord(
+                        context=repository_context,
+                        state=cast(IssueDrivenRepositoryState, repository_state),
+                        integration_pr=repository_pr,
+                        issue_results=repository_results,
+                        issue_navigations=repository_navigations,
+                        planner_skips=repository_skips,
+                        whole_review_result=repository_review,
+                    )
+                )
+        elif issue_driven_context is not None:
+            issue_driven_repositories.append(
+                _IssueDrivenRepositoryRecord(
+                    context=issue_driven_context,
+                    state=cast(IssueDrivenRepositoryState, state),
+                    integration_pr=integration_pr,
+                    issue_results=issue_results,
+                    issue_navigations=issue_navigations,
+                    planner_skips=planner_skips,
+                    whole_review_result=whole_review_result,
+                )
+            )
+        if any(
+            resource.repository_index is not None
+            and resource.repository_index > len(issue_driven_repositories)
+            for resource in resources
+        ):
+            raise ValueError
         stdout_truncated = value.get("stdoutTruncated")
         stderr_truncated = value.get("stderrTruncated")
         if not isinstance(stdout_truncated, bool) or not isinstance(
@@ -1093,7 +1400,9 @@ class PythonRunner:
             issue_driven_context=issue_driven_context,
             issue_results=issue_results,
             issue_navigations=issue_navigations,
+            planner_skips=planner_skips,
             whole_review_result=whole_review_result,
+            issue_driven_repositories=issue_driven_repositories,
             checked=checked,
             issue_driven_json=issue_driven_json,
             resumed_from_run_id=resumed_from_run_id,
@@ -1644,6 +1953,7 @@ class PythonRunner:
             run.credential_path.unlink(missing_ok=True)
         run.exit_code = 1
         run.state = "failed"
+        self._finish_active_repository(run)
         self._append_output(
             run, "stderr", f"Workflow launch failed: {exc}\n", lock_held=True
         )
@@ -1867,12 +2177,14 @@ class PythonRunner:
         stderr_entries = self._render_output_entries(run.stderr, run.stderr_truncated)
         progress = tuple(run.progress)
         visible_prs = {
-            event.pr_number for event in progress if event.pr_number is not None
+            (event.repository, event.pr_number)
+            for event in progress
+            if event.pr_number is not None
         }
         durable_pr_progress = tuple(
             event
-            for number, event in run.progress_prs.items()
-            if number not in visible_prs
+            for event in run.progress_prs.values()
+            if (event.repository, event.pr_number) not in visible_prs
         )
         return RunnerSnapshot(
             state=run.state,
@@ -1903,7 +2215,11 @@ class PythonRunner:
             issue_driven_context=run.issue_driven_context,
             issue_results=tuple(run.issue_results.values()),
             issue_navigations=tuple(run.issue_navigations.values()),
+            planner_skips=tuple(run.planner_skips.values()),
             whole_review_result=run.whole_review_result,
+            issue_driven_repositories=tuple(
+                repository.snapshot() for repository in run.issue_driven_repositories
+            ),
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
             resumed_from_run_id=run.resumed_from_run_id,
@@ -2095,15 +2411,16 @@ class PythonRunner:
                     ),
                 )
 
-            failed_priority: int | None = None
+            failed_priorities: dict[int | None, int] = {}
             for index, original in ordered:
                 priority = self._resource_cleanup_priority(original)
-                if failed_priority is not None and priority > failed_priority:
-                    break
                 with self._lock:
                     current = run.resources[index]
                     if current.cleanup_state == "cleaned":
                         continue
+                failed_priority = failed_priorities.get(current.repository_index)
+                if failed_priority is not None and priority > failed_priority:
+                    continue
                 if current.cleanup_state in ("cleanup_pending", "blocked"):
                     try:
                         absent = self._resource_is_absent(current)
@@ -2116,10 +2433,11 @@ class PythonRunner:
                                 current.identity,
                                 current.metadata,
                                 "cleaned",
+                                repository_index=current.repository_index,
                             )
                             self._mark_changed()
                     else:
-                        failed_priority = priority
+                        failed_priorities[current.repository_index] = priority
                     continue
                 with self._lock:
                     pending = RunResource(
@@ -2127,6 +2445,7 @@ class PythonRunner:
                         current.identity,
                         current.metadata,
                         "cleanup_pending",
+                        repository_index=current.repository_index,
                     )
                     run.resources[index] = pending
                     self._mark_changed()
@@ -2145,9 +2464,10 @@ class PythonRunner:
                             pending.metadata,
                             cleanup_state,
                             str(exc),
+                            pending.repository_index,
                         )
                         self._mark_changed()
-                    failed_priority = priority
+                    failed_priorities[current.repository_index] = priority
                 else:
                     with self._lock:
                         run.resources[index] = RunResource(
@@ -2155,6 +2475,7 @@ class PythonRunner:
                             pending.identity,
                             pending.metadata,
                             "cleaned",
+                            repository_index=pending.repository_index,
                         )
                         self._mark_changed()
             with self._lock:
@@ -2671,30 +2992,151 @@ class PythonRunner:
                 run.has_warnings = True
                 run.warning_count += 1
         elif event_type == "resource":
-            self._register_resource(run, cast(RunResource, event))
-        elif event_type == "resource_ownership":
-            return self._register_owned_resource(
-                run, cast(_ResourceOwnershipEvent, event)
+            self._register_resource(
+                run, self._with_resource_repository(run, cast(RunResource, event))
             )
+        elif event_type == "resource_ownership":
+            ownership = cast(_ResourceOwnershipEvent, event)
+            return self._register_owned_resource(
+                run,
+                replace(
+                    ownership,
+                    resource=self._with_resource_repository(run, ownership.resource),
+                ),
+            )
+        elif event_type == "issue_driven_repositories":
+            declaration = cast(IssueDrivenRepositoryDeclaration, event)
+            if run.issue_driven_repositories or run.issue_driven_context is not None:
+                return False
+            run.issue_driven_repositories = [
+                _IssueDrivenRepositoryRecord(context=context)
+                for context in declaration.repositories
+            ]
+        elif event_type == "issue_driven_repository":
+            lifecycle = cast(IssueDrivenRepositoryLifecycle, event)
+            index = lifecycle.repository_index - 1
+            if index >= len(run.issue_driven_repositories):
+                return False
+            repository = run.issue_driven_repositories[index]
+            active = self._active_issue_driven_repository(run)
+            if lifecycle.status == "started":
+                if active is not None or repository.state != "pending":
+                    return False
+                repository.state = "running"
+            elif active is not repository or repository.state != "running":
+                return False
+            else:
+                repository.state = "success"
+            run.issue_driven_explicit_lifecycle = True
         elif event_type == "run_pr":
             run.integration_pr = cast(PullRequestNavigation, event)
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.integration_pr = run.integration_pr
         elif event_type == "issue_driven_context":
-            run.issue_driven_context = cast(IssueDrivenContext, event)
+            context = cast(IssueDrivenContext, event)
+            active = self._active_issue_driven_repository(run)
+            if run.issue_driven_explicit_lifecycle:
+                if active is None:
+                    return False
+                target = active
+            else:
+                target = next(
+                    (
+                        repository
+                        for repository in run.issue_driven_repositories
+                        if repository.state == "pending"
+                    ),
+                    None,
+                )
+            if target is not None:
+                declared = target.context
+                if (
+                    declared.integration_branch != context.integration_branch
+                    or declared.final_branch != context.final_branch
+                    or declared.policy_issue != context.policy_issue
+                ):
+                    return False
+            run.issue_driven_context = context
+            run.integration_pr = None
+            run.issue_results = {}
+            run.issue_navigations = {}
+            run.planner_skips = {}
+            run.whole_review_result = None
+            if not run.issue_driven_explicit_lifecycle and active is not None:
+                active.state = "success"
+            if target is None:
+                target = _IssueDrivenRepositoryRecord(run.issue_driven_context)
+                run.issue_driven_repositories.append(target)
+            else:
+                target.context = context
+            target.state = "running"
         elif event_type == "issue_result":
             issue_result = cast(IssueResult, event)
             run.issue_results[issue_result.issue] = issue_result
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.issue_results[issue_result.issue] = issue_result
         elif event_type == "issue_navigation":
             issue_navigation = cast(IssueNavigation, event)
             run.issue_navigations[issue_navigation.issue] = issue_navigation
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.issue_navigations[issue_navigation.issue] = issue_navigation
+        elif event_type == "planner_skip":
+            planner_skip = cast(PlannerSkip, event)
+            accepted = replace(planner_skip, observed_at=self._accepted_at())
+            run.planner_skips[accepted.issue] = accepted
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.planner_skips[accepted.issue] = accepted
         elif event_type == "whole_review_result":
             run.whole_review_result = cast(WholeReviewResult, event)
+            repository = self._active_issue_driven_repository(run)
+            if repository is not None:
+                repository.whole_review_result = run.whole_review_result
         else:
             progress = cast(ProgressEvent, event)
-            accepted = replace(progress, observed_at=self._accepted_at())
+            active_repository = self._active_issue_driven_repository(run)
+            repository = (
+                active_repository.context.repository
+                if active_repository is not None
+                else None
+            )
+            accepted = replace(
+                progress,
+                repository=repository,
+                observed_at=self._accepted_at(),
+            )
             run.progress.append(accepted)
-            if accepted.pr_number is not None:
-                run.progress_prs[accepted.pr_number] = accepted
+            if accepted.pr_url is not None:
+                run.progress_prs[accepted.pr_url] = accepted
         return True
+
+    @staticmethod
+    def _active_issue_driven_repository(
+        run: _RunRecord,
+    ) -> _IssueDrivenRepositoryRecord | None:
+        return next(
+            (
+                repository
+                for repository in reversed(run.issue_driven_repositories)
+                if repository.state == "running"
+            ),
+            None,
+        )
+
+    @classmethod
+    def _finish_active_repository(cls, run: _RunRecord) -> None:
+        repository = cls._active_issue_driven_repository(run)
+        if repository is None:
+            repositories = run.issue_driven_repositories
+            if repositories and all(
+                candidate.state == "pending" for candidate in repositories
+            ):
+                repository = repositories[0]
+        if repository is not None and run.state in ("success", "failed", "stopped"):
+            repository.state = run.state
 
     @staticmethod
     def _parse_runner_event(
@@ -2707,8 +3149,11 @@ class PythonRunner:
                 "resource",
                 "resource_ownership",
                 "run_pr",
+                "issue_driven_repositories",
+                "issue_driven_repository",
                 "issue_driven_context",
                 "issue_navigation",
+                "planner_skip",
                 "issue_result",
                 "whole_review_result",
             ],
@@ -2795,6 +3240,61 @@ class PythonRunner:
             if not PythonRunner._valid_pr_navigation(pr_number, pr_url):
                 return None
             return "run_pr", PullRequestNavigation(pr_number, pr_url)
+        if event_type == "issue_driven_repositories":
+            repository_values = value.get("repositories")
+            if not isinstance(repository_values, list) or len(repository_values) < 2:
+                return None
+            repositories: list[IssueDrivenContext] = []
+            seen: set[str] = set()
+            for repository_value in repository_values:
+                if not isinstance(repository_value, dict):
+                    return None
+                repository = repository_value.get("repository")
+                integration_branch = repository_value.get("integration_branch")
+                final_branch = repository_value.get("final_branch")
+                policy_issue = repository_value.get("policy_issue")
+                if (
+                    any(
+                        not isinstance(item, str) or not item.strip()
+                        for item in (repository, integration_branch, final_branch)
+                    )
+                    or cast(str, repository) in seen
+                    or (
+                        policy_issue is not None
+                        and (
+                            isinstance(policy_issue, bool)
+                            or not isinstance(policy_issue, int)
+                            or policy_issue < 1
+                        )
+                    )
+                ):
+                    return None
+                seen.add(cast(str, repository))
+                repositories.append(
+                    IssueDrivenContext(
+                        cast(str, repository),
+                        cast(str, integration_branch),
+                        cast(str, final_branch),
+                        cast(int | None, policy_issue),
+                    )
+                )
+            return "issue_driven_repositories", IssueDrivenRepositoryDeclaration(
+                tuple(repositories)
+            )
+        if event_type == "issue_driven_repository":
+            repository_index = value.get("repository_index")
+            status = value.get("status")
+            if (
+                isinstance(repository_index, bool)
+                or not isinstance(repository_index, int)
+                or repository_index < 1
+                or status not in ("started", "completed")
+            ):
+                return None
+            return "issue_driven_repository", IssueDrivenRepositoryLifecycle(
+                repository_index,
+                cast(Literal["started", "completed"], status),
+            )
         if event_type == "issue_driven_context":
             repository = value.get("repository")
             integration_branch = value.get("integration_branch")
@@ -2859,6 +3359,32 @@ class PythonRunner:
                 PurpleMuxNavigation(workspace_id, cast(str, tab_ids[2])),
                 cast(str | None, label),
             )
+        if event_type == "planner_skip":
+            issue = value.get("issue")
+            reason = value.get("reason")
+            label = value.get("label")
+            if (
+                isinstance(issue, bool)
+                or not isinstance(issue, (int, str))
+                or (isinstance(issue, int) and issue < 1)
+                or (isinstance(issue, str) and (not issue.strip() or len(issue) > 100))
+                or not isinstance(reason, str)
+                or not reason
+                or reason != reason.strip()
+                or "\0" in reason
+                or len(reason) > 500
+                or any(0xD800 <= ord(character) <= 0xDFFF for character in reason)
+                or (
+                    label is not None
+                    and (
+                        not isinstance(label, str)
+                        or not label.strip()
+                        or len(label) > 100
+                    )
+                )
+            ):
+                return None
+            return "planner_skip", PlannerSkip(issue, reason, cast(str | None, label))
         if event_type in ("issue_result", "whole_review_result"):
             outcome = value.get("outcome")
             reviews = value.get("reviews")
@@ -3003,7 +3529,10 @@ class PythonRunner:
             ):
                 # Repeated registration is idempotent only when the ownership
                 # evidence remains exactly the same.
-                if existing.metadata != resource.metadata:
+                if (
+                    existing.metadata != resource.metadata
+                    or existing.repository_index != resource.repository_index
+                ):
                     logger.warning(
                         "Ignored conflicting registration for run %s resource %s/%s",
                         run.run_id,
@@ -3012,6 +3541,66 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+
+    @classmethod
+    def _with_resource_repository(
+        cls, run: _RunRecord, resource: RunResource
+    ) -> RunResource:
+        """Bind owned resources to the active repository or its ownership chain."""
+        repository_index = cls._resource_repository_index(run, resource)
+        if repository_index is None:
+            return resource
+        return replace(resource, repository_index=repository_index)
+
+    @classmethod
+    def _resource_repository_index(
+        cls, run: _RunRecord, resource: RunResource
+    ) -> int | None:
+        if resource.repository_index is not None:
+            return resource.repository_index
+        if resource.kind == "managed_shell_result":
+            tab_id = resource.metadata.get("tab_id")
+            parent = next(
+                (
+                    candidate
+                    for candidate in run.resources
+                    if candidate.kind == "purplemux_tab"
+                    and candidate.identity == tab_id
+                ),
+                None,
+            )
+            if parent is not None:
+                return parent.repository_index
+        elif resource.kind == "purplemux_tab":
+            workspace_id = resource.metadata.get("workspace_id")
+            parent = next(
+                (
+                    candidate
+                    for candidate in run.resources
+                    if candidate.kind == "purplemux_workspace"
+                    and candidate.identity == workspace_id
+                ),
+                None,
+            )
+            if parent is not None:
+                return parent.repository_index
+        elif resource.kind == "purplemux_workspace":
+            directories = resource.metadata.get("directories", "").splitlines()
+            parent = next(
+                (
+                    candidate
+                    for candidate in run.resources
+                    if candidate.kind == "git_worktree"
+                    and candidate.identity in directories
+                ),
+                None,
+            )
+            if parent is not None:
+                return parent.repository_index
+        active = cls._active_issue_driven_repository(run)
+        if active is None or not run.issue_driven_explicit_lifecycle:
+            return None
+        return run.issue_driven_repositories.index(active) + 1
 
     @staticmethod
     def _register_owned_resource(
@@ -3022,15 +3611,25 @@ class PythonRunner:
             if existing.kind != resource.kind or existing.identity != resource.identity:
                 continue
             if ownership.phase == "pending":
-                return existing.metadata == resource.metadata
-            if existing.metadata == resource.metadata:
+                return (
+                    existing.metadata == resource.metadata
+                    and existing.repository_index == resource.repository_index
+                )
+            if (
+                existing.metadata == resource.metadata
+                and existing.repository_index == resource.repository_index
+            ):
                 return True
-            if existing.metadata.get("registration_state") != "pending" or any(
-                key == "registration_state"
-                and resource.metadata.get(key) != "verified"
-                or key != "registration_state"
-                and resource.metadata.get(key) != value
-                for key, value in existing.metadata.items()
+            if (
+                existing.repository_index != resource.repository_index
+                or existing.metadata.get("registration_state") != "pending"
+                or any(
+                    key == "registration_state"
+                    and resource.metadata.get(key) != "verified"
+                    or key != "registration_state"
+                    and resource.metadata.get(key) != value
+                    for key, value in existing.metadata.items()
+                )
             ):
                 return False
             run.resources[index] = resource
@@ -3086,6 +3685,7 @@ class PythonRunner:
                     if exit_code == 0
                     else "failed"
                 )
+                self._finish_active_repository(run)
                 attempt_state = run.state
                 run.attempts.append(
                     RunAttempt(
@@ -3165,6 +3765,7 @@ class PythonRunner:
                 if exit_code == 0
                 else "failed"
             )
+            self._finish_active_repository(run)
             if diagnostic:
                 self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
             run.attempts.append(

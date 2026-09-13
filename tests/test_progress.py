@@ -8,8 +8,11 @@ import pytest
 from purplemux_client import (
     emit_finding,
     emit_issue_driven_context,
+    emit_issue_driven_repositories,
+    emit_issue_driven_repository,
     emit_issue_navigation,
     emit_issue_result,
+    emit_planner_skip,
     emit_run_pr,
     emit_step,
     emit_whole_review_result,
@@ -70,6 +73,79 @@ def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) ->
             "type": "run_pr",
             "pr_number": 17,
             "pr_url": "https://github.com/example/repo/pull/17",
+        }
+
+
+def test_emit_issue_driven_repositories_declares_ordered_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_repositories(
+            (
+                ("acme/api", "dev/api", "main", None),
+                ("acme/web", "dev/web", "main", 9),
+            )
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "issue_driven_repositories",
+            "repositories": [
+                {
+                    "repository": "acme/api",
+                    "integration_branch": "dev/api",
+                    "final_branch": "main",
+                },
+                {
+                    "repository": "acme/web",
+                    "integration_branch": "dev/web",
+                    "final_branch": "main",
+                    "policy_issue": 9,
+                },
+            ],
+        }
+
+
+def test_accepted_issue_driven_repository_declaration_fits_event_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repositories = (
+        ("acme/api", "dev/api", "main", None),
+        ("x" * 3800, "dev/web", "main", 9),
+    )
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_repositories(repositories)
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, "rb") as stream:
+        encoded = stream.read()
+
+    assert len(encoded) <= MAX_PROGRESS_EVENT_BYTES
+    assert json.loads(encoded)["repositories"][1]["repository"] == "x" * 3800
+
+
+def test_emit_issue_driven_repository_writes_lifecycle_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_issue_driven_repository(2, "started")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "issue_driven_repository",
+            "repository_index": 2,
+            "status": "started",
         }
 
 
@@ -176,6 +252,32 @@ def test_emit_issue_result_accepts_labeled_inline_work_item(
             "pr_url": "https://github.com/acme/project/pull/45",
             "warnings": [],
         }
+
+
+def test_emit_planner_skip_writes_authoritative_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_planner_skip(197, "Already implemented by Issue #196.", label="Issue #197")
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        assert json.loads(stream.read()) == {
+            "type": "planner_skip",
+            "issue": 197,
+            "label": "Issue #197",
+            "reason": "Already implemented by Issue #196.",
+        }
+
+
+def test_emit_planner_skip_rejects_missing_or_oversized_reason() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        emit_planner_skip(197, "")
+    with pytest.raises(ValueError, match="reason"):
+        emit_planner_skip(197, "x" * 501)
 
 
 @pytest.mark.parametrize(

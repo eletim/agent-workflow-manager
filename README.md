@@ -86,13 +86,19 @@ PRs, and fails closed if the state is missing, ambiguous, or belongs to a
 different seed.
 The Runner and progress events only observe these decisions, so the generated
 plain Python remains the control-flow source of truth.
+Every skip includes a concise authoritative reason. The Runner retains that
+structured decision independently of stdout and shows `SKIPPED` plus the reason
+in both Progress and the Issue Driven Summary, including historical runs.
 
 Failed and stopped Issue Driven runs expose `Review & Resume` in the UI. The
 confirmation shows the original immutable settings, then starts a distinct run
 with the same generated workflow. Run history records the source run, while the
 workflow's normal authoritative Git, GitHub, and PurpleMux inspection recovers
 existing Base PR, plan, and child-PR state; the terminated Python process is not
-restored. Prompt and custom Python Workflow runs continue to use manual recovery.
+restored. Multi-repository recovery performs that inspection independently for
+each declared repository, so matching branch or PR names in another repository
+cannot supply its recovery state. Prompt and custom Python Workflow runs continue
+to use manual recovery.
 
 For one-shot delivery, replace the initial `issues` / `work_items` list with a
 single `one_shot_issue`. The generated workflow starts with an empty plan and its
@@ -471,11 +477,15 @@ registration-free by default. `GET /api/runs` lists compact summaries,
 run history. Workspace release requires
 PurpleMux's public atomic `workspace delete -w ID --if-empty` CLI contract;
 startup rejects unsupported versions so canonical Cleanup cannot be stranded
-behind an incompatible runtime. The original
-`/api/status`, `/api/output`, and `/api/stop` routes remain available and address
-the most recently created run. `GET /api/events` streams revision-only SSE change
-notifications; initial load, notifications, and reconnects all reconcile through
-the authoritative read APIs rather than treating the stream as workflow state.
+behind an incompatible runtime. Multi-repository resources retain their repository
+ownership: a cleanup failure blocks dependent resources in that repository while
+cleanup of the other repositories continues. Single-repository and unscoped
+resource cleanup keeps the same dependency ordering and failure behavior. The
+original `/api/status`, `/api/output`, and `/api/stop` routes remain available and
+address the most recently created run. `GET /api/events` streams revision-only
+SSE change notifications; initial load, notifications, and reconnects all
+reconcile through the authoritative read APIs rather than treating the stream as
+workflow state.
 
 Workflow processes use one stable Runner-controlled directory; it is not a
 project selector and is not a Workflow form input. Repository-modifying
