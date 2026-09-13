@@ -464,7 +464,6 @@ def recover_issue_driven_work_item_topology(
             state="OPEN",
             expected_head_sha=state.feature_sha,
             expected_base_sha=state.integration_sha,
-            draft=True,
         )
     except WorkerFailure as exc:
         raise WorkerFailure(
@@ -484,6 +483,7 @@ def recover_issue_driven_work_item_topology(
         expected_head_sha=state.feature_sha,
         expected_base=integration_branch,
         expected_base_sha=state.integration_sha,
+        draft=True,
     )
     _require_inline_task_fingerprint(updated, fingerprint)
     emit_finding(

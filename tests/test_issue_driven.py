@@ -380,11 +380,12 @@ def test_recover_inline_task_topology_restores_missing_fingerprint(
             return pr
 
         def require_pr(self, **kwargs: object) -> PullRequestState:
-            assert kwargs["draft"] is True
+            assert "draft" not in kwargs
             return pr
 
         def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
             assert number == pr.number
+            assert kwargs["draft"] is True
             updates.append(str(kwargs["body"]))
             return replace(pr, body=updates[-1])
 
@@ -421,6 +422,59 @@ def test_recover_inline_task_topology_restores_missing_fingerprint(
     ]
 
 
+def test_recover_inline_task_topology_accepts_ready_pr_with_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprint = "a" * 64
+    branch = "feature/work-item-refresh-run-help"
+    ready = topology_pr(
+        head_branch=branch,
+        body=f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->",
+        draft=False,
+    )
+    state = issue_driven.IssueTopologyState(
+        "Mini task refresh-run-help",
+        branch,
+        "recoverable",
+        ready.head_sha,
+        ready.base_sha,
+        ready.number,
+    )
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert "draft" not in kwargs
+            return ready
+
+        def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
+            pytest.fail("correctly fingerprinted Ready PR must not be updated")
+
+    monkeypatch.setattr(
+        issue_driven, "inspect_issue_driven_topology", lambda **kwargs: (state,)
+    )
+    monkeypatch.setattr(
+        issue_driven,
+        "_inspect_repository_declaration",
+        lambda **kwargs: SimpleNamespace(source_repository=Path("/repo")),
+    )
+    monkeypatch.setattr(
+        issue_driven.GitRepository,
+        "open",
+        lambda *args, **kwargs: SimpleNamespace(expected_github_slug="acme/project"),
+    )
+    monkeypatch.setattr(
+        issue_driven.GitHubRepository, "open", lambda *args, **kwargs: GitHub()
+    )
+
+    recovered = issue_driven.recover_issue_driven_work_item_topology(
+        repo="acme/project",
+        integration_branch="dev/v1",
+        issue=("Mini task refresh-run-help", branch, fingerprint),
+    )
+
+    assert recovered == state
+
+
 def test_recover_inline_task_topology_rejects_ready_pr_before_body_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,12 +497,12 @@ def test_recover_inline_task_topology_rejects_ready_pr_before_body_update(
 
     class GitHub:
         def require_pr(self, **kwargs: object) -> PullRequestState:
-            assert kwargs["draft"] is True
-            raise WorkerFailure("PR Draft state is False, expected True")
+            assert "draft" not in kwargs
+            return ready
 
         def update_pr_body(self, number: int, **kwargs: object) -> PullRequestState:
-            updates.append(str(kwargs["body"]))
-            return ready
+            assert kwargs["draft"] is True
+            raise WorkerFailure("PR Draft state is False, expected True")
 
     monkeypatch.setattr(
         issue_driven, "inspect_issue_driven_topology", lambda **kwargs: (state,)
@@ -467,7 +521,7 @@ def test_recover_inline_task_topology_rejects_ready_pr_before_body_update(
         issue_driven.GitHubRepository, "open", lambda *args, **kwargs: GitHub()
     )
 
-    with pytest.raises(WorkerFailure, match="open PR #158 changed or disappeared"):
+    with pytest.raises(WorkerFailure, match="Draft state is False"):
         issue_driven.recover_issue_driven_work_item_topology(
             repo="acme/project",
             integration_branch="dev/v1",

@@ -575,7 +575,7 @@ github.set_draft(
 ) -> PullRequestState
 github.update_pr_body(
     pr, *, body, expected_head, expected_head_sha, expected_base,
-    expected_base_sha
+    expected_base_sha, draft=None
 ) -> PullRequestState
 github.merge_pr(
     pr, *, expected_head, expected_head_sha, expected_base, expected_base_sha,
