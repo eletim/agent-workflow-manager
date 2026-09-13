@@ -1033,7 +1033,7 @@ class PurpleMuxCLIClient:
         The timeout is a warning threshold while the authoritative session state
         remains busy. Once crossed in that state, monitoring continues while it
         stays busy. A subsequent non-busy state gets a bounded grace period to
-        publish a fresh result.
+        publish a fresh result; returning to busy cancels that grace period.
         """
         deadline = self._monotonic() + timeout_seconds
         baseline = self._turn_baselines.get(session_id)
@@ -1050,14 +1050,13 @@ class PurpleMuxCLIClient:
             self._raise_abnormal_state(session_id, state, status)
             if self._is_fresh_interrupt(status, baseline):
                 raise WorkerInterrupted(f"session {session_id} turn was interrupted")
-            if (
-                busy_timeout_reported
-                and result_publication_deadline is None
-                and state != "busy"
-            ):
-                result_publication_deadline = (
-                    self._monotonic() + _TURN_RESULT_PUBLICATION_GRACE_SECONDS
-                )
+            if busy_timeout_reported:
+                if state == "busy":
+                    result_publication_deadline = None
+                elif result_publication_deadline is None:
+                    result_publication_deadline = (
+                        self._monotonic() + _TURN_RESULT_PUBLICATION_GRACE_SECONDS
+                    )
             if state == "busy":
                 saw_busy = True
             elif state == "inactive":

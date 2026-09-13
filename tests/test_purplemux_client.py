@@ -1006,6 +1006,55 @@ def test_ready_result_lag_after_busy_timeout_eventually_completes() -> None:
     assert cli.read_result("tab-1") == "published after lag"
 
 
+@pytest.mark.parametrize("transient_state", ["ready-for-review", "idle"])
+def test_post_timeout_return_to_busy_cancels_result_grace(
+    transient_state: str,
+) -> None:
+    transient = {
+        "cliState": transient_state,
+        "alive": True,
+        "eventSeq": 3,
+        "readyForReviewAt": 200 if transient_state == "ready-for-review" else None,
+        "lastEvent": {"name": "stop", "seq": 3},
+    }
+    completed_status = {
+        "cliState": "ready-for-review",
+        "alive": True,
+        "eventSeq": 5,
+        "readyForReviewAt": 300,
+        "lastEvent": {"name": "stop", "seq": 5},
+    }
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 2}),
+            completed(transient),
+            completed({"status": "not-ready", "completionTimestamp": None}),
+            completed({"cliState": "busy", "alive": True, "eventSeq": 4}),
+            completed(completed_status),
+            completed(
+                {
+                    "status": "completed",
+                    "text": "completed after returning to busy",
+                    "completionTimestamp": 2,
+                }
+            ),
+        ]
+    )
+    warnings: list[str] = []
+    # The final non-busy observation is beyond the first grace deadline. It must
+    # start a new grace period because an authoritative busy state intervened.
+    times = iter([0.0, 1.0, 2.0, 3.0, 40.0])
+    cli = client(runner, monotonic=lambda: next(times))
+
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 1, on_busy_timeout=warnings.append)
+
+    assert cli.read_result("tab-1") == "completed after returning to busy"
+    assert len(warnings) == 1
+
+
 def test_ready_result_lag_after_busy_timeout_fails_when_grace_expires() -> None:
     ready = {
         "cliState": "ready-for-review",
