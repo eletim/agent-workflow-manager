@@ -121,7 +121,9 @@ def classify_issue_topology(
                 pr,
                 inline_task_fingerprint,
                 allow_missing=(
-                    _allow_missing_inline_task_fingerprint and pr.state == "OPEN"
+                    _allow_missing_inline_task_fingerprint
+                    and pr.state == "OPEN"
+                    and pr.is_draft
                 ),
             )
         if closed_pr is not None:
@@ -155,6 +157,12 @@ def classify_issue_topology(
             )
 
         if open_pr is not None:
+            missing_inline_task_fingerprint = (
+                _allow_missing_inline_task_fingerprint
+                and inline_task_fingerprint is not None
+                and _inline_task_fingerprints(open_pr.body)
+                != (inline_task_fingerprint,)
+            )
             pull_requests.require_pr(
                 number=open_pr.number,
                 head=branch,
@@ -162,6 +170,7 @@ def classify_issue_topology(
                 state="OPEN",
                 expected_head_sha=feature_sha,
                 expected_base_sha=integration_sha,
+                draft=True if missing_inline_task_fingerprint else None,
             )
         if merged_pr is not None:
             pull_requests.require_pr(
@@ -455,6 +464,7 @@ def recover_issue_driven_work_item_topology(
             state="OPEN",
             expected_head_sha=state.feature_sha,
             expected_base_sha=state.integration_sha,
+            draft=True,
         )
     except WorkerFailure as exc:
         raise WorkerFailure(
