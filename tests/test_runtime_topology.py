@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import purplemux_client.runner as runner_module
 from purplemux_client import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
@@ -20,6 +21,7 @@ from purplemux_client import (
     WorkspaceState,
 )
 from purplemux_client.correlation import RUN_IDENTITY_ENV
+from purplemux_client.runner import PythonRunner
 
 
 class RuntimeRunner:
@@ -29,6 +31,7 @@ class RuntimeRunner:
         self.tabs: dict[str, dict[str, object]] = {}
         self.workspaces: dict[str, dict[str, object]] = {}
         self.sent: list[str] = []
+        self.initial_listing_failed = False
 
     def __call__(
         self,
@@ -44,6 +47,15 @@ class RuntimeRunner:
         if command[1:] == ["workspaces"]:
             return self.done({"workspaces": list(self.workspaces.values())})
         if command[1:3] == ["tab", "list"]:
+            if (
+                self.mode == "initial-list-failure-once"
+                and not self.initial_listing_failed
+                and any(
+                    call[1:3] == ["workspace", "create"] for call in self.calls[:-1]
+                )
+            ):
+                self.initial_listing_failed = True
+                return self.done({"unexpected": []})
             if self.mode == "incomplete":
                 return self.done({"unexpected": []})
             if self.mode == "postcondition-read-failure" and any(
@@ -632,6 +644,74 @@ def test_workspace_creation_does_not_claim_ambiguous_initial_tabs(
     )
 
     assert workspace.initial_tab is None
+
+
+def test_failed_initial_tab_discovery_reconciles_during_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    topology = RuntimeRunner("initial-list-failure-once")
+    registered: list[tuple[str, str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        "purplemux_client.client.register_run_resource",
+        lambda kind, identity, metadata: registered.append(
+            (kind, identity, dict(metadata))
+        ),
+    )
+    workspace = PurpleMuxRuntime(runner=topology, owned_by_run=True).create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+
+    assert workspace.initial_tab is None
+    assert workspace.initial_tab_discovery_pending
+    assert [(kind, identity) for kind, identity, _metadata in registered] == [
+        ("purplemux_workspace", "ws-new"),
+    ]
+    assert registered[0][2]["initial_tab_discovery"] == "pending"
+
+    history = tmp_path / "run-history.json"
+    workflow = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = workflow.start(
+            f"""from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-new", {{
+    "name": {workspace.name!r}, "directories": {str(tmp_path)!r},
+    "initial_tab_discovery": "pending"
+}})
+"""
+        )
+        deadline = time.monotonic() + 3
+        while workflow.snapshot(run_id).state == "running":
+            if time.monotonic() >= deadline:
+                raise AssertionError("resource registration workflow did not finish")
+            time.sleep(0.01)
+    finally:
+        workflow.close()
+
+    monkeypatch.setattr(
+        runner_module,
+        "PurpleMuxRuntime",
+        lambda: PurpleMuxRuntime(runner=topology),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PurpleMuxCLIClient",
+        lambda workspace_id: PurpleMuxCLIClient(workspace_id, runner=topology),
+    )
+    recovered = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        cleaned = recovered.cleanup(run_id)
+    finally:
+        recovered.close()
+
+    assert topology.tabs == {}
+    assert topology.workspaces == {}
+    assert [
+        (resource.kind, resource.identity, resource.cleanup_state)
+        for resource in cleaned.resources
+    ] == [
+        ("purplemux_workspace", "ws-new", "cleaned"),
+        ("purplemux_tab", "tab-initial", "cleaned"),
+    ]
 
 
 def test_new_run_does_not_collide_with_retained_logical_workspace(

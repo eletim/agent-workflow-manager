@@ -93,9 +93,12 @@ class _ManagedClient:
 
 
 class _ManagedRuntime:
-    def __init__(self, client: _ManagedClient) -> None:
+    def __init__(
+        self, client: _ManagedClient, *, initial_tab_discovery_pending: bool = False
+    ) -> None:
         self.client = client
         self.request: CreateWorkspaceRequest | None = None
+        self.initial_tab_discovery_pending = initial_tab_discovery_pending
 
     def create_workspace(self, request: CreateWorkspaceRequest) -> WorkspaceState:
         self.request = request
@@ -103,7 +106,10 @@ class _ManagedRuntime:
             "ws-workflow",
             request.name,
             (request.cwd,),
-            TabState("tab-initial", "ws-workflow", "", None, None),
+            None
+            if self.initial_tab_discovery_pending
+            else TabState("tab-initial", "ws-workflow", "", None, None),
+            self.initial_tab_discovery_pending,
         )
 
     def workspace(self, workspace_id: str) -> _ManagedClient:
@@ -240,6 +246,32 @@ def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) 
         assert client.interrupted is True
         assert stopped.exit_code == 130
     finally:
+        runner.close()
+
+
+def test_managed_launch_retains_failed_initial_tab_discovery(tmp_path: Path) -> None:
+    client = _ManagedClient()
+    runtime = _ManagedRuntime(client, initial_tab_discovery_pending=True)
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        runtime_factory=lambda: runtime,  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    try:
+        run_id = runner.start("print('managed')")
+        resources = runner.snapshot(run_id).resources
+
+        assert [(resource.kind, resource.identity) for resource in resources[:2]] == [
+            ("purplemux_workspace", "ws-workflow"),
+            ("purplemux_initial_tab", "ws-workflow"),
+        ]
+        assert resources[0].metadata["initial_tab_discovery"] == "pending"
+        client.release.set()
+        _wait_for_state(runner, "success")
+    finally:
+        for resource in runner.snapshot().resources:
+            if resource.kind == "managed_shell_result":
+                shutil.rmtree(resource.identity, ignore_errors=True)
         runner.close()
 
 

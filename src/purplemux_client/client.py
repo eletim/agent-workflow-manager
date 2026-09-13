@@ -81,6 +81,7 @@ class WorkspaceState:
     # Present only on the result of a successful create. Workspace listings do
     # not claim provenance for tabs that may have been created independently.
     initial_tab: TabState | None = field(default=None, compare=False)
+    initial_tab_discovery_pending: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -337,12 +338,14 @@ class PurpleMuxRuntime:
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
         )
         initial_tab: TabState | None = None
+        initial_tab_discovery_pending = False
         try:
             initial_tabs = self.workspace(workspace.id).list_sessions()
         except WorkerFailure:
             # The workspace identity is already authoritative and must remain in
-            # the run inventory. Without a complete tab read, claim no tab.
-            pass
+            # the run inventory. Record a discovery checkpoint without claiming
+            # a tab identity so Cleanup can reconcile it authoritatively later.
+            initial_tab_discovery_pending = True
         else:
             if len(initial_tabs) == 1:
                 candidate = initial_tabs[0]
@@ -354,17 +357,24 @@ class PurpleMuxRuntime:
                 ):
                     initial_tab = candidate
         workspace = WorkspaceState(
-            workspace.id, workspace.name, workspace.directories, initial_tab
+            workspace.id,
+            workspace.name,
+            workspace.directories,
+            initial_tab,
+            initial_tab_discovery_pending,
         )
         if self.owned_by_run:
+            workspace_metadata = {
+                "name": workspace.name,
+                "directories": "\n".join(workspace.directories),
+                "correlation_id": correlation_id,
+            }
+            if initial_tab_discovery_pending:
+                workspace_metadata["initial_tab_discovery"] = "pending"
             register_run_resource(
                 "purplemux_workspace",
                 workspace.id,
-                {
-                    "name": workspace.name,
-                    "directories": "\n".join(workspace.directories),
-                    "correlation_id": correlation_id,
-                },
+                workspace_metadata,
             )
             if initial_tab is not None:
                 self._register_initial_tab(initial_tab)

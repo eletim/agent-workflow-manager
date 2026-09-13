@@ -2005,16 +2005,19 @@ class PythonRunner:
     def _register_managed_workspace(
         self, run: _RunRecord, workspace: WorkspaceState, correlation: str
     ) -> None:
+        workspace_metadata = {
+            "name": workspace.name,
+            "directories": "\n".join(workspace.directories),
+            "correlation_id": correlation,
+        }
+        if workspace.initial_tab_discovery_pending:
+            workspace_metadata["initial_tab_discovery"] = "pending"
         self._register_resource(
             run,
             RunResource(
                 "purplemux_workspace",
                 workspace.id,
-                {
-                    "name": workspace.name,
-                    "directories": "\n".join(workspace.directories),
-                    "correlation_id": correlation,
-                },
+                workspace_metadata,
             ),
         )
         initial_tab = workspace.initial_tab
@@ -2497,6 +2500,37 @@ class PythonRunner:
                     else:
                         failed_priorities[current.repository_index] = priority
                     continue
+                if current.kind == "purplemux_initial_tab":
+                    try:
+                        resolved = self._resolve_initial_tab_resource(current)
+                    except Exception as exc:
+                        with self._lock:
+                            run.resources[index] = RunResource(
+                                current.kind,
+                                current.identity,
+                                current.metadata,
+                                "cleanup_retryable",
+                                str(exc),
+                                current.repository_index,
+                            )
+                            self._mark_changed()
+                        failed_priorities[current.repository_index] = priority
+                        continue
+                    if resolved is None:
+                        with self._lock:
+                            run.resources[index] = RunResource(
+                                current.kind,
+                                current.identity,
+                                current.metadata,
+                                "cleaned",
+                                repository_index=current.repository_index,
+                            )
+                            self._mark_changed()
+                        continue
+                    with self._lock:
+                        run.resources[index] = resolved
+                        self._mark_changed()
+                    current = resolved
                 with self._lock:
                     pending = RunResource(
                         current.kind,
@@ -2546,10 +2580,59 @@ class PythonRunner:
     def _resource_cleanup_priority(resource: RunResource) -> int:
         return {
             "purplemux_tab": 0,
-            "managed_shell_result": 1,
-            "purplemux_workspace": 2,
-            "git_worktree": 3,
-        }.get(resource.kind, 3)
+            "purplemux_initial_tab": 1,
+            "managed_shell_result": 2,
+            "purplemux_workspace": 3,
+            "git_worktree": 4,
+        }.get(resource.kind, 4)
+
+    @staticmethod
+    def _resolve_initial_tab_resource(resource: RunResource) -> RunResource | None:
+        workspace_id = resource.metadata.get("workspace_id")
+        if not workspace_id or workspace_id != resource.identity:
+            raise OSError("PurpleMux initial tab discovery lacks workspace identity")
+        runtime = PurpleMuxRuntime()
+        selected = next(
+            (
+                workspace
+                for workspace in runtime.list_workspaces()
+                if workspace.id == workspace_id
+            ),
+            None,
+        )
+        if selected is None:
+            return None
+        if selected.name != resource.metadata.get("workspace_name"):
+            raise OSError(
+                "PurpleMux workspace name changed before initial tab discovery"
+            )
+        expected_directories = resource.metadata.get("workspace_directories")
+        if expected_directories is None or selected.directories != tuple(
+            expected_directories.splitlines()
+        ):
+            raise OSError(
+                "PurpleMux workspace directories changed before initial tab discovery"
+            )
+        tabs = PurpleMuxCLIClient(workspace_id).list_sessions()
+        if not tabs:
+            return None
+        if len(tabs) != 1:
+            raise OSError("PurpleMux initial tab discovery is ambiguous")
+        tab = tabs[0]
+        if tab.name or tab.panel_type is not None or tab.provider is not None:
+            raise OSError("PurpleMux initial tab identity is not canonical")
+        return RunResource(
+            "purplemux_tab",
+            tab.id,
+            {
+                "workspace_id": tab.workspace_id,
+                "name": tab.name,
+                "panel_type": tab.panel_type or "",
+                "provider": tab.provider or "",
+                "origin": "workspace_initial",
+            },
+            repository_index=resource.repository_index,
+        )
 
     def _cleanup_resource(self, resource: RunResource) -> None:
         if resource.kind == "purplemux_tab":
@@ -3599,6 +3682,24 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+        if (
+            resource.kind == "purplemux_workspace"
+            and resource.metadata.get("initial_tab_discovery") == "pending"
+        ):
+            run.resources.append(
+                RunResource(
+                    "purplemux_initial_tab",
+                    resource.identity,
+                    {
+                        "workspace_id": resource.identity,
+                        "workspace_name": resource.metadata.get("name", ""),
+                        "workspace_directories": resource.metadata.get(
+                            "directories", ""
+                        ),
+                    },
+                    repository_index=resource.repository_index,
+                )
+            )
 
     @classmethod
     def _with_resource_repository(
@@ -3629,7 +3730,7 @@ class PythonRunner:
             )
             if parent is not None:
                 return parent.repository_index
-        elif resource.kind == "purplemux_tab":
+        elif resource.kind in ("purplemux_tab", "purplemux_initial_tab"):
             workspace_id = resource.metadata.get("workspace_id")
             parent = next(
                 (
