@@ -154,11 +154,38 @@ def test_run_turn_retains_busy_timeout_warning_for_summary_and_handoff(
         ),
     )
 
-    assert workflow["run_turn"](Client(), "tab-1", "Implement", "work") == "done"
-    assert findings == [("runtime", "turn timeout warning", "warning")]
-    assert workflow["summary_warnings"](240) == ("turn timeout warning",)
+    assert (
+        workflow["run_turn"](
+            Client(), "tab-1", "Issue #240 implementation", "work", warning_scope=240
+        )
+        == "done"
+    )
+    contextual_warning = "Issue #240 implementation: turn timeout warning"
+    assert findings == [("runtime", contextual_warning, "warning")]
+    records = workflow["AGENT_TURN_TIMEOUT_WARNINGS"]
+    assert records == [
+        workflow["AgentTurnTimeoutWarning"](
+            240, "Issue #240 implementation", contextual_warning
+        )
+    ]
+    other_warning = "Issue #241 correctness review: another timeout"
+    records.append(
+        workflow["AgentTurnTimeoutWarning"](
+            241, "Issue #241 correctness review", other_warning
+        )
+    )
+
+    assert workflow["summary_warnings"](240, ("review warning",)) == (
+        "review warning",
+        contextual_warning,
+    )
+    assert workflow["summary_warnings"](241) == (other_warning,)
+    assert workflow["summary_warnings"](None) == ()
     delivery = workflow["ReviewDelivery"]("approved", "head", "base", 1)
-    assert workflow["human_handoff_warnings"](delivery) == ("turn timeout warning",)
+    assert workflow["human_handoff_warnings"](delivery) == (
+        contextual_warning,
+        other_warning,
+    )
 
 
 def test_terminal_progress_formats_iteration_and_detail(

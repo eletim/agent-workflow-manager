@@ -80,7 +80,6 @@ POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
 POLICY_CONFLICT_WARNINGS: list[tuple[int | str | None, str]] = []
-AGENT_TURN_TIMEOUT_WARNINGS: list[str] = []
 HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
 HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
 MAX_HUMAN_HANDOFF_CHARS = 12_000
@@ -188,6 +187,16 @@ class Config:
     check_command: str
     policy_issue: int | None = None
     one_shot_issue: int | None = None
+
+
+@dataclass(frozen=True)
+class AgentTurnTimeoutWarning:
+    result_scope: int | str | None
+    turn_name: str
+    message: str
+
+
+AGENT_TURN_TIMEOUT_WARNINGS: list[AgentTurnTimeoutWarning] = []
 
 
 @dataclass(frozen=True)
@@ -438,6 +447,7 @@ def run_turn(
     *,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
 ) -> str:
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
@@ -451,10 +461,13 @@ def run_turn(
     terminal_progress("START", name, iteration=iteration)
 
     def warn_busy_timeout(warning: str) -> None:
-        if warning not in AGENT_TURN_TIMEOUT_WARNINGS:
-            AGENT_TURN_TIMEOUT_WARNINGS.append(warning)
-        print(f"WARN: {warning}", flush=True)
-        emit_finding("runtime", warning, status="warning")
+        contextual = AgentTurnTimeoutWarning(
+            warning_scope, name, f"{name}: {warning}"
+        )
+        if contextual not in AGENT_TURN_TIMEOUT_WARNINGS:
+            AGENT_TURN_TIMEOUT_WARNINGS.append(contextual)
+        print(f"WARN: {contextual.message}", flush=True)
+        emit_finding("runtime", contextual.message, status="warning")
 
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
@@ -499,9 +512,18 @@ def run_validated_turn(
     *,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
-    result = run_turn(client, tab, name, prompt, iteration=iteration, pr=pr)
+    result = run_turn(
+        client,
+        tab,
+        name,
+        prompt,
+        iteration=iteration,
+        pr=pr,
+        warning_scope=warning_scope,
+    )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
         try:
             return result, validator(result)
@@ -524,6 +546,7 @@ def run_validated_turn(
                 "session; do not repeat the underlying task or mutate any state.",
                 iteration=correction + 1,
                 pr=pr,
+                warning_scope=warning_scope,
             )
     raise AssertionError("unreachable")
 
@@ -662,8 +685,12 @@ def summary_warnings(
     issue_number: int | str | None, additional: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
     """Keep the result event narrow while retaining its primary warnings."""
-    warnings = list(AGENT_TURN_TIMEOUT_WARNINGS)
-    warnings.extend(additional)
+    warnings = list(additional)
+    warnings.extend(
+        warning.message
+        for warning in AGENT_TURN_TIMEOUT_WARNINGS
+        if warning.result_scope == issue_number
+    )
     warnings.extend(
         warning
         for warning_issue, warning in POLICY_CONFLICT_WARNINGS
@@ -842,7 +869,7 @@ def warn_human_handoff(message: str) -> None:
 
 
 def human_handoff_warnings(delivery: ReviewDelivery) -> tuple[str, ...]:
-    warnings = list(AGENT_TURN_TIMEOUT_WARNINGS)
+    warnings = [warning.message for warning in AGENT_TURN_TIMEOUT_WARNINGS]
     warnings.extend(delivery.warnings)
     for item in ISSUE_HANDOFF_RESULTS:
         warnings.extend(item.warnings)
@@ -1213,6 +1240,7 @@ def require_clean_worktree(
     *,
     context: str,
     iteration: int | None = None,
+    warning_scope: int | str | None = None,
 ) -> None:
     state = repo.inspect_worktree()
     if not state.dirty:
@@ -1235,6 +1263,7 @@ and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve."""),
         iteration=iteration,
+        warning_scope=warning_scope,
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -1257,6 +1286,7 @@ def require_agent_result(
     *,
     allow_unchanged: bool,
     iteration: int | None = None,
+    warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
     repo.require_current_branch(branch)
     require_clean_worktree(
@@ -1265,6 +1295,7 @@ def require_agent_result(
         tab,
         context=f"verifying the coding result on {branch!r}",
         iteration=iteration,
+        warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
         branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
@@ -1607,6 +1638,7 @@ def review_issue_phase(
             decision,
             iteration=review_number,
             pr=pr,
+            warning_scope=issue.result_id,
         )
         emit_policy_conflicts(
             result,
@@ -1631,6 +1663,7 @@ def review_issue_phase(
             current.head_sha,
             allow_unchanged=True,
             iteration=review_number,
+            warning_scope=issue.result_id,
         )
         if reviewer_changed:
             pushed = repo.ensure_pushed(issue.branch, expected_local_sha=reviewed_sha)
@@ -1697,6 +1730,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             ),
             iteration=review_number,
             pr=pr,
+            warning_scope=issue.result_id,
         )
         emit_policy_conflicts(
             fix_result,
@@ -1712,6 +1746,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             current.head_sha,
             allow_unchanged=True,
             iteration=review_number,
+            warning_scope=issue.result_id,
         )
         if not changed:
             warning = (
@@ -1778,6 +1813,7 @@ def process_issue(
             client,
             cleanup,
             context=f"preparing {issue.label}",
+            warning_scope=issue.result_id,
         )
     prepared = prepare_issue(repo, github, issue, config)
     if isinstance(prepared, PullRequestState):
@@ -1849,6 +1885,7 @@ def process_issue(
         f"{issue.label} implementation",
         implementation_prompt,
         pr=existing_pr,
+        warning_scope=issue.result_id,
     )
     emit_policy_conflicts(
         implementation_result,
@@ -1863,6 +1900,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
     if integration.remote_sha is None:
