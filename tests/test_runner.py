@@ -282,7 +282,7 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     assert runner.delete_checked_runs((run_id,)) == (run_id,)
 
 
-def test_delete_checked_runs_retains_resource_ownership_until_fully_cleaned(
+def test_delete_checked_runs_removes_checked_history_without_cleaning_resources(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_id = runner.start(
@@ -294,14 +294,13 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     wait_for(runner, lambda item: item.state == "success", run_id=run_id)
     runner.set_checked(run_id, True)
 
-    with pytest.raises(runner_module.RunDeletionNotAllowedError, match="fully cleaned"):
-        runner.delete_checked_runs((run_id,))
-    assert runner.snapshot(run_id).resources[0].cleanup_state == "retained"
+    cleaned_resources: list[RunResource] = []
+    monkeypatch.setattr(runner, "_cleanup_resource", cleaned_resources.append)
 
-    monkeypatch.setattr(runner, "_cleanup_resource", lambda _resource: None)
-    cleaned = runner.cleanup(run_id)
-    assert cleaned.resources[0].cleanup_state == "cleaned"
     assert runner.delete_checked_runs((run_id,)) == (run_id,)
+    assert cleaned_resources == []
+    with pytest.raises(runner_module.RunNotFoundError):
+        runner.snapshot(run_id)
 
 
 def test_checked_terminal_run_is_restored_after_runner_reconstruction(
