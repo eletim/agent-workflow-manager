@@ -63,13 +63,6 @@ class CreateWorkspaceRequest:
 
 
 @dataclass(frozen=True)
-class WorkspaceState:
-    id: str
-    name: str
-    directories: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class TabState:
     id: str
     workspace_id: str
@@ -78,6 +71,17 @@ class TabState:
     provider: str | None
     alive: bool | None = None
     cli_state: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceState:
+    id: str
+    name: str
+    directories: tuple[str, ...]
+    # Present only on the result of a successful create. Workspace listings do
+    # not claim provenance for tabs that may have been created independently.
+    initial_tab: TabState | None = field(default=None, compare=False)
+    initial_tab_discovery_pending: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -278,6 +282,7 @@ class PurpleMuxRuntime:
         if any(item.name == correlated_name for item in before):
             raise WorkerFailure("workspace creation correlation is already in use")
         response_id: str | None = None
+        response_initial_tab: TabState | None = None
 
         def matches() -> tuple[WorkspaceState, ...]:
             return tuple(
@@ -289,7 +294,7 @@ class PurpleMuxRuntime:
             )
 
         def dispatch() -> WorkspaceState:
-            nonlocal response_id
+            nonlocal response_id, response_initial_tab
             data = self._mutation_json(
                 ["workspace", "create", "--cwd", cwd, "--name", correlated_name],
                 "create workspace",
@@ -297,6 +302,15 @@ class PurpleMuxRuntime:
             candidate = data.get("id") or data.get("workspaceId")
             if isinstance(candidate, str) and candidate:
                 response_id = candidate
+                try:
+                    parsed_initial_tab = PurpleMuxCLIClient._parse_tab(
+                        data.get("initialTab")
+                    )
+                except WorkerFailure:
+                    pass
+                else:
+                    if parsed_initial_tab.workspace_id == response_id:
+                        response_initial_tab = parsed_initial_tab
             try:
                 found = matches()
             except WorkerFailure as exc:
@@ -333,15 +347,39 @@ class PurpleMuxRuntime:
             reconcile=reconcile,
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
         )
+        initial_tab = response_initial_tab
+        # A later listing cannot prove which tab was created with the workspace.
+        # Preserve an unresolved cleanup checkpoint whenever the authoritative
+        # mutation response was unavailable or omitted that identity.
+        initial_tab_discovery_pending = initial_tab is None
+        workspace = WorkspaceState(
+            workspace.id,
+            workspace.name,
+            workspace.directories,
+            initial_tab,
+            initial_tab_discovery_pending,
+        )
         if self.owned_by_run:
+            workspace_metadata = {
+                "name": workspace.name,
+                "directories": "\n".join(workspace.directories),
+                "correlation_id": correlation_id,
+            }
+            if initial_tab_discovery_pending:
+                workspace_metadata["initial_tab_discovery"] = "pending"
+            elif initial_tab is not None:
+                workspace_metadata.update(
+                    {
+                        "initial_tab_id": initial_tab.id,
+                        "initial_tab_name": initial_tab.name,
+                        "initial_tab_panel_type": initial_tab.panel_type or "",
+                        "initial_tab_provider": initial_tab.provider or "",
+                    }
+                )
             register_run_resource(
                 "purplemux_workspace",
                 workspace.id,
-                {
-                    "name": workspace.name,
-                    "directories": "\n".join(workspace.directories),
-                    "correlation_id": correlation_id,
-                },
+                workspace_metadata,
             )
         return workspace
 

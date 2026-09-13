@@ -482,13 +482,21 @@ registration-free by default. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/cleanup` releases registered resources without deleting
-run history. Workspace release requires
-PurpleMux's public atomic `workspace delete -w ID --if-empty` CLI contract;
-startup rejects unsupported versions so canonical Cleanup cannot be stranded
-behind an incompatible runtime. Multi-repository resources retain their repository
-ownership: a cleanup failure blocks dependent resources in that repository while
-cleanup of the other repositories continues. Single-repository and unscoped
-resource cleanup keeps the same dependency ordering and failure behavior. The
+run history. For a newly created run-owned workspace, AWM records the single
+canonical initial/default tab separately, closes it after explicitly created
+run tabs, and does not claim ambiguous or non-default tabs. The required public
+workspace-create response supplies that initial tab identity, which is persisted
+atomically with workspace ownership. If the response is lost or omits it,
+Cleanup retains an unresolved result instead of inferring ownership from the
+shape of a later tab listing. That result is cleared only when authoritative
+state proves the workspace absent or empty. Workspace release
+requires PurpleMux's public atomic
+`workspace delete -w ID --if-empty` CLI contract; startup rejects unsupported
+versions so canonical Cleanup cannot be stranded behind an incompatible runtime.
+Multi-repository resources retain their repository ownership: a cleanup failure
+blocks dependent resources in that repository while cleanup of the other
+repositories continues. Single-repository and unscoped resource cleanup keeps
+the same dependency ordering and failure behavior. The
 original `/api/status`, `/api/output`, and `/api/stop` routes remain available and
 address the most recently created run. `GET /api/events` streams revision-only
 SSE change notifications; initial load, notifications, and reconnects all

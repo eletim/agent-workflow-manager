@@ -251,7 +251,13 @@ CreateWorkspaceRequest(cwd, name, correlation_id=None)
 CreateSessionRequest(worker, cwd, command, metadata={}, name=None, correlation_id=None)
 ShellCommandRequest(command, cwd, name, correlation_id=None)
 
-WorkspaceState(id, name, directories)
+WorkspaceState(
+    id,
+    name,
+    directories,
+    initial_tab=None,
+    initial_tab_discovery_pending=False,
+)
 TabState(id, workspace_id, name, panel_type, provider, alive=None, cli_state=None)
 ShellResult(
     exit_code,
@@ -622,6 +628,12 @@ runtime.workspace(workspace_id) -> PurpleMuxCLIClient
 runtime.delete_workspace(workspace_id, *, expected_state) -> None
 ```
 
+The required public PurpleMux workspace-create response includes `initialTab`
+with the new tab's full structured identity. AWM persists that identity in the
+same workspace ownership event so interruption cannot split their registration.
+A lost or invalid mutation response cannot be repaired from a later tab listing
+because current shape is not historical ownership evidence.
+
 Explicit deletion is an identity-checked, empty-workspace-only cleanup primitive.
 Normal Workflow code must leave owned resources for the Runner's manual Cleanup
 action instead of calling it during success or failure handling.
@@ -732,10 +744,16 @@ and commits change both after a detached worktree is created.
 Do not automatically close a Workflow run's tabs on success or failure. The
 Runner retains the structured inventory on the run record and exposes one manual
 Cleanup action after execution ends. Cleanup verifies identities, closes child
-tabs in reverse deterministic order, removes managed-shell result directories,
-deletes an identity-verified empty workspace through PurpleMux's public atomic
-`workspace delete -w ID --if-empty` contract, and then handles the Git worktree.
-Startup rejects PurpleMux versions without that contract. Only its structured
+tabs in reverse deterministic order (including the separately tracked canonical
+initial/default tab of a newly created run-owned workspace). A failed initial
+tab identity is retained as an unresolved cleanup checkpoint; Cleanup never
+converts a later shape-only observation into ownership evidence. It clears that
+checkpoint only when authoritative state proves the workspace absent or the
+identity-verified workspace empty. Cleanup then removes managed-shell result
+directories and deletes an identity-verified empty workspace through PurpleMux's
+public atomic `workspace delete -w ID --if-empty` contract before handling the
+Git worktree.
+Startup rejects PurpleMux versions without both contracts. Only its structured
 `not-empty` response proves rejection; transport errors and other nonzero exits
 remain uncertain until authoritative workspace listing reconciles them.
 Managed-shell directories are registered with their no-follow filesystem
