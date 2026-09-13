@@ -154,6 +154,15 @@ class PullRequestNavigation:
 
 
 @dataclass(frozen=True)
+class PurpleMuxNavigation:
+    workspace_id: str
+    tab_id: str
+
+    def as_json(self) -> dict[str, str]:
+        return {"workspaceId": self.workspace_id, "tabId": self.tab_id}
+
+
+@dataclass(frozen=True)
 class TopologyFinding:
     category: Literal["runtime", "git", "github", "policy_issue"]
     status: Literal["passed", "warning", "failed", "info"]
@@ -168,6 +177,19 @@ class IssueResult:
     reviews: int
     pr: PullRequestNavigation
     warnings: tuple[str, ...] = ()
+    label: str | None = None
+    implementation_terminal: PurpleMuxNavigation | None = None
+    scope_review_terminal: PurpleMuxNavigation | None = None
+    correctness_review_terminal: PurpleMuxNavigation | None = None
+
+
+@dataclass(frozen=True)
+class IssueNavigation:
+    issue: int | str
+    pr: PullRequestNavigation
+    implementation_terminal: PurpleMuxNavigation
+    scope_review_terminal: PurpleMuxNavigation
+    correctness_review_terminal: PurpleMuxNavigation
     label: str | None = None
 
 
@@ -256,6 +278,10 @@ class RunHistoryError(RuntimeError):
 
 class RunStopUncertainError(RuntimeError):
     """Raised when PurpleMux cannot prove that a stopped Workflow terminated."""
+
+
+class RunResumeNotAllowedError(RuntimeError):
+    """Raised when a run cannot be resumed as a new execution."""
 
 
 @dataclass(frozen=True)
@@ -358,13 +384,28 @@ class RunnerSnapshot:
     warning_count: int = 0
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: tuple[IssueResult, ...] = ()
+    issue_navigations: tuple[IssueNavigation, ...] = ()
     whole_review_result: WholeReviewResult | None = None
     identity: str | None = None
+    issue_driven_json: str | None = None
+    resumed_from_run_id: int | None = None
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
         payload.pop("prompt")
-        payload["mode"] = "prompt" if self.prompt is not None else "workflow"
+        payload["mode"] = (
+            "prompt"
+            if self.prompt is not None
+            else "issue-driven"
+            if self.issue_driven_json is not None
+            else "workflow"
+        )
+        issue_driven_json = payload.pop("issue_driven_json")
+        resumed_from_run_id = payload.pop("resumed_from_run_id")
+        if issue_driven_json is not None:
+            payload["issueDrivenJson"] = issue_driven_json
+        if resumed_from_run_id is not None:
+            payload["resumedFromRunId"] = resumed_from_run_id
         if self.prompt is not None:
             payload["prompt"] = self.prompt.as_json()
             payload["repository"] = self.prompt.repository_json()
@@ -375,6 +416,7 @@ class RunnerSnapshot:
         payload["warningCount"] = payload.pop("warning_count")
         payload.pop("issue_driven_context")
         payload.pop("issue_results")
+        payload.pop("issue_navigations")
         payload.pop("whole_review_result")
         payload["issueDrivenSummary"] = self._issue_driven_summary_json()
         payload["stdoutEntries"] = [
@@ -421,9 +463,16 @@ class RunnerSnapshot:
 
     def _issue_driven_summary_json(self) -> dict[str, object] | None:
         context = self.issue_driven_context
-        if context is None or self.state in ("idle", "running", "validation_failed"):
+        if context is None or self.state in ("idle", "validation_failed"):
+            return None
+        if self.state == "running" and not (
+            self.issue_results or self.issue_navigations
+        ):
             return None
         issues = []
+        navigations = {
+            navigation.issue: navigation for navigation in self.issue_navigations
+        }
         for result in self.issue_results:
             item = {
                 "issue": result.issue,
@@ -434,6 +483,35 @@ class RunnerSnapshot:
             }
             if result.label is not None:
                 item["label"] = result.label
+            navigation = navigations.pop(result.issue, None)
+            terminals = {
+                "implementation": result.implementation_terminal
+                or (navigation.implementation_terminal if navigation else None),
+                "scopeReview": result.scope_review_terminal
+                or (navigation.scope_review_terminal if navigation else None),
+                "correctnessReview": result.correctness_review_terminal
+                or (navigation.correctness_review_terminal if navigation else None),
+            }
+            if any(terminal is not None for terminal in terminals.values()):
+                item["terminals"] = {
+                    role: terminal.as_json()
+                    for role, terminal in terminals.items()
+                    if terminal is not None
+                }
+            issues.append(item)
+        for navigation in navigations.values():
+            item = {
+                "issue": navigation.issue,
+                "pr": navigation.pr.as_json(),
+                "warnings": [],
+                "terminals": {
+                    "implementation": navigation.implementation_terminal.as_json(),
+                    "scopeReview": navigation.scope_review_terminal.as_json(),
+                    "correctnessReview": navigation.correctness_review_terminal.as_json(),
+                },
+            }
+            if navigation.label is not None:
+                item["label"] = navigation.label
             issues.append(item)
         whole_review = self.whole_review_result
         return {
@@ -459,7 +537,13 @@ class RunnerSnapshot:
     def as_summary_json(self) -> dict[str, object]:
         execution_context = self._execution_context_json()
         payload: dict[str, object] = {
-            "mode": "prompt" if self.prompt is not None else "workflow",
+            "mode": (
+                "prompt"
+                if self.prompt is not None
+                else "issue-driven"
+                if self.issue_driven_json is not None
+                else "workflow"
+            ),
             "state": self.state,
             "exitCode": self.exit_code,
             "runId": self.run_id,
@@ -474,6 +558,8 @@ class RunnerSnapshot:
             "resourceCount": len(self.resources),
             "checked": self.checked,
         }
+        if self.resumed_from_run_id is not None:
+            payload["resumedFromRunId"] = self.resumed_from_run_id
         if self.prompt is not None:
             payload["prompt"] = {
                 "agent": self.prompt.agent,
@@ -543,7 +629,10 @@ class _RunRecord:
     checked: bool = False
     issue_driven_context: IssueDrivenContext | None = None
     issue_results: dict[int | str, IssueResult] = field(default_factory=dict)
+    issue_navigations: dict[int | str, IssueNavigation] = field(default_factory=dict)
     whole_review_result: WholeReviewResult | None = None
+    issue_driven_json: str | None = None
+    resumed_from_run_id: int | None = None
 
 
 class PythonRunner:
@@ -724,7 +813,23 @@ class PythonRunner:
             "integrationPr": (
                 asdict(run.integration_pr) if run.integration_pr is not None else None
             ),
+            "issueDrivenContext": (
+                asdict(run.issue_driven_context)
+                if run.issue_driven_context is not None
+                else None
+            ),
+            "issueResults": [asdict(result) for result in run.issue_results.values()],
+            "issueNavigations": [
+                asdict(navigation) for navigation in run.issue_navigations.values()
+            ],
+            "wholeReviewResult": (
+                asdict(run.whole_review_result)
+                if run.whole_review_result is not None
+                else None
+            ),
             "checked": run.checked,
+            "issueDrivenJson": run.issue_driven_json,
+            "resumedFromRunId": run.resumed_from_run_id,
         }
 
     def _write_run_history_locked(self) -> None:
@@ -794,6 +899,8 @@ class PythonRunner:
         args = value.get("args")
         outline = value.get("outline")
         exit_code = value.get("exitCode")
+        issue_driven_json = value.get("issueDrivenJson")
+        resumed_from_run_id = value.get("resumedFromRunId")
         if (
             isinstance(run_id, bool)
             or not isinstance(run_id, int)
@@ -809,6 +916,18 @@ class PythonRunner:
             or any(not isinstance(item, str) for item in outline)
             or isinstance(exit_code, bool)
             or not isinstance(exit_code, int)
+            or (
+                issue_driven_json is not None and not isinstance(issue_driven_json, str)
+            )
+            or (
+                resumed_from_run_id is not None
+                and (
+                    isinstance(resumed_from_run_id, bool)
+                    or not isinstance(resumed_from_run_id, int)
+                    or resumed_from_run_id < 1
+                    or resumed_from_run_id >= run_id
+                )
+            )
         ):
             raise ValueError
 
@@ -861,6 +980,82 @@ class PythonRunner:
             if integration_pr_value is None
             else self._history_dataclass(PullRequestNavigation, integration_pr_value)
         )
+        context_value = value.get("issueDrivenContext")
+        issue_driven_context = (
+            None
+            if context_value is None
+            else self._history_dataclass(IssueDrivenContext, context_value)
+        )
+        issue_result_values = value.get("issueResults", [])
+        if not isinstance(issue_result_values, list):
+            raise ValueError
+        issue_results: dict[int | str, IssueResult] = {}
+        for item in issue_result_values:
+            if not isinstance(item, dict):
+                raise ValueError
+            result_value = dict(item)
+            result_value["pr"] = self._history_dataclass(
+                PullRequestNavigation, result_value.get("pr")
+            )
+            legacy_terminal = result_value.pop("terminal", None)
+            terminal_fields = (
+                "implementation_terminal",
+                "scope_review_terminal",
+                "correctness_review_terminal",
+            )
+            for field_name in terminal_fields:
+                terminal_value = result_value.get(field_name)
+                result_value[field_name] = (
+                    None
+                    if terminal_value is None
+                    else self._history_dataclass(PurpleMuxNavigation, terminal_value)
+                )
+            if (
+                legacy_terminal is not None
+                and result_value["implementation_terminal"] is None
+            ):
+                result_value["implementation_terminal"] = self._history_dataclass(
+                    PurpleMuxNavigation, legacy_terminal
+                )
+            warnings_value = result_value.get("warnings")
+            if not isinstance(warnings_value, list) or any(
+                not isinstance(warning, str) for warning in warnings_value
+            ):
+                raise ValueError
+            result_value["warnings"] = tuple(warnings_value)
+            result = self._history_dataclass(IssueResult, result_value)
+            issue_results[result.issue] = result
+        issue_navigation_values = value.get("issueNavigations", [])
+        if not isinstance(issue_navigation_values, list):
+            raise ValueError
+        issue_navigations: dict[int | str, IssueNavigation] = {}
+        for item in issue_navigation_values:
+            if not isinstance(item, dict):
+                raise ValueError
+            navigation_value = dict(item)
+            navigation_value["pr"] = self._history_dataclass(
+                PullRequestNavigation, navigation_value.get("pr")
+            )
+            for field_name in (
+                "implementation_terminal",
+                "scope_review_terminal",
+                "correctness_review_terminal",
+            ):
+                navigation_value[field_name] = self._history_dataclass(
+                    PurpleMuxNavigation, navigation_value.get(field_name)
+                )
+            navigation = self._history_dataclass(IssueNavigation, navigation_value)
+            issue_navigations[navigation.issue] = navigation
+        whole_review_value = value.get("wholeReviewResult")
+        whole_review_result = (
+            None
+            if whole_review_value is None
+            else self._history_dataclass(WholeReviewResult, whole_review_value)
+        )
+        if whole_review_result is not None:
+            whole_review_result = replace(
+                whole_review_result, warnings=tuple(whole_review_result.warnings)
+            )
         stdout_truncated = value.get("stdoutTruncated")
         stderr_truncated = value.get("stderrTruncated")
         if not isinstance(stdout_truncated, bool) or not isinstance(
@@ -895,7 +1090,13 @@ class PythonRunner:
             resources=resources,
             prompt=prompt,
             integration_pr=integration_pr,
+            issue_driven_context=issue_driven_context,
+            issue_results=issue_results,
+            issue_navigations=issue_navigations,
+            whole_review_result=whole_review_result,
             checked=checked,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=resumed_from_run_id,
         )
 
     def _load_run_history(self) -> None:
@@ -1164,6 +1365,8 @@ class PythonRunner:
         *,
         args: Sequence[str] = (),
         prompt: PromptExecution | None = None,
+        issue_driven_json: str | None = None,
+        resumed_from_run_id: int | None = None,
     ) -> int:
         run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
@@ -1184,7 +1387,31 @@ class PythonRunner:
                     run_args=run_args,
                     child_env=child_env,
                     prompt=prompt,
+                    issue_driven_json=issue_driven_json,
+                    resumed_from_run_id=resumed_from_run_id,
                 )
+
+    def resume(self, run_id: int) -> int:
+        """Start a new run from one terminal run's immutable settings."""
+        with self._lock:
+            source = self._get_run(run_id)
+            if source.state not in ("failed", "stopped"):
+                raise RunResumeNotAllowedError(
+                    f"run {run_id} is {source.state}; only failed or stopped runs can be resumed"
+                )
+            if source.issue_driven_json is None:
+                raise RunResumeNotAllowedError(
+                    f"run {run_id} is not an Issue Driven run; only Issue Driven runs can be resumed"
+                )
+            code = source.code
+            args = source.args
+            issue_driven_json = source.issue_driven_json
+        return self.start(
+            code,
+            args=args,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=run_id,
+        )
 
     def _start_validated(
         self,
@@ -1195,6 +1422,8 @@ class PythonRunner:
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
+        issue_driven_json: str | None = None,
+        resumed_from_run_id: int | None = None,
     ) -> int:
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
@@ -1210,6 +1439,8 @@ class PythonRunner:
                 run_cwd=run_cwd,
                 run_args=run_args,
                 child_env=child_env,
+                issue_driven_json=issue_driven_json,
+                resumed_from_run_id=resumed_from_run_id,
             )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
@@ -1233,6 +1464,8 @@ class PythonRunner:
             findings=deque(maxlen=self._max_progress_events),
             warning_findings=deque(maxlen=self._max_progress_events),
             prompt=prompt,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
 
@@ -1260,6 +1493,8 @@ class PythonRunner:
         run_cwd: Path,
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
+        issue_driven_json: str | None = None,
+        resumed_from_run_id: int | None = None,
     ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -1304,6 +1539,8 @@ class PythonRunner:
             warning_findings=deque(maxlen=self._max_progress_events),
             credential_path=credential_path,
             event_token=event_token,
+            issue_driven_json=issue_driven_json,
+            resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
         correlation = self._run_identity(run_id)
@@ -1665,8 +1902,11 @@ class PythonRunner:
             warning_count=run.warning_count,
             issue_driven_context=run.issue_driven_context,
             issue_results=tuple(run.issue_results.values()),
+            issue_navigations=tuple(run.issue_navigations.values()),
             whole_review_result=run.whole_review_result,
             identity=self._run_identity(run.run_id),
+            issue_driven_json=run.issue_driven_json,
+            resumed_from_run_id=run.resumed_from_run_id,
         )
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
@@ -2443,6 +2683,9 @@ class PythonRunner:
         elif event_type == "issue_result":
             issue_result = cast(IssueResult, event)
             run.issue_results[issue_result.issue] = issue_result
+        elif event_type == "issue_navigation":
+            issue_navigation = cast(IssueNavigation, event)
+            run.issue_navigations[issue_navigation.issue] = issue_navigation
         elif event_type == "whole_review_result":
             run.whole_review_result = cast(WholeReviewResult, event)
         else:
@@ -2465,6 +2708,7 @@ class PythonRunner:
                 "resource_ownership",
                 "run_pr",
                 "issue_driven_context",
+                "issue_navigation",
                 "issue_result",
                 "whole_review_result",
             ],
@@ -2574,6 +2818,47 @@ class PythonRunner:
                 cast(str, final_branch),
                 cast(int | None, policy_issue),
             )
+        if event_type == "issue_navigation":
+            issue = value.get("issue")
+            label = value.get("label")
+            pr_number = value.get("pr_number")
+            pr_url = value.get("pr_url")
+            workspace_id = value.get("workspace_id")
+            tab_ids = (
+                value.get("implementation_tab_id"),
+                value.get("scope_review_tab_id"),
+                value.get("correctness_review_tab_id"),
+            )
+            if (
+                isinstance(issue, bool)
+                or not isinstance(issue, (int, str))
+                or (isinstance(issue, int) and issue < 1)
+                or (isinstance(issue, str) and (not issue.strip() or len(issue) > 100))
+                or (
+                    label is not None
+                    and (
+                        not isinstance(label, str)
+                        or not label.strip()
+                        or len(label) > 100
+                    )
+                )
+                or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
+                or not isinstance(workspace_id, str)
+                or not workspace_id.strip()
+                or any(
+                    not isinstance(tab_id, str) or not tab_id.strip()
+                    for tab_id in tab_ids
+                )
+            ):
+                return None
+            return "issue_navigation", IssueNavigation(
+                issue,
+                PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
+                PurpleMuxNavigation(workspace_id, cast(str, tab_ids[0])),
+                PurpleMuxNavigation(workspace_id, cast(str, tab_ids[1])),
+                PurpleMuxNavigation(workspace_id, cast(str, tab_ids[2])),
+                cast(str | None, label),
+            )
         if event_type in ("issue_result", "whole_review_result"):
             outcome = value.get("outcome")
             reviews = value.get("reviews")
@@ -2601,6 +2886,16 @@ class PythonRunner:
             label = value.get("label")
             pr_number = value.get("pr_number")
             pr_url = value.get("pr_url")
+            workspace_id = value.get("workspace_id")
+            implementation_tab_id = value.get("implementation_tab_id")
+            scope_review_tab_id = value.get("scope_review_tab_id")
+            correctness_review_tab_id = value.get("correctness_review_tab_id")
+            terminal_identities = (
+                workspace_id,
+                implementation_tab_id,
+                scope_review_tab_id,
+                correctness_review_tab_id,
+            )
             if (
                 isinstance(issue, bool)
                 or not isinstance(issue, (int, str))
@@ -2615,8 +2910,32 @@ class PythonRunner:
                     )
                 )
                 or not PythonRunner._valid_pr_navigation(pr_number, pr_url)
+                or (
+                    any(identity is not None for identity in terminal_identities)
+                    and any(
+                        not isinstance(identity, str) or not identity.strip()
+                        for identity in terminal_identities
+                    )
+                )
             ):
                 return None
+            terminals: tuple[
+                PurpleMuxNavigation | None,
+                PurpleMuxNavigation | None,
+                PurpleMuxNavigation | None,
+            ] = (None, None, None)
+            if workspace_id is not None:
+                terminals = (
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, implementation_tab_id)
+                    ),
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, scope_review_tab_id)
+                    ),
+                    PurpleMuxNavigation(
+                        cast(str, workspace_id), cast(str, correctness_review_tab_id)
+                    ),
+                )
             return "issue_result", IssueResult(
                 issue,
                 typed_outcome,
@@ -2624,6 +2943,7 @@ class PythonRunner:
                 PullRequestNavigation(cast(int, pr_number), cast(str, pr_url)),
                 typed_warnings,
                 cast(str | None, label),
+                *terminals,
             )
         name = value.get("name")
         status = value.get("status")

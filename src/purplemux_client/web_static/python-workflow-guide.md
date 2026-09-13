@@ -482,11 +482,18 @@ github = GitHubRepository.open(
     "OWNER/REPO",
     executable="gh",
     command_timeout_seconds=30.0,
-    read_timeout_retries=1,
+    read_timeout_retries=2,
+    read_retry_backoff_seconds=0.25,
     page_size=100,
     max_pages=10,
 )
 ```
+
+Read-only GitHub calls retry timeouts, rate-limit-specific 403 responses, and
+transient HTTP responses such as 429, 502, 503, and 504 with a short exponential
+backoff. Each retry is logged, and the final GitHub error is reported when the
+configured retry limit is exhausted. Ordinary authorization failures and GitHub
+mutations are not retried by this setting.
 
 The supported Git inspection and assertion methods are:
 
@@ -737,7 +744,9 @@ Checkpoint and in-place Resume are not supported Workflow APIs. Failed and
 stopped runs remain inspectable, including output and owned PurpleMux resources,
 but their terminated Python processes are not reconstructed.
 
-Start a new run to recover. Its ordinary Python code should inspect exact Git
+Issue Driven runs can use **Review & Resume** to confirm the failed run's
+immutable settings and start a distinct recovery run. Prompt and custom Python
+Workflow recovery is authored as a new run manually. Its ordinary Python code should inspect exact Git
 branches and commits, GitHub PR topology, and any relevant PurpleMux resources
 before reusing external work or making a new mutation. Keep mutation-once and
 `MutationOutcomeUnknown` protections: reconcile a possibly dispatched mutation
@@ -837,10 +846,16 @@ structured GitHub result is the source of truth; `emit_run_pr()` and the optiona
 `emit_step()` fields only expose that known identity to the current run.
 
 Generated Issue Driven workflows additionally use the specialized
-`emit_issue_driven_context()`, `emit_issue_result()`, and
-`emit_whole_review_result()` observation helpers. These retain narrow final
-facts for the terminal Summary without parsing Progress or stdout. They are not
-a general event store or a workflow control-flow API.
+`emit_issue_driven_context()`, `emit_issue_navigation()`, `emit_issue_result()`,
+and `emit_whole_review_result()` observation helpers. These retain narrow
+structured facts without parsing Progress or stdout. They are not a general
+event store or a workflow control-flow API. As soon as a child PR and all three
+role tabs are known, generated workflows pass the PR identity, shared
+`workspace_id`, and distinct `implementation_tab_id`, `scope_review_tab_id`,
+and `correctness_review_tab_id` to `emit_issue_navigation()`. Final outcome and
+review data remain the responsibility of `emit_issue_result()`. The navigation
+identities survive later review or delivery failure and are never derived from
+a session index, UI state, or tmux state.
 
 Findings and advanced resource registration use:
 

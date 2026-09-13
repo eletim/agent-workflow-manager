@@ -100,4 +100,6 @@ def test_guide_avoids_removed_recovery_contract() -> None:
     guide = guide_text().lower()
 
     assert "checkpoint" not in guide
-    assert "resume" not in guide
+    assert "review & resume" in guide
+    assert "distinct run" in guide
+    assert "authoritative git, github, and purplemux state" in guide

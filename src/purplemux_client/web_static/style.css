@@ -216,6 +216,22 @@ button {
 }
 button.primary { background: #6846d7; border-color: #8061e8; }
 button:disabled { cursor: default; opacity: 0.45; }
+button[data-pending="true"]::before {
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  margin-right: 0.55em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  content: "";
+  vertical-align: -0.1em;
+  animation: button-pending-spin 0.7s linear infinite;
+}
+@keyframes button-pending-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button[data-pending="true"]::before { animation: none; }
+}
 a { color: #bcaaff; }
 #exit-code { margin-left: auto; color: #aab0bf; font-size: 13px; }
 
@@ -233,6 +249,7 @@ a { color: #bcaaff; }
 .recovery-panel { margin-top: 14px; border-color: #6c5a2c; }
 .recovery-panel h2 { margin: 0 0 8px; }
 .recovery-panel p { margin: 0; color: #d7c68f; font-size: 13px; }
+.recovery-panel #resume-open { margin-top: 12px; }
 .attempt-history { margin-bottom: 0; color: #aab0bf; font-size: 13px; }
 
 .validation-panel.invalid { border-color: #7d4148; }
@@ -309,6 +326,7 @@ a { color: #bcaaff; }
 .issue-summary-item.approved .issue-summary-marker { color: #75e2a8; }
 .issue-summary-item.continued_with_warning .issue-summary-marker { color: #ffd66b; }
 .issue-summary-warning { margin-top: 3px; color: #ffd66b; font-size: 12px; overflow-wrap: anywhere; }
+.issue-summary-terminal-link { white-space: nowrap; }
 .progress-panel h2 { margin: 0 0 10px; }
 .empty-progress { margin: 0; color: #737d91; font-size: 13px; }
 .progress-list {
@@ -453,6 +471,11 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 .manual-copy-actions { display: flex; justify-content: flex-end; }
 
 .settings-dialog { width: min(720px, calc(100% - 32px)); height: auto; max-height: calc(100% - 32px); }
+.resume-dialog { width: min(720px, calc(100% - 32px)); height: auto; max-height: calc(100% - 32px); }
+.resume-dialog-content { padding: 18px; }
+.resume-dialog-content p { margin: 0 0 12px; color: #aab0bf; font-size: 13px; }
+#resume-settings { max-height: 50vh; min-height: 180px; overflow: auto; white-space: pre-wrap; }
+.resume-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .settings-dialog-toolbar {
   display: flex;
   align-items: center;

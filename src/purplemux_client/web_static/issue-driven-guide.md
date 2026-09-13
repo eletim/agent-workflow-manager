@@ -254,14 +254,27 @@ then added to the Base PR without changing Draft/Ready state or AWM correlation
 metadata. Agent/validation failures and confirmed-safe update failures are
 structured warnings; an unknown GitHub mutation outcome still fails closed.
 
-After a run reaches a terminal state, its detail view shows an Issue Driven
-Summary with the repository and branches, each work-item PR and exact completed
-review-turn count, whole-version review outcome, Base PR, policy Issue, and the
-number of structured warning Findings. The generated workflow publishes these
-facts through dedicated result events as they become final. The Runner retains
-them per run independently of the bounded Progress history; the Summary is an
-observation surface and never controls workflow execution. Running workflows
-and the New Run draft do not display a premature or previous-run Summary.
+Once work-item navigation is available, the run detail shows an Issue Driven
+Summary with the repository and branches, each known work-item PR, available
+review outcome data, whole-version review outcome, Base PR, policy Issue, and
+the number of structured warning Findings. Each known child PR also links to
+its implementation, Scope / Design Review, and Correctness Review tabs using
+PurpleMux's canonical `/?workspace=<workspaceId>&tab=<tabId>` deep link. AWM
+combines that path with the runtime's configured PurpleMux port and the browser's
+current trusted hostname for Desktop or Mobile access. The generated workflow
+publishes stable PurpleMux navigation through a dedicated event as soon as the
+PR and tab identities are known, independently of the later result event. The
+Runner retains both per run independently of the bounded Progress history, so
+completed items stay linked while later items run and failed partial runs retain
+their known links. The Summary is an observation surface and never controls
+workflow execution. The New Run draft does not display a previous-run Summary.
+
+Failed and stopped runs offer **Review & Resume**. A confirmation dialog shows
+the original Issue Driven JSON before AWM starts a distinct run with that same
+configuration and generated Python. Run history labels the new run with its
+source run. The new workflow still recovers the Base PR, work-item plan, and
+child PRs by inspecting their authoritative Git, GitHub, and PurpleMux state; it
+does not reconstruct the terminated Python process.
 
 ## Rules for AI authors
 

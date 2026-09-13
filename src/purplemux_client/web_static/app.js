@@ -56,6 +56,12 @@ const issueSummaryWarnings = document.querySelector("#issue-summary-warnings");
 const recoveryPanel = document.querySelector("#recovery-panel");
 const recoverySummary = document.querySelector("#recovery-summary");
 const attemptHistory = document.querySelector("#attempt-history");
+const resumeOpen = document.querySelector("#resume-open");
+const resumeDialog = document.querySelector("#resume-dialog");
+const resumeSource = document.querySelector("#resume-source");
+const resumeSettings = document.querySelector("#resume-settings");
+const resumeCancel = document.querySelector("#resume-cancel");
+const resumeConfirm = document.querySelector("#resume-confirm");
 const resourcesPanel = document.querySelector("#resources-panel");
 const resourcesSummary = document.querySelector("#resources-summary");
 const executionContextDetails = document.querySelector("#execution-context-details");
@@ -141,6 +147,7 @@ let promptDraft = {
   prompt: promptText.value,
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+let purpleMuxPort = null;
 let explicitNewRun = false;
 // The last detail response accepted for the selected run. This is the only
 // source used when carrying a reusable folder into a new-run draft; list
@@ -160,6 +167,23 @@ let runningFaviconHrefPromise = null;
 let directoryPickerCurrentPath = null;
 let directoryPickerParentPath = null;
 let directoryPickerRequestGeneration = 0;
+let resumeSourceRunId = null;
+
+async function withPendingButton(button, action, onSettled = null) {
+  if (button.dataset.pending === "true") return;
+  const wasDisabled = button.disabled;
+  button.dataset.pending = "true";
+  button.setAttribute("aria-busy", "true");
+  button.disabled = true;
+  try {
+    return await action();
+  } finally {
+    delete button.dataset.pending;
+    button.removeAttribute("aria-busy");
+    button.disabled = wasDisabled;
+    if (onSettled !== null) await onSettled();
+  }
+}
 
 function runningFaviconHref() {
   if (runningFaviconHrefPromise === null) {
@@ -340,7 +364,12 @@ function runPresentation(run) {
 }
 
 function renderRun(result) {
-  currentMode = result.mode === "prompt" ? "prompt" : "workflow";
+  if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
+    purpleMuxPort = result.purplemuxPort;
+  }
+  currentMode = ["prompt", "issue-driven"].includes(result.mode)
+    ? result.mode
+    : "workflow";
   const running = result.state === "running";
   const presentation = runPresentation(result);
   statusBadge.textContent = presentation.label;
@@ -388,13 +417,21 @@ function renderRun(result) {
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
       promptText.value = result.prompt?.prompt || "";
     } else if (currentMode === "issue-driven") {
-      issueDrivenJson.value = issueDrivenDraft.json;
-      issueDrivenPython.value = issueDrivenDraft.code;
+      issueDrivenJson.value = result.issueDrivenJson || "";
+      issueDrivenPython.value = result.code ?? "";
     } else {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
     }
-    activeContext.textContent = `Viewing ${currentMode === "prompt" ? "Prompt" : "Workflow"} Run #${result.runId} (read-only)`;
+    const modeLabel = {
+      prompt: "Prompt",
+      "issue-driven": "Issue Driven",
+      workflow: "Workflow",
+    }[currentMode];
+    const resumeLabel = result.resumedFromRunId == null
+      ? ""
+      : ` — resumed from Run #${result.resumedFromRunId}`;
+    activeContext.textContent = `Viewing ${modeLabel} Run #${result.runId}${resumeLabel} (read-only)`;
   } else if (activeRunId === null) {
     showDraftLabel();
   }
@@ -416,6 +453,24 @@ function appendPrLink(container, pr, prefix = "PR ") {
   container.append(link);
 }
 
+function appendPurpleMuxLink(container, label, terminal) {
+  if (purpleMuxPort == null) return;
+  const url = new URL(window.location.href);
+  url.port = String(purpleMuxPort);
+  url.pathname = "/";
+  url.search = "";
+  url.searchParams.set("workspace", terminal.workspaceId);
+  url.searchParams.set("tab", terminal.tabId);
+  url.hash = "";
+  const link = document.createElement("a");
+  link.className = "issue-summary-terminal-link";
+  link.href = url.href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = label;
+  container.append(document.createTextNode("  "), link);
+}
+
 function renderIssueDrivenSummary(summary) {
   issueSummaryPanel.hidden = summary == null;
   issueSummaryList.replaceChildren();
@@ -431,20 +486,35 @@ function renderIssueDrivenSummary(summary) {
   issueSummaryTerminal.textContent = `Run result: ${summary.terminalResult.replaceAll("_", " ")}`;
   for (const result of summary.issues || []) {
     const item = document.createElement("li");
-    item.className = `issue-summary-item ${result.outcome}`;
+    const outcome = result.outcome || "in_progress";
+    item.className = `issue-summary-item ${outcome}`;
     const marker = document.createElement("span");
     marker.className = "issue-summary-marker";
-    marker.textContent = result.outcome === "approved"
+    marker.textContent = outcome === "approved"
       ? "✓"
-      : (result.outcome === "continued_with_warning" ? "⚠" : "–");
+      : (outcome === "continued_with_warning"
+        ? "⚠"
+        : (outcome === "in_progress" ? "…" : "–"));
     const details = document.createElement("div");
     const line = document.createElement("div");
     const label = result.label || `#${result.issue}`;
     line.append(document.createTextNode(`${label}  `));
     appendPrLink(line, result.pr);
-    line.append(document.createTextNode(`  Review ${result.reviews}`));
-    if (result.outcome !== "approved") {
-      line.append(document.createTextNode(`  ${result.outcome.replaceAll("_", " ")}`));
+    const terminals = result.terminals || {};
+    if (terminals.implementation) {
+      appendPurpleMuxLink(line, "Implementation", terminals.implementation);
+    }
+    if (terminals.scopeReview) {
+      appendPurpleMuxLink(line, "Scope Review", terminals.scopeReview);
+    }
+    if (terminals.correctnessReview) {
+      appendPurpleMuxLink(line, "Correctness Review", terminals.correctnessReview);
+    }
+    if (result.reviews != null) {
+      line.append(document.createTextNode(`  Review ${result.reviews}`));
+    }
+    if (outcome !== "approved") {
+      line.append(document.createTextNode(`  ${outcome.replaceAll("_", " ")}`));
     }
     details.append(line);
     for (const warning of result.warnings || []) {
@@ -551,7 +621,13 @@ function renderResources(result) {
 function renderRecovery(result) {
   const attempts = result.attempts || [];
   recoveryPanel.hidden = !["failed", "stopped"].includes(result.state);
-  recoverySummary.textContent = "Inspect this run and its retained resources, then start a new run to recover. The new workflow must verify authoritative Git, GitHub, and PurpleMux state before mutating it.";
+  const resumable = result.mode === "issue-driven"
+    && ["failed", "stopped"].includes(result.state);
+  recoverySummary.textContent = resumable
+    ? "Review the original settings, then resume them as a new run. The workflow will reuse its existing recovery semantics and verify authoritative state before mutating it."
+    : "Inspect this run and its retained resources, then start a new run to recover. The new workflow must verify authoritative Git, GitHub, and PurpleMux state before mutating it.";
+  resumeOpen.hidden = !resumable;
+  resumeOpen.disabled = activeRunId === null || !resumable;
   attemptHistory.replaceChildren();
   for (const attempt of attempts) {
     const item = document.createElement("li");
@@ -580,11 +656,18 @@ function renderRunList(runs) {
     const presentation = runPresentation(run);
     button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
-    const mode = run.mode === "prompt" ? "Prompt" : "Workflow";
+    const mode = {
+      prompt: "Prompt",
+      "issue-driven": "Issue Driven",
+      workflow: "Workflow",
+    }[run.mode] || "Workflow";
     const executionRoot = run.mode === "prompt"
       ? run.prompt?.cwd || run.cwd
       : run.executionContext?.executionRoot || "execution context pending";
-    button.textContent = `#${run.runId}  ${mode}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
+    const resumed = run.resumedFromRunId == null
+      ? ""
+      : `  Resume of #${run.resumedFromRunId}`;
+    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -610,7 +693,9 @@ function renderRunList(runs) {
       );
       toggle.setAttribute("aria-pressed", String(Boolean(run.checked)));
       toggle.addEventListener("click", async () => {
-        await updateChecked(run.runId, !run.checked);
+        await withPendingButton(toggle, async () => {
+          await updateChecked(run.runId, !run.checked);
+        });
       });
       runList.append(toggle);
     }
@@ -651,21 +736,26 @@ deleteCheckedRunsButton.addEventListener("click", async () => {
   const noun = count === 1 ? "run" : "runs";
   if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
 
-  deleteCheckedRunsButton.disabled = true;
-  try {
-    const result = await request("/api/runs/delete-checked", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({runIds: confirmedRunIds}),
-    });
-    if (result.deletedRunIds.includes(activeRunId)) {
-      showNewRunAfterHistoryDeletion();
+  await withPendingButton(deleteCheckedRunsButton, async () => {
+    try {
+      const result = await request("/api/runs/delete-checked", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({runIds: confirmedRunIds}),
+      });
+      if (result.deletedRunIds.includes(activeRunId)) {
+        showNewRunAfterHistoryDeletion();
+      }
+      await refresh();
+    } catch (error) {
+      stderr.textContent = String(error);
+      await refresh();
     }
-    await refresh();
-  } catch (error) {
-    stderr.textContent = String(error);
-    await refresh();
-  }
+  }, () => {
+    deleteCheckedRunsButton.disabled = Number(
+      deleteCheckedRunsButton.dataset.count || 0,
+    ) === 0;
+  });
 });
 
 function renderValidation(issues) {
@@ -1369,76 +1459,146 @@ async function generateIssueDrivenCode() {
   }
 }
 
-async function workflowSubmissionPayload() {
+async function workflowSubmissionPayload(includeIssueDrivenSettings = false) {
   if (currentMode === "issue-driven") {
-    return {code: await generateIssueDrivenCode(), args: []};
+    const source = issueDrivenJson.value;
+    const payload = {
+      code: await generateIssueDrivenCode(),
+      args: [],
+    };
+    if (includeIssueDrivenSettings) payload.issueDrivenJson = source;
+    return payload;
   }
   return {code: code.value, ...executionContextPayload()};
 }
 
 issueDrivenGenerate.addEventListener("click", async () => {
   if (activeRunId !== null) return;
-  try {
-    await generateIssueDrivenCode();
-  } catch (error) {
-    if (!Array.isArray(error.result?.issueDrivenValidation)) {
-      stderr.textContent = String(error);
+  await withPendingButton(issueDrivenGenerate, async () => {
+    try {
+      await generateIssueDrivenCode();
+    } catch (error) {
+      if (!Array.isArray(error.result?.issueDrivenValidation)) {
+        stderr.textContent = String(error);
+      }
     }
+  }, applyFieldMode);
+});
+
+function resumeSettingsText(snapshot) {
+  if (snapshot.mode === "prompt") {
+    return JSON.stringify({
+      mode: "prompt",
+      agent: snapshot.prompt?.agent,
+      cwd: snapshot.prompt?.cwd || snapshot.cwd,
+      prompt: snapshot.prompt?.prompt,
+    }, null, 2);
   }
+  if (snapshot.mode === "issue-driven") return snapshot.issueDrivenJson || "";
+  return JSON.stringify({
+    mode: "workflow",
+    arguments: snapshot.args || [],
+    python: snapshot.code || "",
+  }, null, 2);
+}
+
+resumeOpen.addEventListener("click", () => {
+  if (
+    activeRunSnapshot?.runId !== activeRunId
+    || activeRunSnapshot.mode !== "issue-driven"
+    || !["failed", "stopped"].includes(activeRunSnapshot.state)
+  ) return;
+  resumeSourceRunId = activeRunId;
+  resumeSource.textContent = `Failed or stopped Run #${resumeSourceRunId}`;
+  resumeSettings.textContent = resumeSettingsText(activeRunSnapshot);
+  resumeDialog.showModal();
+});
+
+resumeCancel.addEventListener("click", () => {
+  resumeSourceRunId = null;
+  resumeDialog.close();
+});
+
+resumeConfirm.addEventListener("click", async () => {
+  if (resumeSourceRunId === null) return;
+  await withPendingButton(resumeConfirm, async () => {
+    const sourceRunId = resumeSourceRunId;
+    const selectionGeneration = ++activeRunGeneration;
+    try {
+      const result = await request(`/api/runs/${sourceRunId}/resume`, {
+        method: "POST",
+      });
+      resumeSourceRunId = null;
+      resumeDialog.close();
+      if (selectionGeneration === activeRunGeneration) {
+        activeRunId = result.runId;
+        activeRunGeneration += 1;
+        explicitNewRun = false;
+        renderRun(result);
+      }
+      await refresh();
+    } catch (error) {
+      if (selectionGeneration === activeRunGeneration) {
+        stderr.textContent = String(error);
+      }
+    }
+  });
 });
 
 runButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // must explicitly start a New run first
-  captureDraftIfEditing();
-  const submittedMode = currentMode;
-  const selectionGeneration = ++activeRunGeneration;
-  explicitNewRun = true;
-  const validationGeneration = ++validationRequestGeneration;
-  try {
-    const requestPath = submittedMode === "prompt" ? "/api/prompt" : "/api/run";
-    const payload = submittedMode === "prompt"
-      ? {
-        agent: promptAgent.value,
-        cwd: promptCwd.value,
-        prompt: promptText.value,
+  await withPendingButton(runButton, async () => {
+    captureDraftIfEditing();
+    const submittedMode = currentMode;
+    const selectionGeneration = ++activeRunGeneration;
+    explicitNewRun = true;
+    const validationGeneration = ++validationRequestGeneration;
+    try {
+      const requestPath = submittedMode === "prompt" ? "/api/prompt" : "/api/run";
+      const payload = submittedMode === "prompt"
+        ? {
+          agent: promptAgent.value,
+          cwd: promptCwd.value,
+          prompt: promptText.value,
+        }
+        : await workflowSubmissionPayload(true);
+      const result = await request(requestPath, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (selectionGeneration === activeRunGeneration) {
+        // The fields remain editable while the request is pending. Retain any
+        // changes made since submission before replacing them with the run's
+        // authoritative snapshot.
+        captureDraftIfEditing();
+        activeRunId = result.runId;
+        activeRunGeneration += 1;
+        explicitNewRun = false;
+        if (
+          submittedMode !== "prompt"
+          && validationGeneration === validationRequestGeneration
+        ) {
+          renderValidation(result.validation || []);
+        }
+        renderRun(result);
       }
-      : await workflowSubmissionPayload();
-    const result = await request(requestPath, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (selectionGeneration === activeRunGeneration) {
-      // The fields remain editable while the request is pending. Retain any
-      // changes made since submission before replacing them with the run's
-      // authoritative snapshot.
-      captureDraftIfEditing();
-      activeRunId = result.runId;
-      activeRunGeneration += 1;
-      explicitNewRun = false;
-      if (
-        submittedMode !== "prompt"
-        && validationGeneration === validationRequestGeneration
-      ) {
-        renderValidation(result.validation || []);
+      await refresh();
+    } catch (error) {
+      if (Array.isArray(error.result?.validation)) {
+        if (
+          validationGeneration === validationRequestGeneration
+          && selectionGeneration === activeRunGeneration
+          && activeRunId === null
+        ) {
+          renderValidation(error.result.validation);
+          renderOutline(error.result.outline || [], []);
+        }
+      } else if (selectionGeneration === activeRunGeneration) {
+        stderr.textContent = String(error);
       }
-      renderRun(result);
     }
-    await refresh();
-  } catch (error) {
-    if (Array.isArray(error.result?.validation)) {
-      if (
-        validationGeneration === validationRequestGeneration
-        && selectionGeneration === activeRunGeneration
-        && activeRunId === null
-      ) {
-        renderValidation(error.result.validation);
-        renderOutline(error.result.outline || [], []);
-      }
-    } else if (selectionGeneration === activeRunGeneration) {
-      stderr.textContent = String(error);
-    }
-  }
+  }, applyFieldMode);
 });
 
 newRunButton.addEventListener("click", async () => {
@@ -1459,169 +1619,177 @@ issueDrivenModeButton.addEventListener("click", async () => {
 
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
-  const requestGeneration = ++validationRequestGeneration;
-  const selectionGeneration = activeRunGeneration;
-  try {
-    const payload = await workflowSubmissionPayload();
-    const result = await request("/api/validate", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (
-      requestGeneration === validationRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null
-    ) {
-      renderValidation(result.validation || []);
-      renderOutline(result.outline || [], []);
+  await withPendingButton(validateButton, async () => {
+    const requestGeneration = ++validationRequestGeneration;
+    const selectionGeneration = activeRunGeneration;
+    try {
+      const payload = await workflowSubmissionPayload();
+      const result = await request("/api/validate", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
+        renderValidation(result.validation || []);
+        renderOutline(result.outline || [], []);
+      }
+    } catch (error) {
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+        && Array.isArray(error.result?.validation)
+      ) {
+        renderValidation(error.result.validation);
+        renderOutline(error.result.outline || [], []);
+      } else if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
+        stderr.textContent = String(error);
+      }
     }
-  } catch (error) {
-    if (
-      requestGeneration === validationRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null
-      && Array.isArray(error.result?.validation)
-    ) {
-      renderValidation(error.result.validation);
-      renderOutline(error.result.outline || [], []);
-    } else if (
-      requestGeneration === validationRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null
-    ) {
-      stderr.textContent = String(error);
-    }
-  }
+  }, applyFieldMode);
 });
 
 dryRunButton.addEventListener("click", async () => {
   if (activeRunId !== null) return;
-  const selectionGeneration = activeRunGeneration;
-  try {
-    const payload = await workflowSubmissionPayload();
-    const result = await request("/api/dry-run", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (selectionGeneration === activeRunGeneration && activeRunId === null) {
-      renderValidation(result.validation || []);
-      renderOutline(result.outline || [], []);
-      renderDryRun(result);
-    }
-  } catch (error) {
-    if (selectionGeneration === activeRunGeneration && activeRunId === null) {
-      if (error.result) {
-        renderValidation(error.result.validation || []);
-        renderDryRun(error.result);
-      } else {
-        stderr.textContent = String(error);
+  await withPendingButton(dryRunButton, async () => {
+    const selectionGeneration = activeRunGeneration;
+    try {
+      const payload = await workflowSubmissionPayload();
+      const result = await request("/api/dry-run", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+        renderValidation(result.validation || []);
+        renderOutline(result.outline || [], []);
+        renderDryRun(result);
+      }
+    } catch (error) {
+      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+        if (error.result) {
+          renderValidation(error.result.validation || []);
+          renderDryRun(error.result);
+        } else {
+          stderr.textContent = String(error);
+        }
       }
     }
-  }
+  }, applyFieldMode);
 });
 
-refreshReadinessButton.addEventListener("click", refreshReadiness);
+refreshReadinessButton.addEventListener("click", async () => {
+  await withPendingButton(refreshReadinessButton, refreshReadiness);
+});
 
 runReadinessButton.addEventListener("click", async () => {
   if (!readinessWorkspace.value) return;
-  runReadinessButton.disabled = true;
-  refreshReadinessButton.disabled = true;
-  readinessSummary.className = "readiness-summary";
-  readinessSummary.textContent = "Creating exactly one probe tab…";
-  try {
-    const result = await request("/api/readiness/probe", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        workspaceId: readinessWorkspace.value,
-        provider: readinessProvider.value,
-      }),
-    });
-    renderReadinessProbe(result.probe);
-  } catch (error) {
-    if (error.result?.probe) renderReadinessProbe(error.result.probe);
-    else {
-      readinessSummary.className = "readiness-summary failed";
-      readinessSummary.textContent = String(error);
+  await withPendingButton(runReadinessButton, async () => {
+    refreshReadinessButton.disabled = true;
+    readinessSummary.className = "readiness-summary";
+    readinessSummary.textContent = "Creating exactly one probe tab…";
+    try {
+      const result = await request("/api/readiness/probe", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          workspaceId: readinessWorkspace.value,
+          provider: readinessProvider.value,
+        }),
+      });
+      renderReadinessProbe(result.probe);
+    } catch (error) {
+      if (error.result?.probe) renderReadinessProbe(error.result.probe);
+      else {
+        readinessSummary.className = "readiness-summary failed";
+        readinessSummary.textContent = String(error);
+      }
+    } finally {
+      refreshReadinessButton.disabled = false;
     }
-  } finally {
-    refreshReadinessButton.disabled = false;
-    await refreshReadiness();
-  }
+  }, refreshReadiness);
 });
 
 reconcileReadinessButton.addEventListener("click", async () => {
-  reconcileReadinessButton.disabled = true;
-  readinessSummary.className = "readiness-summary";
-  readinessSummary.textContent = "Authoritatively inspecting the unresolved probe identity…";
-  try {
-    const result = await request("/api/readiness/reconcile", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    });
-    renderReadinessProbe(result.probe);
-  } catch (error) {
-    readinessSummary.className = "readiness-summary failed";
-    readinessSummary.textContent = String(error);
-  } finally {
-    await refreshReadiness();
-  }
+  await withPendingButton(reconcileReadinessButton, async () => {
+    readinessSummary.className = "readiness-summary";
+    readinessSummary.textContent = "Authoritatively inspecting the unresolved probe identity…";
+    try {
+      const result = await request("/api/readiness/reconcile", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}",
+      });
+      renderReadinessProbe(result.probe);
+    } catch (error) {
+      readinessSummary.className = "readiness-summary failed";
+      readinessSummary.textContent = String(error);
+    }
+  }, refreshReadiness);
 });
 
 stopButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
-  const targetRunId = activeRunId;
-  const selectionGeneration = ++activeRunGeneration;
-  try {
-    const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) {
-      activeRunGeneration += 1;
-      renderRun(result);
+  await withPendingButton(stopButton, async () => {
+    const targetRunId = activeRunId;
+    const selectionGeneration = ++activeRunGeneration;
+    try {
+      const result = await request(`/api/runs/${targetRunId}/stop`, {method: "POST"});
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) {
+        activeRunGeneration += 1;
+        renderRun(result);
+      }
+    } catch (error) {
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) stderr.textContent = String(error);
     }
-    await refresh();
-  } catch (error) {
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) stderr.textContent = String(error);
-  }
+  }, refresh);
 });
 
 cleanupButton.addEventListener("click", async () => {
   if (activeRunId === null) return;
-  const targetRunId = activeRunId;
-  const selectionGeneration = ++activeRunGeneration;
-  cleanupButton.disabled = true;
-  try {
-    const result = await request(`/api/runs/${targetRunId}/cleanup`, {method: "POST"});
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) {
-      activeRunGeneration += 1;
-      renderRun(result);
+  await withPendingButton(cleanupButton, async () => {
+    const targetRunId = activeRunId;
+    const selectionGeneration = ++activeRunGeneration;
+    try {
+      const result = await request(`/api/runs/${targetRunId}/cleanup`, {method: "POST"});
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) {
+        activeRunGeneration += 1;
+        renderRun(result);
+      }
+    } catch (error) {
+      if (
+        targetRunId === activeRunId
+        && selectionGeneration === activeRunGeneration
+      ) stderr.textContent = String(error);
     }
-    await refresh();
-  } catch (error) {
-    if (
-      targetRunId === activeRunId
-      && selectionGeneration === activeRunGeneration
-    ) stderr.textContent = String(error);
-  }
+  }, refresh);
 });
 
 checkedToggle.addEventListener("click", async () => {
   if (activeRunId === null || checkedToggle.hidden) return;
-  await updateChecked(
-    activeRunId,
-    checkedToggle.getAttribute("aria-pressed") !== "true",
-  );
+  await withPendingButton(checkedToggle, async () => {
+    await updateChecked(
+      activeRunId,
+      checkedToggle.getAttribute("aria-pressed") !== "true",
+    );
+  });
 });
 
 settingsOpen.addEventListener("click", () => {
@@ -1636,40 +1804,38 @@ notifyServer.addEventListener("input", () => renderNotifyServerLink(null));
 
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  saveSettingsButton.disabled = true;
-  showSettingsMessage("Saving…");
-  try {
-    const settings = await request("/api/settings/notifications", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(settingsPayload()),
-    });
-    replacementToken.value = "";
-    renderSettings(settings);
-    showSettingsMessage("Settings saved. Changes apply immediately.");
-  } catch (error) {
-    replacementToken.value = "";
-    showSettingsMessage(String(error), true);
-  } finally {
-    saveSettingsButton.disabled = false;
-  }
+  await withPendingButton(saveSettingsButton, async () => {
+    showSettingsMessage("Saving…");
+    try {
+      const settings = await request("/api/settings/notifications", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(settingsPayload()),
+      });
+      replacementToken.value = "";
+      renderSettings(settings);
+      showSettingsMessage("Settings saved. Changes apply immediately.");
+    } catch (error) {
+      replacementToken.value = "";
+      showSettingsMessage(String(error), true);
+    }
+  });
 });
 
 testNotificationButton.addEventListener("click", async () => {
-  testNotificationButton.disabled = true;
-  showSettingsMessage("Sending…");
-  try {
-    const result = await request("/api/settings/notifications/test", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    });
-    showSettingsMessage(result.message);
-  } catch (error) {
-    showSettingsMessage(String(error), true);
-  } finally {
-    testNotificationButton.disabled = false;
-  }
+  await withPendingButton(testNotificationButton, async () => {
+    showSettingsMessage("Sending…");
+    try {
+      const result = await request("/api/settings/notifications/test", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}",
+      });
+      showSettingsMessage(result.message);
+    } catch (error) {
+      showSettingsMessage(String(error), true);
+    }
+  });
 });
 
 async function initialize() {

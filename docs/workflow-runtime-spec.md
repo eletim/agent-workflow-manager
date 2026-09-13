@@ -73,7 +73,9 @@ Checkpoint and in-place Resume are not part of the Workflow contract. A failed
 or stopped Python process is not reconstructed or replayed. Its run record,
 output, findings, and owned resources remain inspectable until explicit Cleanup.
 
-Recovery starts a new run. The new workflow uses normal Python inspection of
+For Issue Driven mode, the UI's Review & Resume action confirms the original
+immutable settings and starts a distinct run. Prompt and custom Python Workflow
+recovery is authored as a new run manually. The new workflow uses normal Python inspection of
 authoritative Git, GitHub, and PurpleMux state before deciding whether existing
 external work can be reused. Mutation helpers retain their mutation-once,
 postcondition reconciliation, and `MutationOutcomeUnknown` behavior; an unknown
