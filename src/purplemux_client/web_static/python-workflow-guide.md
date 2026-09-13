@@ -106,6 +106,13 @@ When a generated workflow accepts a work item at runtime, it calls
 before persisting its dispatch. This applies the same authoritative remote branch,
 OPEN/MERGED/CLOSED PR, SHA-containment, and inline-fingerprint checks that the
 static batch uses outside that deliberate seed-fingerprint deferral.
+On Resume, the generated workflow instead calls
+`recover_issue_driven_work_item_topology` only for an inline item whose dispatch
+identity was already recovered from the persisted plan. After the same branch,
+PR head/base, and integration checks succeed, this helper may restore a completely
+missing fingerprint on the exact open PR. A malformed or different fingerprint
+still fails closed, and the guarded PR-body mutation authoritatively reconciles
+an unknown GitHub outcome.
 
 The helper resolves the source repository and exact current remote base SHA,
 creates and verifies a fresh detached run worktree under the AWM-owned data

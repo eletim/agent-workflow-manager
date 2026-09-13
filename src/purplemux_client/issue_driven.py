@@ -95,6 +95,7 @@ def classify_issue_topology(
     integration_branch: str,
     integration_sha: str,
     inline_task_fingerprint: str | None = None,
+    _allow_missing_inline_task_fingerprint: bool = False,
 ) -> IssueTopologyState:
     """Classify one Issue from authoritative remote Git and GitHub state."""
     try:
@@ -115,7 +116,13 @@ def classify_issue_topology(
                 f"ambiguous PR states from {branch} to {integration_branch}: {numbers}"
             )
         for pr in matching:
-            _require_inline_task_fingerprint(pr, inline_task_fingerprint)
+            _require_inline_task_fingerprint(
+                pr,
+                inline_task_fingerprint,
+                allow_missing=(
+                    _allow_missing_inline_task_fingerprint and pr.state == "OPEN"
+                ),
+            )
         if closed_pr is not None:
             raise WorkerFailure(
                 f"closed unmerged PR #{closed_pr.number} exists from {branch} "
@@ -213,15 +220,22 @@ def _inline_task_fingerprints(body: str) -> tuple[str, ...]:
 
 
 def _require_inline_task_fingerprint(
-    pr: PullRequestState, expected: str | None
+    pr: PullRequestState, expected: str | None, *, allow_missing: bool = False
 ) -> None:
     if expected is None:
         return
-    if _inline_task_fingerprints(pr.body) != (expected,):
-        raise WorkerFailure(
-            f"PR #{pr.number} inline task fingerprint is missing or does not match "
-            "the declared task"
-        )
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    markers = tuple(
+        line.strip() for line in pr.body.splitlines() if line.strip().startswith(prefix)
+    )
+    if _inline_task_fingerprints(pr.body) == (expected,) and len(markers) == 1:
+        return
+    if allow_missing and not markers:
+        return
+    raise WorkerFailure(
+        f"PR #{pr.number} inline task fingerprint is missing or does not match "
+        "the declared task"
+    )
 
 
 def _commit_is_contained(
@@ -242,6 +256,7 @@ def inspect_issue_driven_topology(
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
     defer_inline_task_fingerprints: bool = False,
+    _allow_missing_inline_task_fingerprints: bool = False,
     _cwd: Path | None = None,
 ) -> tuple[IssueTopologyState, ...]:
     """Inspect all Issue branches and PRs before any workflow mutation."""
@@ -342,6 +357,9 @@ def inspect_issue_driven_topology(
                 if defer_inline_task_fingerprints and isinstance(number, str)
                 else fingerprint
             ),
+            _allow_missing_inline_task_fingerprint=(
+                _allow_missing_inline_task_fingerprints and isinstance(number, str)
+            ),
         )
         for number, branch, fingerprint in normalized
     )
@@ -381,6 +399,77 @@ def inspect_issue_driven_work_item_topology(
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
     )[0]
+
+
+def recover_issue_driven_work_item_topology(
+    *,
+    repo: str,
+    integration_branch: str,
+    issue: tuple[str, str, str],
+    remote: str = "origin",
+    command_timeout_seconds: float = 30.0,
+) -> IssueTopologyState:
+    """Recover a dispatched inline item whose exact open PR lacks its marker."""
+    state = inspect_issue_driven_topology(
+        repo=repo,
+        integration_branch=integration_branch,
+        issues=(issue,),
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+        _allow_missing_inline_task_fingerprints=True,
+    )[0]
+    label, branch, fingerprint = issue
+    if state.classification != "recoverable" or state.feature_sha is None:
+        return state
+
+    preparation = _inspect_repository_declaration(
+        repo=repo,
+        base_branch=integration_branch,
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+    repository = GitRepository.open(
+        preparation.source_repository,
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+    github = GitHubRepository.open(
+        repository.expected_github_slug,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+    pr = github.find_pr(head=branch, base=integration_branch, state="OPEN")
+    if pr is None:
+        raise WorkerFailure(f"{label}: recoverable open PR disappeared")
+    current = github.require_pr(
+        number=pr.number,
+        head=branch,
+        base=integration_branch,
+        state="OPEN",
+        expected_head_sha=state.feature_sha,
+        expected_base_sha=state.integration_sha,
+    )
+    try:
+        _require_inline_task_fingerprint(current, fingerprint)
+        return state
+    except WorkerFailure:
+        _require_inline_task_fingerprint(current, fingerprint, allow_missing=True)
+    marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{fingerprint} -->"
+    body = f"{marker}\n\n{current.body}" if current.body else marker
+    updated = github.update_pr_body(
+        current.number,
+        body=body,
+        expected_head=branch,
+        expected_head_sha=state.feature_sha,
+        expected_base=integration_branch,
+        expected_base_sha=state.integration_sha,
+    )
+    _require_inline_task_fingerprint(updated, fingerprint)
+    emit_finding(
+        "github",
+        f"{label}: restored missing inline task fingerprint on PR #{current.number}",
+        status="info",
+    )
+    return state
 
 
 def _pr_topology(
