@@ -282,6 +282,7 @@ class PurpleMuxRuntime:
         if any(item.name == correlated_name for item in before):
             raise WorkerFailure("workspace creation correlation is already in use")
         response_id: str | None = None
+        response_initial_tab: TabState | None = None
 
         def matches() -> tuple[WorkspaceState, ...]:
             return tuple(
@@ -293,7 +294,7 @@ class PurpleMuxRuntime:
             )
 
         def dispatch() -> WorkspaceState:
-            nonlocal response_id
+            nonlocal response_id, response_initial_tab
             data = self._mutation_json(
                 ["workspace", "create", "--cwd", cwd, "--name", correlated_name],
                 "create workspace",
@@ -301,6 +302,15 @@ class PurpleMuxRuntime:
             candidate = data.get("id") or data.get("workspaceId")
             if isinstance(candidate, str) and candidate:
                 response_id = candidate
+                try:
+                    parsed_initial_tab = PurpleMuxCLIClient._parse_tab(
+                        data.get("initialTab")
+                    )
+                except WorkerFailure:
+                    pass
+                else:
+                    if parsed_initial_tab.workspace_id == response_id:
+                        response_initial_tab = parsed_initial_tab
             try:
                 found = matches()
             except WorkerFailure as exc:
@@ -337,25 +347,11 @@ class PurpleMuxRuntime:
             reconcile=reconcile,
             plan={"kind": "create_workspace", "cwd": cwd, "name": correlated_name},
         )
-        initial_tab: TabState | None = None
-        initial_tab_discovery_pending = False
-        try:
-            initial_tabs = self.workspace(workspace.id).list_sessions()
-        except WorkerFailure:
-            # The workspace identity is already authoritative and must remain in
-            # the run inventory. Record a discovery checkpoint without claiming
-            # a tab identity so Cleanup can reconcile it authoritatively later.
-            initial_tab_discovery_pending = True
-        else:
-            if len(initial_tabs) == 1:
-                candidate = initial_tabs[0]
-                if (
-                    candidate.workspace_id == workspace.id
-                    and not candidate.name
-                    and candidate.panel_type is None
-                    and candidate.provider is None
-                ):
-                    initial_tab = candidate
+        initial_tab = response_initial_tab
+        # A later listing cannot prove which tab was created with the workspace.
+        # Preserve an unresolved cleanup checkpoint whenever the authoritative
+        # mutation response was unavailable or omitted that identity.
+        initial_tab_discovery_pending = initial_tab is None
         workspace = WorkspaceState(
             workspace.id,
             workspace.name,

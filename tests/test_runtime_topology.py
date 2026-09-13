@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-import purplemux_client.runner as runner_module
 from purplemux_client import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
@@ -31,7 +30,6 @@ class RuntimeRunner:
         self.tabs: dict[str, dict[str, object]] = {}
         self.workspaces: dict[str, dict[str, object]] = {}
         self.sent: list[str] = []
-        self.initial_listing_failed = False
 
     def __call__(
         self,
@@ -47,15 +45,6 @@ class RuntimeRunner:
         if command[1:] == ["workspaces"]:
             return self.done({"workspaces": list(self.workspaces.values())})
         if command[1:3] == ["tab", "list"]:
-            if (
-                self.mode == "initial-list-failure-once"
-                and not self.initial_listing_failed
-                and any(
-                    call[1:3] == ["workspace", "create"] for call in self.calls[:-1]
-                )
-            ):
-                self.initial_listing_failed = True
-                return self.done({"unexpected": []})
             if self.mode == "incomplete":
                 return self.done({"unexpected": []})
             if self.mode == "postcondition-read-failure" and any(
@@ -82,7 +71,7 @@ class RuntimeRunner:
                 raise subprocess.TimeoutExpired(command, timeout)
             if self.mode == "workspace-nonzero-after-apply":
                 return self.failed("workspace create failed after apply")
-            return self.done(workspace)
+            return self.done({**workspace, "initialTab": self.tabs["tab-initial"]})
         if command[1:3] == ["workspace", "delete"]:
             workspace_id = command[command.index("-w") + 1]
             if self.mode == "workspace-delete-concurrent-tab":
@@ -576,7 +565,9 @@ def test_postcondition_read_failure_after_close_is_unknown_and_not_retried() -> 
     assert len([call for call in runner.calls if call[1:3] == ["tab", "close"]]) == 1
 
 
-def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) -> None:
+def test_workspace_creation_lost_response_retains_unresolved_initial_tab(
+    tmp_path: Path,
+) -> None:
     runner = RuntimeRunner("workspace-timeout-after-apply")
     runtime = PurpleMuxRuntime(runner=runner)
     result = runtime.create_workspace(
@@ -584,7 +575,8 @@ def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) ->
     )
 
     assert result.id == "ws-new"
-    assert result.initial_tab == TabState("tab-initial", "ws-new", "", None, None)
+    assert result.initial_tab is None
+    assert result.initial_tab_discovery_pending
     assert (
         len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
         == 1
@@ -620,36 +612,10 @@ def test_owned_workspace_registers_its_authoritative_initial_tab(
     }
 
 
-def test_workspace_creation_does_not_claim_ambiguous_initial_tabs(
-    tmp_path: Path,
-) -> None:
-    runner = RuntimeRunner()
-    original = runner.__call__
-
-    def create_with_extra_tab(*args, **kwargs):  # type: ignore[no-untyped-def]
-        result = original(*args, **kwargs)
-        command = list(args[0])
-        if command[1:3] == ["workspace", "create"]:
-            runner.tabs["tab-user"] = {
-                "tabId": "tab-user",
-                "workspaceId": "ws-new",
-                "name": "User tab",
-                "panelType": "terminal",
-                "agentProviderId": None,
-            }
-        return result
-
-    workspace = PurpleMuxRuntime(runner=create_with_extra_tab).create_workspace(
-        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
-    )
-
-    assert workspace.initial_tab is None
-
-
-def test_failed_initial_tab_discovery_reconciles_during_cleanup(
+def test_lost_create_response_does_not_claim_replacement_tab_during_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    topology = RuntimeRunner("initial-list-failure-once")
+    topology = RuntimeRunner("workspace-timeout-after-apply")
     registered: list[tuple[str, str, dict[str, str]]] = []
     monkeypatch.setattr(
         "purplemux_client.client.register_run_resource",
@@ -687,31 +653,30 @@ register_run_resource("purplemux_workspace", "ws-new", {{
     finally:
         workflow.close()
 
-    monkeypatch.setattr(
-        runner_module,
-        "PurpleMuxRuntime",
-        lambda: PurpleMuxRuntime(runner=topology),
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "PurpleMuxCLIClient",
-        lambda workspace_id: PurpleMuxCLIClient(workspace_id, runner=topology),
-    )
+    topology.tabs.pop("tab-initial")
+    topology.tabs["tab-replacement"] = {
+        "tabId": "tab-replacement",
+        "workspaceId": "ws-new",
+        "name": "",
+        "panelType": None,
+        "agentProviderId": None,
+    }
     recovered = PythonRunner(managed_workflows=False, run_history_file=history)
     try:
         cleaned = recovered.cleanup(run_id)
     finally:
         recovered.close()
 
-    assert topology.tabs == {}
-    assert topology.workspaces == {}
+    assert tuple(topology.tabs) == ("tab-replacement",)
+    assert tuple(topology.workspaces) == ("ws-new",)
     assert [
         (resource.kind, resource.identity, resource.cleanup_state)
         for resource in cleaned.resources
     ] == [
-        ("purplemux_workspace", "ws-new", "cleaned"),
-        ("purplemux_tab", "tab-initial", "cleaned"),
+        ("purplemux_workspace", "ws-new", "retained"),
+        ("purplemux_initial_tab", "ws-new", "cleanup_retryable"),
     ]
+    assert "refusing shape-based cleanup" in (cleaned.resources[1].cleanup_error or "")
 
 
 def test_new_run_does_not_collide_with_retained_logical_workspace(

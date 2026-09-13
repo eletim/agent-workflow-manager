@@ -628,6 +628,11 @@ runtime.workspace(workspace_id) -> PurpleMuxCLIClient
 runtime.delete_workspace(workspace_id, *, expected_state) -> None
 ```
 
+The required public PurpleMux workspace-create response includes `initialTab`
+with the new tab's full structured identity. A lost or invalid mutation response
+cannot be repaired from a later tab listing because current shape is not
+historical ownership evidence.
+
 Explicit deletion is an identity-checked, empty-workspace-only cleanup primitive.
 Normal Workflow code must leave owned resources for the Runner's manual Cleanup
 action instead of calling it during success or failure handling.
@@ -740,12 +745,12 @@ Runner retains the structured inventory on the run record and exposes one manual
 Cleanup action after execution ends. Cleanup verifies identities, closes child
 tabs in reverse deterministic order (including the separately tracked canonical
 initial/default tab of a newly created run-owned workspace). A failed initial
-tab read is retained as a discovery checkpoint; Cleanup resolves it only after
-verifying the workspace and canonical tab identity. Cleanup then removes
-managed-shell result directories and deletes an identity-verified empty workspace
-through PurpleMux's public atomic `workspace delete -w ID --if-empty` contract before
-handling the Git worktree. Startup rejects PurpleMux versions without that
-contract. Only its structured
+tab identity is retained as an unresolved cleanup checkpoint; Cleanup never
+converts a later shape-only observation into ownership evidence. Cleanup then
+removes managed-shell result directories and deletes an identity-verified empty
+workspace through PurpleMux's public atomic
+`workspace delete -w ID --if-empty` contract before handling the Git worktree.
+Startup rejects PurpleMux versions without both contracts. Only its structured
 `not-empty` response proves rejection; transport errors and other nonzero exits
 remain uncertain until authoritative workspace listing reconciles them.
 Managed-shell directories are registered with their no-follow filesystem

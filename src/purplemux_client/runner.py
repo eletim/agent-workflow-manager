@@ -2500,37 +2500,6 @@ class PythonRunner:
                     else:
                         failed_priorities[current.repository_index] = priority
                     continue
-                if current.kind == "purplemux_initial_tab":
-                    try:
-                        resolved = self._resolve_initial_tab_resource(current)
-                    except Exception as exc:
-                        with self._lock:
-                            run.resources[index] = RunResource(
-                                current.kind,
-                                current.identity,
-                                current.metadata,
-                                "cleanup_retryable",
-                                str(exc),
-                                current.repository_index,
-                            )
-                            self._mark_changed()
-                        failed_priorities[current.repository_index] = priority
-                        continue
-                    if resolved is None:
-                        with self._lock:
-                            run.resources[index] = RunResource(
-                                current.kind,
-                                current.identity,
-                                current.metadata,
-                                "cleaned",
-                                repository_index=current.repository_index,
-                            )
-                            self._mark_changed()
-                        continue
-                    with self._lock:
-                        run.resources[index] = resolved
-                        self._mark_changed()
-                    current = resolved
                 with self._lock:
                     pending = RunResource(
                         current.kind,
@@ -2586,55 +2555,12 @@ class PythonRunner:
             "git_worktree": 4,
         }.get(resource.kind, 4)
 
-    @staticmethod
-    def _resolve_initial_tab_resource(resource: RunResource) -> RunResource | None:
-        workspace_id = resource.metadata.get("workspace_id")
-        if not workspace_id or workspace_id != resource.identity:
-            raise OSError("PurpleMux initial tab discovery lacks workspace identity")
-        runtime = PurpleMuxRuntime()
-        selected = next(
-            (
-                workspace
-                for workspace in runtime.list_workspaces()
-                if workspace.id == workspace_id
-            ),
-            None,
-        )
-        if selected is None:
-            return None
-        if selected.name != resource.metadata.get("workspace_name"):
-            raise OSError(
-                "PurpleMux workspace name changed before initial tab discovery"
-            )
-        expected_directories = resource.metadata.get("workspace_directories")
-        if expected_directories is None or selected.directories != tuple(
-            expected_directories.splitlines()
-        ):
-            raise OSError(
-                "PurpleMux workspace directories changed before initial tab discovery"
-            )
-        tabs = PurpleMuxCLIClient(workspace_id).list_sessions()
-        if not tabs:
-            return None
-        if len(tabs) != 1:
-            raise OSError("PurpleMux initial tab discovery is ambiguous")
-        tab = tabs[0]
-        if tab.name or tab.panel_type is not None or tab.provider is not None:
-            raise OSError("PurpleMux initial tab identity is not canonical")
-        return RunResource(
-            "purplemux_tab",
-            tab.id,
-            {
-                "workspace_id": tab.workspace_id,
-                "name": tab.name,
-                "panel_type": tab.panel_type or "",
-                "provider": tab.provider or "",
-                "origin": "workspace_initial",
-            },
-            repository_index=resource.repository_index,
-        )
-
     def _cleanup_resource(self, resource: RunResource) -> None:
+        if resource.kind == "purplemux_initial_tab":
+            raise OSError(
+                "PurpleMux initial tab identity was not returned by workspace creation; "
+                "refusing shape-based cleanup"
+            )
         if resource.kind == "purplemux_tab":
             workspace_id = resource.metadata.get("workspace_id")
             if not workspace_id:

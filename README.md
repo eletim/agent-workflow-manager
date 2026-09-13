@@ -484,9 +484,10 @@ registration-free by default. `GET /api/runs` lists compact summaries,
 `POST /api/runs/{runId}/cleanup` releases registered resources without deleting
 run history. For a newly created run-owned workspace, AWM records the single
 canonical initial/default tab separately, closes it after explicitly created
-run tabs, and does not claim ambiguous or non-default tabs. If the initial read
-fails, Cleanup retains a discovery checkpoint and later resolves the canonical
-tab against the verified workspace before closing it. Workspace release
+run tabs, and does not claim ambiguous or non-default tabs. The required public
+workspace-create response supplies that initial tab identity. If the response is
+lost or omits it, Cleanup retains an unresolved result instead of inferring
+ownership from the shape of a later tab listing. Workspace release
 requires PurpleMux's public atomic
 `workspace delete -w ID --if-empty` CLI contract; startup rejects unsupported
 versions so canonical Cleanup cannot be stranded behind an incompatible runtime.
