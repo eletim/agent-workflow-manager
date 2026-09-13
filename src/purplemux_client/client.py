@@ -367,28 +367,21 @@ class PurpleMuxRuntime:
             }
             if initial_tab_discovery_pending:
                 workspace_metadata["initial_tab_discovery"] = "pending"
+            elif initial_tab is not None:
+                workspace_metadata.update(
+                    {
+                        "initial_tab_id": initial_tab.id,
+                        "initial_tab_name": initial_tab.name,
+                        "initial_tab_panel_type": initial_tab.panel_type or "",
+                        "initial_tab_provider": initial_tab.provider or "",
+                    }
+                )
             register_run_resource(
                 "purplemux_workspace",
                 workspace.id,
                 workspace_metadata,
             )
-            if initial_tab is not None:
-                self._register_initial_tab(initial_tab)
         return workspace
-
-    @staticmethod
-    def _register_initial_tab(tab: TabState) -> None:
-        register_run_resource(
-            "purplemux_tab",
-            tab.id,
-            {
-                "workspace_id": tab.workspace_id,
-                "name": tab.name,
-                "panel_type": tab.panel_type or "",
-                "provider": tab.provider or "",
-                "origin": "workspace_initial",
-            },
-        )
 
     def delete_workspace(
         self, workspace_id: str, *, expected_state: WorkspaceState

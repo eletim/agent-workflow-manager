@@ -629,9 +629,10 @@ runtime.delete_workspace(workspace_id, *, expected_state) -> None
 ```
 
 The required public PurpleMux workspace-create response includes `initialTab`
-with the new tab's full structured identity. A lost or invalid mutation response
-cannot be repaired from a later tab listing because current shape is not
-historical ownership evidence.
+with the new tab's full structured identity. AWM persists that identity in the
+same workspace ownership event so interruption cannot split their registration.
+A lost or invalid mutation response cannot be repaired from a later tab listing
+because current shape is not historical ownership evidence.
 
 Explicit deletion is an identity-checked, empty-workspace-only cleanup primitive.
 Normal Workflow code must leave owned resources for the Runner's manual Cleanup
@@ -746,10 +747,12 @@ Cleanup action after execution ends. Cleanup verifies identities, closes child
 tabs in reverse deterministic order (including the separately tracked canonical
 initial/default tab of a newly created run-owned workspace). A failed initial
 tab identity is retained as an unresolved cleanup checkpoint; Cleanup never
-converts a later shape-only observation into ownership evidence. Cleanup then
-removes managed-shell result directories and deletes an identity-verified empty
-workspace through PurpleMux's public atomic
-`workspace delete -w ID --if-empty` contract before handling the Git worktree.
+converts a later shape-only observation into ownership evidence. It clears that
+checkpoint only when authoritative state proves the workspace absent or the
+identity-verified workspace empty. Cleanup then removes managed-shell result
+directories and deletes an identity-verified empty workspace through PurpleMux's
+public atomic `workspace delete -w ID --if-empty` contract before handling the
+Git worktree.
 Startup rejects PurpleMux versions without both contracts. Only its structured
 `not-empty` response proves rejection; transport errors and other nonzero exits
 remain uncertain until authoritative workspace listing reconciles them.
