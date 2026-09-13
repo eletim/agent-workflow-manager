@@ -599,7 +599,7 @@ def test_prompt_workflow_uses_direct_unowned_structured_runtime_path(
     assert "runtime.create_workspace(" in code
     assert "client = runtime.workspace(workspace.id)" in code
     assert "client.create_session(" in code
-    assert "client.wait_for_turn_completion(tab, 3600)" in code
+    assert "client.wait_for_turn_completion(tab, 10800)" in code
     assert "result = client.read_result(tab)" in code
     assert "client.interrupt(tab)" in code
     assert "capture_screen" not in code
