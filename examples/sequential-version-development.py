@@ -40,6 +40,7 @@ from purplemux_client import (
     emit_step,
     emit_whole_review_result,
     inspect_issue_driven_work_item_topology,
+    recover_issue_driven_work_item_topology,
     run_correlation,
 )
 
@@ -2587,7 +2588,9 @@ def persist_work_item_plan(
     )
 
 
-def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
+def inspect_dynamic_work_item_topology(
+    issue: Issue, config: Config, *, recover_missing_inline_identity: bool = False
+) -> None:
     """Validate the plan-owned identity before recording its dispatch."""
     if issue.number is not None and issue in config.issues:
         return
@@ -2601,7 +2604,12 @@ def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
             issue.branch,
             issue.task_fingerprint,
         )
-    inspect_issue_driven_work_item_topology(
+    inspect_topology = (
+        recover_issue_driven_work_item_topology
+        if recover_missing_inline_identity and issue.number is None
+        else inspect_issue_driven_work_item_topology
+    )
+    inspect_topology(
         repo=str(config.repo),
         integration_branch=config.integration_branch,
         issue=declaration,
@@ -2618,7 +2626,9 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
-        inspect_dynamic_work_item_topology(recovered_issue, config)
+        inspect_dynamic_work_item_topology(
+            recovered_issue, config, recover_missing_inline_identity=True
+        )
         run_outline_step(
             recovered_issue.label,
             lambda issue=recovered_issue: process_issue(
