@@ -119,6 +119,48 @@ def test_outline_step_logs_terminal_progress_without_replacing_events(
     ]
 
 
+def test_run_turn_retains_busy_timeout_warning_for_summary_and_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_turn"].__globals__
+    findings: list[tuple[str, str, str]] = []
+
+    class Client:
+        workspace_id = "ws-1"
+
+        def wait_until_ready(self, tab: str, timeout: int) -> None:
+            assert (tab, timeout) == ("tab-1", globals_["READY_TIMEOUT"])
+
+        def send_input(self, tab: str, prompt: str) -> None:
+            assert (tab, prompt) == ("tab-1", "work")
+
+        def wait_for_turn_completion(
+            self, tab: str, timeout: int, *, on_busy_timeout
+        ) -> None:
+            assert (tab, timeout) == ("tab-1", globals_["TURN_TIMEOUT"])
+            on_busy_timeout("turn timeout warning")
+
+        def read_result(self, tab: str) -> str:
+            assert tab == "tab-1"
+            return "done"
+
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        globals_,
+        "emit_finding",
+        lambda category, message, *, status: findings.append(
+            (category, message, status)
+        ),
+    )
+
+    assert workflow["run_turn"](Client(), "tab-1", "Implement", "work") == "done"
+    assert findings == [("runtime", "turn timeout warning", "warning")]
+    assert workflow["summary_warnings"](240) == ("turn timeout warning",)
+    delivery = workflow["ReviewDelivery"]("approved", "head", "base", 1)
+    assert workflow["human_handoff_warnings"](delivery) == ("turn timeout warning",)
+
+
 def test_terminal_progress_formats_iteration_and_detail(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

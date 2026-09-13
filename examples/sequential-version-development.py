@@ -80,6 +80,7 @@ POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
 POLICY_CONFLICT_WARNINGS: list[tuple[int | str | None, str]] = []
+AGENT_TURN_TIMEOUT_WARNINGS: list[str] = []
 HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
 HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
 MAX_HUMAN_HANDOFF_CHARS = 12_000
@@ -448,10 +449,19 @@ def run_turn(
         **navigation,
     )
     terminal_progress("START", name, iteration=iteration)
+
+    def warn_busy_timeout(warning: str) -> None:
+        if warning not in AGENT_TURN_TIMEOUT_WARNINGS:
+            AGENT_TURN_TIMEOUT_WARNINGS.append(warning)
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("runtime", warning, status="warning")
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
-        client.wait_for_turn_completion(tab, TURN_TIMEOUT)
+        client.wait_for_turn_completion(
+            tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
+        )
         result = client.read_result(tab)
     except BaseException as exc:
         emit_step(
@@ -652,7 +662,8 @@ def summary_warnings(
     issue_number: int | str | None, additional: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
     """Keep the result event narrow while retaining its primary warnings."""
-    warnings = list(additional)
+    warnings = list(AGENT_TURN_TIMEOUT_WARNINGS)
+    warnings.extend(additional)
     warnings.extend(
         warning
         for warning_issue, warning in POLICY_CONFLICT_WARNINGS
@@ -831,7 +842,8 @@ def warn_human_handoff(message: str) -> None:
 
 
 def human_handoff_warnings(delivery: ReviewDelivery) -> tuple[str, ...]:
-    warnings = list(delivery.warnings)
+    warnings = list(AGENT_TURN_TIMEOUT_WARNINGS)
+    warnings.extend(delivery.warnings)
     for item in ISSUE_HANDOFF_RESULTS:
         warnings.extend(item.warnings)
     warnings.extend(warning for _, warning in POLICY_CONFLICT_WARNINGS)
@@ -3320,6 +3332,7 @@ def run_repository(
     deferred_deliveries: list[RepositoryDelivery] | None = None,
 ) -> PullRequestState | None:
     POLICY_CONFLICT_WARNINGS.clear()
+    AGENT_TURN_TIMEOUT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
     emit_issue_driven_context(
         config.slug,

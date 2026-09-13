@@ -702,6 +702,11 @@ correlates a fresh PurpleMux completion and structured result with that turn.
 `read_result` returns the structured provider result text and rejects stale,
 interrupted, unavailable, or not-ready results.
 
+The turn timeout is a warning threshold when the authoritative `cliState` is
+still `busy`: the client emits a structured warning and keeps monitoring until
+completion or an authoritative failure. Pass `on_busy_timeout` when the workflow
+also needs to retain the warning in its own summary or human handoff data.
+
 `capture_screen` is diagnostic pane text only. It may be printed or retained for
 failure inspection, but never parse it to decide completion, approval, or the
 agent result.
