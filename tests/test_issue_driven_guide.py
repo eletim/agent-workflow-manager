@@ -106,3 +106,19 @@ def test_guide_avoids_removed_recovery_contract() -> None:
     assert "review & resume" in guide
     assert "distinct run" in guide
     assert "authoritative git, github, and purplemux state" in guide
+
+
+def test_guide_documents_inline_identity_responsibility_boundary() -> None:
+    guide = " ".join(guide_text().split())
+
+    assert "Across a fresh run, **Review & Resume**" in guide
+    assert (
+        "persisted `WorkItemPlan` supplies the authoritative task fingerprint" in guide
+    )
+    assert "Neither source is sufficient by itself" in guide
+    assert "Only AWM creates or repairs the fingerprint marker" in guide
+    assert "recovery from a timed-out marker update" in guide
+    assert (
+        "A different valid fingerprint and ambiguous markers always fail closed"
+        in guide
+    )

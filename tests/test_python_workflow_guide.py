@@ -55,3 +55,19 @@ def test_guide_keeps_terminal_progress_observational() -> None:
     assert "concise `[workflow]` lines" in guide
     assert "Never parse stdout to determine workflow state" in guide
     assert "structured\nProgress, Findings, result events" in guide
+
+
+def test_guide_documents_generated_inline_identity_responsibility() -> None:
+    guide = " ".join(GUIDE.read_text(encoding="utf-8").split())
+
+    assert (
+        "persisted `WorkItemPlan` state supplies the authoritative fingerprint" in guide
+    )
+    assert "Neither authority can substitute for the other" in guide
+    assert "fresh runs, **Review & Resume**" in guide
+    assert "only AWM creates or repairs the fingerprint marker" in guide
+    assert "guarded PR-body update times out" in guide
+    assert (
+        "A different valid fingerprint and ambiguous markers always fail closed"
+        in guide
+    )

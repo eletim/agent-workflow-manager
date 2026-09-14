@@ -247,14 +247,22 @@ or revised mini task receives the same authoritative remote branch, PR-state,
 SHA-containment, and fingerprint checks before its dispatch is persisted.
 
 The generated Python embeds the mini-task instruction and uses the deterministic
-branch `feature/work-item-refresh-run-help`. Its recovery declaration and Draft
-PR record the SHA-256 fingerprint of the authoritative task text, and recovery
-fails if the PR fingerprint is different. During Review & Resume, a dispatched
-task recovered from the persisted `WorkItemPlan` may restore a missing or malformed
-marker after its branch, PR head/base, and integration topology all match. A
-different valid fingerprint and ambiguous markers still fail closed. Implementers
-and both review phases receive that embedded instruction instead of running
-`gh issue view`.
+branch `feature/work-item-refresh-run-help`. Across a fresh run, **Review &
+Resume**, and recovery from a timed-out marker update, the persisted
+`WorkItemPlan` supplies the authoritative task fingerprint while exact remote
+branch, PR head/base, SHA-containment, and integration topology identify the PR
+that may carry it. Neither source is sufficient by itself.
+
+Only AWM creates or repairs the fingerprint marker. Implementer prompts prohibit
+the CodingAgent from editing it. On a fresh run, AWM creates a new Draft PR with
+the plan-owned marker or may adopt an exact Draft PR and repair its missing or
+malformed marker after all topology checks succeed. During **Review & Resume**,
+it applies the same repair only to a dispatched task restored from the persisted
+plan. If the guarded PR-body update times out, AWM re-reads the exact PR and
+accepts only the intended body as the authoritative postcondition; an unresolved
+outcome fails closed. A different valid fingerprint and ambiguous markers always
+fail closed instead of being overwritten. Implementers and both review phases
+receive the embedded instruction instead of running `gh issue view`.
 GitHub Issue work items continue to use `feature/issue-N` and read Issue `N` with
 `gh`. Both forms use the same recovery, Draft PR, review, and delivery functions.
 
