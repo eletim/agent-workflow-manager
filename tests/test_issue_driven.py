@@ -1872,6 +1872,7 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
         scope_review,
         correctness_review,
         module.__dict__["scenario_gate_prompt"](pr, config, config.issues),
+        module.__dict__["design_principles_review_prompt"](pr, config, config.issues),
         module.__dict__["whole_version_review_prompt"](pr, config, config.issues),
         module.__dict__["version_readme_review_prompt"](pr, config, config.issues),
     )
@@ -2246,6 +2247,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
+        "Design Principles reviewer": "REVIEWER_AGENT",
         "Version / README reviewer": "REVIEWER_AGENT",
         "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
