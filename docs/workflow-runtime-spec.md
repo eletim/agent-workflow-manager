@@ -104,8 +104,13 @@ whole-version, and Version / README review rounds use the same durable ownership
 boundary. Their corresponding child PR or Base PR retains a bounded,
 idempotently updated audit section containing each role's verdict, actionable
 findings, reviewed commit, and later fix disposition. The audit stores neither
-raw agent output nor secret-like content and is therefore safe to use for new-run
-recovery and human review without depending on PurpleMux output history.
+raw agent output nor secret-like content: review turns return an exact bounded
+JSON contract, and unsafe values fail validation in the correction loop before
+any PR mutation. A byte-aware audit budget evicts only an older record when the
+same role has a newer record, so the latest decision from every configured role
+survives compaction; other managed Base PR content must leave that minimum audit
+reserve available. The audit is therefore safe to use for new-run recovery and
+human review without depending on PurpleMux output history.
 
 PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
 `purplemux_client` uses

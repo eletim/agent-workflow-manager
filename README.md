@@ -284,9 +284,12 @@ in the same order within the bounded whole-review loop.
 Each consequential review round is also recorded in a bounded managed section
 of its child PR or Base PR. The record keeps the role, verdict, concise
 actionable findings, exact reviewed commit, and the later fix disposition. It is
-updated idempotently, excludes raw agent logs and potentially sensitive text,
-and remains available to recovery runs and human reviewers independently of
-PurpleMux run history.
+updated idempotently from a validated bounded JSON response; raw logs and
+secret-like values are rejected before persistence. Byte-aware retention evicts
+only older records superseded by the same role, preserving every role's latest
+record within a reserved portion of the shared PR-body budget. The audit remains
+available to recovery runs and human reviewers independently of PurpleMux run
+history.
 If a Correctness reviewer or fix changes the head,
 the prior Scope outcome is invalidated and the ordered Scope then Correctness
 sequence restarts on the new commit within the separate cumulative limits.

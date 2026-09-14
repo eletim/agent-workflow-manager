@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import runpy
 import subprocess
 from dataclasses import replace
@@ -85,6 +86,42 @@ def keep_review_audit_in_memory(
         globals_,
         "review_audit_disposition",
         lambda _github, pr, _audit_id, _disposition, **_kwargs: pr,
+    )
+    monkeypatch.setitem(
+        globals_,
+        "new_review_audit",
+        lambda role, round_number, verdict, reviewed_sha, _result: workflow[
+            "ReviewAuditRecord"
+        ](
+            "0" * 32,
+            role,
+            round_number,
+            verdict,
+            reviewed_sha,
+            (),
+            "not_required" if verdict == "APPROVED" else "pending",
+        ),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "decision",
+        lambda result: (
+            "CHANGES_REQUESTED" if "CHANGES_REQUESTED" in result else "APPROVED"
+        ),
+    )
+
+
+def review_result(
+    verdict: str = "APPROVED",
+    findings: tuple[str, ...] = (),
+    policy_conflicts: tuple[str, ...] = (),
+) -> str:
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "findings": list(findings),
+            "policy_conflicts": list(policy_conflicts),
+        }
     )
 
 
@@ -237,83 +274,40 @@ def test_canonical_workflow_logs_major_issue_driven_boundaries() -> None:
     assert '"IDENTIFIED", "Final integration PR"' in source
 
 
-@pytest.mark.parametrize(
-    ("result", "expected"),
-    [
-        ("APPROVED", "APPROVED"),
-        ("## APPROVED", "APPROVED"),
-        ("**APPROVED**", "APPROVED"),
-        ("Verdict: APPROVED", "APPROVED"),
-        ("**Verdict: APPROVED**", "APPROVED"),
-        ("Review result:\nAPPROVED\n\n- no findings", "APPROVED"),
-        ("CHANGES_REQUESTED", "CHANGES_REQUESTED"),
-        ("### CHANGES_REQUESTED", "CHANGES_REQUESTED"),
-        ("**CHANGES_REQUESTED**", "CHANGES_REQUESTED"),
-        ("Verdict: CHANGES_REQUESTED", "CHANGES_REQUESTED"),
-        ("`Verdict: CHANGES_REQUESTED`", "CHANGES_REQUESTED"),
-        ("Review result:\nCHANGES_REQUESTED\n\n- finding", "CHANGES_REQUESTED"),
-        ("`approved`", "APPROVED"),
-        ("Verdict:   changes_requested", "CHANGES_REQUESTED"),
-    ],
-)
-def test_decision_accepts_bounded_reviewer_verdict_variations(
-    result: str, expected: str
-) -> None:
-    decision = runpy.run_path(str(EXAMPLE))["decision"]
+@pytest.mark.parametrize("verdict", ["APPROVED", "CHANGES_REQUESTED"])
+def test_decision_accepts_exact_structured_review_response(verdict: str) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
 
-    assert decision(result) == expected
+    assert (
+        workflow["decision"](review_result(verdict, ("Actionable finding",))) == verdict
+    )
+    assessment = workflow["review_assessment"](
+        review_result(verdict, ("Actionable finding",), ("Policy mismatch",))
+    )
+    assert assessment.findings == ("Actionable finding",)
+    assert assessment.policy_conflicts == ("Policy mismatch",)
 
 
 @pytest.mark.parametrize(
     "result",
     [
-        "APPROVED and CHANGES_REQUESTED",
-        "APPROVED\nCHANGES_REQUESTED",
-        "Review result:\nAPPROVED\nCHANGES_REQUESTED",
-        "Verdict: CHANGES_REQUESTED\n## APPROVED",
-        "I initially considered APPROVED,\nbut the final verdict is CHANGES_REQUESTED.",
-        "Review result:\nNothing conclusive\nPlease retry",
-        "Introduction\nDetails\nMore details\nAPPROVED",
-        "NOT APPROVED",
-        "This review is APPROVED",
-        "Looks approved",
-        "APPROVE",
-        "No changes requested",
-        "UNAPPROVED",
+        "APPROVED",
+        '{"verdict":"APPROVED","findings":[]}',
+        '{"verdict":"APPROVE","findings":[],"policy_conflicts":[]}',
+        '{"verdict":"APPROVED","findings":[],"policy_conflicts":[],"extra":1}',
+        '{"verdict":"APPROVED","findings":"none","policy_conflicts":[]}',
+        review_result("APPROVED", ("$ printenv",)),
+        review_result("APPROVED", ("token=secret-value",)),
+        review_result("APPROVED", ("a\nraw log",)),
+        review_result("APPROVED", ("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",)),
+        review_result("APPROVED", ("界" * 100,)),
     ],
 )
-def test_decision_fails_closed_for_ambiguous_or_invalid_results(result: str) -> None:
+def test_decision_fails_closed_for_invalid_or_unsafe_results(result: str) -> None:
     decision = runpy.run_path(str(EXAMPLE))["decision"]
 
     with pytest.raises(WorkerFailure):
         decision(result)
-
-
-@pytest.mark.parametrize(
-    ("result", "expected"),
-    [
-        (
-            "CHANGES_REQUESTED\nScope was not APPROVED because coverage is missing.",
-            "CHANGES_REQUESTED",
-        ),
-        (
-            "APPROVED\nThe prior CHANGES_REQUESTED findings have been resolved.",
-            "APPROVED",
-        ),
-    ],
-)
-def test_decision_ignores_verdict_words_in_finding_prose(
-    result: str, expected: str
-) -> None:
-    decision = runpy.run_path(str(EXAMPLE))["decision"]
-
-    assert decision(result) == expected
-
-
-def test_decision_accepts_repeated_equivalent_standalone_verdicts() -> None:
-    decision = runpy.run_path(str(EXAMPLE))["decision"]
-
-    assert decision("APPROVED\nVerdict: APPROVED") == "APPROVED"
 
 
 def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> None:
@@ -479,7 +473,8 @@ def test_all_review_phases_share_decision_parser() -> None:
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
-    responses = iter(("Looks approved", "## APPROVED"))
+    corrected = review_result("APPROVED")
+    responses = iter(("Looks approved", corrected))
     turns: list[tuple[str, str, str]] = []
 
     def run_turn(_client, tab, name, prompt, **_kwargs):
@@ -492,11 +487,11 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
         object(), "reviewer-tab", "Scope review", "Review this.", workflow["decision"]
     )
 
-    assert result == "## APPROVED"
+    assert result == corrected
     assert verdict == "APPROVED"
     assert [turn[0] for turn in turns] == ["reviewer-tab", "reviewer-tab"]
     assert turns[1][1] == "Scope review output correction"
-    assert "reviewer must provide APPROVED or CHANGES_REQUESTED" in turns[1][2]
+    assert "reviewer response must be one JSON object" in turns[1][2]
     assert "complete corrected response only" in turns[1][2]
 
 
@@ -536,14 +531,14 @@ def test_review_audit_is_bounded_idempotent_and_records_fix_disposition() -> Non
             round_number,
             "CHANGES_REQUESTED",
             f"head-{round_number}",
-            f"CHANGES_REQUESTED\n- Fix behavior {round_number}",
+            review_result("CHANGES_REQUESTED", (f"Fix behavior {round_number}",)),
         )
         records.append(record)
         body = workflow["with_review_audit"](body, record)
 
     recovered = workflow["review_audit_from_body"](body)
-    assert len(recovered) == workflow["MAX_REVIEW_AUDIT_RECORDS"] == 32
-    assert recovered[0].round == 4
+    assert len(recovered) == workflow["MAX_REVIEW_AUDIT_RECORDS"] == 16
+    assert recovered[0].round == 20
     assert recovered[-1].findings == ("Fix behavior 35",)
 
     unchanged = workflow["with_review_audit"](body, records[-1])
@@ -551,39 +546,68 @@ def test_review_audit_is_bounded_idempotent_and_records_fix_disposition() -> Non
     updated = replace(records[-1], fix_disposition="fixed", fix_sha="fixed-head")
     revised = workflow["with_review_audit"](body, updated)
     revised_records = workflow["review_audit_from_body"](revised)
-    assert len(revised_records) == 32
+    assert len(revised_records) == 16
     assert revised_records[-1].fix_disposition == "fixed"
     assert revised_records[-1].fix_sha == "fixed-head"
     assert "fix: fixed at `fixed-head`" in revised
 
 
-def test_review_audit_omits_raw_logs_and_secret_like_finding_text() -> None:
+def test_review_audit_byte_eviction_retains_latest_record_for_every_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["with_review_audit"].__globals__
+    monkeypatch.setitem(globals_, "MAX_REVIEW_AUDIT_BYTES", 7_000)
+    body = "B" * 55_000
+    roles = ("scenario_gate", "design_principles", "whole_version", "version_readme")
+    findings = tuple(f"Finding {index}: " + "x" * 170 for index in range(3))
+
+    for round_number in (1, 2):
+        for role in roles:
+            record = workflow["new_review_audit"](
+                role,
+                round_number,
+                "CHANGES_REQUESTED",
+                f"head-{round_number}",
+                review_result("CHANGES_REQUESTED", findings),
+            )
+            body = workflow["with_review_audit"](body, record)
+
+    recovered = workflow["review_audit_from_body"](body)
+    assert len(body.encode()) <= workflow["MAX_BASE_PR_BODY_BYTES"]
+    assert len(body[body.index(workflow["REVIEW_AUDIT_START"]) :].encode()) <= 7_000
+    assert {record.role for record in recovered} == set(roles)
+    assert len(recovered) < 8
+    assert all(
+        max(record.round for record in recovered if record.role == role) == 2
+        for role in roles
+    )
+    with pytest.raises(WorkerFailure, match="reserved 8000-byte review audit budget"):
+        workflow["require_base_pr_body_size"](
+            "B"
+            * (
+                workflow["MAX_BASE_PR_BODY_BYTES"]
+                - workflow["MIN_REVIEW_AUDIT_RESERVE_BYTES"]
+                + 1
+            )
+        )
+
+
+def test_review_audit_rejects_raw_logs_and_secret_like_finding_text() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     secret = "github_pat_not-for-github"
-    result = f"""CHANGES_REQUESTED
-- Keep this actionable finding.
-```text
-raw command output
-```
-$ env
-2026-09-15 10:00 build log
-- token={secret}
-POLICY_CONFLICT: separately persisted
-"""
-
-    record = workflow["new_review_audit"](
-        "scope_design", 1, "CHANGES_REQUESTED", "reviewed-head", result
+    unsafe_results = (
+        review_result("CHANGES_REQUESTED", ("$ env",)),
+        review_result("CHANGES_REQUESTED", ("2026-09-15 10:00 build log",)),
+        review_result("CHANGES_REQUESTED", (f"token={secret}",)),
+        review_result("CHANGES_REQUESTED", ("```raw output```",)),
     )
-    body = workflow["with_review_audit"]("Child PR.", record)
 
-    assert secret not in body
-    assert "raw command output" not in body
-    assert "2026-09-15 10:00" not in body
-    assert "POLICY_CONFLICT" not in body
-    assert record.findings == (
-        "Keep this actionable finding.",
-        "[finding withheld: potentially sensitive content]",
-    )
+    for result in unsafe_results:
+        with pytest.raises(WorkerFailure, match="without logs or secret-like"):
+            workflow["new_review_audit"](
+                "scope_design", 1, "CHANGES_REQUESTED", "reviewed-head", result
+            )
 
 
 def test_review_audit_persists_on_exact_draft_pr_and_updates_same_record() -> None:
@@ -612,7 +636,7 @@ def test_review_audit_persists_on_exact_draft_pr_and_updates_same_record() -> No
         1,
         "CHANGES_REQUESTED",
         pr.head_sha,
-        "CHANGES_REQUESTED\n- Add the missing boundary check.",
+        review_result("CHANGES_REQUESTED", ("Add the missing boundary check.",)),
     )
     pr = workflow["persist_review_audit"](
         github, pr, record, head="feature/issue-1", base="dev/v1"
@@ -637,7 +661,7 @@ def test_review_audit_persists_on_exact_draft_pr_and_updates_same_record() -> No
 def test_review_audit_rejects_ambiguous_managed_markers() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     record = workflow["new_review_audit"](
-        "whole_version", 1, "APPROVED", "head", "APPROVED"
+        "whole_version", 1, "APPROVED", "head", review_result()
     )
     body = workflow["with_review_audit"]("Base PR.", record)
 
@@ -776,7 +800,12 @@ def test_scope_review_fix_is_re_reviewed_with_an_independent_count(
             current = replace(current, body=body)
             return current
 
-    results = iter(("CHANGES_REQUESTED\nreduce the scope", "APPROVED"))
+    results = iter(
+        (
+            review_result("CHANGES_REQUESTED", ("Reduce the scope.",)),
+            review_result(),
+        )
+    )
 
     def run_turn(*args: object, **kwargs: object) -> str:
         name = str(args[2])
