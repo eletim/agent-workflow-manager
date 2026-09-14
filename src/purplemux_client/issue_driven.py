@@ -117,15 +117,15 @@ def classify_issue_topology(
                 f"ambiguous PR states from {branch} to {integration_branch}: {numbers}"
             )
         for pr in matching:
-            _require_inline_task_fingerprint(
-                pr,
-                inline_task_fingerprint,
-                allow_repair=(
-                    _allow_repair_inline_task_fingerprint
-                    and pr.state == "OPEN"
-                    and pr.is_draft
-                ),
-            )
+            if (
+                _allow_repair_inline_task_fingerprint
+                and inline_task_fingerprint is not None
+                and pr.state == "OPEN"
+                and pr.is_draft
+            ):
+                reconcile_inline_task_pr_body(pr, inline_task_fingerprint)
+            else:
+                require_inline_task_pr_fingerprint(pr, inline_task_fingerprint)
         if closed_pr is not None:
             raise WorkerFailure(
                 f"closed unmerged PR #{closed_pr.number} exists from {branch} "
@@ -253,16 +253,14 @@ def _inline_task_marker_spans(body: str) -> tuple[tuple[int, int], ...]:
     return tuple(spans)
 
 
-def _require_inline_task_fingerprint(
-    pr: PullRequestState, expected: str | None, *, allow_repair: bool = False
+def require_inline_task_pr_fingerprint(
+    pr: PullRequestState, expected: str | None
 ) -> None:
+    """Require exactly one canonical plan-owned fingerprint marker."""
     if expected is None:
         return
     markers = _inline_task_marker_spans(pr.body)
     if _inline_task_fingerprints(pr.body) == (expected,) and len(markers) == 1:
-        return
-    if allow_repair:
-        _reconciled_inline_task_pr_body(pr, expected)
         return
     raise WorkerFailure(
         f"PR #{pr.number} inline task fingerprint is missing or does not match "
@@ -270,7 +268,7 @@ def _require_inline_task_fingerprint(
     )
 
 
-def _reconciled_inline_task_pr_body(pr: PullRequestState, expected: str) -> str:
+def reconcile_inline_task_pr_body(pr: PullRequestState, expected: str) -> str:
     """Return a body with one canonical plan-owned fingerprint marker."""
     prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
     suffix = " -->"
@@ -522,11 +520,11 @@ def recover_issue_driven_work_item_topology(
             f"{label}: recoverable open PR #{state.open_pr_number} changed or disappeared"
         ) from exc
     try:
-        _require_inline_task_fingerprint(current, fingerprint)
+        require_inline_task_pr_fingerprint(current, fingerprint)
         return state
     except WorkerFailure:
-        _require_inline_task_fingerprint(current, fingerprint, allow_repair=True)
-    body = _reconciled_inline_task_pr_body(current, fingerprint)
+        pass
+    body = reconcile_inline_task_pr_body(current, fingerprint)
     updated = github.update_pr_body(
         current.number,
         body=body,
@@ -536,7 +534,7 @@ def recover_issue_driven_work_item_topology(
         expected_base_sha=state.integration_sha,
         draft=True,
     )
-    _require_inline_task_fingerprint(updated, fingerprint)
+    require_inline_task_pr_fingerprint(updated, fingerprint)
     emit_finding(
         "github",
         f"{label}: restored missing inline task fingerprint on PR #{current.number}",

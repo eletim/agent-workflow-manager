@@ -1572,6 +1572,98 @@ def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> No
     assert bodies == [issue.pr_body, updated.body]
 
 
+@pytest.mark.parametrize(
+    ("update_stage", "foreign_marker"),
+    [("review", False), ("fix", True)],
+    ids=["duplicate-during-review-update", "foreign-during-fix-update"],
+)
+def test_inline_review_updates_reject_ambiguous_pr_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    update_stage: str,
+    foreign_marker: bool,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["review_issue_phase"].__globals__
+    task = "Refresh the New Run help."
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-refresh-run-help",
+        "refresh-run-help",
+        task,
+        fingerprint,
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    initial_sha = "implementation-head"
+    updated_sha = f"{update_stage}-head"
+    base_sha = "integration-head"
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    other = "b" * 64 if foreign_marker else fingerprint
+    added_marker = f"<!-- agent-workflow-manager:inline-task-sha256:{other} -->"
+    current_pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=initial_sha,
+        base_sha=base_sha,
+        body=f"{marker}\n\nImplementation summary",
+    )
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (issue.branch, updated_sha)
+            return BranchState(branch, updated_sha, updated_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            if kwargs["expected_head_sha"] == initial_sha:
+                return current_pr
+            return replace(
+                current_pr,
+                head_sha=updated_sha,
+                body=f"{current_pr.body}\n\n{added_marker}",
+            )
+
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            pytest.fail("ambiguous identity must fail before a PR body mutation")
+
+    agent_results = (
+        iter(((updated_sha, True),))
+        if update_stage == "review"
+        else iter(((initial_sha, False), (updated_sha, True)))
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "run_validated_turn",
+        lambda *args, **kwargs: (
+            ("APPROVED", "APPROVED")
+            if update_stage == "review"
+            else ("CHANGES_REQUESTED\nfix it", "CHANGES_REQUESTED")
+        ),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(agent_results),
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", lambda *args, **kwargs: "fixed")
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        workflow["review_issue_phase"](
+            issue,
+            config,
+            object(),
+            Repository(),
+            GitHub(),
+            "implementer",
+            "reviewer",
+            current_pr,
+            phase="scope/design",
+            prompt="review",
+            max_reviews=2,
+        )
+
+
 def test_regular_issue_pr_body_metadata_maintenance_is_a_noop() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     issue = workflow["Issue"](204, "feature/issue-204")

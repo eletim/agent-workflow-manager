@@ -40,7 +40,9 @@ from purplemux_client import (
     emit_step,
     emit_whole_review_result,
     inspect_issue_driven_work_item_topology,
+    reconcile_inline_task_pr_body,
     recover_issue_driven_work_item_topology,
+    require_inline_task_pr_fingerprint,
     run_correlation,
 )
 
@@ -1130,7 +1132,11 @@ def ensure_issue_pr_metadata(
     issue: Issue,
     config: Config,
 ) -> PullRequestState:
-    body = with_inline_task_pr_identity(pr, issue)
+    body = (
+        pr.body
+        if issue.task_fingerprint is None
+        else reconcile_inline_task_pr_body(pr, issue.task_fingerprint)
+    )
     if config.policy_issue is not None:
         for issue_number, warning in POLICY_CONFLICT_WARNINGS:
             if issue_number != issue.result_id:
@@ -1150,7 +1156,8 @@ def ensure_issue_pr_metadata(
         expected_base=config.integration_branch,
         expected_base_sha=pr.base_sha,
     )
-    return require_inline_task_pr_identity(current, issue)
+    require_inline_task_pr_fingerprint(current, issue.task_fingerprint)
+    return current
 
 
 def policy_pr_notes(config: Config) -> str:
@@ -1354,48 +1361,6 @@ APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
     return implementation, scope_review, correctness_review
 
 
-def require_inline_task_pr_identity(
-    pr: PullRequestState, issue: Issue
-) -> PullRequestState:
-    if issue.task_fingerprint is None:
-        return pr
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    suffix = " -->"
-    lines = pr.body.splitlines()
-    marker = lines[0].strip() if lines else ""
-    if (
-        not marker.startswith(prefix)
-        or not marker.endswith(suffix)
-        or marker[len(prefix) : -len(suffix)] != issue.task_fingerprint
-    ):
-        raise WorkerFailure(
-            f"PR #{pr.number} inline task fingerprint is missing or does not match "
-            "the declared task"
-        )
-    return pr
-
-
-def inline_task_pr_fingerprint(pr: PullRequestState) -> str | None:
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    lines = pr.body.splitlines()
-    marker = lines[0].strip() if lines else ""
-    if not marker.startswith(prefix):
-        return None
-    suffix = " -->"
-    return marker[len(prefix) : -len(suffix)] if marker.endswith(suffix) else ""
-
-
-def with_inline_task_pr_identity(pr: PullRequestState, issue: Issue) -> str:
-    if issue.task_fingerprint is None:
-        return pr.body
-    fingerprint = inline_task_pr_fingerprint(pr)
-    if fingerprint is not None:
-        require_inline_task_pr_identity(pr, issue)
-        return pr.body
-    marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{issue.task_fingerprint} -->"
-    return f"{marker}\n\n{pr.body}" if pr.body else marker
-
-
 def prepare_issue(
     repo: GitRepository,
     github: GitHubRepository,
@@ -1404,12 +1369,12 @@ def prepare_issue(
 ) -> tuple[PullRequestState | None, str, bool] | PullRequestState:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     if open_pr is not None:
-        require_inline_task_pr_identity(open_pr, issue)
+        require_inline_task_pr_fingerprint(open_pr, issue.task_fingerprint)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
     )
     if merged is not None:
-        require_inline_task_pr_identity(merged, issue)
+        require_inline_task_pr_fingerprint(merged, issue.task_fingerprint)
         if open_pr is not None:
             raise WorkerFailure("merged Issue also has an open same-head PR")
         emit_finding(
@@ -1536,7 +1501,8 @@ def ensure_issue_pr(
         expected_base_sha=expected_base_sha,
         draft=True,
     )
-    return require_inline_task_pr_identity(current, issue)
+    require_inline_task_pr_fingerprint(current, issue.task_fingerprint)
+    return current
 
 
 def merge_pr_and_advance(
