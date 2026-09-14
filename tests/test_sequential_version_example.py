@@ -309,6 +309,25 @@ def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> No
     assert "right boundaries" in source
 
 
+def test_design_principles_review_prompt_has_an_independent_conformance_scope() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+
+    prompt = workflow["design_principles_review_prompt"](pr, config, config.issues)
+
+    assert pr.base_sha in prompt
+    assert pr.head_sha in prompt
+    assert f"git show {pr.head_sha}:docs/design-principles.md" in prompt
+    assert "solely for conformance" in prompt
+    assert "authoritative document" in prompt
+    assert "Do not perform Scenario Gate" in prompt
+    assert "general whole-version" in prompt
+    assert "version, or README review" in prompt
+
+
 def test_version_readme_review_prompt_has_an_independent_documentation_scope() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     pr = open_pr(head="dev/v1", base="main", draft=True)
@@ -378,6 +397,7 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
 
     dynamic_prompts = (
         workflow["scenario_gate_prompt"](pr, config, work_items),
+        workflow["design_principles_review_prompt"](pr, config, work_items),
         workflow["whole_version_review_prompt"](pr, config, work_items),
         workflow["version_readme_review_prompt"](pr, config, work_items),
     )
@@ -389,6 +409,9 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
 
     one_shot_prompts = (
         workflow["scenario_gate_prompt"](pr, one_shot_config, one_shot_items),
+        workflow["design_principles_review_prompt"](
+            pr, one_shot_config, one_shot_items
+        ),
         workflow["whole_version_review_prompt"](pr, one_shot_config, one_shot_items),
         workflow["version_readme_review_prompt"](pr, one_shot_config, one_shot_items),
     )
@@ -409,6 +432,7 @@ def test_all_review_prompts_preserve_the_active_checkout() -> None:
         scope_review,
         correctness_review,
         workflow["scenario_gate_prompt"](pr, config, config.issues),
+        workflow["design_principles_review_prompt"](pr, config, config.issues),
         workflow["whole_version_review_prompt"](pr, config, config.issues),
         workflow["version_readme_review_prompt"](pr, config, config.issues),
     )
@@ -431,7 +455,7 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 6
+    assert source.count("run_validated_turn(") == 7
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:
@@ -563,6 +587,7 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
         assert prompt.func.id == "implementer_prompt"
     for label in (
         "  review",
+        "Design Principles reviewer turn",
         "Whole-version reviewer turn",
         "Version / README reviewer turn",
     ):
@@ -2139,6 +2164,7 @@ def test_ready_final_pr_repeats_review_and_checks(
     assert events == [
         "set_draft:True",
         "require_review_head",
+        "Design Principles reviewer turn",
         "Whole-version reviewer turn",
         "Version / README reviewer turn",
         "require_review_head",
@@ -2190,18 +2216,21 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
 
     results = iter(
         (
+            (initial_sha, False),
             (reviewed_sha, True),
+            (reviewed_sha, False),
             (reviewed_sha, False),
             (reviewed_sha, False),
             (reviewed_sha, False),
         )
     )
-    review_count = 0
+    whole_review_count = 0
 
     def run_turn(*args: object, **kwargs: object) -> str:
-        nonlocal review_count
-        review_count += 1
-        if review_count == 1:
+        nonlocal whole_review_count
+        if str(args[2]) == "Whole-version reviewer turn":
+            whole_review_count += 1
+        if whole_review_count == 1 and str(args[2]) == "Whole-version reviewer turn":
             return "APPROVED\nPOLICY_CONFLICT: whole reviewer found a conflict"
         return "APPROVED"
 
@@ -2222,9 +2251,81 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
     )
 
     assert delivery.outcome == "approved"
-    assert review_count == 3
+    assert whole_review_count == 2
     assert persisted_heads
     assert set(persisted_heads) == {reviewed_sha}
+
+
+def test_changed_design_principles_reviewer_invalidates_and_repeats_whole_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    initial_sha = "integration-head"
+    changed_sha = "principles-reviewer-head"
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha=initial_sha,
+    )
+    events: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            events.append(f"push:{expected_local_sha}")
+            return BranchState(branch, expected_local_sha, expected_local_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+    results = iter(
+        (
+            (changed_sha, True),
+            (changed_sha, False),
+            (changed_sha, False),
+            (changed_sha, False),
+            (changed_sha, False),
+        )
+    )
+    prompts: list[str] = []
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        events.append(str(args[2]))
+        prompts.append(str(args[3]))
+        return "APPROVED"
+
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(results),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    _, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current_pr, config.issues
+    )
+
+    assert delivery.outcome == "approved"
+    assert delivery.head_sha == changed_sha
+    assert events == [
+        "Design Principles reviewer turn",
+        f"push:{changed_sha}",
+        "Design Principles reviewer turn",
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ]
+    assert initial_sha in prompts[0]
+    assert changed_sha in prompts[1]
 
 
 def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
@@ -2330,7 +2431,9 @@ def test_whole_failures_do_not_consume_version_readme_review_budget(
         (
             (initial_sha, False),
             (initial_sha, False),
+            (initial_sha, False),
             (fixed_sha, True),
+            (fixed_sha, False),
             (fixed_sha, False),
             (fixed_sha, False),
             (fixed_sha, False),
@@ -2379,9 +2482,11 @@ def test_whole_failures_do_not_consume_version_readme_review_budget(
     assert "Repair the cross-Issue integration." in fix_prompts[0]
     assert "Remove the obsolete CLI example." in fix_prompts[0]
     assert events == [
+        "Design Principles reviewer turn",
         "Whole-version reviewer turn",
         "Version / README reviewer turn",
         "Whole-version fixes",
+        "Design Principles reviewer turn",
         "Whole-version reviewer turn",
         "Version / README reviewer turn",
     ]
@@ -2419,7 +2524,9 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
         (
             (initial_sha, False),
             (initial_sha, False),
+            (initial_sha, False),
             (fixed_sha, True),
+            (fixed_sha, False),
             (fixed_sha, False),
             (fixed_sha, False),
             (fixed_sha, False),
@@ -2467,6 +2574,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     assert pr.is_draft is True
     assert delivery.outcome == "continued_with_warning"
     assert delivery.head_sha == fixed_sha
+    assert events.count("Design Principles reviewer turn") == 2
     assert events.count("Whole-version reviewer turn") == 2
     assert events.count("Version / README reviewer turn") == 2
     assert events.count("Whole-version fixes") == 1
@@ -2631,6 +2739,8 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         nonlocal review_count
         name = str(args[2])
         events.append(name)
+        if name == "Design Principles reviewer turn":
+            return "APPROVED"
         if name == "Whole-version reviewer turn":
             review_count += 1
             return "APPROVED"

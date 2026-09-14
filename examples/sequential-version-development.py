@@ -2763,6 +2763,25 @@ def whole_version_review_prompt(
     )
 
 
+def design_principles_review_prompt(
+    pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
+) -> str:
+    return (
+        f"Review exact integration head {pr.head_sha} solely for conformance with "
+        "the repository's design principles. Before judging, read the authoritative "
+        "document from that exact head with `git show "
+        f"{pr.head_sha}:docs/design-principles.md`. Inspect the integrated change "
+        f"against final base {pr.base_sha} and report only deviations from an "
+        "applicable principle in that document. Do not perform Scenario Gate, "
+        "general whole-version, correctness, version, or README review in this "
+        "turn. Return APPROVED or CHANGES_REQUESTED first, followed by actionable "
+        "design-principle findings; do not mutate anything.\n\n"
+        + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
+        + final_work_item_context(config, work_items)
+    )
+
+
 def version_readme_review_prompt(
     pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
 ) -> str:
@@ -2802,6 +2821,12 @@ def review_whole_version(
         config,
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
+    )
+    design_principles_reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name="Design Principles reviewer",
     )
     version_readme_reviewer = create_agent(
         client,
@@ -2870,6 +2895,52 @@ def review_whole_version(
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
+        principles_result, principles_verdict = run_validated_turn(
+            client,
+            design_principles_reviewer,
+            "Design Principles reviewer turn",
+            policy_context(config, scope="the design-principles conformance review")
+            + design_principles_review_prompt(pr, config, work_items),
+            decision,
+            iteration=review_number,
+        )
+        review_results.append(principles_result)
+        changes_requested = (
+            changes_requested or principles_verdict == "CHANGES_REQUESTED"
+        )
+        emit_policy_conflicts(
+            principles_result, config, scope="the integrated version"
+        )
+        principles_sha, principles_reviewer_changed = require_agent_result(
+            repo,
+            client,
+            fixer,
+            config.integration_branch,
+            pr.head_sha,
+            allow_unchanged=True,
+            iteration=review_number,
+        )
+        if principles_reviewer_changed:
+            pushed = repo.ensure_pushed(
+                config.integration_branch, expected_local_sha=principles_sha
+            )
+            assert pushed.remote_sha is not None
+            pr = github.require_pr(
+                number=pr.number,
+                head=config.integration_branch,
+                base=config.main_branch,
+                state="OPEN",
+                expected_head_sha=pushed.remote_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
+            )
+            pr = ensure_base_pr_policy_notes(github, pr, config)
+            emit_finding(
+                "git",
+                "design-principles review changed the integration branch; "
+                f"approval invalidated at {principles_sha}",
+            )
+            continue
         if verdict == "APPROVED":
             result, verdict = run_validated_turn(
                 client,
