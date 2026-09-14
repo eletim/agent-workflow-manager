@@ -41,15 +41,10 @@ This standalone project was initially migrated from
 `apps/purplemux-client` in an older LangGraph fork. LangGraph itself is not a
 runtime dependency and none of its workflow framework is included here.
 
-## Principles
+## Design principles
 
-- Python code executed by the local runner remains plain Python.
-- There is no workflow DSL.
-- There are no graph semantics.
-- There is no duplicated workflow state machine.
-- External systems are used through public CLI or API contracts.
-- PurpleMux is an agent runtime.
-- The local runner executes, observes, and stops Python processes.
+The project's canonical design principles are maintained in
+[`docs/design-principles.md`](docs/design-principles.md).
 
 ## Issue Driven mode
 
