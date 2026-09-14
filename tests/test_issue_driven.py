@@ -1105,6 +1105,8 @@ def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() 
     assert '        (),\n        "git diff --check",' in parse_args
     assert "        WORKFLOW_POLICY_ISSUE,\n        169," in parse_args
     assert "gh issue view\n{config.one_shot_issue} --repo {config.slug}" in code
+    assert "git show\n{config.integration_branch}:docs/design-principles.md" in code
+    assert "canonical source when decomposing or refining" in code
     assert "short inline mini tasks" in code
     assert "Do not create GitHub Issues" in code
     assert "one_shot_issue" in code
@@ -1208,6 +1210,28 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     assert [item.key for item in inspected] == ["focused-change"]
     assert [item.key for item in effective] == ["focused-change"]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
+    assert all(
+        "git show\ndev/v1:docs/design-principles.md" in prompt for prompt in prompts
+    )
+    assert all(
+        "canonical source when decomposing or refining" in prompt for prompt in prompts
+    )
+
+
+def test_seeded_planner_does_not_receive_one_shot_design_principles_context() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (workflow["Issue"](90, "feature/issue-90"),),
+        "true",
+    )
+
+    prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
+
+    assert "docs/design-principles.md" not in prompt
 
 
 def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
@@ -1848,6 +1872,7 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
         scope_review,
         correctness_review,
         module.__dict__["scenario_gate_prompt"](pr, config, config.issues),
+        module.__dict__["design_principles_review_prompt"](pr, config, config.issues),
         module.__dict__["whole_version_review_prompt"](pr, config, config.issues),
         module.__dict__["version_readme_review_prompt"](pr, config, config.issues),
     )
@@ -2222,6 +2247,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Work-item planner": "REVIEWER_AGENT",
         "Whole-version fixer": "IMPLEMENTER_AGENT",
         "Whole-version reviewer": "REVIEWER_AGENT",
+        "Design Principles reviewer": "REVIEWER_AGENT",
         "Version / README reviewer": "REVIEWER_AGENT",
         "Scenario Gate reviewer": "REVIEWER_AGENT",
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
@@ -3995,7 +4021,10 @@ def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() 
     assert "Before doing anything else, run `gh issue view" in code
     assert "policy_context(config, scope=issue.label)" in code
     assert 'policy_context(config, scope=f"fixes for {issue.label}")' in code
-    assert 'policy_context(config, scope="the whole-version review")' in code
+    assert (
+        'scope="the whole-version review",\n                structured_conflicts=True'
+        in code
+    )
     assert 'policy_context(config, scope="whole-version fixes")' in code
     assert "https://github.com/{config.slug}/issues/{config.policy_issue}" in code
     assert "ensure_base_pr_policy_notes(github, pr, config)" in code

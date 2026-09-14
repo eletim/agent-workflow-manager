@@ -16,6 +16,20 @@ The JSON is not a workflow runtime, DSL, graph, or state machine. It selects
 supported behavior in a deterministic Python generator. Use Python Workflow mode
 when arbitrary control flow is required.
 
+## Human context and durable decisions
+
+Routine human context is `docs/design-principles.md` plus
+`docs/representative-scenarios.md`. During One-Shot development, the One-Shot
+Issue is added to that context as the authoritative goal. The curated scenarios
+in `docs/representative-scenarios.md` are not the configurable `scenarios` list:
+the latter is run-specific validation input for the Scenario Gate.
+
+The persisted work-item plan and the managed Review audit sections on child and
+Base PRs form the durable GitHub decision record. PurpleMux output and agent
+conversation are diagnostics, not substitutes for that record. Keep agent
+context role-minimal: supply the current role only the human context, work-item
+decision, and Review records it needs.
+
 ## Repository semantics
 
 `repository` is the path to the existing source repository. `integration_branch`
@@ -103,10 +117,13 @@ Review uses `scope_max_reviews` (default 3) to check that the change is necessar
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
 safety, regressions, and tests; Whole Review also uses `max_reviews`. After any
-configured Scenario Gate, each eligible integration head receives both the
-cross-Issue Whole-version review and an independent Version / README review, in
-that order. Their findings are aggregated into one fix turn, and a changed head
-repeats both reviews within the bounded loop.
+configured Scenario Gate, each eligible integration head receives the dedicated
+Design Principles review, the cross-Issue Whole-version review, and an
+independent Version / README review, in that order. The Design Principles turn
+reads `docs/design-principles.md` from the exact integration head and checks
+solely for conformance with that authoritative document. Their findings are
+aggregated into one fix turn, and a changed head repeats every review within the
+bounded loop.
 The recommended six/four allocation reserves Scope capacity for required rechecks
 whenever a Correctness fix changes the head. The counters and outcomes are
 independent. A phase that exhausts its limit may continue with an explicit warning

@@ -41,15 +41,31 @@ This standalone project was initially migrated from
 `apps/purplemux-client` in an older LangGraph fork. LangGraph itself is not a
 runtime dependency and none of its workflow framework is included here.
 
-## Principles
+## Design principles
 
-- Python code executed by the local runner remains plain Python.
-- There is no workflow DSL.
-- There are no graph semantics.
-- There is no duplicated workflow state machine.
-- External systems are used through public CLI or API contracts.
-- PurpleMux is an agent runtime.
-- The local runner executes, observes, and stops Python processes.
+The project's canonical design principles are maintained in
+[`docs/design-principles.md`](docs/design-principles.md).
+
+## Representative scenarios
+
+A small, stable set of typical uses and expected behavior is maintained in
+[`docs/representative-scenarios.md`](docs/representative-scenarios.md).
+
+## Human context and durable decisions
+
+Routine human context is deliberately small: read
+[`docs/design-principles.md`](docs/design-principles.md) together with
+[`docs/representative-scenarios.md`](docs/representative-scenarios.md). During
+One-Shot development, add the One-Shot Issue that defines the goal. The curated
+representative-scenario document is not the configurable `scenarios` list;
+that run-specific list is validation input for the Scenario Gate.
+
+For Issue Driven work, the persisted work-item plan and the managed Review
+audit sections on child and Base PRs are the durable GitHub decision record.
+Run output and agent conversation remain useful diagnostics, but are not that
+record. Give each agent only the portion of human context and recorded decisions
+needed for its current role instead of accumulating every available artifact in
+every prompt.
 
 ## Issue Driven mode
 
@@ -274,10 +290,22 @@ defaults to three when omitted; the recommended values are six for Scope Review
 and four for the Correctness and whole-version review limit. The higher
 recommended Scope limit reserves capacity for the required rechecks after
 Correctness fixes change the head. Whole Review first applies any configured
-Scenario Gate, then runs both the integration/cross-Issue Whole-version reviewer
-and the independent Version / README reviewer on every eligible head. Findings
-from both reviewers are aggregated into one fix turn, and any changed head is
-reviewed again in the same order within the bounded whole-review loop.
+Scenario Gate, then runs a dedicated Design Principles reviewer, the
+integration/cross-Issue Whole-version reviewer, and the independent Version /
+README reviewer on every eligible head. The Design Principles turn reads
+`docs/design-principles.md` from the exact integration head and reviews solely
+for conformance with that authoritative document. Findings from the independent
+reviews are aggregated into one fix turn, and any changed head is reviewed again
+in the same order within the bounded whole-review loop.
+Each consequential review round is also recorded in a bounded managed section
+of its child PR or Base PR. The record keeps the role, verdict, concise
+actionable findings, exact reviewed commit, and the later fix disposition. It is
+updated idempotently from a validated bounded JSON response; raw logs and
+secret-like values are rejected before persistence. Byte-aware retention evicts
+only older records superseded by the same role, preserving every role's latest
+record within a reserved portion of the shared PR-body budget. The audit remains
+available to recovery runs and human reviewers independently of PurpleMux run
+history.
 If a Correctness reviewer or fix changes the head,
 the prior Scope outcome is invalidated and the ordered Scope then Correctness
 sequence restarts on the new commit within the separate cumulative limits.
