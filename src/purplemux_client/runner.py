@@ -833,6 +833,7 @@ class PythonRunner:
         self._change_revision = 0
         self._validation_lock = threading.Lock()
         self._runs: dict[int, _RunRecord] = {}
+        self._cleanup_tombstones: dict[int, _RunRecord] = {}
         self._next_run_id = 1
         self._correlation_instance = secrets.token_hex(16)
         self._notifier = notifier
@@ -1041,6 +1042,10 @@ class PythonRunner:
                 "runs": {
                     self._run_identity(run.run_id): self._run_history_json(run)
                     for run in terminal_runs
+                },
+                "cleanupTombstones": {
+                    self._run_identity(run.run_id): self._run_history_json(run)
+                    for run in self._cleanup_tombstones.values()
                 },
             },
             ensure_ascii=True,
@@ -1423,6 +1428,7 @@ class PythonRunner:
             instance_id = payload.get("instanceId")
             next_run_id = payload.get("nextRunId")
             runs = payload.get("runs")
+            cleanup_tombstones = payload.get("cleanupTombstones", {})
             if (
                 not isinstance(instance_id, str)
                 or not re.fullmatch(r"[0-9a-f]{32}", instance_id)
@@ -1430,6 +1436,7 @@ class PythonRunner:
                 or not isinstance(next_run_id, int)
                 or next_run_id < 1
                 or not isinstance(runs, dict)
+                or not isinstance(cleanup_tombstones, dict)
             ):
                 raise ValueError
             self._correlation_instance = instance_id
@@ -1440,13 +1447,23 @@ class PythonRunner:
                 and isinstance(run, dict)
                 and run.get("identity") == identity
             ]
+            restored_tombstones = [
+                self._record_from_run_history(run)
+                for identity, run in cleanup_tombstones.items()
+                if isinstance(identity, str)
+                and isinstance(run, dict)
+                and run.get("identity") == identity
+            ]
+            restored_run_ids = [run.run_id for run in (*restored, *restored_tombstones)]
             if (
-                len({run.run_id for run in restored}) != len(restored)
+                len(set(restored_run_ids)) != len(restored_run_ids)
                 or len(restored) != len(runs)
-                or next_run_id <= max((run.run_id for run in restored), default=0)
+                or len(restored_tombstones) != len(cleanup_tombstones)
+                or next_run_id <= max(restored_run_ids, default=0)
             ):
                 raise ValueError
             self._runs = {run.run_id: run for run in restored}
+            self._cleanup_tombstones = {run.run_id: run for run in restored_tombstones}
             self._next_run_id = next_run_id
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RunHistoryError(
@@ -2180,6 +2197,13 @@ class PythonRunner:
         with self._lock:
             return tuple(self._snapshot_run(run) for run in self._runs.values())
 
+    def cleanup_tombstones(self) -> tuple[RunnerSnapshot, ...]:
+        """Return deleted runs whose owned resources still require cleanup."""
+        with self._lock:
+            return tuple(
+                self._snapshot_run(run) for run in self._cleanup_tombstones.values()
+            )
+
     def validation_snapshot(self) -> RunnerSnapshot:
         with self._lock:
             return self._preview
@@ -2259,7 +2283,7 @@ class PythonRunner:
             return self._snapshot_run(run)
 
     def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
-        """Delete all confirmed checked history without cleaning resources."""
+        """Delete confirmed history while retaining outstanding cleanup ownership."""
         run_ids = tuple(confirmed_run_ids)
         if any(
             isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
@@ -2294,12 +2318,18 @@ class PythonRunner:
                 return ()
 
             previous_runs = self._runs.copy()
+            previous_cleanup_tombstones = self._cleanup_tombstones.copy()
             for run_id in checked_terminal_run_ids:
-                del self._runs[run_id]
+                run = self._runs.pop(run_id)
+                if any(
+                    resource.cleanup_state != "cleaned" for resource in run.resources
+                ):
+                    self._cleanup_tombstones[run_id] = run
             try:
                 self._write_run_history_locked()
             except RunHistoryError:
                 self._runs = previous_runs
+                self._cleanup_tombstones = previous_cleanup_tombstones
                 raise
             self._mark_changed()
             return checked_terminal_run_ids
@@ -2307,6 +2337,15 @@ class PythonRunner:
     def _get_run(self, run_id: int) -> _RunRecord:
         try:
             return self._runs[run_id]
+        except KeyError as exc:
+            raise RunNotFoundError(f"run {run_id} was not found") from exc
+
+    def _get_cleanup_run(self, run_id: int) -> _RunRecord:
+        run = self._runs.get(run_id)
+        if run is not None:
+            return run
+        try:
+            return self._cleanup_tombstones[run_id]
         except KeyError as exc:
             raise RunNotFoundError(f"run {run_id} was not found") from exc
 
@@ -2395,7 +2434,7 @@ class PythonRunner:
         """Explicitly release resources owned by one completed Workflow run."""
         with self._lock:
             self._ensure_open()
-            run = self._get_run(run_id)
+            run = self._get_cleanup_run(run_id)
             cleanup_lock = run.cleanup_lock
             if not cleanup_lock.acquire(blocking=False):
                 raise RunCleanupInProgressError(
@@ -2404,7 +2443,7 @@ class PythonRunner:
         try:
             with self._lock:
                 self._ensure_open()
-                run = self._get_run(run_id)
+                run = self._get_cleanup_run(run_id)
                 if run.prompt is not None:
                     raise RunCleanupNotAllowedError(
                         f"run {run_id} is a Prompt run; Workflow cleanup does not apply"
@@ -2489,8 +2528,20 @@ class PythonRunner:
                         )
                         self._mark_changed()
             with self._lock:
-                self._persist_run_history_locked()
-                return self._snapshot_run(run)
+                snapshot = self._snapshot_run(run)
+                if run_id in self._cleanup_tombstones and all(
+                    resource.cleanup_state == "cleaned" for resource in run.resources
+                ):
+                    del self._cleanup_tombstones[run_id]
+                    try:
+                        self._write_run_history_locked()
+                    except RunHistoryError:
+                        self._cleanup_tombstones[run_id] = run
+                        raise
+                    self._mark_changed()
+                else:
+                    self._persist_run_history_locked()
+                return snapshot
         finally:
             cleanup_lock.release()
 

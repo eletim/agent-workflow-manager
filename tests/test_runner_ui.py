@@ -149,6 +149,7 @@ def test_checked_run_deletion_is_available_inside_run_history() -> None:
         for tag, attributes in ancestors
     )
     assert 'id="delete-checked-runs"' in INDEX.read_text(encoding="utf-8")
+    assert 'id="cleanup-deleted-runs"' in INDEX.read_text(encoding="utf-8")
 
 
 def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:

@@ -428,7 +428,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 {
                     "runs": [
                         run.as_summary_json() for run in self.server.runner.snapshots()
-                    ]
+                    ],
+                    "cleanupTombstones": [
+                        run.as_summary_json()
+                        for run in self.server.runner.cleanup_tombstones()
+                    ],
                 },
             )
             return
@@ -965,6 +969,9 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             except (RunCleanupInProgressError, RunCleanupNotAllowedError) as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            except RunHistoryError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, snapshot.as_json())
             return

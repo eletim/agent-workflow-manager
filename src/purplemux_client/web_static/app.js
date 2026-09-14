@@ -31,6 +31,7 @@ const repositorySlug = document.querySelector("#repository-slug");
 const repositoryLink = document.querySelector("#repository-link");
 const runList = document.querySelector("#run-list");
 const runsEmpty = document.querySelector("#runs-empty");
+const cleanupDeletedRunsButton = document.querySelector("#cleanup-deleted-runs");
 const deleteCheckedRunsButton = document.querySelector("#delete-checked-runs");
 const newRunButton = document.querySelector("#new-run");
 const runButton = document.querySelector("#run");
@@ -158,6 +159,7 @@ let explicitNewRun = false;
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
 let checkedRunIds = [];
+let cleanupTombstoneIds = [];
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
@@ -842,7 +844,7 @@ function renderRecovery(result) {
   }
 }
 
-function renderRunList(runs) {
+function renderRunList(runs, cleanupTombstones = []) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
@@ -852,6 +854,10 @@ function renderRunList(runs) {
   deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;
   deleteCheckedRunsButton.disabled = checkedRunCount === 0;
   deleteCheckedRunsButton.dataset.count = String(checkedRunCount);
+  cleanupTombstoneIds = cleanupTombstones.map((run) => run.runId);
+  cleanupDeletedRunsButton.textContent = `Cleanup deleted runs (${cleanupTombstoneIds.length})`;
+  cleanupDeletedRunsButton.disabled = cleanupTombstoneIds.length === 0;
+  cleanupDeletedRunsButton.dataset.count = String(cleanupTombstoneIds.length);
   for (const run of [...runs].reverse()) {
     const button = document.createElement("button");
     button.type = "button";
@@ -957,6 +963,30 @@ deleteCheckedRunsButton.addEventListener("click", async () => {
   }, () => {
     deleteCheckedRunsButton.disabled = Number(
       deleteCheckedRunsButton.dataset.count || 0,
+    ) === 0;
+  });
+});
+
+cleanupDeletedRunsButton.addEventListener("click", async () => {
+  if (cleanupTombstoneIds.length === 0) return;
+  const runIds = [...cleanupTombstoneIds];
+  await withPendingButton(cleanupDeletedRunsButton, async () => {
+    const incompleteRunIds = [];
+    try {
+      for (const runId of runIds) {
+        const result = await request(`/api/runs/${runId}/cleanup`, {method: "POST"});
+        if (result.resourceCleanupStatus !== "cleaned") incompleteRunIds.push(runId);
+      }
+      if (incompleteRunIds.length > 0) {
+        stderr.textContent = `Cleanup remains incomplete for deleted Run(s): ${incompleteRunIds.join(", ")}`;
+      }
+    } catch (error) {
+      stderr.textContent = String(error);
+    }
+    await refresh();
+  }, () => {
+    cleanupDeletedRunsButton.disabled = Number(
+      cleanupDeletedRunsButton.dataset.count || 0,
     ) === 0;
   });
 });
@@ -1496,7 +1526,7 @@ async function refresh() {
   const requestGeneration = ++refreshRequestGeneration;
   let selectionGeneration = activeRunGeneration;
   try {
-    const {runs} = await request("/api/runs");
+    const {runs, cleanupTombstones = []} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
     if (activeRunId === null && requestedRunIdentity !== null) {
       const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
@@ -1530,7 +1560,7 @@ async function refresh() {
         || requestGeneration <= renderedRefreshGeneration
       ) return;
       showNewRunAfterHistoryDeletion();
-      renderRunList(runs);
+      renderRunList(runs, cleanupTombstones);
       renderFavicon(runs);
       renderedRefreshGeneration = requestGeneration;
       return;
@@ -1544,7 +1574,7 @@ async function refresh() {
       || requestGeneration <= renderedRefreshGeneration
     ) return;
     if (result) renderRun(result);
-    renderRunList(runs);
+    renderRunList(runs, cleanupTombstones);
     renderFavicon(runs);
     renderedRefreshGeneration = requestGeneration;
   } catch (error) {
