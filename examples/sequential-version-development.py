@@ -644,21 +644,22 @@ def decision(result: str) -> str:
 
 
 _SENSITIVE_REVIEW_TEXT = re.compile(
-    r"(?i)(authorization\s*:|bearer\s+|"
-    r"\b[a-z][a-z0-9]*(?:[_-](?:password|passwd|secret|token|api[_-]?key|"
-    r"access[_-]?key))\s*[:=]\s*\S+|"
-    r"\b(?:password|passphrase|secret|token|credential|api[_ -]?key|"
-    r"access[_ -]?key)\b\s*(?:is|was|[:=])\s*\S+|"
+    r"(?i)(\b(?:authorization|bearer|password|passwd|passphrase|credential|"
+    r"secret|token|api[_ -]?key|access[_ -]?key)\b|"
+    r"[_-](?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\b|"
+    r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@[^\s/]+|"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:AKIA|ASIA)[0-9A-Z]{16}|"
     r"AIza[0-9A-Za-z_-]{35}|github_pat_|gh[pousr]_|glpat-|"
     r"xox[baprs]-|sk_(?:live|test)_|sk-[a-z0-9]|"
     r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)"
 )
-_RAW_LOG_LINE = re.compile(
-    r"^(?:\$\s|Traceback \(most recent call last\):|\d{4}-\d\d-\d\d[ T]"
-    r"\d\d:\d\d|[A-Z_][A-Z0-9_]*=\S|FAILED\s+\S+|npm ERR!\s)"
+_RAW_REVIEW_OUTPUT = re.compile(
+    r"(?i)^(?:\$\s|Traceback \(most recent call last\):|\d{4}-\d\d-\d\d[ T]"
+    r"\d\d:\d\d|FAILED(?:\s|:)|ERROR(?:\s|:)|npm ERR!\s|"
+    r"\[(?:DEBUG|ERROR|FATAL|INFO|TRACE|WARN|WARNING)\])"
 )
 _OPAQUE_SECRET_LIKE_VALUE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_./+=-]{32,}")
+_PERSISTENCE_SAFE_REVIEW_TEXT = re.compile(r"^[^\x00-\x1f\x7f<>{}`=]+$")
 
 
 def _safe_review_text(value: object, *, max_bytes: int) -> bool:
@@ -674,7 +675,8 @@ def _safe_review_text(value: object, *, max_bytes: int) -> bool:
         return False
     return (
         len(value.encode()) <= max_bytes
-        and _RAW_LOG_LINE.match(value) is None
+        and _PERSISTENCE_SAFE_REVIEW_TEXT.fullmatch(value) is not None
+        and _RAW_REVIEW_OUTPUT.match(value) is None
         and _SENSITIVE_REVIEW_TEXT.search(value) is None
         and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
     )
@@ -862,6 +864,30 @@ def new_review_audit(
         findings,
         "not_required" if verdict == "APPROVED" else "pending",
     )
+
+
+def allocate_review_audit(
+    body: str, role: str, verdict: str, reviewed_sha: str, result: str
+) -> ReviewAuditRecord:
+    """Allocate a durable role round, reusing only an exact pending review."""
+    assessment = review_assessment(result)
+    records = review_audit_from_body(body)
+    interrupted = [
+        record
+        for record in records
+        if record.role == role
+        and record.verdict == verdict
+        and record.reviewed_sha == reviewed_sha
+        and record.findings == assessment.findings
+        and record.fix_disposition == "pending"
+    ]
+    if interrupted:
+        round_number = max(record.round for record in interrupted)
+    else:
+        round_number = max(
+            (record.round for record in records if record.role == role), default=0
+        ) + 1
+    return new_review_audit(role, round_number, verdict, reviewed_sha, result)
 
 
 def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
@@ -2175,9 +2201,9 @@ def review_issue_phase(
             expected_base_sha=pr.base_sha,
             draft=True,
         )
-        audit = new_review_audit(
+        audit = allocate_review_audit(
+            current.body,
             role,
-            review_number,
             verdict,
             current.head_sha,
             result,
@@ -3480,8 +3506,8 @@ def review_whole_version(
                 iteration=review_number,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
-            scenario_audit = new_review_audit(
-                "scenario_gate", review_number, verdict, pr.head_sha, result
+            scenario_audit = allocate_review_audit(
+                pr.body, "scenario_gate", verdict, pr.head_sha, result
             )
             pr = persist_review_audit(
                 github,
@@ -3563,9 +3589,9 @@ def review_whole_version(
         emit_policy_conflicts(
             principles_result, config, scope="the integrated version"
         )
-        principles_audit = new_review_audit(
+        principles_audit = allocate_review_audit(
+            pr.body,
             "design_principles",
-            review_number,
             principles_verdict,
             pr.head_sha,
             principles_result,
@@ -3641,8 +3667,8 @@ def review_whole_version(
             )
             review_results.append(result)
             changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
-            whole_audit = new_review_audit(
-                "whole_version", review_number, verdict, pr.head_sha, result
+            whole_audit = allocate_review_audit(
+                pr.body, "whole_version", verdict, pr.head_sha, result
             )
             pr = persist_review_audit(
                 github,
@@ -3715,9 +3741,9 @@ def review_whole_version(
         review_results.append(version_result)
         changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
         emit_policy_conflicts(version_result, config, scope="the integrated version")
-        version_audit = new_review_audit(
+        version_audit = allocate_review_audit(
+            pr.body,
             "version_readme",
-            review_number,
             version_verdict,
             pr.head_sha,
             version_result,
