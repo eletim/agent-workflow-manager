@@ -11,10 +11,13 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 from typing import IO, Any, cast
 
 from purplemux_client.errors import WorkerFailure
+
+_CLIENT_VERSION = distribution_version("purplemux-client")
 
 
 def ensure_codex_project_trust(
@@ -75,7 +78,7 @@ def _write_and_verify_trust(canonical: Path, executable: str, deadline: float) -
                         "clientInfo": {
                             "name": "agent-workflow-manager",
                             "title": "Agent Workflow Manager",
-                            "version": "0.1.0",
+                            "version": _CLIENT_VERSION,
                         }
                     },
                 },

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import purplemux_client.runner as runner_module
 from purplemux_client import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
@@ -20,6 +21,7 @@ from purplemux_client import (
     WorkspaceState,
 )
 from purplemux_client.correlation import RUN_IDENTITY_ENV
+from purplemux_client.runner import PythonRunner
 
 
 class RuntimeRunner:
@@ -59,11 +61,18 @@ class RuntimeRunner:
                 "directories": [command[command.index("--cwd") + 1]],
             }
             self.workspaces["ws-new"] = workspace
+            self.tabs["tab-initial"] = {
+                "tabId": "tab-initial",
+                "workspaceId": "ws-new",
+                "name": "",
+                "panelType": None,
+                "agentProviderId": None,
+            }
             if self.mode == "workspace-timeout-after-apply":
                 raise subprocess.TimeoutExpired(command, timeout)
             if self.mode == "workspace-nonzero-after-apply":
                 return self.failed("workspace create failed after apply")
-            return self.done(workspace)
+            return self.done({**workspace, "initialTab": self.tabs["tab-initial"]})
         if command[1:3] == ["workspace", "delete"]:
             workspace_id = command[command.index("-w") + 1]
             if self.mode == "workspace-delete-concurrent-tab":
@@ -557,7 +566,9 @@ def test_postcondition_read_failure_after_close_is_unknown_and_not_retried() -> 
     assert len([call for call in runner.calls if call[1:3] == ["tab", "close"]]) == 1
 
 
-def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) -> None:
+def test_workspace_creation_lost_response_retains_unresolved_initial_tab(
+    tmp_path: Path,
+) -> None:
     runner = RuntimeRunner("workspace-timeout-after-apply")
     runtime = PurpleMuxRuntime(runner=runner)
     result = runtime.create_workspace(
@@ -565,10 +576,179 @@ def test_workspace_creation_is_correlated_after_lost_response(tmp_path: Path) ->
     )
 
     assert result.id == "ws-new"
+    assert result.initial_tab is None
+    assert result.initial_tab_discovery_pending
     assert (
         len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
         == 1
     )
+
+
+def test_owned_workspace_registers_initial_tab_in_one_atomic_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = RuntimeRunner()
+    registered: list[tuple[str, str, dict[str, str]]] = []
+
+    def register(kind: str, identity: str, metadata: dict[str, str]) -> None:
+        registered.append((kind, identity, dict(metadata)))
+        if len(registered) > 1:
+            raise WorkerFailure("second resource delivery was interrupted")
+
+    monkeypatch.setattr(
+        "purplemux_client.client.register_run_resource",
+        register,
+    )
+
+    PurpleMuxRuntime(runner=runner, owned_by_run=True).create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+
+    assert [(kind, identity) for kind, identity, _metadata in registered] == [
+        ("purplemux_workspace", "ws-new")
+    ]
+    assert registered[0][2] == {
+        "name": "Version work [awm:corr-1]",
+        "directories": str(tmp_path),
+        "correlation_id": "corr-1",
+        "initial_tab_id": "tab-initial",
+        "initial_tab_name": "",
+        "initial_tab_panel_type": "",
+        "initial_tab_provider": "",
+    }
+
+
+def test_lost_create_response_does_not_claim_replacement_tab_during_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    topology = RuntimeRunner("workspace-timeout-after-apply")
+    registered: list[tuple[str, str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        "purplemux_client.client.register_run_resource",
+        lambda kind, identity, metadata: registered.append(
+            (kind, identity, dict(metadata))
+        ),
+    )
+    workspace = PurpleMuxRuntime(runner=topology, owned_by_run=True).create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+
+    assert workspace.initial_tab is None
+    assert workspace.initial_tab_discovery_pending
+    assert [(kind, identity) for kind, identity, _metadata in registered] == [
+        ("purplemux_workspace", "ws-new"),
+    ]
+    assert registered[0][2]["initial_tab_discovery"] == "pending"
+
+    history = tmp_path / "run-history.json"
+    workflow = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = workflow.start(
+            f"""from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-new", {{
+    "name": {workspace.name!r}, "directories": {str(tmp_path)!r},
+    "initial_tab_discovery": "pending"
+}})
+"""
+        )
+        deadline = time.monotonic() + 3
+        while workflow.snapshot(run_id).state == "running":
+            if time.monotonic() >= deadline:
+                raise AssertionError("resource registration workflow did not finish")
+            time.sleep(0.01)
+    finally:
+        workflow.close()
+
+    topology.tabs.pop("tab-initial")
+    topology.tabs["tab-replacement"] = {
+        "tabId": "tab-replacement",
+        "workspaceId": "ws-new",
+        "name": "",
+        "panelType": None,
+        "agentProviderId": None,
+    }
+    monkeypatch.setattr(
+        runner_module,
+        "PurpleMuxRuntime",
+        lambda: PurpleMuxRuntime(runner=topology),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PurpleMuxCLIClient",
+        lambda workspace_id: PurpleMuxCLIClient(workspace_id, runner=topology),
+    )
+    recovered = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        cleaned = recovered.cleanup(run_id)
+    finally:
+        recovered.close()
+
+    assert tuple(topology.tabs) == ("tab-replacement",)
+    assert tuple(topology.workspaces) == ("ws-new",)
+    assert [
+        (resource.kind, resource.identity, resource.cleanup_state)
+        for resource in cleaned.resources
+    ] == [
+        ("purplemux_workspace", "ws-new", "retained"),
+        ("purplemux_initial_tab", "ws-new", "cleanup_retryable"),
+    ]
+    assert "refusing shape-based cleanup" in (cleaned.resources[1].cleanup_error or "")
+
+
+@pytest.mark.parametrize("authoritative_state", ["workspace-absent", "workspace-empty"])
+def test_lost_create_response_reconciles_authoritative_initial_tab_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authoritative_state: str,
+) -> None:
+    topology = RuntimeRunner("workspace-timeout-after-apply")
+    workspace = PurpleMuxRuntime(runner=topology).create_workspace(
+        CreateWorkspaceRequest(str(tmp_path), "Version work", "corr-1")
+    )
+    history = tmp_path / "run-history.json"
+    workflow = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = workflow.start(
+            f"""from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-new", {{
+    "name": {workspace.name!r}, "directories": {str(tmp_path)!r},
+    "initial_tab_discovery": "pending"
+}})
+"""
+        )
+        deadline = time.monotonic() + 3
+        while workflow.snapshot(run_id).state == "running":
+            if time.monotonic() >= deadline:
+                raise AssertionError("resource registration workflow did not finish")
+            time.sleep(0.01)
+    finally:
+        workflow.close()
+
+    topology.tabs.pop("tab-initial")
+    if authoritative_state == "workspace-absent":
+        topology.workspaces.pop("ws-new")
+    monkeypatch.setattr(
+        runner_module,
+        "PurpleMuxRuntime",
+        lambda: PurpleMuxRuntime(runner=topology),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "PurpleMuxCLIClient",
+        lambda workspace_id: PurpleMuxCLIClient(workspace_id, runner=topology),
+    )
+    recovered = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        cleaned = recovered.cleanup(run_id)
+    finally:
+        recovered.close()
+
+    assert topology.tabs == {}
+    assert topology.workspaces == {}
+    assert [resource.cleanup_state for resource in cleaned.resources] == [
+        "cleaned",
+        "cleaned",
+    ]
 
 
 def test_new_run_does_not_collide_with_retained_logical_workspace(

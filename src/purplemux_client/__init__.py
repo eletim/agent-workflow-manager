@@ -46,6 +46,9 @@ from purplemux_client.issue_driven import (
     inspect_issue_driven_topology,
     inspect_issue_driven_work_item_topology,
     parse_issue_driven_json,
+    reconcile_inline_task_pr_body,
+    recover_issue_driven_work_item_topology,
+    require_inline_task_pr_fingerprint,
 )
 from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
@@ -109,6 +112,9 @@ __all__ = [
     "inspect_run_repository",
     "inspect_issue_driven_topology",
     "inspect_issue_driven_work_item_topology",
+    "recover_issue_driven_work_item_topology",
+    "reconcile_inline_task_pr_body",
+    "require_inline_task_pr_fingerprint",
     "generate_issue_driven_workflow",
     "parse_issue_driven_json",
     "prepare_run_repository",

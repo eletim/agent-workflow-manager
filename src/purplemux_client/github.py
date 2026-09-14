@@ -609,6 +609,7 @@ class GitHubRepository:
         expected_head_sha: str,
         expected_base: str,
         expected_base_sha: str,
+        draft: bool | None = None,
     ) -> PullRequestState:
         """Update only an exact open PR body while preserving its review state."""
         if "\0" in body:
@@ -620,6 +621,7 @@ class GitHubRepository:
             state="OPEN",
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
+            draft=draft,
         )
         self._require_no_deferred_merge(current)
         if current.body == body:

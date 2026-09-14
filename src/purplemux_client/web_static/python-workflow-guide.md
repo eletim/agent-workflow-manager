@@ -106,6 +106,26 @@ When a generated workflow accepts a work item at runtime, it calls
 before persisting its dispatch. This applies the same authoritative remote branch,
 OPEN/MERGED/CLOSED PR, SHA-containment, and inline-fingerprint checks that the
 static batch uses outside that deliberate seed-fingerprint deferral.
+For inline tasks, persisted `WorkItemPlan` state supplies the authoritative
+fingerprint and exact remote Git/GitHub topology supplies the branch, PR
+head/base, SHA-containment, and integration identity. Neither authority can
+substitute for the other. The generated workflow applies that boundary on fresh
+runs, **Review & Resume**, and recovery from a timed-out marker update.
+
+On Resume, the workflow calls `recover_issue_driven_work_item_topology` only for
+an inline item whose dispatch identity was restored from the persisted plan.
+After all topology checks succeed, the helper may restore a missing or malformed
+fingerprint on the exact open Draft PR. After a fresh implementation, the
+workflow uses the same plan-owned identity and guarded reconciliation to adopt a
+Draft PR created by the CodingAgent, or creates the PR with the marker itself if
+none exists. Subsequent PR metadata updates use
+`reconcile_inline_task_pr_body()` and `require_inline_task_pr_fingerprint()` as
+the same strict reconciliation and validation boundary. CodingAgent prompts
+prohibit marker changes: only AWM creates or repairs the fingerprint marker. If
+the guarded PR-body update times out, AWM
+re-reads the exact PR and accepts only the intended body as the authoritative
+postcondition; an unresolved outcome fails closed. A different valid fingerprint
+and ambiguous markers always fail closed instead of being overwritten.
 
 The helper resolves the source repository and exact current remote base SHA,
 creates and verifies a fresh detached run worktree under the AWM-owned data
@@ -230,7 +250,9 @@ from purplemux_client import (
     emit_issue_driven_repositories,
     inspect_run_repository,
     prepare_run_repository,
+    reconcile_inline_task_pr_body,
     register_run_resource,
+    require_inline_task_pr_fingerprint,
     run_correlation,
 )
 ```
@@ -251,7 +273,13 @@ CreateWorkspaceRequest(cwd, name, correlation_id=None)
 CreateSessionRequest(worker, cwd, command, metadata={}, name=None, correlation_id=None)
 ShellCommandRequest(command, cwd, name, correlation_id=None)
 
-WorkspaceState(id, name, directories)
+WorkspaceState(
+    id,
+    name,
+    directories,
+    initial_tab=None,
+    initial_tab_discovery_pending=False,
+)
 TabState(id, workspace_id, name, panel_type, provider, alive=None, cli_state=None)
 ShellResult(
     exit_code,
@@ -562,7 +590,7 @@ github.set_draft(
 ) -> PullRequestState
 github.update_pr_body(
     pr, *, body, expected_head, expected_head_sha, expected_base,
-    expected_base_sha
+    expected_base_sha, draft=None
 ) -> PullRequestState
 github.merge_pr(
     pr, *, expected_head, expected_head_sha, expected_base, expected_base_sha,
@@ -621,6 +649,12 @@ runtime.create_workspace(request) -> WorkspaceState
 runtime.workspace(workspace_id) -> PurpleMuxCLIClient
 runtime.delete_workspace(workspace_id, *, expected_state) -> None
 ```
+
+The required public PurpleMux workspace-create response includes `initialTab`
+with the new tab's full structured identity. AWM persists that identity in the
+same workspace ownership event so interruption cannot split their registration.
+A lost or invalid mutation response cannot be repaired from a later tab listing
+because current shape is not historical ownership evidence.
 
 Explicit deletion is an identity-checked, empty-workspace-only cleanup primitive.
 Normal Workflow code must leave owned resources for the Runner's manual Cleanup
@@ -690,6 +724,14 @@ correlates a fresh PurpleMux completion and structured result with that turn.
 `read_result` returns the structured provider result text and rejects stale,
 interrupted, unavailable, or not-ready results.
 
+The turn timeout is a warning threshold when the authoritative `cliState` is
+still `busy`: the client emits a structured warning and keeps monitoring until
+the session leaves `busy`. It then allows up to 30 seconds for a fresh correlated
+result to be published before failing on missing or stale data. A return to
+`busy` cancels that grace window, and the next transition out starts a new one.
+Pass `on_busy_timeout` when the workflow also needs to retain the warning in its
+own summary or human handoff data.
+
 `capture_screen` is diagnostic pane text only. It may be printed or retained for
 failure inspection, but never parse it to decide completion, approval, or the
 agent result.
@@ -732,10 +774,16 @@ and commits change both after a detached worktree is created.
 Do not automatically close a Workflow run's tabs on success or failure. The
 Runner retains the structured inventory on the run record and exposes one manual
 Cleanup action after execution ends. Cleanup verifies identities, closes child
-tabs in reverse deterministic order, removes managed-shell result directories,
-deletes an identity-verified empty workspace through PurpleMux's public atomic
-`workspace delete -w ID --if-empty` contract, and then handles the Git worktree.
-Startup rejects PurpleMux versions without that contract. Only its structured
+tabs in reverse deterministic order (including the separately tracked canonical
+initial/default tab of a newly created run-owned workspace). A failed initial
+tab identity is retained as an unresolved cleanup checkpoint; Cleanup never
+converts a later shape-only observation into ownership evidence. It clears that
+checkpoint only when authoritative state proves the workspace absent or the
+identity-verified workspace empty. Cleanup then removes managed-shell result
+directories and deletes an identity-verified empty workspace through PurpleMux's
+public atomic `workspace delete -w ID --if-empty` contract before handling the
+Git worktree.
+Startup rejects PurpleMux versions without both contracts. Only its structured
 `not-empty` response proves rejection; transport errors and other nonzero exits
 remain uncertain until authoritative workspace listing reconciles them.
 Managed-shell directories are registered with their no-follow filesystem

@@ -102,7 +102,11 @@ Each implementation work item is reviewed in two ordered phases. Scope / Design
 Review uses `scope_max_reviews` (default 3) to check that the change is necessary,
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
-safety, regressions, and tests; Whole-version Review also uses `max_reviews`.
+safety, regressions, and tests; Whole Review also uses `max_reviews`. After any
+configured Scenario Gate, each eligible integration head receives both the
+cross-Issue Whole-version review and an independent Version / README review, in
+that order. Their findings are aggregated into one fix turn, and a changed head
+repeats both reviews within the bounded loop.
 The recommended six/four allocation reserves Scope capacity for required rechecks
 whenever a Correctness fix changes the head. The counters and outcomes are
 independent. A phase that exhausts its limit may continue with an explicit warning
@@ -243,10 +247,22 @@ or revised mini task receives the same authoritative remote branch, PR-state,
 SHA-containment, and fingerprint checks before its dispatch is persisted.
 
 The generated Python embeds the mini-task instruction and uses the deterministic
-branch `feature/work-item-refresh-run-help`. Its recovery declaration and Draft
-PR record the SHA-256 fingerprint of the authoritative task text, and recovery
-fails if the PR fingerprint is missing or different. Implementers and both review
-phases receive that embedded instruction instead of running `gh issue view`.
+branch `feature/work-item-refresh-run-help`. Across a fresh run, **Review &
+Resume**, and recovery from a timed-out marker update, the persisted
+`WorkItemPlan` supplies the authoritative task fingerprint while exact remote
+branch, PR head/base, SHA-containment, and integration topology identify the PR
+that may carry it. Neither source is sufficient by itself.
+
+Only AWM creates or repairs the fingerprint marker. Implementer prompts prohibit
+the CodingAgent from editing it. On a fresh run, AWM creates a new Draft PR with
+the plan-owned marker or may adopt an exact Draft PR and repair its missing or
+malformed marker after all topology checks succeed. During **Review & Resume**,
+it applies the same repair only to a dispatched task restored from the persisted
+plan. If the guarded PR-body update times out, AWM re-reads the exact PR and
+accepts only the intended body as the authoritative postcondition; an unresolved
+outcome fails closed. A different valid fingerprint and ambiguous markers always
+fail closed instead of being overwritten. Implementers and both review phases
+receive the embedded instruction instead of running `gh issue view`.
 GitHub Issue work items continue to use `feature/issue-N` and read Issue `N` with
 `gh`. Both forms use the same recovery, Draft PR, review, and delivery functions.
 

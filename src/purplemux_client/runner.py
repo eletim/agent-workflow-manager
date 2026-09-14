@@ -364,6 +364,19 @@ class RunResource:
         return result
 
 
+@dataclass(frozen=True)
+class CleanupOwnershipSnapshot:
+    run_id: int
+    resources: tuple[RunResource, ...]
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "runId": self.run_id,
+            "resources": [resource.as_json() for resource in self.resources],
+            "resourceCleanupStatus": _resource_cleanup_status(self.resources),
+        }
+
+
 def _is_verified_repository_context(resource: RunResource) -> bool:
     required = {
         "repository",
@@ -799,6 +812,13 @@ class _RunRecord:
     resumed_from_run_id: int | None = None
 
 
+@dataclass
+class _CleanupOwnership:
+    run_id: int
+    resources: list[RunResource]
+    cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
 class PythonRunner:
     """Run and observe trusted local Python programs independently."""
 
@@ -833,6 +853,7 @@ class PythonRunner:
         self._change_revision = 0
         self._validation_lock = threading.Lock()
         self._runs: dict[int, _RunRecord] = {}
+        self._cleanup_ownership: dict[int, _CleanupOwnership] = {}
         self._next_run_id = 1
         self._correlation_instance = secrets.token_hex(16)
         self._notifier = notifier
@@ -1041,6 +1062,15 @@ class PythonRunner:
                 "runs": {
                     self._run_identity(run.run_id): self._run_history_json(run)
                     for run in terminal_runs
+                },
+                "cleanupOwnership": {
+                    self._run_identity(ownership.run_id): {
+                        "runId": ownership.run_id,
+                        "resources": [
+                            asdict(resource) for resource in ownership.resources
+                        ],
+                    }
+                    for ownership in self._cleanup_ownership.values()
                 },
             },
             ensure_ascii=True,
@@ -1408,6 +1438,58 @@ class PythonRunner:
             resumed_from_run_id=resumed_from_run_id,
         )
 
+    def _cleanup_ownership_from_history(self, value: object) -> _CleanupOwnership:
+        if not isinstance(value, dict) or set(value) != {"runId", "resources"}:
+            raise ValueError
+        run_id = value.get("runId")
+        resource_values = value.get("resources")
+        if (
+            isinstance(run_id, bool)
+            or not isinstance(run_id, int)
+            or run_id < 1
+            or not isinstance(resource_values, list)
+            or not resource_values
+        ):
+            raise ValueError
+        resources = [
+            self._history_dataclass(RunResource, resource)
+            for resource in resource_values
+        ]
+        if any(
+            not isinstance(resource.kind, str)
+            or not isinstance(resource.identity, str)
+            or not isinstance(resource.metadata, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(item, str)
+                for key, item in resource.metadata.items()
+            )
+            or resource.cleanup_state
+            not in (
+                "retained",
+                "cleanup_pending",
+                "cleanup_retryable",
+                "blocked",
+                "cleaned",
+            )
+            or (
+                resource.cleanup_error is not None
+                and not isinstance(resource.cleanup_error, str)
+            )
+            or (
+                resource.repository_index is not None
+                and (
+                    isinstance(resource.repository_index, bool)
+                    or not isinstance(resource.repository_index, int)
+                    or resource.repository_index < 1
+                )
+            )
+            for resource in resources
+        ):
+            raise ValueError
+        if all(resource.cleanup_state == "cleaned" for resource in resources):
+            raise ValueError
+        return _CleanupOwnership(run_id=run_id, resources=resources)
+
     def _load_run_history(self) -> None:
         path = self._run_history_file
         if path is None:
@@ -1423,6 +1505,7 @@ class PythonRunner:
             instance_id = payload.get("instanceId")
             next_run_id = payload.get("nextRunId")
             runs = payload.get("runs")
+            cleanup_ownership = payload.get("cleanupOwnership", {})
             if (
                 not isinstance(instance_id, str)
                 or not re.fullmatch(r"[0-9a-f]{32}", instance_id)
@@ -1430,6 +1513,7 @@ class PythonRunner:
                 or not isinstance(next_run_id, int)
                 or next_run_id < 1
                 or not isinstance(runs, dict)
+                or not isinstance(cleanup_ownership, dict)
             ):
                 raise ValueError
             self._correlation_instance = instance_id
@@ -1440,13 +1524,28 @@ class PythonRunner:
                 and isinstance(run, dict)
                 and run.get("identity") == identity
             ]
+            restored_ownership = [
+                self._cleanup_ownership_from_history(ownership)
+                for identity, ownership in cleanup_ownership.items()
+                if isinstance(identity, str)
+                and isinstance(ownership, dict)
+                and isinstance(ownership.get("runId"), int)
+                and identity == self._run_identity(ownership["runId"])
+            ]
+            restored_run_ids = [run.run_id for run in restored] + [
+                ownership.run_id for ownership in restored_ownership
+            ]
             if (
-                len({run.run_id for run in restored}) != len(restored)
+                len(set(restored_run_ids)) != len(restored_run_ids)
                 or len(restored) != len(runs)
-                or next_run_id <= max((run.run_id for run in restored), default=0)
+                or len(restored_ownership) != len(cleanup_ownership)
+                or next_run_id <= max(restored_run_ids, default=0)
             ):
                 raise ValueError
             self._runs = {run.run_id: run for run in restored}
+            self._cleanup_ownership = {
+                ownership.run_id: ownership for ownership in restored_ownership
+            }
             self._next_run_id = next_run_id
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RunHistoryError(
@@ -2005,16 +2104,28 @@ class PythonRunner:
     def _register_managed_workspace(
         self, run: _RunRecord, workspace: WorkspaceState, correlation: str
     ) -> None:
+        workspace_metadata = {
+            "name": workspace.name,
+            "directories": "\n".join(workspace.directories),
+            "correlation_id": correlation,
+        }
+        if workspace.initial_tab_discovery_pending:
+            workspace_metadata["initial_tab_discovery"] = "pending"
+        elif workspace.initial_tab is not None:
+            workspace_metadata.update(
+                {
+                    "initial_tab_id": workspace.initial_tab.id,
+                    "initial_tab_name": workspace.initial_tab.name,
+                    "initial_tab_panel_type": workspace.initial_tab.panel_type or "",
+                    "initial_tab_provider": workspace.initial_tab.provider or "",
+                }
+            )
         self._register_resource(
             run,
             RunResource(
                 "purplemux_workspace",
                 workspace.id,
-                {
-                    "name": workspace.name,
-                    "directories": "\n".join(workspace.directories),
-                    "correlation_id": correlation,
-                },
+                workspace_metadata,
             ),
         )
 
@@ -2168,6 +2279,14 @@ class PythonRunner:
         with self._lock:
             return tuple(self._snapshot_run(run) for run in self._runs.values())
 
+    def cleanup_ownership_snapshots(self) -> tuple[CleanupOwnershipSnapshot, ...]:
+        """Return resources retained after their run history was deleted."""
+        with self._lock:
+            return tuple(
+                CleanupOwnershipSnapshot(ownership.run_id, tuple(ownership.resources))
+                for ownership in self._cleanup_ownership.values()
+            )
+
     def validation_snapshot(self) -> RunnerSnapshot:
         with self._lock:
             return self._preview
@@ -2247,56 +2366,74 @@ class PythonRunner:
             return self._snapshot_run(run)
 
     def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
-        """Delete only checked terminal-run records whose resources are cleaned."""
+        """Delete confirmed history while retaining outstanding cleanup ownership."""
         run_ids = tuple(confirmed_run_ids)
         if any(
             isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
             for run_id in run_ids
         ) or len(set(run_ids)) != len(run_ids):
             raise ValueError("run IDs must be unique positive integers")
+        confirmed_run_id_set = set(run_ids)
         with self._lock:
             checked_terminal_run_ids = tuple(
                 run.run_id
                 for run in self._runs.values()
                 if run.checked and run.state in ("success", "failed", "stopped")
             )
+            if confirmed_run_id_set != set(checked_terminal_run_ids):
+                raise RunDeletionNotAllowedError(
+                    "checked terminal runs changed; refresh and confirm deletion again"
+                )
             cleaning_run_ids = tuple(
-                run_id
-                for run_id in checked_terminal_run_ids
-                if self._runs[run_id].cleanup_lock.locked()
+                run.run_id
+                for run in self._runs.values()
+                if run.run_id in confirmed_run_id_set
+                and run.checked
+                and run.state in ("success", "failed", "stopped")
+                and run.cleanup_lock.locked()
             )
             if cleaning_run_ids:
                 raise RunDeletionNotAllowedError(
                     "cleanup is active for confirmed run(s): "
                     + ", ".join(str(run_id) for run_id in cleaning_run_ids)
                 )
-            eligible_run_ids = tuple(
-                run_id
-                for run_id in checked_terminal_run_ids
-                if _resource_cleanup_status(self._runs[run_id].resources) == "cleaned"
-            )
-            if set(run_ids) != set(eligible_run_ids):
-                raise RunDeletionNotAllowedError(
-                    "checked, fully cleaned terminal runs changed; "
-                    "refresh and confirm deletion again"
-                )
-            if not eligible_run_ids:
+            if not checked_terminal_run_ids:
                 return ()
 
             previous_runs = self._runs.copy()
-            for run_id in eligible_run_ids:
-                del self._runs[run_id]
+            previous_cleanup_ownership = self._cleanup_ownership.copy()
+            for run_id in checked_terminal_run_ids:
+                run = self._runs.pop(run_id)
+                outstanding_resources = [
+                    resource
+                    for resource in run.resources
+                    if resource.cleanup_state != "cleaned"
+                ]
+                if outstanding_resources:
+                    self._cleanup_ownership[run_id] = _CleanupOwnership(
+                        run_id, outstanding_resources
+                    )
             try:
                 self._write_run_history_locked()
             except RunHistoryError:
                 self._runs = previous_runs
+                self._cleanup_ownership = previous_cleanup_ownership
                 raise
             self._mark_changed()
-            return eligible_run_ids
+            return checked_terminal_run_ids
 
     def _get_run(self, run_id: int) -> _RunRecord:
         try:
             return self._runs[run_id]
+        except KeyError as exc:
+            raise RunNotFoundError(f"run {run_id} was not found") from exc
+
+    def _get_cleanup_run(self, run_id: int) -> _RunRecord | _CleanupOwnership:
+        run = self._runs.get(run_id)
+        if run is not None:
+            return run
+        try:
+            return self._cleanup_ownership[run_id]
         except KeyError as exc:
             raise RunNotFoundError(f"run {run_id} was not found") from exc
 
@@ -2381,11 +2518,11 @@ class PythonRunner:
         self._terminate_process_group(run)
         return True
 
-    def cleanup(self, run_id: int) -> RunnerSnapshot:
+    def cleanup(self, run_id: int) -> RunnerSnapshot | CleanupOwnershipSnapshot:
         """Explicitly release resources owned by one completed Workflow run."""
         with self._lock:
             self._ensure_open()
-            run = self._get_run(run_id)
+            run = self._get_cleanup_run(run_id)
             cleanup_lock = run.cleanup_lock
             if not cleanup_lock.acquire(blocking=False):
                 raise RunCleanupInProgressError(
@@ -2394,15 +2531,18 @@ class PythonRunner:
         try:
             with self._lock:
                 self._ensure_open()
-                run = self._get_run(run_id)
-                if run.prompt is not None:
-                    raise RunCleanupNotAllowedError(
-                        f"run {run_id} is a Prompt run; Workflow cleanup does not apply"
-                    )
-                if run.state in ("idle", "running", "validation_failed"):
-                    raise RunCleanupNotAllowedError(
-                        f"run {run_id} is {run.state}; cleanup requires a non-running run"
-                    )
+                run = self._get_cleanup_run(run_id)
+                if isinstance(run, _RunRecord):
+                    if run.prompt is not None:
+                        raise RunCleanupNotAllowedError(
+                            f"run {run_id} is a Prompt run; "
+                            "Workflow cleanup does not apply"
+                        )
+                    if run.state in ("idle", "running", "validation_failed"):
+                        raise RunCleanupNotAllowedError(
+                            f"run {run_id} is {run.state}; "
+                            "cleanup requires a non-running run"
+                        )
                 ordered = sorted(
                     enumerate(run.resources),
                     key=lambda item: (
@@ -2479,8 +2619,23 @@ class PythonRunner:
                         )
                         self._mark_changed()
             with self._lock:
-                self._persist_run_history_locked()
-                return self._snapshot_run(run)
+                if isinstance(run, _RunRecord):
+                    self._persist_run_history_locked()
+                    return self._snapshot_run(run)
+                snapshot = CleanupOwnershipSnapshot(run_id, tuple(run.resources))
+                if all(
+                    resource.cleanup_state == "cleaned" for resource in run.resources
+                ):
+                    del self._cleanup_ownership[run_id]
+                    try:
+                        self._write_run_history_locked()
+                    except RunHistoryError:
+                        self._cleanup_ownership[run_id] = run
+                        raise
+                    self._mark_changed()
+                else:
+                    self._persist_run_history_locked()
+                return snapshot
         finally:
             cleanup_lock.release()
 
@@ -2488,12 +2643,20 @@ class PythonRunner:
     def _resource_cleanup_priority(resource: RunResource) -> int:
         return {
             "purplemux_tab": 0,
-            "managed_shell_result": 1,
-            "purplemux_workspace": 2,
-            "git_worktree": 3,
-        }.get(resource.kind, 3)
+            "purplemux_initial_tab": 1,
+            "managed_shell_result": 2,
+            "purplemux_workspace": 3,
+            "git_worktree": 4,
+        }.get(resource.kind, 4)
 
     def _cleanup_resource(self, resource: RunResource) -> None:
+        if resource.kind == "purplemux_initial_tab":
+            if self._unresolved_initial_tab_is_absent(resource):
+                return
+            raise OSError(
+                "PurpleMux initial tab identity was not returned by workspace creation; "
+                "refusing shape-based cleanup"
+            )
         if resource.kind == "purplemux_tab":
             workspace_id = resource.metadata.get("workspace_id")
             if not workspace_id:
@@ -2558,6 +2721,8 @@ class PythonRunner:
 
     @staticmethod
     def _resource_is_absent(resource: RunResource) -> bool:
+        if resource.kind == "purplemux_initial_tab":
+            return PythonRunner._unresolved_initial_tab_is_absent(resource)
         if resource.kind == "purplemux_tab":
             workspace_id = resource.metadata.get("workspace_id")
             if not workspace_id:
@@ -2595,6 +2760,34 @@ class PythonRunner:
             )
             return not registered and not os.path.lexists(resource.identity)
         raise OSError(f"unsupported run resource kind: {resource.kind}")
+
+    @staticmethod
+    def _unresolved_initial_tab_is_absent(resource: RunResource) -> bool:
+        workspace_id = resource.metadata.get("workspace_id")
+        if not workspace_id or workspace_id != resource.identity:
+            raise OSError("PurpleMux initial tab checkpoint lacks workspace identity")
+        selected = next(
+            (
+                workspace
+                for workspace in PurpleMuxRuntime().list_workspaces()
+                if workspace.id == workspace_id
+            ),
+            None,
+        )
+        if selected is None:
+            return True
+        if selected.name != resource.metadata.get("workspace_name"):
+            raise OSError(
+                "PurpleMux workspace name changed before initial tab reconciliation"
+            )
+        expected_directories = resource.metadata.get("workspace_directories")
+        if expected_directories is None or selected.directories != tuple(
+            expected_directories.splitlines()
+        ):
+            raise OSError(
+                "PurpleMux workspace directories changed before initial tab reconciliation"
+            )
+        return not PurpleMuxCLIClient(workspace_id).list_sessions()
 
     @staticmethod
     def _cleanup_managed_shell_result(resource: RunResource) -> None:
@@ -3541,6 +3734,36 @@ class PythonRunner:
                     )
                 return
         run.resources.append(resource)
+        if resource.kind != "purplemux_workspace":
+            return
+        if resource.metadata.get("initial_tab_discovery") == "pending":
+            initial_resource = RunResource(
+                "purplemux_initial_tab",
+                resource.identity,
+                {
+                    "workspace_id": resource.identity,
+                    "workspace_name": resource.metadata.get("name", ""),
+                    "workspace_directories": resource.metadata.get("directories", ""),
+                },
+                repository_index=resource.repository_index,
+            )
+        else:
+            initial_tab_id = resource.metadata.get("initial_tab_id")
+            if not initial_tab_id:
+                return
+            initial_resource = RunResource(
+                "purplemux_tab",
+                initial_tab_id,
+                {
+                    "workspace_id": resource.identity,
+                    "name": resource.metadata.get("initial_tab_name", ""),
+                    "panel_type": resource.metadata.get("initial_tab_panel_type", ""),
+                    "provider": resource.metadata.get("initial_tab_provider", ""),
+                    "origin": "workspace_initial",
+                },
+                repository_index=resource.repository_index,
+            )
+        run.resources.append(initial_resource)
 
     @classmethod
     def _with_resource_repository(
@@ -3571,7 +3794,7 @@ class PythonRunner:
             )
             if parent is not None:
                 return parent.repository_index
-        elif resource.kind == "purplemux_tab":
+        elif resource.kind in ("purplemux_tab", "purplemux_initial_tab"):
             workspace_id = resource.metadata.get("workspace_id")
             parent = next(
                 (

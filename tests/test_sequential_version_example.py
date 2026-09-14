@@ -119,6 +119,75 @@ def test_outline_step_logs_terminal_progress_without_replacing_events(
     ]
 
 
+def test_run_turn_retains_busy_timeout_warning_for_summary_and_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_turn"].__globals__
+    findings: list[tuple[str, str, str]] = []
+
+    class Client:
+        workspace_id = "ws-1"
+
+        def wait_until_ready(self, tab: str, timeout: int) -> None:
+            assert (tab, timeout) == ("tab-1", globals_["READY_TIMEOUT"])
+
+        def send_input(self, tab: str, prompt: str) -> None:
+            assert (tab, prompt) == ("tab-1", "work")
+
+        def wait_for_turn_completion(
+            self, tab: str, timeout: int, *, on_busy_timeout
+        ) -> None:
+            assert (tab, timeout) == ("tab-1", globals_["TURN_TIMEOUT"])
+            on_busy_timeout("turn timeout warning")
+
+        def read_result(self, tab: str) -> str:
+            assert tab == "tab-1"
+            return "done"
+
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        globals_,
+        "emit_finding",
+        lambda category, message, *, status: findings.append(
+            (category, message, status)
+        ),
+    )
+
+    assert (
+        workflow["run_turn"](
+            Client(), "tab-1", "Issue #240 implementation", "work", warning_scope=240
+        )
+        == "done"
+    )
+    contextual_warning = "Issue #240 implementation: turn timeout warning"
+    assert findings == [("runtime", contextual_warning, "warning")]
+    records = workflow["AGENT_TURN_TIMEOUT_WARNINGS"]
+    assert records == [
+        workflow["AgentTurnTimeoutWarning"](
+            240, "Issue #240 implementation", contextual_warning
+        )
+    ]
+    other_warning = "Issue #241 correctness review: another timeout"
+    records.append(
+        workflow["AgentTurnTimeoutWarning"](
+            241, "Issue #241 correctness review", other_warning
+        )
+    )
+
+    assert workflow["summary_warnings"](240, ("review warning",)) == (
+        "review warning",
+        contextual_warning,
+    )
+    assert workflow["summary_warnings"](241) == (other_warning,)
+    assert workflow["summary_warnings"](None) == ()
+    delivery = workflow["ReviewDelivery"]("approved", "head", "base", 1)
+    assert workflow["human_handoff_warnings"](delivery) == (
+        contextual_warning,
+        other_warning,
+    )
+
+
 def test_terminal_progress_formats_iteration_and_detail(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -240,6 +309,25 @@ def test_whole_version_review_prompt_covers_cross_issue_responsibilities() -> No
     assert "right boundaries" in source
 
 
+def test_version_readme_review_prompt_has_an_independent_documentation_scope() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+
+    prompt = workflow["version_readme_review_prompt"](pr, config, config.issues)
+
+    assert pr.base_sha in prompt
+    assert pr.head_sha in prompt
+    assert "version declarations and version references" in prompt
+    assert "README documentation agrees with the current behavior" in prompt
+    assert "removed features" in prompt
+    assert "obsolete CLI or API usage" in prompt
+    assert "outdated configuration examples" in prompt
+    assert "independent documentation/version review" in prompt
+
+
 def test_scenario_gate_prompt_selects_and_compares_human_scenarios() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     prompt_globals = workflow["scenario_gate_prompt"].__globals__
@@ -291,6 +379,7 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
     dynamic_prompts = (
         workflow["scenario_gate_prompt"](pr, config, work_items),
         workflow["whole_version_review_prompt"](pr, config, work_items),
+        workflow["version_readme_review_prompt"](pr, config, work_items),
     )
 
     for prompt in dynamic_prompts:
@@ -301,10 +390,40 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
     one_shot_prompts = (
         workflow["scenario_gate_prompt"](pr, one_shot_config, one_shot_items),
         workflow["whole_version_review_prompt"](pr, one_shot_config, one_shot_items),
+        workflow["version_readme_review_prompt"](pr, one_shot_config, one_shot_items),
     )
     for prompt in one_shot_prompts:
         assert revised_task in prompt
         assert "One-shot source: GitHub Issue #169" in prompt
+
+
+def test_all_review_prompts_preserve_the_active_checkout() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](91, "feature/issue-91")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    _, scope_review, correctness_review = workflow["issue_prompts"](issue, config)
+    prompts = (
+        scope_review,
+        correctness_review,
+        workflow["scenario_gate_prompt"](pr, config, config.issues),
+        workflow["whole_version_review_prompt"](pr, config, config.issues),
+        workflow["version_readme_review_prompt"](pr, config, config.issues),
+    )
+
+    guard = workflow["REVIEWER_CHECKOUT_GUARD"]
+    assert all(guard in prompt for prompt in prompts)
+    for command in (
+        "git checkout",
+        "git switch",
+        "git restore",
+        "gh pr checkout",
+        "git rebase",
+        "git bisect",
+    ):
+        assert command in guard
 
 
 def test_all_review_phases_share_decision_parser() -> None:
@@ -312,7 +431,7 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 5
+    assert source.count("run_validated_turn(") == 6
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:
@@ -442,7 +561,11 @@ def test_every_implementer_turn_uses_shared_implementation_principle() -> None:
         assert isinstance(prompt, ast.Call)
         assert isinstance(prompt.func, ast.Name)
         assert prompt.func.id == "implementer_prompt"
-    for label in ("  review", "Whole-version reviewer turn"):
+    for label in (
+        "  review",
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ):
         prompt = prompts[label]
         assert not (
             isinstance(prompt, ast.Call)
@@ -1352,6 +1475,30 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
             github.pr, "approved", implementation_sha, base_sha, 1
         )
 
+    def reconcile(**kwargs: object) -> SimpleNamespace:
+        assert kwargs == {
+            "repo": str(config.repo),
+            "integration_branch": config.integration_branch,
+            "issue": (issue.label, issue.branch, issue.task_fingerprint),
+            "command_timeout_seconds": workflow["COMMAND_TIMEOUT"],
+        }
+        assert github.pr is not None
+        github.update_pr_body(
+            github.pr.number,
+            body=f"{marker}\n\nAgent-created PR body",
+            expected_head=branch,
+            expected_head_sha=implementation_sha,
+            expected_base=config.integration_branch,
+            expected_base_sha=base_sha,
+            draft=True,
+        )
+        return SimpleNamespace(
+            classification="recoverable",
+            feature_sha=implementation_sha,
+            integration_sha=base_sha,
+            open_pr_number=agent_pr.number,
+        )
+
     monkeypatch.setitem(
         workflow_globals, "prepare_issue", lambda *args: (None, "start-head", False)
     )
@@ -1359,6 +1506,9 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "recover_issue_driven_work_item_topology", reconcile
+    )
     monkeypatch.setitem(
         workflow_globals,
         "require_agent_result",
@@ -1449,6 +1599,98 @@ def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> No
 
     assert updated.body == f"{marker}\n\nUpdated child PR description"
     assert bodies == [issue.pr_body, updated.body]
+
+
+@pytest.mark.parametrize(
+    ("update_stage", "foreign_marker"),
+    [("review", False), ("fix", True)],
+    ids=["duplicate-during-review-update", "foreign-during-fix-update"],
+)
+def test_inline_review_updates_reject_ambiguous_pr_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    update_stage: str,
+    foreign_marker: bool,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["review_issue_phase"].__globals__
+    task = "Refresh the New Run help."
+    fingerprint = hashlib.sha256(task.encode()).hexdigest()
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-refresh-run-help",
+        "refresh-run-help",
+        task,
+        fingerprint,
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    initial_sha = "implementation-head"
+    updated_sha = f"{update_stage}-head"
+    base_sha = "integration-head"
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    other = "b" * 64 if foreign_marker else fingerprint
+    added_marker = f"<!-- agent-workflow-manager:inline-task-sha256:{other} -->"
+    current_pr = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=initial_sha,
+        base_sha=base_sha,
+        body=f"{marker}\n\nImplementation summary",
+    )
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (issue.branch, updated_sha)
+            return BranchState(branch, updated_sha, updated_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            if kwargs["expected_head_sha"] == initial_sha:
+                return current_pr
+            return replace(
+                current_pr,
+                head_sha=updated_sha,
+                body=f"{current_pr.body}\n\n{added_marker}",
+            )
+
+        def update_pr_body(self, *args: object, **kwargs: object) -> PullRequestState:
+            pytest.fail("ambiguous identity must fail before a PR body mutation")
+
+    agent_results = (
+        iter(((updated_sha, True),))
+        if update_stage == "review"
+        else iter(((initial_sha, False), (updated_sha, True)))
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "run_validated_turn",
+        lambda *args, **kwargs: (
+            ("APPROVED", "APPROVED")
+            if update_stage == "review"
+            else ("CHANGES_REQUESTED\nfix it", "CHANGES_REQUESTED")
+        ),
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(agent_results),
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", lambda *args, **kwargs: "fixed")
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        workflow["review_issue_phase"](
+            issue,
+            config,
+            object(),
+            Repository(),
+            GitHub(),
+            "implementer",
+            "reviewer",
+            current_pr,
+            phase="scope/design",
+            prompt="review",
+            max_reviews=2,
+        )
 
 
 def test_regular_issue_pr_body_metadata_maintenance_is_a_noop() -> None:
@@ -1898,6 +2140,7 @@ def test_ready_final_pr_repeats_review_and_checks(
         "set_draft:True",
         "require_review_head",
         "Whole-version reviewer turn",
+        "Version / README reviewer turn",
         "require_review_head",
         "final checks",
         "set_draft:False",
@@ -1945,7 +2188,14 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
             current_pr = replace(current_pr, body=body)
             return current_pr
 
-    results = iter(((reviewed_sha, True), (reviewed_sha, False), (reviewed_sha, False)))
+    results = iter(
+        (
+            (reviewed_sha, True),
+            (reviewed_sha, False),
+            (reviewed_sha, False),
+            (reviewed_sha, False),
+        )
+    )
     review_count = 0
 
     def run_turn(*args: object, **kwargs: object) -> str:
@@ -1972,7 +2222,7 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
     )
 
     assert delivery.outcome == "approved"
-    assert review_count == 2
+    assert review_count == 3
     assert persisted_heads
     assert set(persisted_heads) == {reviewed_sha}
 
@@ -2046,6 +2296,97 @@ def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
     assert "ready" not in events
 
 
+def test_whole_failures_do_not_consume_version_readme_review_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    initial_sha = "integration-head"
+    fixed_sha = "documented-head"
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha=initial_sha,
+    )
+    events: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            assert (branch, expected_local_sha) == (
+                config.integration_branch,
+                fixed_sha,
+            )
+            return BranchState(branch, fixed_sha, fixed_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+    agent_results = iter(
+        (
+            (initial_sha, False),
+            (initial_sha, False),
+            (fixed_sha, True),
+            (fixed_sha, False),
+            (fixed_sha, False),
+            (fixed_sha, False),
+        )
+    )
+    version_reviews = 0
+    whole_reviews = 0
+    fix_prompts: list[str] = []
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        nonlocal version_reviews, whole_reviews
+        name = str(args[2])
+        events.append(name)
+        if name == "Whole-version reviewer turn":
+            whole_reviews += 1
+            if whole_reviews == 1:
+                return "CHANGES_REQUESTED\nRepair the cross-Issue integration."
+        if name == "Version / README reviewer turn":
+            version_reviews += 1
+            if version_reviews == 1:
+                return "CHANGES_REQUESTED\nRemove the obsolete CLI example."
+        if name == "Whole-version fixes":
+            fix_prompts.append(str(args[3]))
+        return "APPROVED"
+
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(agent_results),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    _, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current_pr, config.issues
+    )
+
+    assert delivery.outcome == "approved"
+    assert delivery.reviews == 2
+    assert delivery.head_sha == fixed_sha
+    assert len(fix_prompts) == 1
+    assert "Repair the cross-Issue integration." in fix_prompts[0]
+    assert "Remove the obsolete CLI example." in fix_prompts[0]
+    assert events == [
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+        "Whole-version fixes",
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ]
+
+
 def test_whole_version_review_limit_warns_without_an_extra_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2077,7 +2418,9 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     result_calls = iter(
         (
             (initial_sha, False),
+            (initial_sha, False),
             (fixed_sha, True),
+            (fixed_sha, False),
             (fixed_sha, False),
             (fixed_sha, False),
         )
@@ -2125,6 +2468,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     assert delivery.outcome == "continued_with_warning"
     assert delivery.head_sha == fixed_sha
     assert events.count("Whole-version reviewer turn") == 2
+    assert events.count("Version / README reviewer turn") == 2
     assert events.count("Whole-version fixes") == 1
     assert events[-2:] == ["final checks", f"safe:{fixed_sha}"]
     assert any(
@@ -2289,6 +2633,8 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         events.append(name)
         if name == "Whole-version reviewer turn":
             review_count += 1
+            return "APPROVED"
+        if name == "Version / README reviewer turn":
             return "APPROVED"
         if name == "Clean worktree":
             assert repository.dirty

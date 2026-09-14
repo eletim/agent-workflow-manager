@@ -40,6 +40,9 @@ from purplemux_client import (
     emit_step,
     emit_whole_review_result,
     inspect_issue_driven_work_item_topology,
+    reconcile_inline_task_pr_body,
+    recover_issue_driven_work_item_topology,
+    require_inline_task_pr_fingerprint,
     run_correlation,
 )
 
@@ -75,6 +78,11 @@ IMPLEMENTATION_PRINCIPLE = (
     "to the minimum required for this Issue. Do not achieve a minimal diff or "
     "reduced code size by mixing responsibilities unnaturally or by "
     "over-generalizing distinct behavior into shared abstractions."
+)
+REVIEWER_CHECKOUT_GUARD = (
+    "Never change the checkout: do not run git checkout, git switch, git restore, "
+    "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
+    "git show, or gh pr diff only."
 )
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
@@ -187,6 +195,16 @@ class Config:
     check_command: str
     policy_issue: int | None = None
     one_shot_issue: int | None = None
+
+
+@dataclass(frozen=True)
+class AgentTurnTimeoutWarning:
+    result_scope: int | str | None
+    turn_name: str
+    message: str
+
+
+AGENT_TURN_TIMEOUT_WARNINGS: list[AgentTurnTimeoutWarning] = []
 
 
 @dataclass(frozen=True)
@@ -437,6 +455,7 @@ def run_turn(
     *,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
 ) -> str:
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
@@ -448,10 +467,22 @@ def run_turn(
         **navigation,
     )
     terminal_progress("START", name, iteration=iteration)
+
+    def warn_busy_timeout(warning: str) -> None:
+        contextual = AgentTurnTimeoutWarning(
+            warning_scope, name, f"{name}: {warning}"
+        )
+        if contextual not in AGENT_TURN_TIMEOUT_WARNINGS:
+            AGENT_TURN_TIMEOUT_WARNINGS.append(contextual)
+        print(f"WARN: {contextual.message}", flush=True)
+        emit_finding("runtime", contextual.message, status="warning")
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
-        client.wait_for_turn_completion(tab, TURN_TIMEOUT)
+        client.wait_for_turn_completion(
+            tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
+        )
         result = client.read_result(tab)
     except BaseException as exc:
         emit_step(
@@ -489,9 +520,18 @@ def run_validated_turn(
     *,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
-    result = run_turn(client, tab, name, prompt, iteration=iteration, pr=pr)
+    result = run_turn(
+        client,
+        tab,
+        name,
+        prompt,
+        iteration=iteration,
+        pr=pr,
+        warning_scope=warning_scope,
+    )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
         try:
             return result, validator(result)
@@ -514,13 +554,19 @@ def run_validated_turn(
                 "session; do not repeat the underlying task or mutate any state.",
                 iteration=correction + 1,
                 pr=pr,
+                warning_scope=warning_scope,
             )
     raise AssertionError("unreachable")
 
 
 def implementer_prompt(prompt: str) -> str:
     """Add the shared change-boundary policy to an implementation turn."""
-    return f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}"
+    return (
+        f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
+        "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
+        "the workflow owns and reconciles those markers from its persisted "
+        "work-item plan."
+    )
 
 
 def run_outline_step(name: str, action):
@@ -653,6 +699,11 @@ def summary_warnings(
 ) -> tuple[str, ...]:
     """Keep the result event narrow while retaining its primary warnings."""
     warnings = list(additional)
+    warnings.extend(
+        warning.message
+        for warning in AGENT_TURN_TIMEOUT_WARNINGS
+        if warning.result_scope == issue_number
+    )
     warnings.extend(
         warning
         for warning_issue, warning in POLICY_CONFLICT_WARNINGS
@@ -831,7 +882,8 @@ def warn_human_handoff(message: str) -> None:
 
 
 def human_handoff_warnings(delivery: ReviewDelivery) -> tuple[str, ...]:
-    warnings = list(delivery.warnings)
+    warnings = [warning.message for warning in AGENT_TURN_TIMEOUT_WARNINGS]
+    warnings.extend(delivery.warnings)
     for item in ISSUE_HANDOFF_RESULTS:
         warnings.extend(item.warnings)
     warnings.extend(warning for _, warning in POLICY_CONFLICT_WARNINGS)
@@ -1085,7 +1137,11 @@ def ensure_issue_pr_metadata(
     issue: Issue,
     config: Config,
 ) -> PullRequestState:
-    body = with_inline_task_pr_identity(pr, issue)
+    body = (
+        pr.body
+        if issue.task_fingerprint is None
+        else reconcile_inline_task_pr_body(pr, issue.task_fingerprint)
+    )
     if config.policy_issue is not None:
         for issue_number, warning in POLICY_CONFLICT_WARNINGS:
             if issue_number != issue.result_id:
@@ -1105,7 +1161,8 @@ def ensure_issue_pr_metadata(
         expected_base=config.integration_branch,
         expected_base_sha=pr.base_sha,
     )
-    return require_inline_task_pr_identity(current, issue)
+    require_inline_task_pr_fingerprint(current, issue.task_fingerprint)
+    return current
 
 
 def policy_pr_notes(config: Config) -> str:
@@ -1201,6 +1258,7 @@ def require_clean_worktree(
     *,
     context: str,
     iteration: int | None = None,
+    warning_scope: int | str | None = None,
 ) -> None:
     state = repo.inspect_worktree()
     if not state.dirty:
@@ -1223,6 +1281,7 @@ and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve."""),
         iteration=iteration,
+        warning_scope=warning_scope,
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -1245,6 +1304,7 @@ def require_agent_result(
     *,
     allow_unchanged: bool,
     iteration: int | None = None,
+    warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
     repo.require_current_branch(branch)
     require_clean_worktree(
@@ -1253,6 +1313,7 @@ def require_agent_result(
         tab,
         context=f"verifying the coding result on {branch!r}",
         iteration=iteration,
+        warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
         branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
@@ -1291,7 +1352,7 @@ Issue identifies a policy Issue, use that version-design context; the
 implementation work item remains authoritative when they conflict, and report the
 conflict as a warning. Do not focus on detailed implementation bugs in this
 phase. Do not mutate files or PR state. Return APPROVED or CHANGES_REQUESTED
-first, followed by actionable findings."""
+first, followed by actionable findings. {REVIEWER_CHECKOUT_GUARD}"""
     correctness_review = context + f"""Perform only the Correctness Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement}
@@ -1301,50 +1362,9 @@ cases, state and lifecycle consistency, error handling, races or stale state,
 Git/GitHub topology, regressions, missing tests, cleanup and resource ownership,
 and security or secret handling. Do not reopen scope preferences unless they
 cause a concrete correctness problem. Do not mutate files or PR state. Return
-APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
+APPROVED or CHANGES_REQUESTED first, followed by actionable findings.
+{REVIEWER_CHECKOUT_GUARD}"""
     return implementation, scope_review, correctness_review
-
-
-def require_inline_task_pr_identity(
-    pr: PullRequestState, issue: Issue
-) -> PullRequestState:
-    if issue.task_fingerprint is None:
-        return pr
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    suffix = " -->"
-    lines = pr.body.splitlines()
-    marker = lines[0].strip() if lines else ""
-    if (
-        not marker.startswith(prefix)
-        or not marker.endswith(suffix)
-        or marker[len(prefix) : -len(suffix)] != issue.task_fingerprint
-    ):
-        raise WorkerFailure(
-            f"PR #{pr.number} inline task fingerprint is missing or does not match "
-            "the declared task"
-        )
-    return pr
-
-
-def inline_task_pr_fingerprint(pr: PullRequestState) -> str | None:
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    lines = pr.body.splitlines()
-    marker = lines[0].strip() if lines else ""
-    if not marker.startswith(prefix):
-        return None
-    suffix = " -->"
-    return marker[len(prefix) : -len(suffix)] if marker.endswith(suffix) else ""
-
-
-def with_inline_task_pr_identity(pr: PullRequestState, issue: Issue) -> str:
-    if issue.task_fingerprint is None:
-        return pr.body
-    fingerprint = inline_task_pr_fingerprint(pr)
-    if fingerprint is not None:
-        require_inline_task_pr_identity(pr, issue)
-        return pr.body
-    marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{issue.task_fingerprint} -->"
-    return f"{marker}\n\n{pr.body}" if pr.body else marker
 
 
 def prepare_issue(
@@ -1355,12 +1375,12 @@ def prepare_issue(
 ) -> tuple[PullRequestState | None, str, bool] | PullRequestState:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     if open_pr is not None:
-        require_inline_task_pr_identity(open_pr, issue)
+        require_inline_task_pr_fingerprint(open_pr, issue.task_fingerprint)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
     )
     if merged is not None:
-        require_inline_task_pr_identity(merged, issue)
+        require_inline_task_pr_fingerprint(merged, issue.task_fingerprint)
         if open_pr is not None:
             raise WorkerFailure("merged Issue also has an open same-head PR")
         emit_finding(
@@ -1434,13 +1454,40 @@ def ensure_issue_pr(
     config: Config,
     *,
     expected_base_sha: str,
-    may_initialize_inline_identity: bool = False,
+    reconcile_plan_owned_inline_identity: bool = False,
 ) -> PullRequestState:
     local = repo.require_current_branch(issue.branch)
     assert local.local_sha is not None
     feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
     assert feature.remote_sha is not None
+    reconciled_pr_number: int | None = None
+    if reconcile_plan_owned_inline_identity and issue.task_fingerprint is not None:
+        assert issue.task_id is not None
+        reconciled = recover_issue_driven_work_item_topology(
+            repo=str(config.repo),
+            integration_branch=config.integration_branch,
+            issue=(issue.label, issue.branch, issue.task_fingerprint),
+            command_timeout_seconds=COMMAND_TIMEOUT,
+        )
+        if (
+            reconciled.classification != "recoverable"
+            or reconciled.feature_sha != feature.remote_sha
+            or reconciled.integration_sha != expected_base_sha
+        ):
+            raise WorkerFailure(
+                f"{issue.label} topology changed while reconciling its "
+                "plan-owned PR identity"
+            )
+        reconciled_pr_number = reconciled.open_pr_number
     pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
+    if (
+        reconcile_plan_owned_inline_identity
+        and issue.task_fingerprint is not None
+        and (pr.number if pr is not None else None) != reconciled_pr_number
+    ):
+        raise WorkerFailure(
+            f"{issue.label} PR identity changed after fingerprint reconciliation"
+        )
     if pr is None:
         pr = github.create_draft_pr(
             head=issue.branch,
@@ -1460,20 +1507,8 @@ def ensure_issue_pr(
         expected_base_sha=expected_base_sha,
         draft=True,
     )
-    if (
-        may_initialize_inline_identity
-        and issue.task_fingerprint is not None
-        and inline_task_pr_fingerprint(current) is None
-    ):
-        current = github.update_pr_body(
-            current.number,
-            body=with_inline_task_pr_identity(current, issue),
-            expected_head=issue.branch,
-            expected_head_sha=feature.remote_sha,
-            expected_base=config.integration_branch,
-            expected_base_sha=expected_base_sha,
-        )
-    return require_inline_task_pr_identity(current, issue)
+    require_inline_task_pr_fingerprint(current, issue.task_fingerprint)
+    return current
 
 
 def merge_pr_and_advance(
@@ -1595,6 +1630,7 @@ def review_issue_phase(
             decision,
             iteration=review_number,
             pr=pr,
+            warning_scope=issue.result_id,
         )
         emit_policy_conflicts(
             result,
@@ -1619,6 +1655,7 @@ def review_issue_phase(
             current.head_sha,
             allow_unchanged=True,
             iteration=review_number,
+            warning_scope=issue.result_id,
         )
         if reviewer_changed:
             pushed = repo.ensure_pushed(issue.branch, expected_local_sha=reviewed_sha)
@@ -1685,6 +1722,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             ),
             iteration=review_number,
             pr=pr,
+            warning_scope=issue.result_id,
         )
         emit_policy_conflicts(
             fix_result,
@@ -1700,6 +1738,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             current.head_sha,
             allow_unchanged=True,
             iteration=review_number,
+            warning_scope=issue.result_id,
         )
         if not changed:
             warning = (
@@ -1766,6 +1805,7 @@ def process_issue(
             client,
             cleanup,
             context=f"preparing {issue.label}",
+            warning_scope=issue.result_id,
         )
     prepared = prepare_issue(repo, github, issue, config)
     if isinstance(prepared, PullRequestState):
@@ -1837,6 +1877,7 @@ def process_issue(
         f"{issue.label} implementation",
         implementation_prompt,
         pr=existing_pr,
+        warning_scope=issue.result_id,
     )
     emit_policy_conflicts(
         implementation_result,
@@ -1851,6 +1892,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
     if integration.remote_sha is None:
@@ -1861,7 +1903,7 @@ def process_issue(
         issue,
         config,
         expected_base_sha=integration.remote_sha,
-        may_initialize_inline_identity=existing_pr is None,
+        reconcile_plan_owned_inline_identity=existing_pr is None,
     )
     emit_issue_navigation(
         issue.result_id,
@@ -2537,7 +2579,9 @@ def persist_work_item_plan(
     )
 
 
-def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
+def inspect_dynamic_work_item_topology(
+    issue: Issue, config: Config, *, recover_missing_inline_identity: bool = False
+) -> None:
     """Validate the plan-owned identity before recording its dispatch."""
     if issue.number is not None and issue in config.issues:
         return
@@ -2551,7 +2595,12 @@ def inspect_dynamic_work_item_topology(issue: Issue, config: Config) -> None:
             issue.branch,
             issue.task_fingerprint,
         )
-    inspect_issue_driven_work_item_topology(
+    inspect_topology = (
+        recover_issue_driven_work_item_topology
+        if recover_missing_inline_identity and issue.number is None
+        else inspect_issue_driven_work_item_topology
+    )
+    inspect_topology(
         repo=str(config.repo),
         integration_branch=config.integration_branch,
         issue=declaration,
@@ -2568,7 +2617,9 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
-        inspect_dynamic_work_item_topology(recovered_issue, config)
+        inspect_dynamic_work_item_topology(
+            recovered_issue, config, recover_missing_inline_identity=True
+        )
         run_outline_step(
             recovered_issue.label,
             lambda issue=recovered_issue: process_issue(
@@ -2687,7 +2738,7 @@ expected-output test: use the Issue and policy context to judge the difference.
 Use read-only inspection or disposable temporary directories and leave the
 repository worktree unchanged. Return APPROVED or CHANGES_REQUESTED first,
 followed by the selected scenarios, Before/After evidence, and actionable
-findings. Do not mutate files or PR state."""
+findings. Do not mutate files or PR state. {REVIEWER_CHECKOUT_GUARD}"""
 
 
 def whole_version_review_prompt(
@@ -2702,6 +2753,27 @@ def whole_version_review_prompt(
         "combined version for correctness, safety, and missing integration "
         "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
         "actionable findings; do not mutate anything.\n\n"
+        + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
+        + final_work_item_context(config, work_items)
+    )
+
+
+def version_readme_review_prompt(
+    pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
+) -> str:
+    return (
+        f"Review version and README consistency at exact head {pr.head_sha} "
+        f"against final base {pr.base_sha}. Check that version declarations and "
+        "version references agree with the integrated implementation and intended "
+        "release, and that README documentation agrees with the current behavior "
+        "and specification. Look specifically for remnants of removed features, "
+        "obsolete CLI or API usage, and outdated configuration examples. Keep this "
+        "as an independent documentation/version review; do not repeat the general "
+        "whole-version review. Return APPROVED or CHANGES_REQUESTED first, followed "
+        "by actionable findings; do not mutate anything.\n\n"
+        + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
         + final_work_item_context(config, work_items)
     )
 
@@ -2727,6 +2799,12 @@ def review_whole_version(
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
     )
+    version_readme_reviewer = create_agent(
+        client,
+        config,
+        agent_type=REVIEWER_AGENT,
+        name="Version / README reviewer",
+    )
     scenario_reviewer = (
         create_agent(
             client,
@@ -2740,6 +2818,8 @@ def review_whole_version(
     delivery: ReviewDelivery | None = None
     for review_number in range(1, MAX_REVIEWS + 1):
         result: str
+        review_results: list[str] = []
+        changes_requested = False
         if scenario_reviewer is not None:
             result, verdict = run_validated_turn(
                 client,
@@ -2781,6 +2861,8 @@ def review_whole_version(
                     f"approval invalidated at {scenario_sha}",
                 )
                 continue
+            review_results.append(result)
+            changes_requested = verdict == "CHANGES_REQUESTED"
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
@@ -2794,6 +2876,8 @@ def review_whole_version(
                 decision,
                 iteration=review_number,
             )
+            review_results.append(result)
+            changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
         emit_policy_conflicts(result, config, scope="the integrated version")
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
@@ -2825,6 +2909,54 @@ def review_whole_version(
                 f"approval invalidated at {reviewed_sha}",
             )
             continue
+        version_result, version_verdict = run_validated_turn(
+            client,
+            version_readme_reviewer,
+            "Version / README reviewer turn",
+            policy_context(config, scope="the version and README review")
+            + version_readme_review_prompt(pr, config, work_items),
+            decision,
+            iteration=review_number,
+        )
+        review_results.append(version_result)
+        changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
+        emit_policy_conflicts(version_result, config, scope="the integrated version")
+        reviewed_sha, reviewer_changed = require_agent_result(
+            repo,
+            client,
+            fixer,
+            config.integration_branch,
+            pr.head_sha,
+            allow_unchanged=True,
+            iteration=review_number,
+        )
+        if reviewer_changed:
+            pushed = repo.ensure_pushed(
+                config.integration_branch, expected_local_sha=reviewed_sha
+            )
+            assert pushed.remote_sha is not None
+            pr = github.require_pr(
+                number=pr.number,
+                head=config.integration_branch,
+                base=config.main_branch,
+                state="OPEN",
+                expected_head_sha=pushed.remote_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
+            )
+            pr = ensure_base_pr_policy_notes(github, pr, config)
+            emit_finding(
+                "git",
+                "version and README review changed the integration branch; "
+                f"approval invalidated at {reviewed_sha}",
+            )
+            continue
+        result = "\n\n".join(
+            review_result
+            for review_result in review_results
+            if decision(review_result) == "CHANGES_REQUESTED"
+        )
+        verdict = "CHANGES_REQUESTED" if changes_requested else "APPROVED"
         current = github.require_pr(
             number=pr.number,
             head=config.integration_branch,
@@ -3243,6 +3375,7 @@ def run_repository(
     deferred_deliveries: list[RepositoryDelivery] | None = None,
 ) -> PullRequestState | None:
     POLICY_CONFLICT_WARNINGS.clear()
+    AGENT_TURN_TIMEOUT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
     emit_issue_driven_context(
         config.slug,

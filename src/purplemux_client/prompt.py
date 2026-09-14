@@ -138,7 +138,7 @@ try:
     )
     client.wait_until_ready(tab, 60)
     client.send_input(tab, prompt)
-    client.wait_for_turn_completion(tab, 3600)
+    client.wait_for_turn_completion(tab, 10800)
     result = client.read_result(tab)
 except BaseException as exc:
     emit_step("Prompt", "failed", error=str(exc))
