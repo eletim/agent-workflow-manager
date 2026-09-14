@@ -113,6 +113,10 @@ PR head/base, and integration checks succeed, this helper may restore a missing 
 malformed fingerprint on the exact open Draft PR. A different valid
 fingerprint and ambiguous markers still fail closed, and the guarded PR-body
 mutation authoritatively reconciles an unknown GitHub outcome.
+The workflow also uses that plan-owned identity and guarded reconciliation after
+a fresh implementation when it adopts a Draft PR created by the CodingAgent.
+CodingAgent prompts reserve fingerprint-marker creation and maintenance for AWM;
+if no PR exists, the workflow creates it with the plan-owned identity itself.
 
 The helper resolves the source repository and exact current remote base SHA,
 creates and verifies a fresh detached run worktree under the AWM-owned data

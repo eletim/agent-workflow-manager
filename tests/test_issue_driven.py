@@ -1844,6 +1844,110 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     assert "recovered_issue, config, recover_missing_inline_identity=True" in code
 
 
+def test_fresh_inline_delivery_creates_pr_with_plan_owned_identity() -> None:
+    workflow = load_generated_workflow(
+        work_items=[{"id": "refresh-run-help", "task": "Refresh the help."}]
+    )
+    issue = workflow["parse_args"]().issues[0]
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_sha = "f" * 40
+    base_sha = "b" * 40
+    created: PullRequestState | None = None
+    repository = SimpleNamespace(
+        require_current_branch=lambda branch: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+        ensure_pushed=lambda branch, expected_local_sha: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+    )
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert kwargs["head"] == issue.branch
+            assert kwargs["base"] == config.integration_branch
+            assert kwargs["expected_head_sha"] == head_sha
+            assert kwargs["expected_base_sha"] == base_sha
+            assert kwargs["body"] == issue.pr_body
+            created = replace(
+                topology_pr(
+                    number=191,
+                    head_branch=issue.branch,
+                    head_sha=head_sha,
+                    base_sha=base_sha,
+                    body=issue.pr_body,
+                ),
+                base_branch=config.integration_branch,
+            )
+            return created
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert created is not None
+            return created
+
+    workflow["recover_issue_driven_work_item_topology"] = lambda **kwargs: (
+        SimpleNamespace(
+            classification="recoverable",
+            feature_sha=head_sha,
+            integration_sha=base_sha,
+            open_pr_number=None,
+        )
+    )
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    delivered = workflow["ensure_issue_pr"](
+        repository,
+        GitHub(),
+        issue,
+        config,
+        expected_base_sha=base_sha,
+        reconcile_plan_owned_inline_identity=True,
+    )
+
+    assert delivered == created
+
+
+def test_fresh_inline_delivery_propagates_foreign_fingerprint_rejection() -> None:
+    workflow = load_generated_workflow(
+        work_items=[{"id": "refresh-run-help", "task": "Refresh the help."}]
+    )
+    issue = workflow["parse_args"]().issues[0]
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_sha = "f" * 40
+    repository = SimpleNamespace(
+        require_current_branch=lambda branch: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+        ensure_pushed=lambda branch, expected_local_sha: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+    )
+    workflow["recover_issue_driven_work_item_topology"] = lambda **kwargs: (
+        _ for _ in ()
+    ).throw(WorkerFailure("PR #192 inline task fingerprint does not match"))
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        workflow["ensure_issue_pr"](
+            repository,
+            SimpleNamespace(
+                find_pr=lambda **kwargs: pytest.fail("must fail before PR adoption"),
+                create_draft_pr=lambda **kwargs: pytest.fail("must not create a PR"),
+            ),
+            issue,
+            config,
+            expected_base_sha="b" * 40,
+            reconcile_plan_owned_inline_identity=True,
+        )
+
+
 def test_inline_task_content_changes_topology_recovery_identity() -> None:
     def inline_config(task: str):
         value = payload()
@@ -2197,6 +2301,11 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "Commit every intended source, test, and configuration" in code
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code
+    assert (
+        "Do not create, remove, or edit agent-workflow-manager fingerprint markers"
+        in code
+    )
+    assert "workflow owns and reconciles those markers" in code
     assert "emit_run_pr(pr.number, pr.url)" in code
     assert "emit_issue_driven_context(" in code
     assert "emit_issue_result(" in code

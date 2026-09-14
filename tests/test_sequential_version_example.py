@@ -1446,6 +1446,30 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
             github.pr, "approved", implementation_sha, base_sha, 1
         )
 
+    def reconcile(**kwargs: object) -> SimpleNamespace:
+        assert kwargs == {
+            "repo": str(config.repo),
+            "integration_branch": config.integration_branch,
+            "issue": (issue.label, issue.branch, issue.task_fingerprint),
+            "command_timeout_seconds": workflow["COMMAND_TIMEOUT"],
+        }
+        assert github.pr is not None
+        github.update_pr_body(
+            github.pr.number,
+            body=f"{marker}\n\nAgent-created PR body",
+            expected_head=branch,
+            expected_head_sha=implementation_sha,
+            expected_base=config.integration_branch,
+            expected_base_sha=base_sha,
+            draft=True,
+        )
+        return SimpleNamespace(
+            classification="recoverable",
+            feature_sha=implementation_sha,
+            integration_sha=base_sha,
+            open_pr_number=agent_pr.number,
+        )
+
     monkeypatch.setitem(
         workflow_globals, "prepare_issue", lambda *args: (None, "start-head", False)
     )
@@ -1453,6 +1477,9 @@ def test_mini_task_adopts_agent_created_draft_pr_with_recovery_identity(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "recover_issue_driven_work_item_topology", reconcile
+    )
     monkeypatch.setitem(
         workflow_globals,
         "require_agent_result",
