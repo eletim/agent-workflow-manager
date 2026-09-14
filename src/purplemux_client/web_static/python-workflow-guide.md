@@ -106,13 +106,26 @@ When a generated workflow accepts a work item at runtime, it calls
 before persisting its dispatch. This applies the same authoritative remote branch,
 OPEN/MERGED/CLOSED PR, SHA-containment, and inline-fingerprint checks that the
 static batch uses outside that deliberate seed-fingerprint deferral.
-On Resume, the generated workflow instead calls
-`recover_issue_driven_work_item_topology` only for an inline item whose dispatch
-identity was already recovered from the persisted plan. After the same branch,
-PR head/base, and integration checks succeed, this helper may restore a completely
-missing fingerprint on the exact open Draft PR. A malformed or different
-fingerprint still fails closed, and the guarded PR-body mutation authoritatively
-reconciles an unknown GitHub outcome.
+For inline tasks, persisted `WorkItemPlan` state supplies the authoritative
+fingerprint and exact remote Git/GitHub topology supplies the branch, PR
+head/base, SHA-containment, and integration identity. Neither authority can
+substitute for the other. The generated workflow applies that boundary on fresh
+runs, **Review & Resume**, and recovery from a timed-out marker update.
+
+On Resume, the workflow calls `recover_issue_driven_work_item_topology` only for
+an inline item whose dispatch identity was restored from the persisted plan.
+After all topology checks succeed, the helper may restore a missing or malformed
+fingerprint on the exact open Draft PR. After a fresh implementation, the
+workflow uses the same plan-owned identity and guarded reconciliation to adopt a
+Draft PR created by the CodingAgent, or creates the PR with the marker itself if
+none exists. Subsequent PR metadata updates use
+`reconcile_inline_task_pr_body()` and `require_inline_task_pr_fingerprint()` as
+the same strict reconciliation and validation boundary. CodingAgent prompts
+prohibit marker changes: only AWM creates or repairs the fingerprint marker. If
+the guarded PR-body update times out, AWM
+re-reads the exact PR and accepts only the intended body as the authoritative
+postcondition; an unresolved outcome fails closed. A different valid fingerprint
+and ambiguous markers always fail closed instead of being overwritten.
 
 The helper resolves the source repository and exact current remote base SHA,
 creates and verifies a fresh detached run worktree under the AWM-owned data
@@ -237,7 +250,9 @@ from purplemux_client import (
     emit_issue_driven_repositories,
     inspect_run_repository,
     prepare_run_repository,
+    reconcile_inline_task_pr_body,
     register_run_resource,
+    require_inline_task_pr_fingerprint,
     run_correlation,
 )
 ```

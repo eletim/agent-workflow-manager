@@ -269,10 +269,20 @@ def test_issue_topology_rejects_closed_unmerged_pr() -> None:
     ("state", "body"),
     [
         ("OPEN", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->"),
+        ("OPEN", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64}"),
+        (
+            "OPEN",
+            f"Summary <!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+        ),
         ("MERGED", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->"),
         (
             "OPEN",
             f"<!-- agent-workflow-manager:inline-task-sha256:{'a' * 64} -->\n"
+            f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+        ),
+        (
+            "OPEN",
+            "<!-- agent-workflow-manager:inline-task-sha256:invalid --> "
             f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
         ),
     ],
@@ -303,18 +313,26 @@ def test_inline_task_topology_rejects_pr_fingerprint_mismatch(
             integration_branch="dev/v1",
             integration_sha="b" * 40,
             inline_task_fingerprint=expected,
-            _allow_missing_inline_task_fingerprint=True,
+            _allow_repair_inline_task_fingerprint=True,
         )
 
 
-def test_inline_task_topology_allows_only_completely_missing_open_fingerprint() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Implementation summary",
+        "<!-- agent-workflow-manager:inline-task-sha256:not-a-fingerprint -->\n\n"
+        "Implementation summary",
+    ],
+)
+def test_inline_task_topology_allows_repairable_open_fingerprint(body: str) -> None:
     expected = "a" * 64
     branch = "feature/work-item-refresh-run-help"
     repository = SimpleNamespace(
         inspect_branch=lambda _branch: BranchState(branch, None, "f" * 40, False)
     )
     github = TopologyGitHub(
-        (topology_pr(head_branch=branch, body="Implementation summary"),),
+        (topology_pr(head_branch=branch, body=body),),
         {("b" * 40, "f" * 40)},
     )
 
@@ -327,7 +345,7 @@ def test_inline_task_topology_allows_only_completely_missing_open_fingerprint() 
         integration_branch="dev/v1",
         integration_sha="b" * 40,
         inline_task_fingerprint=expected,
-        _allow_missing_inline_task_fingerprint=True,
+        _allow_repair_inline_task_fingerprint=True,
     )
 
     assert result.classification == "recoverable"
@@ -355,16 +373,41 @@ def test_inline_task_topology_rejects_ready_pr_with_missing_fingerprint() -> Non
             integration_branch="dev/v1",
             integration_sha=pr.base_sha,
             inline_task_fingerprint="a" * 64,
-            _allow_missing_inline_task_fingerprint=True,
+            _allow_repair_inline_task_fingerprint=True,
         )
 
 
-def test_recover_inline_task_topology_restores_missing_fingerprint(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("body", "expected_body"),
+    [
+        (
+            "Implementation summary",
+            "{marker}\n\nImplementation summary",
+        ),
+        (
+            "<!-- agent-workflow-manager:inline-task-sha256:invalid -->\n\n"
+            "Implementation summary",
+            "{marker}\n\nImplementation summary",
+        ),
+        (
+            "Before <!-- agent-workflow-manager:inline-task-sha256:invalid --> after\n"
+            "Details",
+            "{marker}\n\nBefore  after\nDetails",
+        ),
+        (
+            "Summary\n"
+            "Before <!-- agent-workflow-manager:inline-task-sha256:invalid --> after\n"
+            "Details",
+            "{marker}\n\nSummary\nBefore  after\nDetails",
+        ),
+    ],
+)
+def test_recover_inline_task_topology_repairs_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, body: str, expected_body: str
 ) -> None:
     fingerprint = "a" * 64
     branch = "feature/work-item-refresh-run-help"
-    pr = topology_pr(head_branch=branch, body="Implementation summary")
+    pr = topology_pr(head_branch=branch, body=body)
     state = issue_driven.IssueTopologyState(
         "Mini task refresh-run-help",
         branch,
@@ -416,10 +459,36 @@ def test_recover_inline_task_topology_restores_missing_fingerprint(
     )
 
     assert recovered == state
-    assert updates == [
-        f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
-        "\n\nImplementation summary"
-    ]
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    assert updates == [expected_body.format(marker=marker)]
+
+
+def test_inline_task_topology_rejects_ambiguous_malformed_fingerprints() -> None:
+    branch = "feature/work-item-refresh-run-help"
+    pr = topology_pr(
+        head_branch=branch,
+        body=(
+            "<!-- agent-workflow-manager:inline-task-sha256:invalid -->\n"
+            "<!-- agent-workflow-manager:inline-task-sha256:also-invalid -->"
+        ),
+    )
+    repository = SimpleNamespace(
+        inspect_branch=lambda _branch: BranchState(branch, None, pr.head_sha, False)
+    )
+    github = TopologyGitHub((pr,), {(pr.base_sha, pr.head_sha)})
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        classify_issue_topology(
+            repository,
+            github,
+            github,
+            issue="Mini task refresh-run-help",
+            branch=branch,
+            integration_branch="dev/v1",
+            integration_sha=pr.base_sha,
+            inline_task_fingerprint="a" * 64,
+            _allow_repair_inline_task_fingerprint=True,
+        )
 
 
 def test_recover_inline_task_topology_accepts_ready_pr_with_fingerprint(
@@ -1775,6 +1844,110 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     assert "recovered_issue, config, recover_missing_inline_identity=True" in code
 
 
+def test_fresh_inline_delivery_creates_pr_with_plan_owned_identity() -> None:
+    workflow = load_generated_workflow(
+        work_items=[{"id": "refresh-run-help", "task": "Refresh the help."}]
+    )
+    issue = workflow["parse_args"]().issues[0]
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_sha = "f" * 40
+    base_sha = "b" * 40
+    created: PullRequestState | None = None
+    repository = SimpleNamespace(
+        require_current_branch=lambda branch: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+        ensure_pushed=lambda branch, expected_local_sha: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+    )
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal created
+            assert kwargs["head"] == issue.branch
+            assert kwargs["base"] == config.integration_branch
+            assert kwargs["expected_head_sha"] == head_sha
+            assert kwargs["expected_base_sha"] == base_sha
+            assert kwargs["body"] == issue.pr_body
+            created = replace(
+                topology_pr(
+                    number=191,
+                    head_branch=issue.branch,
+                    head_sha=head_sha,
+                    base_sha=base_sha,
+                    body=issue.pr_body,
+                ),
+                base_branch=config.integration_branch,
+            )
+            return created
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert created is not None
+            return created
+
+    workflow["recover_issue_driven_work_item_topology"] = lambda **kwargs: (
+        SimpleNamespace(
+            classification="recoverable",
+            feature_sha=head_sha,
+            integration_sha=base_sha,
+            open_pr_number=None,
+        )
+    )
+    workflow["emit_finding"] = lambda *args, **kwargs: None
+
+    delivered = workflow["ensure_issue_pr"](
+        repository,
+        GitHub(),
+        issue,
+        config,
+        expected_base_sha=base_sha,
+        reconcile_plan_owned_inline_identity=True,
+    )
+
+    assert delivered == created
+
+
+def test_fresh_inline_delivery_propagates_foreign_fingerprint_rejection() -> None:
+    workflow = load_generated_workflow(
+        work_items=[{"id": "refresh-run-help", "task": "Refresh the help."}]
+    )
+    issue = workflow["parse_args"]().issues[0]
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    head_sha = "f" * 40
+    repository = SimpleNamespace(
+        require_current_branch=lambda branch: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+        ensure_pushed=lambda branch, expected_local_sha: BranchState(
+            branch, head_sha, head_sha, True
+        ),
+    )
+    workflow["recover_issue_driven_work_item_topology"] = lambda **kwargs: (
+        _ for _ in ()
+    ).throw(WorkerFailure("PR #192 inline task fingerprint does not match"))
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        workflow["ensure_issue_pr"](
+            repository,
+            SimpleNamespace(
+                find_pr=lambda **kwargs: pytest.fail("must fail before PR adoption"),
+                create_draft_pr=lambda **kwargs: pytest.fail("must not create a PR"),
+            ),
+            issue,
+            config,
+            expected_base_sha="b" * 40,
+            reconcile_plan_owned_inline_identity=True,
+        )
+
+
 def test_inline_task_content_changes_topology_recovery_identity() -> None:
     def inline_config(task: str):
         value = payload()
@@ -2128,6 +2301,11 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "Commit every intended source, test, and configuration" in code
     assert "Push the exact feature branch" in code
     assert "Create or update exactly one Draft PR" in code
+    assert (
+        "Do not create, remove, or edit agent-workflow-manager fingerprint markers"
+        in code
+    )
+    assert "workflow owns and reconciles those markers" in code
     assert "emit_run_pr(pr.number, pr.url)" in code
     assert "emit_issue_driven_context(" in code
     assert "emit_issue_result(" in code

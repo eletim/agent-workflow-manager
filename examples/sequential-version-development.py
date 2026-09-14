@@ -40,7 +40,9 @@ from purplemux_client import (
     emit_step,
     emit_whole_review_result,
     inspect_issue_driven_work_item_topology,
+    reconcile_inline_task_pr_body,
     recover_issue_driven_work_item_topology,
+    require_inline_task_pr_fingerprint,
     run_correlation,
 )
 
@@ -554,7 +556,12 @@ def run_validated_turn(
 
 def implementer_prompt(prompt: str) -> str:
     """Add the shared change-boundary policy to an implementation turn."""
-    return f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}"
+    return (
+        f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
+        "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
+        "the workflow owns and reconciles those markers from its persisted "
+        "work-item plan."
+    )
 
 
 def run_outline_step(name: str, action):
@@ -1125,7 +1132,11 @@ def ensure_issue_pr_metadata(
     issue: Issue,
     config: Config,
 ) -> PullRequestState:
-    body = with_inline_task_pr_identity(pr, issue)
+    body = (
+        pr.body
+        if issue.task_fingerprint is None
+        else reconcile_inline_task_pr_body(pr, issue.task_fingerprint)
+    )
     if config.policy_issue is not None:
         for issue_number, warning in POLICY_CONFLICT_WARNINGS:
             if issue_number != issue.result_id:
@@ -1145,7 +1156,8 @@ def ensure_issue_pr_metadata(
         expected_base=config.integration_branch,
         expected_base_sha=pr.base_sha,
     )
-    return require_inline_task_pr_identity(current, issue)
+    require_inline_task_pr_fingerprint(current, issue.task_fingerprint)
+    return current
 
 
 def policy_pr_notes(config: Config) -> str:
@@ -1349,48 +1361,6 @@ APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
     return implementation, scope_review, correctness_review
 
 
-def require_inline_task_pr_identity(
-    pr: PullRequestState, issue: Issue
-) -> PullRequestState:
-    if issue.task_fingerprint is None:
-        return pr
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    suffix = " -->"
-    lines = pr.body.splitlines()
-    marker = lines[0].strip() if lines else ""
-    if (
-        not marker.startswith(prefix)
-        or not marker.endswith(suffix)
-        or marker[len(prefix) : -len(suffix)] != issue.task_fingerprint
-    ):
-        raise WorkerFailure(
-            f"PR #{pr.number} inline task fingerprint is missing or does not match "
-            "the declared task"
-        )
-    return pr
-
-
-def inline_task_pr_fingerprint(pr: PullRequestState) -> str | None:
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    lines = pr.body.splitlines()
-    marker = lines[0].strip() if lines else ""
-    if not marker.startswith(prefix):
-        return None
-    suffix = " -->"
-    return marker[len(prefix) : -len(suffix)] if marker.endswith(suffix) else ""
-
-
-def with_inline_task_pr_identity(pr: PullRequestState, issue: Issue) -> str:
-    if issue.task_fingerprint is None:
-        return pr.body
-    fingerprint = inline_task_pr_fingerprint(pr)
-    if fingerprint is not None:
-        require_inline_task_pr_identity(pr, issue)
-        return pr.body
-    marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{issue.task_fingerprint} -->"
-    return f"{marker}\n\n{pr.body}" if pr.body else marker
-
-
 def prepare_issue(
     repo: GitRepository,
     github: GitHubRepository,
@@ -1399,12 +1369,12 @@ def prepare_issue(
 ) -> tuple[PullRequestState | None, str, bool] | PullRequestState:
     open_pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
     if open_pr is not None:
-        require_inline_task_pr_identity(open_pr, issue)
+        require_inline_task_pr_fingerprint(open_pr, issue.task_fingerprint)
     merged = github.find_pr(
         head=issue.branch, base=config.integration_branch, state="MERGED"
     )
     if merged is not None:
-        require_inline_task_pr_identity(merged, issue)
+        require_inline_task_pr_fingerprint(merged, issue.task_fingerprint)
         if open_pr is not None:
             raise WorkerFailure("merged Issue also has an open same-head PR")
         emit_finding(
@@ -1478,13 +1448,40 @@ def ensure_issue_pr(
     config: Config,
     *,
     expected_base_sha: str,
-    may_initialize_inline_identity: bool = False,
+    reconcile_plan_owned_inline_identity: bool = False,
 ) -> PullRequestState:
     local = repo.require_current_branch(issue.branch)
     assert local.local_sha is not None
     feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
     assert feature.remote_sha is not None
+    reconciled_pr_number: int | None = None
+    if reconcile_plan_owned_inline_identity and issue.task_fingerprint is not None:
+        assert issue.task_id is not None
+        reconciled = recover_issue_driven_work_item_topology(
+            repo=str(config.repo),
+            integration_branch=config.integration_branch,
+            issue=(issue.label, issue.branch, issue.task_fingerprint),
+            command_timeout_seconds=COMMAND_TIMEOUT,
+        )
+        if (
+            reconciled.classification != "recoverable"
+            or reconciled.feature_sha != feature.remote_sha
+            or reconciled.integration_sha != expected_base_sha
+        ):
+            raise WorkerFailure(
+                f"{issue.label} topology changed while reconciling its "
+                "plan-owned PR identity"
+            )
+        reconciled_pr_number = reconciled.open_pr_number
     pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
+    if (
+        reconcile_plan_owned_inline_identity
+        and issue.task_fingerprint is not None
+        and (pr.number if pr is not None else None) != reconciled_pr_number
+    ):
+        raise WorkerFailure(
+            f"{issue.label} PR identity changed after fingerprint reconciliation"
+        )
     if pr is None:
         pr = github.create_draft_pr(
             head=issue.branch,
@@ -1504,20 +1501,8 @@ def ensure_issue_pr(
         expected_base_sha=expected_base_sha,
         draft=True,
     )
-    if (
-        may_initialize_inline_identity
-        and issue.task_fingerprint is not None
-        and inline_task_pr_fingerprint(current) is None
-    ):
-        current = github.update_pr_body(
-            current.number,
-            body=with_inline_task_pr_identity(current, issue),
-            expected_head=issue.branch,
-            expected_head_sha=feature.remote_sha,
-            expected_base=config.integration_branch,
-            expected_base_sha=expected_base_sha,
-        )
-    return require_inline_task_pr_identity(current, issue)
+    require_inline_task_pr_fingerprint(current, issue.task_fingerprint)
+    return current
 
 
 def merge_pr_and_advance(
@@ -1912,7 +1897,7 @@ def process_issue(
         issue,
         config,
         expected_base_sha=integration.remote_sha,
-        may_initialize_inline_identity=existing_pr is None,
+        reconcile_plan_owned_inline_identity=existing_pr is None,
     )
     emit_issue_navigation(
         issue.result_id,

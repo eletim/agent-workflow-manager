@@ -96,7 +96,7 @@ def classify_issue_topology(
     integration_branch: str,
     integration_sha: str,
     inline_task_fingerprint: str | None = None,
-    _allow_missing_inline_task_fingerprint: bool = False,
+    _allow_repair_inline_task_fingerprint: bool = False,
 ) -> IssueTopologyState:
     """Classify one Issue from authoritative remote Git and GitHub state."""
     try:
@@ -117,15 +117,15 @@ def classify_issue_topology(
                 f"ambiguous PR states from {branch} to {integration_branch}: {numbers}"
             )
         for pr in matching:
-            _require_inline_task_fingerprint(
-                pr,
-                inline_task_fingerprint,
-                allow_missing=(
-                    _allow_missing_inline_task_fingerprint
-                    and pr.state == "OPEN"
-                    and pr.is_draft
-                ),
-            )
+            if (
+                _allow_repair_inline_task_fingerprint
+                and inline_task_fingerprint is not None
+                and pr.state == "OPEN"
+                and pr.is_draft
+            ):
+                reconcile_inline_task_pr_body(pr, inline_task_fingerprint)
+            else:
+                require_inline_task_pr_fingerprint(pr, inline_task_fingerprint)
         if closed_pr is not None:
             raise WorkerFailure(
                 f"closed unmerged PR #{closed_pr.number} exists from {branch} "
@@ -157,8 +157,8 @@ def classify_issue_topology(
             )
 
         if open_pr is not None:
-            missing_inline_task_fingerprint = (
-                _allow_missing_inline_task_fingerprint
+            repairable_inline_task_fingerprint = (
+                _allow_repair_inline_task_fingerprint
                 and inline_task_fingerprint is not None
                 and _inline_task_fingerprints(open_pr.body)
                 != (inline_task_fingerprint,)
@@ -170,7 +170,7 @@ def classify_issue_topology(
                 state="OPEN",
                 expected_head_sha=feature_sha,
                 expected_base_sha=integration_sha,
-                draft=True if missing_inline_task_fingerprint else None,
+                draft=True if repairable_inline_task_fingerprint else None,
             )
         if merged_pr is not None:
             pull_requests.require_pr(
@@ -234,23 +234,73 @@ def _inline_task_fingerprints(body: str) -> tuple[str, ...]:
     return (marker[len(prefix) : -len(suffix)],)
 
 
-def _require_inline_task_fingerprint(
-    pr: PullRequestState, expected: str | None, *, allow_missing: bool = False
+def _inline_task_marker_spans(body: str) -> tuple[tuple[int, int], ...]:
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    starts = tuple(match.start() for match in re.finditer(re.escape(prefix), body))
+    spans: list[tuple[int, int]] = []
+    for start in starts:
+        comment_end = body.find("-->", start + len(prefix))
+        if comment_end >= 0:
+            end = comment_end + len("-->")
+        else:
+            line_ends = tuple(
+                position
+                for position in (body.find("\r", start), body.find("\n", start))
+                if position >= 0
+            )
+            end = min(line_ends, default=len(body))
+        spans.append((start, end))
+    return tuple(spans)
+
+
+def require_inline_task_pr_fingerprint(
+    pr: PullRequestState, expected: str | None
 ) -> None:
+    """Require exactly one canonical plan-owned fingerprint marker."""
     if expected is None:
         return
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    markers = tuple(
-        line.strip() for line in pr.body.splitlines() if line.strip().startswith(prefix)
-    )
+    markers = _inline_task_marker_spans(pr.body)
     if _inline_task_fingerprints(pr.body) == (expected,) and len(markers) == 1:
-        return
-    if allow_missing and not markers:
         return
     raise WorkerFailure(
         f"PR #{pr.number} inline task fingerprint is missing or does not match "
         "the declared task"
     )
+
+
+def reconcile_inline_task_pr_body(pr: PullRequestState, expected: str) -> str:
+    """Return a body with one canonical plan-owned fingerprint marker."""
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    suffix = " -->"
+    spans = _inline_task_marker_spans(pr.body)
+    if len(spans) > 1:
+        raise WorkerFailure(
+            f"PR #{pr.number} inline task fingerprint is ambiguous or does not "
+            "match the declared task"
+        )
+    canonical = f"{prefix}{expected}{suffix}"
+    if spans:
+        start, end = spans[0]
+        candidate = pr.body[start + len(prefix) : end]
+        fingerprints = tuple(
+            match.group()
+            for match in re.finditer(
+                r"(?<![0-9a-f])[0-9a-f]{64}(?=$|\s|-->)", candidate
+            )
+        )
+        if any(fingerprint != expected for fingerprint in fingerprints):
+            raise WorkerFailure(
+                f"PR #{pr.number} inline task fingerprint does not match "
+                "the declared task"
+            )
+        line_end = pr.body.find("\n")
+        first_line_end = len(pr.body) if line_end < 0 else line_end
+        if start == 0 and not pr.body[end:first_line_end].strip():
+            return f"{canonical}{pr.body[end:]}"
+        remaining = f"{pr.body[:start]}{pr.body[end:]}"
+    else:
+        remaining = pr.body
+    return f"{canonical}\n\n{remaining}" if remaining else canonical
 
 
 def _commit_is_contained(
@@ -271,7 +321,7 @@ def inspect_issue_driven_topology(
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
     defer_inline_task_fingerprints: bool = False,
-    _allow_missing_inline_task_fingerprints: bool = False,
+    _allow_repair_inline_task_fingerprints: bool = False,
     _cwd: Path | None = None,
 ) -> tuple[IssueTopologyState, ...]:
     """Inspect all Issue branches and PRs before any workflow mutation."""
@@ -372,8 +422,8 @@ def inspect_issue_driven_topology(
                 if defer_inline_task_fingerprints and isinstance(number, str)
                 else fingerprint
             ),
-            _allow_missing_inline_task_fingerprint=(
-                _allow_missing_inline_task_fingerprints and isinstance(number, str)
+            _allow_repair_inline_task_fingerprint=(
+                _allow_repair_inline_task_fingerprints and isinstance(number, str)
             ),
         )
         for number, branch, fingerprint in normalized
@@ -424,14 +474,14 @@ def recover_issue_driven_work_item_topology(
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
 ) -> IssueTopologyState:
-    """Recover a dispatched inline item whose exact open PR lacks its marker."""
+    """Reconcile a dispatched inline item's marker on its exact open PR."""
     state = inspect_issue_driven_topology(
         repo=repo,
         integration_branch=integration_branch,
         issues=(issue,),
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
-        _allow_missing_inline_task_fingerprints=True,
+        _allow_repair_inline_task_fingerprints=True,
     )[0]
     label, branch, fingerprint = issue
     if (
@@ -470,12 +520,11 @@ def recover_issue_driven_work_item_topology(
             f"{label}: recoverable open PR #{state.open_pr_number} changed or disappeared"
         ) from exc
     try:
-        _require_inline_task_fingerprint(current, fingerprint)
+        require_inline_task_pr_fingerprint(current, fingerprint)
         return state
     except WorkerFailure:
-        _require_inline_task_fingerprint(current, fingerprint, allow_missing=True)
-    marker = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}{fingerprint} -->"
-    body = f"{marker}\n\n{current.body}" if current.body else marker
+        pass
+    body = reconcile_inline_task_pr_body(current, fingerprint)
     updated = github.update_pr_body(
         current.number,
         body=body,
@@ -485,7 +534,7 @@ def recover_issue_driven_work_item_topology(
         expected_base_sha=state.integration_sha,
         draft=True,
     )
-    _require_inline_task_fingerprint(updated, fingerprint)
+    require_inline_task_pr_fingerprint(updated, fingerprint)
     emit_finding(
         "github",
         f"{label}: restored missing inline task fingerprint on PR #{current.number}",
