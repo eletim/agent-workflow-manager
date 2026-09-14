@@ -1347,7 +1347,9 @@ Issue identifies a policy Issue, use that version-design context; the
 implementation work item remains authoritative when they conflict, and report the
 conflict as a warning. Do not focus on detailed implementation bugs in this
 phase. Do not mutate files or PR state. Return APPROVED or CHANGES_REQUESTED
-first, followed by actionable findings."""
+first, followed by actionable findings. Never change the checkout: do not run
+git checkout, git switch, git restore, gh pr checkout, git rebase, or git
+bisect. Inspect the diff with git diff, git show, or gh pr diff only."""
     correctness_review = context + f"""Perform only the Correctness Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement}
@@ -1357,7 +1359,10 @@ cases, state and lifecycle consistency, error handling, races or stale state,
 Git/GitHub topology, regressions, missing tests, cleanup and resource ownership,
 and security or secret handling. Do not reopen scope preferences unless they
 cause a concrete correctness problem. Do not mutate files or PR state. Return
-APPROVED or CHANGES_REQUESTED first, followed by actionable findings."""
+APPROVED or CHANGES_REQUESTED first, followed by actionable findings. Never
+change the checkout: do not run git checkout, git switch, git restore, gh pr
+checkout, git rebase, or git bisect. Inspect the diff with git diff, git show,
+or gh pr diff only."""
     return implementation, scope_review, correctness_review
 
 

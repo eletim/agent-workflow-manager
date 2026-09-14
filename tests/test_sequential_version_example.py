@@ -481,6 +481,13 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
     assert "policy Issue" in scope_review
     assert "functional behavior" in correctness_review
     assert "Do not reopen scope preferences" in correctness_review
+    checkout_guard = (
+        "Never change the checkout: do not run git checkout, git switch, git restore, "
+        "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
+        "git show, or gh pr diff only."
+    )
+    assert checkout_guard in scope_review.replace("\n", " ")
+    assert checkout_guard in correctness_review.replace("\n", " ")
     assert "Reuse the existing implementation where appropriate" in principle
     assert "minimum required for this Issue" in principle
     assert "mixing responsibilities unnaturally" in principle

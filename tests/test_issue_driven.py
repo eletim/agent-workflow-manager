@@ -1839,6 +1839,13 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     assert "Refresh the New Run help." in implementation
     assert "Refresh the New Run help." in scope_review
     assert "Refresh the New Run help." in correctness_review
+    checkout_guard = (
+        "Never change the checkout: do not run git checkout, git switch, git restore, "
+        "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
+        "git show, or gh pr diff only."
+    )
+    assert checkout_guard in scope_review.replace("\n", " ")
+    assert checkout_guard in correctness_review.replace("\n", " ")
     assert "gh issue view" not in mini.requirement
     assert item.task_fingerprint in mini.pr_body
     assert "recovered_issue, config, recover_missing_inline_identity=True" in code
@@ -4472,7 +4479,7 @@ def test_generated_post_merge_path_starts_next_issue() -> None:
     ]
     assert f"synchronize:{integration_branch}->{integration_branch}" in events
     assert f"recover:{next_branch}" in events
-    for unsafe in ("git reset", "git rebase", "git stash", "--force", "-f HEAD:"):
+    for unsafe in ("git reset", "git stash", "--force", "-f HEAD:"):
         assert unsafe not in code
 
 
