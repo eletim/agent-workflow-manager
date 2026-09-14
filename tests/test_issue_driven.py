@@ -269,6 +269,7 @@ def test_issue_topology_rejects_closed_unmerged_pr() -> None:
     ("state", "body"),
     [
         ("OPEN", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->"),
+        ("OPEN", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64}"),
         ("MERGED", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->"),
         (
             "OPEN",
@@ -303,18 +304,26 @@ def test_inline_task_topology_rejects_pr_fingerprint_mismatch(
             integration_branch="dev/v1",
             integration_sha="b" * 40,
             inline_task_fingerprint=expected,
-            _allow_missing_inline_task_fingerprint=True,
+            _allow_repair_inline_task_fingerprint=True,
         )
 
 
-def test_inline_task_topology_allows_only_completely_missing_open_fingerprint() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Implementation summary",
+        "<!-- agent-workflow-manager:inline-task-sha256:not-a-fingerprint -->\n\n"
+        "Implementation summary",
+    ],
+)
+def test_inline_task_topology_allows_repairable_open_fingerprint(body: str) -> None:
     expected = "a" * 64
     branch = "feature/work-item-refresh-run-help"
     repository = SimpleNamespace(
         inspect_branch=lambda _branch: BranchState(branch, None, "f" * 40, False)
     )
     github = TopologyGitHub(
-        (topology_pr(head_branch=branch, body="Implementation summary"),),
+        (topology_pr(head_branch=branch, body=body),),
         {("b" * 40, "f" * 40)},
     )
 
@@ -327,7 +336,7 @@ def test_inline_task_topology_allows_only_completely_missing_open_fingerprint() 
         integration_branch="dev/v1",
         integration_sha="b" * 40,
         inline_task_fingerprint=expected,
-        _allow_missing_inline_task_fingerprint=True,
+        _allow_repair_inline_task_fingerprint=True,
     )
 
     assert result.classification == "recoverable"
@@ -355,16 +364,24 @@ def test_inline_task_topology_rejects_ready_pr_with_missing_fingerprint() -> Non
             integration_branch="dev/v1",
             integration_sha=pr.base_sha,
             inline_task_fingerprint="a" * 64,
-            _allow_missing_inline_task_fingerprint=True,
+            _allow_repair_inline_task_fingerprint=True,
         )
 
 
-def test_recover_inline_task_topology_restores_missing_fingerprint(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Implementation summary",
+        "<!-- agent-workflow-manager:inline-task-sha256:invalid -->\n\n"
+        "Implementation summary",
+    ],
+)
+def test_recover_inline_task_topology_repairs_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, body: str
 ) -> None:
     fingerprint = "a" * 64
     branch = "feature/work-item-refresh-run-help"
-    pr = topology_pr(head_branch=branch, body="Implementation summary")
+    pr = topology_pr(head_branch=branch, body=body)
     state = issue_driven.IssueTopologyState(
         "Mini task refresh-run-help",
         branch,
@@ -420,6 +437,34 @@ def test_recover_inline_task_topology_restores_missing_fingerprint(
         f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
         "\n\nImplementation summary"
     ]
+
+
+def test_inline_task_topology_rejects_ambiguous_malformed_fingerprints() -> None:
+    branch = "feature/work-item-refresh-run-help"
+    pr = topology_pr(
+        head_branch=branch,
+        body=(
+            "<!-- agent-workflow-manager:inline-task-sha256:invalid -->\n"
+            "<!-- agent-workflow-manager:inline-task-sha256:also-invalid -->"
+        ),
+    )
+    repository = SimpleNamespace(
+        inspect_branch=lambda _branch: BranchState(branch, None, pr.head_sha, False)
+    )
+    github = TopologyGitHub((pr,), {(pr.base_sha, pr.head_sha)})
+
+    with pytest.raises(WorkerFailure, match="inline task fingerprint"):
+        classify_issue_topology(
+            repository,
+            github,
+            github,
+            issue="Mini task refresh-run-help",
+            branch=branch,
+            integration_branch="dev/v1",
+            integration_sha=pr.base_sha,
+            inline_task_fingerprint="a" * 64,
+            _allow_repair_inline_task_fingerprint=True,
+        )
 
 
 def test_recover_inline_task_topology_accepts_ready_pr_with_fingerprint(
