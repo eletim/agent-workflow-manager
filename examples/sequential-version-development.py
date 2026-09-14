@@ -635,6 +635,7 @@ _REVIEW_FIX_DISPOSITIONS = {
     "no_change_after_re_evaluation",
     "review_limit_reached",
     "reviewer_changed_head",
+    "head_changed_before_disposition",
 }
 
 
@@ -643,9 +644,13 @@ def decision(result: str) -> str:
 
 
 _SENSITIVE_REVIEW_TEXT = re.compile(
-    r"(?i)(authorization\s*:|bearer\s+|password\s*[:=]|token\s*[:=]|"
-    r"secret\s*[:=]|api[_-]?key\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"github_pat_|gh[pousr]_|sk-[a-z0-9])"
+    r"(?i)(authorization\s*:|bearer\s+|"
+    r"\b(?:password|passphrase|secret|token|credential|api[_ -]?key|"
+    r"access[_ -]?key)\b\s*(?:is|was|[:=])\s*\S+|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:AKIA|ASIA)[0-9A-Z]{16}|"
+    r"AIza[0-9A-Za-z_-]{35}|github_pat_|gh[pousr]_|glpat-|"
+    r"xox[baprs]-|sk_(?:live|test)_|sk-[a-z0-9]|"
+    r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)"
 )
 _RAW_LOG_LINE = re.compile(
     r"^(?:\$\s|Traceback \(most recent call last\):|\d{4}-\d\d-\d\d[ T]"
@@ -990,6 +995,54 @@ def review_audit_disposition(
         fix_sha,
     )
     return persist_review_audit(github, pr, updated, head=head, base=base)
+
+
+def review_audit_dispositions(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    audit_ids: tuple[str, ...],
+    disposition: str,
+    *,
+    head: str,
+    base: str,
+    fix_sha: str | None = None,
+) -> PullRequestState:
+    """Apply one transition to a set of records without duplicating updates."""
+    for audit_id in dict.fromkeys(audit_ids):
+        pr = review_audit_disposition(
+            github,
+            pr,
+            audit_id,
+            disposition,
+            head=head,
+            base=base,
+            fix_sha=fix_sha,
+        )
+    return pr
+
+
+def reconcile_review_audits_after_head_change(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    *,
+    head: str,
+    base: str,
+) -> PullRequestState:
+    """Recover audit transitions interrupted after delivery changed the PR head."""
+    pending = tuple(
+        record.audit_id
+        for record in review_audit_from_body(pr.body)
+        if record.fix_disposition == "pending" and record.reviewed_sha != pr.head_sha
+    )
+    return review_audit_dispositions(
+        github,
+        pr,
+        pending,
+        "head_changed_before_disposition",
+        head=head,
+        base=base,
+        fix_sha=pr.head_sha,
+    )
 
 
 def policy_context(
@@ -1994,6 +2047,12 @@ def review_issue_phase(
     restart_scope_on_change: bool = False,
 ) -> IssueReviewPhaseResult:
     """Run one independently counted Issue review/fix phase."""
+    pr = reconcile_review_audits_after_head_change(
+        github,
+        pr,
+        head=issue.branch,
+        base=config.integration_branch,
+    )
     if review_offset >= max_reviews:
         warning = (
             f"{issue.label} {phase} review limit {max_reviews} was already "
@@ -3261,6 +3320,12 @@ def review_whole_version(
     work_items: tuple[Issue, ...],
 ) -> tuple[PullRequestState, ReviewDelivery]:
     """Review, fix, and check the whole version as one outline-level phase."""
+    pr = reconcile_review_audits_after_head_change(
+        github,
+        pr,
+        head=config.integration_branch,
+        base=config.main_branch,
+    )
     fixer = create_agent(
         client,
         config,
@@ -3353,10 +3418,11 @@ def review_whole_version(
                     draft=True,
                 )
                 pr = ensure_base_pr_policy_notes(github, pr, config)
-                pr = review_audit_disposition(
+                pr = review_audit_dispositions(
                     github,
                     pr,
-                    scenario_audit.audit_id,
+                    tuple(requested_change_audits)
+                    + (scenario_audit.audit_id,),
                     "reviewer_changed_head",
                     head=config.integration_branch,
                     base=config.main_branch,
@@ -3433,10 +3499,11 @@ def review_whole_version(
                 draft=True,
             )
             pr = ensure_base_pr_policy_notes(github, pr, config)
-            pr = review_audit_disposition(
+            pr = review_audit_dispositions(
                 github,
                 pr,
-                principles_audit.audit_id,
+                tuple(requested_change_audits)
+                + (principles_audit.audit_id,),
                 "reviewer_changed_head",
                 head=config.integration_branch,
                 base=config.main_branch,
@@ -3501,16 +3568,18 @@ def review_whole_version(
                 draft=True,
             )
             pr = ensure_base_pr_policy_notes(github, pr, config)
-            if whole_audit is not None:
-                pr = review_audit_disposition(
-                    github,
-                    pr,
-                    whole_audit.audit_id,
-                    "reviewer_changed_head",
-                    head=config.integration_branch,
-                    base=config.main_branch,
-                    fix_sha=reviewed_sha,
-                )
+            current_audits = (
+                (whole_audit.audit_id,) if whole_audit is not None else ()
+            )
+            pr = review_audit_dispositions(
+                github,
+                pr,
+                tuple(requested_change_audits) + current_audits,
+                "reviewer_changed_head",
+                head=config.integration_branch,
+                base=config.main_branch,
+                fix_sha=reviewed_sha,
+            )
             emit_finding(
                 "git",
                 "whole-version review changed the integration branch; "
@@ -3573,10 +3642,10 @@ def review_whole_version(
                 draft=True,
             )
             pr = ensure_base_pr_policy_notes(github, pr, config)
-            pr = review_audit_disposition(
+            pr = review_audit_dispositions(
                 github,
                 pr,
-                version_audit.audit_id,
+                tuple(requested_change_audits) + (version_audit.audit_id,),
                 "reviewer_changed_head",
                 head=config.integration_branch,
                 base=config.main_branch,

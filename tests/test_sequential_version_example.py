@@ -89,6 +89,16 @@ def keep_review_audit_in_memory(
     )
     monkeypatch.setitem(
         globals_,
+        "review_audit_dispositions",
+        lambda _github, pr, _audit_ids, _disposition, **_kwargs: pr,
+    )
+    monkeypatch.setitem(
+        globals_,
+        "reconcile_review_audits_after_head_change",
+        lambda _github, pr, **_kwargs: pr,
+    )
+    monkeypatch.setitem(
+        globals_,
         "new_review_audit",
         lambda role, round_number, verdict, reviewed_sha, _result: workflow[
             "ReviewAuditRecord"
@@ -298,6 +308,10 @@ def test_decision_accepts_exact_structured_review_response(verdict: str) -> None
         '{"verdict":"APPROVED","findings":"none","policy_conflicts":[]}',
         review_result("APPROVED", ("$ printenv",)),
         review_result("APPROVED", ("token=secret-value",)),
+        review_result(
+            "APPROVED", ("AWS credential AKIAIOSFODNN7EXAMPLE was printed.",)
+        ),
+        review_result("APPROVED", ("The password is hunter2; rotate it.",)),
         review_result("APPROVED", ("a\nraw log",)),
         review_result("APPROVED", ("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",)),
         review_result("APPROVED", ("界" * 100,)),
@@ -656,6 +670,102 @@ def test_review_audit_persists_on_exact_draft_pr_and_updates_same_record() -> No
     assert recovered == (
         replace(record, fix_disposition="fixed", fix_sha="fixed-head"),
     )
+
+
+def test_later_reviewer_head_change_invalidates_every_earlier_pending_finding() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    scenario = workflow["new_review_audit"](
+        "scenario_gate",
+        1,
+        "CHANGES_REQUESTED",
+        pr.head_sha,
+        review_result("CHANGES_REQUESTED", ("Correct the scenario behavior.",)),
+    )
+    principles = workflow["new_review_audit"](
+        "design_principles", 1, "APPROVED", pr.head_sha, review_result()
+    )
+    pr = replace(
+        pr,
+        head_sha="principles-reviewer-head",
+        body=workflow["with_review_audit"](
+            workflow["with_review_audit"]("Base PR.", scenario), principles
+        ),
+    )
+
+    class GitHub:
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal pr
+            assert number == pr.number
+            assert kwargs["expected_head_sha"] == "principles-reviewer-head"
+            pr = replace(pr, body=body)
+            return pr
+
+    pr = workflow["review_audit_dispositions"](
+        GitHub(),
+        pr,
+        (scenario.audit_id, principles.audit_id),
+        "reviewer_changed_head",
+        head="dev/v1",
+        base="main",
+        fix_sha=pr.head_sha,
+    )
+
+    records = workflow["review_audit_from_body"](pr.body)
+    assert [record.fix_disposition for record in records] == [
+        "reviewer_changed_head",
+        "reviewer_changed_head",
+    ]
+    assert all(record.fix_sha == "principles-reviewer-head" for record in records)
+
+
+def test_pending_audits_recover_after_push_before_disposition_update() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    pr = open_pr(head="feature/issue-1", base="dev/v1", draft=True)
+    first = workflow["new_review_audit"](
+        "scope_design",
+        1,
+        "CHANGES_REQUESTED",
+        "reviewed-head",
+        review_result("CHANGES_REQUESTED", ("Narrow the implementation scope.",)),
+    )
+    second = workflow["new_review_audit"](
+        "correctness",
+        1,
+        "CHANGES_REQUESTED",
+        "reviewed-head",
+        review_result("CHANGES_REQUESTED", ("Handle the missing failure case.",)),
+    )
+    body = workflow["with_review_audit"]("Child PR.", first)
+    body = workflow["with_review_audit"](body, second)
+    body = workflow["with_review_audit"](
+        body, replace(first, fix_disposition="fixed", fix_sha="pushed-fix")
+    )
+    pr = replace(pr, head_sha="pushed-fix", body=body)
+    updates = 0
+
+    class GitHub:
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal pr, updates
+            assert number == pr.number
+            assert kwargs["expected_head_sha"] == "pushed-fix"
+            updates += 1
+            pr = replace(pr, body=body)
+            return pr
+
+    github = GitHub()
+    pr = workflow["reconcile_review_audits_after_head_change"](
+        github, pr, head="feature/issue-1", base="dev/v1"
+    )
+    pr = workflow["reconcile_review_audits_after_head_change"](
+        github, pr, head="feature/issue-1", base="dev/v1"
+    )
+
+    records = workflow["review_audit_from_body"](pr.body)
+    assert updates == 1
+    assert records[0].fix_disposition == "fixed"
+    assert records[1].fix_disposition == "head_changed_before_disposition"
+    assert records[1].fix_sha == "pushed-fix"
 
 
 def test_review_audit_rejects_ambiguous_managed_markers() -> None:
@@ -2520,6 +2630,93 @@ def test_changed_design_principles_reviewer_invalidates_and_repeats_whole_review
     ]
     assert initial_sha in prompts[0]
     assert changed_sha in prompts[1]
+
+
+def test_changed_later_reviewer_disposes_earlier_role_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    make_audit = workflow["new_review_audit"]
+    keep_review_audit_in_memory(workflow, monkeypatch)
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    initial_sha = "integration-head"
+    changed_sha = "principles-reviewer-head"
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha=initial_sha,
+    )
+    audit_roles: dict[str, str] = {}
+    invalidated_roles: list[tuple[str, ...]] = []
+
+    def tracked_audit(*args: object, **kwargs: object):
+        record = make_audit(*args, **kwargs)
+        audit_roles[record.audit_id] = record.role
+        return record
+
+    def dispositions(
+        _github, pr, audit_ids: tuple[str, ...], disposition: str, **_kwargs
+    ):
+        assert disposition == "reviewer_changed_head"
+        invalidated_roles.append(tuple(audit_roles[audit_id] for audit_id in audit_ids))
+        return pr
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            return BranchState(branch, expected_local_sha, expected_local_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            nonlocal current_pr
+            current_pr = replace(current_pr, head_sha=str(kwargs["expected_head_sha"]))
+            return current_pr
+
+    scenario_reviews = 0
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        nonlocal scenario_reviews
+        if str(args[2]) == "Scenario Gate reviewer turn":
+            scenario_reviews += 1
+            if scenario_reviews == 1:
+                return review_result(
+                    "CHANGES_REQUESTED", ("Correct the scenario behavior.",)
+                )
+        return review_result()
+
+    agent_results = iter(
+        (
+            (initial_sha, False),
+            (changed_sha, True),
+            (changed_sha, False),
+            (changed_sha, False),
+            (changed_sha, False),
+            (changed_sha, False),
+            (changed_sha, False),
+        )
+    )
+    monkeypatch.setitem(workflow_globals, "SCENARIOS", ("scenario",))
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "new_review_audit", tracked_audit)
+    monkeypatch.setitem(workflow_globals, "review_audit_dispositions", dispositions)
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: next(agent_results),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    _, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current_pr, config.issues
+    )
+
+    assert delivery.outcome == "approved"
+    assert invalidated_roles == [("scenario_gate", "design_principles")]
 
 
 def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
