@@ -2070,11 +2070,15 @@ def planner_prompt(plan: WorkItemPlan, config: Config) -> str:
     if config.one_shot_issue is not None:
         one_shot_context = f"""This is a one-shot run sourced from GitHub Issue
 #{config.one_shot_issue}. Before deciding, read it with `gh issue view
-{config.one_shot_issue} --repo {config.slug}`. Manage its delivery by decomposing
-the remaining work into short inline mini tasks. Each task must state its purpose
-and any non-negotiable design decision, while leaving implementation detail to
-the implementer. Do not create GitHub Issues or implement the source Issue as one
-undivided work item. Numeric Issue additions are invalid in one-shot mode.
+{config.one_shot_issue} --repo {config.slug}` and read
+`docs/design-principles.md` from the current integration branch with `git show
+{config.integration_branch}:docs/design-principles.md`. Use that document as the
+canonical source when decomposing or refining work. Manage delivery by
+decomposing the remaining work into short inline mini tasks. Each task must state
+its purpose and any non-negotiable design decision, while leaving implementation
+detail to the implementer. Do not create GitHub Issues or implement the source
+Issue as one undivided work item. Numeric Issue additions are invalid in one-shot
+mode.
 
 """
     return f"""Review the workflow-owned work-item plan before its next dispatch.
