@@ -628,7 +628,7 @@ test("checked run deletion stops when confirmation is cancelled", async () => {
   assert.match(selectedRun(elements).textContent, /#1/);
 });
 
-test("checked run deletion confirms cleanup for every checked run", async () => {
+test("checked run deletion removes every checked run regardless of cleanup state", async () => {
   const retained = {
     runId: 1, state: "success", cwd: "/work/one", checked: true,
     resourceCleanupStatus: "retained",
@@ -669,7 +669,7 @@ test("checked run deletion confirms cleanup for every checked run", async () => 
   assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
   await elements["delete-checked-runs"].dispatch("click");
   assert.deepEqual(confirmations, [
-    "Cleanup owned resources, then delete 2 checked runs from local history? If any cleanup cannot be completed, all run history will be preserved.",
+    "Delete 2 checked runs from local history?",
   ]);
   assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
   assert.equal(

@@ -2259,7 +2259,7 @@ class PythonRunner:
             return self._snapshot_run(run)
 
     def delete_checked_runs(self, confirmed_run_ids: Sequence[int]) -> tuple[int, ...]:
-        """Clean owned resources, then delete all confirmed checked history."""
+        """Delete all confirmed checked history without cleaning resources."""
         run_ids = tuple(confirmed_run_ids)
         if any(
             isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1
@@ -2289,50 +2289,6 @@ class PythonRunner:
                 raise RunDeletionNotAllowedError(
                     "cleanup is active for confirmed run(s): "
                     + ", ".join(str(run_id) for run_id in cleaning_run_ids)
-                )
-            cleanup_run_ids = tuple(
-                run_id
-                for run_id in checked_terminal_run_ids
-                if any(
-                    resource.cleanup_state != "cleaned"
-                    for resource in self._runs[run_id].resources
-                )
-            )
-
-        for run_id in cleanup_run_ids:
-            try:
-                self.cleanup(run_id)
-            except (
-                RunCleanupInProgressError,
-                RunCleanupNotAllowedError,
-                RunNotFoundError,
-            ) as exc:
-                raise RunDeletionNotAllowedError(str(exc)) from exc
-
-        with self._lock:
-            checked_terminal_run_ids = tuple(
-                run.run_id
-                for run in self._runs.values()
-                if run.checked and run.state in ("success", "failed", "stopped")
-            )
-            if confirmed_run_id_set != set(checked_terminal_run_ids):
-                raise RunDeletionNotAllowedError(
-                    "checked terminal runs changed during cleanup; refresh and confirm "
-                    "deletion again"
-                )
-            incomplete_run_ids = tuple(
-                run_id
-                for run_id in checked_terminal_run_ids
-                if any(
-                    resource.cleanup_state != "cleaned"
-                    for resource in self._runs[run_id].resources
-                )
-            )
-            if incomplete_run_ids:
-                raise RunDeletionNotAllowedError(
-                    "resource cleanup did not complete for confirmed run(s): "
-                    + ", ".join(str(run_id) for run_id in incomplete_run_ids)
-                    + "; history was preserved"
                 )
             if not checked_terminal_run_ids:
                 return ()
