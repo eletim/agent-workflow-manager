@@ -140,7 +140,7 @@ wheels = [
 
 [[package]]
 name = "purplemux-client"
-version = "0.3.11"
+version = "0.3.12"
 source = { editable = "." }
 dependencies = [
     { name = "qrcode" },

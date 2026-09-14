@@ -302,15 +302,49 @@ def test_canonical_workflow_logs_major_issue_driven_boundaries() -> None:
 @pytest.mark.parametrize("verdict", ["APPROVED", "CHANGES_REQUESTED"])
 def test_decision_accepts_exact_structured_review_response(verdict: str) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    findings = () if verdict == "APPROVED" else ("Actionable finding",)
 
-    assert (
-        workflow["decision"](review_result(verdict, ("Actionable finding",))) == verdict
-    )
+    assert workflow["decision"](review_result(verdict, findings)) == verdict
     assessment = workflow["review_assessment"](
-        review_result(verdict, ("Actionable finding",), ("Policy mismatch",))
+        review_result(verdict, findings, ("Policy mismatch",))
     )
-    assert assessment.findings == ("Actionable finding",)
+    assert assessment.findings == findings
     assert assessment.policy_conflicts == ("Policy mismatch",)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        review_result("APPROVED", ("Fix the boundary check.",)),
+        review_result("CHANGES_REQUESTED"),
+    ],
+)
+def test_decision_rejects_verdicts_inconsistent_with_findings(result: str) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+
+    with pytest.raises(WorkerFailure, match="APPROVED reviews must have no findings"):
+        workflow["decision"](result)
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        "Add an authorization check before updating the record.",
+        "Do not log credentials or tokens when authentication fails.",
+        "Store secrets through the configured credential provider.",
+        "Use bearer authentication only after validating the authorization header.",
+    ],
+)
+def test_review_findings_allow_security_vocabulary_without_values(
+    finding: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+
+    assessment = workflow["review_assessment"](
+        review_result("CHANGES_REQUESTED", (finding,))
+    )
+
+    assert assessment.findings == (finding,)
 
 
 @pytest.mark.parametrize(
@@ -321,28 +355,35 @@ def test_decision_accepts_exact_structured_review_response(verdict: str) -> None
         '{"verdict":"APPROVE","findings":[],"policy_conflicts":[]}',
         '{"verdict":"APPROVED","findings":[],"policy_conflicts":[],"extra":1}',
         '{"verdict":"APPROVED","findings":"none","policy_conflicts":[]}',
-        review_result("APPROVED", ("$ printenv",)),
-        review_result("APPROVED", ("token=secret-value",)),
+        review_result("CHANGES_REQUESTED", ("$ printenv",)),
+        review_result("CHANGES_REQUESTED", ("token=secret-value",)),
         review_result(
-            "APPROVED", ("AWS credential AKIAIOSFODNN7EXAMPLE was printed.",)
+            "CHANGES_REQUESTED",
+            ("AWS credential AKIAIOSFODNN7EXAMPLE was printed.",),
         ),
-        review_result("APPROVED", ("The password is hunter2; rotate it.",)),
-        review_result("APPROVED", ("client_secret=abc123 was logged; rotate it.",)),
+        review_result("CHANGES_REQUESTED", ("The password is hunter2; rotate it.",)),
         review_result(
-            "APPROVED",
+            "CHANGES_REQUESTED", ("client_secret=abc123 was logged; rotate it.",)
+        ),
+        review_result(
+            "CHANGES_REQUESTED",
             ("FAILED tests/test_api.py::test_auth - AssertionError: expected 401",),
         ),
-        review_result("APPROVED", ("npm ERR! code ERESOLVE while installing",)),
         review_result(
-            "APPROVED",
+            "CHANGES_REQUESTED", ("npm ERR! code ERESOLVE while installing",)
+        ),
+        review_result(
+            "CHANGES_REQUESTED",
             ("https://alice:hunter2@example.com was emitted in the error.",),
         ),
-        review_result("APPROVED", ("Credential hunter2 appeared in output.",)),
-        review_result("APPROVED", ("FAILED: test_auth expected 401 but got 200",)),
-        review_result("APPROVED", ("[ERROR] request headers were emitted",)),
-        review_result("APPROVED", ("a\nraw log",)),
-        review_result("APPROVED", ("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",)),
-        review_result("APPROVED", ("界" * 100,)),
+        review_result("CHANGES_REQUESTED", ("Credential hunter2 appeared in output.",)),
+        review_result(
+            "CHANGES_REQUESTED", ("FAILED: test_auth expected 401 but got 200",)
+        ),
+        review_result("CHANGES_REQUESTED", ("[ERROR] request headers were emitted",)),
+        review_result("CHANGES_REQUESTED", ("a\nraw log",)),
+        review_result("CHANGES_REQUESTED", ("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",)),
+        review_result("CHANGES_REQUESTED", ("界" * 100,)),
     ],
 )
 def test_decision_fails_closed_for_invalid_or_unsafe_results(result: str) -> None:
@@ -862,6 +903,69 @@ def test_review_audit_rejects_ambiguous_managed_markers() -> None:
         workflow["with_review_audit"](
             f"{body}\n{workflow['REVIEW_AUDIT_START']}", record
         )
+
+
+@pytest.mark.parametrize("placement", ["orphaned", "before", "after"])
+def test_review_audit_rejects_payload_outside_managed_section(
+    placement: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    record = workflow["new_review_audit"](
+        "whole_version", 1, "APPROVED", "head", review_result()
+    )
+    marker = (
+        f"<!-- {workflow['REVIEW_AUDIT_MARKER']}"
+        f"{workflow['_review_audit_payload']((record,))} -->"
+    )
+    if placement == "orphaned":
+        body = f"Base PR.\n\n{marker}"
+    elif placement == "before":
+        body = (
+            f"{marker}\n{workflow['REVIEW_AUDIT_START']}\n"
+            f"{workflow['REVIEW_AUDIT_END']}"
+        )
+    else:
+        body = (
+            f"{workflow['REVIEW_AUDIT_START']}\n{workflow['REVIEW_AUDIT_END']}\n"
+            f"{marker}"
+        )
+
+    with pytest.raises(WorkerFailure, match="review audit"):
+        workflow["with_review_audit"](body, record)
+
+
+@pytest.mark.parametrize(
+    ("verdict", "findings"),
+    [
+        ("APPROVED", ("Fix the boundary check.",)),
+        ("CHANGES_REQUESTED", ()),
+    ],
+)
+def test_review_audit_recovery_rejects_verdicts_inconsistent_with_findings(
+    verdict: str, findings: tuple[str, ...]
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    record_type = workflow["ReviewAuditRecord"]
+    record = record_type(
+        "0" * 32,
+        "whole_version",
+        1,
+        verdict,
+        "head",
+        findings,
+        "not_required" if verdict == "APPROVED" else "pending",
+    )
+    marker = (
+        f"<!-- {workflow['REVIEW_AUDIT_MARKER']}"
+        f"{workflow['_review_audit_payload']((record,))} -->"
+    )
+    body = (
+        f"{workflow['REVIEW_AUDIT_START']}\n### Review audit\n{marker}\n"
+        f"{workflow['REVIEW_AUDIT_END']}"
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid values"):
+        workflow["review_audit_from_body"](body)
 
 
 def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
@@ -3208,6 +3312,63 @@ def test_whole_failures_do_not_consume_version_readme_review_budget(
         "Whole-version reviewer turn",
         "Version / README reviewer turn",
         "Whole-version fixes",
+        "Design Principles reviewer turn",
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ]
+
+
+def test_scenario_gate_failure_does_not_skip_independent_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha="integration-head",
+    )
+    events: list[str] = []
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            return BranchState(branch, current_pr.head_sha, current_pr.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **_kwargs: object) -> PullRequestState:
+            return current_pr
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        name = str(args[2])
+        events.append(name)
+        if name == "Scenario Gate reviewer turn":
+            return "CHANGES_REQUESTED\nCorrect the scenario behavior."
+        return "APPROVED"
+
+    monkeypatch.setitem(workflow_globals, "SCENARIOS", ("scenario",))
+    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 1)
+    monkeypatch.setitem(
+        workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
+    )
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (current_pr.head_sha, False),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    _, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current_pr, config.issues
+    )
+
+    assert delivery.outcome == "continued_with_warning"
+    assert events == [
+        "Scenario Gate reviewer turn",
         "Design Principles reviewer turn",
         "Whole-version reviewer turn",
         "Version / README reviewer turn",

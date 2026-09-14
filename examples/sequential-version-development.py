@@ -644,9 +644,13 @@ def decision(result: str) -> str:
 
 
 _SENSITIVE_REVIEW_TEXT = re.compile(
-    r"(?i)(\b(?:authorization|bearer|password|passwd|passphrase|credential|"
-    r"secret|token|api[_ -]?key|access[_ -]?key)\b|"
-    r"[_-](?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\b|"
+    r"(?i)(\b(?:password|passwd|passphrase|credential|secret|token|"
+    r"api[_ -]?key|access[_ -]?key)\b\s*(?:=|:)\s*\S+|"
+    r"\b(?:password|passwd|passphrase|secret|token|credential)\b\s+"
+    r"(?:is|was)\s+\S+|"
+    r"\bcredential\b\s+\S+\s+(?:appeared|exposed|leaked|logged|printed)\b|"
+    r"\bbearer\s+(?=[A-Za-z0-9._~+/=-]{8,}\b)"
+    r"(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]+|"
     r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@[^\s/]+|"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:AKIA|ASIA)[0-9A-Z]{16}|"
     r"AIza[0-9A-Za-z_-]{35}|github_pat_|gh[pousr]_|glpat-|"
@@ -712,6 +716,11 @@ def review_assessment(result: str) -> ReviewAssessment:
                 "reviewer findings must be concise single-line actionable text "
                 "without logs or secret-like values"
             )
+    if (verdict == "APPROVED") != (not findings):
+        raise WorkerFailure(
+            "APPROVED reviews must have no findings and CHANGES_REQUESTED "
+            "reviews must have at least one finding"
+        )
     if (
         not isinstance(policy_conflicts, list)
         or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
@@ -750,16 +759,26 @@ def _review_audit_payload(records: tuple[ReviewAuditRecord, ...]) -> str:
 
 def review_audit_from_body(body: str) -> tuple[ReviewAuditRecord, ...]:
     prefix = f"<!-- {REVIEW_AUDIT_MARKER}"
-    markers = [
-        line.strip()
-        for line in body.splitlines()
-        if line.strip().startswith(prefix)
-    ]
-    if not markers:
+    starts = [match.start() for match in re.finditer(re.escape(REVIEW_AUDIT_START), body)]
+    ends = [match.start() for match in re.finditer(re.escape(REVIEW_AUDIT_END), body)]
+    payloads = [match.start() for match in re.finditer(re.escape(prefix), body)]
+    marker_matches = list(
+        re.finditer(rf"(?m)^[ \t]*{re.escape(prefix)}.*? -->[ \t]*$", body)
+    )
+    if not starts and not ends and not payloads:
         return ()
-    if len(markers) != 1 or not markers[0].endswith(" -->"):
+    if (
+        len(starts) != 1
+        or len(ends) != 1
+        or len(payloads) != 1
+        or len(marker_matches) != 1
+    ):
         raise WorkerFailure("PR has ambiguous review audit markers")
-    encoded = markers[0][len(prefix) : -len(" -->")]
+    marker_match = marker_matches[0]
+    if not starts[0] < marker_match.start() < marker_match.end() <= ends[0]:
+        raise WorkerFailure("PR has invalid review audit section markers")
+    marker = marker_match.group().strip()
+    encoded = marker[len(prefix) : -len(" -->")]
     try:
         source = base64.b64decode(encoded, validate=True).decode("utf-8")
         values = json.loads(source)
@@ -802,6 +821,7 @@ def review_audit_from_body(body: str) -> tuple[ReviewAuditRecord, ...]:
                 )
                 for finding in findings
             )
+            or (value["verdict"] == "APPROVED") != (not findings)
             or not isinstance(value["fix_disposition"], str)
             or value["fix_disposition"] not in _REVIEW_FIX_DISPOSITIONS
             or (
@@ -3651,34 +3671,33 @@ def review_whole_version(
                 f"approval invalidated at {principles_sha}",
             )
             continue
-        if verdict == "APPROVED":
-            result, verdict = run_validated_turn(
-                client,
-                reviewer,
-                "Whole-version reviewer turn",
-                policy_context(
-                    config,
-                    scope="the whole-version review",
-                    structured_conflicts=True,
-                )
-                + whole_version_review_prompt(pr, config, work_items),
-                decision,
-                iteration=review_number,
+        result, verdict = run_validated_turn(
+            client,
+            reviewer,
+            "Whole-version reviewer turn",
+            policy_context(
+                config,
+                scope="the whole-version review",
+                structured_conflicts=True,
             )
-            review_results.append(result)
-            changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
-            whole_audit = allocate_review_audit(
-                pr.body, "whole_version", verdict, pr.head_sha, result
-            )
-            pr = persist_review_audit(
-                github,
-                pr,
-                whole_audit,
-                head=config.integration_branch,
-                base=config.main_branch,
-            )
-            if verdict == "CHANGES_REQUESTED":
-                requested_change_audits.append(whole_audit.audit_id)
+            + whole_version_review_prompt(pr, config, work_items),
+            decision,
+            iteration=review_number,
+        )
+        review_results.append(result)
+        changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
+        whole_audit = allocate_review_audit(
+            pr.body, "whole_version", verdict, pr.head_sha, result
+        )
+        pr = persist_review_audit(
+            github,
+            pr,
+            whole_audit,
+            head=config.integration_branch,
+            base=config.main_branch,
+        )
+        if verdict == "CHANGES_REQUESTED":
+            requested_change_audits.append(whole_audit.audit_id)
         emit_policy_conflicts(result, config, scope="the integrated version")
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,

@@ -4022,7 +4022,7 @@ def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() 
     assert "policy_context(config, scope=issue.label)" in code
     assert 'policy_context(config, scope=f"fixes for {issue.label}")' in code
     assert (
-        'scope="the whole-version review",\n                    structured_conflicts=True'
+        'scope="the whole-version review",\n                structured_conflicts=True'
         in code
     )
     assert 'policy_context(config, scope="whole-version fixes")' in code
