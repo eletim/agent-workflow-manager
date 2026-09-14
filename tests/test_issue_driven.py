@@ -4021,7 +4021,10 @@ def test_policy_issue_is_read_first_by_design_roles_and_referenced_by_base_pr() 
     assert "Before doing anything else, run `gh issue view" in code
     assert "policy_context(config, scope=issue.label)" in code
     assert 'policy_context(config, scope=f"fixes for {issue.label}")' in code
-    assert 'policy_context(config, scope="the whole-version review")' in code
+    assert (
+        'scope="the whole-version review",\n                    structured_conflicts=True'
+        in code
+    )
     assert 'policy_context(config, scope="whole-version fixes")' in code
     assert "https://github.com/{config.slug}/issues/{config.policy_issue}" in code
     assert "ensure_base_pr_policy_notes(github, pr, config)" in code
