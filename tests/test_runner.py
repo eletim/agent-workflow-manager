@@ -220,7 +220,12 @@ def test_delete_checked_runs_removes_only_checked_terminal_history(
 def test_delete_checked_runs_rolls_back_when_history_cannot_be_saved(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run_id = runner.start("print('keep me')")
+    run_id = runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
+"""
+    )
     wait_for(runner, lambda item: item.state == "success", run_id=run_id)
     runner.set_checked(run_id, True)
 
@@ -232,6 +237,7 @@ def test_delete_checked_runs_rolls_back_when_history_cannot_be_saved(
         runner.delete_checked_runs((run_id,))
 
     assert runner.snapshot(run_id).checked is True
+    assert runner._cleanup_ownership == {}
 
 
 def test_delete_checked_runs_rejects_concurrent_cleanup(
@@ -282,7 +288,7 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     assert runner.delete_checked_runs((run_id,)) == (run_id,)
 
 
-def test_delete_checked_runs_cleans_retained_resources_before_deleting_history(
+def test_delete_checked_runs_retains_only_outstanding_resource_ownership(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_id = runner.start(
@@ -298,16 +304,32 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     monkeypatch.setattr(runner, "_cleanup_resource", cleaned_resources.append)
 
     assert runner.delete_checked_runs((run_id,)) == (run_id,)
+    assert cleaned_resources == []
+    with pytest.raises(runner_module.RunNotFoundError):
+        runner.snapshot(run_id)
+    ownership = runner._cleanup_ownership[run_id]
+    assert ownership.run_id == run_id
+    assert [(resource.kind, resource.identity) for resource in ownership.resources] == [
+        ("purplemux_tab", "tab-1")
+    ]
+
+    cleaned = runner.cleanup(run_id)
+    assert cleaned.resources[0].cleanup_state == "cleaned"
     assert [(resource.kind, resource.identity) for resource in cleaned_resources] == [
         ("purplemux_tab", "tab-1")
     ]
-    with pytest.raises(runner_module.RunNotFoundError):
-        runner.snapshot(run_id)
+    assert runner._cleanup_ownership == {}
 
 
-def test_delete_checked_runs_preserves_history_when_resource_cleanup_fails(
-    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+def test_deleted_run_history_does_not_return_after_runner_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
     run_id = runner.start(
         """
 from purplemux_client import register_run_resource
@@ -316,19 +338,52 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     )
     wait_for(runner, lambda item: item.state == "success", run_id=run_id)
     runner.set_checked(run_id, True)
+    retained_run_id = runner.start("print('retain me')")
+    wait_for(
+        runner,
+        lambda item: item.state == "success",
+        run_id=retained_run_id,
+    )
 
-    def fail_cleanup(_resource: RunResource) -> None:
-        raise OSError("still owned")
+    assert runner.delete_checked_runs((run_id,)) == (run_id,)
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    ownership_json = history["cleanupOwnership"][runner._run_identity(run_id)]
+    assert set(ownership_json) == {"runId", "resources"}
+    assert ownership_json["runId"] == run_id
+    assert ownership_json["resources"][0]["identity"] == "tab-1"
+    assert [run["runId"] for run in history["runs"].values()] == [retained_run_id]
+    runner.close()
 
-    monkeypatch.setattr(runner, "_cleanup_resource", fail_cleanup)
+    restored = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        assert [snapshot.run_id for snapshot in restored.snapshots()] == [
+            retained_run_id
+        ]
+        ownership = restored._cleanup_ownership[run_id]
+        assert ownership.resources[0].identity == "tab-1"
 
-    with pytest.raises(
-        runner_module.RunDeletionNotAllowedError, match="history was preserved"
-    ):
-        runner.delete_checked_runs((run_id,))
-    preserved = runner.snapshot(run_id)
-    assert preserved.checked is True
-    assert preserved.resources[0].cleanup_state == "cleanup_retryable"
+        monkeypatch.setattr(restored, "_cleanup_resource", lambda _resource: None)
+        restored.cleanup(run_id)
+        assert restored._cleanup_ownership == {}
+    finally:
+        restored.close()
+
+    reloaded = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    try:
+        assert [snapshot.run_id for snapshot in reloaded.snapshots()] == [
+            retained_run_id
+        ]
+        assert reloaded._cleanup_ownership == {}
+    finally:
+        reloaded.close()
 
 
 def test_checked_terminal_run_is_restored_after_runner_reconstruction(

@@ -158,7 +158,6 @@ let explicitNewRun = false;
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
 let checkedRunIds = [];
-let checkedRunDeletionRequiresCleanup = false;
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
@@ -849,9 +848,6 @@ function renderRunList(runs) {
   renderedRunIds = new Set(runs.map((run) => run.runId));
   const checkedRuns = runs.filter((run) => run.checked);
   checkedRunIds = checkedRuns.map((run) => run.runId);
-  checkedRunDeletionRequiresCleanup = checkedRuns.some(
-    (run) => run.resourceCleanupStatus !== "cleaned",
-  );
   const checkedRunCount = checkedRunIds.length;
   deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;
   deleteCheckedRunsButton.disabled = checkedRunCount === 0;
@@ -941,10 +937,7 @@ deleteCheckedRunsButton.addEventListener("click", async () => {
   if (count < 1) return;
   const confirmedRunIds = [...checkedRunIds];
   const noun = count === 1 ? "run" : "runs";
-  const confirmation = checkedRunDeletionRequiresCleanup
-    ? `Cleanup owned resources, then delete ${count} checked ${noun} from local history? If any cleanup cannot be completed, all run history will be preserved.`
-    : `Delete ${count} checked ${noun} from local history?`;
-  if (!window.confirm(confirmation)) return;
+  if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
 
   await withPendingButton(deleteCheckedRunsButton, async () => {
     try {
