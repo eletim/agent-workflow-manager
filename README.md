@@ -46,6 +46,11 @@ runtime dependency and none of its workflow framework is included here.
 The project's canonical design principles are maintained in
 [`docs/design-principles.md`](docs/design-principles.md).
 
+## Representative scenarios
+
+A small, stable set of typical uses and expected behavior is maintained in
+[`docs/representative-scenarios.md`](docs/representative-scenarios.md).
+
 ## Issue Driven mode
 
 The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts
