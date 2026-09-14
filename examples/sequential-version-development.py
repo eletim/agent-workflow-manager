@@ -643,12 +643,21 @@ def decision(result: str) -> str:
     return review_assessment(result).verdict
 
 
+_SECRET_LABEL = (
+    r"(?:password|passwd|passphrase|credential|secret|token|client[_ -]?secret|"
+    r"api[_ -]?key|access[_ -]?key)"
+)
+_SECRET_LITERAL = (
+    r"(?:\"[^\"\s]{4,}\"|'[^'\s]{4,}'|"
+    r"(?=[A-Za-z0-9_./+-]{4,}\b)(?=[A-Za-z0-9_./+-]*[A-Za-z])"
+    r"(?=[A-Za-z0-9_./+-]*\d)[A-Za-z0-9_./+-]+\b)"
+)
 _SENSITIVE_REVIEW_TEXT = re.compile(
-    r"(?i)(\b(?:password|passwd|passphrase|credential|secret|token|"
-    r"api[_ -]?key|access[_ -]?key)\b\s*(?:=|:)\s*\S+|"
-    r"\b(?:password|passwd|passphrase|secret|token|credential)\b\s+"
-    r"(?:is|was)\s+\S+|"
-    r"\bcredential\b\s+\S+\s+(?:appeared|exposed|leaked|logged|printed)\b|"
+    rf"(?i)(\b{_SECRET_LABEL}\b\s*(?:=|:)\s*\S+|"
+    rf"\b{_SECRET_LABEL}\b\s+(?:is|was)\s+{_SECRET_LITERAL}|"
+    rf"\b{_SECRET_LABEL}\b\s+{_SECRET_LITERAL}|"
+    rf"\b{_SECRET_LABEL}\b\s+(?!(?:is|was)\b)\S+\s+"
+    r"(?:(?:is|was)\s+)?(?:exposed|leaked|logged|printed)\b|"
     r"\bbearer\s+(?=[A-Za-z0-9._~+/=-]{8,}\b)"
     r"(?=\S*[0-9._~+/=-])[A-Za-z0-9._~+/=-]+|"
     r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@[^\s/]+|"
@@ -658,7 +667,8 @@ _SENSITIVE_REVIEW_TEXT = re.compile(
     r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)"
 )
 _RAW_REVIEW_OUTPUT = re.compile(
-    r"(?i)^(?:\$\s|Traceback \(most recent call last\):|\d{4}-\d\d-\d\d[ T]"
+    r"(?i)(?<![A-Za-z0-9_])(?:\$\s|Traceback \(most recent call last\):|"
+    r"\d{4}-\d\d-\d\d[ T]"
     r"\d\d:\d\d|FAILED(?:\s|:)|ERROR(?:\s|:)|npm ERR!\s|"
     r"\[(?:DEBUG|ERROR|FATAL|INFO|TRACE|WARN|WARNING)\])"
 )
@@ -680,7 +690,7 @@ def _safe_review_text(value: object, *, max_bytes: int) -> bool:
     return (
         len(value.encode()) <= max_bytes
         and _PERSISTENCE_SAFE_REVIEW_TEXT.fullmatch(value) is not None
-        and _RAW_REVIEW_OUTPUT.match(value) is None
+        and _RAW_REVIEW_OUTPUT.search(value) is None
         and _SENSITIVE_REVIEW_TEXT.search(value) is None
         and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
     )

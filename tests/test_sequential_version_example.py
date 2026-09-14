@@ -333,6 +333,8 @@ def test_decision_rejects_verdicts_inconsistent_with_findings(result: str) -> No
         "Do not log credentials or tokens when authentication fails.",
         "Store secrets through the configured credential provider.",
         "Use bearer authentication only after validating the authorization header.",
+        "The password was logged without redaction.",
+        "Credential validation appeared incomplete.",
     ],
 )
 def test_review_findings_allow_security_vocabulary_without_values(
@@ -345,6 +347,25 @@ def test_review_findings_allow_security_vocabulary_without_values(
     )
 
     assert assessment.findings == (finding,)
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        "Password hunter2 was printed in the output.",
+        "Password hunter was printed in the output.",
+        "Token abc123 was logged in the output.",
+        "Token abc123 must be redacted.",
+        "Observed failure: FAILED tests/test_api.py::test_auth",
+    ],
+)
+def test_review_findings_reject_secret_values_and_embedded_raw_logs(
+    finding: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+
+    with pytest.raises(WorkerFailure, match="without logs or secret-like values"):
+        workflow["review_assessment"](review_result("CHANGES_REQUESTED", (finding,)))
 
 
 @pytest.mark.parametrize(
