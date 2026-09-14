@@ -654,8 +654,8 @@ _SECRET_LITERAL = (
 )
 _SENSITIVE_REVIEW_TEXT = re.compile(
     rf"(?i)(\b{_SECRET_LABEL}\b\s*(?:=|:)\s*\S+|"
-    rf"\b{_SECRET_LABEL}\b\s+(?:is|was)\s+{_SECRET_LITERAL}|"
-    rf"\b{_SECRET_LABEL}\b\s+{_SECRET_LITERAL}|"
+    rf"\b{_SECRET_LABEL}\b(?:(?![.!?]).){{0,96}}?{_SECRET_LITERAL}|"
+    rf"{_SECRET_LITERAL}(?:(?![.!?]).){{0,96}}?\b{_SECRET_LABEL}\b|"
     rf"\b{_SECRET_LABEL}\b\s+(?!(?:is|was)\b)\S+\s+"
     r"(?:(?:is|was)\s+)?(?:exposed|leaked|logged|printed)\b|"
     r"\bbearer\s+(?=[A-Za-z0-9._~+/=-]{8,}\b)"

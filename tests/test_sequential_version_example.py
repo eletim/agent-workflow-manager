@@ -356,6 +356,10 @@ def test_review_findings_allow_security_vocabulary_without_values(
         "Password hunter was printed in the output.",
         "Token abc123 was logged in the output.",
         "Token abc123 must be redacted.",
+        "A leaked password value of hunter2 was printed.",
+        "A password value copied from the production response was hunter2.",
+        "Remove hunter2 from the password example.",
+        "Remove hunter2 from the outdated generated password example.",
         "Observed failure: FAILED tests/test_api.py::test_auth",
     ],
 )
