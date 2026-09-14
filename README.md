@@ -51,6 +51,22 @@ The project's canonical design principles are maintained in
 A small, stable set of typical uses and expected behavior is maintained in
 [`docs/representative-scenarios.md`](docs/representative-scenarios.md).
 
+## Human context and durable decisions
+
+Routine human context is deliberately small: read
+[`docs/design-principles.md`](docs/design-principles.md) together with
+[`docs/representative-scenarios.md`](docs/representative-scenarios.md). During
+One-Shot development, add the One-Shot Issue that defines the goal. The curated
+representative-scenario document is not the configurable `scenarios` list;
+that run-specific list is validation input for the Scenario Gate.
+
+For Issue Driven work, the persisted work-item plan and the managed Review
+audit sections on child and Base PRs are the durable GitHub decision record.
+Run output and agent conversation remain useful diagnostics, but are not that
+record. Give each agent only the portion of human context and recorded decisions
+needed for its current role instead of accumulating every available artifact in
+every prompt.
+
 ## Issue Driven mode
 
 The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts

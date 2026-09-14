@@ -122,3 +122,18 @@ def test_guide_documents_inline_identity_responsibility_boundary() -> None:
         "A different valid fingerprint and ambiguous markers always fail closed"
         in guide
     )
+
+
+def test_guide_defines_minimal_human_context_and_github_decision_record() -> None:
+    guide = " ".join(guide_text().split())
+
+    assert (
+        "Routine human context is `docs/design-principles.md` plus "
+        "`docs/representative-scenarios.md`" in guide
+    )
+    assert "the One-Shot Issue is added to that context" in guide
+    assert "not the configurable `scenarios` list" in guide
+    assert "run-specific validation input for the Scenario Gate" in guide
+    assert "managed Review audit sections on child and Base PRs" in guide
+    assert "durable GitHub decision record" in guide
+    assert "Keep agent context role-minimal" in guide

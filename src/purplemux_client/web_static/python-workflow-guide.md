@@ -60,6 +60,20 @@ PurpleMux UI = Workflow/child terminal output, runtime inspection, intervention
   the workflow workspace and target path. Do not hide that work in a local
   `subprocess` call.
 
+## Human context and durable decisions
+
+For routine work, use `docs/design-principles.md` and
+`docs/representative-scenarios.md` as the human context. Add the One-Shot Issue
+during One-Shot development. Do not confuse the curated representative
+scenarios with a workflow's configurable `scenarios`; the configurable list is
+version-specific validation input for the Scenario Gate.
+
+In an Issue Driven workflow, persist the work-item plan and maintain the managed
+Review audit sections on child and Base PRs as the durable GitHub decision
+record. Run output and agent conversation do not replace it. Construct each
+agent prompt from only the context and recorded decisions needed for that role;
+do not pass the entire accumulated record to every agent.
+
 ## Static Validation and whole-program Dry Run
 
 Static Validation remains side-effect-free. To opt a trusted workflow into Dry
