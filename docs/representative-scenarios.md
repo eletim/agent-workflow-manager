@@ -16,15 +16,16 @@ for inspection after the run.
 A workflow author writes Python that sequences tools, branches, retries, and
 decides when work is complete. AWM validates and runs that program while the UI
 reports progress and findings. The Python program, rather than the UI or
-Runner, remains the authority for control flow; Dry Run stops before the first
-reachable mutation.
+Runner, remains the authority for control flow. For dry-run-eligible workflows,
+Dry Run stops before the first reachable mutation.
 
 ## Reviewed delivery from a work-item plan
 
 A maintainer starts Issue Driven mode with GitHub Issues and/or inline mini
-tasks. AWM turns the configuration into inspectable Python, gives each work item
-its own branch and Draft pull request, applies separate scope and correctness
-reviews, and advances only when exact Git and GitHub topology is confirmed.
+tasks. AWM turns the configuration into inspectable Python. Each dispatched work
+item requiring implementation receives its own branch and Draft pull request,
+separate scope and correctness reviews, and advances only when exact Git and
+GitHub topology is confirmed.
 Configured policy decides whether reviewed work is integrated and whether the
 final delivery pull request is merely made ready or merged.
 
