@@ -67,6 +67,14 @@ h2, label { font-size: 14px; font-weight: 650; }
   color: #ffd66b;
 }
 .run-check-toggle.checked { color: #75e2a8; }
+.cleanup-ownership-item {
+  grid-column: 1;
+  align-self: center;
+  overflow-wrap: anywhere;
+  color: #ffd66b;
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.cleanup-ownership-action { color: #ffd66b; }
 .run-state-marker {
   position: absolute;
   top: 50%;

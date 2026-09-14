@@ -429,6 +429,10 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     "runs": [
                         run.as_summary_json() for run in self.server.runner.snapshots()
                     ],
+                    "cleanupOwnership": [
+                        ownership.as_json()
+                        for ownership in self.server.runner.cleanup_ownership_snapshots()
+                    ],
                 },
             )
             return

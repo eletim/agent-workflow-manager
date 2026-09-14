@@ -488,9 +488,11 @@ visible, Workflow-owned resources remain inspectable on the run record. Deleting
 checked history removes its code, output, progress, findings, and other run data
 from durable storage. If cleanup remains outstanding, AWM retains only the run
 ID and its resource-ownership records in an internal cleanup-ownership record;
-it is not run history and is removed after cleanup succeeds. Canonical Workflow
+it is not run history, remains visible with a Cleanup action after reload, and
+is removed after cleanup succeeds. Canonical Workflow
 runtimes opt into ownership registration; direct/Prompt adapter use is
-registration-free by default. `GET /api/runs` lists compact summaries,
+registration-free by default. `GET /api/runs` lists compact run summaries and
+separate retained cleanup ownership,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.
 `POST /api/runs/{runId}/cleanup` releases registered resources without deleting

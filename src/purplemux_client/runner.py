@@ -2279,6 +2279,14 @@ class PythonRunner:
         with self._lock:
             return tuple(self._snapshot_run(run) for run in self._runs.values())
 
+    def cleanup_ownership_snapshots(self) -> tuple[CleanupOwnershipSnapshot, ...]:
+        """Return resources retained after their run history was deleted."""
+        with self._lock:
+            return tuple(
+                CleanupOwnershipSnapshot(ownership.run_id, tuple(ownership.resources))
+                for ownership in self._cleanup_ownership.values()
+            )
+
     def validation_snapshot(self) -> RunnerSnapshot:
         with self._lock:
             return self._preview

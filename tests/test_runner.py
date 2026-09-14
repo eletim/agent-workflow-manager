@@ -3249,6 +3249,126 @@ def test_run_api_deletes_only_checked_terminal_history(
     assert request(address, "GET", f"/api/runs/{run_ids[1]}")[0] == 200
 
 
+def test_run_api_discovers_and_cleans_deleted_run_ownership_after_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_file = tmp_path / "run-history.json"
+
+    def serve(runner: PythonRunner) -> tuple[RunnerHTTPServer, threading.Thread]:
+        server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    first_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    first_server, first_thread = serve(first_runner)
+    first_address = (
+        str(first_server.server_address[0]),
+        int(first_server.server_address[1]),
+    )
+    try:
+        status, started = request(
+            first_address,
+            "POST",
+            "/api/run",
+            json.dumps(
+                {
+                    "code": (
+                        "from purplemux_client import register_run_resource\n"
+                        "register_run_resource(\n"
+                        "    'purplemux_tab', 'tab-after-delete',\n"
+                        "    {'workspace_id': 'ws-after-delete'},\n"
+                        ")\n"
+                    )
+                }
+            ),
+            token=first_server.request_token,
+        )
+        assert status == 202
+        run_id = int(started["runId"])
+        deadline = time.monotonic() + 5
+        while (
+            request(first_address, "GET", f"/api/runs/{run_id}")[1]["state"]
+            == "running"
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert (
+            request(
+                first_address,
+                "POST",
+                f"/api/runs/{run_id}/checked",
+                json.dumps({"checked": True}),
+                token=first_server.request_token,
+            )[0]
+            == 200
+        )
+        status, deleted = request(
+            first_address,
+            "POST",
+            "/api/runs/delete-checked",
+            json.dumps({"runIds": [run_id]}),
+            token=first_server.request_token,
+        )
+        assert status == 200
+        assert deleted["deletedRunIds"] == [run_id]
+    finally:
+        first_server.shutdown()
+        first_server.server_close()
+        first_thread.join()
+
+    restored_runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=history_file,
+    )
+    monkeypatch.setattr(restored_runner, "_cleanup_resource", lambda _resource: None)
+    restored_server, restored_thread = serve(restored_runner)
+    restored_address = (
+        str(restored_server.server_address[0]),
+        int(restored_server.server_address[1]),
+    )
+    try:
+        status, listed = request(restored_address, "GET", "/api/runs")
+        assert status == 200
+        assert listed["runs"] == []
+        assert listed["cleanupOwnership"] == [
+            {
+                "runId": run_id,
+                "resourceCleanupStatus": "retained",
+                "resources": [
+                    {
+                        "kind": "purplemux_tab",
+                        "identity": "tab-after-delete",
+                        "metadata": {"workspace_id": "ws-after-delete"},
+                        "cleanupState": "retained",
+                        "cleanupError": None,
+                    }
+                ],
+            }
+        ]
+
+        status, cleaned = request(
+            restored_address,
+            "POST",
+            f"/api/runs/{run_id}/cleanup",
+            token=restored_server.request_token,
+        )
+        assert status == 200
+        assert cleaned["resourceCleanupStatus"] == "cleaned"
+        assert (
+            request(restored_address, "GET", "/api/runs")[1]["cleanupOwnership"] == []
+        )
+    finally:
+        restored_server.shutdown()
+        restored_server.server_close()
+        restored_thread.join()
+
+
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(
     web_server: tuple[tuple[str, int], str],
 ) -> None:

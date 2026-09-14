@@ -842,7 +842,7 @@ function renderRecovery(result) {
   }
 }
 
-function renderRunList(runs) {
+function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
@@ -902,6 +902,40 @@ function renderRunList(runs) {
       });
       runList.append(toggle);
     }
+  }
+  for (const ownership of [...cleanupOwnership].reverse()) {
+    const description = document.createElement("div");
+    description.className = "cleanup-ownership-item";
+    description.dataset.cleanupRunId = String(ownership.runId);
+    const resources = ownership.resources
+      .map((resource) => {
+        const error = resource.cleanupError ? ` (${resource.cleanupError})` : "";
+        return `${resource.kind}: ${resource.identity} — ${resource.cleanupState}${error}`;
+      })
+      .join("; ");
+    description.textContent = `Deleted run #${ownership.runId} cleanup ${ownership.resourceCleanupStatus} — ${resources}`;
+    runList.append(description);
+
+    const cleanup = document.createElement("button");
+    cleanup.type = "button";
+    cleanup.className = "run-check-toggle cleanup-ownership-action";
+    cleanup.textContent = "Clean up";
+    cleanup.setAttribute(
+      "aria-label",
+      `Clean up resources retained by deleted Run #${ownership.runId}`,
+    );
+    cleanup.addEventListener("click", async () => {
+      await withPendingButton(cleanup, async () => {
+        try {
+          await request(`/api/runs/${ownership.runId}/cleanup`, {method: "POST"});
+          await refresh();
+        } catch (error) {
+          stderr.textContent = String(error);
+          await refresh();
+        }
+      });
+    });
+    runList.append(cleanup);
   }
 }
 
@@ -1496,7 +1530,7 @@ async function refresh() {
   const requestGeneration = ++refreshRequestGeneration;
   let selectionGeneration = activeRunGeneration;
   try {
-    const {runs} = await request("/api/runs");
+    const {runs, cleanupOwnership = []} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
     if (activeRunId === null && requestedRunIdentity !== null) {
       const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
@@ -1530,7 +1564,7 @@ async function refresh() {
         || requestGeneration <= renderedRefreshGeneration
       ) return;
       showNewRunAfterHistoryDeletion();
-      renderRunList(runs);
+      renderRunList(runs, cleanupOwnership);
       renderFavicon(runs);
       renderedRefreshGeneration = requestGeneration;
       return;
@@ -1544,7 +1578,7 @@ async function refresh() {
       || requestGeneration <= renderedRefreshGeneration
     ) return;
     if (result) renderRun(result);
-    renderRunList(runs);
+    renderRunList(runs, cleanupOwnership);
     renderFavicon(runs);
     renderedRefreshGeneration = requestGeneration;
   } catch (error) {
