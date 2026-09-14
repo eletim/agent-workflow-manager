@@ -270,10 +270,19 @@ def test_issue_topology_rejects_closed_unmerged_pr() -> None:
     [
         ("OPEN", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->"),
         ("OPEN", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64}"),
+        (
+            "OPEN",
+            f"Summary <!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+        ),
         ("MERGED", f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->"),
         (
             "OPEN",
             f"<!-- agent-workflow-manager:inline-task-sha256:{'a' * 64} -->\n"
+            f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
+        ),
+        (
+            "OPEN",
+            "<!-- agent-workflow-manager:inline-task-sha256:invalid --> "
             f"<!-- agent-workflow-manager:inline-task-sha256:{'c' * 64} -->",
         ),
     ],
@@ -369,15 +378,32 @@ def test_inline_task_topology_rejects_ready_pr_with_missing_fingerprint() -> Non
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected_body"),
     [
-        "Implementation summary",
-        "<!-- agent-workflow-manager:inline-task-sha256:invalid -->\n\n"
-        "Implementation summary",
+        (
+            "Implementation summary",
+            "{marker}\n\nImplementation summary",
+        ),
+        (
+            "<!-- agent-workflow-manager:inline-task-sha256:invalid -->\n\n"
+            "Implementation summary",
+            "{marker}\n\nImplementation summary",
+        ),
+        (
+            "Before <!-- agent-workflow-manager:inline-task-sha256:invalid --> after\n"
+            "Details",
+            "{marker}\n\nBefore  after\nDetails",
+        ),
+        (
+            "Summary\n"
+            "Before <!-- agent-workflow-manager:inline-task-sha256:invalid --> after\n"
+            "Details",
+            "{marker}\n\nSummary\nBefore  after\nDetails",
+        ),
     ],
 )
 def test_recover_inline_task_topology_repairs_fingerprint(
-    monkeypatch: pytest.MonkeyPatch, body: str
+    monkeypatch: pytest.MonkeyPatch, body: str, expected_body: str
 ) -> None:
     fingerprint = "a" * 64
     branch = "feature/work-item-refresh-run-help"
@@ -433,10 +459,8 @@ def test_recover_inline_task_topology_repairs_fingerprint(
     )
 
     assert recovered == state
-    assert updates == [
-        f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
-        "\n\nImplementation summary"
-    ]
+    marker = f"<!-- agent-workflow-manager:inline-task-sha256:{fingerprint} -->"
+    assert updates == [expected_body.format(marker=marker)]
 
 
 def test_inline_task_topology_rejects_ambiguous_malformed_fingerprints() -> None:

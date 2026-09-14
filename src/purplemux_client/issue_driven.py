@@ -234,15 +234,31 @@ def _inline_task_fingerprints(body: str) -> tuple[str, ...]:
     return (marker[len(prefix) : -len(suffix)],)
 
 
+def _inline_task_marker_spans(body: str) -> tuple[tuple[int, int], ...]:
+    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
+    starts = tuple(match.start() for match in re.finditer(re.escape(prefix), body))
+    spans: list[tuple[int, int]] = []
+    for start in starts:
+        comment_end = body.find("-->", start + len(prefix))
+        if comment_end >= 0:
+            end = comment_end + len("-->")
+        else:
+            line_ends = tuple(
+                position
+                for position in (body.find("\r", start), body.find("\n", start))
+                if position >= 0
+            )
+            end = min(line_ends, default=len(body))
+        spans.append((start, end))
+    return tuple(spans)
+
+
 def _require_inline_task_fingerprint(
     pr: PullRequestState, expected: str | None, *, allow_repair: bool = False
 ) -> None:
     if expected is None:
         return
-    prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
-    markers = tuple(
-        line.strip() for line in pr.body.splitlines() if line.strip().startswith(prefix)
-    )
+    markers = _inline_task_marker_spans(pr.body)
     if _inline_task_fingerprints(pr.body) == (expected,) and len(markers) == 1:
         return
     if allow_repair:
@@ -258,31 +274,34 @@ def _reconciled_inline_task_pr_body(pr: PullRequestState, expected: str) -> str:
     """Return a body with one canonical plan-owned fingerprint marker."""
     prefix = f"<!-- {INLINE_TASK_FINGERPRINT_MARKER}"
     suffix = " -->"
-    lines = pr.body.splitlines(keepends=True)
-    indexes = [
-        index for index, line in enumerate(lines) if line.strip().startswith(prefix)
-    ]
-    if len(indexes) > 1:
+    spans = _inline_task_marker_spans(pr.body)
+    if len(spans) > 1:
         raise WorkerFailure(
             f"PR #{pr.number} inline task fingerprint is ambiguous or does not "
             "match the declared task"
         )
     canonical = f"{prefix}{expected}{suffix}"
-    if indexes:
-        index = indexes[0]
-        candidate = lines[index].strip()
-        fingerprint = re.match(r"([0-9a-f]{64})(?=$|\s|-->)", candidate[len(prefix) :])
-        if fingerprint is not None and fingerprint.group(1) != expected:
+    if spans:
+        start, end = spans[0]
+        candidate = pr.body[start + len(prefix) : end]
+        fingerprints = tuple(
+            match.group()
+            for match in re.finditer(
+                r"(?<![0-9a-f])[0-9a-f]{64}(?=$|\s|-->)", candidate
+            )
+        )
+        if any(fingerprint != expected for fingerprint in fingerprints):
             raise WorkerFailure(
                 f"PR #{pr.number} inline task fingerprint does not match "
                 "the declared task"
             )
-        if index == 0:
-            line_ending = lines[0][len(lines[0].rstrip("\r\n")) :]
-            lines[0] = f"{canonical}{line_ending}"
-            return "".join(lines)
-        del lines[index]
-    remaining = "".join(lines)
+        line_end = pr.body.find("\n")
+        first_line_end = len(pr.body) if line_end < 0 else line_end
+        if start == 0 and not pr.body[end:first_line_end].strip():
+            return f"{canonical}{pr.body[end:]}"
+        remaining = f"{pr.body[:start]}{pr.body[end:]}"
+    else:
+        remaining = pr.body
     return f"{canonical}\n\n{remaining}" if remaining else canonical
 
 
