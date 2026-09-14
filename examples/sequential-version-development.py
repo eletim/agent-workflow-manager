@@ -79,6 +79,11 @@ IMPLEMENTATION_PRINCIPLE = (
     "reduced code size by mixing responsibilities unnaturally or by "
     "over-generalizing distinct behavior into shared abstractions."
 )
+REVIEWER_CHECKOUT_GUARD = (
+    "Never change the checkout: do not run git checkout, git switch, git restore, "
+    "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
+    "git show, or gh pr diff only."
+)
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
@@ -1347,9 +1352,7 @@ Issue identifies a policy Issue, use that version-design context; the
 implementation work item remains authoritative when they conflict, and report the
 conflict as a warning. Do not focus on detailed implementation bugs in this
 phase. Do not mutate files or PR state. Return APPROVED or CHANGES_REQUESTED
-first, followed by actionable findings. Never change the checkout: do not run
-git checkout, git switch, git restore, gh pr checkout, git rebase, or git
-bisect. Inspect the diff with git diff, git show, or gh pr diff only."""
+first, followed by actionable findings. {REVIEWER_CHECKOUT_GUARD}"""
     correctness_review = context + f"""Perform only the Correctness Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement}
@@ -1359,10 +1362,8 @@ cases, state and lifecycle consistency, error handling, races or stale state,
 Git/GitHub topology, regressions, missing tests, cleanup and resource ownership,
 and security or secret handling. Do not reopen scope preferences unless they
 cause a concrete correctness problem. Do not mutate files or PR state. Return
-APPROVED or CHANGES_REQUESTED first, followed by actionable findings. Never
-change the checkout: do not run git checkout, git switch, git restore, gh pr
-checkout, git rebase, or git bisect. Inspect the diff with git diff, git show,
-or gh pr diff only."""
+APPROVED or CHANGES_REQUESTED first, followed by actionable findings.
+{REVIEWER_CHECKOUT_GUARD}"""
     return implementation, scope_review, correctness_review
 
 
@@ -2737,7 +2738,7 @@ expected-output test: use the Issue and policy context to judge the difference.
 Use read-only inspection or disposable temporary directories and leave the
 repository worktree unchanged. Return APPROVED or CHANGES_REQUESTED first,
 followed by the selected scenarios, Before/After evidence, and actionable
-findings. Do not mutate files or PR state."""
+findings. Do not mutate files or PR state. {REVIEWER_CHECKOUT_GUARD}"""
 
 
 def whole_version_review_prompt(
@@ -2752,6 +2753,8 @@ def whole_version_review_prompt(
         "combined version for correctness, safety, and missing integration "
         "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
         "actionable findings; do not mutate anything.\n\n"
+        + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
         + final_work_item_context(config, work_items)
     )
 
@@ -2769,6 +2772,8 @@ def version_readme_review_prompt(
         "as an independent documentation/version review; do not repeat the general "
         "whole-version review. Return APPROVED or CHANGES_REQUESTED first, followed "
         "by actionable findings; do not mutate anything.\n\n"
+        + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
         + final_work_item_context(config, work_items)
     )
 

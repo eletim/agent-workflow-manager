@@ -397,6 +397,35 @@ def test_final_review_prompts_include_authoritative_dynamic_plan() -> None:
         assert "One-shot source: GitHub Issue #169" in prompt
 
 
+def test_all_review_prompts_preserve_the_active_checkout() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](91, "feature/issue-91")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pr = open_pr(head="dev/v1", base="main", draft=True)
+    _, scope_review, correctness_review = workflow["issue_prompts"](issue, config)
+    prompts = (
+        scope_review,
+        correctness_review,
+        workflow["scenario_gate_prompt"](pr, config, config.issues),
+        workflow["whole_version_review_prompt"](pr, config, config.issues),
+        workflow["version_readme_review_prompt"](pr, config, config.issues),
+    )
+
+    guard = workflow["REVIEWER_CHECKOUT_GUARD"]
+    assert all(guard in prompt for prompt in prompts)
+    for command in (
+        "git checkout",
+        "git switch",
+        "git restore",
+        "gh pr checkout",
+        "git rebase",
+        "git bisect",
+    ):
+        assert command in guard
+
+
 def test_all_review_phases_share_decision_parser() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
@@ -481,13 +510,6 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
     assert "policy Issue" in scope_review
     assert "functional behavior" in correctness_review
     assert "Do not reopen scope preferences" in correctness_review
-    checkout_guard = (
-        "Never change the checkout: do not run git checkout, git switch, git restore, "
-        "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
-        "git show, or gh pr diff only."
-    )
-    assert checkout_guard in scope_review.replace("\n", " ")
-    assert checkout_guard in correctness_review.replace("\n", " ")
     assert "Reuse the existing implementation where appropriate" in principle
     assert "minimum required for this Issue" in principle
     assert "mixing responsibilities unnaturally" in principle
