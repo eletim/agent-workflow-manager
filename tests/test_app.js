@@ -213,6 +213,7 @@ async function waitFor(predicate) {
 
 async function loadApp({
   runs,
+  cleanupOwnership = [],
   details,
   validation,
   locationHref = "http://127.0.0.1:8765/",
@@ -295,7 +296,7 @@ async function loadApp({
     if (override !== undefined) return override;
     if (url === "/api/token") return response({token: "request-token"});
     if (url === "/api/status") return response(initial);
-    if (url === "/api/runs") return response({runs});
+    if (url === "/api/runs") return response({runs, cleanupOwnership});
     if (url === "/favicon.svg") {
       return response('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
     }
@@ -628,7 +629,7 @@ test("checked run deletion stops when confirmation is cancelled", async () => {
   assert.match(selectedRun(elements).textContent, /#1/);
 });
 
-test("checked run deletion confirms cleanup for every checked run", async () => {
+test("checked run deletion removes every checked run regardless of cleanup state", async () => {
   const retained = {
     runId: 1, state: "success", cwd: "/work/one", checked: true,
     resourceCleanupStatus: "retained",
@@ -651,10 +652,12 @@ test("checked run deletion confirms cleanup for every checked run", async () => 
       return true;
     },
     fetchOverride(url, options) {
-      if (url !== "/api/runs/delete-checked") return undefined;
-      assert.deepEqual(JSON.parse(options.body), {runIds: [1, 2]});
-      runs.splice(0, runs.length);
-      return response({deletedCount: 2, deletedRunIds: [1, 2]});
+      if (url === "/api/runs/delete-checked") {
+        assert.deepEqual(JSON.parse(options.body), {runIds: [1, 2]});
+        runs.splice(0, runs.length);
+        return response({deletedCount: 2, deletedRunIds: [1, 2]});
+      }
+      return undefined;
     },
   });
 
@@ -669,13 +672,60 @@ test("checked run deletion confirms cleanup for every checked run", async () => 
   assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (2)");
   await elements["delete-checked-runs"].dispatch("click");
   assert.deepEqual(confirmations, [
-    "Cleanup owned resources, then delete 2 checked runs from local history? If any cleanup cannot be completed, all run history will be preserved.",
+    "Delete 2 checked runs from local history?",
   ]);
   assert.equal(elements["delete-checked-runs"].textContent, "Delete checked runs (0)");
   assert.equal(
     elements["run-list"].children.filter((item) => item.dataset.runId).length,
     0,
   );
+});
+
+test("retained cleanup remains discoverable and actionable after history reload", async () => {
+  const cleanupOwnership = [{
+    runId: 7,
+    resourceCleanupStatus: "retained",
+    resources: [{
+      kind: "git_worktree",
+      identity: "/worktrees/deleted-run-7",
+      metadata: {},
+      cleanupState: "retained",
+      cleanupError: null,
+    }],
+  }];
+  const {calls, elements} = await loadApp({
+    runs: [],
+    cleanupOwnership,
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/runs/7/cleanup" && options.method === "POST") {
+        cleanupOwnership.splice(0, 1);
+        return response({
+          runId: 7,
+          resourceCleanupStatus: "cleaned",
+          resources: [],
+        });
+      }
+      return undefined;
+    },
+  });
+
+  const retained = elements["run-list"].children.find(
+    (item) => item.dataset.cleanupRunId === "7",
+  );
+  assert.match(retained.textContent, /git_worktree: \/worktrees\/deleted-run-7/);
+  const cleanup = elements["run-list"].children.find(
+    (item) => item.className.includes("cleanup-ownership-action"),
+  );
+  await cleanup.dispatch("click");
+
+  assert.ok(calls.some(
+    ([url, method]) => url === "/api/runs/7/cleanup" && method === "POST",
+  ));
+  assert.equal(elements["run-list"].children.some(
+    (item) => item.dataset.cleanupRunId === "7",
+  ), false);
 });
 
 test("external checked history deletion clears stale selected detail", async () => {

@@ -158,7 +158,6 @@ let explicitNewRun = false;
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
 let checkedRunIds = [];
-let checkedRunDeletionRequiresCleanup = false;
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
@@ -843,15 +842,12 @@ function renderRecovery(result) {
   }
 }
 
-function renderRunList(runs) {
+function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
   const checkedRuns = runs.filter((run) => run.checked);
   checkedRunIds = checkedRuns.map((run) => run.runId);
-  checkedRunDeletionRequiresCleanup = checkedRuns.some(
-    (run) => run.resourceCleanupStatus !== "cleaned",
-  );
   const checkedRunCount = checkedRunIds.length;
   deleteCheckedRunsButton.textContent = `Delete checked runs (${checkedRunCount})`;
   deleteCheckedRunsButton.disabled = checkedRunCount === 0;
@@ -907,6 +903,40 @@ function renderRunList(runs) {
       runList.append(toggle);
     }
   }
+  for (const ownership of [...cleanupOwnership].reverse()) {
+    const description = document.createElement("div");
+    description.className = "cleanup-ownership-item";
+    description.dataset.cleanupRunId = String(ownership.runId);
+    const resources = ownership.resources
+      .map((resource) => {
+        const error = resource.cleanupError ? ` (${resource.cleanupError})` : "";
+        return `${resource.kind}: ${resource.identity} — ${resource.cleanupState}${error}`;
+      })
+      .join("; ");
+    description.textContent = `Deleted run #${ownership.runId} cleanup ${ownership.resourceCleanupStatus} — ${resources}`;
+    runList.append(description);
+
+    const cleanup = document.createElement("button");
+    cleanup.type = "button";
+    cleanup.className = "run-check-toggle cleanup-ownership-action";
+    cleanup.textContent = "Clean up";
+    cleanup.setAttribute(
+      "aria-label",
+      `Clean up resources retained by deleted Run #${ownership.runId}`,
+    );
+    cleanup.addEventListener("click", async () => {
+      await withPendingButton(cleanup, async () => {
+        try {
+          await request(`/api/runs/${ownership.runId}/cleanup`, {method: "POST"});
+          await refresh();
+        } catch (error) {
+          stderr.textContent = String(error);
+          await refresh();
+        }
+      });
+    });
+    runList.append(cleanup);
+  }
 }
 
 async function updateChecked(runId, checked) {
@@ -941,10 +971,7 @@ deleteCheckedRunsButton.addEventListener("click", async () => {
   if (count < 1) return;
   const confirmedRunIds = [...checkedRunIds];
   const noun = count === 1 ? "run" : "runs";
-  const confirmation = checkedRunDeletionRequiresCleanup
-    ? `Cleanup owned resources, then delete ${count} checked ${noun} from local history? If any cleanup cannot be completed, all run history will be preserved.`
-    : `Delete ${count} checked ${noun} from local history?`;
-  if (!window.confirm(confirmation)) return;
+  if (!window.confirm(`Delete ${count} checked ${noun} from local history?`)) return;
 
   await withPendingButton(deleteCheckedRunsButton, async () => {
     try {
@@ -1503,7 +1530,7 @@ async function refresh() {
   const requestGeneration = ++refreshRequestGeneration;
   let selectionGeneration = activeRunGeneration;
   try {
-    const {runs} = await request("/api/runs");
+    const {runs, cleanupOwnership = []} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
     if (activeRunId === null && requestedRunIdentity !== null) {
       const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
@@ -1537,7 +1564,7 @@ async function refresh() {
         || requestGeneration <= renderedRefreshGeneration
       ) return;
       showNewRunAfterHistoryDeletion();
-      renderRunList(runs);
+      renderRunList(runs, cleanupOwnership);
       renderFavicon(runs);
       renderedRefreshGeneration = requestGeneration;
       return;
@@ -1551,7 +1578,7 @@ async function refresh() {
       || requestGeneration <= renderedRefreshGeneration
     ) return;
     if (result) renderRun(result);
-    renderRunList(runs);
+    renderRunList(runs, cleanupOwnership);
     renderFavicon(runs);
     renderedRefreshGeneration = requestGeneration;
   } catch (error) {

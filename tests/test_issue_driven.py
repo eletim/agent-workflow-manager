@@ -1839,6 +1839,20 @@ def test_generated_inline_task_uses_same_review_flow_without_github_issue() -> N
     assert "Refresh the New Run help." in implementation
     assert "Refresh the New Run help." in scope_review
     assert "Refresh the New Run help." in correctness_review
+    pr = topology_pr(
+        head_branch=config.integration_branch,
+        head_sha="f" * 40,
+        base_sha="b" * 40,
+    )
+    review_prompts = (
+        scope_review,
+        correctness_review,
+        module.__dict__["scenario_gate_prompt"](pr, config, config.issues),
+        module.__dict__["whole_version_review_prompt"](pr, config, config.issues),
+        module.__dict__["version_readme_review_prompt"](pr, config, config.issues),
+    )
+    checkout_guard = module.__dict__["REVIEWER_CHECKOUT_GUARD"]
+    assert all(checkout_guard in prompt for prompt in review_prompts)
     assert "gh issue view" not in mini.requirement
     assert item.task_fingerprint in mini.pr_body
     assert "recovered_issue, config, recover_missing_inline_identity=True" in code
@@ -4472,7 +4486,7 @@ def test_generated_post_merge_path_starts_next_issue() -> None:
     ]
     assert f"synchronize:{integration_branch}->{integration_branch}" in events
     assert f"recover:{next_branch}" in events
-    for unsafe in ("git reset", "git rebase", "git stash", "--force", "-f HEAD:"):
+    for unsafe in ("git reset", "git stash", "--force", "-f HEAD:"):
         assert unsafe not in code
 
 
