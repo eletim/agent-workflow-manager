@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,13 @@ def test_trusts_only_the_exact_canonical_project_and_is_idempotent(
     )
 
     requests = [json.loads(line) for line in log.read_text().splitlines()]
+    initializations = [item for item in requests if item.get("method") == "initialize"]
+    assert len(initializations) == 2
+    assert all(
+        item["params"]["clientInfo"]["version"]
+        == distribution_version("purplemux-client")
+        for item in initializations
+    )
     writes = [item for item in requests if item.get("method") == "config/batchWrite"]
     assert len(writes) == 2
     assert {item["params"]["edits"][0]["keyPath"] for item in writes} == {
