@@ -34,3 +34,16 @@ def test_whole_review_documents_dedicated_design_principles_conformance() -> Non
     assert "`docs/design-principles.md` from the exact integration head" in README
     assert "reviews solely\nfor conformance" in README
     assert "bounded whole-review loop" in README
+
+
+def test_human_context_and_durable_decision_record_are_distinguished() -> None:
+    section = README.split("## Human context and durable decisions", maxsplit=1)[1]
+    section = section.split("## Issue Driven mode", maxsplit=1)[0]
+
+    assert "`docs/design-principles.md`" in section
+    assert "`docs/representative-scenarios.md`" in section
+    assert "add the One-Shot Issue" in section
+    assert "not the configurable `scenarios` list" in section
+    assert "persisted work-item plan" in section
+    assert "managed Review\naudit sections on child and Base PRs" in section
+    assert "only the portion" in section

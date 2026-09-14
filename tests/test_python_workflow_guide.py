@@ -71,3 +71,17 @@ def test_guide_documents_generated_inline_identity_responsibility() -> None:
         "A different valid fingerprint and ambiguous markers always fail closed"
         in guide
     )
+
+
+def test_guide_keeps_agent_context_role_minimal_and_decisions_durable() -> None:
+    guide = " ".join(GUIDE.read_text(encoding="utf-8").split())
+
+    assert (
+        "use `docs/design-principles.md` and "
+        "`docs/representative-scenarios.md` as the human context" in guide
+    )
+    assert "Add the One-Shot Issue" in guide
+    assert "configurable list is version-specific validation input" in guide
+    assert "managed Review audit sections on child and Base PRs" in guide
+    assert "durable GitHub decision record" in guide
+    assert "only the context and recorded decisions needed for that role" in guide

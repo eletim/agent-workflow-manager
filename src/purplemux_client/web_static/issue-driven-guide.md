@@ -16,6 +16,20 @@ The JSON is not a workflow runtime, DSL, graph, or state machine. It selects
 supported behavior in a deterministic Python generator. Use Python Workflow mode
 when arbitrary control flow is required.
 
+## Human context and durable decisions
+
+Routine human context is `docs/design-principles.md` plus
+`docs/representative-scenarios.md`. During One-Shot development, the One-Shot
+Issue is added to that context as the authoritative goal. The curated scenarios
+in `docs/representative-scenarios.md` are not the configurable `scenarios` list:
+the latter is run-specific validation input for the Scenario Gate.
+
+The persisted work-item plan and the managed Review audit sections on child and
+Base PRs form the durable GitHub decision record. PurpleMux output and agent
+conversation are diagnostics, not substitutes for that record. Keep agent
+context role-minimal: supply the current role only the human context, work-item
+decision, and Review records it needs.
+
 ## Repository semantics
 
 `repository` is the path to the existing source repository. `integration_branch`
