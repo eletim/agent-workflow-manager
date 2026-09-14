@@ -554,7 +554,12 @@ def run_validated_turn(
 
 def implementer_prompt(prompt: str) -> str:
     """Add the shared change-boundary policy to an implementation turn."""
-    return f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}"
+    return (
+        f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
+        "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
+        "the workflow owns and reconciles those markers from its persisted "
+        "work-item plan."
+    )
 
 
 def run_outline_step(name: str, action):
@@ -1478,13 +1483,40 @@ def ensure_issue_pr(
     config: Config,
     *,
     expected_base_sha: str,
-    may_initialize_inline_identity: bool = False,
+    reconcile_plan_owned_inline_identity: bool = False,
 ) -> PullRequestState:
     local = repo.require_current_branch(issue.branch)
     assert local.local_sha is not None
     feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
     assert feature.remote_sha is not None
+    reconciled_pr_number: int | None = None
+    if reconcile_plan_owned_inline_identity and issue.task_fingerprint is not None:
+        assert issue.task_id is not None
+        reconciled = recover_issue_driven_work_item_topology(
+            repo=str(config.repo),
+            integration_branch=config.integration_branch,
+            issue=(issue.label, issue.branch, issue.task_fingerprint),
+            command_timeout_seconds=COMMAND_TIMEOUT,
+        )
+        if (
+            reconciled.classification != "recoverable"
+            or reconciled.feature_sha != feature.remote_sha
+            or reconciled.integration_sha != expected_base_sha
+        ):
+            raise WorkerFailure(
+                f"{issue.label} topology changed while reconciling its "
+                "plan-owned PR identity"
+            )
+        reconciled_pr_number = reconciled.open_pr_number
     pr = inspect_pr(github, head=issue.branch, base=config.integration_branch)
+    if (
+        reconcile_plan_owned_inline_identity
+        and issue.task_fingerprint is not None
+        and (pr.number if pr is not None else None) != reconciled_pr_number
+    ):
+        raise WorkerFailure(
+            f"{issue.label} PR identity changed after fingerprint reconciliation"
+        )
     if pr is None:
         pr = github.create_draft_pr(
             head=issue.branch,
@@ -1504,19 +1536,6 @@ def ensure_issue_pr(
         expected_base_sha=expected_base_sha,
         draft=True,
     )
-    if (
-        may_initialize_inline_identity
-        and issue.task_fingerprint is not None
-        and inline_task_pr_fingerprint(current) is None
-    ):
-        current = github.update_pr_body(
-            current.number,
-            body=with_inline_task_pr_identity(current, issue),
-            expected_head=issue.branch,
-            expected_head_sha=feature.remote_sha,
-            expected_base=config.integration_branch,
-            expected_base_sha=expected_base_sha,
-        )
     return require_inline_task_pr_identity(current, issue)
 
 
@@ -1912,7 +1931,7 @@ def process_issue(
         issue,
         config,
         expected_base_sha=integration.remote_sha,
-        may_initialize_inline_identity=existing_pr is None,
+        reconcile_plan_owned_inline_identity=existing_pr is None,
     )
     emit_issue_navigation(
         issue.result_id,
