@@ -1105,6 +1105,8 @@ def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() 
     assert '        (),\n        "git diff --check",' in parse_args
     assert "        WORKFLOW_POLICY_ISSUE,\n        169," in parse_args
     assert "gh issue view\n{config.one_shot_issue} --repo {config.slug}" in code
+    assert "git show\n{config.integration_branch}:docs/design-principles.md" in code
+    assert "canonical source when decomposing or refining" in code
     assert "short inline mini tasks" in code
     assert "Do not create GitHub Issues" in code
     assert "one_shot_issue" in code
@@ -1208,6 +1210,28 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     assert [item.key for item in inspected] == ["focused-change"]
     assert [item.key for item in effective] == ["focused-change"]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
+    assert all(
+        "git show\ndev/v1:docs/design-principles.md" in prompt for prompt in prompts
+    )
+    assert all(
+        "canonical source when decomposing or refining" in prompt for prompt in prompts
+    )
+
+
+def test_seeded_planner_does_not_receive_one_shot_design_principles_context() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (workflow["Issue"](90, "feature/issue-90"),),
+        "true",
+    )
+
+    prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
+
+    assert "docs/design-principles.md" not in prompt
 
 
 def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
