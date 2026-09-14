@@ -213,7 +213,6 @@ async function waitFor(predicate) {
 
 async function loadApp({
   runs,
-  cleanupTombstones = [],
   details,
   validation,
   locationHref = "http://127.0.0.1:8765/",
@@ -231,7 +230,7 @@ async function loadApp({
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
     "active-context", "repository-navigation", "repository-slug", "repository-link",
-    "run-list", "cleanup-deleted-runs", "delete-checked-runs",
+    "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
@@ -296,7 +295,7 @@ async function loadApp({
     if (override !== undefined) return override;
     if (url === "/api/token") return response({token: "request-token"});
     if (url === "/api/status") return response(initial);
-    if (url === "/api/runs") return response({runs, cleanupTombstones});
+    if (url === "/api/runs") return response({runs});
     if (url === "/favicon.svg") {
       return response('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
     }
@@ -639,11 +638,9 @@ test("checked run deletion removes every checked run regardless of cleanup state
     resourceCleanupStatus: "cleaned",
   };
   const runs = [retained, cleaned];
-  const cleanupTombstones = [];
   const confirmations = [];
   const {calls, elements, eventSource} = await loadApp({
     runs,
-    cleanupTombstones,
     details: {
       1: snapshot(retained),
       2: snapshot(cleaned),
@@ -657,15 +654,7 @@ test("checked run deletion removes every checked run regardless of cleanup state
       if (url === "/api/runs/delete-checked") {
         assert.deepEqual(JSON.parse(options.body), {runIds: [1, 2]});
         runs.splice(0, runs.length);
-        cleanupTombstones.push({...retained, checked: false});
         return response({deletedCount: 2, deletedRunIds: [1, 2]});
-      }
-      if (url === "/api/runs/1/cleanup") {
-        assert.equal(options.method, "POST");
-        cleanupTombstones.splice(0, 1);
-        return response(snapshot({
-          ...retained, checked: false, resourceCleanupStatus: "cleaned",
-        }));
       }
       return undefined;
     },
@@ -688,15 +677,6 @@ test("checked run deletion removes every checked run regardless of cleanup state
   assert.equal(
     elements["run-list"].children.filter((item) => item.dataset.runId).length,
     0,
-  );
-  assert.equal(
-    elements["cleanup-deleted-runs"].textContent,
-    "Cleanup deleted runs (1)",
-  );
-  await elements["cleanup-deleted-runs"].dispatch("click");
-  assert.equal(
-    elements["cleanup-deleted-runs"].textContent,
-    "Cleanup deleted runs (0)",
   );
 });
 

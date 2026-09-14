@@ -483,10 +483,13 @@ workflow checkpoint API or reconstruct terminated Python control flow.
 
 Runs are independent and may execute concurrently. The UI lists every run and
 lets the operator select its state, output, progress, execution context, Stop,
-and explicit Cleanup action without changing another run. Workflow-owned
-resources remain inspectable after every terminal result and are registered on
-the existing run record rather than a separate lifecycle store. Canonical
-Workflow runtimes opt into ownership registration; direct/Prompt adapter use is
+and explicit Cleanup action without changing another run. While run history is
+visible, Workflow-owned resources remain inspectable on the run record. Deleting
+checked history removes its code, output, progress, findings, and other run data
+from durable storage. If cleanup remains outstanding, AWM retains only the run
+ID and its resource-ownership records in an internal cleanup-ownership record;
+it is not run history and is removed after cleanup succeeds. Canonical Workflow
+runtimes opt into ownership registration; direct/Prompt adapter use is
 registration-free by default. `GET /api/runs` lists compact summaries,
 `GET /api/runs/{runId}` reads one snapshot, and
 `POST /api/runs/{runId}/stop` stops only that run.

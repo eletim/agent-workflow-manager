@@ -237,7 +237,7 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
         runner.delete_checked_runs((run_id,))
 
     assert runner.snapshot(run_id).checked is True
-    assert runner.cleanup_tombstones() == ()
+    assert runner._cleanup_ownership == {}
 
 
 def test_delete_checked_runs_rejects_concurrent_cleanup(
@@ -288,7 +288,7 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     assert runner.delete_checked_runs((run_id,)) == (run_id,)
 
 
-def test_delete_checked_runs_moves_outstanding_resources_to_cleanup_tombstone(
+def test_delete_checked_runs_retains_only_outstanding_resource_ownership(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_id = runner.start(
@@ -307,14 +307,18 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     assert cleaned_resources == []
     with pytest.raises(runner_module.RunNotFoundError):
         runner.snapshot(run_id)
-    assert [snapshot.run_id for snapshot in runner.cleanup_tombstones()] == [run_id]
+    ownership = runner._cleanup_ownership[run_id]
+    assert ownership.run_id == run_id
+    assert [(resource.kind, resource.identity) for resource in ownership.resources] == [
+        ("purplemux_tab", "tab-1")
+    ]
 
     cleaned = runner.cleanup(run_id)
     assert cleaned.resources[0].cleanup_state == "cleaned"
     assert [(resource.kind, resource.identity) for resource in cleaned_resources] == [
         ("purplemux_tab", "tab-1")
     ]
-    assert runner.cleanup_tombstones() == ()
+    assert runner._cleanup_ownership == {}
 
 
 def test_deleted_run_history_does_not_return_after_runner_reconstruction(
@@ -342,6 +346,12 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
     )
 
     assert runner.delete_checked_runs((run_id,)) == (run_id,)
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    ownership_json = history["cleanupOwnership"][runner._run_identity(run_id)]
+    assert set(ownership_json) == {"runId", "resources"}
+    assert ownership_json["runId"] == run_id
+    assert ownership_json["resources"][0]["identity"] == "tab-1"
+    assert [run["runId"] for run in history["runs"].values()] == [retained_run_id]
     runner.close()
 
     restored = PythonRunner(
@@ -353,13 +363,12 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
         assert [snapshot.run_id for snapshot in restored.snapshots()] == [
             retained_run_id
         ]
-        tombstones = restored.cleanup_tombstones()
-        assert [snapshot.run_id for snapshot in tombstones] == [run_id]
-        assert tombstones[0].resources[0].identity == "tab-1"
+        ownership = restored._cleanup_ownership[run_id]
+        assert ownership.resources[0].identity == "tab-1"
 
         monkeypatch.setattr(restored, "_cleanup_resource", lambda _resource: None)
         restored.cleanup(run_id)
-        assert restored.cleanup_tombstones() == ()
+        assert restored._cleanup_ownership == {}
     finally:
         restored.close()
 
@@ -372,7 +381,7 @@ register_run_resource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
         assert [snapshot.run_id for snapshot in reloaded.snapshots()] == [
             retained_run_id
         ]
-        assert reloaded.cleanup_tombstones() == ()
+        assert reloaded._cleanup_ownership == {}
     finally:
         reloaded.close()
 
@@ -3238,53 +3247,6 @@ def test_run_api_deletes_only_checked_terminal_history(
     assert deleted == {"deletedCount": 1, "deletedRunIds": [run_ids[0]]}
     assert request(address, "GET", f"/api/runs/{run_ids[0]}")[0] == 404
     assert request(address, "GET", f"/api/runs/{run_ids[1]}")[0] == 200
-
-
-def test_run_api_exposes_and_cleans_deleted_run_tombstones(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
-    run_id = runner.start("print('owned')")
-    wait_for(runner, lambda item: item.state == "success", run_id=run_id)
-    with runner._lock:
-        runner._runs[run_id].resources.append(
-            RunResource("purplemux_tab", "tab-1", {"workspace_id": "ws-1"})
-        )
-    runner.set_checked(run_id, True)
-    monkeypatch.setattr(runner, "_cleanup_resource", lambda _resource: None)
-    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    host, port = server.server_address
-    address = (str(host), int(port))
-    try:
-        status, _ = request(
-            address,
-            "POST",
-            "/api/runs/delete-checked",
-            json.dumps({"runIds": [run_id]}),
-            token=server.request_token,
-        )
-        assert status == 200
-
-        status, listed = request(address, "GET", "/api/runs")
-        assert status == 200
-        assert listed["runs"] == []
-        assert [run["runId"] for run in listed["cleanupTombstones"]] == [run_id]
-
-        status, cleaned = request(
-            address,
-            "POST",
-            f"/api/runs/{run_id}/cleanup",
-            token=server.request_token,
-        )
-        assert status == 200
-        assert cleaned["resourceCleanupStatus"] == "cleaned"
-        assert request(address, "GET", "/api/runs")[1]["cleanupTombstones"] == []
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
 
 
 def test_run_api_exposes_explicit_cleanup_without_deleting_history(

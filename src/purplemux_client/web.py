@@ -429,10 +429,6 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     "runs": [
                         run.as_summary_json() for run in self.server.runner.snapshots()
                     ],
-                    "cleanupTombstones": [
-                        run.as_summary_json()
-                        for run in self.server.runner.cleanup_tombstones()
-                    ],
                 },
             )
             return
