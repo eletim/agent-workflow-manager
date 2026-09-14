@@ -99,6 +99,14 @@ recovered state and resumes its normal authority. This is domain state owned and
 interpreted by the workflow, not a Runner checkpoint or progress-event state
 machine.
 
+Consequential Scope, Correctness, Scenario Gate, Design Principles,
+whole-version, and Version / README review rounds use the same durable ownership
+boundary. Their corresponding child PR or Base PR retains a bounded,
+idempotently updated audit section containing each role's verdict, actionable
+findings, reviewed commit, and later fix disposition. The audit stores neither
+raw agent output nor secret-like content and is therefore safe to use for new-run
+recovery and human review without depending on PurpleMux output history.
+
 PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
 `purplemux_client` uses
 PurpleMux's public CLI contract and does not replace its runtime or access tmux

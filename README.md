@@ -281,6 +281,12 @@ README reviewer on every eligible head. The Design Principles turn reads
 for conformance with that authoritative document. Findings from the independent
 reviews are aggregated into one fix turn, and any changed head is reviewed again
 in the same order within the bounded whole-review loop.
+Each consequential review round is also recorded in a bounded managed section
+of its child PR or Base PR. The record keeps the role, verdict, concise
+actionable findings, exact reviewed commit, and the later fix disposition. It is
+updated idempotently, excludes raw agent logs and potentially sensitive text,
+and remains available to recovery runs and human reviewers independently of
+PurpleMux run history.
 If a Correctness reviewer or fix changes the head,
 the prior Scope outcome is invalidated and the ordered Scope then Correctness
 sequence restarts on the new commit within the separate cumulative limits.

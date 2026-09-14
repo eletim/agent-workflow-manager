@@ -71,6 +71,23 @@ def open_pr(*, head: str, base: str, draft: bool) -> PullRequestState:
     )
 
 
+def keep_review_audit_in_memory(
+    workflow: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Let review-loop unit fakes stay focused on Git and verdict behavior."""
+    globals_ = workflow["review_issue_phase"].__globals__  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        globals_,
+        "persist_review_audit",
+        lambda _github, pr, _record, **_kwargs: pr,
+    )
+    monkeypatch.setitem(
+        globals_,
+        "review_audit_disposition",
+        lambda _github, pr, _audit_id, _disposition, **_kwargs: pr,
+    )
+
+
 def test_example_is_plain_python_without_in_place_recovery_contract() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 
@@ -439,6 +456,8 @@ def test_all_review_prompts_preserve_the_active_checkout() -> None:
 
     guard = workflow["REVIEWER_CHECKOUT_GUARD"]
     assert all(guard in prompt for prompt in prompts)
+    audit_guard = workflow["REVIEWER_AUDIT_GUARD"]
+    assert all(audit_guard in prompt for prompt in prompts)
     for command in (
         "git checkout",
         "git switch",
@@ -505,6 +524,127 @@ def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
         "Scenario Gate output correction",
         "Scenario Gate output correction",
     ]
+
+
+def test_review_audit_is_bounded_idempotent_and_records_fix_disposition() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    body = "Delivery context."
+    records = []
+    for round_number in range(1, 36):
+        record = workflow["new_review_audit"](
+            "correctness",
+            round_number,
+            "CHANGES_REQUESTED",
+            f"head-{round_number}",
+            f"CHANGES_REQUESTED\n- Fix behavior {round_number}",
+        )
+        records.append(record)
+        body = workflow["with_review_audit"](body, record)
+
+    recovered = workflow["review_audit_from_body"](body)
+    assert len(recovered) == workflow["MAX_REVIEW_AUDIT_RECORDS"] == 32
+    assert recovered[0].round == 4
+    assert recovered[-1].findings == ("Fix behavior 35",)
+
+    unchanged = workflow["with_review_audit"](body, records[-1])
+    assert unchanged == body
+    updated = replace(records[-1], fix_disposition="fixed", fix_sha="fixed-head")
+    revised = workflow["with_review_audit"](body, updated)
+    revised_records = workflow["review_audit_from_body"](revised)
+    assert len(revised_records) == 32
+    assert revised_records[-1].fix_disposition == "fixed"
+    assert revised_records[-1].fix_sha == "fixed-head"
+    assert "fix: fixed at `fixed-head`" in revised
+
+
+def test_review_audit_omits_raw_logs_and_secret_like_finding_text() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    secret = "github_pat_not-for-github"
+    result = f"""CHANGES_REQUESTED
+- Keep this actionable finding.
+```text
+raw command output
+```
+$ env
+2026-09-15 10:00 build log
+- token={secret}
+POLICY_CONFLICT: separately persisted
+"""
+
+    record = workflow["new_review_audit"](
+        "scope_design", 1, "CHANGES_REQUESTED", "reviewed-head", result
+    )
+    body = workflow["with_review_audit"]("Child PR.", record)
+
+    assert secret not in body
+    assert "raw command output" not in body
+    assert "2026-09-15 10:00" not in body
+    assert "POLICY_CONFLICT" not in body
+    assert record.findings == (
+        "Keep this actionable finding.",
+        "[finding withheld: potentially sensitive content]",
+    )
+
+
+def test_review_audit_persists_on_exact_draft_pr_and_updates_same_record() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    pr = open_pr(head="feature/issue-1", base="dev/v1", draft=True)
+    bodies: list[str] = []
+
+    class GitHub:
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal pr
+            assert number == pr.number
+            assert kwargs == {
+                "expected_head": "feature/issue-1",
+                "expected_head_sha": pr.head_sha,
+                "expected_base": "dev/v1",
+                "expected_base_sha": pr.base_sha,
+                "draft": True,
+            }
+            bodies.append(body)
+            pr = replace(pr, body=body)
+            return pr
+
+    github = GitHub()
+    record = workflow["new_review_audit"](
+        "correctness",
+        1,
+        "CHANGES_REQUESTED",
+        pr.head_sha,
+        "CHANGES_REQUESTED\n- Add the missing boundary check.",
+    )
+    pr = workflow["persist_review_audit"](
+        github, pr, record, head="feature/issue-1", base="dev/v1"
+    )
+    pr = workflow["review_audit_disposition"](
+        github,
+        pr,
+        record.audit_id,
+        "fixed",
+        head="feature/issue-1",
+        base="dev/v1",
+        fix_sha="fixed-head",
+    )
+
+    assert len(bodies) == 2
+    recovered = workflow["review_audit_from_body"](pr.body)
+    assert recovered == (
+        replace(record, fix_disposition="fixed", fix_sha="fixed-head"),
+    )
+
+
+def test_review_audit_rejects_ambiguous_managed_markers() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    record = workflow["new_review_audit"](
+        "whole_version", 1, "APPROVED", "head", "APPROVED"
+    )
+    body = workflow["with_review_audit"]("Base PR.", record)
+
+    with pytest.raises(WorkerFailure, match="ambiguous review audit"):
+        workflow["with_review_audit"](
+            f"{body}\n{workflow['REVIEW_AUDIT_START']}", record
+        )
 
 
 def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -> None:
@@ -628,6 +768,14 @@ def test_scope_review_fix_is_re_reviewed_with_an_independent_count(
             current = replace(current, head_sha=str(kwargs["expected_head_sha"]))
             return current
 
+        def update_pr_body(
+            self, number: int, *, body: str, **_kwargs: object
+        ) -> PullRequestState:
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=body)
+            return current
+
     results = iter(("CHANGES_REQUESTED\nreduce the scope", "APPROVED"))
 
     def run_turn(*args: object, **kwargs: object) -> str:
@@ -657,6 +805,11 @@ def test_scope_review_fix_is_re_reviewed_with_an_independent_count(
 
     assert result.outcome == "approved"
     assert result.reviews == 2
+    audit = workflow["review_audit_from_body"](result.pr.body)
+    assert [(record.verdict, record.fix_disposition) for record in audit] == [
+        ("CHANGES_REQUESTED", "fixed"),
+        ("APPROVED", "not_required"),
+    ]
     assert result.head_sha == fixed_sha
     assert turns == [
         "Issue #150 scope/design review",
@@ -669,6 +822,7 @@ def test_scope_review_limit_continues_without_faking_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     review_issue_phase = workflow["review_issue_phase"]
     globals_ = review_issue_phase.__globals__
     issue = workflow["Issue"](150, "feature/issue-150")
@@ -735,6 +889,7 @@ def test_correctness_fix_restarts_scope_before_final_correctness_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     globals_ = workflow["process_issue"].__globals__
     issue = workflow["Issue"](150, "feature/issue-150")
     config = workflow["Config"](
@@ -1014,6 +1169,7 @@ def test_ready_issue_pr_is_redrafted_and_independently_reviewed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["process_issue"].__globals__
     issue = workflow["Issue"](90, "feature/issue-90")
     config = workflow["Config"](
@@ -1083,6 +1239,7 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["process_issue"].__globals__
     issue = workflow["Issue"](116, "feature/issue-116")
     config = workflow["Config"](
@@ -1197,6 +1354,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["process_issue"].__globals__
     issue = workflow["Issue"](116, "feature/issue-116")
     config = workflow["Config"](
@@ -1637,6 +1795,7 @@ def test_inline_review_updates_reject_ambiguous_pr_identity(
     foreign_marker: bool,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["review_issue_phase"].__globals__
     task = "Refresh the New Run help."
     fingerprint = hashlib.sha256(task.encode()).hexdigest()
@@ -1737,6 +1896,7 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["process_issue"].__globals__
     issue = workflow["Issue"](134, "feature/issue-134")
     config = workflow["Config"](
@@ -1847,6 +2007,7 @@ def test_policy_conflict_from_fixer_is_persisted_after_pushed_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["process_issue"].__globals__
     issue = workflow["Issue"](137, "feature/issue-137")
     config = workflow["Config"](
@@ -1945,6 +2106,7 @@ def test_policy_conflict_from_changed_reviewer_uses_reacquired_child_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["process_issue"].__globals__
     issue = workflow["Issue"](137, "feature/issue-137")
     config = workflow["Config"](
@@ -2101,6 +2263,7 @@ def test_ready_final_pr_repeats_review_and_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["integration_delivery"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -2178,6 +2341,7 @@ def test_policy_conflict_from_changed_whole_reviewer_uses_reacquired_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["review_whole_version"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true", 200
@@ -2260,6 +2424,7 @@ def test_changed_design_principles_reviewer_invalidates_and_repeats_whole_review
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["review_whole_version"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -2332,6 +2497,7 @@ def test_unchanged_whole_version_fixer_warns_and_keeps_base_pr_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["integration_delivery"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -2401,6 +2567,7 @@ def test_whole_failures_do_not_consume_version_readme_review_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["review_whole_version"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -2496,6 +2663,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["review_whole_version"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -2658,6 +2826,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["integration_delivery"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -2793,6 +2962,7 @@ def test_whole_version_outline_fails_when_final_checks_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
     workflow_globals = workflow["integration_delivery"].__globals__
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"

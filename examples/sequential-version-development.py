@@ -84,6 +84,10 @@ REVIEWER_CHECKOUT_GUARD = (
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
     "git show, or gh pr diff only."
 )
+REVIEWER_AUDIT_GUARD = (
+    "Keep each actionable finding concise. Do not include raw logs, environment "
+    "values, credentials, tokens, or secrets in the response."
+)
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
@@ -92,9 +96,15 @@ HUMAN_HANDOFF_START = "<!-- agent-workflow-manager:human-handoff:start -->"
 HUMAN_HANDOFF_END = "<!-- agent-workflow-manager:human-handoff:end -->"
 MAX_HUMAN_HANDOFF_CHARS = 12_000
 WORK_ITEM_PLAN_MARKER = "agent-workflow-manager:work-item-plan:"
+REVIEW_AUDIT_START = "<!-- agent-workflow-manager:review-audit:start -->"
+REVIEW_AUDIT_END = "<!-- agent-workflow-manager:review-audit:end -->"
+REVIEW_AUDIT_MARKER = "agent-workflow-manager:review-audit:data:"
 MAX_PLANNER_POLICY_CONFLICTS = 3
 MAX_POLICY_CONFLICT_DETAIL_CHARS = 500
 MAX_POLICY_CONFLICT_WARNINGS = 8
+MAX_REVIEW_AUDIT_RECORDS = 32
+MAX_REVIEW_FINDINGS = 8
+MAX_REVIEW_FINDING_CHARS = 500
 MAX_BASE_PR_BODY_BYTES = 65_536
 
 
@@ -301,6 +311,18 @@ class ReviewDelivery:
     base_sha: str
     reviews: int = 0
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReviewAuditRecord:
+    audit_id: str
+    role: str
+    round: int
+    verdict: Literal["APPROVED", "CHANGES_REQUESTED"]
+    reviewed_sha: str
+    findings: tuple[str, ...]
+    fix_disposition: str
+    fix_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -617,6 +639,255 @@ def decision(result: str) -> str:
     raise WorkerFailure(
         "reviewer must provide APPROVED or CHANGES_REQUESTED near the beginning"
     )
+
+
+_SENSITIVE_REVIEW_TEXT = re.compile(
+    r"(?i)(authorization\s*:|bearer\s+|password\s*[:=]|token\s*[:=]|"
+    r"secret\s*[:=]|api[_-]?key\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"github_pat_|gh[pousr]_|sk-[a-z0-9])"
+)
+_RAW_LOG_LINE = re.compile(
+    r"^(?:\$\s|Traceback \(most recent call last\):|\d{4}-\d\d-\d\d[ T]"
+    r"\d\d:\d\d|[A-Z_][A-Z0-9_]*=\S)"
+)
+
+
+def review_findings(result: str) -> tuple[str, ...]:
+    """Extract bounded, secret-free findings rather than persisting raw output."""
+    findings: list[str] = []
+    in_fence = False
+    for source_line in result.splitlines():
+        line = source_line.strip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or _normalized_verdict(line) is not None:
+            continue
+        if line.startswith(POLICY_CONFLICT_MARKER) or _RAW_LOG_LINE.match(line):
+            continue
+        line = re.sub(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", "", line).strip()
+        if not line or line.lower().rstrip(":") in {
+            "findings",
+            "actionable findings",
+            "review result",
+            "no findings",
+        }:
+            continue
+        if _SENSITIVE_REVIEW_TEXT.search(line):
+            line = "[finding withheld: potentially sensitive content]"
+        else:
+            line = line.translate(str.maketrans({"<": "&lt;", ">": "&gt;"}))
+            line = line[:MAX_REVIEW_FINDING_CHARS]
+        if line not in findings:
+            findings.append(line)
+        if len(findings) == MAX_REVIEW_FINDINGS:
+            break
+    return tuple(findings)
+
+
+def _review_audit_payload(records: tuple[ReviewAuditRecord, ...]) -> str:
+    source = json.dumps(
+        [
+            {
+                "audit_id": record.audit_id,
+                "role": record.role,
+                "round": record.round,
+                "verdict": record.verdict,
+                "reviewed_sha": record.reviewed_sha,
+                "findings": list(record.findings),
+                "fix_disposition": record.fix_disposition,
+                "fix_sha": record.fix_sha,
+            }
+            for record in records
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return base64.b64encode(source.encode()).decode("ascii")
+
+
+def review_audit_from_body(body: str) -> tuple[ReviewAuditRecord, ...]:
+    prefix = f"<!-- {REVIEW_AUDIT_MARKER}"
+    markers = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith(prefix)
+    ]
+    if not markers:
+        return ()
+    if len(markers) != 1 or not markers[0].endswith(" -->"):
+        raise WorkerFailure("PR has ambiguous review audit markers")
+    encoded = markers[0][len(prefix) : -len(" -->")]
+    try:
+        source = base64.b64decode(encoded, validate=True).decode("utf-8")
+        values = json.loads(source)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkerFailure("PR review audit marker is invalid") from exc
+    if not isinstance(values, list) or len(values) > MAX_REVIEW_AUDIT_RECORDS:
+        raise WorkerFailure("PR review audit exceeds its record bound")
+    records: list[ReviewAuditRecord] = []
+    for value in values:
+        if not isinstance(value, dict) or set(value) != {
+            "audit_id",
+            "role",
+            "round",
+            "verdict",
+            "reviewed_sha",
+            "findings",
+            "fix_disposition",
+            "fix_sha",
+        }:
+            raise WorkerFailure("PR review audit record has an invalid schema")
+        findings = value["findings"]
+        if (
+            not isinstance(value["audit_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["audit_id"])
+            or not isinstance(value["role"], str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", value["role"])
+            or not isinstance(value["round"], int)
+            or isinstance(value["round"], bool)
+            or value["round"] < 1
+            or value["verdict"] not in _REVIEW_VERDICTS
+            or not isinstance(value["reviewed_sha"], str)
+            or not 1 <= len(value["reviewed_sha"]) <= 128
+            or not isinstance(findings, list)
+            or len(findings) > MAX_REVIEW_FINDINGS
+            or any(
+                not isinstance(finding, str)
+                or not finding
+                or len(finding) > MAX_REVIEW_FINDING_CHARS
+                or _SENSITIVE_REVIEW_TEXT.search(finding)
+                for finding in findings
+            )
+            or not isinstance(value["fix_disposition"], str)
+            or not 1 <= len(value["fix_disposition"]) <= 80
+            or (
+                value["fix_sha"] is not None
+                and (
+                    not isinstance(value["fix_sha"], str)
+                    or not 1 <= len(value["fix_sha"]) <= 128
+                )
+            )
+        ):
+            raise WorkerFailure("PR review audit record contains invalid values")
+        records.append(
+            ReviewAuditRecord(
+                value["audit_id"],
+                value["role"],
+                value["round"],
+                value["verdict"],
+                value["reviewed_sha"],
+                tuple(findings),
+                value["fix_disposition"],
+                value["fix_sha"],
+            )
+        )
+    if len({record.audit_id for record in records}) != len(records):
+        raise WorkerFailure("PR review audit contains duplicate record IDs")
+    if _review_audit_payload(tuple(records)) != encoded:
+        raise WorkerFailure("PR review audit marker is not canonical")
+    return tuple(records)
+
+
+def new_review_audit(
+    role: str, round_number: int, verdict: str, reviewed_sha: str, result: str
+) -> ReviewAuditRecord:
+    findings = review_findings(result)
+    identity = json.dumps(
+        [role, round_number, verdict, reviewed_sha, findings],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return ReviewAuditRecord(
+        hashlib.sha256(identity.encode()).hexdigest()[:32],
+        role,
+        round_number,
+        verdict,  # type: ignore[arg-type]
+        reviewed_sha,
+        findings,
+        "not_required" if verdict == "APPROVED" else "pending",
+    )
+
+
+def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
+    records = list(review_audit_from_body(body))
+    records = [existing for existing in records if existing.audit_id != record.audit_id]
+    records.append(record)
+    records = records[-MAX_REVIEW_AUDIT_RECORDS:]
+    marker = f"<!-- {REVIEW_AUDIT_MARKER}{_review_audit_payload(tuple(records))} -->"
+    lines = [REVIEW_AUDIT_START, "### Review audit"]
+    for entry in records:
+        disposition = re.sub("_", " ", entry.fix_disposition)
+        if entry.fix_sha is not None:
+            disposition += f" at `{entry.fix_sha}`"
+        lines.append(
+            f"- **{re.sub('_', ' ', entry.role)} round {entry.round}:** "
+            f"{entry.verdict} at `{entry.reviewed_sha}`; fix: {disposition}."
+        )
+        lines.extend(f"  - {finding}" for finding in entry.findings)
+    lines.extend((marker, REVIEW_AUDIT_END))
+    managed = "\n".join(lines)
+    starts = [match.start() for match in re.finditer(re.escape(REVIEW_AUDIT_START), body)]
+    ends = [match.end() for match in re.finditer(re.escape(REVIEW_AUDIT_END), body)]
+    if len(starts) > 1 or len(ends) > 1 or bool(starts) != bool(ends):
+        raise WorkerFailure("PR has ambiguous review audit section markers")
+    if starts:
+        if starts[0] >= ends[0]:
+            raise WorkerFailure("PR has invalid review audit section markers")
+        return f"{body[:starts[0]]}{managed}{body[ends[0]:]}"
+    return f"{body.rstrip()}\n\n{managed}" if body.strip() else managed
+
+
+def persist_review_audit(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    record: ReviewAuditRecord,
+    *,
+    head: str,
+    base: str,
+) -> PullRequestState:
+    body = with_review_audit(pr.body, record)
+    require_base_pr_body_size(body)
+    if body == pr.body:
+        return pr
+    return github.update_pr_body(
+        pr.number,
+        body=body,
+        expected_head=head,
+        expected_head_sha=pr.head_sha,
+        expected_base=base,
+        expected_base_sha=pr.base_sha,
+        draft=True,
+    )
+
+
+def review_audit_disposition(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    audit_id: str,
+    disposition: str,
+    *,
+    head: str,
+    base: str,
+    fix_sha: str | None = None,
+) -> PullRequestState:
+    records = review_audit_from_body(pr.body)
+    matching = [record for record in records if record.audit_id == audit_id]
+    if len(matching) != 1:
+        raise WorkerFailure("review audit record disappeared before fix disposition")
+    record = matching[0]
+    updated = ReviewAuditRecord(
+        record.audit_id,
+        record.role,
+        record.round,
+        record.verdict,
+        record.reviewed_sha,
+        record.findings,
+        disposition,
+        fix_sha,
+    )
+    return persist_review_audit(github, pr, updated, head=head, base=base)
 
 
 def policy_context(
@@ -1352,7 +1623,8 @@ Issue identifies a policy Issue, use that version-design context; the
 implementation work item remains authoritative when they conflict, and report the
 conflict as a warning. Do not focus on detailed implementation bugs in this
 phase. Do not mutate files or PR state. Return APPROVED or CHANGES_REQUESTED
-first, followed by actionable findings. {REVIEWER_CHECKOUT_GUARD}"""
+first, followed by actionable findings. {REVIEWER_CHECKOUT_GUARD}
+{REVIEWER_AUDIT_GUARD}"""
     correctness_review = context + f"""Perform only the Correctness Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement}
@@ -1363,7 +1635,8 @@ Git/GitHub topology, regressions, missing tests, cleanup and resource ownership,
 and security or secret handling. Do not reopen scope preferences unless they
 cause a concrete correctness problem. Do not mutate files or PR state. Return
 APPROVED or CHANGES_REQUESTED first, followed by actionable findings.
-{REVIEWER_CHECKOUT_GUARD}"""
+{REVIEWER_CHECKOUT_GUARD}
+{REVIEWER_AUDIT_GUARD}"""
     return implementation, scope_review, correctness_review
 
 
@@ -1647,6 +1920,20 @@ def review_issue_phase(
             expected_base_sha=pr.base_sha,
             draft=True,
         )
+        audit = new_review_audit(
+            re.sub("/", "_", phase),
+            review_number,
+            verdict,
+            current.head_sha,
+            result,
+        )
+        current = persist_review_audit(
+            github,
+            current,
+            audit,
+            head=issue.branch,
+            base=config.integration_branch,
+        )
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
             client,
@@ -1670,6 +1957,15 @@ def review_issue_phase(
                 draft=True,
             )
             pr = ensure_issue_pr_metadata(github, pr, issue, config)
+            pr = review_audit_disposition(
+                github,
+                pr,
+                audit.audit_id,
+                "reviewer_changed_head",
+                head=issue.branch,
+                base=config.integration_branch,
+                fix_sha=reviewed_sha,
+            )
             emit_finding(
                 "git",
                 f"{phase} review changed {issue.branch}; outcome invalidated at "
@@ -1698,6 +1994,14 @@ def review_issue_phase(
                 base=config.integration_branch,
                 expected_head_sha=current.head_sha,
                 expected_base_sha=current.base_sha,
+            )
+            current = review_audit_disposition(
+                github,
+                current,
+                audit.audit_id,
+                "review_limit_reached",
+                head=issue.branch,
+                base=config.integration_branch,
             )
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
@@ -1755,6 +2059,14 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
                 expected_head_sha=current.head_sha,
                 expected_base_sha=current.base_sha,
             )
+            current = review_audit_disposition(
+                github,
+                current,
+                audit.audit_id,
+                "no_change_after_re_evaluation",
+                head=issue.branch,
+                base=config.integration_branch,
+            )
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
@@ -1778,6 +2090,15 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             draft=True,
         )
         pr = ensure_issue_pr_metadata(github, pr, issue, config)
+        pr = review_audit_disposition(
+            github,
+            pr,
+            audit.audit_id,
+            "fixed",
+            head=issue.branch,
+            base=config.integration_branch,
+            fix_sha=fixed_sha,
+        )
         if restart_scope_on_change:
             return IssueReviewPhaseResult(
                 pr, "head_changed", pr.head_sha, pr.base_sha, review_number
@@ -2742,7 +3063,8 @@ expected-output test: use the Issue and policy context to judge the difference.
 Use read-only inspection or disposable temporary directories and leave the
 repository worktree unchanged. Return APPROVED or CHANGES_REQUESTED first,
 followed by the selected scenarios, Before/After evidence, and actionable
-findings. Do not mutate files or PR state. {REVIEWER_CHECKOUT_GUARD}"""
+findings. Do not mutate files or PR state. {REVIEWER_CHECKOUT_GUARD}
+{REVIEWER_AUDIT_GUARD}"""
 
 
 def whole_version_review_prompt(
@@ -2758,6 +3080,8 @@ def whole_version_review_prompt(
         "coverage. Return APPROVED or CHANGES_REQUESTED first, followed by "
         "actionable findings; do not mutate anything.\n\n"
         + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
+        + REVIEWER_AUDIT_GUARD
         + "\n\n"
         + final_work_item_context(config, work_items)
     )
@@ -2778,6 +3102,8 @@ def design_principles_review_prompt(
         "design-principle findings; do not mutate anything.\n\n"
         + REVIEWER_CHECKOUT_GUARD
         + "\n\n"
+        + REVIEWER_AUDIT_GUARD
+        + "\n\n"
         + final_work_item_context(config, work_items)
     )
 
@@ -2796,6 +3122,8 @@ def version_readme_review_prompt(
         "whole-version review. Return APPROVED or CHANGES_REQUESTED first, followed "
         "by actionable findings; do not mutate anything.\n\n"
         + REVIEWER_CHECKOUT_GUARD
+        + "\n\n"
+        + REVIEWER_AUDIT_GUARD
         + "\n\n"
         + final_work_item_context(config, work_items)
     )
@@ -2848,6 +3176,8 @@ def review_whole_version(
     for review_number in range(1, MAX_REVIEWS + 1):
         result: str
         review_results: list[str] = []
+        requested_change_audits: list[str] = []
+        whole_audit: ReviewAuditRecord | None = None
         changes_requested = False
         if scenario_reviewer is not None:
             result, verdict = run_validated_turn(
@@ -2860,6 +3190,18 @@ def review_whole_version(
                 iteration=review_number,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
+            scenario_audit = new_review_audit(
+                "scenario_gate", review_number, verdict, pr.head_sha, result
+            )
+            pr = persist_review_audit(
+                github,
+                pr,
+                scenario_audit,
+                head=config.integration_branch,
+                base=config.main_branch,
+            )
+            if verdict == "CHANGES_REQUESTED":
+                requested_change_audits.append(scenario_audit.audit_id)
             scenario_sha, scenario_reviewer_changed = require_agent_result(
                 repo,
                 client,
@@ -2884,6 +3226,15 @@ def review_whole_version(
                     draft=True,
                 )
                 pr = ensure_base_pr_policy_notes(github, pr, config)
+                pr = review_audit_disposition(
+                    github,
+                    pr,
+                    scenario_audit.audit_id,
+                    "reviewer_changed_head",
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    fix_sha=scenario_sha,
+                )
                 emit_finding(
                     "git",
                     "Scenario Gate review changed the integration branch; "
@@ -2911,6 +3262,22 @@ def review_whole_version(
         emit_policy_conflicts(
             principles_result, config, scope="the integrated version"
         )
+        principles_audit = new_review_audit(
+            "design_principles",
+            review_number,
+            principles_verdict,
+            pr.head_sha,
+            principles_result,
+        )
+        pr = persist_review_audit(
+            github,
+            pr,
+            principles_audit,
+            head=config.integration_branch,
+            base=config.main_branch,
+        )
+        if principles_verdict == "CHANGES_REQUESTED":
+            requested_change_audits.append(principles_audit.audit_id)
         principles_sha, principles_reviewer_changed = require_agent_result(
             repo,
             client,
@@ -2935,6 +3302,15 @@ def review_whole_version(
                 draft=True,
             )
             pr = ensure_base_pr_policy_notes(github, pr, config)
+            pr = review_audit_disposition(
+                github,
+                pr,
+                principles_audit.audit_id,
+                "reviewer_changed_head",
+                head=config.integration_branch,
+                base=config.main_branch,
+                fix_sha=principles_sha,
+            )
             emit_finding(
                 "git",
                 "design-principles review changed the integration branch; "
@@ -2953,6 +3329,18 @@ def review_whole_version(
             )
             review_results.append(result)
             changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
+            whole_audit = new_review_audit(
+                "whole_version", review_number, verdict, pr.head_sha, result
+            )
+            pr = persist_review_audit(
+                github,
+                pr,
+                whole_audit,
+                head=config.integration_branch,
+                base=config.main_branch,
+            )
+            if verdict == "CHANGES_REQUESTED":
+                requested_change_audits.append(whole_audit.audit_id)
         emit_policy_conflicts(result, config, scope="the integrated version")
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
@@ -2978,6 +3366,16 @@ def review_whole_version(
                 draft=True,
             )
             pr = ensure_base_pr_policy_notes(github, pr, config)
+            if whole_audit is not None:
+                pr = review_audit_disposition(
+                    github,
+                    pr,
+                    whole_audit.audit_id,
+                    "reviewer_changed_head",
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    fix_sha=reviewed_sha,
+                )
             emit_finding(
                 "git",
                 "whole-version review changed the integration branch; "
@@ -2996,6 +3394,22 @@ def review_whole_version(
         review_results.append(version_result)
         changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
         emit_policy_conflicts(version_result, config, scope="the integrated version")
+        version_audit = new_review_audit(
+            "version_readme",
+            review_number,
+            version_verdict,
+            pr.head_sha,
+            version_result,
+        )
+        pr = persist_review_audit(
+            github,
+            pr,
+            version_audit,
+            head=config.integration_branch,
+            base=config.main_branch,
+        )
+        if version_verdict == "CHANGES_REQUESTED":
+            requested_change_audits.append(version_audit.audit_id)
         reviewed_sha, reviewer_changed = require_agent_result(
             repo,
             client,
@@ -3020,6 +3434,15 @@ def review_whole_version(
                 draft=True,
             )
             pr = ensure_base_pr_policy_notes(github, pr, config)
+            pr = review_audit_disposition(
+                github,
+                pr,
+                version_audit.audit_id,
+                "reviewer_changed_head",
+                head=config.integration_branch,
+                base=config.main_branch,
+                fix_sha=reviewed_sha,
+            )
             emit_finding(
                 "git",
                 "version and README review changed the integration branch; "
@@ -3050,6 +3473,15 @@ def review_whole_version(
                     "CHANGES_REQUESTED; keeping the Base PR Draft and continuing "
                     "without reviewer approval."
                 )
+                for audit_id in requested_change_audits:
+                    current = review_audit_disposition(
+                        github,
+                        current,
+                        audit_id,
+                        "review_limit_reached",
+                        head=config.integration_branch,
+                        base=config.main_branch,
+                    )
             else:
                 fix_result = run_turn(
                     client,
@@ -3087,8 +3519,27 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                         draft=True,
                     )
                     pr = ensure_base_pr_policy_notes(github, pr, config)
+                    for audit_id in requested_change_audits:
+                        pr = review_audit_disposition(
+                            github,
+                            pr,
+                            audit_id,
+                            "fixed",
+                            head=config.integration_branch,
+                            base=config.main_branch,
+                            fix_sha=fixed_sha,
+                        )
                     continue
                 current = ensure_base_pr_policy_notes(github, current, config)
+                for audit_id in requested_change_audits:
+                    current = review_audit_disposition(
+                        github,
+                        current,
+                        audit_id,
+                        "no_change_after_re_evaluation",
+                        head=config.integration_branch,
+                        base=config.main_branch,
+                    )
                 warning = (
                     "Whole-version reviewer requested changes, but the fixer "
                     "re-evaluated the findings and produced no code changes; "
