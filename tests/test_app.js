@@ -3855,3 +3855,55 @@ test("external targets load and save stable registrations without credential val
   await elements["external-target-settings"].dispatch("submit");
   assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 1);
 });
+
+test("obsolete external target responses cannot overwrite reopened Settings edits", async () => {
+  const first = deferred();
+  const second = deferred();
+  let reads = 0;
+  let saved;
+  const target = {id: "current", destination: "https://current.example", tokenEnv: "CURRENT_TOKEN"};
+  const edited = {...target, destination: "https://edited.example"};
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      if (options.method === "POST") {
+        saved = JSON.parse(options.body);
+        return response({targets: [{...edited, credentialStatus: "configured"}]});
+      }
+      return ++reads === 1 ? first.promise : second.promise;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  second.resolve(response({targets: [{...target, credentialStatus: "missing"}]}));
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  elements["external-targets-json"].value = JSON.stringify([edited]);
+  first.resolve(response({targets: [{...target, id: "stale", credentialStatus: "configured"}]}));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+  assert.equal(elements["external-target-credentials"].textContent, "current: credentials missing");
+  await elements["external-target-settings"].dispatch("submit");
+  assert.deepEqual(saved, {targets: [edited]});
+});
+
+test("obsolete external target failures cannot change current Settings state", async () => {
+  const first = deferred();
+  let reads = 0;
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      return ++reads === 1 ? first.promise : response({targets: []});
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  first.resolve(response({error: "obsolete failure"}, 500));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements["external-target-message"].textContent, "");
+  assert.equal(elements["save-external-targets"].disabled, false);
+});

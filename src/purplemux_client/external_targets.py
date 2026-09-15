@@ -152,14 +152,24 @@ class ExternalTargetSettings:
             raise SettingsError("External target settings could not be read.") from None
         return self._validate(payload)
 
+    @staticmethod
+    def _credential_status(token: str | None) -> str:
+        if not token:
+            return "missing"
+        if len(token) > 4096 or any(
+            ord(char) < 33 or ord(char) > 126 for char in token
+        ):
+            return "invalid"
+        return "configured"
+
     def read(self) -> dict[str, object]:
         return {
             "targets": [
                 {
                     **target,
-                    "credentialStatus": "configured"
-                    if self._environment.get(target["tokenEnv"])
-                    else "missing",
+                    "credentialStatus": self._credential_status(
+                        self._environment.get(target["tokenEnv"])
+                    ),
                 }
                 for target in self._read_targets()
             ]
@@ -203,11 +213,7 @@ class ExternalTargetSettings:
         if target is None:
             raise SettingsValidationError("External target is not registered.")
         token = self._environment.get(target["tokenEnv"])
-        if (
-            not token
-            or len(token) > 4096
-            or any(ord(char) < 33 or ord(char) > 126 for char in token)
-        ):
+        if token is None or self._credential_status(token) != "configured":
             raise SettingsError("External target credential is missing or invalid.")
         return ExternalTargetConnection(
             target_id, target["destination"], {"X-Python-Runner-Token": token}

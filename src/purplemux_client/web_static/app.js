@@ -1621,6 +1621,7 @@ const externalTargetsForm = document.querySelector("#external-target-settings");
 const externalTargetsJson = document.querySelector("#external-targets-json");
 const externalTargetMessage = document.querySelector("#external-target-message");
 const saveExternalTargets = document.querySelector("#save-external-targets");
+let externalTargetsRequestGeneration = 0;
 
 function renderExternalTargets(settings) {
   externalTargetsJson.value = JSON.stringify(settings.targets.map(({id, destination, tokenEnv}) => ({id, destination, tokenEnv})), null, 2);
@@ -2146,18 +2147,26 @@ checkedToggle.addEventListener("click", async () => {
 
 settingsOpen.addEventListener("click", () => {
   settingsDialog.showModal();
+  const requestGeneration = ++externalTargetsRequestGeneration;
   saveExternalTargets.disabled = true;
   externalTargetMessage.textContent = "Loading…";
   request("/api/settings/external-targets").then(settings => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
     renderExternalTargets(settings);
     saveExternalTargets.disabled = false;
     externalTargetMessage.textContent = "";
   }).catch(error => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
     externalTargetMessage.textContent = String(error);
   });
 });
 
+settingsDialog.addEventListener("close", () => {
+  if (!settingsDialog.open) ++externalTargetsRequestGeneration;
+});
+
 settingsClose.addEventListener("click", () => {
+  ++externalTargetsRequestGeneration;
   settingsDialog.close();
 });
 

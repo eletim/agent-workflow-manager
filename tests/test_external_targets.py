@@ -116,13 +116,28 @@ def test_supported_destinations(tmp_path: Path, destination: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "token", ["", "private-secret\r\ninjected: yes", "private-secret\x00", "é"]
+    ("token", "status"),
+    [
+        (None, "missing"),
+        ("", "missing"),
+        ("private-secret\r\ninjected: yes", "invalid"),
+        ("private-secret\x00", "invalid"),
+        ("é", "invalid"),
+        ("private secret", "invalid"),
+        ("x" * 4097, "invalid"),
+    ],
 )
-def test_missing_or_invalid_credential_is_sanitized(tmp_path: Path, token: str) -> None:
+def test_missing_or_invalid_credential_is_sanitized(
+    tmp_path: Path, token: str | None, status: str
+) -> None:
     settings = ExternalTargetSettings(
-        tmp_path / "targets.json", environment={"OFFICE_AWM_TOKEN": token}
+        tmp_path / "targets.json",
+        environment={} if token is None else {"OFFICE_AWM_TOKEN": token},
     )
-    settings.update({"targets": [registration()]})
+    saved = settings.update({"targets": [registration()]})
+    assert saved["targets"][0]["credentialStatus"] == status
+    assert settings.read() == saved
+    assert "private-secret" not in json.dumps(saved)
     with pytest.raises(SettingsError) as error:
         settings.connection("office")
     assert "private-secret" not in str(error.value)
