@@ -79,7 +79,7 @@ def get_child_run_result(
         run_id=run_id,
         target_id=target_id,
         timeout=_timeout,
-        request_timeout=35 if _timeout is None else _timeout + 1,
+        request_timeout=35 if _timeout is None else _timeout,
     )
     return ChildRunResult(**result) if result else None
 
@@ -95,21 +95,19 @@ def wait_child_run(
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         remaining = None if deadline is None else deadline - time.monotonic()
-        if target_id is not None and remaining is not None and remaining <= 0:
+        if remaining is not None and remaining <= 0:
             raise TimeoutError(f"child Run {run_id} is still unknown")
         result = get_child_run_result(
             run_id,
             target_id=target_id,
-            _timeout=remaining if target_id is not None else None,
+            _timeout=remaining,
         )
-        if (
-            target_id is not None
-            and deadline is not None
-            and time.monotonic() >= deadline
-        ):
+        if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"child Run {run_id} is still unknown")
         if result is not None:
             return result
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"child Run {run_id} is still running")
-        time.sleep(0.05)
+        time.sleep(
+            0.05 if deadline is None else max(0, min(0.05, deadline - time.monotonic()))
+        )

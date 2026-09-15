@@ -678,3 +678,63 @@ def test_runnable_child_example(target_id, tmp_path):
         assert parent.state == "success", parent.stderr
         assert "hello AWM" in parent.stdout
         assert len(parent.child_runs) == 1
+
+
+@pytest.mark.parametrize("target_id", [None, "remote"])
+def test_wait_rejects_terminal_response_after_deadline(target_id, monkeypatch):
+    from purplemux_client import workflow
+
+    clock = [0.0]
+    monkeypatch.setattr(workflow.time, "monotonic", lambda: clock[0])
+    budgets = []
+
+    def delayed_control(operation, **payload):
+        budgets.append(payload)
+        clock[0] += 0.25
+        return dict(run_id=1, state="success", exit_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(workflow, "_control", delayed_control)
+    with pytest.raises(TimeoutError):
+        workflow.wait_child_run(1, timeout=0.01, target_id=target_id)
+    assert budgets[0]["timeout"] == pytest.approx(0.01)
+    assert budgets[0]["request_timeout"] == pytest.approx(0.01)
+
+
+@pytest.mark.parametrize("target_id", [None, "remote"])
+def test_wait_bounds_delayed_control_transport(target_id, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from purplemux_client import workflow
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            time.sleep(0.25)
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(
+                    b'{"run_id":1,"state":"success","exit_code":0,"stdout":"","stderr":""}'
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv(
+        workflow.CONTROL_URL_ENV, f"http://127.0.0.1:{server.server_port}/control"
+    )
+    monkeypatch.setenv(workflow.CONTROL_TOKEN_ENV, "test-token")
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            workflow.wait_child_run(1, timeout=0.01, target_id=target_id)
+        assert time.monotonic() - started < 0.2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

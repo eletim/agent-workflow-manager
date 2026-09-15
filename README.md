@@ -858,11 +858,13 @@ persist in `$XDG_CONFIG_HOME/agent-workflow-manager/external-targets.json`
 `AGENT_WORKFLOW_MANAGER_EXTERNAL_TARGETS_FILE`. Invalid files are reported rather
 than overwritten.
 
-Set each `tokenEnv` variable in the local AWM server environment to the destination
-server's request token. Only the variable name and credential status appear in
+Fetch the request token through `GET /api/token` on the trusted destination.
+Export its `token` value as the registered `tokenEnv` variable before starting
+the source AWM server. Only the variable name and credential status appear in
 settings; credential values are never stored in the registry or returned by its
-API. Environment changes require restarting the local server; a destination token
-must be refreshed when that server rotates it. Server code can use
+API. The destination generates a new token on every server start. After every
+destination restart, fetch the new token, export it again, and restart the source
+server so it inherits the updated environment. Server code can use
 `ExternalTargetSettings.connection(id)` to obtain the destination and private
 `X-Python-Runner-Token` header. Registration does not initiate a connection or
 launch an external Run.
@@ -911,9 +913,25 @@ by itself attach a child to the currently running Workflow.
 [examples/child-runs.py](examples/child-runs.py) is a runnable Workflow for both
 cases. Paste its source into Python Workflow mode and start it with no arguments
 for a local child. For two local AWM instances, start the destination on a different
-port, register `remote` on the source with destination `http://127.0.0.1:<port>`
-and a `tokenEnv` supplied in the source server environment, then start the example
-on the source with arguments `["remote"]`. The child receives `["AWM"]` and prints
+port and use separate history files for the two instances. In the destination
+terminal:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE="$PWD/remote-run-history.json" make web ARGS="--port 8766"
+```
+In the source terminal, fetch and export the destination credential, then start
+the source on its own port:
+
+```bash
+export REMOTE_AWM_TOKEN="$(curl --fail --silent http://127.0.0.1:8766/api/token | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE="$PWD/source-run-history.json" make web ARGS="--port 8765"
+```
+
+Register `remote` in the source Settings with destination
+`http://127.0.0.1:8766` and `tokenEnv` set to `REMOTE_AWM_TOKEN`, then start the
+example on the source with arguments `["remote"]`. After every destination
+restart, repeat the token export and restart the source before using `remote`.
+The child receives `["AWM"]` and prints
 `hello AWM`; its final state, exit code, stdout, and stderr are printed by the parent.
 Running this file directly outside an AWM Workflow lacks the run-scoped control
 credentials and fails explicitly.
