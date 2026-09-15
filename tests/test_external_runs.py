@@ -625,3 +625,28 @@ socket.getaddrinfo = delayed_getaddrinfo
     result = client.wait_run("remote", run_id, timeout=5)
     assert result.state == "success"
     assert result.stdout.strip() == "DNS recovered"
+
+
+@pytest.mark.parametrize("observed", [None, "a" * 32 + "-1", "b" * 32 + "-2"])
+def test_navigation_rejects_missing_or_different_run_identity(
+    tmp_path, monkeypatch, observed
+):
+    settings = ExternalTargetSettings(
+        tmp_path / "targets.json", environment={"TOKEN": "secret"}
+    )
+    settings.update(
+        {
+            "targets": [
+                {
+                    "id": "remote",
+                    "destination": "https://remote.example",
+                    "tokenEnv": "TOKEN",
+                }
+            ]
+        }
+    )
+    client = ExternalRunClient(settings)
+    monkeypatch.setattr(
+        client, "_request", lambda *args, **kwargs: {"runId": 1, "identity": observed}
+    )
+    assert client.navigation_url("b" * 32 + "-1") is None

@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import qrcode
 from qrcode.image.svg import SvgPathImage
@@ -445,6 +445,24 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+        if path == "/api/run-navigation":
+            if not self._is_trusted_request(require_json=False):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+                return
+            identity = parse_qs(urlparse(self.path).query).get("identity", [""])[0]
+            try:
+                from purplemux_client.external_runs import ExternalRunClient
+
+                url = ExternalRunClient(
+                    self.server.external_target_settings
+                ).navigation_url(identity)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except SettingsError:
+                url = None
+            self._send_json(HTTPStatus.OK, {"url": url})
             return
         if path == "/api/events":
             self._send_events()

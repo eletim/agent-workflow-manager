@@ -5097,3 +5097,104 @@ def test_external_target_settings_api(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_run_family_navigation_across_registered_awms_after_reload(tmp_path):
+    from purplemux_client.external_targets import ExternalTargetSettings
+
+    histories = [tmp_path / "parent.json", tmp_path / "child.json"]
+    runners = [
+        PythonRunner(managed_workflows=False, run_history_file=history)
+        for history in histories
+    ]
+    identities = []
+    for runner in runners:
+        run_id = runner.start("pass")
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        identities.append(runner.snapshot(run_id).identity)
+    for runner in runners:
+        runner.link_runs(*identities)
+        runner.close()
+    settings = [
+        ExternalTargetSettings(
+            tmp_path / f"targets-{index}.json", environment={"TOKEN": "remote-token"}
+        )
+        for index in range(2)
+    ]
+    servers = [
+        RunnerHTTPServer(
+            ("127.0.0.1", 0),
+            PythonRunner(managed_workflows=False, run_history_file=history),
+            external_target_settings=registration,
+        )
+        for history, registration in zip(histories, settings, strict=True)
+    ]
+    threads = []
+    addresses = [("127.0.0.1", server.server_address[1]) for server in servers]
+    destinations = [f"http://127.0.0.1:{address[1]}" for address in addresses]
+    for index, server in enumerate(servers):
+        server.request_token = "remote-token"
+        settings[index].update(
+            {
+                "targets": [
+                    {
+                        "id": "missing-credential",
+                        "destination": destinations[index],
+                        "tokenEnv": "MISSING",
+                    },
+                    {
+                        "id": "same-numeric-id",
+                        "destination": destinations[index],
+                        "tokenEnv": "TOKEN",
+                    },
+                    {
+                        "id": "other",
+                        "destination": destinations[1 - index],
+                        "tokenEnv": "TOKEN",
+                    },
+                ]
+            }
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        threads.append(thread)
+    try:
+        for index in range(2):
+            status, detail = request(addresses[index], "GET", "/api/runs/1")
+            assert status == 200
+            reference = detail["childRuns"][0] if index == 0 else detail["parentRun"]
+            assert reference["scope"] == "external"
+            assert reference["identity"] == identities[1 - index]
+            path = f"/api/run-navigation?identity={reference['identity']}"
+            assert request(addresses[index], "GET", path)[0] == 403
+            assert request(addresses[index], "GET", path, token="remote-token") == (
+                200,
+                {"url": destinations[1 - index] + "/?run=" + identities[1 - index]},
+            )
+        servers[1].runner.set_checked(1, True)
+        servers[1].runner.delete_checked_runs([1])
+        path = f"/api/run-navigation?identity={identities[1]}"
+        assert request(addresses[0], "GET", path, token="remote-token") == (
+            200,
+            {"url": None},
+        )
+        assert servers[0].runner.snapshot(1).child_runs == (identities[1],)
+        settings[0].update({"targets": []})
+        assert request(addresses[0], "GET", path, token="remote-token") == (
+            200,
+            {"url": None},
+        )
+        assert (
+            request(
+                addresses[0],
+                "GET",
+                "/api/run-navigation?identity=1",
+                token="remote-token",
+            )[0]
+            == 400
+        )
+    finally:
+        for server, thread in zip(servers, threads, strict=True):
+            server.shutdown()
+            server.server_close()
+            thread.join()
