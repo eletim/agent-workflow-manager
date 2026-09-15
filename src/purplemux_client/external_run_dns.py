@@ -48,9 +48,16 @@ class ResolverEventLoop(asyncio.SelectorEventLoop):
         self._resolvers.add(process)
         try:
             assert process.stdout is not None
-            output = await process.stdout.read(_MAX_RESOLVER_BYTES + 1)
-            if len(output) > _MAX_RESOLVER_BYTES:
-                raise OSError("external DNS response too large")
+            output = bytearray()
+            while True:
+                chunk = await process.stdout.read(
+                    min(4096, _MAX_RESOLVER_BYTES + 1 - len(output))
+                )
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > _MAX_RESOLVER_BYTES:
+                    raise OSError("external DNS response too large")
             await process.wait()
             if process.returncode != 0:
                 raise OSError("external DNS resolver failed")
@@ -71,5 +78,15 @@ class ResolverEventLoop(asyncio.SelectorEventLoop):
         for process in self._resolvers:
             if process.returncode is None:
                 process.kill()
-        await asyncio.gather(*(process.wait() for process in self._resolvers))
+
+        async def reap(process: asyncio.subprocess.Process) -> None:
+            # A full StreamReader pauses its pipe transport. Drain after killing
+            # the producer so unread oversized output cannot block wait(), while
+            # keeping cleanup memory bounded too.
+            if process.stdout is not None:
+                while await process.stdout.read(65_536):
+                    pass
+            await process.wait()
+
+        await asyncio.gather(*(reap(process) for process in self._resolvers))
         self._resolvers.clear()
