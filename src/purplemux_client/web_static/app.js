@@ -157,6 +157,7 @@ let explicitNewRun = false;
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
+let familyNavigationRequestGeneration = 0;
 let checkedRunIds = [];
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
@@ -856,20 +857,22 @@ function renderRunFamily(container, run) {
     link.type = "button";
     link.textContent = `${relation}: ${reference.identity} (${reference.scope})`;
     link.href = `/?run=${encodeURIComponent(reference.identity)}`;
-    if (reference.scope === "external") {
-      link.addEventListener("click", async event => {
-        event.preventDefault();
-        const generation = activeRunGeneration;
-        try {
-          const {url} = await request(`/api/run-navigation?identity=${encodeURIComponent(reference.identity)}`);
-          if (generation !== activeRunGeneration) return;
-          if (url) window.location.href = url;
-          else link.textContent = `${relation}: ${reference.identity} — target unavailable or history deleted`;
-        } catch (error) {
-          if (generation === activeRunGeneration) link.textContent = `${relation}: ${reference.identity} — target unavailable`;
+    link.addEventListener("click", async event => {
+      const requestGeneration = ++familyNavigationRequestGeneration;
+      if (reference.scope !== "external") return;
+      event.preventDefault();
+      const generation = activeRunGeneration;
+      try {
+        const {url} = await request(`/api/run-navigation?identity=${encodeURIComponent(reference.identity)}`);
+        if (generation !== activeRunGeneration || requestGeneration !== familyNavigationRequestGeneration) return;
+        if (url) window.location.href = url;
+        else link.textContent = `${relation}: ${reference.identity} — target unavailable or history deleted`;
+      } catch (error) {
+        if (generation === activeRunGeneration && requestGeneration === familyNavigationRequestGeneration) {
+          link.textContent = `${relation}: ${reference.identity} — target unavailable`;
         }
-      });
-    }
+      }
+    });
     container.append(link);
   }
 }

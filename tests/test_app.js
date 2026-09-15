@@ -4002,3 +4002,57 @@ for (const relation of ["parentRun", "childRuns"]) {
     assert.ok(app.calls.some(([path]) => path === `/api/run-navigation?identity=${identity}`));
   });
 }
+
+for (const responseOrder of [[0, 1], [1, 0]]) {
+  for (const obsoleteResult of ["destination", "unavailable", "error"]) {
+    test(`latest family click wins with response order ${responseOrder} and obsolete ${obsoleteResult}`, async () => {
+      const identities = ["b".repeat(32) + "-7", "c".repeat(32) + "-8"];
+      const pending = [deferred(), deferred()];
+      const run = {
+        ...snapshot({runId: 1, state: "success", stdout: ""}),
+        childRuns: identities.map((identity, index) => ({identity, runId: index + 7, scope: "external"})),
+      };
+      const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+        const index = identities.findIndex(identity => path === `/api/run-navigation?identity=${identity}`);
+        if (index >= 0) return pending[index].promise;
+      }});
+      // Detail and history share the same navigation intent.
+      const firstLink = app.elements["run-family"].children[0];
+      const historyFamily = app.elements["run-list"].children.find(item => item.className === "run-family");
+      const secondLink = historyFamily.children[1];
+      const originalLabel = firstLink.textContent;
+      const clicks = [firstLink.dispatch("click"), secondLink.dispatch("click")];
+      const destinations = identities.map(identity => `https://registered.example/?run=${identity}`);
+      for (const index of responseOrder) {
+        pending[index].resolve(index === 0 && obsoleteResult === "error"
+          ? response({error: "obsolete failure"}, 500)
+          : response({url: index === 0 && obsoleteResult === "unavailable" ? null : destinations[index]}));
+        await clicks[index];
+        assert.equal(app.location.href, index === 1 || responseOrder[0] === 1
+          ? destinations[1] : "http://127.0.0.1:8765/");
+        assert.equal(firstLink.textContent, originalLabel);
+      }
+    });
+  }
+}
+
+test("local family click invalidates pending external navigation", async () => {
+  const pending = deferred();
+  const run = {
+    ...snapshot({runId: 1, state: "success", stdout: ""}),
+    childRuns: [
+      {identity: "b".repeat(32) + "-7", runId: 7, scope: "external"},
+      {identity: "a".repeat(32) + "-2", runId: 2, scope: "local"},
+    ],
+  };
+  const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+    if (path.startsWith("/api/run-navigation?")) return pending.promise;
+  }});
+  const [external, local] = app.elements["run-family"].children;
+  const click = external.dispatch("click");
+  await local.dispatch("click");
+  pending.resolve(response({url: "https://obsolete.example/"}));
+  await click;
+  assert.equal(app.location.href, "http://127.0.0.1:8765/");
+  assert.equal(local.href, `/?run=${"a".repeat(32)}-2`);
+});
