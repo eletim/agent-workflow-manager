@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import ssl
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from http.client import HTTPException
-from urllib import error, request
+
+import httpx
 
 from purplemux_client.external_targets import ExternalTargetSettings
 
@@ -23,11 +26,6 @@ class ExternalRunError(RuntimeError):
 
 class ExternalRunLaunchUnknown(ExternalRunError):
     """A launch may have executed. Inspect the destination; do not retry blindly."""
-
-
-class _NoRedirect(request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 @dataclass(frozen=True)
@@ -60,7 +58,7 @@ class ExternalRunClient:
         _duration(request_timeout)
         self.settings = settings if settings is not None else ExternalTargetSettings()
         self.request_timeout = request_timeout
-        self._opener = request.build_opener(_NoRedirect())
+        self._tls_context = ssl.create_default_context()
         self._destinations: dict[str, str] = {}
 
     def _request(
@@ -80,66 +78,83 @@ class ExternalRunClient:
             )
         launching = payload is not None
         failure = ExternalRunLaunchUnknown if launching else ExternalRunError
-        message = request.Request(
-            connection.destination + path,
-            data=None if payload is None else json.dumps(payload).encode(),
-            headers={**connection.headers, "Content-Type": "application/json"},
-            method="POST" if launching else "GET",
-        )
-        try:
-            with self._opener.open(
-                message, timeout=timeout or self.request_timeout
-            ) as response:
-                if (
-                    response.status != (202 if launching else 200)
-                    or response.headers.get_content_type() != "application/json"
-                ):
-                    raise ValueError("unexpected response")
-                body = bytearray()
-                while True:
-                    if deadline is not None:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise TimeoutError("external Run result deadline expired")
-                        # urllib returns an HTTPResponse backed by SocketIO for
-                        # both HTTP and HTTPS. Limit each read to the time left;
-                        # read1 returns available data rather than waiting to fill.
-                        if response.fp is not None:
-                            response.fp.raw._sock.settimeout(
-                                min(self.request_timeout, remaining)
+
+        async def exchange() -> dict:
+            transport = httpx.AsyncHTTPTransport(
+                verify=self._tls_context, retries=0, trust_env=False
+            )
+            async with httpx.AsyncClient(
+                transport=transport,
+                follow_redirects=False,
+                trust_env=False,
+                timeout=timeout or self.request_timeout,
+            ) as client:
+                async with client.stream(
+                    "POST" if launching else "GET",
+                    connection.destination + path,
+                    content=None if payload is None else json.dumps(payload).encode(),
+                    headers={
+                        **connection.headers,
+                        "Content-Type": "application/json",
+                        "Accept-Encoding": "identity",
+                    },
+                ) as response:
+                    if response.status_code != (202 if launching else 200):
+                        # Only explicit pre-execution rejections establish that
+                        # no Run launched. Redirects are never followed.
+                        if launching and response.status_code in {
+                            400,
+                            403,
+                            404,
+                            409,
+                            422,
+                        }:
+                            raise ExternalRunError(
+                                f"external launch rejected (HTTP {response.status_code})"
                             )
-                    chunk = response.read1(
-                        min(65_536, _MAX_RESPONSE_BYTES + 1 - len(body))
-                    )
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise TimeoutError("external Run result deadline expired")
-                    if not chunk:
-                        if response.length not in {None, 0}:
-                            raise ValueError("incomplete response")
-                        break
-                    body.extend(chunk)
-                    if len(body) > _MAX_RESPONSE_BYTES:
-                        raise ValueError("response too large")
-                value = json.loads(body)
-                if not isinstance(value, dict):
-                    raise ValueError("expected object")
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("external Run result deadline expired")
-                return value
-        except error.HTTPError as exc:
-            # Only explicit pre-execution rejections establish that no Run launched.
-            if launching and exc.code in {400, 403, 404, 409, 422}:
-                raise ExternalRunError(
-                    f"external launch rejected (HTTP {exc.code})"
-                ) from None
-            raise failure(
-                f"external request failed (HTTP {exc.code}); outcome unknown"
-            ) from None
-        except TimeoutError as exc:
+                        raise failure(
+                            f"external request failed (HTTP {response.status_code}); outcome unknown"
+                        )
+                    if (
+                        response.headers.get("Content-Type", "")
+                        .split(";", 1)[0]
+                        .strip()
+                        .lower()
+                        != "application/json"
+                    ):
+                        raise ValueError("unexpected response")
+                    body = bytearray()
+                    async for chunk in response.aiter_raw(chunk_size=65_536):
+                        if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                            raise ValueError("response too large")
+                        body.extend(chunk)
+                    value = json.loads(body)
+                    if not isinstance(value, dict):
+                        raise ValueError("expected object")
+                    return value
+
+        async def timed_exchange() -> dict:
+            remaining = timeout or self.request_timeout
+            if deadline is not None:
+                remaining = min(remaining, deadline - time.monotonic())
+            if remaining <= 0:
+                raise TimeoutError("external Run result deadline expired")
+            return await asyncio.wait_for(exchange(), timeout=remaining)
+
+        try:
+            # Own the event loop in a worker so this synchronous contract also
+            # works when its caller already runs an asyncio loop. wait_for
+            # cancels HTTPX I/O and context managers close the response/client.
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                value = worker.submit(lambda: asyncio.run(timed_exchange())).result()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("external Run result deadline expired")
+            return value
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("external Run result deadline expired") from None
             raise failure("external response timed out; outcome unknown") from exc
-        except (OSError, ValueError, HTTPException, error.URLError) as exc:
+        except (OSError, ValueError, httpx.HTTPError) as exc:
             raise failure(
                 "external response unavailable or malformed; outcome unknown"
             ) from exc

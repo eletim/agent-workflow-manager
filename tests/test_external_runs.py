@@ -354,7 +354,8 @@ def test_registration_change_cannot_observe_colliding_run(external_awms):
     assert len(servers[1].runner.snapshots()) == 1
 
 
-def test_trickling_response_expires_within_polling_deadline(tmp_path):
+@pytest.mark.parametrize("trickle_part", ["headers", "body"])
+def test_trickling_response_expires_within_polling_deadline(tmp_path, trickle_part):
     import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -369,12 +370,19 @@ def test_trickling_response_expires_within_polling_deadline(tmp_path):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
             try:
-                for byte in body:
+                if trickle_part == "headers":
+                    message = (
+                        f"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+                        + body
+                    )
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    message = body
+                for byte in message:
                     self.wfile.write(bytes([byte]))
                     self.wfile.flush()
                     time.sleep(0.005)
@@ -454,3 +462,94 @@ def test_response_limit_remains_bounded(external_awms, monkeypatch):
     monkeypatch.setattr("purplemux_client.external_runs._MAX_RESPONSE_BYTES", 128)
     with pytest.raises(ExternalRunError, match="malformed"):
         client.get_run_result("remote", run_id)
+
+
+def test_synchronous_client_works_with_running_event_loop(external_awms):
+    import asyncio
+
+    _, settings, _ = external_awms
+    client = ExternalRunClient(settings)
+
+    async def workflow():
+        run_id = client.start_run("remote", 'print("async caller")')
+        return client.wait_run("remote", run_id, timeout=5)
+
+    result = asyncio.run(workflow())
+    assert result.state == "success"
+    assert result.stdout.strip() == "async caller"
+
+
+@pytest.mark.parametrize(
+    "trusted,hostname", [(False, "localhost"), (True, "localhost"), (True, "127.0.0.1")]
+)
+def test_tls_verifies_certificate_and_hostname(
+    trusted, hostname, tmp_path, monkeypatch
+):
+    import ssl
+    import subprocess
+
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    if trusted:
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        settings = ExternalTargetSettings(
+            tmp_path / "targets.json", environment={"TOKEN": server.request_token}
+        )
+        settings.update(
+            {
+                "targets": [
+                    {
+                        "id": "remote",
+                        "destination": f"https://{hostname}:{server.server_port}",
+                        "tokenEnv": "TOKEN",
+                    }
+                ]
+            }
+        )
+        client = ExternalRunClient(settings)
+        if trusted and hostname == "localhost":
+            run_id = client.start_run("remote", 'print("verified TLS")')
+            result = client.wait_run("remote", run_id, timeout=5)
+            assert result.state == "success"
+            assert result.stdout.strip() == "verified TLS"
+        else:
+            with pytest.raises(ExternalRunLaunchUnknown):
+                client.start_run("remote", 'print("must not execute")')
+            assert not runner.snapshots()
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+        runner.close()
