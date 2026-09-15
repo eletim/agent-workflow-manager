@@ -1617,6 +1617,45 @@ async function scheduleEventRefresh() {
   }
 }
 
+const externalTargetsForm = document.querySelector("#external-target-settings");
+const externalTargetsJson = document.querySelector("#external-targets-json");
+const externalTargetMessage = document.querySelector("#external-target-message");
+const saveExternalTargets = document.querySelector("#save-external-targets");
+let externalTargetsRequestGeneration = 0;
+
+function renderExternalTargets(settings) {
+  externalTargetsJson.value = JSON.stringify(settings.targets.map(({id, destination, tokenEnv}) => ({id, destination, tokenEnv})), null, 2);
+  document.querySelector("#external-target-credentials").textContent = settings.targets.map(target => `${target.id}: credentials ${target.credentialStatus}`).join("; ");
+}
+
+externalTargetsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (saveExternalTargets.disabled || saveExternalTargets.dataset.pending === "true") return;
+  const requestGeneration = externalTargetsRequestGeneration;
+  saveExternalTargets.dataset.pending = "true";
+  saveExternalTargets.setAttribute("aria-busy", "true");
+  saveExternalTargets.disabled = true;
+  try {
+    const settings = await request("/api/settings/external-targets", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({targets: JSON.parse(externalTargetsJson.value)}),
+    });
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    externalTargetMessage.textContent = "External targets saved.";
+  } catch (error) {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  } finally {
+    if (requestGeneration === externalTargetsRequestGeneration) {
+      delete saveExternalTargets.dataset.pending;
+      saveExternalTargets.removeAttribute("aria-busy");
+      saveExternalTargets.disabled = false;
+    }
+  }
+});
+
 function renderSettings(settings) {
   notificationsEnabled.checked = settings.enabled;
   notifySuccess.checked = settings.onSuccess;
@@ -2119,9 +2158,28 @@ checkedToggle.addEventListener("click", async () => {
 
 settingsOpen.addEventListener("click", () => {
   settingsDialog.showModal();
+  const requestGeneration = ++externalTargetsRequestGeneration;
+  delete saveExternalTargets.dataset.pending;
+  saveExternalTargets.removeAttribute("aria-busy");
+  saveExternalTargets.disabled = true;
+  externalTargetMessage.textContent = "Loading…";
+  request("/api/settings/external-targets").then(settings => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    saveExternalTargets.disabled = false;
+    externalTargetMessage.textContent = "";
+  }).catch(error => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  });
+});
+
+settingsDialog.addEventListener("close", () => {
+  if (!settingsDialog.open) ++externalTargetsRequestGeneration;
 });
 
 settingsClose.addEventListener("click", () => {
+  ++externalTargetsRequestGeneration;
   settingsDialog.close();
 });
 

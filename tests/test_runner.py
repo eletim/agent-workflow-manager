@@ -5031,3 +5031,69 @@ def test_run_family_links_reject_conflicting_external_child_parents_after_reload
         assert history.read_text() == saved
     finally:
         restored.close()
+
+
+def test_external_target_settings_api(tmp_path: Path) -> None:
+    from purplemux_client.external_targets import ExternalTargetSettings
+
+    settings = ExternalTargetSettings(
+        tmp_path / "targets.json", environment={"REMOTE_TOKEN": "private-secret"}
+    )
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        PythonRunner(managed_workflows=False),
+        external_target_settings=settings,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    path = "/api/settings/external-targets"
+    body = json.dumps(
+        {
+            "targets": [
+                {
+                    "id": "remote",
+                    "destination": "https://remote.example",
+                    "tokenEnv": "REMOTE_TOKEN",
+                }
+            ]
+        }
+    )
+    try:
+        assert request(address, "GET", path) == (200, {"targets": []})
+        assert request(address, "POST", path, body)[0] == 403
+        assert not settings.path.exists()
+        status, saved = request(address, "POST", path, body, token=server.request_token)
+        assert status == 200
+        assert saved["targets"][0]["credentialStatus"] == "configured"
+        assert "private-secret" not in json.dumps(saved)
+        assert request(address, "GET", path) == (200, saved)
+        assert (
+            request(
+                address,
+                "POST",
+                path,
+                body,
+                token=server.request_token,
+                origin="https://evil.example",
+            )[0]
+            == 403
+        )
+        status, error = request(
+            address,
+            "POST",
+            path,
+            '{"targets":[{"token":"private-secret"}]}',
+            token=server.request_token,
+        )
+        assert status == 400
+        assert "private-secret" not in json.dumps(error)
+        assert request(address, "GET", path) == (200, saved)
+        settings.path.write_text("invalid private-secret")
+        status, error = request(address, "GET", path)
+        assert status == 500
+        assert "private-secret" not in json.dumps(error)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

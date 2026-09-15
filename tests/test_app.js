@@ -222,6 +222,7 @@ async function loadApp({
   confirmOverride = null,
 }) {
   const ids = [
+    "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
@@ -3828,3 +3829,128 @@ test("completed Workflow runs expose explicit Cleanup and retain their history",
   assert.equal(elements.cleanup.disabled, true);
   assert.match(elements["resources-summary"].textContent, /cleaned/);
 });
+
+test("external targets load and save stable registrations without credential values", async () => {
+  const target = {id: "office", destination: "https://awm.example", tokenEnv: "OFFICE_TOKEN"};
+  const {elements, calls} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/settings/external-targets") {
+        if (options.method === "POST") {
+          assert.deepEqual(JSON.parse(options.body), {targets: [target]});
+        }
+        return response({targets: [{...target, credentialStatus: "configured"}]});
+      }
+      return undefined;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [target]);
+  assert.match(elements["external-target-credentials"].textContent, /office: credentials configured/);
+  await elements["external-target-settings"].dispatch("submit");
+  assert.ok(calls.some(([url, method]) => url === "/api/settings/external-targets" && method === "POST"));
+  assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+  elements["external-targets-json"].value = "invalid";
+  await elements["external-target-settings"].dispatch("submit");
+  assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 1);
+});
+
+test("obsolete external target responses cannot overwrite reopened Settings edits", async () => {
+  const first = deferred();
+  const second = deferred();
+  let reads = 0;
+  let saved;
+  const target = {id: "current", destination: "https://current.example", tokenEnv: "CURRENT_TOKEN"};
+  const edited = {...target, destination: "https://edited.example"};
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      if (options.method === "POST") {
+        saved = JSON.parse(options.body);
+        return response({targets: [{...edited, credentialStatus: "configured"}]});
+      }
+      return ++reads === 1 ? first.promise : second.promise;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  second.resolve(response({targets: [{...target, credentialStatus: "missing"}]}));
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  elements["external-targets-json"].value = JSON.stringify([edited]);
+  first.resolve(response({targets: [{...target, id: "stale", credentialStatus: "configured"}]}));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+  assert.equal(elements["external-target-credentials"].textContent, "current: credentials missing");
+  await elements["external-target-settings"].dispatch("submit");
+  assert.deepEqual(saved, {targets: [edited]});
+});
+
+test("obsolete external target failures cannot change current Settings state", async () => {
+  const first = deferred();
+  let reads = 0;
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      return ++reads === 1 ? first.promise : response({targets: []});
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  first.resolve(response({error: "obsolete failure"}, 500));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements["external-target-message"].textContent, "");
+  assert.equal(elements["save-external-targets"].disabled, false);
+});
+
+for (const obsoleteStatus of [200, 500]) {
+  test(`obsolete external target save (${obsoleteStatus}) preserves reopened edits and pending save`, async () => {
+    const oldSave = deferred();
+    const currentSave = deferred();
+    let saves = 0;
+    const target = {id: "office", destination: "https://office.example", tokenEnv: "OFFICE_TOKEN"};
+    const edited = {...target, destination: "https://edited.example"};
+    const {elements, calls} = await loadApp({
+      runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+      fetchOverride(url, options) {
+        if (url !== "/api/settings/external-targets") return undefined;
+        if (options.method === "POST") return ++saves === 1 ? oldSave.promise : currentSave.promise;
+        return response({targets: [{...target, credentialStatus: "missing"}]});
+      },
+    });
+    await elements["settings-open"].dispatch("click");
+    await waitFor(() => !elements["save-external-targets"].disabled);
+    const oldSubmission = elements["external-target-settings"].dispatch("submit");
+    await waitFor(() => saves === 1);
+    await elements["settings-close"].dispatch("click");
+    await elements["settings-open"].dispatch("click");
+    await waitFor(() => !elements["save-external-targets"].disabled);
+    elements["external-targets-json"].value = JSON.stringify([edited]);
+    const currentSubmission = elements["external-target-settings"].dispatch("submit");
+    await waitFor(() => saves === 2);
+    oldSave.resolve(response(obsoleteStatus === 200
+      ? {targets: [{...target, credentialStatus: "configured"}]}
+      : {error: "obsolete save failure"}, obsoleteStatus));
+    await oldSubmission;
+    assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+    assert.equal(elements["external-target-message"].textContent, "");
+    assert.equal(elements["external-target-credentials"].textContent, "office: credentials missing");
+    assert.equal(elements["save-external-targets"].disabled, true);
+    assert.equal(elements["save-external-targets"].dataset.pending, "true");
+    assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), "true");
+    await elements["external-target-settings"].dispatch("submit");
+    assert.equal(saves, 2);
+    assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 2);
+    currentSave.resolve(response({targets: [{...edited, credentialStatus: "configured"}]}));
+    await currentSubmission;
+    assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+    assert.equal(elements["save-external-targets"].disabled, false);
+    assert.equal(elements["save-external-targets"].dataset.pending, undefined);
+    assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), undefined);
+  });
+}

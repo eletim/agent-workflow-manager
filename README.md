@@ -841,3 +841,28 @@ second launch using its already-established project trust:
 AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
   uv run pytest tests/test_live_claude_trust.py
 ```
+
+External AWM targets can be registered in **Settings → External AWM targets** or
+through `GET` / `POST /api/settings/external-targets`. POST replaces the list and
+uses the existing trusted JSON request policy (`X-Python-Runner-Token`). Example:
+
+```json
+{"targets":[{"id":"office","destination":"https://awm.example","tokenEnv":"OFFICE_AWM_TOKEN"}]}
+```
+
+IDs are unique, stable names (1–64 letters, numbers, underscores, or hyphens).
+Destinations support HTTPS and loopback HTTP, including a deployment path prefix;
+URLs containing credentials, queries, or fragments are rejected. Registrations
+persist in `$XDG_CONFIG_HOME/agent-workflow-manager/external-targets.json`
+(default `~/.config/agent-workflow-manager/external-targets.json`), overridable with
+`AGENT_WORKFLOW_MANAGER_EXTERNAL_TARGETS_FILE`. Invalid files are reported rather
+than overwritten.
+
+Set each `tokenEnv` variable in the local AWM server environment to the destination
+server's request token. Only the variable name and credential status appear in
+settings; credential values are never stored in the registry or returned by its
+API. Environment changes require restarting the local server; a destination token
+must be refreshed when that server rotates it. Server code can use
+`ExternalTargetSettings.connection(id)` to obtain the destination and private
+`X-Python-Runner-Token` header. Registration does not initiate a connection or
+launch an external Run.
