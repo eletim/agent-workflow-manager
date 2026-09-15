@@ -232,7 +232,7 @@ async function loadApp({
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
     "active-context", "repository-navigation", "repository-slug", "repository-link",
-    "run-list", "delete-checked-runs",
+    "run-family", "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
@@ -369,6 +369,7 @@ async function loadApp({
   return {
     calls,
     elements,
+    location: context.window.location,
     eventSource: eventSources[0],
     logDisplay: context.runnerLogDisplay,
   };
@@ -3952,5 +3953,52 @@ for (const obsoleteStatus of [200, 500]) {
     assert.equal(elements["save-external-targets"].disabled, false);
     assert.equal(elements["save-external-targets"].dataset.pending, undefined);
     assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), undefined);
+  });
+}
+
+
+test("persisted family links navigate both directions after reload", async () => {
+  const parent = "a".repeat(32) + "-1";
+  const child = "a".repeat(32) + "-2";
+  const childRef = {identity: child, runId: 2, scope: "local"};
+  const parentRef = {identity: parent, runId: 1, scope: "local"};
+  const runs = [
+    {runId: 1, identity: parent, state: "success", childRuns: [childRef]},
+    {runId: 2, identity: child, state: "success", parentRun: parentRef},
+  ];
+  const details = Object.fromEntries(runs.map(run => [run.runId, {
+    ...snapshot({runId: run.runId, state: "success", stdout: ""}), ...run,
+  }]));
+  const first = await loadApp({runs, details, locationHref: `http://127.0.0.1:8765/?run=${parent}`});
+  assert.equal(selectedRun(first.elements).dataset.runId, "1");
+  const childLink = first.elements["run-family"].children[0];
+  assert.equal(childLink.href, `/?run=${child}`);
+  assert.equal(first.elements["run-list"].children.filter(item => item.className === "run-family").length, 2);
+  const second = await loadApp({runs, details, locationHref: `http://127.0.0.1:8765${childLink.href}`});
+  assert.equal(selectedRun(second.elements).dataset.runId, "2");
+  assert.equal(second.elements["run-family"].children[0].href, `/?run=${parent}`);
+  const deleted = await loadApp({runs: [runs[0]], details, locationHref: `http://127.0.0.1:8765/?run=${child}`});
+  assert.equal(selectedRun(deleted.elements), undefined);
+  assert.match(deleted.elements.stderr.textContent, /no longer available/);
+});
+
+for (const relation of ["parentRun", "childRuns"]) {
+  test(`external ${relation} resolves exact identity and handles unavailable targets`, async () => {
+    const identity = "b".repeat(32) + "-7";
+    const ref = {identity, runId: 7, scope: "external"};
+    const family = {[relation]: relation === "parentRun" ? ref : [ref]};
+    const run = {...snapshot({runId: 1, state: "success", stdout: ""}), ...family};
+    let url = null;
+    const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+      if (path.startsWith("/api/run-navigation?")) return response({url});
+    }});
+    const link = app.elements["run-family"].children[0];
+    await link.dispatch("click");
+    assert.match(link.textContent, /target unavailable or history deleted/);
+    assert.equal(app.location.href, "http://127.0.0.1:8765/");
+    url = `https://registered.example/?run=${identity}`;
+    await link.dispatch("click");
+    assert.equal(app.location.href, url);
+    assert.ok(app.calls.some(([path]) => path === `/api/run-navigation?identity=${identity}`));
   });
 }

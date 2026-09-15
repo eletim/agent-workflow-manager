@@ -461,6 +461,7 @@ function inheritFolderIntoDraft(snapshot, mode) {
 }
 
 function renderCleanDraftState() {
+  renderRunFamily(document.querySelector("#run-family"), {});
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
   rawStdout = "";
@@ -513,6 +514,7 @@ function runPresentation(run) {
 }
 
 function renderRun(result) {
+  renderRunFamily(document.querySelector("#run-family"), result);
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
@@ -842,6 +844,36 @@ function renderRecovery(result) {
   }
 }
 
+function renderRunFamily(container, run) {
+  container.replaceChildren();
+  const references = [
+    ...(run.parentRun ? [["Parent", run.parentRun]] : []),
+    ...(run.childRuns || []).map(reference => ["Child", reference]),
+  ];
+  container.hidden = references.length === 0;
+  for (const [relation, reference] of references) {
+    const link = document.createElement(reference.scope === "external" ? "button" : "a");
+    link.type = "button";
+    link.textContent = `${relation}: ${reference.identity} (${reference.scope})`;
+    link.href = `/?run=${encodeURIComponent(reference.identity)}`;
+    if (reference.scope === "external") {
+      link.addEventListener("click", async event => {
+        event.preventDefault();
+        const generation = activeRunGeneration;
+        try {
+          const {url} = await request(`/api/run-navigation?identity=${encodeURIComponent(reference.identity)}`);
+          if (generation !== activeRunGeneration) return;
+          if (url) window.location.href = url;
+          else link.textContent = `${relation}: ${reference.identity} — target unavailable or history deleted`;
+        } catch (error) {
+          if (generation === activeRunGeneration) link.textContent = `${relation}: ${reference.identity} — target unavailable`;
+        }
+      });
+    }
+    container.append(link);
+  }
+}
+
 function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
@@ -885,6 +917,10 @@ function renderRunList(runs, cleanupOwnership = []) {
       await refresh();
     });
     runList.append(button);
+    const family = document.createElement("nav");
+    family.className = "run-family";
+    family.setAttribute("aria-label", `Run #${run.runId} family`);
+    renderRunFamily(family, run);
     if (["success", "failed", "stopped"].includes(run.state)) {
       const toggle = document.createElement("button");
       toggle.type = "button";
@@ -902,6 +938,7 @@ function renderRunList(runs, cleanupOwnership = []) {
       });
       runList.append(toggle);
     }
+    if (!family.hidden) runList.append(family);
   }
   for (const ownership of [...cleanupOwnership].reverse()) {
     const description = document.createElement("div");

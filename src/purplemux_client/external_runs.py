@@ -10,11 +10,13 @@ import ssl
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import cast
 
 import httpx
 
 from purplemux_client.external_run_dns import ResolverEventLoop
 from purplemux_client.external_targets import ExternalTargetSettings
+from purplemux_client.notification_settings import SettingsError
 from purplemux_client.workflow import ChildRunResult as ExternalRunResult
 
 # Two default million-character streams, up to 12 JSON bytes per Unicode
@@ -171,6 +173,32 @@ class ExternalRunClient:
             raise failure(
                 "external response unavailable or malformed; outcome unknown"
             ) from exc
+
+    def navigation_url(self, identity: str) -> str | None:
+        """Find a registered AWM that still owns this exact persisted Run."""
+        if not re.fullmatch(r"[0-9a-f]{32}-[1-9][0-9]*", identity):
+            raise ValueError("Run references must be full AWM Run identities")
+        run_id = int(identity.rsplit("-", 1)[1])
+        deadline = time.monotonic() + 10
+        targets = cast(list[dict[str, str]], self.settings.read()["targets"])
+
+        def resolve(target: dict[str, str]) -> str | None:
+            try:
+                value = self._request(
+                    target["id"],
+                    f"/api/runs/{run_id}/result",
+                    timeout=1,
+                    deadline=deadline,
+                )
+            except (ExternalRunError, SettingsError):
+                return None
+            if value.get("identity") == identity and value.get("runId") == run_id:
+                return self._destinations[target["id"]] + "/?run=" + identity
+            return None
+
+        # Probe registrations together so an offline AWM cannot hide later targets.
+        with ThreadPoolExecutor(max_workers=20) as worker:
+            return next((url for url in worker.map(resolve, targets) if url), None)
 
     def start_run(
         self,
