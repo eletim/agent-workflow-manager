@@ -509,6 +509,15 @@ run. Its ordinary Python logic must explicitly inspect and reuse authoritative
 Git, GitHub, or PurpleMux state where appropriate. The Runner does not expose a
 workflow checkpoint API or reconstruct terminated Python control flow.
 
+`PythonRunner.link_runs(parent_identity, child_identity)` records family links on
+ordinary Runs using full instance-qualified AWM identities. At least one Run must
+be local; local records are updated on both sides. Terminal history preserves these
+links across reload, including references to external AWMs and deleted Runs.
+Run detail and list snapshots expose `parentRun` and `childRuns`, each reference
+containing `identity`, `scope` (`local` or `external`), and `runId`. Numeric Run IDs
+alone do not identify a related Run across AWM instances. Existing history without
+family fields loads with empty links.
+
 Runs are independent and may execute concurrently. The UI lists every run and
 lets the operator select its state, output, progress, execution context, Stop,
 and explicit Cleanup action without changing another run. While run history is
