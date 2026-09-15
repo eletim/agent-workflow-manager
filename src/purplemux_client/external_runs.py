@@ -197,9 +197,15 @@ class ExternalRunClient:
             and re.fullmatch(r"[0-9a-f]{32}-[1-9][0-9]*", identity)
             and int(identity.rsplit("-", 1)[1]) == value["runId"]
         ):
-            self.run_identities[target_id, value["runId"]] = identity
+            known_identity = self.run_identities.setdefault(
+                (target_id, value["runId"]), identity
+            )
             if _on_identity is not None:
                 _on_identity(value["runId"], identity)
+            if known_identity != identity:
+                raise ExternalRunLaunchUnknown(
+                    "external Run ID collides with a known child; inspect destination"
+                )
         elif parent_identity is not None:
             raise ExternalRunLaunchUnknown(
                 "external child identity unavailable; outcome unknown"
@@ -225,17 +231,23 @@ class ExternalRunClient:
         *,
         _timeout: float | None = None,
         _deadline: float | None = None,
+        _identity: str | None = None,
     ) -> ExternalRunResult | None:
         """Return None only for a confirmed running Run; errors remain exceptions."""
         if not _positive_id(run_id):
             raise ValueError("run_id must be a positive integer")
+        # Pin before communication: another launch must not change this observation's identity.
+        identity = (
+            _identity
+            if _identity is not None
+            else self.run_identities.get((target_id, run_id))
+        )
         value = self._request(
             target_id,
             f"/api/runs/{run_id}/result",
             timeout=_timeout,
             deadline=_deadline,
         )
-        identity = self.run_identities.get((target_id, run_id))
         if identity is not None and value.get("identity") != identity:
             raise ExternalRunError(
                 "external Run identity changed or unavailable; outcome unknown"

@@ -401,3 +401,172 @@ def test_external_child_result_requires_known_identity(observed_identity, monkey
     with pytest.raises(ExternalRunError):
         client.get_run_result("remote", 42)
     assert client.run_identities["remote", 42] == identity
+
+
+def test_concurrent_external_collision_keeps_authorized_identity(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from purplemux_client.external_runs import (
+        ExternalRunClient,
+        ExternalRunError,
+        ExternalRunLaunchUnknown,
+    )
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    request_started = threading.Event()
+    replacement_launched = threading.Event()
+    try:
+        parent_id = runner.start("import time; time.sleep(60)")
+        other_parent_id = runner.start("import time; time.sleep(60)")
+        client = ExternalRunClient()
+        runner._external_child_client = client
+        original = "a" * 32 + "-42"
+        replacement = "b" * 32 + "-42"
+        client.run_identities["remote", 42] = original
+        runner.link_runs(runner._run_identity(parent_id), original)
+        token = runner._runs[parent_id].control_token
+        other_token = runner._runs[other_parent_id].control_token
+
+        def exchange(target_id, path, payload=None, **kwargs):
+            if payload is not None:
+                return {"runId": 42, "identity": replacement, "state": "running"}
+            request_started.set()
+            assert replacement_launched.wait(5)
+            return {
+                "runId": 42,
+                "identity": replacement,
+                "state": "success",
+                "result": {"exitCode": 0, "stdout": "replacement output", "stderr": ""},
+            }
+
+        monkeypatch.setattr(client, "_request", exchange)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            pending = workers.submit(
+                runner._workflow_control,
+                token,
+                {"operation": "result", "target_id": "remote", "run_id": 42},
+            )
+            try:
+                assert request_started.wait(5)
+                with pytest.raises(ExternalRunLaunchUnknown):
+                    runner._workflow_control(
+                        other_token,
+                        {"operation": "start", "target_id": "remote", "code": "pass"},
+                    )
+            finally:
+                replacement_launched.set()
+            with pytest.raises(ExternalRunError, match="identity changed"):
+                pending.result(timeout=5)
+        assert client.run_identities["remote", 42] == original
+        assert runner.snapshot(parent_id).child_runs == (original,)
+        assert runner.snapshot(other_parent_id).child_runs == (replacement,)
+        with pytest.raises(PermissionError):
+            runner._workflow_control(
+                other_token,
+                {"operation": "result", "target_id": "remote", "run_id": 42},
+            )
+        links = json.loads((tmp_path / "history.json").read_text())["runFamilyLinks"]
+        assert links[runner._run_identity(parent_id)] == [original]
+        assert links[runner._run_identity(other_parent_id)] == [replacement]
+    finally:
+        replacement_launched.set()
+        runner.close()
+
+
+def test_concurrent_external_client_first_use(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from purplemux_client import external_runs
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    client_type = external_runs.ExternalRunClient
+    constructors = []
+    start_together = threading.Barrier(2)
+    constructors_together = threading.Barrier(2)
+    try:
+        parent_ids = [runner.start("import time; time.sleep(60)") for _ in range(2)]
+
+        def make_client():
+            client = client_type()
+            constructors.append(client)
+            # Allow competing constructors to overlap in the unsynchronized implementation.
+            # A single synchronized constructor proceeds when the barrier times out.
+            try:
+                constructors_together.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+            return client
+
+        def exchange(self, target_id, path, payload=None, **kwargs):
+            if payload is not None:
+                run_id = int(payload["parentRun"].rsplit("-", 1)[1])
+                return {
+                    "runId": run_id,
+                    "identity": "a" * 32 + f"-{run_id}",
+                    "state": "running",
+                }
+            run_id = int(path.split("/")[-2])
+            return {
+                "runId": run_id,
+                "identity": "a" * 32 + f"-{run_id}",
+                "state": "success",
+                "result": {"exitCode": 0, "stdout": str(run_id), "stderr": ""},
+            }
+
+        monkeypatch.setattr(external_runs, "ExternalRunClient", make_client)
+        monkeypatch.setattr(client_type, "_request", exchange)
+
+        def start(parent_id):
+            start_together.wait(timeout=5)
+            return runner._workflow_control(
+                runner._runs[parent_id].control_token,
+                {"operation": "start", "target_id": "remote", "code": "pass"},
+            )["run_id"]
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [workers.submit(start, parent_id) for parent_id in parent_ids]
+            child_ids = [future.result(timeout=5) for future in futures]
+        assert len(constructors) == 1
+        assert runner._external_child_client is constructors[0]
+        for parent_id, child_id in zip(parent_ids, child_ids):
+            result = runner._workflow_control(
+                runner._runs[parent_id].control_token,
+                {"operation": "result", "target_id": "remote", "run_id": child_id},
+            )
+            assert result["state"] == "success"
+            assert result["stdout"] == str(child_id)
+            assert runner.snapshot(parent_id).child_runs == ("a" * 32 + f"-{child_id}",)
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("response_matches", [True, False])
+def test_external_result_uses_authorized_identity(response_matches, monkeypatch):
+    from purplemux_client.external_runs import ExternalRunClient, ExternalRunError
+
+    client = ExternalRunClient()
+    authorized = "a" * 32 + "-42"
+    replacement = "b" * 32 + "-42"
+    client.run_identities["remote", 42] = replacement
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda *args, **kwargs: {
+            "runId": 42,
+            "identity": authorized if response_matches else replacement,
+            "state": "success",
+            "result": {"exitCode": 0, "stdout": "child output", "stderr": ""},
+        },
+    )
+    if response_matches:
+        result = client.get_run_result("remote", 42, _identity=authorized)
+        assert result is not None and result.stdout == "child output"
+    else:
+        with pytest.raises(ExternalRunError):
+            client.get_run_result("remote", 42, _identity=authorized)

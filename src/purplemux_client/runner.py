@@ -2070,10 +2070,11 @@ class PythonRunner:
 
         from purplemux_client.external_runs import ExternalRunClient
 
-        client = getattr(self, "_external_child_client", None)
-        if client is None:
-            client = ExternalRunClient()
-            self._external_child_client = client
+        with self._lock:
+            client = getattr(self, "_external_child_client", None)
+            if client is None:
+                client = ExternalRunClient()
+                self._external_child_client = client
         parent_identity = self._run_identity(parent.run_id)
         operation = payload.get("operation")
         if operation == "start":
@@ -2105,7 +2106,11 @@ class PythonRunner:
                 _duration(timeout)
                 deadline = time.monotonic() + timeout
             result = client.get_run_result(
-                target_id, run_id, _timeout=timeout, _deadline=deadline
+                target_id,
+                run_id,
+                _timeout=timeout,
+                _deadline=deadline,
+                _identity=identity,
             )
             return asdict(result) if result is not None else {}
         raise ValueError("unknown Workflow control operation")
