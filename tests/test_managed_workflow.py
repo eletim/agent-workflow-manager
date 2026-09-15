@@ -29,6 +29,7 @@ from purplemux_client.progress import (
 )
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
 from purplemux_client.web import RunnerHTTPServer
+from purplemux_client.workflow import CONTROL_TOKEN_ENV, CONTROL_URL_ENV
 
 
 class _ManagedClient:
@@ -173,6 +174,11 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         assert run.resources[1].metadata["origin"] == "workspace_initial"
         assert run.event_token is not None
         assert run.event_token not in client.request.command
+        assert run.control_token is not None
+        assert run.control_token not in client.request.command
+        environment = run.credential_path.read_text(encoding="utf-8")
+        assert f"export {CONTROL_TOKEN_ENV}=" in environment
+        assert f"export {CONTROL_URL_ENV}=http://127.0.0.1:" in environment
         assert str(run.credential_path) in client.request.command
         assert (
             f"http://127.0.0.1:{server.server_address[1]}"
