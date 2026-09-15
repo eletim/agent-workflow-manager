@@ -1853,7 +1853,12 @@ class PythonRunner:
         issue_driven_json: str | None = None,
         resumed_from_run_id: int | None = None,
         parent_run_id: int | None = None,
+        parent_identity: str | None = None,
     ) -> int:
+        if parent_identity is not None:
+            self._validate_run_reference(parent_identity)
+            if parent_run_id is not None:
+                raise ValueError("provide only one parent reference")
         run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
@@ -1880,6 +1885,7 @@ class PythonRunner:
                     issue_driven_json=issue_driven_json,
                     resumed_from_run_id=resumed_from_run_id,
                     parent_run_id=parent_run_id,
+                    parent_identity=parent_identity,
                 )
 
     def resume(self, run_id: int) -> int:
@@ -1916,6 +1922,7 @@ class PythonRunner:
         issue_driven_json: str | None = None,
         resumed_from_run_id: int | None = None,
         parent_run_id: int | None = None,
+        parent_identity: str | None = None,
     ) -> int:
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
@@ -1934,6 +1941,7 @@ class PythonRunner:
                 issue_driven_json=issue_driven_json,
                 resumed_from_run_id=resumed_from_run_id,
                 parent_run_id=parent_run_id,
+                parent_identity=parent_identity,
             )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
@@ -1957,7 +1965,9 @@ class PythonRunner:
         )
         self._runs[run_id] = run
         try:
-            self._prepare_workflow_launch(run, run_environment, parent_run_id)
+            self._prepare_workflow_launch(
+                run, run_environment, parent_run_id, parent_identity
+            )
             process, script_path, progress_read_fd, resource_ack_fd = (
                 self._spawn_process(
                     code,
@@ -1980,18 +1990,23 @@ class PythonRunner:
         return run_id
 
     def _prepare_workflow_launch(
-        self, run: _RunRecord, environment: dict[str, str], parent_run_id: int | None
+        self,
+        run: _RunRecord,
+        environment: dict[str, str],
+        parent_run_id: int | None,
+        parent_identity: str | None = None,
     ) -> None:
         if self._control_server is None:
             self._control_server = WorkflowControlServer(self._workflow_control)
         run.control_token = secrets.token_urlsafe(32)
         environment[CONTROL_URL_ENV] = self._control_server.url
         environment[CONTROL_TOKEN_ENV] = run.control_token
+        if parent_identity is not None:
+            self._link_runs_locked(parent_identity, self._run_identity(run.run_id))
         if parent_run_id is not None:
-            # This newly reserved identity cannot already have a parent or form a cycle.
-            parent = self._get_run(parent_run_id)
-            run.parent_run = self._run_identity(parent_run_id)
-            parent.child_runs += (self._run_identity(run.run_id),)
+            self._link_runs_locked(
+                self._run_identity(parent_run_id), self._run_identity(run.run_id)
+            )
         # Running Runs are not terminal history; persist their family links separately.
         self._write_run_history_locked()
 
@@ -2011,7 +2026,12 @@ class PythonRunner:
                 raise PermissionError("invalid running Workflow credential")
             parent_id = parent.run_id
             operation = payload.get("operation")
-            if operation == "result":
+            target_id = payload.get("target_id")
+            if target_id is not None and (
+                not isinstance(target_id, str) or not target_id
+            ):
+                raise ValueError("target_id must be a registered external identifier")
+            if target_id is None and operation == "result":
                 child_id = payload.get("run_id")
                 if isinstance(child_id, bool) or not isinstance(child_id, int):
                     raise ValueError("invalid child Run ID")
@@ -2028,16 +2048,72 @@ class PythonRunner:
                     "stdout": snapshot.stdout,
                     "stderr": snapshot.stderr,
                 }
-            if operation != "start":
+            if operation not in {"start", "result"}:
                 raise ValueError("unknown Workflow control operation")
             code, args = payload.get("code"), payload.get("args", [])
-            if not isinstance(code, str) or not code.strip():
-                raise ValueError("code must be a non-empty string")
-            if not isinstance(args, list) or any(
-                not isinstance(arg, str) for arg in args
-            ):
-                raise ValueError("args must be strings")
+            if operation == "start":
+                if not isinstance(code, str) or not code.strip():
+                    raise ValueError("code must be a non-empty string")
+                if not isinstance(args, list) or any(
+                    not isinstance(arg, str) for arg in args
+                ):
+                    raise ValueError("args must be strings")
+        if target_id is not None:
+            return self._external_child_control(parent, target_id, payload)
+        assert isinstance(code, str)
         return {"run_id": self.start(code, args=args, parent_run_id=parent_id)}
+
+    def _external_child_control(
+        self, parent: _RunRecord, target_id: str, payload: dict
+    ) -> dict:
+        from dataclasses import asdict
+
+        from purplemux_client.external_runs import ExternalRunClient
+
+        with self._lock:
+            client = getattr(self, "_external_child_client", None)
+            if client is None:
+                client = ExternalRunClient()
+                self._external_child_client = client
+        parent_identity = self._run_identity(parent.run_id)
+        operation = payload.get("operation")
+        if operation == "start":
+            code = payload.get("code")
+            if not isinstance(code, str):
+                raise ValueError("code must be a string")
+            run_id = client.start_run(
+                target_id,
+                code,
+                args=payload.get("args", []),
+                parent_identity=parent_identity,
+                _on_identity=lambda run_id, identity: self.link_runs(
+                    parent_identity, identity
+                ),
+            )
+            return {"run_id": run_id}
+        if operation == "result":
+            run_id = payload.get("run_id")
+            if type(run_id) is not int or run_id < 1:
+                raise ValueError("invalid child Run ID")
+            identity = client.run_identities.get((target_id, run_id))
+            if identity not in parent.child_runs:
+                raise PermissionError("Run is not a child of this Workflow")
+            timeout = payload.get("timeout")
+            deadline = None
+            if timeout is not None:
+                from purplemux_client.external_runs import _duration
+
+                _duration(timeout)
+                deadline = time.monotonic() + timeout
+            result = client.get_run_result(
+                target_id,
+                run_id,
+                _timeout=timeout,
+                _deadline=deadline,
+                _identity=identity,
+            )
+            return asdict(result) if result is not None else {}
+        raise ValueError("unknown Workflow control operation")
 
     def _reserve_run_id_locked(self) -> int:
         """Durably consume one identity before any workflow-side mutation."""
@@ -2060,6 +2136,7 @@ class PythonRunner:
         issue_driven_json: str | None = None,
         resumed_from_run_id: int | None = None,
         parent_run_id: int | None = None,
+        parent_identity: str | None = None,
     ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -2114,7 +2191,9 @@ class PythonRunner:
         created_tab_id: str | None = None
         result_path: str | None = None
         try:
-            self._prepare_workflow_launch(run, managed_env, parent_run_id)
+            self._prepare_workflow_launch(
+                run, managed_env, parent_run_id, parent_identity
+            )
             with credential_path.open("a", encoding="utf-8") as stream:
                 for name in (CONTROL_URL_ENV, CONTROL_TOKEN_ENV):
                     stream.write(f"export {name}={shlex.quote(managed_env[name])}\n")
@@ -2529,62 +2608,65 @@ class PythonRunner:
         if parent_identity == child_identity:
             raise ValueError("a Run cannot be its own parent")
         with self._lock:
-            self._ensure_open()
+            self._link_runs_locked(parent_identity, child_identity)
 
-            def local_record(identity: str) -> _RunRecord | None:
-                instance_id, run_id = identity.rsplit("-", 1)
-                if instance_id != self._correlation_instance:
-                    return None
-                return self._get_run(int(run_id))
+    def _link_runs_locked(self, parent_identity: str, child_identity: str) -> None:
+        self._ensure_open()
 
-            parent = local_record(parent_identity)
-            child = local_record(child_identity)
-            if parent is None and child is None:
-                raise ValueError("a family link must involve a local Run")
-            # Both sides of each stored link contribute known edges, including
-            # references whose ordinary Run record is external or was deleted.
-            edges: dict[str, set[str]] = {
-                parent: set(children)
-                for parent, children in self._historical_family_links.items()
-            }
-            for run in self._runs.values():
-                identity = self._run_identity(run.run_id)
-                edges.setdefault(identity, set()).update(run.child_runs)
-                if run.parent_run is not None:
-                    edges.setdefault(run.parent_run, set()).add(identity)
-            if any(
-                known_parent != parent_identity and child_identity in children
-                for known_parent, children in edges.items()
-            ):
-                raise ValueError("Run already has a different parent")
-            pending = [child_identity]
-            seen: set[str] = set()
-            while pending:
-                identity = pending.pop()
-                if identity == parent_identity:
-                    raise ValueError("Run family links cannot form a cycle")
-                if identity not in seen:
-                    seen.add(identity)
-                    pending.extend(edges.get(identity, ()))
-            old_children = parent.child_runs if parent else ()
-            old_parent = child.parent_run if child else None
-            if parent is not None and child_identity not in parent.child_runs:
-                parent.child_runs += (child_identity,)
+        def local_record(identity: str) -> _RunRecord | None:
+            instance_id, run_id = identity.rsplit("-", 1)
+            if instance_id != self._correlation_instance:
+                return None
+            return self._get_run(int(run_id))
+
+        parent = local_record(parent_identity)
+        child = local_record(child_identity)
+        if parent is None and child is None:
+            raise ValueError("a family link must involve a local Run")
+        # Both sides of each stored link contribute known edges, including
+        # references whose ordinary Run record is external or was deleted.
+        edges: dict[str, set[str]] = {
+            parent: set(children)
+            for parent, children in self._historical_family_links.items()
+        }
+        for run in self._runs.values():
+            identity = self._run_identity(run.run_id)
+            edges.setdefault(identity, set()).update(run.child_runs)
+            if run.parent_run is not None:
+                edges.setdefault(run.parent_run, set()).add(identity)
+        if any(
+            known_parent != parent_identity and child_identity in children
+            for known_parent, children in edges.items()
+        ):
+            raise ValueError("Run already has a different parent")
+        pending = [child_identity]
+        seen: set[str] = set()
+        while pending:
+            identity = pending.pop()
+            if identity == parent_identity:
+                raise ValueError("Run family links cannot form a cycle")
+            if identity not in seen:
+                seen.add(identity)
+                pending.extend(edges.get(identity, ()))
+        old_children = parent.child_runs if parent else ()
+        old_parent = child.parent_run if child else None
+        if parent is not None and child_identity not in parent.child_runs:
+            parent.child_runs += (child_identity,)
+        if child is not None:
+            child.parent_run = parent_identity
+        if (parent is None or parent.child_runs == old_children) and (
+            child is None or child.parent_run == old_parent
+        ):
+            return
+        try:
+            self._write_run_history_locked()
+        except RunHistoryError:
+            if parent is not None:
+                parent.child_runs = old_children
             if child is not None:
-                child.parent_run = parent_identity
-            if (parent is None or parent.child_runs == old_children) and (
-                child is None or child.parent_run == old_parent
-            ):
-                return
-            try:
-                self._write_run_history_locked()
-            except RunHistoryError:
-                if parent is not None:
-                    parent.child_runs = old_children
-                if child is not None:
-                    child.parent_run = old_parent
-                raise
-            self._mark_changed()
+                child.parent_run = old_parent
+            raise
+        self._mark_changed()
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
         """Set human-review metadata without changing execution state."""

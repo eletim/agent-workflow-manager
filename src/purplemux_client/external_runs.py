@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import ssl
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 import httpx
 
 from purplemux_client.external_run_dns import ResolverEventLoop
 from purplemux_client.external_targets import ExternalTargetSettings
+from purplemux_client.workflow import ChildRunResult as ExternalRunResult
 
 # Two default million-character streams, up to 12 JSON bytes per Unicode
 # character (surrogate pairs), plus truncation notices and envelope overhead.
@@ -27,15 +28,6 @@ class ExternalRunError(RuntimeError):
 
 class ExternalRunLaunchUnknown(ExternalRunError):
     """A launch may have executed. Inspect the destination; do not retry blindly."""
-
-
-@dataclass(frozen=True)
-class ExternalRunResult:
-    run_id: int
-    state: str
-    exit_code: int
-    stdout: str
-    stderr: str
 
 
 def _positive_id(value: object) -> bool:
@@ -61,6 +53,7 @@ class ExternalRunClient:
         self.request_timeout = request_timeout
         self._tls_context = ssl.create_default_context()
         self._destinations: dict[str, str] = {}
+        self.run_identities: dict[tuple[str, int], str] = {}
 
     def _request(
         self,
@@ -179,13 +172,44 @@ class ExternalRunClient:
                 "external response unavailable or malformed; outcome unknown"
             ) from exc
 
-    def start_run(self, target_id: str, code: str, *, args: Sequence[str] = ()) -> int:
+    def start_run(
+        self,
+        target_id: str,
+        code: str,
+        *,
+        args: Sequence[str] = (),
+        parent_identity: str | None = None,
+        _on_identity: Callable[[int, str], None] | None = None,
+    ) -> int:
         """Launch once. An unknown outcome requires inspection at the destination."""
         if not isinstance(code, str) or not code.strip():
             raise ValueError("code must be a non-empty string")
         if isinstance(args, str) or any(not isinstance(arg, str) for arg in args):
             raise ValueError("args must be a sequence of strings")
-        value = self._request(target_id, "/api/run", {"code": code, "args": list(args)})
+        payload = {"code": code, "args": list(args)}
+        if parent_identity is not None:
+            payload["parentRun"] = parent_identity
+        value = self._request(target_id, "/api/run", payload)
+        identity = value.get("identity")
+        if (
+            _positive_id(value.get("runId"))
+            and isinstance(identity, str)
+            and re.fullmatch(r"[0-9a-f]{32}-[1-9][0-9]*", identity)
+            and int(identity.rsplit("-", 1)[1]) == value["runId"]
+        ):
+            known_identity = self.run_identities.setdefault(
+                (target_id, value["runId"]), identity
+            )
+            if _on_identity is not None:
+                _on_identity(value["runId"], identity)
+            if known_identity != identity:
+                raise ExternalRunLaunchUnknown(
+                    "external Run ID collides with a known child; inspect destination"
+                )
+        elif parent_identity is not None:
+            raise ExternalRunLaunchUnknown(
+                "external child identity unavailable; outcome unknown"
+            )
         if (
             not _positive_id(value.get("runId"))
             or not isinstance(value.get("state"), str)
@@ -207,16 +231,27 @@ class ExternalRunClient:
         *,
         _timeout: float | None = None,
         _deadline: float | None = None,
+        _identity: str | None = None,
     ) -> ExternalRunResult | None:
         """Return None only for a confirmed running Run; errors remain exceptions."""
         if not _positive_id(run_id):
             raise ValueError("run_id must be a positive integer")
+        # Pin before communication: another launch must not change this observation's identity.
+        identity = (
+            _identity
+            if _identity is not None
+            else self.run_identities.get((target_id, run_id))
+        )
         value = self._request(
             target_id,
             f"/api/runs/{run_id}/result",
             timeout=_timeout,
             deadline=_deadline,
         )
+        if identity is not None and value.get("identity") != identity:
+            raise ExternalRunError(
+                "external Run identity changed or unavailable; outcome unknown"
+            )
         state, result = value.get("state"), value.get("result")
         if (
             value.get("runId") != run_id

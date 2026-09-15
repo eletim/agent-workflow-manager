@@ -215,3 +215,358 @@ def test_failed_child_launch_is_persisted_before_another_history_write(
             restored.close()
     finally:
         runner.close()
+
+
+@pytest.mark.parametrize(
+    "outcome", ["success", "failed", "stopped", "timeout", "unknown"]
+)
+def test_external_child_workflow(outcome, tmp_path, monkeypatch):
+    import threading
+    from contextlib import ExitStack
+
+    from purplemux_client.external_runs import ExternalRunError
+    from purplemux_client.external_targets import ExternalTargetSettings
+    from purplemux_client.web import RunnerHTTPServer
+
+    with ExitStack() as stack:
+        remote = PythonRunner(
+            managed_workflows=False,
+            run_history_file=tmp_path / "remote.json",
+            stop_timeout=0.2,
+        )
+        local = PythonRunner(
+            managed_workflows=False, run_history_file=tmp_path / "local.json"
+        )
+        stack.callback(remote.close)
+        stack.callback(local.close)
+        settings = ExternalTargetSettings(tmp_path / "targets.json", environment={})
+        server = RunnerHTTPServer(("127.0.0.1", 0), remote)
+        stack.callback(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        stack.callback(thread.join)
+        stack.callback(server.shutdown)
+        settings._environment = {"REMOTE_TOKEN": server.request_token}
+        settings.update(
+            {
+                "targets": [
+                    {
+                        "id": "remote",
+                        "destination": f"http://127.0.0.1:{server.server_address[1]}",
+                        "tokenEnv": "REMOTE_TOKEN",
+                    }
+                ]
+            }
+        )
+        from purplemux_client.external_runs import ExternalRunClient
+
+        local._external_child_client = ExternalRunClient(settings)
+        child_code = 'print("remote output", flush=True)\n'
+        if outcome == "failed":
+            child_code += 'raise RuntimeError("remote failure")\n'
+        elif outcome in {"stopped", "timeout", "unknown"}:
+            child_code += "import time; time.sleep(60)\n"
+        if outcome == "unknown":
+
+            def unavailable(*args, **kwargs):
+                raise ExternalRunError("observation unavailable; outcome unknown")
+
+            monkeypatch.setattr(
+                local._external_child_client, "get_run_result", unavailable
+            )
+        workflow = f"""
+from purplemux_client import start_child_run, wait_child_run, get_child_run_result, ExternalRunError
+child_id = start_child_run({child_code!r}, target_id="remote")
+print(child_id, flush=True)
+try:
+    result = wait_child_run(child_id, target_id="remote", timeout={0.05 if outcome == "timeout" else 10})
+    assert result == get_child_run_result(child_id, target_id="remote")
+    print(result.state, result.stdout, flush=True)
+except (TimeoutError, ExternalRunError) as exc:
+    print(type(exc).__name__, flush=True)
+"""
+        original_spawn = remote._spawn_process
+        received_parents = []
+
+        def spawn_remote(code, **kwargs):
+            child = remote._runs[max(remote._runs)]
+            records = json.loads((tmp_path / "remote.json").read_text())
+            assert records["runFamilyLinks"][child.parent_run] == [
+                remote._run_identity(child.run_id)
+            ]
+            received_parents.append(child.parent_run)
+            return original_spawn(code, **kwargs)
+
+        monkeypatch.setattr(remote, "_spawn_process", spawn_remote)
+        parent_id = local.start(workflow)
+        deadline = time.monotonic() + 15
+        while not local.snapshot(parent_id).child_runs:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        parent_identity = local._run_identity(parent_id)
+        child_identity = local.snapshot(parent_id).child_runs[0]
+        child_id = int(child_identity.rsplit("-", 1)[1])
+        assert child_identity == remote._run_identity(child_id)
+        assert remote.snapshot(child_id).parent_run == parent_identity
+        assert received_parents == [parent_identity]
+        if outcome == "stopped":
+            remote.stop(child_id)
+        while local.snapshot(parent_id).state == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        parent = local.snapshot(parent_id)
+        assert parent.state == "success", parent.stderr
+        expected = {"timeout": "TimeoutError", "unknown": "ExternalRunError"}.get(
+            outcome, outcome
+        )
+        assert expected in parent.stdout
+        if outcome in {"success", "failed"}:
+            assert "remote output" in parent.stdout
+        if outcome in {"timeout", "unknown"}:
+            assert remote.snapshot(child_id).state == "running"
+        assert json.loads((tmp_path / "local.json").read_text())["runFamilyLinks"][
+            parent_identity
+        ] == [child_identity]
+        assert json.loads((tmp_path / "remote.json").read_text())["runFamilyLinks"][
+            parent_identity
+        ] == [child_identity]
+        with pytest.raises(PermissionError):
+            local._workflow_control(
+                local._runs[parent_id].control_token,
+                {"operation": "result", "target_id": "remote", "run_id": child_id},
+            )
+
+
+@pytest.mark.parametrize("received_identity", [True, False])
+def test_external_launch_unknown_retains_received_identity(
+    tmp_path, monkeypatch, received_identity
+):
+    from purplemux_client.external_runs import (
+        ExternalRunClient,
+        ExternalRunLaunchUnknown,
+    )
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    try:
+        parent_id = runner.start("import time; time.sleep(60)")
+        client = ExternalRunClient()
+        runner._external_child_client = client
+        identity = "a" * 32 + "-42"
+        calls = []
+
+        def launch(target_id, path, payload):
+            calls.append(payload)
+            return {
+                "runId": 42,
+                "identity": identity if received_identity else None,
+                "state": "unknown",
+            }
+
+        monkeypatch.setattr(client, "_request", launch)
+        with pytest.raises(ExternalRunLaunchUnknown):
+            runner._workflow_control(
+                runner._runs[parent_id].control_token,
+                {"operation": "start", "code": "pass", "target_id": "remote"},
+            )
+        assert len(calls) == 1
+        assert calls[0]["parentRun"] == runner._run_identity(parent_id)
+        expected = (identity,) if received_identity else ()
+        assert runner.snapshot(parent_id).child_runs == expected
+        assert json.loads((tmp_path / "history.json").read_text())[
+            "runFamilyLinks"
+        ].get(runner._run_identity(parent_id), []) == list(expected)
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("observed_identity", [None, "b" * 32 + "-42"])
+def test_external_child_result_requires_known_identity(observed_identity, monkeypatch):
+    from purplemux_client.external_runs import ExternalRunClient, ExternalRunError
+
+    client = ExternalRunClient()
+    identity = "a" * 32 + "-42"
+    client.run_identities["remote", 42] = identity
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda *args, **kwargs: {
+            "runId": 42,
+            "identity": observed_identity,
+            "state": "success",
+            "result": {"exitCode": 0, "stdout": "wrong child", "stderr": ""},
+        },
+    )
+    with pytest.raises(ExternalRunError):
+        client.get_run_result("remote", 42)
+    assert client.run_identities["remote", 42] == identity
+
+
+def test_concurrent_external_collision_keeps_authorized_identity(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from purplemux_client.external_runs import (
+        ExternalRunClient,
+        ExternalRunError,
+        ExternalRunLaunchUnknown,
+    )
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    request_started = threading.Event()
+    replacement_launched = threading.Event()
+    try:
+        parent_id = runner.start("import time; time.sleep(60)")
+        other_parent_id = runner.start("import time; time.sleep(60)")
+        client = ExternalRunClient()
+        runner._external_child_client = client
+        original = "a" * 32 + "-42"
+        replacement = "b" * 32 + "-42"
+        client.run_identities["remote", 42] = original
+        runner.link_runs(runner._run_identity(parent_id), original)
+        token = runner._runs[parent_id].control_token
+        other_token = runner._runs[other_parent_id].control_token
+
+        def exchange(target_id, path, payload=None, **kwargs):
+            if payload is not None:
+                return {"runId": 42, "identity": replacement, "state": "running"}
+            request_started.set()
+            assert replacement_launched.wait(5)
+            return {
+                "runId": 42,
+                "identity": replacement,
+                "state": "success",
+                "result": {"exitCode": 0, "stdout": "replacement output", "stderr": ""},
+            }
+
+        monkeypatch.setattr(client, "_request", exchange)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            pending = workers.submit(
+                runner._workflow_control,
+                token,
+                {"operation": "result", "target_id": "remote", "run_id": 42},
+            )
+            try:
+                assert request_started.wait(5)
+                with pytest.raises(ExternalRunLaunchUnknown):
+                    runner._workflow_control(
+                        other_token,
+                        {"operation": "start", "target_id": "remote", "code": "pass"},
+                    )
+            finally:
+                replacement_launched.set()
+            with pytest.raises(ExternalRunError, match="identity changed"):
+                pending.result(timeout=5)
+        assert client.run_identities["remote", 42] == original
+        assert runner.snapshot(parent_id).child_runs == (original,)
+        assert runner.snapshot(other_parent_id).child_runs == (replacement,)
+        with pytest.raises(PermissionError):
+            runner._workflow_control(
+                other_token,
+                {"operation": "result", "target_id": "remote", "run_id": 42},
+            )
+        links = json.loads((tmp_path / "history.json").read_text())["runFamilyLinks"]
+        assert links[runner._run_identity(parent_id)] == [original]
+        assert links[runner._run_identity(other_parent_id)] == [replacement]
+    finally:
+        replacement_launched.set()
+        runner.close()
+
+
+def test_concurrent_external_client_first_use(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from purplemux_client import external_runs
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    client_type = external_runs.ExternalRunClient
+    constructors = []
+    start_together = threading.Barrier(2)
+    constructors_together = threading.Barrier(2)
+    try:
+        parent_ids = [runner.start("import time; time.sleep(60)") for _ in range(2)]
+
+        def make_client():
+            client = client_type()
+            constructors.append(client)
+            # Allow competing constructors to overlap in the unsynchronized implementation.
+            # A single synchronized constructor proceeds when the barrier times out.
+            try:
+                constructors_together.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+            return client
+
+        def exchange(self, target_id, path, payload=None, **kwargs):
+            if payload is not None:
+                run_id = int(payload["parentRun"].rsplit("-", 1)[1])
+                return {
+                    "runId": run_id,
+                    "identity": "a" * 32 + f"-{run_id}",
+                    "state": "running",
+                }
+            run_id = int(path.split("/")[-2])
+            return {
+                "runId": run_id,
+                "identity": "a" * 32 + f"-{run_id}",
+                "state": "success",
+                "result": {"exitCode": 0, "stdout": str(run_id), "stderr": ""},
+            }
+
+        monkeypatch.setattr(external_runs, "ExternalRunClient", make_client)
+        monkeypatch.setattr(client_type, "_request", exchange)
+
+        def start(parent_id):
+            start_together.wait(timeout=5)
+            return runner._workflow_control(
+                runner._runs[parent_id].control_token,
+                {"operation": "start", "target_id": "remote", "code": "pass"},
+            )["run_id"]
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [workers.submit(start, parent_id) for parent_id in parent_ids]
+            child_ids = [future.result(timeout=5) for future in futures]
+        assert len(constructors) == 1
+        assert runner._external_child_client is constructors[0]
+        for parent_id, child_id in zip(parent_ids, child_ids):
+            result = runner._workflow_control(
+                runner._runs[parent_id].control_token,
+                {"operation": "result", "target_id": "remote", "run_id": child_id},
+            )
+            assert result["state"] == "success"
+            assert result["stdout"] == str(child_id)
+            assert runner.snapshot(parent_id).child_runs == ("a" * 32 + f"-{child_id}",)
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize("response_matches", [True, False])
+def test_external_result_uses_authorized_identity(response_matches, monkeypatch):
+    from purplemux_client.external_runs import ExternalRunClient, ExternalRunError
+
+    client = ExternalRunClient()
+    authorized = "a" * 32 + "-42"
+    replacement = "b" * 32 + "-42"
+    client.run_identities["remote", 42] = replacement
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda *args, **kwargs: {
+            "runId": 42,
+            "identity": authorized if response_matches else replacement,
+            "state": "success",
+            "result": {"exitCode": 0, "stdout": "child output", "stderr": ""},
+        },
+    )
+    if response_matches:
+        result = client.get_run_result("remote", 42, _identity=authorized)
+        assert result is not None and result.stdout == "child output"
+    else:
+        with pytest.raises(ExternalRunError):
+            client.get_run_result("remote", 42, _identity=authorized)

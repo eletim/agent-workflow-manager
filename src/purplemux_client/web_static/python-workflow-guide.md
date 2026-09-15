@@ -1271,7 +1271,7 @@ Replace constants and prompts for the requested Issue, but keep orchestration,
 review separation, bounded attempts, and mutation handling explicit in plain
 Python. Resource destruction is the separate, explicit run Cleanup action.
 
-## Local child Runs
+## Child Runs
 
 A running Python Workflow can start another Workflow on the same Runner and
 sequence it using ordinary Python:
@@ -1300,6 +1300,22 @@ Only the running parent may request its children's results. These helpers requir
 a running Workflow and are unavailable during validation or Dry Run. An uncertain
 start request must be reconciled by inspecting Runner history before starting
 another child; it must not be retried automatically.
+
+Pass the same registered `target_id` to all three helpers to run an external child:
+
+```python
+child_id = start_child_run('print("remote child")', target_id="registered-target-id")
+result = wait_child_run(child_id, target_id="registered-target-id", timeout=300)
+assert result == get_child_run_result(child_id, target_id="registered-target-id")
+```
+
+The returned integer is the destination's Run ID. The receiving AWM persists the
+originating parent reference before execution; the caller persists the full child
+identity once received. Local and external children use the same final result
+fields and failure/stop semantics. External observation failures raise
+`ExternalRunError`, and uncertain launches raise `ExternalRunLaunchUnknown`;
+known family identities remain in history. A timeout does not stop the remote Run.
+Credentials are resolved on the calling server from its registered target settings.
 
 ## External ordinary Runs
 

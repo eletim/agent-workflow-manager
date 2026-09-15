@@ -24,7 +24,10 @@ class WorkflowControlServer:
                 except PermissionError as exc:
                     status, result = 403, {"error": str(exc)}
                 except Exception as exc:
-                    status, result = 400, {"error": str(exc)}
+                    status, result = (
+                        400,
+                        {"error": str(exc), "error_type": type(exc).__name__},
+                    )
                 encoded = json.dumps(result).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
