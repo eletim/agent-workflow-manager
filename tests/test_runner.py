@@ -2827,6 +2827,8 @@ def test_runner_http_lifecycle(
     assert result == {
         "mode": "workflow",
         "state": "success",
+        "parentRun": None,
+        "childRuns": [],
         "stdout": "HTTP_OK\n",
         "stderr": "",
         "outline": [],
@@ -4777,3 +4779,118 @@ def test_web_server_bind_failure_preserves_address_in_use_error() -> None:
             RunnerHTTPServer(address)
     finally:
         first.server_close()
+
+
+def test_run_family_links_persist_with_colliding_external_ids(tmp_path: Path) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        ids = [runner.start("pass") for _ in range(3)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        parent, child, other = [runner._run_identity(run_id) for run_id in ids]
+        external_child = "a" * 32 + f"-{ids[1]}"
+        external_parent = "b" * 32 + f"-{ids[0]}"
+        runner.link_runs(parent, child)
+        runner.link_runs(parent, external_child)
+        runner.link_runs(external_parent, other)
+        runner.link_runs(parent, child)  # Retried registration is idempotent.
+        with pytest.raises(ValueError, match="different parent"):
+            runner.link_runs(external_parent, child)
+        with pytest.raises(ValueError, match="cycle"):
+            runner.link_runs(child, parent)
+        with pytest.raises(ValueError, match="own parent"):
+            runner.link_runs(parent, parent)
+        with pytest.raises(ValueError, match="full AWM"):
+            runner.link_runs("1", child)
+        with pytest.raises(runner_module.RunNotFoundError):
+            runner.link_runs(parent, runner._run_identity(999))
+        expected = {
+            "parentRun": None,
+            "childRuns": [
+                {"identity": child, "scope": "local", "runId": ids[1]},
+                {"identity": external_child, "scope": "external", "runId": ids[1]},
+            ],
+        }
+        for snapshot_json in (
+            runner.snapshot(ids[0]).as_json(),
+            runner.snapshot(ids[0]).as_summary_json(),
+        ):
+            assert {key: snapshot_json[key] for key in expected} == expected
+        assert runner.snapshot(ids[1]).parent_run == parent
+        assert runner.snapshot(ids[2]).parent_run == external_parent
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert restored.snapshot(ids[0]).as_json()["childRuns"] == expected["childRuns"]
+        assert restored.snapshot(ids[1]).parent_run == parent
+        assert restored.snapshot(ids[2]).as_summary_json()["parentRun"] == {
+            "identity": external_parent,
+            "scope": "external",
+            "runId": ids[0],
+        }
+        restored.set_checked(ids[1], True)
+        restored.delete_checked_runs([ids[1]])
+        assert restored.snapshot(ids[0]).child_runs == (child, external_child)
+    finally:
+        restored.close()
+    # Existing v1 history without family fields remains readable.
+    saved = json.loads(history.read_text())
+    for record in saved["runs"].values():
+        record.pop("parentRun")
+        record.pop("childRuns")
+    history.write_text(json.dumps(saved))
+    legacy = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert all(
+            item.parent_run is None and item.child_runs == ()
+            for item in legacy.snapshots()
+        )
+    finally:
+        legacy.close()
+
+
+def test_run_family_links_roll_back_failed_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+
+        def fail_write() -> None:
+            raise runner_module.RunHistoryError("failed write")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runner, "_write_run_history_locked", fail_write)
+            with pytest.raises(runner_module.RunHistoryError):
+                runner.link_runs(*(runner._run_identity(run_id) for run_id in ids))
+        assert runner.snapshot(ids[0]).child_runs == ()
+        assert runner.snapshot(ids[1]).parent_run is None
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "reference"),
+    [("parentRun", "1"), ("childRuns", ["1"]), ("childRuns", None)],
+)
+def test_run_history_rejects_invalid_family_references(
+    tmp_path: Path, field: str, reference: object
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = runner.start("pass")
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+    saved = json.loads(history.read_text())
+    next(iter(saved["runs"].values()))[field] = reference
+    history.write_text(json.dumps(saved))
+    with pytest.raises(runner_module.RunHistoryError, match="unreadable"):
+        PythonRunner(managed_workflows=False, run_history_file=history)

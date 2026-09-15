@@ -471,9 +471,14 @@ class RunnerSnapshot:
     identity: str | None = None
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
+    parent_run: str | None = None
+    child_runs: tuple[str, ...] = ()
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
+        payload.pop("parent_run")
+        payload.pop("child_runs")
+        payload.update(self._family_json())
         payload.pop("prompt")
         payload["mode"] = (
             "prompt"
@@ -730,6 +735,7 @@ class RunnerSnapshot:
             "resourceCount": len(self.resources),
             "checked": self.checked,
         }
+        payload.update(self._family_json())
         if self.resumed_from_run_id is not None:
             payload["resumedFromRunId"] = self.resumed_from_run_id
         if self.prompt is not None:
@@ -739,6 +745,21 @@ class RunnerSnapshot:
             }
             payload["repository"] = self.prompt.repository_json()
         return payload
+
+    def _family_json(self) -> dict[str, object]:
+        def reference(identity: str) -> dict[str, object]:
+            instance_id, run_id = identity.rsplit("-", 1)
+            local_instance = self.identity.rsplit("-", 1)[0] if self.identity else None
+            return {
+                "identity": identity,
+                "scope": "local" if instance_id == local_instance else "external",
+                "runId": int(run_id),
+            }
+
+        return {
+            "parentRun": reference(self.parent_run) if self.parent_run else None,
+            "childRuns": [reference(item) for item in self.child_runs],
+        }
 
     def _execution_context_json(self) -> dict[str, str] | None:
         for resource in self.resources:
@@ -810,6 +831,8 @@ class _RunRecord:
     issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
+    parent_run: str | None = None
+    child_runs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -975,6 +998,8 @@ class PythonRunner:
         return {
             "identity": self._run_identity(run.run_id),
             "runId": run.run_id,
+            "parentRun": run.parent_run,
+            "childRuns": list(run.child_runs),
             "cwd": run.cwd,
             "args": list(run.args),
             "code": run.code,
@@ -1152,6 +1177,21 @@ class PythonRunner:
             )
         ):
             raise ValueError
+
+        parent_run = value.get("parentRun")
+        child_runs = value.get("childRuns", [])
+        if parent_run is not None:
+            self._validate_run_reference(parent_run)
+        if not isinstance(child_runs, list):
+            raise ValueError("childRuns must be a list")
+        for child in child_runs:
+            self._validate_run_reference(child)
+        if (
+            identity == parent_run
+            or identity in child_runs
+            or len(set(child_runs)) != len(child_runs)
+        ):
+            raise ValueError("invalid Run family references")
 
         def load_many(kind: type[Any], key: str) -> list[Any]:
             items = value.get(key)
@@ -1436,6 +1476,8 @@ class PythonRunner:
             checked=checked,
             issue_driven_json=issue_driven_json,
             resumed_from_run_id=resumed_from_run_id,
+            parent_run=parent_run,
+            child_runs=tuple(child_runs),
         )
 
     def _cleanup_ownership_from_history(self, value: object) -> _CleanupOwnership:
@@ -2342,7 +2384,72 @@ class PythonRunner:
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
             resumed_from_run_id=run.resumed_from_run_id,
+            parent_run=run.parent_run,
+            child_runs=run.child_runs,
         )
+
+    @staticmethod
+    def _validate_run_reference(identity: object) -> None:
+        if not isinstance(identity, str) or not re.fullmatch(
+            r"[0-9a-f]{32}-[1-9][0-9]*", identity
+        ):
+            raise ValueError("Run references must be full AWM Run identities")
+
+    def link_runs(self, parent_identity: str, child_identity: str) -> None:
+        """Persist a family link on ordinary Runs, retaining external references.
+
+        Local records are resolved by full identity, never by numeric ID alone.
+        References survive deletion of related records.
+        """
+        self._validate_run_reference(parent_identity)
+        self._validate_run_reference(child_identity)
+        if parent_identity == child_identity:
+            raise ValueError("a Run cannot be its own parent")
+        with self._lock:
+            self._ensure_open()
+
+            def local_record(identity: str) -> _RunRecord | None:
+                instance_id, run_id = identity.rsplit("-", 1)
+                if instance_id != self._correlation_instance:
+                    return None
+                return self._get_run(int(run_id))
+
+            parent = local_record(parent_identity)
+            child = local_record(child_identity)
+            if parent is None and child is None:
+                raise ValueError("a family link must involve a local Run")
+            if child is not None and child.parent_run not in (None, parent_identity):
+                raise ValueError("Run already has a different parent")
+            ancestor = parent
+            seen = {child_identity}
+            while ancestor is not None:
+                identity = self._run_identity(ancestor.run_id)
+                if identity in seen:
+                    raise ValueError("Run family links cannot form a cycle")
+                seen.add(identity)
+                reference = ancestor.parent_run
+                if reference is None:
+                    break
+                instance_id, run_id = reference.rsplit("-", 1)
+                ancestor = (
+                    self._runs.get(int(run_id))
+                    if instance_id == self._correlation_instance
+                    else None
+                )
+            old_children = parent.child_runs if parent else ()
+            old_parent = child.parent_run if child else None
+            if parent is not None and child_identity not in parent.child_runs:
+                parent.child_runs += (child_identity,)
+            if child is not None:
+                child.parent_run = parent_identity
+            try:
+                self._write_run_history_locked()
+            except RunHistoryError:
+                if parent is not None:
+                    parent.child_runs = old_children
+                if child is not None:
+                    child.parent_run = old_parent
+                raise
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
         """Set human-review metadata without changing execution state."""
