@@ -17,6 +17,7 @@ import qrcode
 from qrcode.image.svg import SvgPathImage
 
 from purplemux_client.errors import TerminalSessionError
+from purplemux_client.external_targets import ExternalTargetSettings
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -228,6 +229,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         readiness_service: AgentReadinessService | None = None,
         purplemux_port: int | None = None,
         purplemux_port_file: Path | None = None,
+        external_target_settings: ExternalTargetSettings | None = None,
     ) -> None:
         if purplemux_port is not None and purplemux_port_file is not None:
             raise ValueError("PurpleMux port and port file are mutually exclusive")
@@ -286,6 +288,9 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self.readiness_service = readiness_service or AgentReadinessService()
         self._settings_notifier = (
             notifier if runner is not None and notification_settings is None else None
+        )
+        self.external_target_settings = (
+            external_target_settings or ExternalTargetSettings()
         )
         self.request_token = secrets.token_urlsafe(32)
         self.allowed_hosts = {
@@ -453,6 +458,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, settings.as_json())
             return
+        if path == "/api/settings/external-targets":
+            try:
+                settings = self.server.external_target_settings.read()
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings)
+            return
         if path == "/api/settings/mobile-connection":
             self._send_json(
                 HTTPStatus.OK,
@@ -549,6 +562,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/readiness/probe",
             "/api/readiness/reconcile",
             "/api/settings/notifications",
+            "/api/settings/external-targets",
             "/api/settings/notifications/test",
         }
         checked_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/checked", path)
@@ -974,6 +988,20 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, snapshot.as_json())
+            return
+        if path == "/api/settings/external-targets":
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                settings = self.server.external_target_settings.update(payload)
+            except SettingsValidationError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings)
             return
         if path == "/api/settings/notifications":
             payload = self._read_json()

@@ -222,6 +222,7 @@ async function loadApp({
   confirmOverride = null,
 }) {
   const ids = [
+    "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
@@ -3827,4 +3828,30 @@ test("completed Workflow runs expose explicit Cleanup and retain their history",
   assert.equal(runs.length, 1);
   assert.equal(elements.cleanup.disabled, true);
   assert.match(elements["resources-summary"].textContent, /cleaned/);
+});
+
+test("external targets load and save stable registrations without credential values", async () => {
+  const target = {id: "office", destination: "https://awm.example", tokenEnv: "OFFICE_TOKEN"};
+  const {elements, calls} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/settings/external-targets") {
+        if (options.method === "POST") {
+          assert.deepEqual(JSON.parse(options.body), {targets: [target]});
+        }
+        return response({targets: [{...target, credentialStatus: "configured"}]});
+      }
+      return undefined;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [target]);
+  assert.match(elements["external-target-credentials"].textContent, /office: credentials configured/);
+  await elements["external-target-settings"].dispatch("submit");
+  assert.ok(calls.some(([url, method]) => url === "/api/settings/external-targets" && method === "POST"));
+  assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+  elements["external-targets-json"].value = "invalid";
+  await elements["external-target-settings"].dispatch("submit");
+  assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 1);
 });

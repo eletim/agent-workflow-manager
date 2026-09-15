@@ -1617,6 +1617,33 @@ async function scheduleEventRefresh() {
   }
 }
 
+const externalTargetsForm = document.querySelector("#external-target-settings");
+const externalTargetsJson = document.querySelector("#external-targets-json");
+const externalTargetMessage = document.querySelector("#external-target-message");
+const saveExternalTargets = document.querySelector("#save-external-targets");
+
+function renderExternalTargets(settings) {
+  externalTargetsJson.value = JSON.stringify(settings.targets.map(({id, destination, tokenEnv}) => ({id, destination, tokenEnv})), null, 2);
+  document.querySelector("#external-target-credentials").textContent = settings.targets.map(target => `${target.id}: credentials ${target.credentialStatus}`).join("; ");
+}
+
+externalTargetsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await withPendingButton(saveExternalTargets, async () => {
+    try {
+      const settings = await request("/api/settings/external-targets", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({targets: JSON.parse(externalTargetsJson.value)}),
+      });
+      renderExternalTargets(settings);
+      externalTargetMessage.textContent = "External targets saved.";
+    } catch (error) {
+      externalTargetMessage.textContent = String(error);
+    }
+  });
+});
+
 function renderSettings(settings) {
   notificationsEnabled.checked = settings.enabled;
   notifySuccess.checked = settings.onSuccess;
@@ -2119,6 +2146,15 @@ checkedToggle.addEventListener("click", async () => {
 
 settingsOpen.addEventListener("click", () => {
   settingsDialog.showModal();
+  saveExternalTargets.disabled = true;
+  externalTargetMessage.textContent = "Loading…";
+  request("/api/settings/external-targets").then(settings => {
+    renderExternalTargets(settings);
+    saveExternalTargets.disabled = false;
+    externalTargetMessage.textContent = "";
+  }).catch(error => {
+    externalTargetMessage.textContent = String(error);
+  });
 });
 
 settingsClose.addEventListener("click", () => {
