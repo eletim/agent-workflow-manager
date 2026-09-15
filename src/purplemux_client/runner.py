@@ -2420,28 +2420,33 @@ class PythonRunner:
                 raise ValueError("a family link must involve a local Run")
             if child is not None and child.parent_run not in (None, parent_identity):
                 raise ValueError("Run already has a different parent")
-            ancestor = parent
-            seen = {child_identity}
-            while ancestor is not None:
-                identity = self._run_identity(ancestor.run_id)
-                if identity in seen:
+            # Both sides of each stored link contribute known edges, including
+            # references whose ordinary Run record is external or was deleted.
+            edges: dict[str, set[str]] = {}
+            for run in self._runs.values():
+                identity = self._run_identity(run.run_id)
+                edges.setdefault(identity, set()).update(run.child_runs)
+                if run.parent_run is not None:
+                    edges.setdefault(run.parent_run, set()).add(identity)
+            pending = [child_identity]
+            seen: set[str] = set()
+            while pending:
+                identity = pending.pop()
+                if identity == parent_identity:
                     raise ValueError("Run family links cannot form a cycle")
-                seen.add(identity)
-                reference = ancestor.parent_run
-                if reference is None:
-                    break
-                instance_id, run_id = reference.rsplit("-", 1)
-                ancestor = (
-                    self._runs.get(int(run_id))
-                    if instance_id == self._correlation_instance
-                    else None
-                )
+                if identity not in seen:
+                    seen.add(identity)
+                    pending.extend(edges.get(identity, ()))
             old_children = parent.child_runs if parent else ()
             old_parent = child.parent_run if child else None
             if parent is not None and child_identity not in parent.child_runs:
                 parent.child_runs += (child_identity,)
             if child is not None:
                 child.parent_run = parent_identity
+            if (parent is None or parent.child_runs == old_children) and (
+                child is None or child.parent_run == old_parent
+            ):
+                return
             try:
                 self._write_run_history_locked()
             except RunHistoryError:
@@ -2450,6 +2455,7 @@ class PythonRunner:
                 if child is not None:
                     child.parent_run = old_parent
                 raise
+            self._mark_changed()
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
         """Set human-review metadata without changing execution state."""

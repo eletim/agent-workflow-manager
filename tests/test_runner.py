@@ -4862,6 +4862,8 @@ def test_run_family_links_roll_back_failed_persistence(
         for run_id in ids:
             wait_for(runner, lambda item: item.state == "success", run_id=run_id)
 
+        revision = runner.change_revision()
+
         def fail_write() -> None:
             raise runner_module.RunHistoryError("failed write")
 
@@ -4869,6 +4871,8 @@ def test_run_family_links_roll_back_failed_persistence(
             patch.setattr(runner, "_write_run_history_locked", fail_write)
             with pytest.raises(runner_module.RunHistoryError):
                 runner.link_runs(*(runner._run_identity(run_id) for run_id in ids))
+        assert runner.change_revision() == revision
+        assert runner.wait_for_change(revision, timeout=0) == revision
         assert runner.snapshot(ids[0]).child_runs == ()
         assert runner.snapshot(ids[1]).parent_run is None
     finally:
@@ -4894,3 +4898,98 @@ def test_run_history_rejects_invalid_family_references(
     history.write_text(json.dumps(saved))
     with pytest.raises(runner_module.RunHistoryError, match="unreadable"):
         PythonRunner(managed_workflows=False, run_history_file=history)
+
+
+@pytest.mark.parametrize("external_parent_first", [True, False])
+def test_run_family_links_reject_external_cycles_after_reload(
+    tmp_path: Path, external_parent_first: bool
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = runner.start("pass")
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        local = runner._run_identity(run_id)
+        external = "a" * 32 + f"-{run_id}"
+        first = (external, local) if external_parent_first else (local, external)
+        runner.link_runs(*first)
+        expected = runner.snapshot(run_id).as_json()
+        saved = history.read_text()
+        revision = runner.change_revision()
+        with pytest.raises(ValueError, match="cycle"):
+            runner.link_runs(*reversed(first))
+        assert runner.snapshot(run_id).as_json() == expected
+        assert runner.change_revision() == revision
+        assert history.read_text() == saved
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert restored.snapshot(run_id).as_json() == expected
+        with pytest.raises(ValueError, match="cycle"):
+            restored.link_runs(*reversed(first))
+        assert restored.snapshot(run_id).as_json() == expected
+        assert history.read_text() == saved
+    finally:
+        restored.close()
+
+
+def test_run_family_links_reject_longer_cycles_through_external_run(
+    tmp_path: Path,
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        first, second = [runner._run_identity(run_id) for run_id in ids]
+        external = "a" * 32 + "-1"
+        runner.link_runs(first, external)
+        runner.link_runs(external, second)
+        with pytest.raises(ValueError, match="cycle"):
+            runner.link_runs(second, first)
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        with pytest.raises(ValueError, match="cycle"):
+            restored.link_runs(second, first)
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("external_side", [None, "parent", "child"])
+def test_run_family_links_notify_only_after_changed_links_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, external_side: str | None
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        parent, child = [runner._run_identity(run_id) for run_id in ids]
+        if external_side == "parent":
+            parent = "a" * 32 + f"-{ids[0]}"
+        elif external_side == "child":
+            child = "a" * 32 + f"-{ids[1]}"
+        revision = runner.change_revision()
+        original_write = runner._write_run_history_locked
+
+        def write_before_notification() -> None:
+            assert runner._change_revision == revision
+            original_write()
+
+        monkeypatch.setattr(
+            runner, "_write_run_history_locked", write_before_notification
+        )
+        runner.link_runs(parent, child)
+        assert runner.wait_for_change(revision, timeout=0) == revision + 1
+        assert runner.change_revision() == revision + 1
+        # A retry must neither write history nor advance the SSE revision.
+        runner.link_runs(parent, child)
+        assert runner.change_revision() == revision + 1
+    finally:
+        runner.close()
