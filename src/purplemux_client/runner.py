@@ -1966,10 +1966,8 @@ class PythonRunner:
                     child_env=run_environment,
                 )
             )
-        except BaseException:
-            run.state = "failed"
-            run.exit_code = 1
-            self._mark_changed()
+        except BaseException as exc:
+            self._fail_workflow_launch(run, exc)
             raise
         run.process = process
         run.process_group_id = process.pid
@@ -2213,6 +2211,10 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
+        self._fail_workflow_launch(run, exc)
+
+    def _fail_workflow_launch(self, run: _RunRecord, exc: BaseException) -> None:
+        """Record a terminal launch failure while holding the Runner lock."""
         run.exit_code = 1
         run.state = "failed"
         self._finish_active_repository(run)

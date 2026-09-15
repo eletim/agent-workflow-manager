@@ -566,7 +566,8 @@ def test_run_id_is_durably_reserved_before_launch_crash(
             crashing_runner.start("print('never launched')")
         saved = json.loads(history_file.read_text(encoding="utf-8"))
         assert saved["nextRunId"] == 2
-        assert saved["runs"] == {}
+        assert list(saved["runs"]) == [crashed_identity]
+        assert saved["runs"][crashed_identity]["state"] == "failed"
     finally:
         crashing_runner.close()
 

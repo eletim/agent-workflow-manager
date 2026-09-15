@@ -169,3 +169,49 @@ def test_child_does_not_execute_when_family_write_fails(
             assert not spawned
     finally:
         runner.close()
+
+
+def test_failed_child_launch_is_persisted_before_another_history_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from purplemux_client.runner import RunAttempt
+
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        parent_id = runner.start("import time; time.sleep(60)")
+
+        def fail_spawn(*args, **kwargs):
+            raise OSError("child process could not be spawned")
+
+        monkeypatch.setattr(runner, "_spawn_process", fail_spawn)
+        with pytest.raises(OSError, match="child process could not be spawned"):
+            runner.start("pass", parent_run_id=parent_id)
+        child_id = int(runner.snapshot(parent_id).child_runs[0].rsplit("-", 1)[1])
+        failed = runner.snapshot(child_id)
+        assert failed.state == "failed"
+        assert failed.exit_code == 1
+        assert (
+            failed.stderr
+            == "Workflow launch failed: child process could not be spawned\n"
+        )
+        assert failed.attempts == (RunAttempt(1, "failed", 1),)
+        assert runner.snapshot(parent_id).state == "running"
+
+        # Freeze the immediate failure history before Stop/close can write it again.
+        recovery_history = tmp_path / "recovery-history.json"
+        recovery_history.write_bytes(history.read_bytes())
+        restored = PythonRunner(
+            managed_workflows=False, run_history_file=recovery_history
+        )
+        try:
+            result = restored.snapshot(child_id)
+            assert result.state == failed.state
+            assert result.exit_code == failed.exit_code
+            assert result.stderr_entries == failed.stderr_entries
+            assert result.attempts == failed.attempts
+            assert result.parent_run == failed.parent_run
+        finally:
+            restored.close()
+    finally:
+        runner.close()
