@@ -901,3 +901,33 @@ communication failures and malformed or unknown results raise ExternalRunError.
 An uncertain launch raises ExternalRunLaunchUnknown: inspect destination Run
 history before deciding what to do, since a Run may already have started. The
 client never retries a launch or follows redirects, including credential redirects.
+
+From an **AWM Python Workflow**, use `start_child_run`, `get_child_run_result`,
+and `wait_child_run` to record parent/child relationships automatically. Omit
+`target_id` for the local AWM, or pass the same registered ID to all three calls
+for an external child. The standalone `ExternalRunClient` example above does not
+by itself attach a child to the currently running Workflow.
+
+[examples/child-runs.py](examples/child-runs.py) is a runnable Workflow for both
+cases. Paste its source into Python Workflow mode and start it with no arguments
+for a local child. For two local AWM instances, start the destination on a different
+port, register `remote` on the source with destination `http://127.0.0.1:<port>`
+and a `tokenEnv` supplied in the source server environment, then start the example
+on the source with arguments `["remote"]`. The child receives `["AWM"]` and prints
+`hello AWM`; its final state, exit code, stdout, and stderr are printed by the parent.
+Running this file directly outside an AWM Workflow lacks the run-scoped control
+credentials and fails explicitly.
+
+A returned child ID is numeric and scoped to its AWM; persisted family references
+use the full instance-qualified identity. Both AWMs retain the external relationship
+in their own history. Family links in Run history let operators navigate locally
+or to a registered destination that still owns the exact identity.
+
+`get_child_run_result()` returns `None` only while the child is confirmed running.
+`wait_child_run()` returns a `ChildRunResult` for success, failure, or stop; Python
+must decide which outcomes satisfy the parent. The example requires `success`
+and exit code zero. A wait timeout does not stop the child. Communication failure,
+unavailable or mismatched identity, and unknown results raise errors instead of
+reporting success. An uncertain start may already have created a child: inspect
+source and destination histories before recovery, and never blindly retry it.
+See the [dedicated control contract](docs/workflow-runtime-spec.md#child-run-control-contract).
