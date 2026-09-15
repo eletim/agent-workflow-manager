@@ -415,6 +415,31 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted host"})
             return
         path = urlparse(self.path).path
+        result_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/result", path)
+        if result_match is not None:
+            if not self._is_trusted_request(require_json=False):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+                return
+            try:
+                snapshot = self.server.runner.snapshot(int(result_match.group(1)))
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "runId": snapshot.run_id,
+                    "state": snapshot.state,
+                    "result": None
+                    if snapshot.state == "running"
+                    else {
+                        "exitCode": snapshot.exit_code,
+                        "stdout": snapshot.stdout,
+                        "stderr": snapshot.stderr,
+                    },
+                },
+            )
+            return
         if path == "/api/events":
             self._send_events()
             return

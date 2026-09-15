@@ -866,3 +866,32 @@ must be refreshed when that server rotates it. Server code can use
 `ExternalTargetSettings.connection(id)` to obtain the destination and private
 `X-Python-Runner-Token` header. Registration does not initiate a connection or
 launch an external Run.
+
+Server-to-server ordinary Runs use the same registered external targets as Settings.
+Credentials are resolved on the calling server from each registration's `tokenEnv`;
+keep them out of browser code. The destination must be HTTPS or loopback HTTP and
+must accept its configured Host and `X-Python-Runner-Token` credential. No Origin
+header is needed for server requests; existing Host, Origin, and token checks remain.
+
+```python
+from purplemux_client import ExternalRunClient
+
+client = ExternalRunClient(request_timeout=30)
+run_id = client.start_run("registered-target-id", 'print("hello")', args=[])
+result = client.wait_run("registered-target-id", run_id, timeout=300)
+print(result.state, result.exit_code, result.stdout, result.stderr)
+```
+
+The client launches once through `POST /api/run` with JSON `code` and optional
+string-array `args`; HTTP 202 returns a positive `runId`. Authenticated
+`GET /api/runs/{runId}/result` returns JSON `runId`, `state`, and `result`.
+For `running`, `result` is null. For terminal `success`, `failed`, or `stopped`,
+`result` contains `exitCode`, `stdout`, and `stderr` from the Runner snapshot
+(output retains the Runner's existing limits and truncation notices).
+`get_run_result()` returns None only for a confirmed running Run. Failed and
+stopped Runs return their actual terminal result; callers must inspect `state`.
+Unknown IDs return HTTP 404. Polling deadline expiry raises TimeoutError;
+communication failures and malformed or unknown results raise ExternalRunError.
+An uncertain launch raises ExternalRunLaunchUnknown: inspect destination Run
+history before deciding what to do, since a Run may already have started. The
+client never retries a launch or follows redirects, including credential redirects.
