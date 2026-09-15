@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from urllib import request
 
 import pytest
 
@@ -63,6 +64,10 @@ print(json.dumps({{"state": result.state, "stdout": result.stdout}}), flush=True
     try:
         assert restored.snapshot(parent_id).child_runs == parent.child_runs
         assert restored.snapshot(child_id).state == outcome
+        assert restored.snapshot(child_id).parent_run == child_snapshot.parent_run
+        assert restored.snapshot(child_id).stdout == child_snapshot.stdout
+        assert restored.snapshot(child_id).stderr == child_snapshot.stderr
+        assert restored.snapshot(child_id).progress == child_snapshot.progress
     finally:
         restored.close()
 
@@ -247,21 +252,42 @@ def test_external_child_workflow(outcome, tmp_path, monkeypatch):
         stack.callback(thread.join)
         stack.callback(server.shutdown)
         settings._environment = {"REMOTE_TOKEN": server.request_token}
-        settings.update(
-            {
-                "targets": [
-                    {
-                        "id": "remote",
-                        "destination": f"http://127.0.0.1:{server.server_address[1]}",
-                        "tokenEnv": "REMOTE_TOKEN",
-                    }
-                ]
-            }
+        source = RunnerHTTPServer(
+            ("127.0.0.1", 0), local, external_target_settings=settings
         )
-        from purplemux_client.external_runs import ExternalRunClient
-
-        local._external_child_client = ExternalRunClient(settings)
-        child_code = 'print("remote output", flush=True)\n'
+        stack.callback(source.server_close)
+        source_thread = threading.Thread(target=source.serve_forever, daemon=True)
+        source_thread.start()
+        stack.callback(source_thread.join)
+        stack.callback(source.shutdown)
+        registration = {
+            "targets": [
+                {
+                    "id": "remote",
+                    "destination": f"http://127.0.0.1:{server.server_address[1]}",
+                    "tokenEnv": "REMOTE_TOKEN",
+                }
+            ]
+        }
+        message = request.Request(
+            f"http://127.0.0.1:{source.server_address[1]}/api/settings/external-targets",
+            data=json.dumps(registration).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Python-Runner-Token": source.request_token,
+            },
+        )
+        with request.urlopen(message, timeout=5) as response:
+            registered = json.load(response)
+        assert registered["targets"][0]["credentialStatus"] == "configured"
+        assert server.request_token not in json.dumps(registered)
+        assert (
+            ExternalTargetSettings(settings.path, environment={}).read()["targets"][0][
+                "id"
+            ]
+            == "remote"
+        )
+        child_code = 'from purplemux_client import emit_step\nemit_step("remote", "completed")\nprint("remote output", flush=True)\n'
         if outcome == "failed":
             child_code += 'raise RuntimeError("remote failure")\n'
         elif outcome in {"stopped", "timeout", "unknown"}:
@@ -330,11 +356,45 @@ except (TimeoutError, ExternalRunError) as exc:
         assert json.loads((tmp_path / "remote.json").read_text())["runFamilyLinks"][
             parent_identity
         ] == [child_identity]
+        if outcome in {"success", "failed"}:
+            assert remote.snapshot(child_id).state == outcome
+            assert remote.snapshot(child_id).progress[0].name == "remote"
+            child_result = local._external_child_client.get_run_result(
+                "remote", child_id
+            )
+            assert child_result is not None
+            assert child_result.exit_code == remote.snapshot(child_id).exit_code
+            assert child_result.stdout == remote.snapshot(child_id).stdout
+            assert child_result.stderr == remote.snapshot(child_id).stderr
+            if outcome == "failed":
+                assert child_result.exit_code != 0
+                assert "remote failure" in child_result.stderr
         with pytest.raises(PermissionError):
             local._workflow_control(
                 local._runs[parent_id].control_token,
                 {"operation": "result", "target_id": "remote", "run_id": child_id},
             )
+        local.close()
+        remote.close()
+        # Reload independent histories after both instances have shut down.
+        for runner, name, run_id in (
+            (local, "local", parent_id),
+            (remote, "remote", child_id),
+        ):
+            before = runner.snapshot(run_id)
+            restored = PythonRunner(
+                managed_workflows=False, run_history_file=tmp_path / f"{name}.json"
+            )
+            try:
+                after = restored.snapshot(run_id)
+                assert after.parent_run == before.parent_run
+                assert after.child_runs == before.child_runs
+                assert after.state == before.state
+                assert after.stdout == before.stdout
+                assert after.stderr == before.stderr
+                assert after.progress == before.progress
+            finally:
+                restored.close()
 
 
 @pytest.mark.parametrize("received_identity", [True, False])
@@ -570,3 +630,51 @@ def test_external_result_uses_authorized_identity(response_matches, monkeypatch)
     else:
         with pytest.raises(ExternalRunError):
             client.get_run_result("remote", 42, _identity=authorized)
+
+
+@pytest.mark.parametrize("target_id", [None, "remote"])
+def test_runnable_child_example(target_id, tmp_path):
+    import threading
+    from contextlib import ExitStack
+
+    from purplemux_client.external_targets import ExternalTargetSettings
+    from purplemux_client.web import RunnerHTTPServer
+
+    with ExitStack() as stack:
+        remote = PythonRunner(managed_workflows=False)
+        local = PythonRunner(managed_workflows=False)
+        stack.callback(remote.close)
+        stack.callback(local.close)
+        server = RunnerHTTPServer(("127.0.0.1", 0), remote)
+        stack.callback(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        stack.callback(thread.join)
+        stack.callback(server.shutdown)
+        settings = ExternalTargetSettings(
+            tmp_path / "targets.json", environment={"TOKEN": server.request_token}
+        )
+        settings.update(
+            {
+                "targets": [
+                    {
+                        "id": "remote",
+                        "destination": f"http://127.0.0.1:{server.server_address[1]}",
+                        "tokenEnv": "TOKEN",
+                    }
+                ]
+            }
+        )
+        from purplemux_client.external_runs import ExternalRunClient
+
+        local._external_child_client = ExternalRunClient(settings)
+        code = (Path(__file__).parents[1] / "examples" / "child-runs.py").read_text()
+        parent_id = local.start(code, args=[] if target_id is None else [target_id])
+        deadline = time.monotonic() + 15
+        while local.snapshot(parent_id).state == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        parent = local.snapshot(parent_id)
+        assert parent.state == "success", parent.stderr
+        assert "hello AWM" in parent.stdout
+        assert len(parent.child_runs) == 1
