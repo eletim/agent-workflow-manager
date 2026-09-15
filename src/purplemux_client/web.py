@@ -292,6 +292,11 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self.external_target_settings = (
             external_target_settings or ExternalTargetSettings()
         )
+        from purplemux_client.external_runs import ExternalRunClient
+
+        self.runner._external_child_client = ExternalRunClient(
+            self.external_target_settings
+        )
         self.request_token = secrets.token_urlsafe(32)
         self.allowed_hosts = {
             f"{requested_host}:{bound_port}",
@@ -429,6 +434,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {
                     "runId": snapshot.run_id,
+                    "identity": snapshot.identity,
                     "state": snapshot.state,
                     "result": None
                     if snapshot.state == "running"
@@ -835,7 +841,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     code,
                     args=args,
                     issue_driven_json=issue_driven_json,
+                    parent_identity=payload.get("parentRun"),
                 )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
