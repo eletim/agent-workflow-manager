@@ -1630,19 +1630,30 @@ function renderExternalTargets(settings) {
 
 externalTargetsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await withPendingButton(saveExternalTargets, async () => {
-    try {
-      const settings = await request("/api/settings/external-targets", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({targets: JSON.parse(externalTargetsJson.value)}),
-      });
-      renderExternalTargets(settings);
-      externalTargetMessage.textContent = "External targets saved.";
-    } catch (error) {
-      externalTargetMessage.textContent = String(error);
+  if (saveExternalTargets.disabled || saveExternalTargets.dataset.pending === "true") return;
+  const requestGeneration = externalTargetsRequestGeneration;
+  saveExternalTargets.dataset.pending = "true";
+  saveExternalTargets.setAttribute("aria-busy", "true");
+  saveExternalTargets.disabled = true;
+  try {
+    const settings = await request("/api/settings/external-targets", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({targets: JSON.parse(externalTargetsJson.value)}),
+    });
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    externalTargetMessage.textContent = "External targets saved.";
+  } catch (error) {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  } finally {
+    if (requestGeneration === externalTargetsRequestGeneration) {
+      delete saveExternalTargets.dataset.pending;
+      saveExternalTargets.removeAttribute("aria-busy");
+      saveExternalTargets.disabled = false;
     }
-  });
+  }
 });
 
 function renderSettings(settings) {
@@ -2148,6 +2159,8 @@ checkedToggle.addEventListener("click", async () => {
 settingsOpen.addEventListener("click", () => {
   settingsDialog.showModal();
   const requestGeneration = ++externalTargetsRequestGeneration;
+  delete saveExternalTargets.dataset.pending;
+  saveExternalTargets.removeAttribute("aria-busy");
   saveExternalTargets.disabled = true;
   externalTargetMessage.textContent = "Loading…";
   request("/api/settings/external-targets").then(settings => {
