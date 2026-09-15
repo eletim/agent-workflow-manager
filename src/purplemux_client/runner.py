@@ -2418,8 +2418,6 @@ class PythonRunner:
             child = local_record(child_identity)
             if parent is None and child is None:
                 raise ValueError("a family link must involve a local Run")
-            if child is not None and child.parent_run not in (None, parent_identity):
-                raise ValueError("Run already has a different parent")
             # Both sides of each stored link contribute known edges, including
             # references whose ordinary Run record is external or was deleted.
             edges: dict[str, set[str]] = {}
@@ -2428,6 +2426,11 @@ class PythonRunner:
                 edges.setdefault(identity, set()).update(run.child_runs)
                 if run.parent_run is not None:
                     edges.setdefault(run.parent_run, set()).add(identity)
+            if any(
+                known_parent != parent_identity and child_identity in children
+                for known_parent, children in edges.items()
+            ):
+                raise ValueError("Run already has a different parent")
             pending = [child_identity]
             seen: set[str] = set()
             while pending:

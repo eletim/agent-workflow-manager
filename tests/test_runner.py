@@ -4993,3 +4993,40 @@ def test_run_family_links_notify_only_after_changed_links_persist(
         assert runner.change_revision() == revision + 1
     finally:
         runner.close()
+
+
+def test_run_family_links_reject_conflicting_external_child_parents_after_reload(
+    tmp_path: Path,
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        parent, other_parent = [runner._run_identity(run_id) for run_id in ids]
+        external_child = "a" * 32 + f"-{ids[1]}"
+        runner.link_runs(parent, external_child)
+        saved = history.read_text()
+        expected = [item.as_json() for item in runner.snapshots()]
+        revision = runner.change_revision()
+        with pytest.raises(ValueError, match="different parent"):
+            runner.link_runs(other_parent, external_child)
+        runner.link_runs(parent, external_child)
+        assert runner.change_revision() == revision
+        assert [item.as_json() for item in runner.snapshots()] == expected
+        assert history.read_text() == saved
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert [item.as_json() for item in restored.snapshots()] == expected
+        revision = restored.change_revision()
+        with pytest.raises(ValueError, match="different parent"):
+            restored.link_runs(other_parent, external_child)
+        restored.link_runs(parent, external_child)
+        assert restored.change_revision() == revision
+        assert [item.as_json() for item in restored.snapshots()] == expected
+        assert history.read_text() == saved
+    finally:
+        restored.close()
