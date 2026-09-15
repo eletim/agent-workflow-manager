@@ -553,3 +553,75 @@ def test_tls_verifies_certificate_and_hostname(
         thread.join()
         server.server_close()
         runner.close()
+
+
+@pytest.mark.parametrize("launching", [True, False])
+@pytest.mark.parametrize("resolver_delay", [0.5, 3600])
+def test_dns_deadline_kills_and_reaps_resolver(
+    launching, resolver_delay, external_awms, monkeypatch
+):
+    import asyncio
+    import socket
+    import time
+
+    from purplemux_client import external_run_dns
+
+    servers, settings, _ = external_awms
+    settings.update(
+        {
+            "targets": [
+                {
+                    "id": "remote",
+                    "destination": f"http://localhost:{servers[0].server_port}",
+                    "tokenEnv": "TOKEN",
+                }
+            ]
+        }
+    )
+    script = f"""
+import socket, time
+real_getaddrinfo = socket.getaddrinfo
+def delayed_getaddrinfo(*args, **kwargs):
+    time.sleep({resolver_delay})
+    return real_getaddrinfo(*args, **kwargs)
+socket.getaddrinfo = delayed_getaddrinfo
+"""
+    monkeypatch.setattr(
+        external_run_dns, "_RESOLVER_SCRIPT", script + external_run_dns._RESOLVER_SCRIPT
+    )
+    processes = []
+    original_spawn = asyncio.create_subprocess_exec
+
+    async def track_process(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", track_process)
+
+    # Any accidental executor-backed lookup would delay worker shutdown too.
+    # The helper process uses its own system resolver, unaffected by this patch.
+    def forbidden_parent_dns(*args, **kwargs):
+        raise AssertionError("DNS must not run in an unmanaged parent thread")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_parent_dns)
+    client = ExternalRunClient(settings, request_timeout=0.1 if launching else 5)
+    started = time.monotonic()
+    with pytest.raises(ExternalRunLaunchUnknown if launching else TimeoutError):
+        if launching:
+            client.start_run("remote", 'print("must not launch")')
+        else:
+            client.wait_run("remote", 1, timeout=0.1)
+    assert time.monotonic() - started < 0.3
+    assert len(processes) == 1
+    assert processes[0].returncode is not None
+    assert processes[0].returncode < 0
+    assert not servers[0].runner.snapshots()
+    # A subsequent ordinary lookup succeeds, demonstrating that cancelled DNS
+    # neither abandons a resolver nor breaks the next request's owned loop.
+    monkeypatch.undo()
+    client.request_timeout = 5
+    run_id = client.start_run("remote", 'print("DNS recovered")')
+    result = client.wait_run("remote", run_id, timeout=5)
+    assert result.state == "success"
+    assert result.stdout.strip() == "DNS recovered"

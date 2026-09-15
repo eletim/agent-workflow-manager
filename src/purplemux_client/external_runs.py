@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from purplemux_client.external_run_dns import ResolverEventLoop
 from purplemux_client.external_targets import ExternalTargetSettings
 
 # Two default million-character streams, up to 12 JSON bytes per Unicode
@@ -141,16 +142,35 @@ class ExternalRunClient:
                 raise TimeoutError("external Run result deadline expired")
             return await asyncio.wait_for(exchange(), timeout=remaining)
 
+        def run_exchange() -> dict:
+            loop = ResolverEventLoop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(timed_exchange())
+            finally:
+                try:
+                    tasks = asyncio.all_tasks(loop)
+                    for task in tasks:
+                        task.cancel()
+                    loop.run_until_complete(
+                        asyncio.gather(*tasks, return_exceptions=True)
+                    )
+                    loop.run_until_complete(loop.shutdown_resolvers())
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                finally:
+                    asyncio.set_event_loop(None)
+                    loop.close()
+
         try:
-            # Own the event loop in a worker so this synchronous contract also
-            # works when its caller already runs an asyncio loop. wait_for
-            # cancels HTTPX I/O and context managers close the response/client.
+            # Own the loop in a worker even when the caller runs an asyncio loop.
+            # All resolver helpers are killed and reaped before this worker exits.
             with ThreadPoolExecutor(max_workers=1) as worker:
-                value = worker.submit(lambda: asyncio.run(timed_exchange())).result()
+                value = worker.submit(run_exchange).result()
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("external Run result deadline expired")
             return value
-        except (TimeoutError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("external Run result deadline expired") from None
             raise failure("external response timed out; outcome unknown") from exc
