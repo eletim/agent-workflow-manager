@@ -143,11 +143,16 @@ def test_http_server_builds_notification_metadata_for_unmanaged_runner(
 def test_remote_bind_fallback_is_used_for_notification_clicks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_tcp_init = socketserver.TCPServer.__init__
+
     def bind_remote_address(
         server: RunnerHTTPServer,
         server_address: tuple[str, int],
         handler: object,
     ) -> None:
+        if not isinstance(server, RunnerHTTPServer):
+            original_tcp_init(server, server_address, handler)
+            return
         assert server_address == ("100.64.10.20", 0)
         server.server_address = (server_address[0], 8765)
 

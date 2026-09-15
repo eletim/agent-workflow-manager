@@ -566,7 +566,8 @@ def test_run_id_is_durably_reserved_before_launch_crash(
             crashing_runner.start("print('never launched')")
         saved = json.loads(history_file.read_text(encoding="utf-8"))
         assert saved["nextRunId"] == 2
-        assert saved["runs"] == {}
+        assert list(saved["runs"]) == [crashed_identity]
+        assert saved["runs"][crashed_identity]["state"] == "failed"
     finally:
         crashing_runner.close()
 
@@ -2827,6 +2828,8 @@ def test_runner_http_lifecycle(
     assert result == {
         "mode": "workflow",
         "state": "success",
+        "parentRun": None,
+        "childRuns": [],
         "stdout": "HTTP_OK\n",
         "stderr": "",
         "outline": [],
@@ -4777,3 +4780,421 @@ def test_web_server_bind_failure_preserves_address_in_use_error() -> None:
             RunnerHTTPServer(address)
     finally:
         first.server_close()
+
+
+def test_run_family_links_persist_with_colliding_external_ids(tmp_path: Path) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        ids = [runner.start("pass") for _ in range(3)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        parent, child, other = [runner._run_identity(run_id) for run_id in ids]
+        external_child = "a" * 32 + f"-{ids[1]}"
+        external_parent = "b" * 32 + f"-{ids[0]}"
+        runner.link_runs(parent, child)
+        runner.link_runs(parent, external_child)
+        runner.link_runs(external_parent, other)
+        runner.link_runs(parent, child)  # Retried registration is idempotent.
+        with pytest.raises(ValueError, match="different parent"):
+            runner.link_runs(external_parent, child)
+        with pytest.raises(ValueError, match="cycle"):
+            runner.link_runs(child, parent)
+        with pytest.raises(ValueError, match="own parent"):
+            runner.link_runs(parent, parent)
+        with pytest.raises(ValueError, match="full AWM"):
+            runner.link_runs("1", child)
+        with pytest.raises(runner_module.RunNotFoundError):
+            runner.link_runs(parent, runner._run_identity(999))
+        expected = {
+            "parentRun": None,
+            "childRuns": [
+                {"identity": child, "scope": "local", "runId": ids[1]},
+                {"identity": external_child, "scope": "external", "runId": ids[1]},
+            ],
+        }
+        for snapshot_json in (
+            runner.snapshot(ids[0]).as_json(),
+            runner.snapshot(ids[0]).as_summary_json(),
+        ):
+            assert {key: snapshot_json[key] for key in expected} == expected
+        assert runner.snapshot(ids[1]).parent_run == parent
+        assert runner.snapshot(ids[2]).parent_run == external_parent
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert restored.snapshot(ids[0]).as_json()["childRuns"] == expected["childRuns"]
+        assert restored.snapshot(ids[1]).parent_run == parent
+        assert restored.snapshot(ids[2]).as_summary_json()["parentRun"] == {
+            "identity": external_parent,
+            "scope": "external",
+            "runId": ids[0],
+        }
+        restored.set_checked(ids[1], True)
+        restored.delete_checked_runs([ids[1]])
+        assert restored.snapshot(ids[0]).child_runs == (child, external_child)
+    finally:
+        restored.close()
+    # Existing v1 history without family fields remains readable.
+    saved = json.loads(history.read_text())
+    for record in saved["runs"].values():
+        record.pop("parentRun")
+        record.pop("childRuns")
+    history.write_text(json.dumps(saved))
+    legacy = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert all(
+            item.parent_run is None and item.child_runs == ()
+            for item in legacy.snapshots()
+        )
+    finally:
+        legacy.close()
+
+
+def test_run_family_links_roll_back_failed_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+
+        revision = runner.change_revision()
+
+        def fail_write() -> None:
+            raise runner_module.RunHistoryError("failed write")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runner, "_write_run_history_locked", fail_write)
+            with pytest.raises(runner_module.RunHistoryError):
+                runner.link_runs(*(runner._run_identity(run_id) for run_id in ids))
+        assert runner.change_revision() == revision
+        assert runner.wait_for_change(revision, timeout=0) == revision
+        assert runner.snapshot(ids[0]).child_runs == ()
+        assert runner.snapshot(ids[1]).parent_run is None
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "reference"),
+    [("parentRun", "1"), ("childRuns", ["1"]), ("childRuns", None)],
+)
+def test_run_history_rejects_invalid_family_references(
+    tmp_path: Path, field: str, reference: object
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = runner.start("pass")
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+    saved = json.loads(history.read_text())
+    next(iter(saved["runs"].values()))[field] = reference
+    history.write_text(json.dumps(saved))
+    with pytest.raises(runner_module.RunHistoryError, match="unreadable"):
+        PythonRunner(managed_workflows=False, run_history_file=history)
+
+
+@pytest.mark.parametrize("external_parent_first", [True, False])
+def test_run_family_links_reject_external_cycles_after_reload(
+    tmp_path: Path, external_parent_first: bool
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        run_id = runner.start("pass")
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        local = runner._run_identity(run_id)
+        external = "a" * 32 + f"-{run_id}"
+        first = (external, local) if external_parent_first else (local, external)
+        runner.link_runs(*first)
+        expected = runner.snapshot(run_id).as_json()
+        saved = history.read_text()
+        revision = runner.change_revision()
+        with pytest.raises(ValueError, match="cycle"):
+            runner.link_runs(*reversed(first))
+        assert runner.snapshot(run_id).as_json() == expected
+        assert runner.change_revision() == revision
+        assert history.read_text() == saved
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert restored.snapshot(run_id).as_json() == expected
+        with pytest.raises(ValueError, match="cycle"):
+            restored.link_runs(*reversed(first))
+        assert restored.snapshot(run_id).as_json() == expected
+        assert history.read_text() == saved
+    finally:
+        restored.close()
+
+
+def test_run_family_links_reject_longer_cycles_through_external_run(
+    tmp_path: Path,
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        first, second = [runner._run_identity(run_id) for run_id in ids]
+        external = "a" * 32 + "-1"
+        runner.link_runs(first, external)
+        runner.link_runs(external, second)
+        with pytest.raises(ValueError, match="cycle"):
+            runner.link_runs(second, first)
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        with pytest.raises(ValueError, match="cycle"):
+            restored.link_runs(second, first)
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("external_side", [None, "parent", "child"])
+def test_run_family_links_notify_only_after_changed_links_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, external_side: str | None
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        parent, child = [runner._run_identity(run_id) for run_id in ids]
+        if external_side == "parent":
+            parent = "a" * 32 + f"-{ids[0]}"
+        elif external_side == "child":
+            child = "a" * 32 + f"-{ids[1]}"
+        revision = runner.change_revision()
+        original_write = runner._write_run_history_locked
+
+        def write_before_notification() -> None:
+            assert runner._change_revision == revision
+            original_write()
+
+        monkeypatch.setattr(
+            runner, "_write_run_history_locked", write_before_notification
+        )
+        runner.link_runs(parent, child)
+        assert runner.wait_for_change(revision, timeout=0) == revision + 1
+        assert runner.change_revision() == revision + 1
+        # A retry must neither write history nor advance the SSE revision.
+        runner.link_runs(parent, child)
+        assert runner.change_revision() == revision + 1
+    finally:
+        runner.close()
+
+
+def test_run_family_links_reject_conflicting_external_child_parents_after_reload(
+    tmp_path: Path,
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        ids = [runner.start("pass") for _ in range(2)]
+        for run_id in ids:
+            wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        parent, other_parent = [runner._run_identity(run_id) for run_id in ids]
+        external_child = "a" * 32 + f"-{ids[1]}"
+        runner.link_runs(parent, external_child)
+        saved = history.read_text()
+        expected = [item.as_json() for item in runner.snapshots()]
+        revision = runner.change_revision()
+        with pytest.raises(ValueError, match="different parent"):
+            runner.link_runs(other_parent, external_child)
+        runner.link_runs(parent, external_child)
+        assert runner.change_revision() == revision
+        assert [item.as_json() for item in runner.snapshots()] == expected
+        assert history.read_text() == saved
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert [item.as_json() for item in restored.snapshots()] == expected
+        revision = restored.change_revision()
+        with pytest.raises(ValueError, match="different parent"):
+            restored.link_runs(other_parent, external_child)
+        restored.link_runs(parent, external_child)
+        assert restored.change_revision() == revision
+        assert [item.as_json() for item in restored.snapshots()] == expected
+        assert history.read_text() == saved
+    finally:
+        restored.close()
+
+
+def test_external_target_settings_api(tmp_path: Path) -> None:
+    from purplemux_client.external_targets import ExternalTargetSettings
+
+    settings = ExternalTargetSettings(
+        tmp_path / "targets.json", environment={"REMOTE_TOKEN": "private-secret"}
+    )
+    server = RunnerHTTPServer(
+        ("127.0.0.1", 0),
+        PythonRunner(managed_workflows=False),
+        external_target_settings=settings,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    path = "/api/settings/external-targets"
+    body = json.dumps(
+        {
+            "targets": [
+                {
+                    "id": "remote",
+                    "destination": "https://remote.example",
+                    "tokenEnv": "REMOTE_TOKEN",
+                }
+            ]
+        }
+    )
+    try:
+        assert request(address, "GET", path) == (200, {"targets": []})
+        assert request(address, "POST", path, body)[0] == 403
+        assert not settings.path.exists()
+        status, saved = request(address, "POST", path, body, token=server.request_token)
+        assert status == 200
+        assert saved["targets"][0]["credentialStatus"] == "configured"
+        assert "private-secret" not in json.dumps(saved)
+        assert request(address, "GET", path) == (200, saved)
+        assert (
+            request(
+                address,
+                "POST",
+                path,
+                body,
+                token=server.request_token,
+                origin="https://evil.example",
+            )[0]
+            == 403
+        )
+        status, error = request(
+            address,
+            "POST",
+            path,
+            '{"targets":[{"token":"private-secret"}]}',
+            token=server.request_token,
+        )
+        assert status == 400
+        assert "private-secret" not in json.dumps(error)
+        assert request(address, "GET", path) == (200, saved)
+        settings.path.write_text("invalid private-secret")
+        status, error = request(address, "GET", path)
+        assert status == 500
+        assert "private-secret" not in json.dumps(error)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_run_family_navigation_across_registered_awms_after_reload(tmp_path):
+    from purplemux_client.external_targets import ExternalTargetSettings
+
+    histories = [tmp_path / "parent.json", tmp_path / "child.json"]
+    runners = [
+        PythonRunner(managed_workflows=False, run_history_file=history)
+        for history in histories
+    ]
+    identities = []
+    for runner in runners:
+        run_id = runner.start("pass")
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        identities.append(runner.snapshot(run_id).identity)
+    for runner in runners:
+        runner.link_runs(*identities)
+        runner.close()
+    settings = [
+        ExternalTargetSettings(
+            tmp_path / f"targets-{index}.json", environment={"TOKEN": "remote-token"}
+        )
+        for index in range(2)
+    ]
+    servers = [
+        RunnerHTTPServer(
+            ("127.0.0.1", 0),
+            PythonRunner(managed_workflows=False, run_history_file=history),
+            external_target_settings=registration,
+        )
+        for history, registration in zip(histories, settings, strict=True)
+    ]
+    threads = []
+    addresses = [("127.0.0.1", server.server_address[1]) for server in servers]
+    destinations = [f"http://127.0.0.1:{address[1]}" for address in addresses]
+    for index, server in enumerate(servers):
+        server.request_token = "remote-token"
+        settings[index].update(
+            {
+                "targets": [
+                    {
+                        "id": "missing-credential",
+                        "destination": destinations[index],
+                        "tokenEnv": "MISSING",
+                    },
+                    {
+                        "id": "same-numeric-id",
+                        "destination": destinations[index],
+                        "tokenEnv": "TOKEN",
+                    },
+                    {
+                        "id": "other",
+                        "destination": destinations[1 - index],
+                        "tokenEnv": "TOKEN",
+                    },
+                ]
+            }
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        threads.append(thread)
+    try:
+        for index in range(2):
+            status, detail = request(addresses[index], "GET", "/api/runs/1")
+            assert status == 200
+            reference = detail["childRuns"][0] if index == 0 else detail["parentRun"]
+            assert reference["scope"] == "external"
+            assert reference["identity"] == identities[1 - index]
+            path = f"/api/run-navigation?identity={reference['identity']}"
+            assert request(addresses[index], "GET", path)[0] == 403
+            assert request(addresses[index], "GET", path, token="remote-token") == (
+                200,
+                {"url": destinations[1 - index] + "/?run=" + identities[1 - index]},
+            )
+        servers[1].runner.set_checked(1, True)
+        servers[1].runner.delete_checked_runs([1])
+        path = f"/api/run-navigation?identity={identities[1]}"
+        assert request(addresses[0], "GET", path, token="remote-token") == (
+            200,
+            {"url": None},
+        )
+        assert servers[0].runner.snapshot(1).child_runs == (identities[1],)
+        settings[0].update({"targets": []})
+        assert request(addresses[0], "GET", path, token="remote-token") == (
+            200,
+            {"url": None},
+        )
+        assert (
+            request(
+                addresses[0],
+                "GET",
+                "/api/run-navigation?identity=1",
+                token="remote-token",
+            )[0]
+            == 400
+        )
+    finally:
+        for server, thread in zip(servers, threads, strict=True):
+            server.shutdown()
+            server.server_close()
+            thread.join()

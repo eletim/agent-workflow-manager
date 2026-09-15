@@ -41,6 +41,7 @@
         </div>
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
+          <nav id="run-family" aria-label="Run family" hidden></nav>
           <button id="new-run" type="button">New run</button>
         </div>
         <div id="repository-navigation" class="repository-navigation" hidden>
@@ -272,6 +273,16 @@ emit_step("workspace create", "completed")</textarea>
           </div>
           <img id="mobile-connection-qr" alt="QR code for the Agent Workflow Manager URL" hidden>
         </section>
+        <hr class="settings-divider">
+        <form id="external-target-settings">
+          <h3>External AWM targets</h3>
+          <p>Register stable IDs and server destinations. tokenEnv names a credential environment variable on this server; enter no credential values here.</p>
+          <label for="external-targets-json">Registrations (JSON array)</label>
+          <textarea id="external-targets-json" rows="6" spellcheck="false" placeholder='[{"id":"office","destination":"https://awm.example","tokenEnv":"OFFICE_AWM_TOKEN"}]'></textarea>
+          <p id="external-target-credentials"></p>
+          <button id="save-external-targets" type="submit" disabled>Save external targets</button>
+          <span id="external-target-message" role="status" aria-live="polite"></span>
+        </form>
         <hr class="settings-divider">
         <form id="notification-settings">
           <div class="settings-heading">

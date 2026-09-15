@@ -29,6 +29,7 @@ from purplemux_client.progress import (
 )
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
 from purplemux_client.web import RunnerHTTPServer
+from purplemux_client.workflow import CONTROL_TOKEN_ENV, CONTROL_URL_ENV
 
 
 class _ManagedClient:
@@ -173,6 +174,11 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         assert run.resources[1].metadata["origin"] == "workspace_initial"
         assert run.event_token is not None
         assert run.event_token not in client.request.command
+        assert run.control_token is not None
+        assert run.control_token not in client.request.command
+        environment = run.credential_path.read_text(encoding="utf-8")
+        assert f"export {CONTROL_TOKEN_ENV}=" in environment
+        assert f"export {CONTROL_URL_ENV}=http://127.0.0.1:" in environment
         assert str(run.credential_path) in client.request.command
         assert (
             f"http://127.0.0.1:{server.server_address[1]}"
@@ -378,3 +384,174 @@ def test_authoritative_start_failure_tracks_created_tab_and_result(
             if resource.kind == "managed_shell_result":
                 shutil.rmtree(resource.identity, ignore_errors=True)
         runner.close()
+
+
+class _ExecutingManagedClient(_ManagedClient):
+    """Execute the generated shell command while retaining structured completion."""
+
+    def __init__(self, result_root: Path) -> None:
+        super().__init__()
+        self.result_root = result_root
+
+    def start_shell(self, request, *, on_created=None):
+        import subprocess
+
+        self.request = request
+        tab_id = "tab-workflow"
+        result_dir = tempfile.mkdtemp(prefix="awm-shell-", dir=self.result_root)
+        if on_created is not None:
+            on_created(tab_id, str(Path(result_dir) / "result.json"))
+        self.process = subprocess.Popen(
+            ["bash", "-c", request.command],
+            cwd=request.cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return tab_id
+
+    def wait_for_shell_completion(self, session_id, timeout_seconds):
+        self.process.wait(timeout=timeout_seconds)
+
+    def read_shell_result(self, session_id):
+        assert self.process.returncode is not None
+        return ShellResult(self.process.returncode)
+
+    def interrupt(self, session_id):
+        import signal
+
+        self.interrupted = True
+        self.process.send_signal(signal.SIGINT)
+
+    def close_session(self, session_id):
+        self.process.kill()
+        self.process.wait(timeout=3)
+
+
+@pytest.mark.parametrize("target_id", [None, "remote"])
+@pytest.mark.parametrize("outcome", ["success", "failed", "stopped"])
+def test_managed_workflow_executes_child_helpers_and_reloads_family(
+    tmp_path: Path, target_id: str | None, outcome: str
+) -> None:
+    from contextlib import ExitStack
+
+    from purplemux_client.external_targets import ExternalTargetSettings
+
+    def runtime():
+        return _ManagedRuntime(_ExecutingManagedClient(tmp_path))
+
+    with ExitStack() as stack:
+        runners = {}
+        servers = {}
+        for name in ("remote", "local"):
+            runner = PythonRunner(
+                workflow_cwd=tmp_path,
+                run_history_file=tmp_path / f"{name}.json",
+                runtime_factory=runtime,  # type: ignore[arg-type]
+            )
+            assert runner.managed_workflows is True
+            stack.callback(runner.close)
+            settings = None
+            if name == "local":
+                settings = ExternalTargetSettings(
+                    tmp_path / "targets.json",
+                    environment={"REMOTE_TOKEN": servers["remote"].request_token},
+                )
+                settings.update(
+                    {
+                        "targets": [
+                            {
+                                "id": "remote",
+                                "destination": f"http://127.0.0.1:{servers['remote'].server_port}",
+                                "tokenEnv": "REMOTE_TOKEN",
+                            }
+                        ]
+                    }
+                )
+            server = RunnerHTTPServer(
+                ("127.0.0.1", 0), runner, external_target_settings=settings
+            )
+            stack.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            stack.callback(thread.join)
+            stack.callback(server.shutdown)
+            runners[name] = runner
+            servers[name] = server
+
+        child_code = 'from purplemux_client import emit_step\nemit_step("child", "completed")\nprint("shell output")\n'
+        if outcome == "failed":
+            child_code += "raise SystemExit(7)\n"
+        elif outcome == "stopped":
+            child_code += "import time; time.sleep(60)\n"
+        result_path = tmp_path / "observed-result.json"
+        parent_code = f"""
+from purplemux_client import start_child_run, get_child_run_result, wait_child_run, emit_step
+from dataclasses import asdict
+from pathlib import Path
+import json
+child_id = start_child_run({child_code!r}, target_id={target_id!r})
+result = wait_child_run(child_id, target_id={target_id!r}, timeout=10)
+assert result == get_child_run_result(child_id, target_id={target_id!r})
+Path({str(result_path)!r}).write_text(json.dumps(asdict(result)))
+emit_step("parent", "completed")
+"""
+        local = runners["local"]
+        destination = runners["remote"] if target_id else local
+        parent_id = local.start(parent_code)
+        deadline = time.monotonic() + 10
+        while not local.snapshot(parent_id).child_runs:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        parent_identity = local._run_identity(parent_id)
+        child_identity = local.snapshot(parent_id).child_runs[0]
+        child_id = int(child_identity.rsplit("-", 1)[1])
+        if outcome == "stopped":
+            while not destination.snapshot(child_id).progress:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert local.snapshot(parent_id).state == "running"
+            assert destination.stop(child_id) is True
+            assert destination._runs[child_id].managed_client.interrupted is True
+        while local.snapshot(parent_id).state == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        parent = local.snapshot(parent_id)
+        child = destination.snapshot(child_id)
+        assert parent.state == "success", parent.stderr
+        assert child.state == outcome
+        assert child.exit_code == {"success": 0, "failed": 7, "stopped": -2}[outcome]
+        assert json.loads(result_path.read_text()) == {
+            "run_id": child_id,
+            "state": child.state,
+            "exit_code": child.exit_code,
+            "stdout": child.stdout,
+            "stderr": child.stderr,
+        }
+        assert child.stdout == ""
+        assert child.progress[0].name == "child"
+        assert parent.progress[0].name == "parent"
+        assert child.parent_run == parent_identity
+        assert parent.child_runs == (destination._run_identity(child_id),)
+        for owner in {local, destination}:
+            records = json.loads(owner._run_history_file.read_text())
+            assert records["runFamilyLinks"][parent_identity] == [child_identity]
+        for runner in runners.values():
+            runner.close()
+        for name, run_id, before in (
+            ("local", parent_id, parent),
+            ("remote" if target_id else "local", child_id, child),
+        ):
+            restored = PythonRunner(run_history_file=tmp_path / f"{name}.json")
+            try:
+                after = restored.snapshot(run_id)
+                assert (after.state, after.exit_code, after.stdout, after.stderr) == (
+                    before.state,
+                    before.exit_code,
+                    before.stdout,
+                    before.stderr,
+                )
+                assert after.parent_run == before.parent_run
+                assert after.child_runs == before.child_runs
+                assert after.progress == before.progress
+            finally:
+                restored.close()

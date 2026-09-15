@@ -53,6 +53,8 @@ from purplemux_client.progress import (
     StepStatus,
 )
 from purplemux_client.prompt import PromptExecution
+from purplemux_client.workflow import CONTROL_TOKEN_ENV, CONTROL_URL_ENV
+from purplemux_client.workflow_control import WorkflowControlServer
 
 RunnerState = Literal[
     "idle",
@@ -471,9 +473,14 @@ class RunnerSnapshot:
     identity: str | None = None
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
+    parent_run: str | None = None
+    child_runs: tuple[str, ...] = ()
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
+        payload.pop("parent_run")
+        payload.pop("child_runs")
+        payload.update(self._family_json())
         payload.pop("prompt")
         payload["mode"] = (
             "prompt"
@@ -730,6 +737,7 @@ class RunnerSnapshot:
             "resourceCount": len(self.resources),
             "checked": self.checked,
         }
+        payload.update(self._family_json())
         if self.resumed_from_run_id is not None:
             payload["resumedFromRunId"] = self.resumed_from_run_id
         if self.prompt is not None:
@@ -739,6 +747,21 @@ class RunnerSnapshot:
             }
             payload["repository"] = self.prompt.repository_json()
         return payload
+
+    def _family_json(self) -> dict[str, object]:
+        def reference(identity: str) -> dict[str, object]:
+            instance_id, run_id = identity.rsplit("-", 1)
+            local_instance = self.identity.rsplit("-", 1)[0] if self.identity else None
+            return {
+                "identity": identity,
+                "scope": "local" if instance_id == local_instance else "external",
+                "runId": int(run_id),
+            }
+
+        return {
+            "parentRun": reference(self.parent_run) if self.parent_run else None,
+            "childRuns": [reference(item) for item in self.child_runs],
+        }
 
     def _execution_context_json(self) -> dict[str, str] | None:
         for resource in self.resources:
@@ -797,6 +820,7 @@ class _RunRecord:
     managed_tab_name: str | None = None
     credential_path: Path | None = None
     event_token: str | None = None
+    control_token: str | None = None
     integration_pr: PullRequestNavigation | None = None
     checked: bool = False
     issue_driven_context: IssueDrivenContext | None = None
@@ -810,6 +834,8 @@ class _RunRecord:
     issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
     resumed_from_run_id: int | None = None
+    parent_run: str | None = None
+    child_runs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -854,6 +880,7 @@ class PythonRunner:
         self._validation_lock = threading.Lock()
         self._runs: dict[int, _RunRecord] = {}
         self._cleanup_ownership: dict[int, _CleanupOwnership] = {}
+        self._historical_family_links: dict[str, list[str]] = {}
         self._next_run_id = 1
         self._correlation_instance = secrets.token_hex(16)
         self._notifier = notifier
@@ -875,6 +902,7 @@ class PythonRunner:
         self._browser_origin: str | None = None
         self._event_base_url: str | None = None
         self._wait_threads: set[threading.Thread] = set()
+        self._control_server: WorkflowControlServer | None = None
         self._closed = False
         try:
             self._workflow_cwd = (
@@ -975,6 +1003,8 @@ class PythonRunner:
         return {
             "identity": self._run_identity(run.run_id),
             "runId": run.run_id,
+            "parentRun": run.parent_run,
+            "childRuns": list(run.child_runs),
             "cwd": run.cwd,
             "args": list(run.args),
             "code": run.code,
@@ -1045,6 +1075,21 @@ class PythonRunner:
             "resumedFromRunId": run.resumed_from_run_id,
         }
 
+    def _family_links_locked(self) -> dict[str, list[str]]:
+        links = {
+            parent: list(children)
+            for parent, children in self._historical_family_links.items()
+        }
+        for run in self._runs.values():
+            identity = self._run_identity(run.run_id)
+            if run.child_runs:
+                links[identity] = list(run.child_runs)
+            if run.parent_run:
+                children = links.setdefault(run.parent_run, [])
+                if identity not in children:
+                    children.append(identity)
+        return links
+
     def _write_run_history_locked(self) -> None:
         path = self._run_history_file
         if path is None:
@@ -1063,6 +1108,7 @@ class PythonRunner:
                     self._run_identity(run.run_id): self._run_history_json(run)
                     for run in terminal_runs
                 },
+                "runFamilyLinks": self._family_links_locked(),
                 "cleanupOwnership": {
                     self._run_identity(ownership.run_id): {
                         "runId": ownership.run_id,
@@ -1152,6 +1198,21 @@ class PythonRunner:
             )
         ):
             raise ValueError
+
+        parent_run = value.get("parentRun")
+        child_runs = value.get("childRuns", [])
+        if parent_run is not None:
+            self._validate_run_reference(parent_run)
+        if not isinstance(child_runs, list):
+            raise ValueError("childRuns must be a list")
+        for child in child_runs:
+            self._validate_run_reference(child)
+        if (
+            identity == parent_run
+            or identity in child_runs
+            or len(set(child_runs)) != len(child_runs)
+        ):
+            raise ValueError("invalid Run family references")
 
         def load_many(kind: type[Any], key: str) -> list[Any]:
             items = value.get(key)
@@ -1436,6 +1497,8 @@ class PythonRunner:
             checked=checked,
             issue_driven_json=issue_driven_json,
             resumed_from_run_id=resumed_from_run_id,
+            parent_run=parent_run,
+            child_runs=tuple(child_runs),
         )
 
     def _cleanup_ownership_from_history(self, value: object) -> _CleanupOwnership:
@@ -1516,6 +1579,20 @@ class PythonRunner:
                 or not isinstance(cleanup_ownership, dict)
             ):
                 raise ValueError
+            family_links = payload.get("runFamilyLinks", {})
+            if not isinstance(family_links, dict):
+                raise ValueError("invalid Run family links")
+            for parent, children in family_links.items():
+                self._validate_run_reference(parent)
+                if not isinstance(children, list) or len(set(children)) != len(
+                    children
+                ):
+                    raise ValueError("invalid Run family links")
+                for child in children:
+                    self._validate_run_reference(child)
+                    if child == parent:
+                        raise ValueError("invalid Run family links")
+            self._historical_family_links = family_links
             self._correlation_instance = instance_id
             restored = [
                 self._record_from_run_history(run)
@@ -1775,7 +1852,13 @@ class PythonRunner:
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        parent_run_id: int | None = None,
+        parent_identity: str | None = None,
     ) -> int:
+        if parent_identity is not None:
+            self._validate_run_reference(parent_identity)
+            if parent_run_id is not None:
+                raise ValueError("provide only one parent reference")
         run_cwd, run_args, child_env = self._execution_context(args)
         with self._validation_lock:
             with self._lock:
@@ -1788,6 +1871,10 @@ class PythonRunner:
                 if not validation.valid:
                     self._apply_validation(validation, run_cwd, run_args)
                     raise WorkflowValidationError(validation)
+                if parent_run_id is not None:
+                    parent = self._get_run(parent_run_id)
+                    if parent.state != "running" or parent.stop_requested:
+                        raise ValueError("parent Run is no longer running")
                 return self._start_validated(
                     code,
                     outline=validation.outline,
@@ -1797,6 +1884,8 @@ class PythonRunner:
                     prompt=prompt,
                     issue_driven_json=issue_driven_json,
                     resumed_from_run_id=resumed_from_run_id,
+                    parent_run_id=parent_run_id,
+                    parent_identity=parent_identity,
                 )
 
     def resume(self, run_id: int) -> int:
@@ -1832,6 +1921,8 @@ class PythonRunner:
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        parent_run_id: int | None = None,
+        parent_identity: str | None = None,
     ) -> int:
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
@@ -1849,22 +1940,19 @@ class PythonRunner:
                 child_env=child_env,
                 issue_driven_json=issue_driven_json,
                 resumed_from_run_id=resumed_from_run_id,
+                parent_run_id=parent_run_id,
+                parent_identity=parent_identity,
             )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
-        process, script_path, progress_read_fd, resource_ack_fd = self._spawn_process(
-            code,
-            run_cwd=run_cwd,
-            run_args=run_args,
-            child_env=run_environment,
-        )
+        script_path = Path()
 
         run = _RunRecord(
             run_id=run_id,
             cwd=prompt.cwd if prompt is not None else str(run_cwd),
             args=run_args,
-            process=process,
-            process_group_id=process.pid,
+            process=None,
+            process_group_id=None,
             script_path=script_path,
             code=code,
             outline=outline,
@@ -1876,12 +1964,156 @@ class PythonRunner:
             resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
+        try:
+            self._prepare_workflow_launch(
+                run, run_environment, parent_run_id, parent_identity
+            )
+            process, script_path, progress_read_fd, resource_ack_fd = (
+                self._spawn_process(
+                    code,
+                    run_cwd=run_cwd,
+                    run_args=run_args,
+                    child_env=run_environment,
+                )
+            )
+        except BaseException as exc:
+            self._fail_workflow_launch(run, exc)
+            raise
+        run.process = process
+        run.process_group_id = process.pid
+        run.script_path = script_path
 
         self._start_attempt_threads(
             run, process, script_path, progress_read_fd, resource_ack_fd
         )
         self._mark_changed()
         return run_id
+
+    def _prepare_workflow_launch(
+        self,
+        run: _RunRecord,
+        environment: dict[str, str],
+        parent_run_id: int | None,
+        parent_identity: str | None = None,
+    ) -> None:
+        if self._control_server is None:
+            self._control_server = WorkflowControlServer(self._workflow_control)
+        run.control_token = secrets.token_urlsafe(32)
+        environment[CONTROL_URL_ENV] = self._control_server.url
+        environment[CONTROL_TOKEN_ENV] = run.control_token
+        if parent_identity is not None:
+            self._link_runs_locked(parent_identity, self._run_identity(run.run_id))
+        if parent_run_id is not None:
+            self._link_runs_locked(
+                self._run_identity(parent_run_id), self._run_identity(run.run_id)
+            )
+        # Running Runs are not terminal history; persist their family links separately.
+        self._write_run_history_locked()
+
+    def _workflow_control(self, token: str, payload: dict) -> dict:
+        with self._lock:
+            self._ensure_open()
+            parent = next(
+                (
+                    run
+                    for run in self._runs.values()
+                    if run.control_token
+                    and secrets.compare_digest(token, run.control_token)
+                ),
+                None,
+            )
+            if parent is None or parent.state != "running" or parent.stop_requested:
+                raise PermissionError("invalid running Workflow credential")
+            parent_id = parent.run_id
+            operation = payload.get("operation")
+            target_id = payload.get("target_id")
+            if target_id is not None and (
+                not isinstance(target_id, str) or not target_id
+            ):
+                raise ValueError("target_id must be a registered external identifier")
+            if target_id is None and operation == "result":
+                child_id = payload.get("run_id")
+                if isinstance(child_id, bool) or not isinstance(child_id, int):
+                    raise ValueError("invalid child Run ID")
+                child = self._get_run(child_id)
+                if child.parent_run != self._run_identity(parent_id):
+                    raise PermissionError("Run is not a child of this Workflow")
+                if child.state == "running":
+                    return {}
+                snapshot = self._snapshot_run(child)
+                return {
+                    "run_id": child_id,
+                    "state": snapshot.state,
+                    "exit_code": snapshot.exit_code,
+                    "stdout": snapshot.stdout,
+                    "stderr": snapshot.stderr,
+                }
+            if operation not in {"start", "result"}:
+                raise ValueError("unknown Workflow control operation")
+            code, args = payload.get("code"), payload.get("args", [])
+            if operation == "start":
+                if not isinstance(code, str) or not code.strip():
+                    raise ValueError("code must be a non-empty string")
+                if not isinstance(args, list) or any(
+                    not isinstance(arg, str) for arg in args
+                ):
+                    raise ValueError("args must be strings")
+        if target_id is not None:
+            return self._external_child_control(parent, target_id, payload)
+        assert isinstance(code, str)
+        return {"run_id": self.start(code, args=args, parent_run_id=parent_id)}
+
+    def _external_child_control(
+        self, parent: _RunRecord, target_id: str, payload: dict
+    ) -> dict:
+        from dataclasses import asdict
+
+        from purplemux_client.external_runs import ExternalRunClient
+
+        with self._lock:
+            client = getattr(self, "_external_child_client", None)
+            if client is None:
+                client = ExternalRunClient()
+                self._external_child_client = client
+        parent_identity = self._run_identity(parent.run_id)
+        operation = payload.get("operation")
+        if operation == "start":
+            code = payload.get("code")
+            if not isinstance(code, str):
+                raise ValueError("code must be a string")
+            run_id = client.start_run(
+                target_id,
+                code,
+                args=payload.get("args", []),
+                parent_identity=parent_identity,
+                _on_identity=lambda run_id, identity: self.link_runs(
+                    parent_identity, identity
+                ),
+            )
+            return {"run_id": run_id}
+        if operation == "result":
+            run_id = payload.get("run_id")
+            if type(run_id) is not int or run_id < 1:
+                raise ValueError("invalid child Run ID")
+            identity = client.run_identities.get((target_id, run_id))
+            if identity not in parent.child_runs:
+                raise PermissionError("Run is not a child of this Workflow")
+            timeout = payload.get("timeout")
+            deadline = None
+            if timeout is not None:
+                from purplemux_client.external_runs import _duration
+
+                _duration(timeout)
+                deadline = time.monotonic() + timeout
+            result = client.get_run_result(
+                target_id,
+                run_id,
+                _timeout=timeout,
+                _deadline=deadline,
+                _identity=identity,
+            )
+            return asdict(result) if result is not None else {}
+        raise ValueError("unknown Workflow control operation")
 
     def _reserve_run_id_locked(self) -> int:
         """Durably consume one identity before any workflow-side mutation."""
@@ -1903,6 +2135,8 @@ class PythonRunner:
         child_env: Mapping[str, str],
         issue_driven_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        parent_run_id: int | None = None,
+        parent_identity: str | None = None,
     ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -1957,6 +2191,12 @@ class PythonRunner:
         created_tab_id: str | None = None
         result_path: str | None = None
         try:
+            self._prepare_workflow_launch(
+                run, managed_env, parent_run_id, parent_identity
+            )
+            with credential_path.open("a", encoding="utf-8") as stream:
+                for name in (CONTROL_URL_ENV, CONTROL_TOKEN_ENV):
+                    stream.write(f"export {name}={shlex.quote(managed_env[name])}\n")
             runtime = self._runtime_factory()
             workspace = runtime.create_workspace(
                 CreateWorkspaceRequest(
@@ -2050,6 +2290,10 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
+        self._fail_workflow_launch(run, exc)
+
+    def _fail_workflow_launch(self, run: _RunRecord, exc: BaseException) -> None:
+        """Record a terminal launch failure while holding the Runner lock."""
         run.exit_code = 1
         run.state = "failed"
         self._finish_active_repository(run)
@@ -2342,7 +2586,87 @@ class PythonRunner:
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
             resumed_from_run_id=run.resumed_from_run_id,
+            parent_run=run.parent_run,
+            child_runs=run.child_runs,
         )
+
+    @staticmethod
+    def _validate_run_reference(identity: object) -> None:
+        if not isinstance(identity, str) or not re.fullmatch(
+            r"[0-9a-f]{32}-[1-9][0-9]*", identity
+        ):
+            raise ValueError("Run references must be full AWM Run identities")
+
+    def link_runs(self, parent_identity: str, child_identity: str) -> None:
+        """Persist a family link on ordinary Runs, retaining external references.
+
+        Local records are resolved by full identity, never by numeric ID alone.
+        References survive deletion of related records.
+        """
+        self._validate_run_reference(parent_identity)
+        self._validate_run_reference(child_identity)
+        if parent_identity == child_identity:
+            raise ValueError("a Run cannot be its own parent")
+        with self._lock:
+            self._link_runs_locked(parent_identity, child_identity)
+
+    def _link_runs_locked(self, parent_identity: str, child_identity: str) -> None:
+        self._ensure_open()
+
+        def local_record(identity: str) -> _RunRecord | None:
+            instance_id, run_id = identity.rsplit("-", 1)
+            if instance_id != self._correlation_instance:
+                return None
+            return self._get_run(int(run_id))
+
+        parent = local_record(parent_identity)
+        child = local_record(child_identity)
+        if parent is None and child is None:
+            raise ValueError("a family link must involve a local Run")
+        # Both sides of each stored link contribute known edges, including
+        # references whose ordinary Run record is external or was deleted.
+        edges: dict[str, set[str]] = {
+            parent: set(children)
+            for parent, children in self._historical_family_links.items()
+        }
+        for run in self._runs.values():
+            identity = self._run_identity(run.run_id)
+            edges.setdefault(identity, set()).update(run.child_runs)
+            if run.parent_run is not None:
+                edges.setdefault(run.parent_run, set()).add(identity)
+        if any(
+            known_parent != parent_identity and child_identity in children
+            for known_parent, children in edges.items()
+        ):
+            raise ValueError("Run already has a different parent")
+        pending = [child_identity]
+        seen: set[str] = set()
+        while pending:
+            identity = pending.pop()
+            if identity == parent_identity:
+                raise ValueError("Run family links cannot form a cycle")
+            if identity not in seen:
+                seen.add(identity)
+                pending.extend(edges.get(identity, ()))
+        old_children = parent.child_runs if parent else ()
+        old_parent = child.parent_run if child else None
+        if parent is not None and child_identity not in parent.child_runs:
+            parent.child_runs += (child_identity,)
+        if child is not None:
+            child.parent_run = parent_identity
+        if (parent is None or parent.child_runs == old_children) and (
+            child is None or child.parent_run == old_parent
+        ):
+            return
+        try:
+            self._write_run_history_locked()
+        except RunHistoryError:
+            if parent is not None:
+                parent.child_runs = old_children
+            if child is not None:
+                child.parent_run = old_parent
+            raise
+        self._mark_changed()
 
     def set_checked(self, run_id: int, checked: bool) -> RunnerSnapshot:
         """Set human-review metadata without changing execution state."""
@@ -2460,6 +2784,8 @@ class PythonRunner:
         child_env.pop("PURPLEMUX_RUNNER_RESUME_CHECKPOINT", None)
         child_env.pop("PURPLEMUX_RUNNER_REPOSITORY_CONTEXT", None)
         child_env.pop("PURPLEMUX_RUNNER_PENDING_REPOSITORY_CONTEXT", None)
+        child_env.pop(CONTROL_URL_ENV, None)
+        child_env.pop(CONTROL_TOKEN_ENV, None)
         child_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
         return run_cwd, run_args, child_env
 
@@ -3002,6 +3328,8 @@ class PythonRunner:
             )
             for run in active_runs:
                 run.stop_requested = True
+        if self._control_server is not None:
+            self._control_server.close()
         self._validator.close()
         cleanup_threads = tuple(
             threading.Thread(

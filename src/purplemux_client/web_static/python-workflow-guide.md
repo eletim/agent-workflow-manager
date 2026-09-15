@@ -1270,3 +1270,80 @@ except BaseException as exc:
 Replace constants and prompts for the requested Issue, but keep orchestration,
 review separation, bounded attempts, and mutation handling explicit in plain
 Python. Resource destruction is the separate, explicit run Cleanup action.
+
+## Child Runs
+
+A running Python Workflow can start another Workflow on the same Runner and
+sequence it using ordinary Python:
+
+```python
+from purplemux_client import start_child_run, wait_child_run, get_child_run_result
+
+child_id = start_child_run('print("child work")')
+result = wait_child_run(child_id, timeout=60)
+assert result == get_child_run_result(child_id)
+if result.state != "success":
+    raise RuntimeError(f"Child {child_id} ended as {result.state}: {result.stderr}")
+```
+
+`start_child_run()` returns the local integer Run ID. The Runner persists both
+family references before executing child work, then uses its ordinary execution,
+Progress, Result, Stop, and history handling. `get_child_run_result()` returns
+`None` while running; the immutable `ChildRunResult` contains `run_id`, `state`,
+`exit_code`, `stdout`, and `stderr`. Failed and stopped children return results;
+the parent decides how to handle them. `wait_child_run()` raises `TimeoutError`
+when its optional timeout expires without stopping the child. Stop remains the
+Runner's existing per-Run action; stopping a parent does not cascade to children.
+
+Control uses a separate local authenticated endpoint, never progress events.
+Only the running parent may request its children's results. These helpers require
+a running Workflow and are unavailable during validation or Dry Run. An uncertain
+start request must be reconciled by inspecting Runner history before starting
+another child; it must not be retried automatically.
+
+Pass the same registered `target_id` to all three helpers to run an external child:
+
+```python
+child_id = start_child_run('print("remote child")', target_id="registered-target-id")
+result = wait_child_run(child_id, target_id="registered-target-id", timeout=300)
+assert result == get_child_run_result(child_id, target_id="registered-target-id")
+```
+
+The returned integer is the destination's Run ID. The receiving AWM persists the
+originating parent reference before execution; the caller persists the full child
+identity once received. Local and external children use the same final result
+fields and failure/stop semantics. External observation failures raise
+`ExternalRunError`, and uncertain launches raise `ExternalRunLaunchUnknown`;
+known family identities remain in history. A timeout does not stop the remote Run.
+Credentials are resolved on the calling server from its registered target settings.
+
+## External ordinary Runs
+
+`ExternalRunClient` launches ordinary Runs on external AWMs registered in Settings.
+The calling server resolves the registration and its environment credential;
+HTTPS or loopback HTTP, Host, Origin, and request-token protections still apply.
+
+```python
+from purplemux_client import ExternalRunClient
+
+external = ExternalRunClient(request_timeout=30)
+run_id = external.start_run("registered-target-id", 'print("remote work")')
+result = external.wait_run("registered-target-id", run_id, timeout=300)
+if result.state != "success":
+    raise RuntimeError(f"Remote Run {run_id} ended as {result.state}: {result.stderr}")
+```
+
+`start_run()` returns the destination's integer Run ID. Each client pins a target's
+destination on first use and explicitly rejects later destination changes, so
+colliding Run IDs on another AWM cannot substitute for the original results. `get_run_result()` returns
+None only when the destination confirms it is running. Terminal results use
+`ExternalRunResult` with `run_id`, `state`, `exit_code`, `stdout`, and `stderr`;
+output retains the destination Runner's limits and truncation notices. Failed
+and stopped Runs return their actual results. `wait_run()` raises TimeoutError
+when its deadline expires, without stopping the remote Run.
+
+Communication failures, unknown IDs, and malformed or unknown result responses
+raise `ExternalRunError`. An uncertain launch raises `ExternalRunLaunchUnknown`:
+the destination may already have started a Run. Inspect destination history
+before deciding whether to launch again. No launch is retried and no redirect is
+followed. Keep credentials on the calling server, outside browser code.
