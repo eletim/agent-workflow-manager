@@ -1270,3 +1270,33 @@ except BaseException as exc:
 Replace constants and prompts for the requested Issue, but keep orchestration,
 review separation, bounded attempts, and mutation handling explicit in plain
 Python. Resource destruction is the separate, explicit run Cleanup action.
+
+## Local child Runs
+
+A running Python Workflow can start another Workflow on the same Runner and
+sequence it using ordinary Python:
+
+```python
+from purplemux_client import start_child_run, wait_child_run, get_child_run_result
+
+child_id = start_child_run('print("child work")')
+result = wait_child_run(child_id, timeout=60)
+assert result == get_child_run_result(child_id)
+if result.state != "success":
+    raise RuntimeError(f"Child {child_id} ended as {result.state}: {result.stderr}")
+```
+
+`start_child_run()` returns the local integer Run ID. The Runner persists both
+family references before executing child work, then uses its ordinary execution,
+Progress, Result, Stop, and history handling. `get_child_run_result()` returns
+`None` while running; the immutable `ChildRunResult` contains `run_id`, `state`,
+`exit_code`, `stdout`, and `stderr`. Failed and stopped children return results;
+the parent decides how to handle them. `wait_child_run()` raises `TimeoutError`
+when its optional timeout expires without stopping the child. Stop remains the
+Runner's existing per-Run action; stopping a parent does not cascade to children.
+
+Control uses a separate local authenticated endpoint, never progress events.
+Only the running parent may request its children's results. These helpers require
+a running Workflow and are unavailable during validation or Dry Run. An uncertain
+start request must be reconciled by inspecting Runner history before starting
+another child; it must not be retried automatically.

@@ -66,6 +66,10 @@ from purplemux_client.progress import (
 )
 
 __all__ = [
+    "ChildRunResult",
+    "get_child_run_result",
+    "start_child_run",
+    "wait_child_run",
     "AgentReadinessProbeResult",
     "CreateSessionRequest",
     "CreateWorkspaceRequest",
@@ -121,3 +125,10 @@ __all__ = [
     "register_run_resource",
     "run_correlation",
 ]
+
+from purplemux_client.workflow import (
+    ChildRunResult,
+    get_child_run_result,
+    start_child_run,
+    wait_child_run,
+)
