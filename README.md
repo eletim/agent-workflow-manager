@@ -882,6 +882,12 @@ result = client.wait_run("registered-target-id", run_id, timeout=300)
 print(result.state, result.exit_code, result.stdout, result.stderr)
 ```
 
+Each client pins a target destination on first use. Changing that registration's
+destination makes subsequent requests fail explicitly; use the original
+destination to observe its Runs. Credentials can rotate at the same destination.
+The client accepts up to 24,065,536 response bytes, covering both default retained
+output streams even when JSON expands Unicode into surrogate pairs.
+
 The client launches once through `POST /api/run` with JSON `code` and optional
 string-array `args`; HTTP 202 returns a positive `runId`. Authenticated
 `GET /api/runs/{runId}/result` returns JSON `runId`, `state`, and `result`.

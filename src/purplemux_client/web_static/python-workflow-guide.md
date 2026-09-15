@@ -1317,7 +1317,9 @@ if result.state != "success":
     raise RuntimeError(f"Remote Run {run_id} ended as {result.state}: {result.stderr}")
 ```
 
-`start_run()` returns the destination's integer Run ID. `get_run_result()` returns
+`start_run()` returns the destination's integer Run ID. Each client pins a target's
+destination on first use and explicitly rejects later destination changes, so
+colliding Run IDs on another AWM cannot substitute for the original results. `get_run_result()` returns
 None only when the destination confirms it is running. Terminal results use
 `ExternalRunResult` with `run_id`, `state`, `exit_code`, `stdout`, and `stderr`;
 output retains the destination Runner's limits and truncation notices. Failed

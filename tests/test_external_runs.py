@@ -156,7 +156,15 @@ def test_malformed_result_fails(value, monkeypatch):
 @pytest.mark.parametrize("launching", [True, False])
 @pytest.mark.parametrize(
     "response_kind",
-    ["timeout", "disconnect", "malformed", "null", "redirect", "server_error"],
+    [
+        "timeout",
+        "disconnect",
+        "malformed",
+        "null",
+        "redirect",
+        "server_error",
+        "truncated",
+    ],
 )
 def test_transport_failures_never_succeed_or_retry(launching, response_kind, tmp_path):
     import socket
@@ -186,9 +194,19 @@ def test_transport_failures_never_succeed_or_retry(launching, response_kind, tmp
                 else 200
             )
             body = b"null" if response_kind == "null" else b"broken json"
+            if response_kind == "truncated":
+                body = json.dumps(
+                    {
+                        "runId": 1,
+                        "state": "success",
+                        "result": {"exitCode": 0, "stdout": "", "stderr": ""},
+                    }
+                ).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Length", str(len(body) + (response_kind == "truncated"))
+            )
             self.send_header("Location", "/credential-leak")
             self.end_headers()
             self.wfile.write(body)
@@ -276,3 +294,163 @@ def test_lost_launch_response_does_not_launch_twice(tmp_path, monkeypatch):
         thread.join()
         server.server_close()
         runner.close()
+
+
+@pytest.fixture
+def external_awms(tmp_path):
+    with ExitStack() as stack:
+        servers = []
+        for name in ("a", "b"):
+            runner = PythonRunner(
+                managed_workflows=False, run_history_file=tmp_path / f"{name}.json"
+            )
+            stack.callback(runner.close)
+            server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+            stack.callback(server.server_close)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            stack.callback(thread.join)
+            stack.callback(server.shutdown)
+            servers.append(server)
+        environment = {"TOKEN": servers[0].request_token}
+        settings = ExternalTargetSettings(
+            tmp_path / "targets.json", environment=environment
+        )
+
+        def register(server):
+            environment["TOKEN"] = server.request_token
+            settings.update(
+                {
+                    "targets": [
+                        {
+                            "id": "remote",
+                            "destination": f"http://127.0.0.1:{server.server_port}",
+                            "tokenEnv": "TOKEN",
+                        }
+                    ]
+                }
+            )
+
+        register(servers[0])
+        yield servers, settings, register
+
+
+def test_registration_change_cannot_observe_colliding_run(external_awms):
+    servers, settings, register = external_awms
+    client = ExternalRunClient(settings)
+    run_id = client.start_run("remote", 'raise RuntimeError("AWM A failed")')
+    assert client.wait_run("remote", run_id, timeout=5).state == "failed"
+    register(servers[1])
+    other = ExternalRunClient(settings)
+    other_id = other.start_run("remote", 'print("unrelated AWM B success")')
+    assert other_id == run_id
+    assert other.wait_run("remote", other_id, timeout=5).state == "success"
+    with pytest.raises(ExternalRunError, match="destination changed"):
+        client.get_run_result("remote", run_id)
+    with pytest.raises(ExternalRunError, match="destination changed"):
+        client.wait_run("remote", run_id, timeout=5)
+    with pytest.raises(ExternalRunError, match="destination changed"):
+        client.start_run("remote", 'print("must not launch")')
+    assert len(servers[1].runner.snapshots()) == 1
+
+
+def test_trickling_response_expires_within_polling_deadline(tmp_path):
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    body = json.dumps(
+        {
+            "runId": 1,
+            "state": "success",
+            "result": {"exitCode": 0, "stdout": "", "stderr": ""},
+        }
+    ).encode()
+    finished = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.005)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                finished.set()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        settings = ExternalTargetSettings(
+            tmp_path / "targets.json", environment={"TOKEN": "secret"}
+        )
+        settings.update(
+            {
+                "targets": [
+                    {
+                        "id": "remote",
+                        "destination": f"http://127.0.0.1:{server.server_port}",
+                        "tokenEnv": "TOKEN",
+                    }
+                ]
+            }
+        )
+        client = ExternalRunClient(settings)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            client.wait_run("remote", 1, timeout=0.05)
+        assert time.monotonic() - started < 0.15
+        assert finished.wait(1)
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+def test_wait_checks_deadline_before_returning_result(monkeypatch):
+    import time
+
+    from purplemux_client import ExternalRunResult
+
+    client = ExternalRunClient()
+
+    def late_result(*args, **kwargs):
+        time.sleep(0.02)
+        return ExternalRunResult(1, "success", 0, "", "")
+
+    monkeypatch.setattr(client, "get_run_result", late_result)
+    with pytest.raises(TimeoutError):
+        client.wait_run("remote", 1, timeout=0.01)
+
+
+@pytest.mark.parametrize("character", ["a", "日", "😀"])
+def test_maximum_retained_output_is_retrievable(character, external_awms):
+    servers, settings, _ = external_awms
+    client = ExternalRunClient(settings)
+    run_id = client.start_run(
+        "remote",
+        f"import sys, time\ntime.sleep(0.02)\nsys.stdout.write({character!r} * 1_000_000)\nsys.stderr.write({character!r} * 1_000_000)",
+    )
+    result = client.wait_run("remote", run_id, timeout=15)
+    assert result.state == "success"
+    assert result.stdout == result.stderr == character * 1_000_000
+    assert servers[0].runner.snapshot(run_id).stdout == result.stdout
+
+
+def test_response_limit_remains_bounded(external_awms, monkeypatch):
+    servers, settings, _ = external_awms
+    run_id = servers[0].runner.start('print("x" * 256)')
+    client = ExternalRunClient(settings)
+    assert client.wait_run("remote", run_id, timeout=5).state == "success"
+    monkeypatch.setattr("purplemux_client.external_runs._MAX_RESPONSE_BYTES", 128)
+    with pytest.raises(ExternalRunError, match="malformed"):
+        client.get_run_result("remote", run_id)
