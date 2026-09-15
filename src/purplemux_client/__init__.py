@@ -23,6 +23,12 @@ from purplemux_client.execution_context import (
     inspect_run_repository,
     prepare_run_repository,
 )
+from purplemux_client.external_runs import (
+    ExternalRunClient,
+    ExternalRunError,
+    ExternalRunLaunchUnknown,
+    ExternalRunResult,
+)
 from purplemux_client.git import (
     BranchState,
     FeaturePreparationState,
@@ -66,6 +72,10 @@ from purplemux_client.progress import (
 )
 
 __all__ = [
+    "ExternalRunClient",
+    "ExternalRunError",
+    "ExternalRunLaunchUnknown",
+    "ExternalRunResult",
     "ChildRunResult",
     "get_child_run_result",
     "start_child_run",
