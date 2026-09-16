@@ -64,7 +64,9 @@ repositories; oversized content may be shortened with counts in `truncated`.
 The verdict describes the check; the Run state and exit code describe whether
 the workflow executed successfully. A completed Run may therefore have a
 `FAIL` or `BLOCKED` verdict. Invalid agent output, an unavailable PurpleMux
-contract, a repository change, or an unconfirmed start turn can fail the Run
-without a structured verdict. A stopped Run may also have no complete result.
+contract, or a repository change can fail the Run without a structured verdict.
+If the start observation times out or is unavailable, the Run completes with a
+`BLOCKED` verdict and an observability gap; it skips the check and finish because
+start completion cannot be confirmed. A stopped Run may also have no complete result.
 If an optional `finish` turn times out or is unavailable, the check verdict is
 retained and the gap is added to `observability_gaps`.

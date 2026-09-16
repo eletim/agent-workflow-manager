@@ -145,7 +145,7 @@ A stopped Run may end without a complete readiness JSON result.
 
 ## Issue Driven mode
 
-The UI offers `Prompt | Environment Setup | Issue Driven | Python Workflow`. Issue Driven mode accepts
+The UI offers `Prompt | Environment Setup | Issue Driven | Review | Python Workflow`. Issue Driven mode accepts
 only a small JSON configuration, validates it separately from Python, and
 deterministically expands it into the canonical sequential plain-Python workflow.
 The generated Python is visible for inspection and is then passed unchanged to the

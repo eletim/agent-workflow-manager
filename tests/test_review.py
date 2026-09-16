@@ -70,7 +70,7 @@ def test_review_generates_valid_ordinary_workflow(
     assert "PurpleMuxRuntime(owned_by_run=True)" in code
     assert "worker=AGENT" in code
     assert "if START is not None:" in code
-    assert "if FINISH is not None:" in code
+    assert "if FINISH is not None and start_completed:" in code
     assert "json.loads(report)" in code
     assert "any available browser tool" in code
     assert "PurpleMux CLI" in code
@@ -472,6 +472,95 @@ def test_generated_review_unavailable_returns_blocked_and_runs_finish(
     assert result["observability_gaps"] == [expected]
     assert "Close the observation" in messages[1]
     assert closed == ["agent-tab"]
+
+
+@pytest.mark.parametrize("unavailable", ["timeout", "result unavailable"])
+@pytest.mark.parametrize("repository_changed", [False, True])
+def test_generated_review_start_unavailable_blocks_without_check_or_finish(
+    repositories: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    unavailable: str,
+    repository_changed: bool,
+) -> None:
+    import purplemux_client
+    import purplemux_client.review as review_module
+    from purplemux_client.errors import WorkerFailure
+
+    messages: list[str] = []
+    closed: list[str] = []
+    steps: list[tuple[str, str]] = []
+
+    class Client:
+        def create_session(self, _request: object) -> str:
+            return "agent-tab"
+
+        def wait_until_ready(self, _tab: str, _seconds: float) -> None:
+            pass
+
+        def send_input(self, _tab: str, message: str) -> None:
+            messages.append(message)
+
+        def wait_for_turn_completion(
+            self, _tab: str, _seconds: float, **_kwargs: object
+        ) -> None:
+            if repository_changed:
+                (repositories[1] / "changed.txt").write_text("changed during start")
+            if unavailable == "timeout":
+                raise TimeoutError("start observation timed out")
+            raise WorkerFailure("start result unavailable")
+
+        def close_session(self, tab: str) -> None:
+            closed.append(tab)
+
+    client = Client()
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="review-workspace")
+
+        def workspace(self, _workspace_id: str) -> Client:
+            return client
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
+    )
+    monkeypatch.setattr(
+        purplemux_client,
+        "emit_step",
+        lambda name, state, **_kwargs: steps.append((name, state)),
+    )
+    config = parse_review_json(
+        declaration(repositories, start="Start observation", finish="Close observation")
+    )
+    output = StringIO()
+    with redirect_stdout(output):
+        if repository_changed:
+            with pytest.raises(RuntimeError, match="Review repository change detected"):
+                exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
+        else:
+            exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
+    if repository_changed:
+        assert output.getvalue() == ""
+        assert closed == ["agent-tab"]
+        assert steps == [("Review", "started"), ("Review", "failed")]
+        return
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "BLOCKED"
+    assert "start observation" in result["summary"]
+    assert result["observability_gaps"] == [
+        "Start completion could not be confirmed: "
+        + ("start observation timed out" if unavailable == "timeout" else "start result unavailable")
+    ]
+    assert len(messages) == 1
+    assert "Start observation" in messages[0]
+    assert closed == ["agent-tab"]
+    assert steps == [("Review", "started"), ("Review", "completed")]
 
 
 def test_review_result_stays_complete_with_worst_case_json_escaping() -> None:

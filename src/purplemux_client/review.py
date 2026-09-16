@@ -386,23 +386,36 @@ try:
         + "You may operate a browser through any available browser tool; no particular library is required. "
         + "For read-only observation of an external terminal, use the verified PurpleMux CLI " + json.dumps(ext_review_cli) + " ext-review create --socket PATH --session SESSION --window @ID with a known socket, session, and allowed window targets; open its returned browser URL. "
                + "Do not modify the repositories or send input to observed external terminals. ")
+    result = None
+    start_completed = True
     if START is not None:
-        turn(context + "First, follow this start instruction and report what you did: " + START)
-    try:
-        report = turn(context + "Perform this check: " + CHECK + "\\nReturn one JSON object with verdict PASS, FAIL, or BLOCKED and a non-empty summary. Optional findings, observed_facts, evidence, hypotheses, and observability_gaps are arrays of strings. Report BLOCKED when observation times out or is unavailable; describe what could not be observed in observability_gaps. Base PASS or FAIL on observed evidence.")
-    except (TimeoutError, WorkerFailure) as exc:
-        if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
-            raise
-        result = {{
-            "verdict": "BLOCKED",
-            "summary": "Review observation was unavailable: " + str(exc),
-            "observability_gaps": [str(exc)],
-        }}
-    else:
         try:
-            result = json.loads(report)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Review agent did not return JSON") from exc
+            turn(context + "First, follow this start instruction and report what you did: " + START)
+        except (TimeoutError, WorkerFailure) as exc:
+            if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
+                raise
+            start_completed = False
+            result = {{
+                "verdict": "BLOCKED",
+                "summary": "Review start observation was unavailable: " + str(exc),
+                "observability_gaps": ["Start completion could not be confirmed: " + str(exc)],
+            }}
+    if result is None:
+        try:
+            report = turn(context + "Perform this check: " + CHECK + "\\nReturn one JSON object with verdict PASS, FAIL, or BLOCKED and a non-empty summary. Optional findings, observed_facts, evidence, hypotheses, and observability_gaps are arrays of strings. Report BLOCKED when observation times out or is unavailable; describe what could not be observed in observability_gaps. Base PASS or FAIL on observed evidence.")
+        except (TimeoutError, WorkerFailure) as exc:
+            if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
+                raise
+            result = {{
+                "verdict": "BLOCKED",
+                "summary": "Review observation was unavailable: " + str(exc),
+                "observability_gaps": [str(exc)],
+            }}
+        else:
+            try:
+                result = json.loads(report)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Review agent did not return JSON") from exc
     if (not isinstance(result, dict) or result.get("verdict") not in ("PASS", "FAIL", "BLOCKED")
             or not isinstance(result.get("summary"), str) or not result["summary"].strip()
             or any(not isinstance(result.get(name, []), list)
@@ -410,7 +423,7 @@ try:
                    for name in ("findings", "observed_facts", "evidence", "hypotheses", "observability_gaps"))):
         raise RuntimeError("Review agent returned an invalid report")
     serialized_result = serialize_review_result(result, REPOSITORIES)
-    if FINISH is not None:
+    if FINISH is not None and start_completed:
         try:
             turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH, finish=True)
         except (TimeoutError, WorkerFailure) as exc:
