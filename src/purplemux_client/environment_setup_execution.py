@@ -1,99 +1,184 @@
-"""Observe supplied Environment Setup commands in the prepared worktree."""
+"""Run Environment Setup commands in observable, run-owned PurpleMux terminals."""
 
 from __future__ import annotations
 
-import os
-import signal
-import subprocess
-import tempfile
-import time
 from collections.abc import Callable
+from typing import Any
+
+from purplemux_client.client import PurpleMuxCLIClient, ShellCommandRequest
+from purplemux_client.errors import ResultNotReady, WorkerFailure
 
 
-def _stop_group(process: subprocess.Popen[bytes]) -> None:
+def _capture(client: PurpleMuxCLIClient, tab: str) -> str:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    if process.poll() is None:
-        process.wait()
+        return client.capture_screen(tab)[-4096:]
+    except WorkerFailure as exc:
+        return f"pane capture failed: {exc}"
 
 
-def _run(command: str, cwd: str, remaining: Callable[[], float]) -> dict[str, object]:
-    with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(
-            ["/bin/sh", "-c", command],
-            cwd=cwd,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+def _completed_command(
+    client: PurpleMuxCLIClient,
+    *,
+    name: str,
+    command: str,
+    cwd: str,
+    remaining: Callable[[], float],
+) -> dict[str, object]:
+    remaining()
+    created: list[str] = []
+    try:
+        tab = client.start_shell(
+            ShellCommandRequest(command, cwd, f"Environment Setup {name}"),
+            on_created=lambda session, _result_path: created.append(session),
         )
+    except WorkerFailure as exc:
+        remaining()
+        tab = created[0] if created else None
+        return {
+            "command": command,
+            "tab_id": tab,
+            "workspace_id": client.workspace_id,
+            "error": str(exc),
+            "output": _capture(client, tab) if tab else "",
+        }
+    try:
+        client.wait_for_shell_completion(tab, remaining())
+        result = client.read_shell_result(tab)
+    except WorkerFailure as exc:
         try:
-            process.wait(timeout=remaining())
             remaining()
-        except subprocess.TimeoutExpired as exc:
-            _stop_group(process)
-            raise TimeoutError("Environment Setup timed out") from exc
-        except BaseException:
-            _stop_group(process)
+        except TimeoutError:
+            try:
+                client.interrupt(tab)
+            except WorkerFailure:
+                pass
             raise
-        output.seek(0)
-        observed = output.read(4096).decode("utf-8", errors="replace")
-    return {"command": command, "exit_code": process.returncode, "output": observed}
+        return {
+            "command": command,
+            "tab_id": tab,
+            "workspace_id": client.workspace_id,
+            "error": str(exc),
+            "output": _capture(client, tab),
+        }
+    remaining()
+    return {
+        "command": command,
+        "tab_id": tab,
+        "workspace_id": client.workspace_id,
+        "exit_code": result.exit_code,
+        "output": _capture(client, tab),
+    }
+
+
+def _service_outcome(
+    client: PurpleMuxCLIClient, tab: str, command: str
+) -> dict[str, object]:
+    outcome: dict[str, object] = {
+        "command": command,
+        "tab_id": tab,
+        "workspace_id": client.workspace_id,
+        "output": _capture(client, tab),
+    }
+    try:
+        result = client.read_shell_result(tab)
+    except ResultNotReady:
+        status = client.read_status(tab)
+        outcome["running"] = status.get("alive") is not False
+        if status.get("alive") is False:
+            outcome["error"] = "start terminal exited without a shell result"
+    except WorkerFailure as exc:
+        outcome["error"] = str(exc)
+        outcome["running"] = False
+    else:
+        outcome["exit_code"] = result.exit_code
+        outcome["running"] = False
+    return outcome
 
 
 def execute_environment_setup_commands(
     *,
+    client: PurpleMuxCLIClient,
     build: str | None,
     start: str | None,
     ready_check: str | None,
     verification_command: str | None,
     cwd: str,
     remaining: Callable[[], float],
-) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
-    """Run declared commands in order and return observed outcomes."""
+    resume_at: str = "build",
+    service_tab: str | None = None,
+) -> dict[str, Any]:
+    """Run supplied stages in order; return observations and the first failure."""
+    stages = ("build", "start", "ready_check")
+    if resume_at not in stages:
+        raise ValueError(f"invalid Environment Setup resume stage: {resume_at}")
     checks: dict[str, dict[str, object]] = {}
-    started: subprocess.Popen[bytes] | None = None
-    try:
-        if build is not None:
-            checks["build"] = _run(build, cwd, remaining)
-            if checks["build"]["exit_code"] != 0:
-                raise RuntimeError(f"Environment Setup build failed: {checks['build']}")
-        if start is not None:
+    verification: dict[str, object] | None = None
+    failure: str | None = None
+    failed_stage: str | None = None
+    for stage in stages[stages.index(resume_at) :]:
+        command = {"build": build, "start": start, "ready_check": ready_check}[stage]
+        outcome: dict[str, object]
+        if stage == "ready_check":
+            command = ready_check if ready_check is not None else verification_command
+            if not isinstance(command, str) or not command.strip():
+                failure = "Environment Setup needs a usability check command"
+                failed_stage = stage
+                break
+        elif command is None:
+            continue
+        if stage == "start":
             remaining()
-            started = subprocess.Popen(
-                ["/bin/sh", "-c", start],
-                cwd=cwd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+            created: list[str] = []
+            try:
+                service_tab = client.start_shell(
+                    ShellCommandRequest(command, cwd, "Environment Setup start"),
+                    on_created=lambda tab, _result_path: created.append(tab),
+                )
+            except WorkerFailure as exc:
+                remaining()
+                service_tab = created[0] if created else None
+                outcome = {
+                    "command": command,
+                    "tab_id": service_tab,
+                    "workspace_id": client.workspace_id,
+                    "error": str(exc),
+                    "output": _capture(client, service_tab) if service_tab else "",
+                }
+            else:
+                try:
+                    remaining()
+                except TimeoutError:
+                    try:
+                        client.interrupt(service_tab)
+                    except WorkerFailure:
+                        pass
+                    raise
+                outcome = _service_outcome(client, service_tab, command)
+        else:
+            outcome = _completed_command(
+                client, name=stage, command=command, cwd=cwd, remaining=remaining
             )
-            time.sleep(min(0.05, remaining()))
-            remaining()
-            exit_code = started.poll()
-            checks["start"] = {
-                "command": start,
-                "pid": started.pid,
-                "exit_code": exit_code,
-                "running": exit_code is None,
-            }
-            if exit_code is not None and exit_code != 0:
-                raise RuntimeError(f"Environment Setup start failed: {checks['start']}")
-        command = ready_check if ready_check is not None else verification_command
-        if not isinstance(command, str) or not command.strip():
-            raise RuntimeError("Environment Setup needs a usability check command")
-        verification = _run(command, cwd, remaining)
-        if ready_check is not None:
-            checks["ready_check"] = verification
-        if verification["exit_code"] != 0:
-            raise RuntimeError(
-                f"Environment Setup usability check failed: {verification}"
-            )
-        if started is not None and started.poll() not in (None, 0):
-            raise RuntimeError("Environment Setup start command exited unsuccessfully")
-        remaining()
-        return checks, verification
-    except BaseException:
-        if started is not None:
-            _stop_group(started)
-        raise
+        if stage == "ready_check":
+            verification = outcome
+            if ready_check is not None:
+                checks[stage] = outcome
+        else:
+            checks[stage] = outcome
+        if outcome.get("error") or outcome.get("exit_code") not in (None, 0):
+            failure = f"Environment Setup {stage} failed: {outcome}"
+            failed_stage = stage
+            break
+    if failure is None and service_tab is not None and start is not None:
+        service = _service_outcome(client, service_tab, start)
+        checks["start"] = service
+        if service.get("error") or service.get("exit_code") not in (None, 0):
+            failure = f"Environment Setup start failed: {service}"
+            failed_stage = "start"
+    remaining()
+    return {
+        "checks": checks,
+        "verification": verification,
+        "service_tab": service_tab,
+        "failure": failure,
+        "failed_stage": failed_stage,
+    }

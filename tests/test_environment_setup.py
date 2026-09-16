@@ -114,7 +114,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            "did not prepare the target",
+            "agent blocked: build failed",
         ),
         (
             {
@@ -125,7 +125,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            "needs a usability check command",
+            "agent blocked: no usable check",
         ),
         (None, True, False, "timed out while the agent was busy"),
         (
@@ -154,6 +154,16 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             True,
             "Environment Setup timed out",
         ),
+        (
+            {
+                "status": "READY",
+                "summary": "recover",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
+        ),
     ],
 )
 def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
@@ -170,14 +180,21 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     interrupted: list[str] = []
 
     class Client:
+        workspace_id = "ws-1"
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.shells = 0
+            self.prompts: list[str] = []
+
         def create_session(self, _request: object) -> str:
             return "tab-1"
 
         def wait_until_ready(self, _tab: str, _timeout: float) -> None:
             pass
 
-        def send_input(self, _tab: str, _prompt: str) -> None:
-            pass
+        def send_input(self, _tab: str, prompt: str) -> None:
+            self.prompts.append(prompt)
 
         def wait_for_turn_completion(
             self, _tab: str, _timeout: float, *, on_busy_timeout: object
@@ -188,7 +205,39 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
                 time.sleep(1.05)
 
         def read_result(self, _tab: str) -> str:
+            self.reads += 1
+            if (
+                self.reads > 1
+                and report is not None
+                and not report.get("verification_command")
+            ):
+                return json.dumps({"status": "BLOCKED", "summary": "no usable check"})
             return json.dumps(report)
+
+        def start_shell(self, _request: object, *, on_created=None) -> str:
+            self.shells += 1
+            tab = f"shell-{self.shells}"
+            if on_created is not None:
+                on_created(tab, "/managed/result.json")
+            return tab
+
+        def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
+            pass
+
+        def read_shell_result(self, tab: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                exit_code=3
+                if report is not None
+                and report.get("summary") == "recover"
+                and tab == "shell-1"
+                else 0
+            )
+
+        def capture_screen(self, tab: str) -> str:
+            return f"observed {tab}"
+
+        def read_status(self, _tab: str) -> dict[str, object]:
+            return {"alive": True}
 
         def interrupt(self, tab: str) -> None:
             interrupted.append(tab)
@@ -232,8 +281,12 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         result = json.loads(output.getvalue())
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
-        assert result["checks"]["build"]["output"] == "built"
-        assert result["verification"]["output"] == "usable"
+        offset = 1 if report is not None and report.get("summary") == "recover" else 0
+        assert result["checks"]["build"]["output"] == f"observed shell-{1 + offset}"
+        assert result["verification"]["output"] == f"observed shell-{2 + offset}"
+        if offset:
+            assert client.reads == 2
+            assert "Environment Setup build failed" in client.prompts[1]
     else:
         with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
             with redirect_stdout(output):

@@ -81,12 +81,14 @@ whose object is not available locally is marked `provisional`; the Workflow
 verifies that it points to a commit after fetching it. The generated workflow
 prepares a detached worktree and asks the selected agent to prepare it. The
 workflow then runs each supplied build, start, and ready check command as given,
-in order. Omitted commands are skipped. If no ready check is supplied, the agent
-provides a usability check command for the workflow to run. The declared timeout
-applies to preparation, session creation, agent execution, and commands. The
-workflow records command outcomes and bounded output from completed checks, and accepts
-`READY` only when the commands and usability check succeed. A busy agent is
-interrupted at timeout.
+in order, in managed PurpleMux terminals. Omitted commands are skipped. If no
+ready check is supplied, the agent provides a usability check command. Failed
+commands and their terminal logs go back to the agent for diagnosis and repair;
+the workflow retries the failed stage within the same timeout. The start terminal
+remains available for inspection and control. The declared timeout applies to
+preparation, session creation, agent turns, and commands. The workflow records
+observed outcomes and accepts `READY` only when the commands and usability check
+succeed. A busy agent is interrupted at timeout.
 On success, the workflow adds the verified commit SHA as `resolved_revision` and
 the detached worktree as `working_path` to the JSON result.
 These inputs describe the environment;
