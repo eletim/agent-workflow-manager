@@ -3,7 +3,6 @@ const runArguments = document.querySelector("#run-arguments");
 const promptModeButton = document.querySelector("#prompt-mode");
 const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
 const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
-const reviewModeButton = document.querySelector("#review-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
@@ -13,12 +12,6 @@ const environmentSetupPython = document.querySelector("#environment-setup-python
 const environmentSetupGenerate = document.querySelector("#environment-setup-generate");
 const environmentSetupSuccess = document.querySelector("#environment-setup-success");
 const environmentSetupError = document.querySelector("#environment-setup-error");
-const reviewFields = document.querySelector("#review-fields");
-const reviewJson = document.querySelector("#review-json");
-const reviewPython = document.querySelector("#review-python");
-const reviewGenerate = document.querySelector("#review-generate");
-const reviewSuccess = document.querySelector("#review-success");
-const reviewError = document.querySelector("#review-error");
 const workflowFields = document.querySelector("#workflow-fields");
 const issueDrivenJson = document.querySelector("#issue-driven-json");
 const issueDrivenPython = document.querySelector("#issue-driven-python");
@@ -165,7 +158,6 @@ let promptDraft = {
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
 let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
-let reviewDraft = {json: reviewJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
 // The last detail response accepted for the selected run. This is the only
@@ -181,7 +173,6 @@ let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
 let issueDrivenRequestGeneration = 0;
 let environmentSetupRequestGeneration = 0;
-let reviewRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
@@ -390,8 +381,6 @@ function applyFieldMode() {
   issueDrivenGenerate.disabled = !drafting;
   environmentSetupJson.readOnly = !drafting;
   environmentSetupGenerate.disabled = !drafting;
-  reviewJson.readOnly = !drafting;
-  reviewGenerate.disabled = !drafting;
   repositoryConfigAdd.disabled = !drafting;
   directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
@@ -405,19 +394,16 @@ function applyModeVisibility() {
   const promptMode = currentMode === "prompt";
   const issueDrivenMode = currentMode === "issue-driven";
   const environmentSetupMode = currentMode === "environment-setup";
-  const reviewMode = currentMode === "review";
   promptFields.hidden = !promptMode;
   issueDrivenFields.hidden = !issueDrivenMode;
   environmentSetupFields.hidden = !environmentSetupMode;
-  reviewFields.hidden = !reviewMode;
-  workflowFields.hidden = promptMode || issueDrivenMode || environmentSetupMode || reviewMode;
+  workflowFields.hidden = promptMode || issueDrivenMode || environmentSetupMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
   guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide"
-    : environmentSetupMode ? "Environment Setup Guide"
-    : reviewMode ? "Review Guide" : "Workflow Guide";
+    : environmentSetupMode ? "Environment Setup Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
   dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
   outlinePanel.hidden = promptMode || outlinePanel.hidden;
@@ -426,17 +412,15 @@ function applyModeVisibility() {
   promptModeButton.className = promptMode ? "selected" : "";
   issueDrivenModeButton.className = issueDrivenMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
-  reviewModeButton.className = reviewMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
   environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
-  reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
 }
 
 function showDraftLabel() {
-  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", review: "Review", workflow: "Python Workflow"}[currentMode];
+  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", workflow: "Python Workflow"}[currentMode];
   activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
 }
 
@@ -453,8 +437,6 @@ function captureDraftIfEditing() {
       };
     } else if (currentMode === "environment-setup") {
       environmentSetupDraft = {json: environmentSetupJson.value, code: environmentSetupPython.value};
-    } else if (currentMode === "review") {
-      reviewDraft = {json: reviewJson.value, code: reviewPython.value};
     } else if (currentMode === "issue-driven") {
       issueDrivenDraft = {json: issueDrivenJson.value, code: issueDrivenPython.value};
     } else {
@@ -536,8 +518,6 @@ function renderCleanDraftState() {
   issueDrivenValidation.replaceChildren();
   environmentSetupSuccess.hidden = true;
   environmentSetupError.hidden = true;
-  reviewSuccess.hidden = true;
-  reviewError.hidden = true;
 }
 
 function runPresentation(run) {
@@ -559,7 +539,7 @@ function renderRun(result) {
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
-  currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
+  currentMode = ["prompt", "issue-driven", "environment-setup"].includes(result.mode)
     ? result.mode
     : "workflow";
   const running = result.state === "running";
@@ -612,9 +592,6 @@ function renderRun(result) {
     } else if (currentMode === "environment-setup") {
       environmentSetupJson.value = result.environmentSetupJson || "";
       environmentSetupPython.value = result.code ?? "";
-    } else if (currentMode === "review") {
-      reviewJson.value = result.reviewJson || "";
-      reviewPython.value = result.code ?? "";
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = result.issueDrivenJson || "";
       issueDrivenPython.value = result.code ?? "";
@@ -626,7 +603,6 @@ function renderRun(result) {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
       "environment-setup": "Environment Setup",
-      review: "Review",
       workflow: "Workflow",
     }[currentMode];
     const resumeLabel = result.resumedFromRunId == null
@@ -843,9 +819,6 @@ async function enterDraftMode(mode = currentMode) {
     } else if (currentMode === "environment-setup") {
       environmentSetupJson.value = environmentSetupDraft.json;
       environmentSetupPython.value = environmentSetupDraft.code;
-    } else if (currentMode === "review") {
-      reviewJson.value = reviewDraft.json;
-      reviewPython.value = reviewDraft.code;
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = issueDrivenDraft.json;
       issueDrivenPython.value = issueDrivenDraft.code;
@@ -952,7 +925,6 @@ function renderRunList(runs, cleanupOwnership = []) {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
       "environment-setup": "Environment Setup",
-      review: "Review",
       workflow: "Workflow",
     }[run.mode] || "Workflow";
     const executionRoot = run.mode === "prompt"
@@ -1869,12 +1841,6 @@ async function generateIssueDrivenCode() {
 }
 
 async function workflowSubmissionPayload(includeSourceSettings = false) {
-  if (currentMode === "review") {
-    const source = reviewJson.value;
-    const payload = {code: await generateReviewCode(), args: []};
-    if (includeSourceSettings) payload.reviewJson = source;
-    return payload;
-  }
   if (currentMode === "environment-setup") {
     const source = environmentSetupJson.value;
     const payload = {code: await generateEnvironmentSetupCode(), args: []};
@@ -1892,55 +1858,6 @@ async function workflowSubmissionPayload(includeSourceSettings = false) {
   }
   return {code: code.value, ...executionContextPayload()};
 }
-
-async function generateReviewCode() {
-  const requestGeneration = ++reviewRequestGeneration;
-  const selectionGeneration = activeRunGeneration;
-  const source = reviewJson.value;
-  try {
-    const result = await request("/api/review/generate", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({json: source}),
-    });
-    if (requestGeneration === reviewRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null && currentMode === "review"
-      && reviewJson.value === source) {
-      reviewPython.value = result.generatedCode;
-      reviewDraft = {json: source, code: result.generatedCode};
-      reviewSuccess.hidden = false;
-      reviewError.hidden = true;
-    }
-    return result.generatedCode;
-  } catch (error) {
-    if (requestGeneration === reviewRequestGeneration
-      && selectionGeneration === activeRunGeneration
-      && activeRunId === null && currentMode === "review"
-      && reviewJson.value === source) {
-      reviewSuccess.hidden = true;
-      reviewError.hidden = false;
-      reviewError.textContent = error.result?.error || String(error);
-    }
-    throw error;
-  }
-}
-
-reviewGenerate.addEventListener("click", async () => {
-  if (activeRunId !== null) return;
-  await withPendingButton(reviewGenerate, async () => {
-    try { await generateReviewCode(); }
-    catch (error) { if (!error.result?.error) stderr.textContent = String(error); }
-  }, applyFieldMode);
-});
-
-reviewJson.addEventListener("input", () => {
-  reviewRequestGeneration += 1;
-  reviewPython.value = "";
-  reviewDraft = {json: reviewJson.value, code: ""};
-  reviewSuccess.hidden = true;
-  reviewError.hidden = true;
-});
 
 async function generateEnvironmentSetupCode() {
   const requestGeneration = ++environmentSetupRequestGeneration;
@@ -2192,10 +2109,6 @@ workflowModeButton.addEventListener("click", async () => {
 
 environmentSetupModeButton.addEventListener("click", async () => {
   await enterDraftMode("environment-setup");
-});
-
-reviewModeButton.addEventListener("click", async () => {
-  await enterDraftMode("review");
 });
 
 issueDrivenModeButton.addEventListener("click", async () => {
