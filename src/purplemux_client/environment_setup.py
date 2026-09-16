@@ -285,13 +285,14 @@ def busy_timeout(_warning):
     raise TimeoutError("Environment Setup timed out while the agent was busy")
 
 
-def ask_agent(message):
+def ask_agent(message, turn_limit=None):
     global turn_active
     remaining()
     client.send_input(tab, message)
     turn_active = True
     client.wait_for_turn_completion(
-        tab, remaining(), on_busy_timeout=busy_timeout
+        tab, min(remaining(), turn_limit) if turn_limit is not None else remaining(),
+        on_busy_timeout=busy_timeout,
     )
     turn_active = False
     remaining()
@@ -385,19 +386,26 @@ try:
         if report.get("status") != "READY":
             raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}; {{attempt['failure']}}")
         resume_at = attempt["failed_stage"]
-    remaining()
-    report = ask_agent(
-        "The managed commands and usability check succeeded. Inspect their "
-        "observed output and the running service when present. Return one JSON "
-        "object with status READY, a non-empty summary, and endpoint only if "
-        "you observed a usable connection address. Do not infer an address "
-        "from configuration alone. Command observations: "
-        + json.dumps({{"checks": checks, "verification": verification}})
-    )
-    agent_reports.append(report)
-    if report.get("status") != "READY":
-        raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}")
-    remaining()
+    try:
+        endpoint_report = ask_agent(
+            "The managed commands and usability check succeeded. Inspect their "
+            "observed output and the running service when present. Return one "
+            "JSON object with a non-empty summary and endpoint only if you "
+            "observed a usable connection address. An endpoint is optional. "
+            "Do not infer an address from configuration alone. Command "
+            "observations: "
+            + json.dumps({{"checks": checks, "verification": verification}}),
+            turn_limit=30,
+        )
+    except Exception:
+        if turn_active:
+            try:
+                client.interrupt(tab)
+            except Exception:
+                pass
+            turn_active = False
+    else:
+        agent_reports.append(endpoint_report)
     result = {{
         "status": "READY",
         "summary": report["summary"],

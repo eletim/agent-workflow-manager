@@ -188,7 +188,17 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            "agent blocked: endpoint unavailable",
+            None,
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata timeout",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
         ),
     ],
 )
@@ -212,6 +222,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             self.reads = 0
             self.shells = 0
             self.prompts: list[str] = []
+            self.turn_timeouts: list[float] = []
 
         def create_session(self, _request: object) -> str:
             return "tab-1"
@@ -225,8 +236,15 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         def wait_for_turn_completion(
             self, _tab: str, _timeout: float, *, on_busy_timeout: object
         ) -> None:
+            self.turn_timeouts.append(_timeout)
             if busy_timeout:
                 on_busy_timeout("still busy")  # type: ignore[operator]
+            if (
+                report is not None
+                and report.get("summary") == "metadata timeout"
+                and self.reads >= 1
+            ):
+                raise TimeoutError("endpoint report timed out")
             if late_completion:
                 time.sleep(1.05)
 
@@ -323,6 +341,11 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             exec(compile(code, "<environment-setup>", "exec"), {})
         result = json.loads(output.getvalue())
         assert result["status"] == "READY"
+        if report is not None and report.get("summary") in {
+            "final blocked",
+            "metadata timeout",
+        }:
+            assert result["summary"] == report["summary"]
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
         expected_connection = {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
@@ -341,6 +364,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             assert "Environment Setup build failed" in client.prompts[1]
             assert "temporary environment or setup changes" in client.prompts[1]
         assert "observed a usable connection address" in client.prompts[-1]
+        assert client.turn_timeouts[-1] <= 30
     else:
         with redirect_stdout(output):
             exec(compile(code, "<environment-setup>", "exec"), {})
@@ -368,7 +392,10 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         ("Environment Setup", "started"),
         ("Environment Setup", "completed" if expected_error is None else "failed"),
     ]
-    assert interrupted == (["tab-1"] if busy_timeout else [])
+    metadata_timeout = (
+        report is not None and report.get("summary") == "metadata timeout"
+    )
+    assert interrupted == (["tab-1"] if busy_timeout or metadata_timeout else [])
 
 
 @pytest.mark.parametrize("phase", ["preparation", "workspace", "session"])
