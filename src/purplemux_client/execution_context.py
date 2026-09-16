@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from purplemux_client.errors import WorkerFailure
 from purplemux_client.git import (
@@ -32,11 +33,13 @@ class RepositoryExecutionContext:
     """Structured identity for one isolated repository workflow execution."""
 
     source_repository: Path
-    remote: str
-    base_branch: str
+    remote: str | None
+    base_branch: str | None
     base_ref: str
     base_sha: str
     execution_root: Path
+    revision_kind: Literal["branch", "tag", "commit"] = "branch"
+    revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,10 +47,12 @@ class RepositoryPreparation:
     """Read-only result shared by validation and run-time preparation."""
 
     source_repository: Path
-    remote: str
-    base_branch: str
+    remote: str | None
+    base_branch: str | None
     base_ref: str
     base_sha: str
+    revision_kind: Literal["branch", "tag", "commit"] = "branch"
+    revision: str | None = None
 
 
 def inspect_run_repository(
@@ -175,6 +180,8 @@ def _inspect_run_repository(
         base_branch=base_branch,
         base_ref=f"{remote}/{base_branch}",
         base_sha=base_sha,
+        revision_kind="branch",
+        revision=base_branch,
     )
 
 
@@ -202,9 +209,7 @@ def prepare_run_repository(
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
     )
-    return _prepare_repository_worktree(
-        preparation, root, command_timeout_seconds, fetch_kind="branch"
-    )
+    return _prepare_repository_worktree(preparation, root, command_timeout_seconds)
 
 
 def inspect_run_revision(
@@ -229,9 +234,6 @@ def inspect_run_revision(
     source = Path(
         _git_read(requested, ["rev-parse", "--show-toplevel"], command_timeout_seconds)
     ).resolve()
-    remotes = _git_read(source, ["remote"], command_timeout_seconds).splitlines()
-    if remote not in remotes:
-        raise WorkerFailure(f"Git remote {remote!r} does not exist in {source}")
     if _OBJECT_ID_RE.fullmatch(revision.lower()):
         sha = revision.lower()
         if (
@@ -239,9 +241,14 @@ def inspect_run_revision(
             != "commit"
         ):
             raise WorkerFailure(f"revision {revision!r} is not a commit")
-        return RepositoryPreparation(source, remote, "", sha, sha), "commit"
+        return RepositoryPreparation(
+            source, None, None, sha, sha, "commit", revision
+        ), "commit"
     if revision.startswith("-") or revision.startswith("refs/"):
         raise ValueError("revision must be a branch or tag name, or full commit SHA")
+    remotes = _git_read(source, ["remote"], command_timeout_seconds).splitlines()
+    if remote not in remotes:
+        raise WorkerFailure(f"Git remote {remote!r} does not exist in {source}")
     branch_ref = f"refs/heads/{revision}"
     tag_ref = f"refs/tags/{revision}"
     refs = _git_read(
@@ -263,7 +270,9 @@ def inspect_run_revision(
         sha = matches.get(f"{tag_ref}^{{}}", matches[tag_ref]).lower()
         if not _OBJECT_ID_RE.fullmatch(sha):
             raise WorkerFailure(f"revision {revision!r} did not resolve to a commit")
-        return RepositoryPreparation(source, remote, "", tag_ref, sha), "tag"
+        return RepositoryPreparation(
+            source, remote, None, tag_ref, sha, "tag", revision
+        ), "tag"
     raise WorkerFailure(f"revision {revision!r} was not found on {remote}")
 
 
@@ -294,17 +303,13 @@ def prepare_run_revision(
         raise TypeError("worktree_root must be a path or None")
     root_value = DEFAULT_WORKTREE_ROOT if worktree_root is None else worktree_root
     root = Path(root_value).expanduser().resolve()
-    return _prepare_repository_worktree(
-        preparation, root, command_timeout_seconds, fetch_kind=kind
-    )
+    return _prepare_repository_worktree(preparation, root, command_timeout_seconds)
 
 
 def _prepare_repository_worktree(
     preparation: RepositoryPreparation,
     root: Path,
     command_timeout_seconds: float,
-    *,
-    fetch_kind: str,
 ) -> RepositoryExecutionContext:
     repository_name = _safe_name(preparation.source_repository.name)
     execution_root = root / (f"awm-run-{repository_name}-{uuid.uuid4().hex[:12]}")
@@ -324,10 +329,7 @@ def _prepare_repository_worktree(
         "registration_state": "pending",
         "repository": str(preparation.source_repository),
         "source_repository": str(preparation.source_repository),
-        "remote": preparation.remote,
-        "base_branch": preparation.base_branch,
-        "base_ref": preparation.base_ref,
-        "base_sha": preparation.base_sha,
+        **_revision_resource_metadata(preparation),
     }
     acknowledge_run_resource(
         "pending", "git_worktree", str(execution_root), pending_metadata
@@ -336,7 +338,9 @@ def _prepare_repository_worktree(
     def dispatch() -> None:
         try:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if fetch_kind == "branch":
+            if preparation.revision_kind == "branch":
+                if preparation.remote is None or preparation.base_branch is None:
+                    raise PreDispatchFailure("branch preparation lacks remote identity")
                 fetch_ref = (
                     f"+refs/heads/{preparation.base_branch}:"
                     f"refs/remotes/{preparation.remote}/{preparation.base_branch}"
@@ -344,13 +348,15 @@ def _prepare_repository_worktree(
                 verification_ref = (
                     f"refs/remotes/{preparation.remote}/{preparation.base_branch}"
                 )
-            elif fetch_kind == "tag":
+            elif preparation.revision_kind == "tag":
                 fetch_ref = preparation.base_ref
                 verification_ref = "FETCH_HEAD"
             else:
                 fetch_ref = ""
                 verification_ref = preparation.base_sha
             if fetch_ref:
+                if preparation.remote is None:
+                    raise PreDispatchFailure("tag preparation lacks remote identity")
                 fetched = _run_git_mutation_process_group(
                     ["fetch", "--no-tags", preparation.remote, fetch_ref],
                     cwd=preparation.source_repository,
@@ -457,8 +463,14 @@ def _prepare_repository_worktree(
         plan={
             "kind": "git_worktree_add",
             "repository": str(preparation.source_repository),
-            "remoteBase": preparation.base_ref,
+            "revisionKind": preparation.revision_kind,
+            "revisionRef": preparation.base_ref,
             "baseSha": preparation.base_sha,
+            **(
+                {"remoteBase": preparation.base_ref}
+                if preparation.remote is not None
+                else {}
+            ),
             "path": str(execution_root),
             "detached": True,
         },
@@ -489,10 +501,7 @@ def _finalize_preparation(
         "registration_state": "verified",
         "repository": str(preparation.source_repository),
         "source_repository": str(preparation.source_repository),
-        "remote": preparation.remote,
-        "base_branch": preparation.base_branch,
-        "base_ref": preparation.base_ref,
-        "base_sha": preparation.base_sha,
+        **_revision_resource_metadata(preparation),
         "path_identity": _path_identity(execution_root),
         "git_file_identity": _administrative_identity(git_file),
         "git_dir": _git_read(
@@ -516,14 +525,31 @@ def _finalize_preparation(
         base_ref=preparation.base_ref,
         base_sha=preparation.base_sha,
         execution_root=execution_root,
+        revision_kind=preparation.revision_kind,
+        revision=preparation.revision,
     )
+
+
+def _revision_resource_metadata(preparation: RepositoryPreparation) -> dict[str, str]:
+    metadata = {
+        "revision_kind": preparation.revision_kind,
+        "revision": preparation.revision or preparation.base_ref,
+        "revision_ref": preparation.base_ref,
+        "base_sha": preparation.base_sha,
+    }
+    if preparation.remote is not None:
+        metadata["remote"] = preparation.remote
+    if preparation.base_branch is not None:
+        metadata["base_branch"] = preparation.base_branch
+        metadata["base_ref"] = preparation.base_ref
+    return metadata
 
 
 def _inspect_candidate(
     repository: Path,
     worktree: Path,
-    remote: str,
-    base_branch: str,
+    remote: str | None,
+    base_branch: str | None,
     timeout: float,
 ) -> dict[str, object]:
     listed = _git_read(repository, ["worktree", "list", "--porcelain"], timeout)
@@ -549,7 +575,9 @@ def _inspect_candidate(
                 f"refs/remotes/{remote}/{base_branch}^{{commit}}",
             ],
             timeout,
-        ),
+        )
+        if remote is not None and base_branch is not None
+        else None,
     }
 
 

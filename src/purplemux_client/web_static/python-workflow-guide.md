@@ -327,9 +327,24 @@ PullRequestState(
     body,
 )
 MergeResult(pr, merge_commit_sha, reconciled=False)
-RepositoryPreparation(source_repository, remote, base_branch, base_ref, base_sha)
+RepositoryPreparation(
+    source_repository,
+    remote,
+    base_branch,
+    base_ref,
+    base_sha,
+    revision_kind="branch",
+    revision=None,
+)
 RepositoryExecutionContext(
-    source_repository, remote, base_branch, base_ref, base_sha, execution_root
+    source_repository,
+    remote,
+    base_branch,
+    base_ref,
+    base_sha,
+    execution_root,
+    revision_kind="branch",
+    revision=None,
 )
 ```
 
@@ -648,7 +663,8 @@ inspection-aware mutation that creates and registers an isolated worktree, or
 reconciles the exact correlated worktree if the mutation outcome was uncertain.
 `inspect_run_revision()` and `prepare_run_revision()` also accept remote tags
 and full local commit SHAs. Branches use the existing repository preparation
-path. A name shared by a remote branch and tag is rejected as ambiguous.
+path. Local commits need no remote; tag and commit contexts have no base branch.
+A name shared by a remote branch and tag is rejected as ambiguous.
 `run_correlation()` is deterministic within one Runner run (and process-stable
 outside it); use it for logical resource names, never as a secret.
 

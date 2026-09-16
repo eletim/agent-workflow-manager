@@ -89,7 +89,16 @@ def test_prepare_creates_fresh_detached_worktree_and_returns_identity(
 
 def test_prepare_run_revision_accepts_tag_and_commit_without_changing_source(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    metadata: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        execution_context,
+        "acknowledge_run_resource",
+        lambda _phase, _kind, _identity, values: metadata.append(values),
+    )
     repository, sha = repository_with_remote(tmp_path)
     git(repository, "tag", "-a", "release-1", "-m", "release")
     git(repository, "push", "origin", "refs/tags/release-1")
@@ -99,6 +108,9 @@ def test_prepare_run_revision_accepts_tag_and_commit_without_changing_source(
     for revision, expected_kind in (("release-1", "tag"), (sha, "commit")):
         preparation, kind = inspect_run_revision(repo=repository, revision=revision)
         assert kind == expected_kind
+        assert preparation.revision_kind == expected_kind
+        assert preparation.revision == revision
+        assert preparation.base_branch is None
         assert preparation.base_sha == sha
         result = prepare_run_revision(
             repo=repository,
@@ -106,6 +118,15 @@ def test_prepare_run_revision_accepts_tag_and_commit_without_changing_source(
             worktree_root=tmp_path / "managed-worktrees",
         )
         assert git(result.execution_root, "rev-parse", "HEAD") == sha
+        assert result.revision_kind == expected_kind
+        assert result.base_branch is None
+        assert metadata[-1]["revision_kind"] == expected_kind
+        assert metadata[-1]["revision"] == revision
+        assert "base_branch" not in metadata[-1]
+        if expected_kind == "commit":
+            assert "remote" not in metadata[-1]
+        else:
+            assert metadata[-1]["remote"] == "origin"
         assert (
             git(result.execution_root, "rev-parse", "--symbolic-full-name", "HEAD")
             == "HEAD"
@@ -113,6 +134,48 @@ def test_prepare_run_revision_accepts_tag_and_commit_without_changing_source(
 
     assert git(repository, "branch", "--show-current") == "ambient-work"
     assert (repository / "untracked").read_text(encoding="utf-8") == "keep me"
+
+
+def test_local_commit_revision_needs_no_remote_and_has_explicit_resource_identity(
+    tmp_path: Path,
+) -> None:
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "remote", "remove", "origin")
+    preparation, kind = inspect_run_revision(repo=repository, revision=sha)
+    assert kind == "commit"
+    assert preparation.remote is None
+    assert preparation.base_branch is None
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    code = (
+        "from purplemux_client import prepare_run_revision\n"
+        f"prepare_run_revision(repo={str(repository)!r}, revision={sha!r}, "
+        f"worktree_root={str(tmp_path / 'managed-worktrees')!r})\n"
+    )
+    try:
+        run_id = runner.start(code)
+        result = wait_until_finished(runner)
+        assert result.state == "success"
+        assert result.run_id == run_id
+        resource = next(
+            item for item in result.resources if item.kind == "git_worktree"
+        )
+        assert resource.metadata["revision_kind"] == "commit"
+        assert resource.metadata["revision"] == sha
+        assert resource.metadata["revision_ref"] == sha
+        assert "remote" not in resource.metadata
+        assert "base_branch" not in resource.metadata
+        context = result.as_json()["executionContext"]
+        assert context["revisionKind"] == "commit"
+        assert context["revision"] == sha
+        assert "remote" not in context
+        assert "baseBranch" not in context
+        cleaned = runner.cleanup(run_id)
+        assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
+    finally:
+        runner.close()
 
 
 def test_prepare_run_revision_rejects_ambiguous_branch_and_tag(tmp_path: Path) -> None:

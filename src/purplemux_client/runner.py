@@ -382,18 +382,27 @@ class CleanupOwnershipSnapshot:
 def _is_verified_repository_context(resource: RunResource) -> bool:
     required = {
         "repository",
-        "remote",
-        "base_branch",
-        "base_ref",
         "base_sha",
         "path_identity",
         "git_file_identity",
         "git_dir",
     }
+    metadata = resource.metadata
+    kind = metadata.get("revision_kind")
+    if kind == "branch":
+        required.update(
+            {"revision", "revision_ref", "remote", "base_branch", "base_ref"}
+        )
+    elif kind == "tag":
+        required.update({"revision", "revision_ref", "remote"})
+    elif kind == "commit":
+        required.update({"revision", "revision_ref"})
+    else:
+        required.update({"remote", "base_branch", "base_ref"})
     return (
         resource.kind == "git_worktree"
-        and resource.metadata.get("registration_state") != "pending"
-        and required.issubset(resource.metadata)
+        and metadata.get("registration_state") != "pending"
+        and required.issubset(metadata)
     )
 
 
@@ -768,16 +777,24 @@ class RunnerSnapshot:
             if not _is_verified_repository_context(resource):
                 continue
             metadata = resource.metadata
-            return {
+            context = {
                 "sourceRepository": metadata.get(
                     "source_repository", metadata.get("repository", "")
                 ),
-                "remote": metadata.get("remote", ""),
-                "baseBranch": metadata.get("base_branch", ""),
-                "baseRef": metadata.get("base_ref", ""),
                 "baseSha": metadata.get("base_sha", metadata.get("head", "")),
                 "executionRoot": resource.identity,
             }
+            for key, field_name in (
+                ("remote", "remote"),
+                ("base_branch", "baseBranch"),
+                ("base_ref", "baseRef"),
+                ("revision_kind", "revisionKind"),
+                ("revision", "revision"),
+                ("revision_ref", "revisionRef"),
+            ):
+                if key in metadata:
+                    context[field_name] = metadata[key]
+            return context
         return None
 
 
