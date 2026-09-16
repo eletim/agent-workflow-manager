@@ -154,10 +154,8 @@ human review without depending on PurpleMux output history.
 
 PurpleMux owns the Workflow process, agent, and managed-terminal runtime.
 `purplemux_client` uses
-PurpleMux's public CLI contract and does not replace its runtime. Generated
-Review alone reads the pane PID of its exact public tab from tmux so it can
-contain the agent and descendants in a Linux cgroup v2 scope; it does not send
-tmux mutations. Observable or parallel shell work is launched in a named PurpleMux
+PurpleMux's public CLI contract and does not replace its runtime or access tmux
+directly. Observable or parallel shell work is launched in a named PurpleMux
 `terminal` tab with an explicit working directory. Its completion comes from a
 machine-readable exit-code sidecar written by the command wrapper; pane text is
 diagnostic only, and `terminalStatus` is optional status context rather than an

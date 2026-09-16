@@ -305,7 +305,6 @@ import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
 from purplemux_client.review import require_ext_review_contract, serialize_review_result, snapshot_review_repositories
-from purplemux_client.review_process import ReviewProcessScope
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -350,10 +349,8 @@ baseline = None
 runtime = PurpleMuxRuntime(owned_by_run=True)
 client = None
 tab = None
-scope = None
 try:
     ext_review_cli = require_ext_review_contract(timeout=min(10, remaining()))
-    scope = ReviewProcessScope()
     baseline = snapshot_review_repositories(REPOSITORIES)
     workspace = runtime.create_workspace(CreateWorkspaceRequest(
         cwd=REPOSITORIES[0], name="AWM Review", deadline_check=remaining,
@@ -363,7 +360,6 @@ try:
         worker=AGENT, cwd=REPOSITORIES[0], command=AGENT,
         name="Review agent", deadline_check=remaining,
     ))
-    scope.attach(ext_review_cli, workspace.id, tab)
     client.wait_until_ready(tab, min(remaining(), 60))
     context = ("Review these local repositories: " + json.dumps(REPOSITORIES)
                + ". Read and inspect every declared repository as needed, using any available tool. "
@@ -385,20 +381,12 @@ try:
     serialized_result = serialize_review_result(result, REPOSITORIES)
     if FINISH is not None:
         turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH)
-    scope.stop()
-    scope = None
     client.close_session(tab)
     tab = None
     verify_repositories()
     print(serialized_result)
 except BaseException as exc:
     failure = exc
-    if scope is not None:
-        try:
-            scope.stop()
-            scope = None
-        except BaseException as stop_error:
-            failure = RuntimeError("Review agent process containment could not stop: " + str(stop_error) + "; prior failure: " + str(failure))
     if client is not None and tab is not None:
         try:
             client.close_session(tab)

@@ -25,23 +25,6 @@ from purplemux_client.web import RunnerHTTPServer
 
 
 @pytest.fixture
-def process_scope(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    import purplemux_client.review_process as review_process
-
-    events: list[str] = []
-
-    class Scope:
-        def attach(self, _cli: str, _workspace: str, _tab: str) -> None:
-            events.append("attach")
-
-        def stop(self) -> None:
-            events.append("stop")
-
-    monkeypatch.setattr(review_process, "ReviewProcessScope", Scope)
-    return events
-
-
-@pytest.fixture
 def repositories(tmp_path: Path) -> tuple[Path, Path]:
     paths = (tmp_path / "first", tmp_path / "second")
     for path in paths:
@@ -184,7 +167,6 @@ def test_review_generation_api_feeds_ordinary_run(
 def test_generated_review_sequences_optional_turns_and_reports_result(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
-    process_scope: list[str],
     oversized: bool,
 ) -> None:
     import purplemux_client
@@ -280,7 +262,6 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
         assert len(messages[2]) < 1_000_000
     assert steps == [("Review", "started"), ("Review", "completed")]
     assert closed == ["agent-tab"]
-    assert process_scope == ["attach", "stop"]
 
 
 def test_review_result_stays_complete_with_worst_case_json_escaping() -> None:
@@ -397,7 +378,6 @@ def test_review_snapshot_detects_git_object_write(
 def test_generated_review_reports_repository_change(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
-    process_scope: list[str],
 ) -> None:
     import purplemux_client
     import purplemux_client.review as review_module
@@ -452,13 +432,11 @@ def test_generated_review_reports_repository_change(
     assert steps[0][:2] == ("Review", "started")
     assert steps[-1][:2] == ("Review", "failed")
     assert str(repositories[1]) in (steps[-1][2] or "")
-    assert process_scope == ["attach", "stop"]
 
 
 def test_generated_review_verifies_after_agent_session_closes(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
-    process_scope: list[str],
 ) -> None:
     import purplemux_client
     import purplemux_client.review as review_module
@@ -512,7 +490,6 @@ def test_generated_review_verifies_after_agent_session_closes(
         exec(compile(code, "<review>", "exec"), {})
     assert steps[-1][:2] == ("Review", "failed")
     assert str(repositories[1]) in (steps[-1][2] or "")
-    assert process_scope == ["attach", "stop"]
 
 
 def test_review_requires_matching_cli_and_server_ext_review_contract(
