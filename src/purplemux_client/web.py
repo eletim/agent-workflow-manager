@@ -39,6 +39,7 @@ from purplemux_client.readiness import (
     ReadinessProbeBusy,
     ReadinessReconciliationRequired,
 )
+from purplemux_client.review import generate_review_workflow, parse_review_json
 from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
@@ -616,6 +617,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/validate",
             "/api/dry-run",
             "/api/issue-driven/generate",
+            "/api/review/generate",
             "/api/readiness/probe",
             "/api/readiness/reconcile",
             "/api/settings/notifications",
@@ -813,6 +815,27 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     "revisionValidation": config.revision_validation,
                     "generatedCode": code,
                 },
+            )
+            return
+        if path == "/api/review/generate":
+            payload = self._read_json()
+            if payload is None:
+                return
+            source = payload.get("json")
+            if not isinstance(source, str) or set(payload) != {"json"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain only a JSON source string"},
+                )
+                return
+            try:
+                config = parse_review_json(source)
+                code = generate_review_workflow(config)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK, {"config": config.as_json(), "generatedCode": code}
             )
             return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:

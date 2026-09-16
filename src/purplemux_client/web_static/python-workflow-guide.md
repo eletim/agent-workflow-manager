@@ -34,6 +34,33 @@ Runner-scoped correlation through named PurpleMux resources and
 `merge_final: false`, it generates no final-branch merge call. The displayed
 Python remains the sole execution and control-flow source of truth.
 
+## Review generation
+
+Review input is a small JSON declaration. `repositories` is a non-empty array
+of existing local Git repository roots, and `check` is a required non-empty
+natural-language instruction. Optional `start` and `finish` are non-empty
+natural-language instructions before and after the check. `agent` defaults to
+`codex` (`claude-code` is also supported), and `timeout` defaults to 3600
+seconds (range 1–86400). For example:
+
+```json
+{
+  "mode": "review",
+  "repositories": ["/path/to/project", "/path/to/related-project"],
+  "check": "Review error handling across these repositories",
+  "agent": "codex",
+  "timeout": 3600
+}
+```
+
+`POST /api/review/generate` with `{"json":"<the JSON declaration>"}`
+validates the input and returns `generatedCode`. Submit that code through the
+ordinary Validate and Run endpoints. The generated Python owns the
+start, check, finish, deadline, and result handling. It asks the agent to
+inspect without changing the repositories and prints one JSON result with a
+`PASS`, `FAIL`, or `BLOCKED` verdict and a summary. The JSON has no actions,
+conditions, loops, or other workflow control flow.
+
 ## Architecture and responsibility
 
 ```text
