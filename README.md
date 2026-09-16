@@ -4,6 +4,7 @@
 # Install and start the custom PurpleMux fork (keep this terminal running).
 git clone https://github.com/eletim/purplemux.git "$HOME/DevEnv/purplemux"
 cd "$HOME/DevEnv/purplemux"
+git switch dev/v0.5.0
 corepack enable
 pnpm install
 pnpm start
@@ -29,7 +30,10 @@ This setup intentionally uses the custom CLI from
 the upstream `npm install -g purplemux` package: it does not provide the CLI
 contract required by Agent Workflow Manager. No token needs to be copied into
 these commands; the custom CLI reads the runtime connection files created under
-`~/.purplemux/`.
+`~/.purplemux/`. Review requires the `ext-review` CLI and server API in the
+fork's `dev/v0.5.0` branch or newer. Check both with `purplemux help` and
+`purplemux api-guide` after starting the server; the Review Run checks the same
+contract before creating a workspace.
 
 # Agent Workflow Manager
 
@@ -555,8 +559,8 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI has four explicit modes: **Prompt**, **Environment Setup**,
-**Issue Driven**, and **Python Workflow**. Prompt accepts an agent,
+The trusted local Runner UI has five explicit modes: **Prompt**, **Environment Setup**,
+**Issue Driven**, **Review**, and **Python Workflow**. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt

@@ -65,7 +65,8 @@ inspect without changing the repositories and prints one JSON result with a
 `PASS`, `FAIL`, or `BLOCKED` verdict and a summary. Optional string arrays retain
 `findings`, `observed_facts`, `evidence`, `hypotheses`, and `observability_gaps`.
 An observation timeout or unavailable agent result produces `BLOCKED` with an
-observability gap; the optional finish instruction still runs. The JSON has no actions,
+observability gap. If start or check completion cannot be confirmed, the optional
+finish instruction is skipped. The JSON has no actions,
 conditions, loops, or other workflow control flow. Long reports are compacted
 to fit Run stdout; a `truncated` object records omitted text or repository paths.
 

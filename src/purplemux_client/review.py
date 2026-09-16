@@ -320,7 +320,7 @@ def generate_review_workflow(config: ReviewInput) -> str:
 import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
-from purplemux_client.errors import MutationOutcomeUnknown, WorkerFailure, WorkerInterrupted
+from purplemux_client.errors import MutationOutcomeUnknown, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
 from purplemux_client.review import require_ext_review_contract, serialize_review_result, snapshot_review_repositories
 
 WORKFLOW_OUTLINE = ["Review"]
@@ -380,15 +380,24 @@ try:
         worker=AGENT, cwd=REPOSITORIES[0], command=AGENT,
         name="Review agent", deadline_check=remaining,
     ))
-    client.wait_until_ready(tab, min(remaining(), 60))
+    result = None
+    try:
+        client.wait_until_ready(tab, min(remaining(), 60))
+    except (SessionReadyTimeout, TimeoutError, WorkerFailure) as exc:
+        if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
+            raise
+        result = {{
+            "verdict": "BLOCKED",
+            "summary": "Review agent was unavailable before observation: " + str(exc),
+            "observability_gaps": ["Agent readiness could not be confirmed: " + str(exc)],
+        }}
     context = ("Review these local repositories: " + json.dumps(REPOSITORIES)
                + ". Read and inspect every declared repository as needed, using any available tool. "
         + "You may operate a browser through any available browser tool; no particular library is required. "
         + "For read-only observation of an external terminal, use the verified PurpleMux CLI " + json.dumps(ext_review_cli) + " ext-review create --socket PATH --session SESSION --window @ID with a known socket, session, and allowed window targets; open its returned browser URL. "
                + "Do not modify the repositories or send input to observed external terminals. ")
-    result = None
-    start_completed = True
-    if START is not None:
+    start_completed = result is None
+    if result is None and START is not None:
         try:
             turn(context + "First, follow this start instruction and report what you did: " + START)
         except (TimeoutError, WorkerFailure) as exc:
@@ -400,12 +409,14 @@ try:
                 "summary": "Review start observation was unavailable: " + str(exc),
                 "observability_gaps": ["Start completion could not be confirmed: " + str(exc)],
             }}
+    check_completed = result is None
     if result is None:
         try:
             report = turn(context + "Perform this check: " + CHECK + "\\nReturn one JSON object with verdict PASS, FAIL, or BLOCKED and a non-empty summary. Optional findings, observed_facts, evidence, hypotheses, and observability_gaps are arrays of strings. Report BLOCKED when observation times out or is unavailable; describe what could not be observed in observability_gaps. Base PASS or FAIL on observed evidence.")
         except (TimeoutError, WorkerFailure) as exc:
             if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
                 raise
+            check_completed = False
             result = {{
                 "verdict": "BLOCKED",
                 "summary": "Review observation was unavailable: " + str(exc),
@@ -423,7 +434,7 @@ try:
                    for name in ("findings", "observed_facts", "evidence", "hypotheses", "observability_gaps"))):
         raise RuntimeError("Review agent returned an invalid report")
     serialized_result = serialize_review_result(result, REPOSITORIES)
-    if FINISH is not None and start_completed:
+    if FINISH is not None and start_completed and check_completed:
         try:
             turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH, finish=True)
         except (TimeoutError, WorkerFailure) as exc:
@@ -433,6 +444,11 @@ try:
                 result, REPOSITORIES,
                 finish_failure="Finish could not be confirmed: " + str(exc),
             )
+    elif FINISH is not None and start_completed:
+        serialized_result = serialize_review_result(
+            result, REPOSITORIES,
+            finish_failure="Finish could not run because check completion was not confirmed",
+        )
     client.close_session(tab)
     tab = None
     verify_repositories()

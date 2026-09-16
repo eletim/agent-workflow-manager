@@ -67,6 +67,9 @@ the workflow executed successfully. A completed Run may therefore have a
 contract, or a repository change can fail the Run without a structured verdict.
 If the start observation times out or is unavailable, the Run completes with a
 `BLOCKED` verdict and an observability gap; it skips the check and finish because
-start completion cannot be confirmed. A stopped Run may also have no complete result.
+start completion cannot be confirmed. If the agent does not become ready, the
+Run also completes with `BLOCKED` and skips all turns. If check completion cannot
+be confirmed, finish is skipped and an observability gap records why. A stopped
+Run may also have no complete result.
 If an optional `finish` turn times out or is unavailable, the check verdict is
 retained and the gap is added to `observability_gaps`.
