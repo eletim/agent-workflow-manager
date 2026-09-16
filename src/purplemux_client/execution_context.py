@@ -350,15 +350,18 @@ def _prepare_repository_worktree(
                 )
             elif preparation.revision_kind == "tag":
                 fetch_ref = preparation.base_ref
-                verification_ref = "FETCH_HEAD"
+                verification_ref = preparation.base_sha
             else:
                 fetch_ref = ""
                 verification_ref = preparation.base_sha
             if fetch_ref:
                 if preparation.remote is None:
                     raise PreDispatchFailure("tag preparation lacks remote identity")
+                fetch_args = ["fetch", "--no-tags"]
+                if preparation.revision_kind == "tag":
+                    fetch_args.append("--no-write-fetch-head")
                 fetched = _run_git_mutation_process_group(
-                    ["fetch", "--no-tags", preparation.remote, fetch_ref],
+                    [*fetch_args, preparation.remote, fetch_ref],
                     cwd=preparation.source_repository,
                     timeout=command_timeout_seconds,
                 )
@@ -368,6 +371,22 @@ def _prepare_repository_worktree(
                     )
                     raise AuthoritativeMutationRejection(
                         f"Git revision fetch exited {fetched.returncode}: {detail}"
+                    )
+            if preparation.revision_kind == "tag":
+                try:
+                    current, kind = inspect_run_revision(
+                        repo=preparation.source_repository,
+                        revision=preparation.revision or preparation.base_ref,
+                        remote=preparation.remote or "origin",
+                        command_timeout_seconds=command_timeout_seconds,
+                    )
+                except WorkerFailure as exc:
+                    raise AuthoritativeMutationRejection(
+                        "remote tag could not be verified after fetch"
+                    ) from exc
+                if kind != "tag" or current.base_sha != preparation.base_sha:
+                    raise AuthoritativeMutationRejection(
+                        "remote tag changed during preparation"
                     )
             try:
                 fetched_sha = _git_read(

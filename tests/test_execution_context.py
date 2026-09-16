@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -185,6 +187,49 @@ def test_prepare_run_revision_rejects_ambiguous_branch_and_tag(tmp_path: Path) -
 
     with pytest.raises(Exception, match="both a branch and a tag"):
         inspect_run_revision(repo=repository, revision="main")
+
+
+def test_concurrent_tag_preparations_do_not_share_fetch_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    repository, first_sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "first")
+    (repository / "tracked").write_text("second\n", encoding="utf-8")
+    git(repository, "commit", "-qam", "second")
+    second_sha = git(repository, "rev-parse", "HEAD")
+    git(repository, "tag", "second")
+    git(repository, "push", "origin", "refs/tags/first", "refs/tags/second")
+
+    fetches_complete = Barrier(2)
+    original = execution_context._run_git_mutation_process_group
+
+    def interleaved_fetch(args: list[str], **kwargs: object):
+        result = original(args, **kwargs)
+        if args[0] == "fetch" and args[-1].startswith("refs/tags/"):
+            fetches_complete.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(
+        execution_context, "_run_git_mutation_process_group", interleaved_fetch
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            prepare_run_revision,
+            repo=repository,
+            revision="first",
+            worktree_root=tmp_path / "worktrees",
+        )
+        second = pool.submit(
+            prepare_run_revision,
+            repo=repository,
+            revision="second",
+            worktree_root=tmp_path / "worktrees",
+        )
+        results = (first.result(), second.result())
+    assert git(results[0].execution_root, "rev-parse", "HEAD") == first_sha
+    assert git(results[1].execution_root, "rev-parse", "HEAD") == second_sha
 
 
 def test_generated_environment_workflow_validates_tag_and_commit(

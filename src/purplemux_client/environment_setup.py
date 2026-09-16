@@ -108,7 +108,9 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     instructions = [
         "Set up the repository at the selected revision for development.",
         "Work only in the supplied execution directory.",
-        "Run the supplied commands in order. Stop and report any failure.",
+        "Run the supplied commands in order. If one fails, inspect the repository "
+        "and logs, correct the environment, and retry. Report BLOCKED if the "
+        "environment cannot be made ready.",
     ]
     for label, command in (
         ("Build", config.build),
@@ -117,9 +119,23 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     ):
         if command is not None:
             instructions.append(f"{label} command: {command}")
-    instructions.append("Report what you ran and whether the environment is ready.")
+    expected_checks = {
+        name: "passed"
+        for name in ("build", "start", "ready_check")
+        if getattr(config, name) is not None
+    }
+    instructions.extend(
+        (
+            "Return only one JSON object with status READY or BLOCKED, a non-empty "
+            "summary, and a checks object. Include each supplied command in checks "
+            "with passed or failed. Use READY only after every supplied command "
+            "passes and the environment is actually ready. Include observed errors "
+            "in a BLOCKED summary.",
+        )
+    )
     prompt = "\n".join(instructions)
-    return f"""import time
+    return f"""import json
+import time
 
 from purplemux_client import (
     CreateSessionRequest,
@@ -130,6 +146,7 @@ from purplemux_client import (
 )
 
 WORKFLOW_OUTLINE = ["Environment Setup"]
+EXPECTED_CHECKS = {expected_checks!r}
 
 
 def remaining():
@@ -139,7 +156,14 @@ def remaining():
     return seconds
 
 
+def busy_timeout(_warning):
+    raise TimeoutError("Environment Setup timed out while the agent was busy")
+
+
 emit_step("Environment Setup", "started")
+client = None
+tab = None
+turn_active = False
 try:
     deadline = time.monotonic() + {config.timeout}
     context = prepare_run_revision(
@@ -160,12 +184,37 @@ try:
     )
     client.wait_until_ready(tab, min(remaining(), 60))
     client.send_input(tab, {prompt!r})
-    client.wait_for_turn_completion(tab, remaining())
+    turn_active = True
+    client.wait_for_turn_completion(
+        tab, remaining(), on_busy_timeout=busy_timeout
+    )
+    turn_active = False
+    remaining()
     result = client.read_result(tab)
+    remaining()
+    print(result)
+    report = json.loads(result)
+    if (
+        not isinstance(report, dict)
+        or report.get("status") != "READY"
+        or not isinstance(report.get("summary"), str)
+        or not report["summary"].strip()
+        or report.get("checks") != EXPECTED_CHECKS
+    ):
+        raise RuntimeError("Environment Setup did not report verified READY")
+    remaining()
 except BaseException as exc:
-    emit_step("Environment Setup", "failed", error=str(exc))
+    interrupt_error = None
+    if isinstance(exc, TimeoutError) and turn_active and client is not None and tab is not None:
+        try:
+            client.interrupt(tab)
+        except BaseException as interruption:
+            interrupt_error = str(interruption)
+    error = str(exc)
+    if interrupt_error is not None:
+        error = f"{{error}}; agent interruption failed: {{interrupt_error}}"
+    emit_step("Environment Setup", "failed", error=error)
     raise
 else:
-    print(result)
     emit_step("Environment Setup", "completed", workspace=workspace.id, tab=tab)
 """

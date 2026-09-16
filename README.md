@@ -78,7 +78,10 @@ Optional non-empty strings are `build`, `start`, and `ready_check`. The endpoint
 validates the inputs and returns the normalized configuration and generated
 plain Python Workflow. The generated workflow prepares a detached worktree,
 asks the selected agent to set up the environment and run the supplied commands,
-and waits within the declared timeout. These inputs describe the environment;
+and waits within the declared timeout. The agent must return a JSON `READY`
+result with a passing check for each supplied command; `BLOCKED`, failed checks,
+and unstructured results fail the Run. A busy agent is interrupted at timeout.
+These inputs describe the environment;
 they are not a steps language. Submit `generatedCode` to the existing Workflow
 validation and Run endpoints to execute it.
 
