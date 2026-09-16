@@ -27,6 +27,7 @@ class ManagedClient:
         self.interrupted: list[str] = []
 
     def start_shell(self, request: ShellCommandRequest, *, on_created=None) -> str:
+        assert request.deadline_check is not None
         tab = f"tab-{len(self.requests) + 1}"
         self.requests.append(request)
         self.results[tab] = self.outcomes[request.command].pop(0)

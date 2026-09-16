@@ -46,7 +46,9 @@ def _completed_command(
     created: list[str] = []
     try:
         tab = client.start_shell(
-            ShellCommandRequest(command, cwd, f"Environment Setup {name}"),
+            ShellCommandRequest(
+                command, cwd, f"Environment Setup {name}", deadline_check=remaining
+            ),
             on_created=lambda session, _result_path: created.append(session),
         )
     except MutationOutcomeUnknown:
@@ -168,7 +170,12 @@ def execute_environment_setup_commands(
             created: list[str] = []
             try:
                 service_tab = client.start_shell(
-                    ShellCommandRequest(command, cwd, "Environment Setup start"),
+                    ShellCommandRequest(
+                        command,
+                        cwd,
+                        "Environment Setup start",
+                        deadline_check=remaining,
+                    ),
                     on_created=lambda tab, _result_path: created.append(tab),
                 )
             except MutationOutcomeUnknown:
