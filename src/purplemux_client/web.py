@@ -39,6 +39,7 @@ from purplemux_client.readiness import (
     ReadinessProbeBusy,
     ReadinessReconciliationRequired,
 )
+from purplemux_client.review import generate_review_workflow, parse_review_json
 from purplemux_client.runner import (
     AlreadyRunningError,
     InvalidExecutionContextError,
@@ -73,6 +74,10 @@ STATIC_FILES = {
     ),
     "/python-workflow-guide.md": (
         "python-workflow-guide.md",
+        "text/markdown; charset=utf-8",
+    ),
+    "/review-guide.md": (
+        "review-guide.md",
         "text/markdown; charset=utf-8",
     ),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
@@ -616,6 +621,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/validate",
             "/api/dry-run",
             "/api/issue-driven/generate",
+            "/api/review/generate",
             "/api/readiness/probe",
             "/api/readiness/reconcile",
             "/api/settings/notifications",
@@ -815,6 +821,27 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/review/generate":
+            payload = self._read_json()
+            if payload is None:
+                return
+            source = payload.get("json")
+            if not isinstance(source, str) or set(payload) != {"json"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain only a JSON source string"},
+                )
+                return
+            try:
+                config = parse_review_json(source)
+                code = generate_review_workflow(config)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK, {"config": config.as_json(), "generatedCode": code}
+            )
+            return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:
             payload = self._read_json()
             if payload is None:
@@ -897,6 +924,36 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         {"error": "code does not match environmentSetupJson"},
                     )
                     return
+            review_json = payload.get("reviewJson")
+            if "reviewJson" in payload:
+                if (
+                    path != "/api/run"
+                    or not isinstance(review_json, str)
+                    or "issueDrivenJson" in payload
+                    or "environmentSetupJson" in payload
+                ):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "reviewJson is supported only for Run and must be a string"
+                        },
+                    )
+                    return
+                try:
+                    review_code = generate_review_workflow(
+                        parse_review_json(review_json)
+                    )
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)}
+                    )
+                    return
+                if review_code != code:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "code does not match reviewJson"},
+                    )
+                    return
             try:
                 if path == "/api/validate":
                     result = self.server.runner.validate(code, args=args)
@@ -923,6 +980,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     args=args,
                     issue_driven_json=issue_driven_json,
                     environment_setup_json=environment_setup_json,
+                    review_json=review_json,
                     parent_identity=payload.get("parentRun"),
                 )
             except ValueError as exc:
