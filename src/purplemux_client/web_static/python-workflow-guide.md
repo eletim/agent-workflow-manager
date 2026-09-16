@@ -54,8 +54,12 @@ seconds (range 1–86400). For example:
 ```
 
 `POST /api/review/generate` with `{"json":"<the JSON declaration>"}`
-validates the input and returns `generatedCode`. Submit that code through the
-ordinary Validate and Run endpoints. The generated Python owns the
+validates the input and returns `generatedCode`. Validate with
+`{"code":"<generatedCode>","args":[]}`. Submit through `POST /api/run` with
+`{"code":"<generatedCode>","args":[],"reviewJson":"<the original JSON declaration>"}`.
+Run regenerates the code from `reviewJson` and rejects a mismatch. Keep the
+original declaration in the request so Run history identifies it as Review and
+retains its settings. The generated Python owns the
 start, check, finish, deadline, and result handling. It asks the agent to
 inspect without changing the repositories and prints one JSON result with a
 `PASS`, `FAIL`, or `BLOCKED` verdict and a summary. Optional string arrays retain
