@@ -140,6 +140,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "checks": {"build": "passed"},
                 "verification": "service responded successfully",
                 "verification_command": "printf usable; test -d .",
+                "endpoint": "http://127.0.0.1:8000/health",
                 "resolved_revision": "unverified",
                 "working_path": "/wrong/path",
             },
@@ -169,6 +170,66 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             False,
             None,
         ),
+        (
+            {
+                "status": "READY",
+                "summary": "start interrupted",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "start observation interrupted",
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "final blocked",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "agent blocked: service exited after ready check",
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata timeout",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata interrupt fails",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "agent interruption failed: cannot stop agent",
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata missing status",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata unexpected status",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
+        ),
     ],
 )
 def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
@@ -191,6 +252,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             self.reads = 0
             self.shells = 0
             self.prompts: list[str] = []
+            self.turn_timeouts: list[float] = []
 
         def create_session(self, _request: object) -> str:
             return "tab-1"
@@ -204,13 +266,42 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         def wait_for_turn_completion(
             self, _tab: str, _timeout: float, *, on_busy_timeout: object
         ) -> None:
+            self.turn_timeouts.append(_timeout)
             if busy_timeout:
                 on_busy_timeout("still busy")  # type: ignore[operator]
+            if (
+                report is not None
+                and report.get("summary")
+                in {"metadata timeout", "metadata interrupt fails"}
+                and self.reads >= 1
+            ):
+                raise TimeoutError("endpoint report timed out")
             if late_completion:
                 time.sleep(1.05)
 
         def read_result(self, _tab: str) -> str:
             self.reads += 1
+            if (
+                self.reads > 1
+                and report is not None
+                and report.get("summary")
+                in {"metadata missing status", "metadata unexpected status"}
+            ):
+                final_report = {
+                    "summary": "endpoint found",
+                    "endpoint": "http://unverified.example",
+                }
+                if report.get("summary") == "metadata unexpected status":
+                    final_report["status"] = "UNKNOWN"
+                return json.dumps(final_report)
+            if (
+                self.reads > 1
+                and report is not None
+                and report.get("summary") == "final blocked"
+            ):
+                return json.dumps(
+                    {"status": "BLOCKED", "summary": "service exited after ready check"}
+                )
             if (
                 self.reads > 1
                 and report is not None
@@ -230,6 +321,12 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             pass
 
         def read_shell_result(self, tab: str) -> SimpleNamespace:
+            if (
+                report is not None
+                and report.get("summary") == "start interrupted"
+                and tab == "shell-2"
+            ):
+                raise TimeoutError("start observation interrupted")
             return SimpleNamespace(
                 exit_code=3
                 if report is not None
@@ -246,6 +343,11 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
 
         def interrupt(self, tab: str) -> None:
             interrupted.append(tab)
+            if (
+                report is not None
+                and report.get("summary") == "metadata interrupt fails"
+            ):
+                raise RuntimeError("cannot stop agent")
 
     client = Client()
 
@@ -277,6 +379,9 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             "codex",
             1 if late_completion else 120,
             build="printf built",
+            start="serve"
+            if report is not None and report.get("summary") == "start interrupted"
+            else None,
         )
     )
     output = StringIO()
@@ -284,25 +389,75 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         with redirect_stdout(output):
             exec(compile(code, "<environment-setup>", "exec"), {})
         result = json.loads(output.getvalue())
+        assert result["status"] == "READY"
+        if report is not None and report.get("summary") in {
+            "metadata timeout",
+            "metadata missing status",
+            "metadata unexpected status",
+        }:
+            assert result["summary"] == report["summary"]
+        if report is not None and report.get("summary") in {
+            "metadata missing status",
+            "metadata unexpected status",
+        }:
+            assert result["endpoint_report_error"] == (
+                "Environment Setup final agent returned an invalid status"
+            )
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
+        expected_connection = {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        if report is not None and "endpoint" in report:
+            expected_connection["endpoint"] = report["endpoint"]
+        assert result["connection"] == expected_connection
+        assert result["process"] is None
+        assert result["execution_summary"]
+        assert result["readiness_summary"]
         offset = 1 if report is not None and report.get("summary") == "recover" else 0
         assert result["checks"]["build"]["output"] == f"observed shell-{1 + offset}"
         assert result["verification"]["output"] == f"observed shell-{2 + offset}"
+        assert len(result["attempts"]) == 1 + offset
         if offset:
-            assert client.reads == 2
+            assert client.reads == 3
             assert "Environment Setup build failed" in client.prompts[1]
             assert "temporary environment or setup changes" in client.prompts[1]
+        assert "observed a usable connection address" in client.prompts[-1]
+        assert client.turn_timeouts[-1] <= 30
     else:
-        with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
-            with redirect_stdout(output):
-                exec(compile(code, "<environment-setup>", "exec"), {})
-        assert not output.getvalue()
+        with redirect_stdout(output):
+            exec(compile(code, "<environment-setup>", "exec"), {})
+        result = json.loads(output.getvalue())
+        assert result["status"] == "BLOCKED"
+        assert expected_error in result["summary"]
+        assert result["observed_facts"]["error"] == result["summary"]
+        assert result["resolved_revision"] == "a" * 40
+        assert result["working_path"] == str(tmp_path)
+        assert result["connection"] == {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        if (
+            report is not None
+            and report.get("summary") == "ready"
+            and not report.get("verification_command")
+        ):
+            assert result["attempts"][0]["failed_stage"] == "ready_check"
+        if report is not None and report.get("summary") == "start interrupted":
+            assert result["checks"]["build"]["exit_code"] == 0
+            assert result["process"]["tab_id"] == "shell-2"
+            assert result["service_tab"] == "shell-2"
+            assert result["attempts"][0]["failed_stage"] == "start"
+        if report is not None and report.get("summary") == "final blocked":
+            assert result["attempts"][0]["failure"] is None
+            assert result["observed_facts"]["agent_reports"][-1]["status"] == "BLOCKED"
+        if report is not None and report.get("summary") == "metadata interrupt fails":
+            assert "endpoint report timed out" in result["summary"]
+            assert "cannot stop agent" in result["observed_facts"]["error"]
     assert events == [
         ("Environment Setup", "started"),
         ("Environment Setup", "completed" if expected_error is None else "failed"),
     ]
-    assert interrupted == (["tab-1"] if busy_timeout else [])
+    metadata_timeout = report is not None and report.get("summary") in {
+        "metadata timeout",
+        "metadata interrupt fails",
+    }
+    assert interrupted == (["tab-1"] if busy_timeout or metadata_timeout else [])
 
 
 @pytest.mark.parametrize("phase", ["preparation", "workspace", "session"])
@@ -319,7 +474,9 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
             time.sleep(1.05)
         kwargs["deadline_check"]()  # type: ignore[operator]
         created.append("worktree")
-        return SimpleNamespace(execution_root=Path("/tmp/environment-setup"))
+        return SimpleNamespace(
+            execution_root=Path("/tmp/environment-setup"), base_sha="b" * 40
+        )
 
     class Client:
         command_timeout_seconds = 30.0
@@ -355,8 +512,14 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
     code = setup.generate_environment_setup_workflow(
         setup.EnvironmentSetupInput("/source/repo", "main", "codex", 1)
     )
-    with pytest.raises(TimeoutError, match="Environment Setup timed out"):
+    output = StringIO()
+    with redirect_stdout(output):
         exec(compile(code, "<environment-setup>", "exec"), {})
+    result = json.loads(output.getvalue())
+    assert result["status"] == "BLOCKED"
+    assert "Environment Setup timed out" in result["summary"]
+    assert result["resolved_revision"] == (None if phase == "preparation" else "b" * 40)
+    assert result["attempts"] == []
     assert events == ["started", "failed"]
     assert (
         created
@@ -366,3 +529,106 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
             "session": ["worktree", "workspace"],
         }[phase]
     )
+
+
+def test_fitting_result_preserves_paths_endpoints_and_history() -> None:
+    result = {
+        "status": "READY",
+        "summary": "ready",
+        "execution_summary": "built",
+        "readiness_summary": "responding",
+        "resolved_revision": "a" * 40,
+        "working_path": "/tmp/" + "p" * 3000,
+        "connection": {"endpoint": "https://example.test/" + "e" * 3000},
+        "process": {"tab_id": "tab-1"},
+        "checks": {},
+        "verification": {"exit_code": 0},
+        "attempts": [{"failure": None, "output": str(i)} for i in range(20)],
+    }
+    assert setup.serialize_environment_setup_result(result) == json.dumps(result)
+
+
+def test_large_result_remains_parseable_and_keeps_latest_observation() -> None:
+    history = [
+        {"checks": {"build": {"output": "x" * 4096}}, "failure": f"attempt {i}"}
+        for i in range(1000)
+    ]
+    result = {
+        "status": "BLOCKED",
+        "summary": "retry limit reached",
+        "execution_summary": "build failed",
+        "readiness_summary": "not ready",
+        "resolved_revision": "a" * 40,
+        "working_path": "/tmp/" + "p" * 3000,
+        "connection": {
+            "workspace_id": "ws-1",
+            "endpoint": "https://example.test/" + "e" * 3000,
+        },
+        "process": {"tab_id": "tab-1"},
+        "checks": {"build": {"exit_code": 1}},
+        "verification": {"exit_code": 1},
+        "attempts": history,
+        "observed_facts": {"agent_reports": [{"summary": "y" * 4096}] * 1000},
+    }
+    payload = setup.serialize_environment_setup_result(result)
+    assert len(payload) < 1_000_000
+    decoded = json.loads(payload)
+    assert decoded["status"] == "BLOCKED"
+    assert decoded["attempts"][-1]["failure"] == "attempt 999"
+    assert decoded["history_truncated"]["attempts"] > 0
+    assert decoded["history_truncated"]["agent_reports"] > 0
+    assert decoded["resolved_revision"] == "a" * 40
+    assert decoded["working_path"] == result["working_path"]
+    assert decoded["connection"] == result["connection"]
+    assert decoded["process"] == result["process"]
+    assert decoded["execution_summary"] == "build failed"
+    assert decoded["readiness_summary"] == "not ready"
+
+
+def test_oversized_agent_report_keeps_result_contract() -> None:
+    result = {
+        "status": "BLOCKED",
+        "summary": "not ready",
+        "execution_summary": "build failed",
+        "readiness_summary": "no response",
+        "resolved_revision": "a" * 40,
+        "working_path": "/tmp/" + "p" * 3000,
+        "connection": {
+            "workspace_id": "ws-1",
+            "endpoint": "http://localhost:8000/" + "e" * 3000,
+        },
+        "process": {"tab_id": "tab-1", "running": True},
+        "service_tab": "tab-1",
+        "checks": {"build": {"exit_code": 1}},
+        "verification": {"exit_code": 1},
+        "attempts": [
+            {"checks": {"build": {"exit_code": 1}}, "failure": "build failed"}
+        ],
+        "observed_facts": {
+            "error": "build failed",
+            "agent_reports": [{"status": "x" * 1_100_000, "summary": "too large"}],
+        },
+    }
+    payload = setup.serialize_environment_setup_result(result)
+    assert len(payload) < 1_000_000
+    decoded = json.loads(payload)
+    for field in (
+        "status",
+        "summary",
+        "execution_summary",
+        "readiness_summary",
+        "resolved_revision",
+        "working_path",
+        "connection",
+        "process",
+        "service_tab",
+        "checks",
+        "verification",
+        "attempts",
+        "observed_facts",
+    ):
+        assert field in decoded
+    assert decoded["connection"] == result["connection"]
+    assert decoded["working_path"] == result["working_path"]
+    assert decoded["process"]["tab_id"] == "tab-1"
+    assert len(decoded["observed_facts"]["agent_reports"][0]["status"]) <= 64

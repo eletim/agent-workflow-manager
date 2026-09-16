@@ -91,10 +91,21 @@ requires a permanent product fix. The start terminal
 remains available for inspection and control. The declared timeout applies to
 preparation, session creation, agent turns, and commands. The workflow records
 observed outcomes and accepts `READY` only when the commands and usability check
-succeed. Uncertain launches are not replayed unless the terminal result confirms
-the command failed. A busy agent is interrupted at timeout.
-On success, the workflow adds the verified commit SHA as `resolved_revision` and
-the detached worktree as `working_path` to the JSON result.
+succeed and the final service inspection does not report a readiness failure.
+An absent endpoint does not block readiness. Uncertain launches are not replayed
+unless the terminal result confirms the command failed. A busy agent is
+interrupted at timeout.
+The workflow returns one JSON result with `status` (`READY` or `BLOCKED`),
+`summary`, `resolved_revision` (the verified commit SHA when preparation
+succeeds), and `working_path` (the detached worktree when available). It also
+includes `connection` with workspace and agent tab IDs and an observed
+`endpoint` when available, `process` with the
+observed start process outcome, `checks`, `verification`, `attempts`, and
+execution and readiness summaries. A `BLOCKED` result includes
+`observed_facts` with the error and agent reports, so a later Python Workflow
+Run can inspect the available evidence and decide how to proceed.
+When the full result exceeds the Run output limit, histories are shortened to
+recent attempts with omission counts, then bulky logs are reduced as needed.
 These inputs describe the environment;
 they are not a steps language. Submit `generatedCode` to the existing Workflow
 validation and Run endpoints to execute it.
