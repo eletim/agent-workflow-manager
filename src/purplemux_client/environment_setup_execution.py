@@ -120,14 +120,22 @@ def _service_outcome(
     }
     try:
         result = client.read_shell_result(tab)
-    except ResultNotReady:
-        status = client.read_status(tab)
-        outcome["running"] = status.get("alive") is not False
-        if status.get("alive") is False:
-            outcome["error"] = "start terminal exited without a shell result"
-    except WorkerFailure as exc:
-        outcome["error"] = str(exc)
-        outcome["running"] = False
+    except (ResultNotReady, WorkerFailure) as exc:
+        try:
+            status = client.read_status(tab)
+        except WorkerFailure as status_error:
+            outcome["running"] = None
+            outcome["error"] = f"{exc}; status unavailable: {status_error}"
+        else:
+            alive = status.get("alive")
+            outcome["running"] = alive if isinstance(alive, bool) else None
+            if isinstance(exc, ResultNotReady):
+                if alive is False:
+                    outcome["error"] = "start terminal exited without a shell result"
+                elif alive is not True:
+                    outcome["error"] = "start terminal state is unknown"
+            else:
+                outcome["error"] = str(exc)
     else:
         outcome["exit_code"] = result.exit_code
         outcome["running"] = False
@@ -230,13 +238,30 @@ def execute_environment_setup_commands(
         if outcome.get("error") or outcome.get("exit_code") not in (None, 0):
             failure = f"Environment Setup {stage} failed: {outcome}"
             failed_stage = stage
+            if (
+                stage == "start"
+                and "running" in outcome
+                and outcome["running"] is not False
+            ):
+                failed_stage = "ready_check"
             break
-    if failure is None and service_tab is not None and start is not None:
+    if (
+        service_tab is not None
+        and start is not None
+        and (failure is None or failed_stage == "ready_check")
+    ):
         service = _service_outcome(client, service_tab, start)
         checks["start"] = service
-        if service.get("error") or service.get("exit_code") not in (None, 0):
+        if service.get("running") is False and (
+            failed_stage == "ready_check"
+            or service.get("error")
+            or service.get("exit_code") != 0
+        ):
             failure = f"Environment Setup start failed: {service}"
             failed_stage = "start"
+        elif service.get("error"):
+            failure = f"Environment Setup start observation failed: {service}"
+            failed_stage = "ready_check"
     remaining()
     return {
         "checks": checks,

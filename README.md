@@ -84,7 +84,10 @@ workflow then runs each supplied build, start, and ready check command as given,
 in order, in managed PurpleMux terminals. Omitted commands are skipped. If no
 ready check is supplied, the agent provides a usability check command. Failed
 commands and their terminal logs go back to the agent for diagnosis and repair;
-the workflow retries the failed stage within the same timeout. The start terminal
+the agent may make temporary setup changes, and the workflow retries the failed
+stage within the same timeout. If the start process exits while readiness fails,
+the workflow retries the start stage. The agent reports `BLOCKED` when readiness
+requires a permanent product fix. The start terminal
 remains available for inspection and control. The declared timeout applies to
 preparation, session creation, agent turns, and commands. The workflow records
 observed outcomes and accepts `READY` only when the commands and usability check

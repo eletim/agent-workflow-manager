@@ -64,6 +64,11 @@ def test_generates_python_from_declarative_inputs(
     assert "Ready check command: curl http://localhost:8000/health" in code
     assert "exactly as given" in code
     assert "before considering any alternative" in code
+    assert "temporary setup changes in the execution directory" in code
+    assert "Report BLOCKED if readiness requires a permanent product fix" in code
+    assert "Execution failed or readiness was not reached" in code
+    assert "Inspect repository files and managed terminal logs" in code
+    assert "Do not change product code to conceal a product failure" in code
     assert "execute_environment_setup_commands(" in code
     assert "steps" not in config.as_json()
 
@@ -287,6 +292,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         if offset:
             assert client.reads == 2
             assert "Environment Setup build failed" in client.prompts[1]
+            assert "temporary environment or setup changes" in client.prompts[1]
     else:
         with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
             with redirect_stdout(output):
