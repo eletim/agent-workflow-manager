@@ -118,6 +118,7 @@ function snapshot({
   plannerSkips = [],
   purplemuxPort = 9123,
   issueDrivenJson = undefined,
+  environmentSetupJson = undefined,
   resumedFromRunId = null,
 }) {
   const result = {
@@ -157,6 +158,7 @@ function snapshot({
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
   if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
+  if (environmentSetupJson !== undefined) result.environmentSetupJson = environmentSetupJson;
   return result;
 }
 
@@ -223,7 +225,9 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "workflow-mode", "prompt-fields",
+    "environment-setup-fields", "environment-setup-json", "environment-setup-python",
+    "environment-setup-generate", "environment-setup-success", "environment-setup-error",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
     "repository-config-add", "repository-config-list", "repository-config-message",
@@ -4055,4 +4059,61 @@ test("local family click invalidates pending external navigation", async () => {
   await click;
   assert.equal(app.location.href, "http://127.0.0.1:8765/");
   assert.equal(local.href, `/?run=${"a".repeat(32)}-2`);
+});
+
+test("Environment Setup generates, submits, and restores an ordinary Run", async () => {
+  const source = JSON.stringify({mode: "environment-setup", repository: "/repo", revision: "main", environment_agent: "codex", timeout: 120});
+  const generatedCode = "print('setup')";
+  const calls = [];
+  const running = snapshot({runId: 9, state: "running", stdout: "", mode: "environment-setup", code: generatedCode, environmentSetupJson: source});
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/environment-setup/generate") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({generatedCode, revisionValidation: "verified"});
+      }
+      if (["/api/validate", "/api/dry-run"].includes(url)) {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({validation: [], outline: ["Environment Setup"], dryRun: {status: "complete", findings: [], nextMutation: null}});
+      }
+      if (url === "/api/run") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response(running, 202);
+      }
+      return undefined;
+    },
+  });
+  await elements["environment-setup-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Environment Setup Guide");
+  elements["environment-setup-json"].value = source;
+  await elements["environment-setup-generate"].dispatch("click");
+  assert.equal(elements["environment-setup-python"].value, generatedCode);
+  assert.equal(elements["environment-setup-success"].hidden, false);
+  await elements.validate.dispatch("click");
+  await elements["dry-run"].dispatch("click");
+  await elements.run.dispatch("click");
+  assert.deepEqual(calls.at(-1), ["/api/run", {code: generatedCode, args: [], environmentSetupJson: source}]);
+  assert.match(elements["active-context"].textContent, /Environment Setup Run #9/);
+  assert.equal(elements["environment-setup-json"].value, source);
+  assert.equal(elements["environment-setup-json"].readOnly, true);
+  assert.equal(elements.stop.disabled, false);
+  assert.deepEqual(calls.filter(([url]) => url === "/api/validate" || url === "/api/dry-run").map(([url, body]) => [url, body]), [
+    ["/api/validate", {code: generatedCode, args: []}],
+    ["/api/dry-run", {code: generatedCode, args: []}],
+  ]);
+});
+
+test("Environment Setup generation errors clear stale generated Python", async () => {
+  const {elements} = await loadApp({runs: [], details: {}, validation: {body: {}, status: 200}, fetchOverride(url) {
+    if (url === "/api/environment-setup/generate") return response({error: "invalid revision"}, 422);
+    return undefined;
+  }});
+  await elements["environment-setup-mode"].dispatch("click");
+  elements["environment-setup-python"].value = "old code";
+  elements["environment-setup-json"].value = "{}";
+  await elements["environment-setup-json"].dispatch("input");
+  assert.equal(elements["environment-setup-python"].value, "");
+  await elements["environment-setup-generate"].dispatch("click");
+  assert.equal(elements["environment-setup-error"].textContent, "invalid revision");
 });
