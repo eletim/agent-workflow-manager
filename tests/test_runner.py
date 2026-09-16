@@ -3587,6 +3587,42 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         assert f'id="{element_id}"' in page
 
 
+def test_environment_setup_generation_api(
+    web_server: tuple[tuple[str, int], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from purplemux_client import web
+    from purplemux_client.environment_setup import EnvironmentSetupInput
+
+    def parse(source: str) -> EnvironmentSetupInput:
+        if source != "valid":
+            raise ValueError("invalid environment setup")
+        return EnvironmentSetupInput("/source/repo", "main", "codex", 120)
+
+    monkeypatch.setattr(web, "parse_environment_setup_json", parse)
+    address, token = web_server
+    status, generated = request(
+        address,
+        "POST",
+        "/api/environment-setup/generate",
+        json.dumps({"json": "valid"}),
+        token=token,
+    )
+    assert status == 200
+    assert generated["config"]["revision"] == "main"
+    assert generated["revisionValidation"] == "verified"
+    ast.parse(generated["generatedCode"])
+
+    status, rejected = request(
+        address,
+        "POST",
+        "/api/environment-setup/generate",
+        json.dumps({"json": "invalid"}),
+        token=token,
+    )
+    assert status == 422
+    assert rejected == {"error": "invalid environment setup"}
+
+
 def test_issue_driven_generation_api_is_distinct_from_python_validation(
     web_server: tuple[tuple[str, int], str],
 ) -> None:

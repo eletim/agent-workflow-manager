@@ -28,6 +28,7 @@ class RuntimeRunner:
     def __init__(self, mode: str = "success") -> None:
         self.mode = mode
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.tabs: dict[str, dict[str, object]] = {}
         self.workspaces: dict[str, dict[str, object]] = {}
         self.sent: list[str] = []
@@ -43,6 +44,7 @@ class RuntimeRunner:
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         self.calls.append(command)
+        self.timeouts.append(timeout)
         if command[1:] == ["workspaces"]:
             return self.done({"workspaces": list(self.workspaces.values())})
         if command[1:3] == ["tab", "list"]:
@@ -582,6 +584,26 @@ def test_workspace_creation_lost_response_retains_unresolved_initial_tab(
         len([call for call in runner.calls if call[1:3] == ["workspace", "create"]])
         == 1
     )
+
+
+def test_workspace_deadline_only_limits_create_command(tmp_path: Path) -> None:
+    runner = RuntimeRunner()
+    runtime = PurpleMuxRuntime(runner=runner, command_timeout_seconds=30)
+
+    runtime.create_workspace(
+        CreateWorkspaceRequest(
+            str(tmp_path), "Version work", "corr-1", deadline_check=lambda: 0.5
+        )
+    )
+
+    create_index = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if call[1:3] == ["workspace", "create"]
+    )
+    assert runner.timeouts[create_index] == 0.5
+    assert runtime.command_timeout_seconds == 30
+    assert runner.timeouts[create_index + 1] == 30
 
 
 def test_owned_workspace_registers_initial_tab_in_one_atomic_event(

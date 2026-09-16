@@ -16,6 +16,10 @@ from urllib.parse import parse_qs, urlparse
 import qrcode
 from qrcode.image.svg import SvgPathImage
 
+from purplemux_client.environment_setup import (
+    generate_environment_setup_workflow,
+    parse_environment_setup_json,
+)
 from purplemux_client.errors import TerminalSessionError
 from purplemux_client.external_targets import ExternalTargetSettings
 from purplemux_client.issue_driven import (
@@ -778,6 +782,32 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     "config": config.as_json(),
                     "generatedCode": code,
                     "issueDrivenValidation": [],
+                },
+            )
+            return
+        if path == "/api/environment-setup/generate":
+            payload = self._read_json()
+            if payload is None:
+                return
+            source = payload.get("json")
+            if not isinstance(source, str) or set(payload) != {"json"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain only a JSON source string"},
+                )
+                return
+            try:
+                config = parse_environment_setup_json(source)
+                code = generate_environment_setup_workflow(config)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "config": config.as_json(),
+                    "revisionValidation": config.revision_validation,
+                    "generatedCode": code,
                 },
             )
             return
