@@ -920,6 +920,36 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         {"error": "code does not match environmentSetupJson"},
                     )
                     return
+            review_json = payload.get("reviewJson")
+            if "reviewJson" in payload:
+                if (
+                    path != "/api/run"
+                    or not isinstance(review_json, str)
+                    or "issueDrivenJson" in payload
+                    or "environmentSetupJson" in payload
+                ):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "reviewJson is supported only for Run and must be a string"
+                        },
+                    )
+                    return
+                try:
+                    review_code = generate_review_workflow(
+                        parse_review_json(review_json)
+                    )
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)}
+                    )
+                    return
+                if review_code != code:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "code does not match reviewJson"},
+                    )
+                    return
             try:
                 if path == "/api/validate":
                     result = self.server.runner.validate(code, args=args)
@@ -946,6 +976,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     args=args,
                     issue_driven_json=issue_driven_json,
                     environment_setup_json=environment_setup_json,
+                    review_json=review_json,
                     parent_identity=payload.get("parentRun"),
                 )
             except ValueError as exc:
