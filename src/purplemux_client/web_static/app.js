@@ -2,9 +2,16 @@ const code = document.querySelector("#code");
 const runArguments = document.querySelector("#run-arguments");
 const promptModeButton = document.querySelector("#prompt-mode");
 const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
+const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
+const environmentSetupFields = document.querySelector("#environment-setup-fields");
+const environmentSetupJson = document.querySelector("#environment-setup-json");
+const environmentSetupPython = document.querySelector("#environment-setup-python");
+const environmentSetupGenerate = document.querySelector("#environment-setup-generate");
+const environmentSetupSuccess = document.querySelector("#environment-setup-success");
+const environmentSetupError = document.querySelector("#environment-setup-error");
 const workflowFields = document.querySelector("#workflow-fields");
 const issueDrivenJson = document.querySelector("#issue-driven-json");
 const issueDrivenPython = document.querySelector("#issue-driven-python");
@@ -150,6 +157,7 @@ let promptDraft = {
   prompt: promptText.value,
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
 // The last detail response accepted for the selected run. This is the only
@@ -164,6 +172,7 @@ let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
 let issueDrivenRequestGeneration = 0;
+let environmentSetupRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
@@ -370,6 +379,8 @@ function applyFieldMode() {
   promptText.readOnly = !drafting;
   issueDrivenJson.readOnly = !drafting;
   issueDrivenGenerate.disabled = !drafting;
+  environmentSetupJson.readOnly = !drafting;
+  environmentSetupGenerate.disabled = !drafting;
   repositoryConfigAdd.disabled = !drafting;
   directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
@@ -382,14 +393,17 @@ function applyFieldMode() {
 function applyModeVisibility() {
   const promptMode = currentMode === "prompt";
   const issueDrivenMode = currentMode === "issue-driven";
+  const environmentSetupMode = currentMode === "environment-setup";
   promptFields.hidden = !promptMode;
   issueDrivenFields.hidden = !issueDrivenMode;
-  workflowFields.hidden = promptMode || issueDrivenMode;
+  environmentSetupFields.hidden = !environmentSetupMode;
+  workflowFields.hidden = promptMode || issueDrivenMode || environmentSetupMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
-  guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide" : "Workflow Guide";
+  guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide"
+    : environmentSetupMode ? "Environment Setup Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
   dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
   outlinePanel.hidden = promptMode || outlinePanel.hidden;
@@ -397,14 +411,16 @@ function applyModeVisibility() {
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
   issueDrivenModeButton.className = issueDrivenMode ? "selected" : "";
-  workflowModeButton.className = !promptMode && !issueDrivenMode ? "selected" : "";
+  environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
+  workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
-  workflowModeButton.setAttribute("aria-pressed", String(!promptMode && !issueDrivenMode));
+  environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
+  workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
 }
 
 function showDraftLabel() {
-  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", workflow: "Python Workflow"}[currentMode];
+  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", workflow: "Python Workflow"}[currentMode];
   activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
 }
 
@@ -419,6 +435,8 @@ function captureDraftIfEditing() {
         cwd: promptCwd.value,
         prompt: promptText.value,
       };
+    } else if (currentMode === "environment-setup") {
+      environmentSetupDraft = {json: environmentSetupJson.value, code: environmentSetupPython.value};
     } else if (currentMode === "issue-driven") {
       issueDrivenDraft = {json: issueDrivenJson.value, code: issueDrivenPython.value};
     } else {
@@ -498,6 +516,8 @@ function renderCleanDraftState() {
   validation.replaceChildren();
   issueDrivenSuccess.hidden = true;
   issueDrivenValidation.replaceChildren();
+  environmentSetupSuccess.hidden = true;
+  environmentSetupError.hidden = true;
 }
 
 function runPresentation(run) {
@@ -519,7 +539,7 @@ function renderRun(result) {
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
-  currentMode = ["prompt", "issue-driven"].includes(result.mode)
+  currentMode = ["prompt", "issue-driven", "environment-setup"].includes(result.mode)
     ? result.mode
     : "workflow";
   const running = result.state === "running";
@@ -569,6 +589,9 @@ function renderRun(result) {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
       promptText.value = result.prompt?.prompt || "";
+    } else if (currentMode === "environment-setup") {
+      environmentSetupJson.value = result.environmentSetupJson || "";
+      environmentSetupPython.value = result.code ?? "";
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = result.issueDrivenJson || "";
       issueDrivenPython.value = result.code ?? "";
@@ -579,6 +602,7 @@ function renderRun(result) {
     const modeLabel = {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
+      "environment-setup": "Environment Setup",
       workflow: "Workflow",
     }[currentMode];
     const resumeLabel = result.resumedFromRunId == null
@@ -792,6 +816,9 @@ async function enterDraftMode(mode = currentMode) {
       promptAgent.value = promptDraft.agent;
       promptCwd.value = promptDraft.cwd;
       promptText.value = promptDraft.prompt;
+    } else if (currentMode === "environment-setup") {
+      environmentSetupJson.value = environmentSetupDraft.json;
+      environmentSetupPython.value = environmentSetupDraft.code;
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = issueDrivenDraft.json;
       issueDrivenPython.value = issueDrivenDraft.code;
@@ -897,6 +924,7 @@ function renderRunList(runs, cleanupOwnership = []) {
     const mode = {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
+      "environment-setup": "Environment Setup",
       workflow: "Workflow",
     }[run.mode] || "Workflow";
     const executionRoot = run.mode === "prompt"
@@ -1372,6 +1400,13 @@ function renderRepository(repository) {
 }
 
 function selectedGuide() {
+  if (currentMode === "environment-setup") {
+    return {
+      key: "environment-setup",
+      path: "/environment-setup-guide.md",
+      title: "Environment Setup Guide",
+    };
+  }
   if (currentMode === "issue-driven") {
     return {
       key: "issue-driven",
@@ -1805,18 +1840,73 @@ async function generateIssueDrivenCode() {
   }
 }
 
-async function workflowSubmissionPayload(includeIssueDrivenSettings = false) {
+async function workflowSubmissionPayload(includeSourceSettings = false) {
+  if (currentMode === "environment-setup") {
+    const source = environmentSetupJson.value;
+    const payload = {code: await generateEnvironmentSetupCode(), args: []};
+    if (includeSourceSettings) payload.environmentSetupJson = source;
+    return payload;
+  }
   if (currentMode === "issue-driven") {
     const source = issueDrivenJson.value;
     const payload = {
       code: await generateIssueDrivenCode(),
       args: [],
     };
-    if (includeIssueDrivenSettings) payload.issueDrivenJson = source;
+    if (includeSourceSettings) payload.issueDrivenJson = source;
     return payload;
   }
   return {code: code.value, ...executionContextPayload()};
 }
+
+async function generateEnvironmentSetupCode() {
+  const requestGeneration = ++environmentSetupRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
+  const source = environmentSetupJson.value;
+  try {
+    const result = await request("/api/environment-setup/generate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({json: source}),
+    });
+    if (requestGeneration === environmentSetupRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "environment-setup"
+      && environmentSetupJson.value === source) {
+      environmentSetupPython.value = result.generatedCode;
+      environmentSetupDraft = {json: source, code: result.generatedCode};
+      environmentSetupSuccess.hidden = false;
+      environmentSetupError.hidden = true;
+    }
+    return result.generatedCode;
+  } catch (error) {
+    if (requestGeneration === environmentSetupRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "environment-setup"
+      && environmentSetupJson.value === source) {
+      environmentSetupSuccess.hidden = true;
+      environmentSetupError.hidden = false;
+      environmentSetupError.textContent = error.result?.error || String(error);
+    }
+    throw error;
+  }
+}
+
+environmentSetupGenerate.addEventListener("click", async () => {
+  if (activeRunId !== null) return;
+  await withPendingButton(environmentSetupGenerate, async () => {
+    try { await generateEnvironmentSetupCode(); }
+    catch (error) { if (!error.result?.error) stderr.textContent = String(error); }
+  }, applyFieldMode);
+});
+
+environmentSetupJson.addEventListener("input", () => {
+  environmentSetupRequestGeneration += 1;
+  environmentSetupPython.value = "";
+  environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
+  environmentSetupSuccess.hidden = true;
+  environmentSetupError.hidden = true;
+});
 
 issueDrivenGenerate.addEventListener("click", async () => {
   if (activeRunId !== null) return;
@@ -2015,6 +2105,10 @@ promptModeButton.addEventListener("click", async () => {
 
 workflowModeButton.addEventListener("click", async () => {
   await enterDraftMode("workflow");
+});
+
+environmentSetupModeButton.addEventListener("click", async () => {
+  await enterDraftMode("environment-setup");
 });
 
 issueDrivenModeButton.addEventListener("click", async () => {

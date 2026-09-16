@@ -69,6 +69,13 @@ every prompt.
 
 ## Environment Setup inputs
 
+The UI offers an Environment Setup mode. Enter the declaration, select
+**Validate JSON & Generate** to inspect its Python, then use the usual
+Validate, Dry Run, and Run buttons. Run submits the generated Python and
+the original declaration to `/api/run`; Progress, Stop, Result, and history
+are the ordinary Run surfaces. History retains the declaration and generated
+Python.
+
 `POST /api/environment-setup/generate` accepts `{"json": "..."}` with an
 `environment-setup` declaration. Required fields are `mode`, `repository`
 (an existing local Git repository), `revision` (an existing `origin` branch or
@@ -106,9 +113,14 @@ execution and readiness summaries. A `BLOCKED` result includes
 Run can inspect the available evidence and decide how to proceed.
 When the full result exceeds the Run output limit, histories are shortened to
 recent attempts with omission counts, then bulky logs are reduced as needed.
-These inputs describe the environment;
-they are not a steps language. Submit `generatedCode` to the existing Workflow
-validation and Run endpoints to execute it.
+These inputs describe the environment; they are not a steps language.
+API clients submit `generatedCode` to the existing Workflow validation and
+Dry Run endpoints, then submit `{"code": generatedCode, "args": [],
+"environmentSetupJson": originalJson}` to `/api/run`. A Run submission
+rejects a declaration whose generated code differs from `code`. The Run result
+is the JSON value on stdout described above; its Run state and exit code report
+workflow execution, while `status` in that JSON reports environment readiness.
+A stopped Run may end without a complete readiness JSON result.
 
 ## Issue Driven mode
 
