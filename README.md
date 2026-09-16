@@ -67,6 +67,20 @@ record. Give each agent only the portion of human context and recorded decisions
 needed for its current role instead of accumulating every available artifact in
 every prompt.
 
+## Environment Setup inputs
+
+`POST /api/environment-setup/generate` accepts `{"json": "..."}` with an
+`environment-setup` declaration. Required fields are `mode`, `repository`
+(an existing local Git repository), `revision` (an existing `origin` branch),
+`environment_agent` (`codex` or `claude-code`), and `timeout` (1–86400 seconds).
+Optional non-empty strings are `build`, `start`, and `ready_check`. The endpoint
+validates the inputs and returns the normalized configuration and generated
+plain Python Workflow. The generated workflow prepares a detached worktree,
+asks the selected agent to set up the environment and run the supplied commands,
+and waits within the declared timeout. These inputs describe the environment;
+they are not a steps language. Submit `generatedCode` to the existing Workflow
+validation and Run endpoints to execute it.
+
 ## Issue Driven mode
 
 The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts
