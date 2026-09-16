@@ -199,6 +199,7 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                 if exclude_git and current == str(root):
                     directories[:] = [name for name in directories if name != ".git"]
                     files[:] = [name for name in files if name != ".git"]
+                directories.sort()
                 for name in sorted(directories + files):
                     path = Path(current) / name
                     entry(path, path.relative_to(root))
@@ -241,30 +242,8 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
 
         tree(Path(repository), exclude_git=True)
         for admin_dir in dict.fromkeys((git_dir, common_dir)):
-            for relative in (
-                "config",
-                "config.worktree",
-                "info/exclude",
-                "HEAD",
-                "packed-refs",
-                "refs",
-                "hooks",
-                "index",
-                "shallow",
-                "objects",
-            ):
-                path = admin_dir / relative
-                field(digest, os.fsencode(admin_dir))
-                field(digest, relative.encode())
-                try:
-                    path.lstat()
-                except FileNotFoundError:
-                    field(digest, b"absent")
-                    continue
-                if path.is_dir() and not path.is_symlink():
-                    tree(path)
-                else:
-                    entry(path, Path(relative))
+            field(digest, os.fsencode(admin_dir))
+            tree(admin_dir)
         snapshots.append(digest.hexdigest())
     return tuple(snapshots)
 

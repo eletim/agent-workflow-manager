@@ -375,6 +375,34 @@ def test_review_snapshot_detects_git_object_write(
     assert snapshot_review_repositories((str(repository),)) != baseline
 
 
+def test_review_snapshot_detects_reflog_expiration(
+    repositories: tuple[Path, Path],
+) -> None:
+    repository = repositories[0]
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Review Test",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    baseline = snapshot_review_repositories((str(repository),))
+    subprocess.run(
+        ["git", "-C", str(repository), "reflog", "expire", "--expire=now", "--all"],
+        check=True,
+    )
+    assert snapshot_review_repositories((str(repository),)) != baseline
+
+
 def test_generated_review_reports_repository_change(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
