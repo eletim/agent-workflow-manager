@@ -64,7 +64,7 @@ def test_generates_python_from_declarative_inputs(
     assert "Ready check command: curl http://localhost:8000/health" in code
     assert "exactly as given" in code
     assert "before considering any alternative" in code
-    assert "Verify that the target is actually usable" in code
+    assert "execute_environment_setup_commands(" in code
     assert "steps" not in config.as_json()
 
 
@@ -93,7 +93,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
     assert "Start command:" not in code
     assert "Ready check command:" not in code
     assert "Skip instructions that were omitted" in code
-    assert "If no commands were supplied" in code
+    assert "even if all were omitted" in code
     assert set(config.as_json()) == {
         "mode",
         "repository",
@@ -114,18 +114,18 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            "did not report verified READY",
+            "did not prepare the target",
         ),
         (
             {
                 "status": "READY",
-                "summary": "build failed",
-                "checks": {"build": "failed"},
-                "verification": "service responded",
+                "summary": "ready",
+                "checks": {"build": "passed"},
+                "verification": "ok",
             },
             False,
             False,
-            "did not report verified READY",
+            "needs a usability check command",
         ),
         (None, True, False, "timed out while the agent was busy"),
         (
@@ -134,6 +134,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "summary": "ready",
                 "checks": {"build": "passed"},
                 "verification": "service responded successfully",
+                "verification_command": "printf usable; test -d .",
                 "resolved_revision": "unverified",
                 "working_path": "/wrong/path",
             },
@@ -147,21 +148,17 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "summary": "ready",
                 "checks": {"build": "passed"},
                 "verification": "service responded successfully",
+                "verification_command": "printf usable; test -d .",
             },
             False,
             True,
             "Environment Setup timed out",
         ),
-        (
-            {"status": "READY", "summary": "ready", "checks": {"build": "passed"}},
-            False,
-            False,
-            "did not report verified READY",
-        ),
     ],
 )
 def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     report: dict[str, object] | None,
     busy_timeout: bool,
     late_completion: bool,
@@ -212,9 +209,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     monkeypatch.setattr(
         purplemux_client,
         "prepare_run_revision",
-        lambda **_kwargs: SimpleNamespace(
-            execution_root=Path("/tmp/environment-setup"), base_sha="a" * 40
-        ),
+        lambda **_kwargs: SimpleNamespace(execution_root=tmp_path, base_sha="a" * 40),
     )
     monkeypatch.setattr(
         purplemux_client,
@@ -223,7 +218,11 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     )
     code = setup.generate_environment_setup_workflow(
         setup.EnvironmentSetupInput(
-            "/source/repo", "main", "codex", 1 if late_completion else 120, build="make"
+            "/source/repo",
+            "main",
+            "codex",
+            1 if late_completion else 120,
+            build="printf built",
         )
     )
     output = StringIO()
@@ -232,7 +231,9 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             exec(compile(code, "<environment-setup>", "exec"), {})
         result = json.loads(output.getvalue())
         assert result["resolved_revision"] == "a" * 40
-        assert result["working_path"] == "/tmp/environment-setup"
+        assert result["working_path"] == str(tmp_path)
+        assert result["checks"]["build"]["output"] == "built"
+        assert result["verification"]["output"] == "usable"
     else:
         with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
             with redirect_stdout(output):

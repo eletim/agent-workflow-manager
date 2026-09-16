@@ -110,12 +110,11 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     instructions = [
         "Set up the repository at the selected revision for development.",
         "Work only in the supplied execution directory.",
-        "Run each supplied build, start, and ready_check command exactly as given, "
-        "in that order, before considering any alternative. Do not substitute a "
-        "different command for the first attempt. Skip instructions that were "
-        "omitted. If a command fails, inspect the repository and logs, correct "
-        "the environment, and retry. Report BLOCKED if the environment cannot "
-        "be made ready.",
+        "Prepare prerequisites for the supplied commands. The workflow will run "
+        "each supplied build, start, and ready_check command exactly as given, "
+        "in that order, before considering any alternative. Do not run or "
+        "substitute these commands yourself. Skip instructions that were omitted. "
+        "Report BLOCKED if the environment cannot be prepared.",
     ]
     for label, command in (
         ("Build", config.build),
@@ -124,23 +123,16 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     ):
         if command is not None:
             instructions.append(f"{label} command: {command}")
-    expected_checks = {
-        name: "passed"
-        for name in ("build", "start", "ready_check")
-        if getattr(config, name) is not None
-    }
     instructions.extend(
         (
-            "Verify that the target is actually usable in the prepared worktree. "
-            "Observe a relevant successful behavior, including the ready_check "
-            "result when one was supplied. If no commands were supplied, still "
-            "perform a concrete usability check. Report the observed evidence "
-            "in a non-empty verification string.",
+            "If no ready_check was supplied, include a non-empty "
+            "verification_command that exercises the target's intended use; "
+            "a trivial always-successful command is insufficient. The workflow "
+            "will execute it after the supplied commands, even if all were omitted.",
             "Return only one JSON object with status READY or BLOCKED, a non-empty "
-            "summary, a checks object, and verification. Include each supplied command in checks "
-            "with passed or failed. Use READY only after every supplied command "
-            "passes and the target is verified usable. Include observed errors "
-            "in a BLOCKED summary.",
+            "summary, and verification_command when required. READY means "
+            "preparation is complete; the workflow will decide final readiness "
+            "from observed command outcomes. Include errors in a BLOCKED summary.",
         )
     )
     prompt = "\n".join(instructions)
@@ -154,9 +146,9 @@ from purplemux_client import (
     emit_step,
     prepare_run_revision,
 )
+from purplemux_client.environment_setup_execution import execute_environment_setup_commands
 
 WORKFLOW_OUTLINE = ["Environment Setup"]
-EXPECTED_CHECKS = {expected_checks!r}
 REVISION_VALIDATION = {config.revision_validation!r}
 
 
@@ -216,15 +208,23 @@ try:
         or report.get("status") != "READY"
         or not isinstance(report.get("summary"), str)
         or not report["summary"].strip()
-        or not isinstance(report.get("verification"), str)
-        or not report["verification"].strip()
-        or report.get("checks") != EXPECTED_CHECKS
     ):
-        raise RuntimeError("Environment Setup did not report verified READY")
+        raise RuntimeError("Environment Setup agent did not prepare the target")
+    checks, verification = execute_environment_setup_commands(
+        build={config.build!r}, start={config.start!r},
+        ready_check={config.ready_check!r},
+        verification_command=report.get("verification_command"),
+        cwd=cwd, remaining=remaining,
+    )
     remaining()
-    report["resolved_revision"] = context.base_sha
-    report["working_path"] = cwd
-    print(json.dumps(report))
+    print(json.dumps({{
+        "status": "READY",
+        "summary": report["summary"],
+        "checks": checks,
+        "verification": verification,
+        "resolved_revision": context.base_sha,
+        "working_path": cwd,
+    }}))
 except BaseException as exc:
     interrupt_error = None
     if isinstance(exc, TimeoutError) and turn_active and client is not None and tab is not None:

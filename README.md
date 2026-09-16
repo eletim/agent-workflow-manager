@@ -79,14 +79,13 @@ validates the inputs and returns the normalized configuration, a
 `revisionValidation` status, and generated plain Python Workflow. A remote tag
 whose object is not available locally is marked `provisional`; the Workflow
 verifies that it points to a commit after fetching it. The generated workflow
-prepares a detached worktree,
-asks the selected agent to set up the environment and run the supplied commands,
-running each supplied command as given before considering alternatives. Omitted
-commands are skipped. The declared timeout applies to preparation, session
-creation, and agent execution. The agent must verify that the target is usable
-and return a JSON `READY` result with observed `verification` evidence and a
-passing check for each supplied command; `BLOCKED`, failed checks, missing
-verification, and unstructured results fail the Run. A busy agent is
+prepares a detached worktree and asks the selected agent to prepare it. The
+workflow then runs each supplied build, start, and ready check command as given,
+in order. Omitted commands are skipped. If no ready check is supplied, the agent
+provides a usability check command for the workflow to run. The declared timeout
+applies to preparation, session creation, agent execution, and commands. The
+workflow records command outcomes and bounded output from completed checks, and accepts
+`READY` only when the commands and usability check succeed. A busy agent is
 interrupted at timeout.
 On success, the workflow adds the verified commit SHA as `resolved_revision` and
 the detached worktree as `working_path` to the JSON result.
