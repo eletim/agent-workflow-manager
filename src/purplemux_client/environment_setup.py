@@ -183,6 +183,9 @@ def serialize_environment_setup_result(result: dict[str, Any]) -> str:
         "summary": str(result.get("summary", ""))[:4096],
         "execution_summary": str(result.get("execution_summary", ""))[:4096],
         "readiness_summary": str(result.get("readiness_summary", ""))[:4096],
+        "endpoint_report_error": str(result.get("endpoint_report_error", ""))[:4096]
+        if result.get("endpoint_report_error")
+        else None,
         "resolved_revision": result.get("resolved_revision"),
         "working_path": result.get("working_path"),
         "connection": deepcopy(result.get("connection", {})),
@@ -199,7 +202,7 @@ def serialize_environment_setup_result(result: dict[str, Any]) -> str:
             "failed_stage": facts.get("failed_stage"),
             "agent_reports": [
                 {
-                    "status": report.get("status"),
+                    "status": str(report.get("status", ""))[:64],
                     "summary": str(report.get("summary", ""))[:4096],
                 }
                 for report in facts.get("agent_reports", [])[-1:]
@@ -212,12 +215,39 @@ def serialize_environment_setup_result(result: dict[str, Any]) -> str:
             "agent_reports": max(0, len(facts.get("agent_reports", [])) - 1),
         },
     }
+
+    def bound_fields(value: Any) -> Any:
+        if isinstance(value, str):
+            return value[:4096]
+        if isinstance(value, list):
+            return [bound_fields(item) for item in value[-4:]]
+        if isinstance(value, dict):
+            return {
+                str(key)[:128]: bound_fields(item)
+                for key, item in list(value.items())[:24]
+            }
+        return value
+
+    fallback = bound_fields(fallback)
+    # Preserve usable connection details and paths exactly when they fit.
+    fallback["working_path"] = result.get("working_path")
+    fallback["connection"] = deepcopy(result.get("connection", {}))
     payload = json.dumps(fallback)
-    if len(payload) > max_chars and "endpoint" in fallback["connection"]:
-        fallback["connection"].pop("endpoint")
-        fallback["connection_details_omitted"] = (
-            "Endpoint exceeded the result size limit"
-        )
+    if len(payload) > max_chars:
+        omitted = []
+        for key, value in list(fallback["connection"].items()):
+            if len(payload) <= max_chars:
+                break
+            if isinstance(value, str) and len(value) > 4096:
+                fallback["connection"].pop(key)
+                omitted.append(key)
+                payload = json.dumps(fallback)
+        if omitted:
+            fallback["connection_details_omitted"] = omitted
+            payload = json.dumps(fallback)
+    if len(payload) > max_chars and isinstance(fallback["working_path"], str):
+        fallback["working_path"] = None
+        fallback["working_path_error"] = "Path exceeded the result size limit"
         payload = json.dumps(fallback)
     return payload
 
@@ -318,6 +348,7 @@ agent_reports = []
 report = None
 result = None
 current_attempt = None
+endpoint_report_error = None
 try:
     deadline = time.monotonic() + {config.timeout}
     context = prepare_run_revision(
@@ -400,6 +431,7 @@ try:
             turn_limit=30,
         )
     except Exception as endpoint_error:
+        endpoint_report_error = f"Endpoint inspection failed: {{str(endpoint_error)[:4096]}}"
         if turn_active:
             try:
                 client.interrupt(tab)
@@ -410,17 +442,24 @@ try:
                 ) from interruption
             turn_active = False
     else:
-        agent_reports.append(endpoint_report)
-        if endpoint_report.get("status") == "BLOCKED":
+        endpoint_status = endpoint_report.get("status")
+        if endpoint_status == "BLOCKED":
+            agent_reports.append(endpoint_report)
             raise RuntimeError(
                 f"Environment Setup agent blocked: {{endpoint_report['summary']}}"
             )
+        if endpoint_status == "READY":
+            agent_reports.append(endpoint_report)
+        else:
+            endpoint_report_error = "Environment Setup final agent returned an invalid status"
     result = {{
         "status": "READY",
         "summary": report["summary"],
         "execution_summary": "All supplied commands completed successfully.",
         "readiness_summary": "The usability check succeeded.",
     }}
+    if endpoint_report_error is not None:
+        result["endpoint_report_error"] = endpoint_report_error
 except BaseException as exc:
     if current_attempt is not None:
         checks.update(current_attempt.get("checks", {{}}))
@@ -467,7 +506,7 @@ result.update({{
     "verification": verification,
     "attempts": attempts,
 }})
-last_report = agent_reports[-1] if agent_reports else None
+last_report = agent_reports[-1] if agent_reports and result["status"] == "READY" else None
 if last_report is not None:
     endpoint = last_report.get("endpoint")
     if isinstance(endpoint, str) and endpoint.strip():

@@ -210,6 +210,26 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             False,
             "agent interruption failed: cannot stop agent",
         ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata missing status",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata unexpected status",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
+        ),
     ],
 )
 def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
@@ -261,6 +281,19 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
 
         def read_result(self, _tab: str) -> str:
             self.reads += 1
+            if (
+                self.reads > 1
+                and report is not None
+                and report.get("summary")
+                in {"metadata missing status", "metadata unexpected status"}
+            ):
+                final_report = {
+                    "summary": "endpoint found",
+                    "endpoint": "http://unverified.example",
+                }
+                if report.get("summary") == "metadata unexpected status":
+                    final_report["status"] = "UNKNOWN"
+                return json.dumps(final_report)
             if (
                 self.reads > 1
                 and report is not None
@@ -359,8 +392,17 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         assert result["status"] == "READY"
         if report is not None and report.get("summary") in {
             "metadata timeout",
+            "metadata missing status",
+            "metadata unexpected status",
         }:
             assert result["summary"] == report["summary"]
+        if report is not None and report.get("summary") in {
+            "metadata missing status",
+            "metadata unexpected status",
+        }:
+            assert result["endpoint_report_error"] == (
+                "Environment Setup final agent returned an invalid status"
+            )
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
         expected_connection = {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
@@ -564,7 +606,7 @@ def test_oversized_agent_report_keeps_result_contract() -> None:
         ],
         "observed_facts": {
             "error": "build failed",
-            "agent_reports": [{"summary": "x" * 1_100_000}],
+            "agent_reports": [{"status": "x" * 1_100_000, "summary": "too large"}],
         },
     }
     payload = setup.serialize_environment_setup_result(result)
@@ -589,3 +631,4 @@ def test_oversized_agent_report_keeps_result_contract() -> None:
     assert decoded["connection"] == result["connection"]
     assert decoded["working_path"] == result["working_path"]
     assert decoded["process"]["tab_id"] == "tab-1"
+    assert len(decoded["observed_facts"]["agent_reports"][0]["status"]) <= 64
