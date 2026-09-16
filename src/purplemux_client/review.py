@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,16 +84,23 @@ def parse_review_json(source: str) -> ReviewInput:
         try:
             path = path.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
-            raise ValueError(f"repositories[{index}] cannot be resolved: {exc}") from exc
+            raise ValueError(
+                f"repositories[{index}] cannot be resolved: {exc}"
+            ) from exc
         if not path.is_dir():
             raise ValueError(f"repositories[{index}] must be a directory")
         try:
             command = subprocess.run(
                 ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, timeout=10, check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ValueError(f"repositories[{index}] cannot be inspected: {exc}") from exc
+            raise ValueError(
+                f"repositories[{index}] cannot be inspected: {exc}"
+            ) from exc
         if command.returncode or Path(command.stdout.strip()).resolve() != path:
             raise ValueError(f"repositories[{index}] must be a Git repository root")
         if str(path) in resolved:
@@ -106,10 +116,14 @@ def parse_review_json(source: str) -> ReviewInput:
     timeout = value.get("timeout", 3600)
     if type(timeout) is not int or not 1 <= timeout <= 86400:
         raise ValueError("timeout must be an integer from 1 to 86400 seconds")
-    return ReviewInput(tuple(resolved), check, value.get("start"), value.get("finish"), agent, timeout)
+    return ReviewInput(
+        tuple(resolved), check, value.get("start"), value.get("finish"), agent, timeout
+    )
 
 
-def serialize_review_result(report: dict[str, Any], repositories: tuple[str, ...]) -> str:
+def serialize_review_result(
+    report: dict[str, Any], repositories: tuple[str, ...]
+) -> str:
     """Keep a complete Review JSON value within the runner's stdout limit."""
     summary = report["summary"]
     findings = report.get("findings", [])
@@ -145,13 +159,68 @@ def serialize_review_result(report: dict[str, Any], repositories: tuple[str, ...
     return payload
 
 
+def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ...]:
+    """Fingerprint Git state and file contents, including ignored and untracked files."""
+    snapshots = []
+    for repository in repositories:
+        digest = hashlib.sha256()
+        for args in (
+            ("rev-parse", "HEAD"),
+            ("symbolic-ref", "-q", "HEAD"),
+            ("show-ref",),
+            ("ls-files", "--stage", "-z"),
+        ):
+            result = subprocess.run(
+                ["git", "-C", repository, *args],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            digest.update(str(result.returncode).encode())
+            digest.update(result.stdout)
+            if result.returncode and args[0] == "ls-files":
+                raise RuntimeError(
+                    f"Could not inspect Git index in {repository}: {result.stderr.decode(errors='replace')}"
+                )
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        for root, directories, files in os.walk(
+            repository, followlinks=False, onerror=fail_walk
+        ):
+            if root == repository and ".git" in directories:
+                directories.remove(".git")
+            for name in sorted(directories + files):
+                path = Path(root) / name
+                relative = path.relative_to(repository)
+                info = path.lstat()
+                digest.update(os.fsencode(relative))
+                digest.update(b"\0")
+                digest.update(str(stat.S_IMODE(info.st_mode)).encode())
+                if path.is_symlink():
+                    digest.update(b"link")
+                    digest.update(os.fsencode(os.readlink(path)))
+                elif path.is_file():
+                    digest.update(b"file")
+                    with path.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                elif path.is_dir():
+                    digest.update(b"directory")
+                else:
+                    digest.update(b"other")
+        snapshots.append(digest.hexdigest())
+    return tuple(snapshots)
+
+
 def generate_review_workflow(config: ReviewInput) -> str:
     """Place Review sequencing and result checks in visible, plain Python."""
-    return f'''import json
+    return f"""import json
 import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
-from purplemux_client.review import serialize_review_result
+from purplemux_client.review import serialize_review_result, snapshot_review_repositories
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -174,18 +243,30 @@ def busy_timeout(_warning):
 
 def turn(message):
     remaining()
-    client.send_input(tab, message)
-    client.wait_for_turn_completion(tab, remaining(), on_busy_timeout=busy_timeout)
-    remaining()
-    return client.read_result(tab)
+    try:
+        client.send_input(tab, message)
+        client.wait_for_turn_completion(tab, remaining(), on_busy_timeout=busy_timeout)
+        remaining()
+        return client.read_result(tab)
+    finally:
+        verify_repositories()
+
+
+def verify_repositories():
+    current = snapshot_review_repositories(REPOSITORIES)
+    changed = [path for path, before, after in zip(REPOSITORIES, baseline, current) if before != after]
+    if changed:
+        raise RuntimeError("Review repository change detected: " + json.dumps(changed))
 
 
 emit_step("Review", "started")
 deadline = time.monotonic() + {config.timeout}
+baseline = None
 runtime = PurpleMuxRuntime(owned_by_run=True)
 client = None
 tab = None
 try:
+    baseline = snapshot_review_repositories(REPOSITORIES)
     workspace = runtime.create_workspace(CreateWorkspaceRequest(
         cwd=REPOSITORIES[0], name="AWM Review", deadline_check=remaining,
     ))
@@ -195,7 +276,11 @@ try:
         name="Review agent", deadline_check=remaining,
     ))
     client.wait_until_ready(tab, min(remaining(), 60))
-    context = "Review these local repositories: " + json.dumps(REPOSITORIES) + ". Do not modify them. "
+    context = ("Review these local repositories: " + json.dumps(REPOSITORIES)
+               + ". Read and inspect every declared repository as needed, using any available tool. "
+        + "You may operate a browser through any available browser tool; no particular library is required. "
+        + "For read-only observation of an external terminal, use PurpleMux ext-review create --socket PATH --session SESSION --window @ID with a known socket, session, and allowed window targets; open its returned browser URL. "
+               + "Do not modify the repositories or send input to observed external terminals. ")
     if START is not None:
         turn(context + "First, follow this start instruction and report what you did: " + START)
     report = turn(context + "Perform this check: " + CHECK + "\\nReturn a JSON object with verdict PASS, FAIL, or BLOCKED, a non-empty summary, and an optional findings array of strings. Base the verdict on observed evidence.")
@@ -219,4 +304,4 @@ except BaseException as exc:
     raise
 else:
     emit_step("Review", "completed", workspace=workspace.id, tab=tab)
-'''
+"""

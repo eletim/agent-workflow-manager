@@ -16,6 +16,7 @@ from purplemux_client.review import (
     generate_review_workflow,
     parse_review_json,
     serialize_review_result,
+    snapshot_review_repositories,
 )
 from purplemux_client.runner import PythonRunner
 from purplemux_client.web import RunnerHTTPServer
@@ -40,25 +41,37 @@ def declaration(paths: tuple[Path, Path], **changes: object) -> str:
     return json.dumps(value)
 
 
-def test_review_generates_valid_ordinary_workflow(repositories: tuple[Path, Path]) -> None:
+def test_review_generates_valid_ordinary_workflow(
+    repositories: tuple[Path, Path],
+) -> None:
     config = parse_review_json(
-        declaration(repositories, start="Read their README files.", finish="Summarize risks.",
-                    agent="claude-code", timeout=120)
+        declaration(
+            repositories,
+            start="Read their README files.",
+            finish="Summarize risks.",
+            agent="claude-code",
+            timeout=120,
+        )
     )
     assert config.as_json() == {
-        "mode": "review", "repositories": [str(path) for path in repositories],
+        "mode": "review",
+        "repositories": [str(path) for path in repositories],
         "check": "Inspect both repositories for missing error handling.",
-        "start": "Read their README files.", "finish": "Summarize risks.",
-        "agent": "claude-code", "timeout": 120,
+        "start": "Read their README files.",
+        "finish": "Summarize risks.",
+        "agent": "claude-code",
+        "timeout": 120,
     }
     code = generate_review_workflow(config)
     ast.parse(code)
-    assert "WORKFLOW_OUTLINE = [\"Review\"]" in code
+    assert 'WORKFLOW_OUTLINE = ["Review"]' in code
     assert "PurpleMuxRuntime(owned_by_run=True)" in code
     assert "worker=AGENT" in code
     assert "if START is not None:" in code
     assert "if FINISH is not None:" in code
     assert "json.loads(report)" in code
+    assert "any available browser tool" in code
+    assert "PurpleMux ext-review" in code
     runner = PythonRunner(managed_workflows=False)
     try:
         assert runner.validate(code).valid
@@ -83,22 +96,30 @@ def test_review_generates_valid_ordinary_workflow(repositories: tuple[Path, Path
     ],
 )
 def test_review_rejects_bad_inputs(
-    repositories: tuple[Path, Path], changes: dict[str, object], expected: str,
+    repositories: tuple[Path, Path],
+    changes: dict[str, object],
+    expected: str,
 ) -> None:
     with pytest.raises(ValueError, match=expected):
         parse_review_json(declaration(repositories, **changes))
 
 
-def test_review_rejects_duplicate_or_nested_repository(repositories: tuple[Path, Path]) -> None:
+def test_review_rejects_duplicate_or_nested_repository(
+    repositories: tuple[Path, Path],
+) -> None:
     with pytest.raises(ValueError, match="repeat"):
-        parse_review_json(declaration(repositories, repositories=[str(repositories[0])] * 2))
+        parse_review_json(
+            declaration(repositories, repositories=[str(repositories[0])] * 2)
+        )
     nested = repositories[0] / "nested"
     nested.mkdir()
     with pytest.raises(ValueError, match="repository root"):
         parse_review_json(declaration(repositories, repositories=[str(nested)]))
     source = declaration(repositories)
     with pytest.raises(ValueError, match="duplicate fields"):
-        parse_review_json(source.replace('"mode": "review",', '"mode": "review", "mode": "review",'))
+        parse_review_json(
+            source.replace('"mode": "review",', '"mode": "review", "mode": "review",')
+        )
 
 
 def test_review_generation_api_feeds_ordinary_run(
@@ -112,14 +133,21 @@ def test_review_generation_api_feeds_ordinary_run(
     try:
         source = declaration(repositories)
         status, generated = request(
-            address, "POST", "/api/review/generate",
-            json.dumps({"json": source}), token=server.request_token,
+            address,
+            "POST",
+            "/api/review/generate",
+            json.dumps({"json": source}),
+            token=server.request_token,
         )
         assert status == 200
-        assert generated["config"]["repositories"] == [str(path) for path in repositories]
+        assert generated["config"]["repositories"] == [
+            str(path) for path in repositories
+        ]
         assert runner.validate(generated["generatedCode"]).valid
         status, rejected = request(
-            address, "POST", "/api/review/generate",
+            address,
+            "POST",
+            "/api/review/generate",
             json.dumps({"json": declaration(repositories, check="")}),
             token=server.request_token,
         )
@@ -134,7 +162,9 @@ def test_review_generation_api_feeds_ordinary_run(
 
 @pytest.mark.parametrize("oversized", [False, True])
 def test_generated_review_sequences_optional_turns_and_reports_result(
-    repositories: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, oversized: bool,
+    repositories: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    oversized: bool,
 ) -> None:
     import purplemux_client
 
@@ -152,16 +182,22 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
         def send_input(self, _tab: str, message: str) -> None:
             messages.append(message)
 
-        def wait_for_turn_completion(self, _tab: str, _seconds: float, **_kwargs: object) -> None:
+        def wait_for_turn_completion(
+            self, _tab: str, _seconds: float, **_kwargs: object
+        ) -> None:
             pass
 
         def read_result(self, _tab: str) -> str:
             if len(messages) == 2:
-                return json.dumps({
-                    "verdict": "FAIL",
-                    "summary": "Missing handling" if not oversized else "x" * 1_100_000,
-                    "findings": ["A" if not oversized else "y" * 1_100_000],
-                })
+                return json.dumps(
+                    {
+                        "verdict": "FAIL",
+                        "summary": "Missing handling"
+                        if not oversized
+                        else "x" * 1_100_000,
+                        "findings": ["A" if not oversized else "y" * 1_100_000],
+                    }
+                )
             return "done"
 
     client = Client()
@@ -179,12 +215,17 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
     monkeypatch.setattr(
-        purplemux_client, "emit_step",
+        purplemux_client,
+        "emit_step",
         lambda name, state, **_kwargs: steps.append((name, state)),
     )
-    config = parse_review_json(declaration(
-        repositories, start="Survey layout", finish="Summarize findings",
-    ))
+    config = parse_review_json(
+        declaration(
+            repositories,
+            start="Survey layout",
+            finish="Summarize findings",
+        )
+    )
     output = StringIO()
     with redirect_stdout(output):
         exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
@@ -221,3 +262,72 @@ def test_review_result_stays_complete_with_worst_case_json_escaping() -> None:
     assert result["verdict"] == "PASS"
     assert result["truncated"]["repositories"] > 0
     assert result["truncated"]["findings"] == 20
+
+
+def test_review_snapshot_detects_changes_in_every_declared_repository(
+    repositories: tuple[Path, Path],
+) -> None:
+    first, second = repositories
+    (first / "tracked.txt").write_text("before")
+    subprocess.run(["git", "-C", str(first), "add", "tracked.txt"], check=True)
+    (second / ".gitignore").write_text("ignored.txt\n")
+    (second / "ignored.txt").write_text("before")
+    paths = tuple(map(str, repositories))
+    baseline = snapshot_review_repositories(paths)
+    (first / "tracked.txt").write_text("after")
+    assert snapshot_review_repositories(paths)[0] != baseline[0]
+    (first / "tracked.txt").write_text("before")
+    (second / "ignored.txt").write_text("after")
+    assert snapshot_review_repositories(paths)[1] != baseline[1]
+    (second / "untracked.txt").write_text("new")
+    assert snapshot_review_repositories(paths)[1] != baseline[1]
+
+
+def test_generated_review_reports_repository_change(
+    repositories: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import purplemux_client
+
+    steps: list[tuple[str, str, str | None]] = []
+
+    class Client:
+        def create_session(self, _request: object) -> str:
+            return "agent-tab"
+
+        def wait_until_ready(self, _tab: str, _seconds: float) -> None:
+            pass
+
+        def send_input(self, _tab: str, _message: str) -> None:
+            (repositories[1] / "new.txt").write_text("changed")
+
+        def wait_for_turn_completion(
+            self, _tab: str, _seconds: float, **_kwargs: object
+        ) -> None:
+            pass
+
+        def read_result(self, _tab: str) -> str:
+            return json.dumps({"verdict": "PASS", "summary": "Looks good"})
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="review-workspace")
+
+        def workspace(self, _workspace_id: str) -> Client:
+            return Client()
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        purplemux_client,
+        "emit_step",
+        lambda name, state, **kwargs: steps.append((name, state, kwargs.get("error"))),
+    )
+    config = parse_review_json(declaration(repositories))
+    with pytest.raises(RuntimeError, match="Review repository change detected"):
+        exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
+    assert steps[0][:2] == ("Review", "started")
+    assert steps[-1][:2] == ("Review", "failed")
+    assert str(repositories[1]) in (steps[-1][2] or "")
