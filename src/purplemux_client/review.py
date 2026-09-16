@@ -109,12 +109,49 @@ def parse_review_json(source: str) -> ReviewInput:
     return ReviewInput(tuple(resolved), check, value.get("start"), value.get("finish"), agent, timeout)
 
 
+def serialize_review_result(report: dict[str, Any], repositories: tuple[str, ...]) -> str:
+    """Keep a complete Review JSON value within the runner's stdout limit."""
+    summary = report["summary"]
+    findings = report.get("findings", [])
+    result: dict[str, Any] = {
+        "verdict": report["verdict"],
+        "summary": summary[:16384],
+        "findings": [finding[:512] for finding in findings[:100]],
+        "repositories": list(repositories[:32]),
+    }
+    truncated: dict[str, int] = {}
+    if len(summary) > 16384:
+        truncated["summary_chars"] = len(summary) - 16384
+    if len(findings) > 100:
+        truncated["findings"] = len(findings) - 100
+    clipped_findings = sum(len(finding) > 512 for finding in findings[:100])
+    if clipped_findings:
+        truncated["finding_texts"] = clipped_findings
+    omitted_repositories = len(repositories) - len(result["repositories"])
+    if omitted_repositories:
+        truncated["repositories"] = omitted_repositories
+    if truncated:
+        result["truncated"] = truncated
+
+    max_chars = 999_999  # Reserve one character for print's newline.
+    payload = json.dumps(result)
+    while len(payload) > max_chars and result["repositories"]:
+        result["repositories"].pop()
+        truncated["repositories"] = truncated.get("repositories", 0) + 1
+        result["truncated"] = truncated
+        payload = json.dumps(result)
+    if len(payload) > max_chars:
+        raise ValueError("Review result exceeds stdout limit after compaction")
+    return payload
+
+
 def generate_review_workflow(config: ReviewInput) -> str:
     """Place Review sequencing and result checks in visible, plain Python."""
     return f'''import json
 import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
+from purplemux_client.review import serialize_review_result
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -171,10 +208,10 @@ try:
             or not isinstance(result.get("findings", []), list)
             or any(not isinstance(item, str) for item in result.get("findings", []))):
         raise RuntimeError("Review agent returned an invalid report")
+    serialized_result = serialize_review_result(result, REPOSITORIES)
     if FINISH is not None:
-        turn("The check produced this report: " + json.dumps(result) + "\\nNow follow this finish instruction and report what you did: " + FINISH)
-    result["repositories"] = list(REPOSITORIES)
-    print(json.dumps(result))
+        turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH)
+    print(serialized_result)
 except BaseException as exc:
     if isinstance(exc, TimeoutError) and client is not None and tab is not None:
         client.interrupt(tab)

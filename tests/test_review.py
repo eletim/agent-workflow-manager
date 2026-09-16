@@ -12,7 +12,11 @@ from types import SimpleNamespace
 import pytest
 from test_runner import request
 
-from purplemux_client.review import generate_review_workflow, parse_review_json
+from purplemux_client.review import (
+    generate_review_workflow,
+    parse_review_json,
+    serialize_review_result,
+)
 from purplemux_client.runner import PythonRunner
 from purplemux_client.web import RunnerHTTPServer
 
@@ -128,8 +132,9 @@ def test_review_generation_api_feeds_ordinary_run(
         runner.close()
 
 
+@pytest.mark.parametrize("oversized", [False, True])
 def test_generated_review_sequences_optional_turns_and_reports_result(
-    repositories: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    repositories: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, oversized: bool,
 ) -> None:
     import purplemux_client
 
@@ -152,7 +157,11 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
 
         def read_result(self, _tab: str) -> str:
             if len(messages) == 2:
-                return json.dumps({"verdict": "FAIL", "summary": "Missing handling", "findings": ["A"]})
+                return json.dumps({
+                    "verdict": "FAIL",
+                    "summary": "Missing handling" if not oversized else "x" * 1_100_000,
+                    "findings": ["A" if not oversized else "y" * 1_100_000],
+                })
             return "done"
 
     client = Client()
@@ -183,5 +192,32 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     assert "Survey layout" in messages[0]
     assert "Perform this check" in messages[1]
     assert "Summarize findings" in messages[2]
-    assert json.loads(output.getvalue())["verdict"] == "FAIL"
+    retained = output.getvalue()
+    assert len(retained) <= 1_000_000
+    result = json.loads(retained)
+    assert result["verdict"] == "FAIL"
+    assert result["repositories"] == [str(path) for path in repositories]
+    if oversized:
+        assert result["truncated"] == {
+            "summary_chars": 1_100_000 - 16384,
+            "finding_texts": 1,
+        }
+        assert len(result["summary"]) == 16384
+        assert len(result["findings"][0]) == 512
+        assert len(messages[2]) < 1_000_000
     assert steps == [("Review", "started"), ("Review", "completed")]
+
+
+def test_review_result_stays_complete_with_worst_case_json_escaping() -> None:
+    report = {
+        "verdict": "PASS",
+        "summary": "😀" * 20_000,
+        "findings": ["😀" * 1_000] * 120,
+    }
+    repositories = tuple("/" + "😀" * 2_000 + str(index) for index in range(32))
+    payload = serialize_review_result(report, repositories)
+    assert len(payload) + 1 <= 1_000_000
+    result = json.loads(payload)
+    assert result["verdict"] == "PASS"
+    assert result["truncated"]["repositories"] > 0
+    assert result["truncated"]["findings"] == 20
