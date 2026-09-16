@@ -123,7 +123,10 @@ def parse_review_json(source: str) -> ReviewInput:
 
 
 def serialize_review_result(
-    report: dict[str, Any], repositories: tuple[str, ...]
+    report: dict[str, Any],
+    repositories: tuple[str, ...],
+    *,
+    finish_failure: str | None = None,
 ) -> str:
     """Keep a complete Review JSON value within the runner's stdout limit."""
     summary = report["summary"]
@@ -143,9 +146,15 @@ def serialize_review_result(
         "observability_gaps",
     )
     for name in array_names:
-        if name not in report and name != "findings":
+        if (
+            name not in report
+            and name != "findings"
+            and not (name == "observability_gaps" and finish_failure is not None)
+        ):
             continue
         entries = report.get(name, [])
+        if name == "observability_gaps" and finish_failure is not None:
+            entries = [finish_failure, *entries]
         result[name] = [entry[:512] for entry in entries[:100]]
         if len(entries) > 100:
             truncated[name] = len(entries) - 100
@@ -168,7 +177,16 @@ def serialize_review_result(
         result["truncated"] = truncated
         payload = json.dumps(result)
     while len(payload) > max_chars:
-        populated = [name for name in array_names if result.get(name)]
+        populated = [
+            name
+            for name in array_names
+            if result.get(name)
+            and not (
+                name == "observability_gaps"
+                and finish_failure is not None
+                and len(result[name]) == 1
+            )
+        ]
         if not populated:
             raise ValueError("Review result exceeds stdout limit after compaction")
         name = max(populated, key=lambda item: len(json.dumps(result[item][-1])))
@@ -398,8 +416,10 @@ try:
         except (TimeoutError, WorkerFailure) as exc:
             if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
                 raise
-            result.setdefault("observability_gaps", []).insert(0, "Finish could not be confirmed: " + str(exc))
-            serialized_result = serialize_review_result(result, REPOSITORIES)
+            serialized_result = serialize_review_result(
+                result, REPOSITORIES,
+                finish_failure="Finish could not be confirmed: " + str(exc),
+            )
     client.close_session(tab)
     tab = None
     verify_repositories()

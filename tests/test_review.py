@@ -404,6 +404,27 @@ def test_review_compacts_escaped_optional_arrays_without_losing_verdict() -> Non
         assert len(result[name]) + result["truncated"].get(name, 0) == 100
 
 
+def test_review_compaction_preserves_finish_failure_with_escaped_arrays() -> None:
+    other_entry = "\0" * 440 + "x" * 72
+    report = {
+        "verdict": "PASS",
+        "summary": "The check passed",
+        "findings": [other_entry] * 100,
+        "observed_facts": [other_entry] * 100,
+        "evidence": [other_entry] * 100,
+        "hypotheses": [other_entry] * 100,
+        "observability_gaps": ["\0" * 512] * 100,
+    }
+    failure = "Finish could not be confirmed: " + "\0" * 512
+    payload = serialize_review_result(report, (), finish_failure=failure)
+    result = json.loads(payload)
+    assert len(payload) + 1 <= 1_000_000
+    assert result["verdict"] == "PASS"
+    assert len(result["observability_gaps"]) == 1
+    assert result["observability_gaps"][0].startswith("Finish could not be confirmed: ")
+    assert result["truncated"]["observability_gaps"] == 100
+
+
 def test_review_snapshot_detects_changes_in_every_declared_repository(
     repositories: tuple[Path, Path],
 ) -> None:
