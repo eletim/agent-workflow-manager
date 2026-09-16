@@ -1223,6 +1223,28 @@ test("Issue Driven mode opens and copies its dedicated guide", async () => {
   assert.deepEqual(clipboard.writes, ["issue guide"]);
 });
 
+test("Review mode opens its dedicated guide", async () => {
+  const {elements, calls} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/review-guide.md") return response("review guide");
+      return undefined;
+    },
+  });
+
+  await elements["review-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Review Guide");
+  await elements["guide-open"].dispatch("click");
+  assert.equal(elements["guide-title"].textContent, "Review Guide");
+  assert.equal(elements["guide-raw"].href, "/review-guide.md");
+  assert.equal(elements["guide-content"].textContent, "review guide");
+  assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
+    ["/review-guide.md", "GET"],
+  ]);
+});
+
 test("stale guide failure cannot replace the active guide", async () => {
   const workflowGuide = deferred();
   const {elements} = await loadApp({

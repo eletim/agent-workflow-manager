@@ -417,8 +417,9 @@ function applyModeVisibility() {
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
-  guideOpen.hidden = promptMode || reviewMode;
-  guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide"
+  guideOpen.hidden = promptMode;
+  guideOpen.textContent = reviewMode ? "Review Guide"
+    : issueDrivenMode ? "Issue Driven Guide"
     : environmentSetupMode ? "Environment Setup Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
   dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
@@ -1454,6 +1455,13 @@ function renderRepository(repository) {
 }
 
 function selectedGuide() {
+  if (currentMode === "review") {
+    return {
+      key: "review",
+      path: "/review-guide.md",
+      title: "Review Guide",
+    };
+  }
   if (currentMode === "environment-setup") {
     return {
       key: "environment-setup",
