@@ -507,6 +507,7 @@ def _prepare_repository_worktree(
             preparation.remote,
             preparation.base_branch,
             command_timeout_seconds,
+            deadline_check=deadline_check,
         )
 
     def desired(state: dict[str, object]) -> bool:
@@ -562,6 +563,7 @@ def _prepare_repository_worktree(
         execution_root,
         command_timeout_seconds,
         finding="prepared",
+        deadline_check=deadline_check,
     )
 
 
@@ -571,7 +573,16 @@ def _finalize_preparation(
     command_timeout_seconds: float,
     *,
     finding: str,
+    deadline_check: Callable[[], float] | None = None,
 ) -> RepositoryExecutionContext:
+    def timeout() -> float:
+        return (
+            min(command_timeout_seconds, deadline_check())
+            if deadline_check is not None
+            else command_timeout_seconds
+        )
+
+    timeout()
     git_file = execution_root / ".git"
     metadata = {
         "registration_state": "verified",
@@ -583,11 +594,12 @@ def _finalize_preparation(
         "git_dir": _git_read(
             execution_root,
             ["rev-parse", "--absolute-git-dir"],
-            command_timeout_seconds,
+            timeout(),
         ),
         "head": preparation.base_sha,
         "branch": "HEAD",
     }
+    timeout()
     acknowledge_run_resource("verified", "git_worktree", str(execution_root), metadata)
     emit_finding(
         "git",

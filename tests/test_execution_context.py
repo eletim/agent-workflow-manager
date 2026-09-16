@@ -600,6 +600,106 @@ print(context.execution_root)
         runner.close()
 
 
+@pytest.mark.parametrize("expiry_phase", ["postcondition", "finalization"])
+def test_deadline_after_worktree_creation_preserves_cleanup_ownership(
+    tmp_path: Path, expiry_phase: str
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "managed-worktrees"
+    code = f"""
+import purplemux_client.execution_context as execution_context
+from purplemux_client import prepare_run_repository
+
+expired = False
+original_mutation = execution_context._run_git_mutation_process_group
+original_path_identity = execution_context._path_identity
+
+def mutation(args, **kwargs):
+    global expired
+    result = original_mutation(args, **kwargs)
+    if {expiry_phase == "postcondition"!r} and args[:2] == ["worktree", "add"]:
+        expired = True
+    return result
+
+def path_identity(path):
+    global expired
+    value = original_path_identity(path)
+    if {expiry_phase == "finalization"!r}:
+        expired = True
+    return value
+
+def remaining():
+    if expired:
+        raise TimeoutError("Environment Setup timed out")
+    return 30.0
+
+execution_context._run_git_mutation_process_group = mutation
+execution_context._path_identity = path_identity
+prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={str(worktree_root)!r},
+    deadline_check=remaining,
+)
+"""
+    runner = PythonRunner(managed_workflows=False)
+    try:
+        run_id = runner.start(code)
+        result = wait_until_finished(runner)
+        assert result.state == "failed"
+        assert len(result.resources) == 1
+        resource = result.resources[0]
+        assert resource.metadata["registration_state"] == "pending"
+        worktree = Path(resource.identity)
+        assert worktree.is_dir()
+
+        cleaned = runner.cleanup(run_id)
+        assert cleaned.resources[0].cleanup_state == "cleaned"
+        assert not worktree.exists()
+    finally:
+        runner.close()
+
+
+def test_post_creation_git_reads_use_remaining_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    repository, _sha = repository_with_remote(tmp_path)
+    original_mutation = execution_context._run_git_mutation_process_group
+    original_read = execution_context._git_read
+    created = False
+    post_creation_reads: list[tuple[list[str], float]] = []
+
+    def mutation(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal created
+        result = original_mutation(args, **kwargs)
+        if args[:2] == ["worktree", "add"]:
+            created = True
+        return result
+
+    def read(path: Path, args: list[str], timeout: float) -> str:
+        if created:
+            post_creation_reads.append((args, timeout))
+        return original_read(path, args, timeout)
+
+    monkeypatch.setattr(execution_context, "_run_git_mutation_process_group", mutation)
+    monkeypatch.setattr(execution_context, "_git_read", read)
+
+    context = prepare_run_repository(
+        repo=repository,
+        base_branch="main",
+        worktree_root=tmp_path / "managed-worktrees",
+        deadline_check=lambda: 0.5 if created else 30.0,
+    )
+    assert post_creation_reads
+    assert any(
+        args == ["rev-parse", "--absolute-git-dir"] for args, _ in post_creation_reads
+    )
+    assert all(timeout <= 0.5 for _, timeout in post_creation_reads)
+    git(repository, "worktree", "remove", "--force", str(context.execution_root))
+
+
 def test_cleanup_refuses_dirty_prepared_worktree(tmp_path: Path) -> None:
     repository, _sha = repository_with_remote(tmp_path)
     worktree_root = tmp_path / "managed-worktrees"
