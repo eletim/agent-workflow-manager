@@ -135,13 +135,14 @@ def serialize_review_result(
     truncated: dict[str, int] = {}
     if len(summary) > 16384:
         truncated["summary_chars"] = len(summary) - 16384
-    for name in (
+    array_names = (
         "findings",
         "observed_facts",
         "evidence",
         "hypotheses",
         "observability_gaps",
-    ):
+    )
+    for name in array_names:
         if name not in report and name != "findings":
             continue
         entries = report.get(name, [])
@@ -166,8 +167,15 @@ def serialize_review_result(
         truncated["repositories"] = truncated.get("repositories", 0) + 1
         result["truncated"] = truncated
         payload = json.dumps(result)
-    if len(payload) > max_chars:
-        raise ValueError("Review result exceeds stdout limit after compaction")
+    while len(payload) > max_chars:
+        populated = [name for name in array_names if result.get(name)]
+        if not populated:
+            raise ValueError("Review result exceeds stdout limit after compaction")
+        name = max(populated, key=lambda item: len(json.dumps(result[item][-1])))
+        result[name].pop()
+        truncated[name] = truncated.get(name, 0) + 1
+        result["truncated"] = truncated
+        payload = json.dumps(result)
     return payload
 
 
@@ -390,7 +398,7 @@ try:
         except (TimeoutError, WorkerFailure) as exc:
             if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
                 raise
-            result.setdefault("observability_gaps", []).append("Finish could not be confirmed: " + str(exc))
+            result.setdefault("observability_gaps", []).insert(0, "Finish could not be confirmed: " + str(exc))
             serialized_result = serialize_review_result(result, REPOSITORIES)
     client.close_session(tab)
     tab = None
