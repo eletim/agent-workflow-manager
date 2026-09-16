@@ -88,7 +88,8 @@ whose object is not available locally is marked `provisional`; the Workflow
 verifies that it points to a commit after fetching it. The generated workflow
 prepares a detached worktree and asks the selected agent to prepare it. The
 workflow then runs each supplied build, start, and ready check command as given,
-in order, in managed PurpleMux terminals. Omitted commands are skipped. If no
+in order, in managed PurpleMux terminals, even if the initial agent report is
+`BLOCKED`. Omitted commands are skipped. If no
 ready check is supplied, the agent provides a usability check command. Failed
 commands and their terminal logs go back to the agent for diagnosis and repair;
 the agent may make temporary setup changes, and the workflow retries the failed
@@ -99,6 +100,8 @@ remains available for inspection and control. The declared timeout applies to
 preparation, session creation, agent turns, and commands. The workflow records
 observed outcomes and accepts `READY` only when the commands and usability check
 succeed and the final service inspection does not report a readiness failure.
+Before returning `READY`, it verifies that the working path's HEAD still matches
+the resolved revision.
 An absent endpoint does not block readiness. Uncertain launches are not replayed
 unless the terminal result confirms the command failed. A busy agent is
 interrupted at timeout.
@@ -124,7 +127,7 @@ A stopped Run may end without a complete readiness JSON result.
 
 ## Issue Driven mode
 
-The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts
+The UI offers `Prompt | Environment Setup | Issue Driven | Python Workflow`. Issue Driven mode accepts
 only a small JSON configuration, validates it separately from Python, and
 deterministically expands it into the canonical sequential plain-Python workflow.
 The generated Python is visible for inspection and is then passed unchanged to the
@@ -534,7 +537,8 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI has two explicit modes. **Prompt** accepts an agent,
+The trusted local Runner UI has four explicit modes: **Prompt**, **Environment Setup**,
+**Issue Driven**, and **Python Workflow**. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt
@@ -543,7 +547,7 @@ Workflow-owned resources and have no automatic or explicit Workflow cleanup path
 The generated Python remains an implementation detail rather than an editable or
 historical UI field.
 
-**Workflow** executes arbitrary Python with the current Python interpreter in a
+**Python Workflow** executes arbitrary Python with the current Python interpreter in a
 visible PurpleMux-managed Bash tab. PurpleMux terminal output is the detailed
 stdout/stderr inspection surface; AWM shows structured Progress, Findings,
 bounded failure diagnostics, the managed-shell exit code, and the

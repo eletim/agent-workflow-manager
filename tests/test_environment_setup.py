@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
 import time
 from contextlib import redirect_stdout
 from io import StringIO
@@ -119,7 +120,16 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            "agent blocked: build failed",
+            "agent blocked: no usable check",
+        ),
+        (
+            {
+                "status": "BLOCKED",
+                "summary": "initial blocked",
+            },
+            False,
+            False,
+            None,
         ),
         (
             {
@@ -284,6 +294,12 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             if (
                 self.reads > 1
                 and report is not None
+                and report.get("summary") == "initial blocked"
+            ):
+                return json.dumps({"status": "READY", "summary": "commands passed"})
+            if (
+                self.reads > 1
+                and report is not None
                 and report.get("summary")
                 in {"metadata missing status", "metadata unexpected status"}
             ):
@@ -362,6 +378,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             return client
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(setup, "verify_environment_setup_revision", lambda *_args: None)
     monkeypatch.setattr(
         purplemux_client,
         "prepare_run_revision",
@@ -382,6 +399,9 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             start="serve"
             if report is not None and report.get("summary") == "start interrupted"
             else None,
+            ready_check="test -f file"
+            if report is not None and report.get("summary") == "initial blocked"
+            else None,
         )
     )
     output = StringIO()
@@ -390,6 +410,10 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             exec(compile(code, "<environment-setup>", "exec"), {})
         result = json.loads(output.getvalue())
         assert result["status"] == "READY"
+        if report is not None and report.get("summary") == "initial blocked":
+            assert result["summary"] == "commands passed"
+            assert result["checks"]["build"]["exit_code"] == 0
+            assert result["checks"]["ready_check"]["exit_code"] == 0
         if report is not None and report.get("summary") in {
             "metadata timeout",
             "metadata missing status",
@@ -432,6 +456,9 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
         assert result["connection"] == {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        if report is not None and report.get("summary") == "build failed":
+            assert result["checks"]["build"]["exit_code"] == 0
+            assert result["attempts"][0]["failed_stage"] == "ready_check"
         if (
             report is not None
             and report.get("summary") == "ready"
@@ -458,6 +485,35 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         "metadata interrupt fails",
     }
     assert interrupted == (["tab-1"] if busy_timeout or metadata_timeout else [])
+
+
+def test_ready_requires_working_path_head_to_match(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    (repository / "file").write_text("first", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "file"], check=True)
+    commit = [
+        "git",
+        "-C",
+        str(repository),
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+    ]
+    subprocess.run([*commit, "first"], check=True)
+    first = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
+    ).strip()
+    setup.verify_environment_setup_revision(str(repository), first, lambda: 5.0)
+    (repository / "file").write_text("second", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "file"], check=True)
+    subprocess.run([*commit, "second"], check=True)
+    with pytest.raises(RuntimeError, match="working path HEAD changed"):
+        setup.verify_environment_setup_revision(str(repository), first, lambda: 5.0)
 
 
 @pytest.mark.parametrize("phase", ["preparation", "workspace", "session"])

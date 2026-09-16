@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from purplemux_client.errors import WorkerFailure
@@ -252,6 +255,30 @@ def serialize_environment_setup_result(result: dict[str, Any]) -> str:
     return payload
 
 
+def verify_environment_setup_revision(
+    working_path: str, expected_sha: str, remaining: Callable[[], float]
+) -> None:
+    """Reject readiness when the prepared worktree no longer has its selected HEAD."""
+    completed = subprocess.run(
+        ["git", "-C", str(Path(working_path)), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=remaining(),
+        check=False,
+    )
+    remaining()
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Environment Setup cannot verify working path HEAD: {completed.stderr.strip()}"
+        )
+    actual_sha = completed.stdout.strip().lower()
+    if actual_sha != expected_sha.lower():
+        raise RuntimeError(
+            f"Environment Setup working path HEAD changed: expected {expected_sha}, "
+            f"found {actual_sha}"
+        )
+
+
 def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     """Generate a plain Python Workflow from validated declarative inputs."""
     instructions = [
@@ -298,7 +325,10 @@ from purplemux_client import (
     prepare_run_revision,
 )
 from purplemux_client.environment_setup_execution import execute_environment_setup_commands
-from purplemux_client.environment_setup import serialize_environment_setup_result
+from purplemux_client.environment_setup import (
+    serialize_environment_setup_result,
+    verify_environment_setup_revision,
+)
 
 WORKFLOW_OUTLINE = ["Environment Setup"]
 REVISION_VALIDATION = {config.revision_validation!r}
@@ -377,7 +407,9 @@ try:
     client.wait_until_ready(tab, min(remaining(), 60))
     report = ask_agent({prompt!r})
     agent_reports.append(report)
-    if report.get("status") != "READY":
+    if report.get("status") != "READY" and not any(
+        ({config.build!r}, {config.start!r}, {config.ready_check!r})
+    ):
         raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}")
     resume_at = "build"
     while True:
@@ -441,6 +473,11 @@ try:
                     f"agent interruption failed: {{interruption}}"
                 ) from interruption
             turn_active = False
+        if report.get("status") != "READY":
+            raise RuntimeError(
+                f"Environment Setup agent blocked: {{report['summary']}}; "
+                f"{{endpoint_report_error}}"
+            )
     else:
         endpoint_status = endpoint_report.get("status")
         if endpoint_status == "BLOCKED":
@@ -450,8 +487,15 @@ try:
             )
         if endpoint_status == "READY":
             agent_reports.append(endpoint_report)
+            report = endpoint_report
         else:
             endpoint_report_error = "Environment Setup final agent returned an invalid status"
+            if report.get("status") != "READY":
+                raise RuntimeError(
+                    f"Environment Setup agent blocked: {{report['summary']}}; "
+                    f"{{endpoint_report_error}}"
+                )
+    verify_environment_setup_revision(cwd, context.base_sha, remaining)
     result = {{
         "status": "READY",
         "summary": report["summary"],
