@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import json
 import time
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -121,7 +123,13 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
         ),
         (None, True, False, "timed out while the agent was busy"),
         (
-            {"status": "READY", "summary": "ready", "checks": {"build": "passed"}},
+            {
+                "status": "READY",
+                "summary": "ready",
+                "checks": {"build": "passed"},
+                "resolved_revision": "unverified",
+                "working_path": "/wrong/path",
+            },
             False,
             False,
             None,
@@ -187,7 +195,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         purplemux_client,
         "prepare_run_revision",
         lambda **_kwargs: SimpleNamespace(
-            execution_root=Path("/tmp/environment-setup")
+            execution_root=Path("/tmp/environment-setup"), base_sha="a" * 40
         ),
     )
     monkeypatch.setattr(
@@ -200,11 +208,18 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             "/source/repo", "main", "codex", 1 if late_completion else 120, build="make"
         )
     )
+    output = StringIO()
     if expected_error is None:
-        exec(compile(code, "<environment-setup>", "exec"), {})
+        with redirect_stdout(output):
+            exec(compile(code, "<environment-setup>", "exec"), {})
+        result = json.loads(output.getvalue())
+        assert result["resolved_revision"] == "a" * 40
+        assert result["working_path"] == "/tmp/environment-setup"
     else:
         with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
-            exec(compile(code, "<environment-setup>", "exec"), {})
+            with redirect_stdout(output):
+                exec(compile(code, "<environment-setup>", "exec"), {})
+        assert not output.getvalue()
     assert events == [
         ("Environment Setup", "started"),
         ("Environment Setup", "completed" if expected_error is None else "failed"),

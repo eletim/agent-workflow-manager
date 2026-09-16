@@ -85,6 +85,8 @@ and applies the declared timeout to preparation, session creation, and agent
 execution. The agent must return a JSON `READY`
 result with a passing check for each supplied command; `BLOCKED`, failed checks,
 and unstructured results fail the Run. A busy agent is interrupted at timeout.
+On success, the workflow adds the verified commit SHA as `resolved_revision` and
+the detached worktree as `working_path` to the JSON result.
 These inputs describe the environment;
 they are not a steps language. Submit `generatedCode` to the existing Workflow
 validation and Run endpoints to execute it.
