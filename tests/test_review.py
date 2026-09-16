@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import stat
 import subprocess
 import threading
@@ -14,6 +15,7 @@ import pytest
 from test_runner import request, wait_for
 
 from purplemux_client.review import (
+    ReviewWriteMonitor,
     generate_review_workflow,
     parse_review_json,
     require_ext_review_contract,
@@ -431,9 +433,12 @@ def test_generated_review_unavailable_returns_blocked_and_skips_finish(
                 if unavailable == "busy timeout":
                     _kwargs["on_busy_timeout"]("check tab remains busy")  # type: ignore[operator]
                     pytest.fail("Busy callback should stop the wait")
-                raise WorkerFailure("result unavailable")
+                if unavailable != "result unavailable":
+                    raise WorkerFailure("result unavailable")
 
         def read_result(self, _tab: str) -> str:
+            if len(messages) == 1 and unavailable == "result unavailable":
+                raise WorkerFailure("result unavailable")
             return "finish complete"
 
         def close_session(self, tab: str) -> None:
@@ -474,11 +479,14 @@ def test_generated_review_unavailable_returns_blocked_and_skips_finish(
         else "result unavailable"
     )
     assert expected in result["summary"]
-    assert result["observability_gaps"] == [
-        "Finish could not run because check completion was not confirmed",
-        expected,
-    ]
-    assert len(messages) == 1
+    assert result["observability_gaps"] == (
+        [expected]
+        if unavailable == "result unavailable"
+        else ["Finish could not run because check completion was not confirmed", expected]
+    )
+    assert len(messages) == (2 if unavailable == "result unavailable" else 1)
+    if unavailable == "result unavailable":
+        assert "Close the observation" in messages[1]
     assert closed == ["agent-tab"]
 
 
@@ -826,14 +834,40 @@ def test_review_snapshot_detects_reflog_expiration(
     assert snapshot_review_repositories((str(repository),)) != baseline
 
 
+def test_review_monitor_detects_restored_write_through_external_hard_link(
+    repositories: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repository = repositories[0]
+    inside = repository / "existing.txt"
+    inside.write_text("original")
+    outside = tmp_path / "same-inode.txt"
+    os.link(inside, outside)
+    baseline = snapshot_review_repositories((str(repository),))
+    monitor = ReviewWriteMonitor((str(repository),))
+    try:
+        outside.write_text("changed")
+        outside.write_text("original")
+        assert snapshot_review_repositories((str(repository),)) == baseline
+        with pytest.raises(RuntimeError, match="Review repository change detected"):
+            monitor.assert_unchanged()
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize("restored", [False, True])
 def test_generated_review_reports_repository_change(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
+    restored: bool,
 ) -> None:
     import purplemux_client
     import purplemux_client.review as review_module
 
     steps: list[tuple[str, str, str | None]] = []
+    restored_path = repositories[1] / "existing.txt"
+    if restored:
+        restored_path.write_text("original")
+    baseline = snapshot_review_repositories(tuple(map(str, repositories)))
 
     class Client:
         def create_session(self, _request: object) -> str:
@@ -843,7 +877,11 @@ def test_generated_review_reports_repository_change(
             pass
 
         def send_input(self, _tab: str, _message: str) -> None:
-            (repositories[1] / "new.txt").write_text("changed")
+            if restored:
+                restored_path.write_text("changed")
+                restored_path.write_text("original")
+            else:
+                (repositories[1] / "new.txt").write_text("changed")
 
         def wait_for_turn_completion(
             self, _tab: str, _seconds: float, **_kwargs: object
@@ -883,6 +921,8 @@ def test_generated_review_reports_repository_change(
     assert steps[0][:2] == ("Review", "started")
     assert steps[-1][:2] == ("Review", "failed")
     assert str(repositories[1]) in (steps[-1][2] or "")
+    if restored:
+        assert snapshot_review_repositories(tuple(map(str, repositories))) == baseline
 
 
 def test_generated_review_verifies_after_agent_session_closes(

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -285,6 +289,93 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
     return tuple(snapshots)
 
 
+class ReviewWriteMonitor:
+    """Record filesystem writes during a Review, including restored writes."""
+
+    _WRITE_EVENTS = 0x002 | 0x004 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+
+    def __init__(self, repositories: tuple[str, ...]) -> None:
+        if sys.platform != "linux":
+            raise RuntimeError("Review repository write monitoring requires Linux")
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.inotify_init1.argtypes = [ctypes.c_int]
+        libc.inotify_init1.restype = ctypes.c_int
+        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.restype = ctypes.c_int
+        self._libc = libc
+        self._fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self._fd < 0:
+            raise OSError(ctypes.get_errno(), "Could not start Review repository write monitor")
+        self._watched: dict[Path, int] = {}
+        self._owners: dict[int, set[str]] = {}
+        self._repositories = repositories
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        try:
+            for repository in repositories:
+                roots = [Path(repository)]
+                for name in ("--git-dir", "--git-common-dir"):
+                    result = subprocess.run(
+                        ["git", "-C", repository, "rev-parse", name],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=True,
+                    )
+                    roots.append((Path(repository) / result.stdout.strip()).resolve())
+                for root in roots:
+                    if not root.is_dir():
+                        raise RuntimeError(f"Could not watch Review repository path {root}")
+                    for current, directories, files in os.walk(
+                        root, followlinks=False, onerror=fail_walk
+                    ):
+                        directories[:] = [
+                            name for name in directories
+                            if not (Path(current) / name).is_symlink()
+                        ]
+                        candidates = [Path(current)]
+                        candidates.extend(
+                            Path(current) / name for name in files
+                            if not (Path(current) / name).is_symlink()
+                        )
+                        for candidate in candidates:
+                            path = candidate.resolve()
+                            descriptor = self._watched.get(path)
+                            if descriptor is None:
+                                descriptor = libc.inotify_add_watch(
+                                    self._fd, os.fsencode(path),
+                                    self._WRITE_EVENTS | 0x02000000,  # IN_DONT_FOLLOW
+                                )
+                                if descriptor < 0:
+                                    raise OSError(
+                                        ctypes.get_errno(), f"Could not watch Review repository path {path}"
+                                    )
+                                self._watched[path] = descriptor
+                            self._owners.setdefault(descriptor, set()).add(repository)
+        except BaseException:
+            self.close()
+            raise
+
+    def assert_unchanged(self) -> None:
+        try:
+            events = os.read(self._fd, 65536)
+        except BlockingIOError as exc:
+            if exc.errno == errno.EAGAIN:
+                return
+            raise
+        if events:
+            descriptor = struct.unpack_from("i", events)[0]
+            changed = sorted(self._owners.get(descriptor, self._repositories))
+            raise RuntimeError("Review repository change detected during observation: " + json.dumps(changed))
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+
 def require_ext_review_contract(*, timeout: float = 10) -> str:
     """Require the CLI command and connected PurpleMux server API for external review."""
     executable = shutil.which("purplemux")
@@ -321,7 +412,7 @@ import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
 from purplemux_client.errors import MutationOutcomeUnknown, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
-from purplemux_client.review import require_ext_review_contract, serialize_review_result, snapshot_review_repositories
+from purplemux_client.review import ReviewWriteMonitor, require_ext_review_contract, serialize_review_result, snapshot_review_repositories
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -342,13 +433,15 @@ def busy_timeout(_warning):
     raise TimeoutError("Review timed out while the agent was busy")
 
 
-def turn(message, *, finish=False):
+def turn(message, *, finish=False, completion=None):
     seconds = max(remaining() if not finish else deadline - time.monotonic(), 0)
     if finish:
         seconds = max(seconds, 60)
     try:
         client.send_input(tab, message)
         client.wait_for_turn_completion(tab, seconds, on_busy_timeout=busy_timeout)
+        if completion is not None:
+            completion["confirmed"] = True
         if not finish:
             remaining()
         return client.read_result(tab)
@@ -357,6 +450,7 @@ def turn(message, *, finish=False):
 
 
 def verify_repositories():
+    monitor.assert_unchanged()
     current = snapshot_review_repositories(REPOSITORIES)
     changed = [path for path, before, after in zip(REPOSITORIES, baseline, current) if before != after]
     if changed:
@@ -366,11 +460,13 @@ def verify_repositories():
 emit_step("Review", "started")
 deadline = time.monotonic() + {config.timeout}
 baseline = None
+monitor = None
 runtime = PurpleMuxRuntime(owned_by_run=True)
 client = None
 tab = None
 try:
     ext_review_cli = require_ext_review_contract(timeout=min(10, remaining()))
+    monitor = ReviewWriteMonitor(REPOSITORIES)
     baseline = snapshot_review_repositories(REPOSITORIES)
     workspace = runtime.create_workspace(CreateWorkspaceRequest(
         cwd=REPOSITORIES[0], name="AWM Review", deadline_check=remaining,
@@ -411,12 +507,13 @@ try:
             }}
     check_completed = result is None
     if result is None:
+        check_completion = {{"confirmed": False}}
         try:
-            report = turn(context + "Perform this check: " + CHECK + "\\nReturn one JSON object with verdict PASS, FAIL, or BLOCKED and a non-empty summary. Optional findings, observed_facts, evidence, hypotheses, and observability_gaps are arrays of strings. Report BLOCKED when observation times out or is unavailable; describe what could not be observed in observability_gaps. Base PASS or FAIL on observed evidence.")
+            report = turn(context + "Perform this check: " + CHECK + "\\nReturn one JSON object with verdict PASS, FAIL, or BLOCKED and a non-empty summary. Optional findings, observed_facts, evidence, hypotheses, and observability_gaps are arrays of strings. Report BLOCKED when observation times out or is unavailable; describe what could not be observed in observability_gaps. Base PASS or FAIL on observed evidence.", completion=check_completion)
         except (TimeoutError, WorkerFailure) as exc:
             if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
                 raise
-            check_completed = False
+            check_completed = check_completion["confirmed"]
             result = {{
                 "verdict": "BLOCKED",
                 "summary": "Review observation was unavailable: " + str(exc),
@@ -470,4 +567,7 @@ except BaseException as exc:
     raise failure
 else:
     emit_step("Review", "completed", workspace=workspace.id)
+finally:
+    if monitor is not None:
+        monitor.close()
 """

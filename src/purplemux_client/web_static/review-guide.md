@@ -44,9 +44,12 @@ Open the returned browser URL. This is for read-only
 observation. Do not send input to an observed terminal or modify a declared
 repository. Review requires a running PurpleMux 0.5.0 or newer server and a
 matching CLI with public `ext-review` support; it checks this contract before
-creating its workspace. The workflow fingerprints each declared repository's
-files, including ignored and untracked files, and Git state. A detected change
-fails the Run instead of producing a trustworthy Review verdict.
+creating its workspace. On Linux, the workflow monitors writes to every declared
+repository and its Git administrative directories, including writes that are
+later restored. It also fingerprints files, including ignored and untracked
+files, and Git state. A detected write or changed fingerprint fails the Run
+instead of producing a trustworthy Review verdict. Review fails closed if write
+monitoring is unavailable.
 
 ## Verdict and Run status
 
