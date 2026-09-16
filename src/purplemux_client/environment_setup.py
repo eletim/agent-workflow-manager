@@ -186,14 +186,23 @@ emit_step("Environment Setup", "started")
 client = None
 tab = None
 turn_active = False
+context = None
+workspace = None
+cwd = None
+checks = {{}}
+verification = None
+service_tab = None
+attempts = []
+agent_reports = []
+result = None
 try:
     deadline = time.monotonic() + {config.timeout}
     context = prepare_run_revision(
         repo={config.repository!r}, revision={config.revision!r},
         deadline_check=remaining,
     )
-    remaining()
     cwd = str(context.execution_root)
+    remaining()
     runtime = PurpleMuxRuntime(owned_by_run=True)
     workspace = runtime.create_workspace(
         CreateWorkspaceRequest(
@@ -213,11 +222,10 @@ try:
     remaining()
     client.wait_until_ready(tab, min(remaining(), 60))
     report = ask_agent({prompt!r})
+    agent_reports.append(report)
     if report.get("status") != "READY":
         raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}")
-    checks = {{}}
     resume_at = "build"
-    service_tab = None
     while True:
         attempt = execute_environment_setup_commands(
             client=client, build={config.build!r}, start={config.start!r},
@@ -226,10 +234,11 @@ try:
             cwd=cwd, remaining=remaining, resume_at=resume_at,
             service_tab=service_tab,
         )
+        attempts.append(attempt)
         checks.update(attempt["checks"])
         service_tab = attempt["service_tab"]
+        verification = attempt["verification"]
         if attempt["failure"] is None:
-            verification = attempt["verification"]
             break
         recovery_prompt = (
             "Execution failed or readiness was not reached after the required "
@@ -246,19 +255,17 @@ try:
             + json.dumps(attempt)
         )
         report = ask_agent(recovery_prompt)
+        agent_reports.append(report)
         if report.get("status") != "READY":
             raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}; {{attempt['failure']}}")
         resume_at = attempt["failed_stage"]
     remaining()
-    print(json.dumps({{
+    result = {{
         "status": "READY",
         "summary": report["summary"],
-        "checks": checks,
-        "verification": verification,
-        "service_tab": service_tab,
-        "resolved_revision": context.base_sha,
-        "working_path": cwd,
-    }}))
+        "execution_summary": "All supplied commands completed successfully.",
+        "readiness_summary": "The usability check succeeded.",
+    }}
 except BaseException as exc:
     interrupt_error = None
     if isinstance(exc, TimeoutError) and turn_active and client is not None and tab is not None:
@@ -270,7 +277,34 @@ except BaseException as exc:
     if interrupt_error is not None:
         error = f"{{error}}; agent interruption failed: {{interrupt_error}}"
     emit_step("Environment Setup", "failed", error=error)
-    raise
+    result = {{
+        "status": "BLOCKED",
+        "summary": error,
+        "execution_summary": (
+            attempts[-1]["failure"] if attempts and attempts[-1]["failure"]
+            else "No failed command outcome was observed."
+        ),
+        "readiness_summary": "Readiness was not established.",
+        "observed_facts": {{
+            "error": error,
+            "failed_stage": attempts[-1]["failed_stage"] if attempts else None,
+            "agent_reports": agent_reports,
+        }},
+    }}
 else:
     emit_step("Environment Setup", "completed", workspace=workspace.id, tab=tab)
+result.update({{
+    "resolved_revision": context.base_sha if context is not None else None,
+    "working_path": cwd,
+    "connection": {{
+        "workspace_id": workspace.id if workspace is not None else None,
+        "agent_tab_id": tab,
+    }},
+    "process": checks.get("start"),
+    "service_tab": service_tab,
+    "checks": checks,
+    "verification": verification,
+    "attempts": attempts,
+}})
+print(json.dumps(result))
 """

@@ -284,20 +284,37 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         with redirect_stdout(output):
             exec(compile(code, "<environment-setup>", "exec"), {})
         result = json.loads(output.getvalue())
+        assert result["status"] == "READY"
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
+        assert result["connection"] == {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        assert result["process"] is None
+        assert result["execution_summary"]
+        assert result["readiness_summary"]
         offset = 1 if report is not None and report.get("summary") == "recover" else 0
         assert result["checks"]["build"]["output"] == f"observed shell-{1 + offset}"
         assert result["verification"]["output"] == f"observed shell-{2 + offset}"
+        assert len(result["attempts"]) == 1 + offset
         if offset:
             assert client.reads == 2
             assert "Environment Setup build failed" in client.prompts[1]
             assert "temporary environment or setup changes" in client.prompts[1]
     else:
-        with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
-            with redirect_stdout(output):
-                exec(compile(code, "<environment-setup>", "exec"), {})
-        assert not output.getvalue()
+        with redirect_stdout(output):
+            exec(compile(code, "<environment-setup>", "exec"), {})
+        result = json.loads(output.getvalue())
+        assert result["status"] == "BLOCKED"
+        assert expected_error in result["summary"]
+        assert result["observed_facts"]["error"] == result["summary"]
+        assert result["resolved_revision"] == "a" * 40
+        assert result["working_path"] == str(tmp_path)
+        assert result["connection"] == {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        if (
+            report is not None
+            and report.get("summary") == "ready"
+            and not report.get("verification_command")
+        ):
+            assert result["attempts"][0]["failed_stage"] == "ready_check"
     assert events == [
         ("Environment Setup", "started"),
         ("Environment Setup", "completed" if expected_error is None else "failed"),
@@ -319,7 +336,9 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
             time.sleep(1.05)
         kwargs["deadline_check"]()  # type: ignore[operator]
         created.append("worktree")
-        return SimpleNamespace(execution_root=Path("/tmp/environment-setup"))
+        return SimpleNamespace(
+            execution_root=Path("/tmp/environment-setup"), base_sha="b" * 40
+        )
 
     class Client:
         command_timeout_seconds = 30.0
@@ -355,8 +374,14 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
     code = setup.generate_environment_setup_workflow(
         setup.EnvironmentSetupInput("/source/repo", "main", "codex", 1)
     )
-    with pytest.raises(TimeoutError, match="Environment Setup timed out"):
+    output = StringIO()
+    with redirect_stdout(output):
         exec(compile(code, "<environment-setup>", "exec"), {})
+    result = json.loads(output.getvalue())
+    assert result["status"] == "BLOCKED"
+    assert "Environment Setup timed out" in result["summary"]
+    assert result["resolved_revision"] == (None if phase == "preparation" else "b" * 40)
+    assert result["attempts"] == []
     assert events == ["started", "failed"]
     assert (
         created
