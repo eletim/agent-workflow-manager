@@ -165,11 +165,52 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
     snapshots = []
     for repository in repositories:
         digest = hashlib.sha256()
+
+        def field(target: Any, value: bytes) -> None:
+            target.update(len(value).to_bytes(8, "big"))
+            target.update(value)
+
+        def entry(path: Path, relative: Path) -> None:
+            info = path.lstat()
+            record = hashlib.sha256()
+            field(record, os.fsencode(relative))
+            field(record, str(stat.S_IMODE(info.st_mode)).encode())
+            if path.is_symlink():
+                field(record, b"link")
+                field(record, os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                field(record, b"file")
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        record.update(chunk)
+            elif path.is_dir():
+                field(record, b"directory")
+            else:
+                field(record, b"other")
+            digest.update(record.digest())
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        def tree(root: Path, *, exclude_git: bool = False) -> None:
+            for current, directories, files in os.walk(
+                root, followlinks=False, onerror=fail_walk
+            ):
+                if exclude_git and current == str(root):
+                    directories[:] = [name for name in directories if name != ".git"]
+                    files[:] = [name for name in files if name != ".git"]
+                for name in sorted(directories + files):
+                    path = Path(current) / name
+                    entry(path, path.relative_to(root))
+
         for args in (
             ("rev-parse", "HEAD"),
             ("symbolic-ref", "-q", "HEAD"),
             ("show-ref",),
             ("ls-files", "--stage", "-z"),
+            ("config", "--local", "--list", "--null", "--show-origin"),
+            ("rev-parse", "--git-dir"),
+            ("rev-parse", "--git-common-dir"),
         ):
             result = subprocess.run(
                 ["git", "-C", repository, *args],
@@ -177,40 +218,53 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                 timeout=30,
                 check=False,
             )
-            digest.update(str(result.returncode).encode())
-            digest.update(result.stdout)
-            if result.returncode and args[0] == "ls-files":
+            field(digest, b" ".join(part.encode() for part in args))
+            field(digest, str(result.returncode).encode())
+            field(digest, result.stdout)
+            if result.returncode and args in (
+                ("ls-files", "--stage", "-z"),
+                ("config", "--local", "--list", "--null", "--show-origin"),
+                ("rev-parse", "--git-dir"),
+                ("rev-parse", "--git-common-dir"),
+            ):
                 raise RuntimeError(
-                    f"Could not inspect Git index in {repository}: {result.stderr.decode(errors='replace')}"
+                    f"Could not inspect Git state in {repository}: {result.stderr.decode(errors='replace')}"
                 )
+            if args == ("rev-parse", "--git-dir"):
+                git_dir = (
+                    Path(repository) / os.fsdecode(result.stdout.removesuffix(b"\n"))
+                ).resolve()
+            elif args == ("rev-parse", "--git-common-dir"):
+                common_dir = (
+                    Path(repository) / os.fsdecode(result.stdout.removesuffix(b"\n"))
+                ).resolve()
 
-        def fail_walk(error: OSError) -> None:
-            raise error
-
-        for root, directories, files in os.walk(
-            repository, followlinks=False, onerror=fail_walk
-        ):
-            if root == repository and ".git" in directories:
-                directories.remove(".git")
-            for name in sorted(directories + files):
-                path = Path(root) / name
-                relative = path.relative_to(repository)
-                info = path.lstat()
-                digest.update(os.fsencode(relative))
-                digest.update(b"\0")
-                digest.update(str(stat.S_IMODE(info.st_mode)).encode())
-                if path.is_symlink():
-                    digest.update(b"link")
-                    digest.update(os.fsencode(os.readlink(path)))
-                elif path.is_file():
-                    digest.update(b"file")
-                    with path.open("rb") as stream:
-                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                elif path.is_dir():
-                    digest.update(b"directory")
+        tree(Path(repository), exclude_git=True)
+        for admin_dir in dict.fromkeys((git_dir, common_dir)):
+            for relative in (
+                "config",
+                "config.worktree",
+                "info/exclude",
+                "HEAD",
+                "packed-refs",
+                "refs",
+                "hooks",
+                "index",
+                "shallow",
+                "objects/info/alternates",
+            ):
+                path = admin_dir / relative
+                field(digest, os.fsencode(admin_dir))
+                field(digest, relative.encode())
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    field(digest, b"absent")
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    tree(path)
                 else:
-                    digest.update(b"other")
+                    entry(path, Path(relative))
         snapshots.append(digest.hexdigest())
     return tuple(snapshots)
 
@@ -327,12 +381,25 @@ try:
     serialized_result = serialize_review_result(result, REPOSITORIES)
     if FINISH is not None:
         turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH)
+    client.close_session(tab)
+    tab = None
+    verify_repositories()
     print(serialized_result)
 except BaseException as exc:
-    if isinstance(exc, TimeoutError) and client is not None and tab is not None:
-        client.interrupt(tab)
-    emit_step("Review", "failed", error=str(exc))
-    raise
+    failure = exc
+    if client is not None and tab is not None:
+        try:
+            client.close_session(tab)
+            tab = None
+        except BaseException as stop_error:
+            failure = RuntimeError("Review agent could not be stopped: " + str(stop_error) + "; prior failure: " + str(failure))
+    if baseline is not None:
+        try:
+            verify_repositories()
+        except BaseException as check_error:
+            failure = check_error
+    emit_step("Review", "failed", error=str(failure))
+    raise failure
 else:
-    emit_step("Review", "completed", workspace=workspace.id, tab=tab)
+    emit_step("Review", "completed", workspace=workspace.id)
 """

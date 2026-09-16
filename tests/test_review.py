@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import stat
 import subprocess
 import threading
 from contextlib import redirect_stdout
@@ -173,6 +174,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
 
     messages: list[str] = []
     steps: list[tuple[str, str]] = []
+    closed: list[str] = []
 
     class Client:
         def create_session(self, request: object) -> str:
@@ -202,6 +204,9 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
                     }
                 )
             return "done"
+
+        def close_session(self, tab: str) -> None:
+            closed.append(tab)
 
     client = Client()
 
@@ -256,6 +261,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
         assert len(result["findings"][0]) == 512
         assert len(messages[2]) < 1_000_000
     assert steps == [("Review", "started"), ("Review", "completed")]
+    assert closed == ["agent-tab"]
 
 
 def test_review_result_stays_complete_with_worst_case_json_escaping() -> None:
@@ -292,6 +298,69 @@ def test_review_snapshot_detects_changes_in_every_declared_repository(
     assert snapshot_review_repositories(paths)[1] != baseline[1]
 
 
+def test_review_snapshot_separates_file_records_and_covers_git_config(
+    repositories: tuple[Path, Path],
+) -> None:
+    first = repositories[0]
+    (first / "a").write_bytes(b"A")
+    (first / "b").write_bytes(b"B")
+    paths = tuple(map(str, repositories))
+    baseline = snapshot_review_repositories(paths)
+    mode = stat.S_IMODE((first / "b").stat().st_mode)
+    (first / "a").write_bytes(b"Ab\0" + str(mode).encode() + b"fileB")
+    (first / "b").unlink()
+    assert snapshot_review_repositories(paths)[0] != baseline[0]
+    (first / "a").write_bytes(b"A")
+    (first / "b").write_bytes(b"B")
+    subprocess.run(
+        ["git", "-C", str(first), "config", "--local", "review.test", "enabled"],
+        check=True,
+    )
+    assert snapshot_review_repositories(paths)[0] != baseline[0]
+
+
+def test_review_snapshot_covers_linked_worktree_git_config(tmp_path: Path) -> None:
+    repository = tmp_path / "source"
+    linked = tmp_path / "linked"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Review Test",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            str(linked),
+        ],
+        check=True,
+    )
+    baseline = snapshot_review_repositories((str(linked),))
+    subprocess.run(
+        ["git", "-C", str(linked), "config", "--local", "review.test", "enabled"],
+        check=True,
+    )
+    assert snapshot_review_repositories((str(linked),)) != baseline
+
+
 def test_generated_review_reports_repository_change(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -319,6 +388,9 @@ def test_generated_review_reports_repository_change(
         def read_result(self, _tab: str) -> str:
             return json.dumps({"verdict": "PASS", "summary": "Looks good"})
 
+        def close_session(self, _tab: str) -> None:
+            pass
+
     class Runtime:
         def __init__(self, *, owned_by_run: bool) -> None:
             assert owned_by_run
@@ -344,6 +416,64 @@ def test_generated_review_reports_repository_change(
     with pytest.raises(RuntimeError, match="Review repository change detected"):
         exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
     assert steps[0][:2] == ("Review", "started")
+    assert steps[-1][:2] == ("Review", "failed")
+    assert str(repositories[1]) in (steps[-1][2] or "")
+
+
+def test_generated_review_verifies_after_agent_session_closes(
+    repositories: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import purplemux_client
+    import purplemux_client.review as review_module
+
+    steps: list[tuple[str, str, str | None]] = []
+
+    class Client:
+        def create_session(self, _request: object) -> str:
+            return "agent-tab"
+
+        def wait_until_ready(self, _tab: str, _seconds: float) -> None:
+            pass
+
+        def send_input(self, _tab: str, _message: str) -> None:
+            pass
+
+        def wait_for_turn_completion(
+            self, _tab: str, _seconds: float, **_kwargs: object
+        ) -> None:
+            pass
+
+        def read_result(self, _tab: str) -> str:
+            return json.dumps({"verdict": "PASS", "summary": "Looks good"})
+
+        def close_session(self, _tab: str) -> None:
+            (repositories[1] / "late.txt").write_text("changed during close")
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="review-workspace")
+
+        def workspace(self, _workspace_id: str) -> Client:
+            return Client()
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
+    )
+    monkeypatch.setattr(
+        purplemux_client,
+        "emit_step",
+        lambda name, state, **kwargs: steps.append((name, state, kwargs.get("error"))),
+    )
+    code = generate_review_workflow(parse_review_json(declaration(repositories)))
+    with pytest.raises(RuntimeError, match="Review repository change detected"):
+        exec(compile(code, "<review>", "exec"), {})
     assert steps[-1][:2] == ("Review", "failed")
     assert str(repositories[1]) in (steps[-1][2] or "")
 
