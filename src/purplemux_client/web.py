@@ -76,6 +76,10 @@ STATIC_FILES = {
         "python-workflow-guide.md",
         "text/markdown; charset=utf-8",
     ),
+    "/review-guide.md": (
+        "review-guide.md",
+        "text/markdown; charset=utf-8",
+    ),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")

@@ -67,6 +67,19 @@ record. Give each agent only the portion of human context and recorded decisions
 needed for its current role instead of accumulating every available artifact in
 every prompt.
 
+## Review mode
+
+Choose **Review** in the Runner to inspect local Git repositories or observe an
+external terminal. Enter a JSON declaration, select **Validate JSON & Generate**
+to inspect the generated Python, then use **Validate**, **Dry Run**, and **Run**.
+Progress, Stop, Result, and history use the ordinary Run surfaces. The Review
+result panel shows the structured verdict when one is available. The original
+JSON and generated Python are retained in history.
+
+The [Review Guide](src/purplemux_client/web_static/review-guide.md) gives the
+field schema, an example, the read-only browser and `ext-review` observation
+contract, and the meanings of `PASS`, `FAIL`, and `BLOCKED`.
+
 ## Environment Setup inputs
 
 The UI offers an Environment Setup mode. Enter the declaration, select
