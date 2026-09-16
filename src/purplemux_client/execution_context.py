@@ -5,6 +5,7 @@ import re
 import stat
 import subprocess
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -53,6 +54,7 @@ class RepositoryPreparation:
     base_sha: str
     revision_kind: Literal["branch", "tag", "commit"] = "branch"
     revision: str | None = None
+    revision_validation: Literal["verified", "provisional"] = "verified"
 
 
 def inspect_run_repository(
@@ -61,6 +63,7 @@ def inspect_run_repository(
     base_branch: str,
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
+    deadline_check: Callable[[], float] | None = None,
 ) -> RepositoryPreparation:
     """Resolve and validate a declared source repository and remote base."""
 
@@ -70,6 +73,7 @@ def inspect_run_repository(
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
         live_remote=True,
+        deadline_check=deadline_check,
     )
 
 
@@ -101,6 +105,7 @@ def _inspect_run_repository(
     command_timeout_seconds: float,
     live_remote: bool,
     resolution_base: Path | None = None,
+    deadline_check: Callable[[], float] | None = None,
 ) -> RepositoryPreparation:
     if not isinstance(base_branch, str) or not base_branch or "\0" in base_branch:
         raise ValueError("base_branch must be a non-empty string without nulls")
@@ -113,6 +118,14 @@ def _inspect_run_repository(
         raise ValueError("remote must be a non-empty name")
     if command_timeout_seconds <= 0:
         raise ValueError("command_timeout_seconds must be positive")
+
+    def timeout() -> float:
+        return (
+            min(command_timeout_seconds, deadline_check())
+            if deadline_check is not None
+            else command_timeout_seconds
+        )
+
     try:
         requested = Path(repo).expanduser()
         if not requested.is_absolute() and resolution_base is not None:
@@ -127,19 +140,19 @@ def _inspect_run_repository(
         _git_read(
             requested,
             ["rev-parse", "--show-toplevel"],
-            command_timeout_seconds,
+            timeout(),
         )
     ).resolve()
     if not source.is_dir():
         raise WorkerFailure(f"Git reported an invalid repository root: {source}")
-    remotes = _git_read(source, ["remote"], command_timeout_seconds).splitlines()
+    remotes = _git_read(source, ["remote"], timeout()).splitlines()
     if remote not in remotes:
         raise WorkerFailure(f"Git remote {remote!r} does not exist in {source}")
-    _git_read(source, ["remote", "get-url", remote], command_timeout_seconds)
+    _git_read(source, ["remote", "get-url", remote], timeout())
     checked_branch = _git_read(
         source,
         ["check-ref-format", "--branch", base_branch],
-        command_timeout_seconds,
+        timeout(),
     )
     if checked_branch != base_branch:
         raise WorkerFailure(f"invalid base branch {base_branch!r}")
@@ -148,7 +161,7 @@ def _inspect_run_repository(
         remote_lines = _git_read(
             source,
             ["ls-remote", "--exit-code", remote, remote_ref],
-            command_timeout_seconds,
+            timeout(),
         ).splitlines()
         matches = [
             line.split("\t", 1)[0].lower()
@@ -168,7 +181,7 @@ def _inspect_run_repository(
                 "--verify",
                 f"refs/remotes/{remote}/{base_branch}^{{commit}}",
             ],
-            command_timeout_seconds,
+            timeout(),
         ).lower()
     if not _OBJECT_ID_RE.fullmatch(base_sha):
         raise WorkerFailure(
@@ -192,6 +205,7 @@ def prepare_run_repository(
     remote: str = "origin",
     worktree_root: str | os.PathLike[str] | None = None,
     command_timeout_seconds: float = 30.0,
+    deadline_check: Callable[[], float] | None = None,
 ) -> RepositoryExecutionContext:
     """Create, verify, and register a fresh detached run worktree.
 
@@ -203,13 +217,18 @@ def prepare_run_repository(
         raise TypeError("worktree_root must be a path or None")
     root_value = DEFAULT_WORKTREE_ROOT if worktree_root is None else worktree_root
     root = Path(root_value).expanduser().resolve()
+    if deadline_check is not None:
+        deadline_check()
     preparation = inspect_run_repository(
         repo=repo,
         base_branch=base_branch,
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
+        deadline_check=deadline_check,
     )
-    return _prepare_repository_worktree(preparation, root, command_timeout_seconds)
+    return _prepare_repository_worktree(
+        preparation, root, command_timeout_seconds, deadline_check=deadline_check
+    )
 
 
 def inspect_run_revision(
@@ -219,12 +238,21 @@ def inspect_run_revision(
     remote: str = "origin",
     command_timeout_seconds: float = 30.0,
     cwd: Path | None = None,
+    deadline_check: Callable[[], float] | None = None,
 ) -> tuple[RepositoryPreparation, str]:
     """Resolve a remote branch or tag, or a full local commit ID."""
     if not isinstance(revision, str) or not revision or "\0" in revision:
         raise ValueError("revision must be a non-empty string without nulls")
     if command_timeout_seconds <= 0:
         raise ValueError("command_timeout_seconds must be positive")
+
+    def timeout() -> float:
+        return (
+            min(command_timeout_seconds, deadline_check())
+            if deadline_check is not None
+            else command_timeout_seconds
+        )
+
     requested = Path(repo).expanduser()
     if not requested.is_absolute() and cwd is not None:
         requested = cwd / requested
@@ -232,21 +260,18 @@ def inspect_run_revision(
     if not requested.is_dir():
         raise WorkerFailure(f"repository directory does not exist: {requested}")
     source = Path(
-        _git_read(requested, ["rev-parse", "--show-toplevel"], command_timeout_seconds)
+        _git_read(requested, ["rev-parse", "--show-toplevel"], timeout())
     ).resolve()
     if _OBJECT_ID_RE.fullmatch(revision.lower()):
         sha = revision.lower()
-        if (
-            _git_read(source, ["cat-file", "-t", sha], command_timeout_seconds)
-            != "commit"
-        ):
+        if _git_read(source, ["cat-file", "-t", sha], timeout()) != "commit":
             raise WorkerFailure(f"revision {revision!r} is not a commit")
         return RepositoryPreparation(
             source, None, None, sha, sha, "commit", revision
         ), "commit"
     if revision.startswith("-") or revision.startswith("refs/"):
         raise ValueError("revision must be a branch or tag name, or full commit SHA")
-    remotes = _git_read(source, ["remote"], command_timeout_seconds).splitlines()
+    remotes = _git_read(source, ["remote"], timeout()).splitlines()
     if remote not in remotes:
         raise WorkerFailure(f"Git remote {remote!r} does not exist in {source}")
     branch_ref = f"refs/heads/{revision}"
@@ -254,7 +279,7 @@ def inspect_run_revision(
     refs = _git_read(
         source,
         ["ls-remote", remote, branch_ref, tag_ref, f"{tag_ref}^{{}}"],
-        command_timeout_seconds,
+        timeout(),
     ).splitlines()
     matches = dict(line.split("\t", 1)[::-1] for line in refs if "\t" in line)
     if branch_ref in matches and tag_ref in matches:
@@ -265,13 +290,24 @@ def inspect_run_revision(
             base_branch=revision,
             remote=remote,
             command_timeout_seconds=command_timeout_seconds,
+            deadline_check=deadline_check,
         ), "branch"
     if tag_ref in matches:
         sha = matches.get(f"{tag_ref}^{{}}", matches[tag_ref]).lower()
         if not _OBJECT_ID_RE.fullmatch(sha):
             raise WorkerFailure(f"revision {revision!r} did not resolve to a commit")
+        object_type = _git_local_object_type(source, sha, timeout())
+        if object_type is not None and object_type != "commit":
+            raise WorkerFailure(f"revision {revision!r} tag points to a {object_type}")
         return RepositoryPreparation(
-            source, remote, None, tag_ref, sha, "tag", revision
+            source,
+            remote,
+            None,
+            tag_ref,
+            sha,
+            "tag",
+            revision,
+            "verified" if object_type == "commit" else "provisional",
         ), "tag"
     raise WorkerFailure(f"revision {revision!r} was not found on {remote}")
 
@@ -283,6 +319,7 @@ def prepare_run_revision(
     remote: str = "origin",
     worktree_root: str | os.PathLike[str] | None = None,
     command_timeout_seconds: float = 30.0,
+    deadline_check: Callable[[], float] | None = None,
 ) -> RepositoryExecutionContext:
     """Prepare a detached worktree from a branch, tag, or full commit SHA."""
     preparation, kind = inspect_run_revision(
@@ -290,6 +327,7 @@ def prepare_run_revision(
         revision=revision,
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
+        deadline_check=deadline_check,
     )
     if kind == "branch":
         return prepare_run_repository(
@@ -298,19 +336,32 @@ def prepare_run_revision(
             remote=remote,
             worktree_root=worktree_root,
             command_timeout_seconds=command_timeout_seconds,
+            deadline_check=deadline_check,
         )
     if worktree_root is not None and not isinstance(worktree_root, (str, os.PathLike)):
         raise TypeError("worktree_root must be a path or None")
     root_value = DEFAULT_WORKTREE_ROOT if worktree_root is None else worktree_root
     root = Path(root_value).expanduser().resolve()
-    return _prepare_repository_worktree(preparation, root, command_timeout_seconds)
+    return _prepare_repository_worktree(
+        preparation, root, command_timeout_seconds, deadline_check=deadline_check
+    )
 
 
 def _prepare_repository_worktree(
     preparation: RepositoryPreparation,
     root: Path,
     command_timeout_seconds: float,
+    *,
+    deadline_check: Callable[[], float] | None = None,
 ) -> RepositoryExecutionContext:
+    def timeout() -> float:
+        return (
+            min(command_timeout_seconds, deadline_check())
+            if deadline_check is not None
+            else command_timeout_seconds
+        )
+
+    timeout()
     repository_name = _safe_name(preparation.source_repository.name)
     execution_root = root / (f"awm-run-{repository_name}-{uuid.uuid4().hex[:12]}")
     before = _inspect_candidate(
@@ -319,7 +370,9 @@ def _prepare_repository_worktree(
         preparation.remote,
         preparation.base_branch,
         command_timeout_seconds,
+        deadline_check=deadline_check,
     )
+    timeout()
     if before["registered"] or before["path_exists"]:
         raise WorkerFailure(
             f"fresh worktree path unexpectedly exists: {execution_root}"
@@ -337,6 +390,7 @@ def _prepare_repository_worktree(
 
     def dispatch() -> None:
         try:
+            timeout()
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
             if preparation.revision_kind == "branch":
                 if preparation.remote is None or preparation.base_branch is None:
@@ -363,7 +417,7 @@ def _prepare_repository_worktree(
                 fetched = _run_git_mutation_process_group(
                     [*fetch_args, preparation.remote, fetch_ref],
                     cwd=preparation.source_repository,
-                    timeout=command_timeout_seconds,
+                    timeout=timeout(),
                 )
                 if fetched.returncode != 0:
                     detail = (
@@ -379,6 +433,7 @@ def _prepare_repository_worktree(
                         revision=preparation.revision or preparation.base_ref,
                         remote=preparation.remote or "origin",
                         command_timeout_seconds=command_timeout_seconds,
+                        deadline_check=deadline_check,
                     )
                 except WorkerFailure as exc:
                     raise AuthoritativeMutationRejection(
@@ -392,7 +447,7 @@ def _prepare_repository_worktree(
                 fetched_sha = _git_read(
                     preparation.source_repository,
                     ["rev-parse", "--verify", f"{verification_ref}^{{commit}}"],
-                    command_timeout_seconds,
+                    timeout(),
                 ).lower()
             except WorkerFailure as exc:
                 raise AuthoritativeMutationRejection(
@@ -412,7 +467,7 @@ def _prepare_repository_worktree(
                     preparation.base_sha,
                 ],
                 cwd=preparation.source_repository,
-                timeout=command_timeout_seconds,
+                timeout=timeout(),
             )
         except _QuiescentMutationTimeout as exc:
             raise AuthoritativeMutationRejection(
@@ -423,6 +478,8 @@ def _prepare_repository_worktree(
                 "Git repository preparation was interrupted after process-group "
                 "quiescence"
             ) from exc
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise PreDispatchFailure(
                 f"could not execute Git worktree creation: {exc}"
@@ -570,16 +627,25 @@ def _inspect_candidate(
     remote: str | None,
     base_branch: str | None,
     timeout: float,
+    *,
+    deadline_check: Callable[[], float] | None = None,
 ) -> dict[str, object]:
-    listed = _git_read(repository, ["worktree", "list", "--porcelain"], timeout)
+    def remaining_timeout() -> float:
+        return min(timeout, deadline_check()) if deadline_check is not None else timeout
+
+    listed = _git_read(
+        repository, ["worktree", "list", "--porcelain"], remaining_timeout()
+    )
     registered = any(line == f"worktree {worktree}" for line in listed.splitlines())
     path_exists = os.path.lexists(worktree)
     head: str | None = None
     branch: str | None = None
     if registered and worktree.is_dir():
-        head = _git_read(worktree, ["rev-parse", "HEAD"], timeout).lower()
+        head = _git_read(worktree, ["rev-parse", "HEAD"], remaining_timeout()).lower()
         branch = _git_read(
-            worktree, ["rev-parse", "--symbolic-full-name", "HEAD"], timeout
+            worktree,
+            ["rev-parse", "--symbolic-full-name", "HEAD"],
+            remaining_timeout(),
         )
     return {
         "registered": registered,
@@ -593,7 +659,7 @@ def _inspect_candidate(
                 "--verify",
                 f"refs/remotes/{remote}/{base_branch}^{{commit}}",
             ],
-            timeout,
+            remaining_timeout(),
         )
         if remote is not None and base_branch is not None
         else None,
@@ -624,6 +690,22 @@ def _git_optional_read(repository: Path, args: list[str], timeout: float) -> str
         return _git_read(repository, args, timeout).lower()
     except WorkerFailure:
         return None
+
+
+def _git_local_object_type(repository: Path, sha: str, timeout: float) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), "cat-file", "-t", sha],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkerFailure("read-only Git cat-file timed out") from exc
+    except OSError as exc:
+        raise WorkerFailure(f"could not execute Git cat-file: {exc}") from exc
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 
 def _safe_name(value: str) -> str:

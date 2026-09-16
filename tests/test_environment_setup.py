@@ -29,7 +29,9 @@ def repository_lookup(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
     def inspect(*, repo: str, revision: str) -> tuple[SimpleNamespace, str]:
         calls.append((repo, revision))
-        return SimpleNamespace(source_repository=Path(repo)), "branch"
+        return SimpleNamespace(
+            source_repository=Path(repo), revision_validation="verified"
+        ), "branch"
 
     monkeypatch.setattr(setup, "inspect_run_revision", inspect)
     return calls
@@ -51,7 +53,7 @@ def test_generates_python_from_declarative_inputs(
     assert repository_lookup == [("/source/repo", "dev/v0.4.1")]
     assert "prepare_run_revision(" in code
     assert "revision='dev/v0.4.1'" in code
-    assert "PurpleMuxRuntime(owned_by_run=True)" in code
+    assert "owned_by_run=True, command_timeout_seconds=min(remaining(), 30)" in code
     assert "worker='claude-code'" in code
     assert "deadline = time.monotonic() + 120" in code
     assert "Build command: python -m build" in code
@@ -170,8 +172,11 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     client = Client()
 
     class Runtime:
-        def __init__(self, *, owned_by_run: bool) -> None:
+        def __init__(
+            self, *, owned_by_run: bool, command_timeout_seconds: float
+        ) -> None:
             assert owned_by_run
+            assert command_timeout_seconds > 0
 
         def create_workspace(self, _request: object) -> SimpleNamespace:
             return SimpleNamespace(id="ws-1")
@@ -207,3 +212,68 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         ("Environment Setup", "completed" if expected_error is None else "failed"),
     ]
     assert interrupted == (["tab-1"] if busy_timeout else [])
+
+
+@pytest.mark.parametrize("phase", ["preparation", "workspace", "session"])
+def test_generated_workflow_stops_creating_resources_after_deadline(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    import purplemux_client
+
+    created: list[str] = []
+    events: list[str] = []
+
+    def prepare(**kwargs: object) -> SimpleNamespace:
+        if phase == "preparation":
+            time.sleep(1.05)
+        kwargs["deadline_check"]()  # type: ignore[operator]
+        created.append("worktree")
+        return SimpleNamespace(execution_root=Path("/tmp/environment-setup"))
+
+    class Client:
+        command_timeout_seconds = 30.0
+
+        def create_session(self, request: object) -> str:
+            if phase == "session":
+                time.sleep(1.05)
+            request.deadline_check()  # type: ignore[attr-defined]
+            created.append("session")
+            return "tab-1"
+
+    class Runtime:
+        def __init__(
+            self, *, owned_by_run: bool, command_timeout_seconds: float
+        ) -> None:
+            assert owned_by_run and command_timeout_seconds > 0
+
+        def create_workspace(self, request: object) -> SimpleNamespace:
+            if phase == "workspace":
+                time.sleep(1.05)
+            request.deadline_check()  # type: ignore[attr-defined]
+            created.append("workspace")
+            return SimpleNamespace(id="ws-1")
+
+        def workspace(self, _workspace_id: str) -> Client:
+            return Client()
+
+    monkeypatch.setattr(purplemux_client, "prepare_run_revision", prepare)
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        purplemux_client,
+        "emit_step",
+        lambda _name, state, **_kwargs: events.append(state),
+    )
+    code = setup.generate_environment_setup_workflow(
+        setup.EnvironmentSetupInput("/source/repo", "main", "codex", 1)
+    )
+    with pytest.raises(TimeoutError, match="Environment Setup timed out"):
+        exec(compile(code, "<environment-setup>", "exec"), {})
+    assert events == ["started", "failed"]
+    assert (
+        created
+        == {
+            "preparation": [],
+            "workspace": ["worktree"],
+            "session": ["worktree", "workspace"],
+        }[phase]
+    )

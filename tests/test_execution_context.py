@@ -10,6 +10,7 @@ from threading import Barrier
 import pytest
 
 from purplemux_client import (
+    WorkerFailure,
     inspect_run_repository,
     inspect_run_revision,
     prepare_run_repository,
@@ -187,6 +188,120 @@ def test_prepare_run_revision_rejects_ambiguous_branch_and_tag(tmp_path: Path) -
 
     with pytest.raises(Exception, match="both a branch and a tag"):
         inspect_run_revision(repo=repository, revision="main")
+
+
+def test_non_commit_tag_is_rejected_when_object_is_local(tmp_path: Path) -> None:
+    from purplemux_client.environment_setup import parse_environment_setup_json
+
+    repository, _sha = repository_with_remote(tmp_path)
+    blob_sha = git(repository, "hash-object", "tracked")
+    git(repository, "update-ref", "refs/tags/blob-release", blob_sha)
+    git(repository, "push", "origin", "refs/tags/blob-release")
+
+    with pytest.raises(WorkerFailure, match="tag points to a blob"):
+        inspect_run_revision(repo=repository, revision="blob-release")
+    with pytest.raises(ValueError, match="tag points to a blob"):
+        parse_environment_setup_json(
+            json.dumps(
+                {
+                    "mode": "environment-setup",
+                    "repository": str(repository),
+                    "revision": "blob-release",
+                    "environment_agent": "codex",
+                    "timeout": 120,
+                }
+            )
+        )
+
+
+def test_remote_only_tag_validation_is_explicitly_provisional(tmp_path: Path) -> None:
+    from purplemux_client.environment_setup import (
+        generate_environment_setup_workflow,
+        parse_environment_setup_json,
+    )
+
+    repository, _sha = repository_with_remote(tmp_path)
+    writer = tmp_path / "writer"
+    git(tmp_path, "clone", "-b", "main", str(tmp_path / "remote.git"), str(writer))
+    git(writer, "config", "user.email", "test@example.com")
+    git(writer, "config", "user.name", "Test")
+    (writer / "new").write_text("unfetched\n", encoding="utf-8")
+    git(writer, "add", "new")
+    git(writer, "commit", "-qm", "unfetched")
+    git(writer, "tag", "remote-release")
+    git(writer, "push", "origin", "refs/tags/remote-release")
+
+    preparation, kind = inspect_run_revision(repo=repository, revision="remote-release")
+    assert kind == "tag"
+    assert preparation.revision_validation == "provisional"
+    config = parse_environment_setup_json(
+        json.dumps(
+            {
+                "mode": "environment-setup",
+                "repository": str(repository),
+                "revision": "remote-release",
+                "environment_agent": "codex",
+                "timeout": 120,
+            }
+        )
+    )
+    assert config.revision_validation == "provisional"
+    assert "REVISION_VALIDATION = 'provisional'" in generate_environment_setup_workflow(
+        config
+    )
+
+    blob_sha = git(writer, "hash-object", "new")
+    git(writer, "update-ref", "refs/tags/remote-blob", blob_sha)
+    git(writer, "push", "origin", "refs/tags/remote-blob")
+    blob_preparation, blob_kind = inspect_run_revision(
+        repo=repository, revision="remote-blob"
+    )
+    assert blob_kind == "tag"
+    assert blob_preparation.revision_validation == "provisional"
+    with pytest.raises(WorkerFailure, match="confirmed_rejected"):
+        prepare_run_revision(
+            repo=repository,
+            revision="remote-blob",
+            worktree_root=tmp_path / "blob-worktrees",
+        )
+    assert list((tmp_path / "blob-worktrees").iterdir()) == []
+
+
+def test_deadline_expiring_during_git_inspection_prevents_worktree_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    original_read = execution_context._git_read
+    reached_worktree_inspection = False
+
+    def slow_read(repository_path: Path, args: list[str], timeout: float) -> str:
+        nonlocal reached_worktree_inspection
+        if args[:2] == ["worktree", "list"]:
+            reached_worktree_inspection = True
+            time.sleep(0.1)
+        return original_read(repository_path, args, timeout)
+
+    monkeypatch.setattr(execution_context, "_git_read", slow_read)
+    deadline = time.monotonic() + 0.05
+
+    def remaining() -> float:
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("Environment Setup timed out")
+        return seconds
+
+    with pytest.raises(TimeoutError, match="Environment Setup timed out"):
+        prepare_run_revision(
+            repo=repository,
+            revision="main",
+            worktree_root=worktree_root,
+            deadline_check=remaining,
+        )
+    assert reached_worktree_inspection
+    assert not worktree_root.exists()
 
 
 def test_concurrent_tag_preparations_do_not_share_fetch_identity(

@@ -299,11 +299,19 @@ class WorkflowValidator:
                 "remote",
                 "worktree_root",
                 "command_timeout_seconds",
+                "deadline_check",
             }
             for keyword in node.keywords:
                 if keyword.arg is None or keyword.arg not in allowed:
                     malformed = True
                     break
+                if keyword.arg == "deadline_check":
+                    if not (
+                        isinstance(keyword.value, ast.Name)
+                        and keyword.value.id == "remaining"
+                    ):
+                        malformed = True
+                    continue
                 try:
                     values[keyword.arg] = ast.literal_eval(keyword.value)
                 except (ValueError, TypeError):

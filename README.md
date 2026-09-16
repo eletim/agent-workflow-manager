@@ -75,10 +75,14 @@ every prompt.
 tag, or a full local commit SHA; a local commit needs no remote),
 `environment_agent` (`codex` or `claude-code`), and `timeout` (1–86400 seconds).
 Optional non-empty strings are `build`, `start`, and `ready_check`. The endpoint
-validates the inputs and returns the normalized configuration and generated
-plain Python Workflow. The generated workflow prepares a detached worktree,
+validates the inputs and returns the normalized configuration, a
+`revisionValidation` status, and generated plain Python Workflow. A remote tag
+whose object is not available locally is marked `provisional`; the Workflow
+verifies that it points to a commit after fetching it. The generated workflow
+prepares a detached worktree,
 asks the selected agent to set up the environment and run the supplied commands,
-and waits within the declared timeout. The agent must return a JSON `READY`
+and applies the declared timeout to preparation, session creation, and agent
+execution. The agent must return a JSON `READY`
 result with a passing check for each supplied command; `BLOCKED`, failed checks,
 and unstructured results fail the Run. A busy agent is interrupted at timeout.
 These inputs describe the environment;

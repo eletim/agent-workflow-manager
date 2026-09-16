@@ -804,7 +804,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 HTTPStatus.OK,
-                {"config": config.as_json(), "generatedCode": code},
+                {
+                    "config": config.as_json(),
+                    "revisionValidation": config.revision_validation,
+                    "generatedCode": code,
+                },
             )
             return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:

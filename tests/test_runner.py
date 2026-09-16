@@ -3609,6 +3609,7 @@ def test_environment_setup_generation_api(
     )
     assert status == 200
     assert generated["config"]["revision"] == "main"
+    assert generated["revisionValidation"] == "verified"
     ast.parse(generated["generatedCode"])
 
     status, rejected = request(

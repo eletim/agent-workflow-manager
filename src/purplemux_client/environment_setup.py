@@ -23,6 +23,7 @@ class EnvironmentSetupInput:
     build: str | None = None
     start: str | None = None
     ready_check: str | None = None
+    revision_validation: str = "verified"
 
     def as_json(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -100,6 +101,7 @@ def parse_environment_setup_json(source: str) -> EnvironmentSetupInput:
         build=value.get("build"),
         start=value.get("start"),
         ready_check=value.get("ready_check"),
+        revision_validation=preparation.revision_validation,
     )
 
 
@@ -147,6 +149,7 @@ from purplemux_client import (
 
 WORKFLOW_OUTLINE = ["Environment Setup"]
 EXPECTED_CHECKS = {expected_checks!r}
+REVISION_VALIDATION = {config.revision_validation!r}
 
 
 def remaining():
@@ -167,21 +170,31 @@ turn_active = False
 try:
     deadline = time.monotonic() + {config.timeout}
     context = prepare_run_revision(
-        repo={config.repository!r}, revision={config.revision!r}
+        repo={config.repository!r}, revision={config.revision!r},
+        deadline_check=remaining,
     )
+    remaining()
     cwd = str(context.execution_root)
-    runtime = PurpleMuxRuntime(owned_by_run=True)
-    workspace = runtime.create_workspace(
-        CreateWorkspaceRequest(cwd=cwd, name="AWM Environment Setup")
+    runtime = PurpleMuxRuntime(
+        owned_by_run=True, command_timeout_seconds=min(remaining(), 30)
     )
+    workspace = runtime.create_workspace(
+        CreateWorkspaceRequest(
+            cwd=cwd, name="AWM Environment Setup", deadline_check=remaining
+        )
+    )
+    remaining()
     client = runtime.workspace(workspace.id)
+    client.command_timeout_seconds = min(remaining(), 30)
     tab = client.create_session(
         CreateSessionRequest(
             worker={config.environment_agent!r},
             cwd=cwd,
             command={config.environment_agent!r},
+            deadline_check=remaining,
         )
     )
+    remaining()
     client.wait_until_ready(tab, min(remaining(), 60))
     client.send_input(tab, {prompt!r})
     turn_active = True

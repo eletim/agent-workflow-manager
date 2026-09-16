@@ -51,6 +51,7 @@ class CreateSessionRequest:
     metadata: Mapping[str, str] = field(default_factory=dict)
     name: str | None = None
     correlation_id: str | None = None
+    deadline_check: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class CreateWorkspaceRequest:
     cwd: str
     name: str
     correlation_id: str | None = None
+    deadline_check: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +254,8 @@ class PurpleMuxRuntime:
         return tuple(workspaces)
 
     def create_workspace(self, request: CreateWorkspaceRequest) -> WorkspaceState:
+        if request.deadline_check is not None:
+            request.deadline_check()
         cwd = os.path.abspath(os.path.expanduser(request.cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"workspace directory is not a directory: {cwd}")
@@ -296,6 +300,10 @@ class PurpleMuxRuntime:
 
         def dispatch() -> WorkspaceState:
             nonlocal response_id, response_initial_tab
+            if request.deadline_check is not None:
+                self.command_timeout_seconds = min(
+                    self.command_timeout_seconds, request.deadline_check()
+                )
             data = self._mutation_json(
                 ["workspace", "create", "--cwd", cwd, "--name", correlated_name],
                 "create workspace",
@@ -641,6 +649,8 @@ class PurpleMuxCLIClient:
 
     def create_session(self, request: CreateSessionRequest) -> str:
         """Create and launch a Codex or Claude session."""
+        if request.deadline_check is not None:
+            request.deadline_check()
         panel_type = _PANEL_TYPES.get(request.worker.lower())
         if panel_type is None:
             panel_type = _PANEL_TYPES.get(request.command.lower())
@@ -679,6 +689,7 @@ class PurpleMuxCLIClient:
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",
             name=name,
+            deadline_check=request.deadline_check,
         )
         if self.owned_by_run:
             self._register_owned_tab(tab)
@@ -1356,6 +1367,7 @@ class PurpleMuxCLIClient:
         provider: str | None,
         name: str,
         before: tuple[TabState, ...] | None = None,
+        deadline_check: Callable[[], float] | None = None,
     ) -> TabState:
         if not name.strip() or "\0" in name or len(name) > 200:
             raise ValueError("tab name must be 1-200 characters without nulls")
@@ -1377,6 +1389,10 @@ class PurpleMuxCLIClient:
 
         def dispatch() -> TabState:
             nonlocal response_id
+            if deadline_check is not None:
+                self.command_timeout_seconds = min(
+                    self.command_timeout_seconds, deadline_check()
+                )
             data = self._mutation_json(
                 [
                     "tab",
