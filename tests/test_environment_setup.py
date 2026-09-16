@@ -62,6 +62,9 @@ def test_generates_python_from_declarative_inputs(
     assert "Build command: python -m build" in code
     assert "Start command: python app.py" in code
     assert "Ready check command: curl http://localhost:8000/health" in code
+    assert "exactly as given" in code
+    assert "before considering any alternative" in code
+    assert "Verify that the target is actually usable" in code
     assert "steps" not in config.as_json()
 
 
@@ -89,6 +92,8 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
     assert "Build command:" not in code
     assert "Start command:" not in code
     assert "Ready check command:" not in code
+    assert "Skip instructions that were omitted" in code
+    assert "If no commands were supplied" in code
     assert set(config.as_json()) == {
         "mode",
         "repository",
@@ -116,6 +121,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "status": "READY",
                 "summary": "build failed",
                 "checks": {"build": "failed"},
+                "verification": "service responded",
             },
             False,
             False,
@@ -127,6 +133,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "status": "READY",
                 "summary": "ready",
                 "checks": {"build": "passed"},
+                "verification": "service responded successfully",
                 "resolved_revision": "unverified",
                 "working_path": "/wrong/path",
             },
@@ -135,10 +142,21 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             None,
         ),
         (
-            {"status": "READY", "summary": "ready", "checks": {"build": "passed"}},
+            {
+                "status": "READY",
+                "summary": "ready",
+                "checks": {"build": "passed"},
+                "verification": "service responded successfully",
+            },
             False,
             True,
             "Environment Setup timed out",
+        ),
+        (
+            {"status": "READY", "summary": "ready", "checks": {"build": "passed"}},
+            False,
+            False,
+            "did not report verified READY",
         ),
     ],
 )

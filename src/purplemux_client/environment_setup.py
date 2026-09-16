@@ -110,9 +110,12 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     instructions = [
         "Set up the repository at the selected revision for development.",
         "Work only in the supplied execution directory.",
-        "Run the supplied commands in order. If one fails, inspect the repository "
-        "and logs, correct the environment, and retry. Report BLOCKED if the "
-        "environment cannot be made ready.",
+        "Run each supplied build, start, and ready_check command exactly as given, "
+        "in that order, before considering any alternative. Do not substitute a "
+        "different command for the first attempt. Skip instructions that were "
+        "omitted. If a command fails, inspect the repository and logs, correct "
+        "the environment, and retry. Report BLOCKED if the environment cannot "
+        "be made ready.",
     ]
     for label, command in (
         ("Build", config.build),
@@ -128,10 +131,15 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     }
     instructions.extend(
         (
+            "Verify that the target is actually usable in the prepared worktree. "
+            "Observe a relevant successful behavior, including the ready_check "
+            "result when one was supplied. If no commands were supplied, still "
+            "perform a concrete usability check. Report the observed evidence "
+            "in a non-empty verification string.",
             "Return only one JSON object with status READY or BLOCKED, a non-empty "
-            "summary, and a checks object. Include each supplied command in checks "
+            "summary, a checks object, and verification. Include each supplied command in checks "
             "with passed or failed. Use READY only after every supplied command "
-            "passes and the environment is actually ready. Include observed errors "
+            "passes and the target is verified usable. Include observed errors "
             "in a BLOCKED summary.",
         )
     )
@@ -208,6 +216,8 @@ try:
         or report.get("status") != "READY"
         or not isinstance(report.get("summary"), str)
         or not report["summary"].strip()
+        or not isinstance(report.get("verification"), str)
+        or not report["verification"].strip()
         or report.get("checks") != EXPECTED_CHECKS
     ):
         raise RuntimeError("Environment Setup did not report verified READY")

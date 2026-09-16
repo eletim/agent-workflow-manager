@@ -81,10 +81,13 @@ whose object is not available locally is marked `provisional`; the Workflow
 verifies that it points to a commit after fetching it. The generated workflow
 prepares a detached worktree,
 asks the selected agent to set up the environment and run the supplied commands,
-and applies the declared timeout to preparation, session creation, and agent
-execution. The agent must return a JSON `READY`
-result with a passing check for each supplied command; `BLOCKED`, failed checks,
-and unstructured results fail the Run. A busy agent is interrupted at timeout.
+running each supplied command as given before considering alternatives. Omitted
+commands are skipped. The declared timeout applies to preparation, session
+creation, and agent execution. The agent must verify that the target is usable
+and return a JSON `READY` result with observed `verification` evidence and a
+passing check for each supplied command; `BLOCKED`, failed checks, missing
+verification, and unstructured results fail the Run. A busy agent is
+interrupted at timeout.
 On success, the workflow adds the verified commit SHA as `resolved_revision` and
 the detached worktree as `working_path` to the JSON result.
 These inputs describe the environment;
