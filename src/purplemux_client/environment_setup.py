@@ -202,7 +202,6 @@ try:
     remaining()
     result = client.read_result(tab)
     remaining()
-    print(result)
     report = json.loads(result)
     if (
         not isinstance(report, dict)
@@ -213,6 +212,9 @@ try:
     ):
         raise RuntimeError("Environment Setup did not report verified READY")
     remaining()
+    report["resolved_revision"] = context.base_sha
+    report["working_path"] = cwd
+    print(json.dumps(report))
 except BaseException as exc:
     interrupt_error = None
     if isinstance(exc, TimeoutError) and turn_active and client is not None and tab is not None:
