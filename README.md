@@ -518,6 +518,12 @@ client.close_session(shell_tab)
 
 PurpleMux owns provider launch commands and the workspace directory. The
 adapter never calls tmux, private PurpleMux APIs, or PurpleMux internal files.
+Generated Review is a narrow exception outside the adapter: it reads the pane
+PID for its exact public tab identity from the PurpleMux tmux session, then
+places that process tree in a dedicated Linux cgroup v2 scope before sending
+agent input. Review requires delegated cgroup v2 and `cgroup.kill`; it stops
+the entire scope before its final repository check. If containment cannot be
+established, the Review fails before the agent receives a task.
 Before creating a Codex tab, the adapter canonicalizes the requested working
 directory, re-reads the selected workspace, and requires it to match the
 workspace's current first directory—the directory PurpleMux actually launches.
