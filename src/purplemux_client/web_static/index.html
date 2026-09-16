@@ -36,6 +36,7 @@
       <section class="panel editor-panel">
         <div class="mode-switch" role="group" aria-label="Execution mode">
           <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
+          <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
           <button id="issue-driven-mode" type="button" aria-pressed="false">Issue Driven</button>
           <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Python Workflow</button>
         </div>
@@ -102,6 +103,24 @@
           <p id="issue-driven-success" class="validation-success" hidden>✓ JSON/schema valid</p>
           <ol id="issue-driven-validation" class="validation-list"></ol>
           <textarea id="issue-driven-python" spellcheck="false" readonly aria-label="Generated Python workflow"></textarea>
+        </div>
+
+        <div id="environment-setup-fields" hidden>
+          <label for="environment-setup-json">Environment Setup JSON</label>
+          <textarea id="environment-setup-json" spellcheck="false">{
+  "mode": "environment-setup",
+  "repository": "~/DevEnv/project",
+  "revision": "origin/main",
+  "environment_agent": "codex",
+  "timeout": 3600
+}</textarea>
+          <div class="generated-heading">
+            <label for="environment-setup-python">Generated Python (read-only)</label>
+            <button id="environment-setup-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="environment-setup-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <p id="environment-setup-error" class="repository-config-message" hidden></p>
+          <textarea id="environment-setup-python" spellcheck="false" readonly aria-label="Generated Environment Setup workflow"></textarea>
         </div>
 
         <div id="workflow-fields">

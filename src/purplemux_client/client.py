@@ -51,6 +51,7 @@ class CreateSessionRequest:
     metadata: Mapping[str, str] = field(default_factory=dict)
     name: str | None = None
     correlation_id: str | None = None
+    deadline_check: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class CreateWorkspaceRequest:
     cwd: str
     name: str
     correlation_id: str | None = None
+    deadline_check: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,7 @@ class ShellCommandRequest:
     cwd: str
     name: str
     correlation_id: str | None = None
+    deadline_check: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +255,8 @@ class PurpleMuxRuntime:
         return tuple(workspaces)
 
     def create_workspace(self, request: CreateWorkspaceRequest) -> WorkspaceState:
+        if request.deadline_check is not None:
+            request.deadline_check()
         cwd = os.path.abspath(os.path.expanduser(request.cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"workspace directory is not a directory: {cwd}")
@@ -296,9 +301,15 @@ class PurpleMuxRuntime:
 
         def dispatch() -> WorkspaceState:
             nonlocal response_id, response_initial_tab
+            timeout_seconds = (
+                min(self.command_timeout_seconds, request.deadline_check())
+                if request.deadline_check is not None
+                else self.command_timeout_seconds
+            )
             data = self._mutation_json(
                 ["workspace", "create", "--cwd", cwd, "--name", correlated_name],
                 "create workspace",
+                timeout_seconds=timeout_seconds,
             )
             candidate = data.get("id") or data.get("workspaceId")
             if isinstance(candidate, str) and candidate:
@@ -531,9 +542,21 @@ class PurpleMuxRuntime:
             return _parse_json_object(completed.stdout, operation)
         raise AssertionError("unreachable")
 
-    def _mutation_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+    def _mutation_json(
+        self,
+        args: Sequence[str],
+        operation: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         return _run_mutation_json(
-            self._runner, self.executable, args, operation, self.command_timeout_seconds
+            self._runner,
+            self.executable,
+            args,
+            operation,
+            self.command_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds,
         )
 
 
@@ -641,6 +664,8 @@ class PurpleMuxCLIClient:
 
     def create_session(self, request: CreateSessionRequest) -> str:
         """Create and launch a Codex or Claude session."""
+        if request.deadline_check is not None:
+            request.deadline_check()
         panel_type = _PANEL_TYPES.get(request.worker.lower())
         if panel_type is None:
             panel_type = _PANEL_TYPES.get(request.command.lower())
@@ -679,17 +704,21 @@ class PurpleMuxCLIClient:
             panel_type=panel_type,
             provider="codex" if panel_type == "codex-cli" else "claude",
             name=name,
+            deadline_check=request.deadline_check,
         )
         if self.owned_by_run:
             self._register_owned_tab(tab)
         return tab.id
 
-    def list_sessions(self) -> tuple[TabState, ...]:
+    def list_sessions(
+        self, *, deadline_check: Callable[[], float] | None = None
+    ) -> tuple[TabState, ...]:
         """Return one complete structured tab listing for this workspace."""
         data = self._run_json(
             ["tab", "list", "-w", self.workspace_id],
             operation="list tabs",
             read_only=True,
+            deadline_check=deadline_check,
         )
         values = data.get("tabs")
         if not isinstance(values, list):
@@ -881,7 +910,11 @@ class PurpleMuxCLIClient:
             name = f"{name} [awm:{correlation_id}]"
 
         tab = self._create_correlated_tab(
-            panel_type="terminal", provider=None, name=name
+            panel_type="terminal",
+            provider=None,
+            name=name,
+            deadline_check=request.deadline_check,
+            bound_reads=request.deadline_check is not None,
         )
         if self.owned_by_run:
             self._register_owned_tab(tab)
@@ -904,7 +937,12 @@ class PurpleMuxCLIClient:
             on_created(session_id, result_path)
         wrapper = self._shell_wrapper(request.command, cwd, result_path)
         try:
-            self._send_mutation(session_id, wrapper, operation="start shell command")
+            self._send_mutation(
+                session_id,
+                wrapper,
+                operation="start shell command",
+                deadline_check=request.deadline_check,
+            )
         except MutationOutcomeUnknown as exc:
             # Keep both the tab and correlation data: a timed-out send may have
             # started the command, and the terminal remains useful for inspection.
@@ -1356,10 +1394,18 @@ class PurpleMuxCLIClient:
         provider: str | None,
         name: str,
         before: tuple[TabState, ...] | None = None,
+        deadline_check: Callable[[], float] | None = None,
+        bound_reads: bool = False,
     ) -> TabState:
         if not name.strip() or "\0" in name or len(name) > 200:
             raise ValueError("tab name must be 1-200 characters without nulls")
-        captured = self.list_sessions() if before is None else before
+
+        def current_tabs() -> tuple[TabState, ...]:
+            if not bound_reads or deadline_check is None:
+                return self.list_sessions()
+            return self.list_sessions(deadline_check=deadline_check)
+
+        captured = current_tabs() if before is None else before
         before_ids = {tab.id for tab in captured}
         if any(tab.name == name for tab in captured):
             raise WorkerFailure(f"tab correlation name {name!r} is already in use")
@@ -1368,7 +1414,7 @@ class PurpleMuxCLIClient:
         def matches() -> tuple[TabState, ...]:
             return tuple(
                 tab
-                for tab in self.list_sessions()
+                for tab in current_tabs()
                 if tab.id not in before_ids
                 and tab.name == name
                 and tab.panel_type == panel_type
@@ -1377,6 +1423,11 @@ class PurpleMuxCLIClient:
 
         def dispatch() -> TabState:
             nonlocal response_id
+            timeout_seconds = (
+                min(self.command_timeout_seconds, deadline_check())
+                if deadline_check is not None
+                else self.command_timeout_seconds
+            )
             data = self._mutation_json(
                 [
                     "tab",
@@ -1389,6 +1440,7 @@ class PurpleMuxCLIClient:
                     panel_type,
                 ],
                 "create tab",
+                timeout_seconds=timeout_seconds,
             )
             candidate = data.get("tabId") or data.get("tab_id") or data.get("id")
             if isinstance(candidate, str) and candidate:
@@ -1469,13 +1521,26 @@ class PurpleMuxCLIClient:
     def _tab_identity(tab: TabState) -> tuple[str, str, str, str | None, str | None]:
         return (tab.id, tab.workspace_id, tab.name, tab.panel_type, tab.provider)
 
-    def _send_mutation(self, session_id: str, text: str, *, operation: str) -> None:
+    def _send_mutation(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        operation: str,
+        deadline_check: Callable[[], float] | None = None,
+    ) -> None:
         self._execute_runtime_mutation(
             operation=operation,
             target=f"{self.workspace_id}/{session_id}",
             pre_state={"workspace": self.workspace_id, "tab": session_id},
             dispatch=lambda: self._mutation_json(
-                ["tab", "send", "-w", self.workspace_id, session_id, text], operation
+                ["tab", "send", "-w", self.workspace_id, session_id, text],
+                operation,
+                timeout_seconds=(
+                    min(self.command_timeout_seconds, deadline_check())
+                    if deadline_check is not None
+                    else None
+                ),
             ),
             desired=lambda: False,
             unchanged=lambda: True,
@@ -1558,9 +1623,21 @@ class PurpleMuxCLIClient:
                 )
             self._sleep(self.poll_interval_seconds)
 
-    def _mutation_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+    def _mutation_json(
+        self,
+        args: Sequence[str],
+        operation: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         return _run_mutation_json(
-            self._runner, self.executable, args, operation, self.command_timeout_seconds
+            self._runner,
+            self.executable,
+            args,
+            operation,
+            self.command_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds,
         )
 
     def _read_turn_baseline(self, session_id: str) -> _TurnBaseline:
@@ -1679,9 +1756,19 @@ class PurpleMuxCLIClient:
             raise WorkerFailure(f"session {session_id} entered {state}")
 
     def _run_json(
-        self, args: Sequence[str], *, operation: str, read_only: bool
+        self,
+        args: Sequence[str],
+        *,
+        operation: str,
+        read_only: bool,
+        deadline_check: Callable[[], float] | None = None,
     ) -> dict[str, Any]:
-        completed = self._run(args, operation=operation, read_only=read_only)
+        completed = self._run(
+            args,
+            operation=operation,
+            read_only=read_only,
+            deadline_check=deadline_check,
+        )
         try:
             data = json.loads(completed.stdout)
         except (json.JSONDecodeError, TypeError) as exc:
@@ -1699,17 +1786,27 @@ class PurpleMuxCLIClient:
         return cast(dict[str, Any], data)
 
     def _run(
-        self, args: Sequence[str], *, operation: str, read_only: bool
+        self,
+        args: Sequence[str],
+        *,
+        operation: str,
+        read_only: bool,
+        deadline_check: Callable[[], float] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [self.executable, *args]
         attempts = self.read_timeout_retries + 1 if read_only else 1
         for attempt in range(attempts):
+            timeout_seconds = (
+                min(self.command_timeout_seconds, deadline_check())
+                if deadline_check is not None
+                else self.command_timeout_seconds
+            )
             try:
                 completed = self._runner(
                     command,
                     capture_output=True,
                     text=True,
-                    timeout=self.command_timeout_seconds,
+                    timeout=timeout_seconds,
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:
@@ -1717,12 +1814,11 @@ class PurpleMuxCLIClient:
                     continue
                 if read_only:
                     raise WorkerFailure(
-                        f"PurpleMux {operation} timed out after "
-                        f"{self.command_timeout_seconds}s"
+                        f"PurpleMux {operation} timed out after {timeout_seconds}s"
                     ) from exc
                 raise MutationOutcomeUnknown(
                     f"PurpleMux {operation} timed out after "
-                    f"{self.command_timeout_seconds}s; remote outcome is unknown"
+                    f"{timeout_seconds}s; remote outcome is unknown"
                 ) from exc
             except OSError as exc:
                 raise WorkerFailure(

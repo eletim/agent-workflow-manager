@@ -21,7 +21,9 @@ from purplemux_client.execution_context import (
     RepositoryExecutionContext,
     RepositoryPreparation,
     inspect_run_repository,
+    inspect_run_revision,
     prepare_run_repository,
+    prepare_run_revision,
 )
 from purplemux_client.external_runs import (
     ExternalRunClient,
@@ -124,6 +126,7 @@ __all__ = [
     "emit_run_pr",
     "emit_whole_review_result",
     "inspect_run_repository",
+    "inspect_run_revision",
     "inspect_issue_driven_topology",
     "inspect_issue_driven_work_item_topology",
     "recover_issue_driven_work_item_topology",
@@ -132,6 +135,7 @@ __all__ = [
     "generate_issue_driven_workflow",
     "parse_issue_driven_json",
     "prepare_run_repository",
+    "prepare_run_revision",
     "register_run_resource",
     "run_correlation",
 ]

@@ -67,9 +67,72 @@ record. Give each agent only the portion of human context and recorded decisions
 needed for its current role instead of accumulating every available artifact in
 every prompt.
 
+## Environment Setup inputs
+
+The UI offers an Environment Setup mode. Enter the declaration, select
+**Validate JSON & Generate** to inspect its Python, then use the usual
+Validate, Dry Run, and Run buttons. Run submits the generated Python and
+the original declaration to `/api/run`; Progress, Stop, Result, and history
+are the ordinary Run surfaces. History retains the declaration and generated
+Python.
+
+`POST /api/environment-setup/generate` accepts `{"json": "..."}` with an
+`environment-setup` declaration. Required fields are `mode`, `repository`
+(an existing local Git repository), `revision` (an existing `origin` branch or
+tag, or a full local commit SHA; a local commit needs no remote),
+`environment_agent` (`codex` or `claude-code`), and `timeout` (1–86400 seconds).
+Optional non-empty strings are `build`, `start`, and `ready_check`. The endpoint
+validates the inputs and returns the normalized configuration, a
+`revisionValidation` status, and generated plain Python Workflow. A remote tag
+whose object is not available locally is marked `provisional`; the Workflow
+verifies that it points to a commit after fetching it. The generated workflow
+prepares a detached worktree and asks the selected agent to prepare it. The
+workflow then runs each supplied build, start, and ready check command as given,
+in order, in managed PurpleMux terminals, even if the initial agent report is
+`BLOCKED`. Omitted commands are skipped. If no
+ready check is supplied, the agent provides a usability check command. Failed
+commands and their terminal logs go back to the agent for diagnosis and repair;
+the agent may make temporary setup changes, and the workflow retries the failed
+stage within the same timeout. If the start process exits while readiness fails,
+the workflow retries the start stage. The agent reports `BLOCKED` when readiness
+requires a permanent product fix. The start terminal
+remains available for inspection and control. The declared timeout applies to
+preparation, session creation, agent turns, and commands. The workflow records
+observed outcomes and accepts `READY` only when the commands and usability check
+succeed and the final service inspection does not report a readiness failure.
+On Linux, when a start terminal exits successfully, the workflow accepts a detached service
+only if the ready check names one local HTTP endpoint and a new listener on that
+port belongs to a process working inside the prepared worktree. It checks that
+same listener again before `READY`. Otherwise it treats the start as unverified
+and retains its output for diagnosis.
+Before returning `READY`, it verifies that the working path's HEAD still matches
+the resolved revision.
+An absent endpoint does not block readiness. Uncertain launches are not replayed
+unless the terminal result confirms the command failed. A busy agent is
+interrupted at timeout.
+The workflow returns one JSON result with `status` (`READY` or `BLOCKED`),
+`summary`, `resolved_revision` (the verified commit SHA when preparation
+succeeds), and `working_path` (the detached worktree when available). It also
+includes `connection` with workspace and agent tab IDs and an observed
+`endpoint` when available, `process` with the
+observed start process outcome, `checks`, `verification`, `attempts`, and
+execution and readiness summaries. A `BLOCKED` result includes
+`observed_facts` with the error and agent reports, so a later Python Workflow
+Run can inspect the available evidence and decide how to proceed.
+When the full result exceeds the Run output limit, histories are shortened to
+recent attempts with omission counts, then bulky logs are reduced as needed.
+These inputs describe the environment; they are not a steps language.
+API clients submit `generatedCode` to the existing Workflow validation and
+Dry Run endpoints, then submit `{"code": generatedCode, "args": [],
+"environmentSetupJson": originalJson}` to `/api/run`. A Run submission
+rejects a declaration whose generated code differs from `code`. The Run result
+is the JSON value on stdout described above; its Run state and exit code report
+workflow execution, while `status` in that JSON reports environment readiness.
+A stopped Run may end without a complete readiness JSON result.
+
 ## Issue Driven mode
 
-The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts
+The UI offers `Prompt | Environment Setup | Issue Driven | Python Workflow`. Issue Driven mode accepts
 only a small JSON configuration, validates it separately from Python, and
 deterministically expands it into the canonical sequential plain-Python workflow.
 The generated Python is visible for inspection and is then passed unchanged to the
@@ -479,7 +542,8 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI has two explicit modes. **Prompt** accepts an agent,
+The trusted local Runner UI has four explicit modes: **Prompt**, **Environment Setup**,
+**Issue Driven**, and **Python Workflow**. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt
@@ -488,7 +552,7 @@ Workflow-owned resources and have no automatic or explicit Workflow cleanup path
 The generated Python remains an implementation detail rather than an editable or
 historical UI field.
 
-**Workflow** executes arbitrary Python with the current Python interpreter in a
+**Python Workflow** executes arbitrary Python with the current Python interpreter in a
 visible PurpleMux-managed Bash tab. PurpleMux terminal output is the detailed
 stdout/stderr inspection surface; AWM shows structured Progress, Findings,
 bounded failure diagnostics, the managed-shell exit code, and the
