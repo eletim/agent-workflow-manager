@@ -8,7 +8,11 @@ from purplemux_client.client import ShellCommandRequest, ShellResult
 from purplemux_client.environment_setup_execution import (
     execute_environment_setup_commands,
 )
-from purplemux_client.errors import ResultNotReady, WorkerFailure
+from purplemux_client.errors import (
+    MutationOutcomeUnknown,
+    ResultNotReady,
+    WorkerFailure,
+)
 
 
 class ManagedClient:
@@ -19,6 +23,7 @@ class ManagedClient:
         self.requests: list[ShellCommandRequest] = []
         self.results: dict[str, int | None] = {}
         self.launch_error: str | None = None
+        self.launch_uncertain = False
         self.interrupted: list[str] = []
 
     def start_shell(self, request: ShellCommandRequest, *, on_created=None) -> str:
@@ -28,11 +33,14 @@ class ManagedClient:
         if on_created is not None:
             on_created(tab, "/managed/result.json")
         if request.command == self.launch_error:
+            if self.launch_uncertain:
+                raise MutationOutcomeUnknown("send outcome unknown")
             raise WorkerFailure("send failed")
         return tab
 
     def wait_for_shell_completion(self, tab: str, _timeout: float) -> None:
-        assert self.results[tab] is not None
+        if self.results[tab] is None:
+            raise WorkerFailure("shell did not finish")
 
     def read_shell_result(self, tab: str) -> ShellResult:
         result = self.results[tab]
@@ -160,6 +168,40 @@ def test_managed_shell_launch_failure_keeps_terminal_for_diagnosis(
     assert "send failed" in failed["failure"]
 
 
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_uncertain_build_launch_reconciles_structured_result(
+    tmp_path: Path, exit_code: int
+) -> None:
+    client = ManagedClient({"build": [exit_code], "verify": [0]})
+    client.launch_error = "build"
+    client.launch_uncertain = True
+    attempt = execute(client, tmp_path, build="build", verification_command="verify")
+    assert attempt["checks"]["build"]["exit_code"] == exit_code
+    assert [request.command for request in client.requests] == (
+        ["build", "verify"] if exit_code == 0 else ["build"]
+    )
+    assert (attempt["failure"] is None) is (exit_code == 0)
+
+
+@pytest.mark.parametrize("stage", ["build", "start"])
+def test_unresolved_launch_stops_without_replay(tmp_path: Path, stage: str) -> None:
+    client = ManagedClient({stage: [None], "verify": [0]})
+    client.launch_error = stage
+    client.launch_uncertain = True
+    with pytest.raises(MutationOutcomeUnknown, match="unresolved"):
+        execute(client, tmp_path, **{stage: stage}, verification_command="verify")
+    assert [request.command for request in client.requests] == [stage]
+
+
+def test_uncertain_start_launch_with_completed_result_continues(tmp_path: Path) -> None:
+    client = ManagedClient({"start": [0], "ready": [0]})
+    client.launch_error = "start"
+    client.launch_uncertain = True
+    attempt = execute(client, tmp_path, start="start", ready_check="ready")
+    assert attempt["failure"] is None
+    assert [request.command for request in client.requests] == ["start", "ready"]
+
+
 def test_command_deadline_interrupts_managed_terminal(tmp_path: Path) -> None:
     class TimedOutClient(ManagedClient):
         def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
@@ -171,10 +213,28 @@ def test_command_deadline_interrupts_managed_terminal(tmp_path: Path) -> None:
     def remaining() -> float:
         nonlocal calls
         calls += 1
-        if calls >= 3:
+        if calls >= 4:
             raise TimeoutError("Environment Setup timed out")
         return 1
 
     with pytest.raises(TimeoutError, match="timed out"):
         execute(client, tmp_path, build="build", remaining=remaining)
+    assert client.interrupted == ["tab-1"]
+
+
+@pytest.mark.parametrize("stage", ["build", "ready_check"])
+def test_deadline_after_launch_interrupts_command(tmp_path: Path, stage: str) -> None:
+    command = "build" if stage == "build" else "ready"
+    client = ManagedClient({command: [None]})
+    calls = 0
+
+    def remaining() -> float:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise TimeoutError("Environment Setup timed out")
+        return 1
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        execute(client, tmp_path, **{stage: command}, remaining=remaining)
     assert client.interrupted == ["tab-1"]

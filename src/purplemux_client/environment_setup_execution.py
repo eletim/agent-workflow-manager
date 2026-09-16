@@ -6,7 +6,11 @@ from collections.abc import Callable
 from typing import Any
 
 from purplemux_client.client import PurpleMuxCLIClient, ShellCommandRequest
-from purplemux_client.errors import ResultNotReady, WorkerFailure
+from purplemux_client.errors import (
+    MutationOutcomeUnknown,
+    ResultNotReady,
+    WorkerFailure,
+)
 
 
 def _capture(client: PurpleMuxCLIClient, tab: str) -> str:
@@ -14,6 +18,20 @@ def _capture(client: PurpleMuxCLIClient, tab: str) -> str:
         return client.capture_screen(tab)[-4096:]
     except WorkerFailure as exc:
         return f"pane capture failed: {exc}"
+
+
+def _remaining_or_interrupt(
+    client: PurpleMuxCLIClient, tab: str | None, remaining: Callable[[], float]
+) -> float:
+    try:
+        return remaining()
+    except TimeoutError:
+        if tab is not None:
+            try:
+                client.interrupt(tab)
+            except WorkerFailure:
+                pass
+        raise
 
 
 def _completed_command(
@@ -31,9 +49,32 @@ def _completed_command(
             ShellCommandRequest(command, cwd, f"Environment Setup {name}"),
             on_created=lambda session, _result_path: created.append(session),
         )
-    except WorkerFailure as exc:
-        remaining()
+    except MutationOutcomeUnknown:
         tab = created[0] if created else None
+        _remaining_or_interrupt(client, tab, remaining)
+        if tab is None:
+            raise
+        try:
+            client.wait_for_shell_completion(
+                tab, _remaining_or_interrupt(client, tab, remaining)
+            )
+            result = client.read_shell_result(tab)
+        except WorkerFailure as observation_error:
+            _remaining_or_interrupt(client, tab, remaining)
+            raise MutationOutcomeUnknown(
+                f"Environment Setup {name} launch is unresolved in terminal {tab}"
+            ) from observation_error
+        _remaining_or_interrupt(client, tab, remaining)
+        return {
+            "command": command,
+            "tab_id": tab,
+            "workspace_id": client.workspace_id,
+            "exit_code": result.exit_code,
+            "output": _capture(client, tab),
+        }
+    except WorkerFailure as exc:
+        tab = created[0] if created else None
+        _remaining_or_interrupt(client, tab, remaining)
         return {
             "command": command,
             "tab_id": tab,
@@ -41,18 +82,14 @@ def _completed_command(
             "error": str(exc),
             "output": _capture(client, tab) if tab else "",
         }
+    _remaining_or_interrupt(client, tab, remaining)
     try:
-        client.wait_for_shell_completion(tab, remaining())
+        client.wait_for_shell_completion(
+            tab, _remaining_or_interrupt(client, tab, remaining)
+        )
         result = client.read_shell_result(tab)
     except WorkerFailure as exc:
-        try:
-            remaining()
-        except TimeoutError:
-            try:
-                client.interrupt(tab)
-            except WorkerFailure:
-                pass
-            raise
+        _remaining_or_interrupt(client, tab, remaining)
         return {
             "command": command,
             "tab_id": tab,
@@ -60,7 +97,7 @@ def _completed_command(
             "error": str(exc),
             "output": _capture(client, tab),
         }
-    remaining()
+    _remaining_or_interrupt(client, tab, remaining)
     return {
         "command": command,
         "tab_id": tab,
@@ -134,9 +171,35 @@ def execute_environment_setup_commands(
                     ShellCommandRequest(command, cwd, "Environment Setup start"),
                     on_created=lambda tab, _result_path: created.append(tab),
                 )
-            except WorkerFailure as exc:
-                remaining()
+            except MutationOutcomeUnknown:
                 service_tab = created[0] if created else None
+                _remaining_or_interrupt(client, service_tab, remaining)
+                if service_tab is None:
+                    raise
+                try:
+                    result = client.read_shell_result(service_tab)
+                except WorkerFailure as observation_error:
+                    _remaining_or_interrupt(client, service_tab, remaining)
+                    try:
+                        status = client.read_status(service_tab)
+                    except WorkerFailure as status_error:
+                        status = {"error": str(status_error)}
+                    raise MutationOutcomeUnknown(
+                        f"Environment Setup start launch is unresolved in terminal "
+                        f"{service_tab}; status={status}; output={_capture(client, service_tab)}"
+                    ) from observation_error
+                _remaining_or_interrupt(client, service_tab, remaining)
+                outcome = {
+                    "command": command,
+                    "tab_id": service_tab,
+                    "workspace_id": client.workspace_id,
+                    "exit_code": result.exit_code,
+                    "running": False,
+                    "output": _capture(client, service_tab),
+                }
+            except WorkerFailure as exc:
+                service_tab = created[0] if created else None
+                _remaining_or_interrupt(client, service_tab, remaining)
                 outcome = {
                     "command": command,
                     "tab_id": service_tab,
@@ -145,14 +208,7 @@ def execute_environment_setup_commands(
                     "output": _capture(client, service_tab) if service_tab else "",
                 }
             else:
-                try:
-                    remaining()
-                except TimeoutError:
-                    try:
-                        client.interrupt(service_tab)
-                    except WorkerFailure:
-                        pass
-                    raise
+                _remaining_or_interrupt(client, service_tab, remaining)
                 outcome = _service_outcome(client, service_tab, command)
         else:
             outcome = _completed_command(

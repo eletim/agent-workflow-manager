@@ -88,7 +88,8 @@ the workflow retries the failed stage within the same timeout. The start termina
 remains available for inspection and control. The declared timeout applies to
 preparation, session creation, agent turns, and commands. The workflow records
 observed outcomes and accepts `READY` only when the commands and usability check
-succeed. A busy agent is interrupted at timeout.
+succeed. Uncertain launches are not replayed unless the terminal result confirms
+the command failed. A busy agent is interrupted at timeout.
 On success, the workflow adds the verified commit SHA as `resolved_revision` and
 the detached worktree as `working_path` to the JSON result.
 These inputs describe the environment;
