@@ -430,6 +430,28 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     cli.close_session(session_id)
 
 
+def test_start_shell_bounds_tab_reads_create_and_send_by_deadline(tmp_path) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    cli.start_shell(
+        ShellCommandRequest(
+            command="true",
+            cwd=str(tmp_path),
+            name="Bounded shell",
+            deadline_check=lambda: 0.2,
+        )
+    )
+    launch_calls = [
+        (call[1:3], timeout) for call, timeout in zip(runner.calls, runner.timeouts)
+    ]
+    assert (["tab", "create"], 0.2) in launch_calls
+    assert (["tab", "send"], 0.2) in launch_calls
+    assert sum(command == ["tab", "list"] for command, _ in launch_calls) >= 2
+    assert all(timeout <= 0.2 for _, timeout in launch_calls)
+
+
 def test_run_ownership_is_opt_in_and_registers_shell_result_directory(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

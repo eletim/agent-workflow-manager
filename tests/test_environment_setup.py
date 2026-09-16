@@ -62,6 +62,9 @@ def test_generates_python_from_declarative_inputs(
     assert "Build command: python -m build" in code
     assert "Start command: python app.py" in code
     assert "Ready check command: curl http://localhost:8000/health" in code
+    assert "exactly as given" in code
+    assert "before considering any alternative" in code
+    assert "execute_environment_setup_commands(" in code
     assert "steps" not in config.as_json()
 
 
@@ -89,6 +92,8 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
     assert "Build command:" not in code
     assert "Start command:" not in code
     assert "Ready check command:" not in code
+    assert "Skip instructions that were omitted" in code
+    assert "even if all were omitted" in code
     assert set(config.as_json()) == {
         "mode",
         "repository",
@@ -109,17 +114,18 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            "did not report verified READY",
+            "agent blocked: build failed",
         ),
         (
             {
                 "status": "READY",
-                "summary": "build failed",
-                "checks": {"build": "failed"},
+                "summary": "ready",
+                "checks": {"build": "passed"},
+                "verification": "ok",
             },
             False,
             False,
-            "did not report verified READY",
+            "agent blocked: no usable check",
         ),
         (None, True, False, "timed out while the agent was busy"),
         (
@@ -127,6 +133,8 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "status": "READY",
                 "summary": "ready",
                 "checks": {"build": "passed"},
+                "verification": "service responded successfully",
+                "verification_command": "printf usable; test -d .",
                 "resolved_revision": "unverified",
                 "working_path": "/wrong/path",
             },
@@ -135,15 +143,32 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             None,
         ),
         (
-            {"status": "READY", "summary": "ready", "checks": {"build": "passed"}},
+            {
+                "status": "READY",
+                "summary": "ready",
+                "checks": {"build": "passed"},
+                "verification": "service responded successfully",
+                "verification_command": "printf usable; test -d .",
+            },
             False,
             True,
             "Environment Setup timed out",
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "recover",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            None,
         ),
     ],
 )
 def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     report: dict[str, object] | None,
     busy_timeout: bool,
     late_completion: bool,
@@ -155,14 +180,21 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     interrupted: list[str] = []
 
     class Client:
+        workspace_id = "ws-1"
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.shells = 0
+            self.prompts: list[str] = []
+
         def create_session(self, _request: object) -> str:
             return "tab-1"
 
         def wait_until_ready(self, _tab: str, _timeout: float) -> None:
             pass
 
-        def send_input(self, _tab: str, _prompt: str) -> None:
-            pass
+        def send_input(self, _tab: str, prompt: str) -> None:
+            self.prompts.append(prompt)
 
         def wait_for_turn_completion(
             self, _tab: str, _timeout: float, *, on_busy_timeout: object
@@ -173,7 +205,39 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
                 time.sleep(1.05)
 
         def read_result(self, _tab: str) -> str:
+            self.reads += 1
+            if (
+                self.reads > 1
+                and report is not None
+                and not report.get("verification_command")
+            ):
+                return json.dumps({"status": "BLOCKED", "summary": "no usable check"})
             return json.dumps(report)
+
+        def start_shell(self, _request: object, *, on_created=None) -> str:
+            self.shells += 1
+            tab = f"shell-{self.shells}"
+            if on_created is not None:
+                on_created(tab, "/managed/result.json")
+            return tab
+
+        def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
+            pass
+
+        def read_shell_result(self, tab: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                exit_code=3
+                if report is not None
+                and report.get("summary") == "recover"
+                and tab == "shell-1"
+                else 0
+            )
+
+        def capture_screen(self, tab: str) -> str:
+            return f"observed {tab}"
+
+        def read_status(self, _tab: str) -> dict[str, object]:
+            return {"alive": True}
 
         def interrupt(self, tab: str) -> None:
             interrupted.append(tab)
@@ -194,9 +258,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     monkeypatch.setattr(
         purplemux_client,
         "prepare_run_revision",
-        lambda **_kwargs: SimpleNamespace(
-            execution_root=Path("/tmp/environment-setup"), base_sha="a" * 40
-        ),
+        lambda **_kwargs: SimpleNamespace(execution_root=tmp_path, base_sha="a" * 40),
     )
     monkeypatch.setattr(
         purplemux_client,
@@ -205,7 +267,11 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     )
     code = setup.generate_environment_setup_workflow(
         setup.EnvironmentSetupInput(
-            "/source/repo", "main", "codex", 1 if late_completion else 120, build="make"
+            "/source/repo",
+            "main",
+            "codex",
+            1 if late_completion else 120,
+            build="printf built",
         )
     )
     output = StringIO()
@@ -214,7 +280,13 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             exec(compile(code, "<environment-setup>", "exec"), {})
         result = json.loads(output.getvalue())
         assert result["resolved_revision"] == "a" * 40
-        assert result["working_path"] == "/tmp/environment-setup"
+        assert result["working_path"] == str(tmp_path)
+        offset = 1 if report is not None and report.get("summary") == "recover" else 0
+        assert result["checks"]["build"]["output"] == f"observed shell-{1 + offset}"
+        assert result["verification"]["output"] == f"observed shell-{2 + offset}"
+        if offset:
+            assert client.reads == 2
+            assert "Environment Setup build failed" in client.prompts[1]
     else:
         with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
             with redirect_stdout(output):

@@ -79,12 +79,17 @@ validates the inputs and returns the normalized configuration, a
 `revisionValidation` status, and generated plain Python Workflow. A remote tag
 whose object is not available locally is marked `provisional`; the Workflow
 verifies that it points to a commit after fetching it. The generated workflow
-prepares a detached worktree,
-asks the selected agent to set up the environment and run the supplied commands,
-and applies the declared timeout to preparation, session creation, and agent
-execution. The agent must return a JSON `READY`
-result with a passing check for each supplied command; `BLOCKED`, failed checks,
-and unstructured results fail the Run. A busy agent is interrupted at timeout.
+prepares a detached worktree and asks the selected agent to prepare it. The
+workflow then runs each supplied build, start, and ready check command as given,
+in order, in managed PurpleMux terminals. Omitted commands are skipped. If no
+ready check is supplied, the agent provides a usability check command. Failed
+commands and their terminal logs go back to the agent for diagnosis and repair;
+the workflow retries the failed stage within the same timeout. The start terminal
+remains available for inspection and control. The declared timeout applies to
+preparation, session creation, agent turns, and commands. The workflow records
+observed outcomes and accepts `READY` only when the commands and usability check
+succeed. Uncertain launches are not replayed unless the terminal result confirms
+the command failed. A busy agent is interrupted at timeout.
 On success, the workflow adds the verified commit SHA as `resolved_revision` and
 the detached worktree as `working_path` to the JSON result.
 These inputs describe the environment;
