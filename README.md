@@ -102,8 +102,8 @@ observed start process outcome, `checks`, `verification`, `attempts`, and
 execution and readiness summaries. A `BLOCKED` result includes
 `observed_facts` with the error and agent reports, so a later Python Workflow
 Run can inspect the available evidence and decide how to proceed.
-Long histories are shortened to recent attempts with omission counts so the
-single JSON result stays within the Run output limit.
+When the full result exceeds the Run output limit, histories are shortened to
+recent attempts with omission counts, then bulky logs are reduced as needed.
 These inputs describe the environment;
 they are not a steps language. Submit `generatedCode` to the existing Workflow
 validation and Run endpoints to execute it.

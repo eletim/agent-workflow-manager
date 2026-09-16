@@ -442,6 +442,23 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
     )
 
 
+def test_fitting_result_preserves_paths_endpoints_and_history() -> None:
+    result = {
+        "status": "READY",
+        "summary": "ready",
+        "execution_summary": "built",
+        "readiness_summary": "responding",
+        "resolved_revision": "a" * 40,
+        "working_path": "/tmp/" + "p" * 3000,
+        "connection": {"endpoint": "https://example.test/" + "e" * 3000},
+        "process": {"tab_id": "tab-1"},
+        "checks": {},
+        "verification": {"exit_code": 0},
+        "attempts": [{"failure": None, "output": str(i)} for i in range(20)],
+    }
+    assert setup.serialize_environment_setup_result(result) == json.dumps(result)
+
+
 def test_large_result_remains_parseable_and_keeps_latest_observation() -> None:
     history = [
         {"checks": {"build": {"output": "x" * 4096}}, "failure": f"attempt {i}"}
@@ -450,19 +467,78 @@ def test_large_result_remains_parseable_and_keeps_latest_observation() -> None:
     result = {
         "status": "BLOCKED",
         "summary": "retry limit reached",
+        "execution_summary": "build failed",
+        "readiness_summary": "not ready",
         "resolved_revision": "a" * 40,
-        "working_path": "/tmp/setup",
-        "connection": {"workspace_id": "ws-1"},
+        "working_path": "/tmp/" + "p" * 3000,
+        "connection": {
+            "workspace_id": "ws-1",
+            "endpoint": "https://example.test/" + "e" * 3000,
+        },
+        "process": {"tab_id": "tab-1"},
+        "checks": {"build": {"exit_code": 1}},
+        "verification": {"exit_code": 1},
         "attempts": history,
         "observed_facts": {"agent_reports": [{"summary": "y" * 4096}] * 1000},
     }
     payload = setup.serialize_environment_setup_result(result)
-    assert len(payload) < 100_000
+    assert len(payload) < 1_000_000
     decoded = json.loads(payload)
     assert decoded["status"] == "BLOCKED"
     assert decoded["attempts"][-1]["failure"] == "attempt 999"
-    assert decoded["history_truncated"] == {
-        "attempts": 992,
-        "agent_reports": 992,
-    }
+    assert decoded["history_truncated"]["attempts"] > 0
+    assert decoded["history_truncated"]["agent_reports"] > 0
     assert decoded["resolved_revision"] == "a" * 40
+    assert decoded["working_path"] == result["working_path"]
+    assert decoded["connection"] == result["connection"]
+    assert decoded["process"] == result["process"]
+    assert decoded["execution_summary"] == "build failed"
+    assert decoded["readiness_summary"] == "not ready"
+
+
+def test_oversized_agent_report_keeps_result_contract() -> None:
+    result = {
+        "status": "BLOCKED",
+        "summary": "not ready",
+        "execution_summary": "build failed",
+        "readiness_summary": "no response",
+        "resolved_revision": "a" * 40,
+        "working_path": "/tmp/" + "p" * 3000,
+        "connection": {
+            "workspace_id": "ws-1",
+            "endpoint": "http://localhost:8000/" + "e" * 3000,
+        },
+        "process": {"tab_id": "tab-1", "running": True},
+        "service_tab": "tab-1",
+        "checks": {"build": {"exit_code": 1}},
+        "verification": {"exit_code": 1},
+        "attempts": [
+            {"checks": {"build": {"exit_code": 1}}, "failure": "build failed"}
+        ],
+        "observed_facts": {
+            "error": "build failed",
+            "agent_reports": [{"summary": "x" * 1_100_000}],
+        },
+    }
+    payload = setup.serialize_environment_setup_result(result)
+    assert len(payload) < 1_000_000
+    decoded = json.loads(payload)
+    for field in (
+        "status",
+        "summary",
+        "execution_summary",
+        "readiness_summary",
+        "resolved_revision",
+        "working_path",
+        "connection",
+        "process",
+        "service_tab",
+        "checks",
+        "verification",
+        "attempts",
+        "observed_facts",
+    ):
+        assert field in decoded
+    assert decoded["connection"] == result["connection"]
+    assert decoded["working_path"] == result["working_path"]
+    assert decoded["process"]["tab_id"] == "tab-1"

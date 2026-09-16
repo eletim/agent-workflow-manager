@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,55 +107,119 @@ def parse_environment_setup_json(source: str) -> EnvironmentSetupInput:
 
 
 def serialize_environment_setup_result(result: dict[str, Any]) -> str:
-    """Keep the single JSON result below the runner's stdout retention limit."""
+    """Keep one complete JSON value within the runner's stdout retention limit."""
+    max_chars = 999_999  # Leave one character for print's newline.
+    payload = json.dumps(result)
+    if len(payload) <= max_chars:
+        return payload
 
-    def compact(value: Any, string_limit: int, list_limit: int, depth: int = 0) -> Any:
-        if isinstance(value, str):
-            return value if len(value) <= string_limit else value[:string_limit] + "…"
-        if depth >= 6:
-            return "…"
-        if isinstance(value, list):
-            return [
-                compact(item, string_limit, list_limit, depth + 1)
-                for item in value[-list_limit:]
-            ]
-        if isinstance(value, dict):
-            return {
-                str(key)[:128]: compact(item, string_limit, list_limit, depth + 1)
-                for key, item in list(value.items())[:24]
-            }
-        return value
-
-    for string_limit, list_limit in ((2048, 8), (512, 4), (128, 1)):
-        candidate = compact(result, string_limit, list_limit)
+    def trim_history(candidate: dict[str, Any], limit: int) -> None:
         omitted: dict[str, int] = {}
-        attempts = result.get("attempts")
-        if isinstance(attempts, list) and len(attempts) > list_limit:
-            omitted["attempts"] = len(attempts) - list_limit
+        attempts = result.get("attempts", [])
+        if len(attempts) > limit:
+            candidate["attempts"] = deepcopy(attempts[-limit:])
+            omitted["attempts"] = len(attempts) - limit
         facts = result.get("observed_facts")
         if isinstance(facts, dict):
-            reports = facts.get("agent_reports")
-            if isinstance(reports, list) and len(reports) > list_limit:
-                omitted["agent_reports"] = len(reports) - list_limit
+            reports = facts.get("agent_reports", [])
+            if len(reports) > limit:
+                candidate["observed_facts"]["agent_reports"] = deepcopy(
+                    reports[-limit:]
+                )
+                omitted["agent_reports"] = len(reports) - limit
         if omitted:
             candidate["history_truncated"] = omitted
+
+    def trim_logs(value: Any, limit: int) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "output" and isinstance(item, str) and len(item) > limit:
+                    value[key] = item[-limit:] if limit else ""
+                else:
+                    trim_logs(item, limit)
+        elif isinstance(value, list):
+            for item in value:
+                trim_logs(item, limit)
+
+    for history_limit, log_limit in ((32, 4096), (8, 1024), (1, 0)):
+        candidate = deepcopy(result)
+        trim_history(candidate, history_limit)
+        for field in ("attempts", "checks", "process", "verification"):
+            trim_logs(candidate.get(field), log_limit)
         payload = json.dumps(candidate)
-        if len(payload) < 100_000:
+        if len(payload) <= max_chars:
             return payload
-    return json.dumps(
-        {
-            "status": result["status"],
-            "summary": str(result.get("summary", ""))[:512],
-            "resolved_revision": result.get("resolved_revision"),
-            "working_path": str(result.get("working_path"))[:512]
-            if result.get("working_path")
-            else None,
-            "connection": compact(result.get("connection", {}), 512, 1),
-            "observed_facts": {
-                "error": "Detailed observations exceeded the result size limit"
-            },
+
+    def outcome_details(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: item if not isinstance(item, str) else item[:4096]
+            for key, item in value.items()
+            if key
+            in {"command", "tab_id", "workspace_id", "exit_code", "running", "error"}
         }
-    )
+
+    last_attempt = result.get("attempts", [])[-1:]
+    compact_attempts = []
+    for attempt in last_attempt:
+        compact_attempts.append(
+            {
+                "checks": {
+                    stage: outcome_details(outcome)
+                    for stage, outcome in attempt.get("checks", {}).items()
+                },
+                "verification": outcome_details(attempt.get("verification")),
+                "service_tab": attempt.get("service_tab"),
+                "failed_stage": attempt.get("failed_stage"),
+                "failure": str(attempt.get("failure"))[:4096]
+                if attempt.get("failure")
+                else None,
+            }
+        )
+    facts = result.get("observed_facts", {})
+    fallback = {
+        "status": result["status"],
+        "summary": str(result.get("summary", ""))[:4096],
+        "execution_summary": str(result.get("execution_summary", ""))[:4096],
+        "readiness_summary": str(result.get("readiness_summary", ""))[:4096],
+        "resolved_revision": result.get("resolved_revision"),
+        "working_path": result.get("working_path"),
+        "connection": deepcopy(result.get("connection", {})),
+        "process": outcome_details(result.get("process")),
+        "service_tab": result.get("service_tab"),
+        "checks": {
+            stage: outcome_details(outcome)
+            for stage, outcome in result.get("checks", {}).items()
+        },
+        "verification": outcome_details(result.get("verification")),
+        "attempts": compact_attempts,
+        "observed_facts": {
+            "error": str(facts.get("error", ""))[:4096],
+            "failed_stage": facts.get("failed_stage"),
+            "agent_reports": [
+                {
+                    "status": report.get("status"),
+                    "summary": str(report.get("summary", ""))[:4096],
+                }
+                for report in facts.get("agent_reports", [])[-1:]
+            ],
+        }
+        if facts
+        else None,
+        "history_truncated": {
+            "attempts": max(0, len(result.get("attempts", [])) - 1),
+            "agent_reports": max(0, len(facts.get("agent_reports", [])) - 1),
+        },
+    }
+    payload = json.dumps(fallback)
+    if len(payload) > max_chars and "endpoint" in fallback["connection"]:
+        fallback["connection"].pop("endpoint")
+        fallback["connection_details_omitted"] = (
+            "Endpoint exceeded the result size limit"
+        )
+        payload = json.dumps(fallback)
+    return payload
 
 
 def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
