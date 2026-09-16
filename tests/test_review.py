@@ -15,6 +15,7 @@ from test_runner import request
 from purplemux_client.review import (
     generate_review_workflow,
     parse_review_json,
+    require_ext_review_contract,
     serialize_review_result,
     snapshot_review_repositories,
 )
@@ -71,7 +72,8 @@ def test_review_generates_valid_ordinary_workflow(
     assert "if FINISH is not None:" in code
     assert "json.loads(report)" in code
     assert "any available browser tool" in code
-    assert "PurpleMux ext-review" in code
+    assert "PurpleMux CLI" in code
+    assert "require_ext_review_contract" in code
     runner = PythonRunner(managed_workflows=False)
     try:
         assert runner.validate(code).valid
@@ -167,6 +169,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     oversized: bool,
 ) -> None:
     import purplemux_client
+    import purplemux_client.review as review_module
 
     messages: list[str] = []
     steps: list[tuple[str, str]] = []
@@ -215,6 +218,11 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
     monkeypatch.setattr(
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
+    )
+    monkeypatch.setattr(
         purplemux_client,
         "emit_step",
         lambda name, state, **_kwargs: steps.append((name, state)),
@@ -231,6 +239,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
         exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
     assert len(messages) == 3
     assert "Survey layout" in messages[0]
+    assert '"/usr/bin/purplemux" ext-review create' in messages[0]
     assert "Perform this check" in messages[1]
     assert "Summarize findings" in messages[2]
     retained = output.getvalue()
@@ -288,6 +297,7 @@ def test_generated_review_reports_repository_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import purplemux_client
+    import purplemux_client.review as review_module
 
     steps: list[tuple[str, str, str | None]] = []
 
@@ -321,6 +331,11 @@ def test_generated_review_reports_repository_change(
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
     monkeypatch.setattr(
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
+    )
+    monkeypatch.setattr(
         purplemux_client,
         "emit_step",
         lambda name, state, **kwargs: steps.append((name, state, kwargs.get("error"))),
@@ -331,3 +346,74 @@ def test_generated_review_reports_repository_change(
     assert steps[0][:2] == ("Review", "started")
     assert steps[-1][:2] == ("Review", "failed")
     assert str(repositories[1]) in (steps[-1][2] or "")
+
+
+def test_review_requires_matching_cli_and_server_ext_review_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import purplemux_client.review as review_module
+
+    monkeypatch.setattr(
+        review_module.shutil, "which", lambda _name: "/usr/bin/purplemux"
+    )
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(args)
+        output = (
+            "ext-review create --socket PATH --session SESSION --window @ID"
+            if args[-1] == "help"
+            else "POST /api/cli/ext-reviews"
+        )
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(review_module.subprocess, "run", run)
+    assert require_ext_review_contract() == "/usr/bin/purplemux"
+    assert calls == [
+        ["/usr/bin/purplemux", "help"],
+        ["/usr/bin/purplemux", "api-guide"],
+    ]
+
+    def old_server(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout="ext-review create --socket PATH"
+            if args[-1] == "help"
+            else "old API",
+        )
+
+    monkeypatch.setattr(review_module.subprocess, "run", old_server)
+    with pytest.raises(RuntimeError, match="matching CLI"):
+        require_ext_review_contract()
+
+
+def test_generated_review_rejects_old_runtime_before_creating_workspace(
+    repositories: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import purplemux_client
+    import purplemux_client.review as review_module
+
+    steps: list[tuple[str, str]] = []
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> None:
+            pytest.fail("Review created a workspace without ext-review support")
+
+    def unsupported(**_kwargs: object) -> str:
+        raise RuntimeError("matching CLI with public ext-review support required")
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(review_module, "require_ext_review_contract", unsupported)
+    monkeypatch.setattr(
+        purplemux_client,
+        "emit_step",
+        lambda name, state, **_kwargs: steps.append((name, state)),
+    )
+    code = generate_review_workflow(parse_review_json(declaration(repositories)))
+    with pytest.raises(RuntimeError, match="ext-review support required"):
+        exec(compile(code, "<review>", "exec"), {})
+    assert steps == [("Review", "started"), ("Review", "failed")]

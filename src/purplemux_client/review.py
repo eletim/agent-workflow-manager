@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -214,13 +215,42 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
     return tuple(snapshots)
 
 
+def require_ext_review_contract(*, timeout: float = 10) -> str:
+    """Require the CLI command and connected PurpleMux server API for external review."""
+    executable = shutil.which("purplemux")
+    if executable is None:
+        raise RuntimeError("Review requires the PurpleMux 0.5.0 ext-review CLI")
+    for args, required in (
+        (("help",), "ext-review create --socket"),
+        (("api-guide",), "POST /api/cli/ext-reviews"),
+    ):
+        try:
+            result = subprocess.run(
+                [executable, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"PurpleMux ext-review contract could not be verified: {exc}"
+            ) from exc
+        if result.returncode or required not in result.stdout:
+            raise RuntimeError(
+                "Review requires a running PurpleMux 0.5.0 or newer server "
+                "and matching CLI with public ext-review support"
+            )
+    return str(Path(executable).resolve())
+
+
 def generate_review_workflow(config: ReviewInput) -> str:
     """Place Review sequencing and result checks in visible, plain Python."""
     return f"""import json
 import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
-from purplemux_client.review import serialize_review_result, snapshot_review_repositories
+from purplemux_client.review import require_ext_review_contract, serialize_review_result, snapshot_review_repositories
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -266,6 +296,7 @@ runtime = PurpleMuxRuntime(owned_by_run=True)
 client = None
 tab = None
 try:
+    ext_review_cli = require_ext_review_contract(timeout=min(10, remaining()))
     baseline = snapshot_review_repositories(REPOSITORIES)
     workspace = runtime.create_workspace(CreateWorkspaceRequest(
         cwd=REPOSITORIES[0], name="AWM Review", deadline_check=remaining,
@@ -279,7 +310,7 @@ try:
     context = ("Review these local repositories: " + json.dumps(REPOSITORIES)
                + ". Read and inspect every declared repository as needed, using any available tool. "
         + "You may operate a browser through any available browser tool; no particular library is required. "
-        + "For read-only observation of an external terminal, use PurpleMux ext-review create --socket PATH --session SESSION --window @ID with a known socket, session, and allowed window targets; open its returned browser URL. "
+        + "For read-only observation of an external terminal, use the verified PurpleMux CLI " + json.dumps(ext_review_cli) + " ext-review create --socket PATH --session SESSION --window @ID with a known socket, session, and allowed window targets; open its returned browser URL. "
                + "Do not modify the repositories or send input to observed external terminals. ")
     if START is not None:
         turn(context + "First, follow this start instruction and report what you did: " + START)
