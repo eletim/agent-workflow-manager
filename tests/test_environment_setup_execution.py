@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -7,6 +11,7 @@ import pytest
 from purplemux_client.client import ShellCommandRequest, ShellResult
 from purplemux_client.environment_setup_execution import (
     execute_environment_setup_commands,
+    verify_detached_service_provenance,
 )
 from purplemux_client.errors import (
     MutationOutcomeUnknown,
@@ -303,6 +308,99 @@ def test_exited_background_start_cannot_claim_existing_service(tmp_path: Path) -
     assert attempt["checks"]["start"]["exit_code"] == 0
     assert "address already in use" in attempt["failure"]
     assert attempt["verification"]["exit_code"] == 0
+
+
+def test_detached_service_from_worktree_can_reach_ready(tmp_path: Path) -> None:
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+
+    class DetachedClient(ManagedClient):
+        service: subprocess.Popen[bytes] | None = None
+
+        def start_shell(self, request: ShellCommandRequest, *, on_created=None) -> str:
+            if request.command == "start":
+                self.service = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "http.server",
+                        str(port),
+                        "--bind",
+                        "127.0.0.1",
+                    ],
+                    cwd=tmp_path,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                            break
+                    except OSError:
+                        time.sleep(0.01)
+                else:
+                    raise AssertionError("test server did not start")
+            return super().start_shell(request, on_created=on_created)
+
+    ready_check = f"curl http://127.0.0.1:{port}/ && ready"
+    client = DetachedClient({"start": [0], ready_check: [0]})
+    try:
+        attempt = execute(
+            client,
+            tmp_path,
+            start="start",
+            ready_check=ready_check,
+        )
+        assert attempt["failure"] is None
+        provenance = attempt["checks"]["start"]["provenance"]
+        assert provenance["port"] == port
+        verify_detached_service_provenance(str(tmp_path), provenance)
+        assert client.service is not None
+        client.service.terminate()
+        client.service.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="no longer verified"):
+            verify_detached_service_provenance(str(tmp_path), provenance)
+    finally:
+        if client.service is not None:
+            client.service.terminate()
+            client.service.wait(timeout=5)
+
+
+def test_preexisting_worktree_listener_does_not_prove_new_start(tmp_path: Path) -> None:
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    service = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.01)
+        else:
+            raise AssertionError("test server did not start")
+        ready_check = f"curl http://127.0.0.1:{port}/"
+        client = ManagedClient({"start": [0], ready_check: [0]})
+        attempt = execute(client, tmp_path, start="start", ready_check=ready_check)
+        assert attempt["failed_stage"] == "start"
+        assert "without verified service provenance" in attempt["failure"]
+        assert attempt["verification"]["exit_code"] == 0
+    finally:
+        service.terminate()
+        service.wait(timeout=5)
 
 
 def test_command_deadline_interrupts_managed_terminal(tmp_path: Path) -> None:

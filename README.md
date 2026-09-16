@@ -100,9 +100,11 @@ remains available for inspection and control. The declared timeout applies to
 preparation, session creation, agent turns, and commands. The workflow records
 observed outcomes and accepts `READY` only when the commands and usability check
 succeed and the final service inspection does not report a readiness failure.
-An exited start terminal cannot establish that a backgrounded service reached by
-the ready check came from the prepared worktree, even when its exit code is zero;
-the workflow treats it as a start failure and retains its output for diagnosis.
+On Linux, when a start terminal exits successfully, the workflow accepts a detached service
+only if the ready check names one local HTTP endpoint and a new listener on that
+port belongs to a process working inside the prepared worktree. It checks that
+same listener again before `READY`. Otherwise it treats the start as unverified
+and retains its output for diagnosis.
 Before returning `READY`, it verifies that the working path's HEAD still matches
 the resolved revision.
 An absent endpoint does not block readiness. Uncertain launches are not replayed

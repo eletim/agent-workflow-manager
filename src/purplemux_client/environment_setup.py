@@ -160,7 +160,15 @@ def serialize_environment_setup_result(result: dict[str, Any]) -> str:
             key: item if not isinstance(item, str) else item[:4096]
             for key, item in value.items()
             if key
-            in {"command", "tab_id", "workspace_id", "exit_code", "running", "error"}
+            in {
+                "command",
+                "tab_id",
+                "workspace_id",
+                "exit_code",
+                "running",
+                "error",
+                "provenance",
+            }
         }
 
     last_attempt = result.get("attempts", [])[-1:]
@@ -324,7 +332,10 @@ from purplemux_client import (
     emit_step,
     prepare_run_revision,
 )
-from purplemux_client.environment_setup_execution import execute_environment_setup_commands
+from purplemux_client.environment_setup_execution import (
+    execute_environment_setup_commands,
+    verify_detached_service_provenance,
+)
 from purplemux_client.environment_setup import (
     serialize_environment_setup_result,
     verify_environment_setup_revision,
@@ -496,6 +507,9 @@ try:
                     f"{{endpoint_report_error}}"
                 )
     verify_environment_setup_revision(cwd, context.base_sha, remaining)
+    detached = checks.get("start", {{}}).get("provenance")
+    if detached is not None:
+        verify_detached_service_provenance(cwd, detached)
     result = {{
         "status": "READY",
         "summary": report["summary"],

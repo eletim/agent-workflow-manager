@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from purplemux_client.client import PurpleMuxCLIClient, ShellCommandRequest
 from purplemux_client.errors import (
@@ -151,6 +155,120 @@ def _service_outcome(
     return outcome
 
 
+def _local_check_port(command: str | None) -> tuple[int, str] | None:
+    if not command:
+        return None
+    urls = re.findall(r"https?://[^\s\"']+", command)
+    endpoints: set[tuple[int, str]] = set()
+    for url in urls:
+        parsed = urlsplit(url.rstrip(";,)]"))
+        host = parsed.hostname
+        if host not in {"localhost", "127.0.0.1", "[::1]", "::1"}:
+            continue
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            return None
+        family = "any" if host == "localhost" else "ipv6" if host == "::1" else "ipv4"
+        endpoints.add((port, family))
+    return next(iter(endpoints)) if len(endpoints) == 1 else None
+
+
+def _listener_inodes(endpoint: tuple[int, str]) -> set[str]:
+    port, family = endpoint
+    files = (
+        ("tcp", "tcp6")
+        if family == "any"
+        else (("tcp6",) if family == "ipv6" else ("tcp",))
+    )
+    inodes: set[str] = set()
+    for name in files:
+        try:
+            lines = (
+                Path(f"/proc/net/{name}").read_text(encoding="ascii").splitlines()[1:]
+            )
+        except OSError:
+            return set()
+        for line in lines:
+            fields = line.split()
+            address, hex_port = fields[1].split(":")
+            if fields[3] != "0A" or int(hex_port, 16) != port:
+                continue
+            allowed = (
+                {"00000000", "0100007F"}
+                if name == "tcp"
+                else {"0" * 32, "00000000000000000000000001000000"}
+            )
+            if address in allowed:
+                inodes.add(fields[9])
+    return inodes
+
+
+def _detached_service_provenance(
+    cwd: str, endpoint: tuple[int, str], baseline: set[str]
+) -> dict[str, object] | None:
+    if baseline:
+        return None
+    candidates = _listener_inodes(endpoint) - baseline
+    if not candidates:
+        return None
+    root = os.path.realpath(cwd)
+    try:
+        processes = list(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for process in processes:
+        if not process.name.isdecimal():
+            continue
+        try:
+            process_cwd = os.path.realpath(os.readlink(process / "cwd"))
+            if os.path.commonpath((root, process_cwd)) != root:
+                continue
+            for fd in (process / "fd").iterdir():
+                target = os.readlink(fd)
+                if target.startswith("socket:[") and target[8:-1] in candidates:
+                    return {
+                        "pid": int(process.name),
+                        "socket_inode": target[8:-1],
+                        "port": endpoint[0],
+                        "family": endpoint[1],
+                    }
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def verify_detached_service_provenance(cwd: str, provenance: dict[str, object]) -> None:
+    """Ensure the same worktree process still owns the observed local listener."""
+    pid = provenance.get("pid")
+    inode = provenance.get("socket_inode")
+    port = provenance.get("port")
+    family = provenance.get("family")
+    if (
+        not isinstance(pid, int)
+        or not isinstance(inode, str)
+        or not isinstance(port, int)
+        or not isinstance(family, str)
+        or family not in {"any", "ipv4", "ipv6"}
+    ):
+        raise RuntimeError("Environment Setup detached service provenance is invalid")
+    process = Path("/proc") / str(pid)
+    try:
+        root = os.path.realpath(cwd)
+        process_cwd = os.path.realpath(os.readlink(process / "cwd"))
+        owned = os.path.commonpath((root, process_cwd)) == root
+        sockets = {os.readlink(fd) for fd in (process / "fd").iterdir()}
+    except (OSError, ValueError):
+        owned = False
+        sockets = set()
+    if (
+        not owned
+        or f"socket:[{inode}]" not in sockets
+        or inode not in _listener_inodes((port, family))
+    ):
+        raise RuntimeError("Environment Setup detached service is no longer verified")
+
+
 def execute_environment_setup_commands(
     *,
     client: PurpleMuxCLIClient,
@@ -173,6 +291,8 @@ def execute_environment_setup_commands(
     verification: dict[str, object] | None = None
     failure: str | None = None
     failed_stage: str | None = None
+    detached_endpoint: tuple[int, str] | None = None
+    listener_baseline: set[str] = set()
     attempt.update(
         checks=checks,
         verification=verification,
@@ -207,6 +327,9 @@ def execute_environment_setup_commands(
 
         if stage == "start":
             remaining()
+            detached_endpoint = _local_check_port(ready_check or verification_command)
+            if detached_endpoint is not None:
+                listener_baseline = _listener_inodes(detached_endpoint)
             created: list[str] = []
 
             def record_created(tab: str, _result_path: str) -> None:
@@ -301,11 +424,19 @@ def execute_environment_setup_commands(
         service = _service_outcome(client, service_tab, start)
         checks["start"] = service
         if service.get("running") is False:
-            failure = (
-                "Environment Setup start terminal exited; the ready check cannot "
-                f"establish that the prepared service started: {service}"
+            provenance = (
+                _detached_service_provenance(cwd, detached_endpoint, listener_baseline)
+                if detached_endpoint is not None and service.get("exit_code") == 0
+                else None
             )
-            failed_stage = "start"
+            if provenance is None:
+                failure = (
+                    "Environment Setup start terminal exited without verified "
+                    f"service provenance: {service}"
+                )
+                failed_stage = "start"
+            else:
+                service["provenance"] = provenance
         elif service.get("error"):
             failure = f"Environment Setup start observation failed: {service}"
             failed_stage = "ready_check"
