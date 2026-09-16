@@ -170,6 +170,26 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             False,
             None,
         ),
+        (
+            {
+                "status": "READY",
+                "summary": "start interrupted",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "start observation interrupted",
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "final blocked",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "agent blocked: endpoint unavailable",
+        ),
     ],
 )
 def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
@@ -215,6 +235,14 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             if (
                 self.reads > 1
                 and report is not None
+                and report.get("summary") == "final blocked"
+            ):
+                return json.dumps(
+                    {"status": "BLOCKED", "summary": "endpoint unavailable"}
+                )
+            if (
+                self.reads > 1
+                and report is not None
                 and not report.get("verification_command")
             ):
                 return json.dumps({"status": "BLOCKED", "summary": "no usable check"})
@@ -231,6 +259,12 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             pass
 
         def read_shell_result(self, tab: str) -> SimpleNamespace:
+            if (
+                report is not None
+                and report.get("summary") == "start interrupted"
+                and tab == "shell-2"
+            ):
+                raise TimeoutError("start observation interrupted")
             return SimpleNamespace(
                 exit_code=3
                 if report is not None
@@ -278,6 +312,9 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             "codex",
             1 if late_completion else 120,
             build="printf built",
+            start="serve"
+            if report is not None and report.get("summary") == "start interrupted"
+            else None,
         )
     )
     output = StringIO()
@@ -320,6 +357,13 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             and not report.get("verification_command")
         ):
             assert result["attempts"][0]["failed_stage"] == "ready_check"
+        if report is not None and report.get("summary") == "start interrupted":
+            assert result["checks"]["build"]["exit_code"] == 0
+            assert result["process"]["tab_id"] == "shell-2"
+            assert result["service_tab"] == "shell-2"
+            assert result["attempts"][0]["failed_stage"] == "start"
+        if report is not None and report.get("summary") == "final blocked":
+            assert result["attempts"][0]["failure"] is None
     assert events == [
         ("Environment Setup", "started"),
         ("Environment Setup", "completed" if expected_error is None else "failed"),
@@ -396,3 +440,29 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
             "session": ["worktree", "workspace"],
         }[phase]
     )
+
+
+def test_large_result_remains_parseable_and_keeps_latest_observation() -> None:
+    history = [
+        {"checks": {"build": {"output": "x" * 4096}}, "failure": f"attempt {i}"}
+        for i in range(1000)
+    ]
+    result = {
+        "status": "BLOCKED",
+        "summary": "retry limit reached",
+        "resolved_revision": "a" * 40,
+        "working_path": "/tmp/setup",
+        "connection": {"workspace_id": "ws-1"},
+        "attempts": history,
+        "observed_facts": {"agent_reports": [{"summary": "y" * 4096}] * 1000},
+    }
+    payload = setup.serialize_environment_setup_result(result)
+    assert len(payload) < 100_000
+    decoded = json.loads(payload)
+    assert decoded["status"] == "BLOCKED"
+    assert decoded["attempts"][-1]["failure"] == "attempt 999"
+    assert decoded["history_truncated"] == {
+        "attempts": 992,
+        "agent_reports": 992,
+    }
+    assert decoded["resolved_revision"] == "a" * 40

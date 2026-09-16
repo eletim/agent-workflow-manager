@@ -105,6 +105,58 @@ def parse_environment_setup_json(source: str) -> EnvironmentSetupInput:
     )
 
 
+def serialize_environment_setup_result(result: dict[str, Any]) -> str:
+    """Keep the single JSON result below the runner's stdout retention limit."""
+
+    def compact(value: Any, string_limit: int, list_limit: int, depth: int = 0) -> Any:
+        if isinstance(value, str):
+            return value if len(value) <= string_limit else value[:string_limit] + "…"
+        if depth >= 6:
+            return "…"
+        if isinstance(value, list):
+            return [
+                compact(item, string_limit, list_limit, depth + 1)
+                for item in value[-list_limit:]
+            ]
+        if isinstance(value, dict):
+            return {
+                str(key)[:128]: compact(item, string_limit, list_limit, depth + 1)
+                for key, item in list(value.items())[:24]
+            }
+        return value
+
+    for string_limit, list_limit in ((2048, 8), (512, 4), (128, 1)):
+        candidate = compact(result, string_limit, list_limit)
+        omitted: dict[str, int] = {}
+        attempts = result.get("attempts")
+        if isinstance(attempts, list) and len(attempts) > list_limit:
+            omitted["attempts"] = len(attempts) - list_limit
+        facts = result.get("observed_facts")
+        if isinstance(facts, dict):
+            reports = facts.get("agent_reports")
+            if isinstance(reports, list) and len(reports) > list_limit:
+                omitted["agent_reports"] = len(reports) - list_limit
+        if omitted:
+            candidate["history_truncated"] = omitted
+        payload = json.dumps(candidate)
+        if len(payload) < 100_000:
+            return payload
+    return json.dumps(
+        {
+            "status": result["status"],
+            "summary": str(result.get("summary", ""))[:512],
+            "resolved_revision": result.get("resolved_revision"),
+            "working_path": str(result.get("working_path"))[:512]
+            if result.get("working_path")
+            else None,
+            "connection": compact(result.get("connection", {}), 512, 1),
+            "observed_facts": {
+                "error": "Detailed observations exceeded the result size limit"
+            },
+        }
+    )
+
+
 def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
     """Generate a plain Python Workflow from validated declarative inputs."""
     instructions = [
@@ -151,6 +203,7 @@ from purplemux_client import (
     prepare_run_revision,
 )
 from purplemux_client.environment_setup_execution import execute_environment_setup_commands
+from purplemux_client.environment_setup import serialize_environment_setup_result
 
 WORKFLOW_OUTLINE = ["Environment Setup"]
 REVISION_VALIDATION = {config.revision_validation!r}
@@ -198,6 +251,7 @@ attempts = []
 agent_reports = []
 report = None
 result = None
+current_attempt = None
 try:
     deadline = time.monotonic() + {config.timeout}
     context = prepare_run_revision(
@@ -230,18 +284,21 @@ try:
         raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}")
     resume_at = "build"
     while True:
+        current_attempt = {{}}
+        attempts.append(current_attempt)
         attempt = execute_environment_setup_commands(
             client=client, build={config.build!r}, start={config.start!r},
             ready_check={config.ready_check!r},
             verification_command=report.get("verification_command"),
             cwd=cwd, remaining=remaining, resume_at=resume_at,
             service_tab=service_tab,
+            observation=current_attempt,
         )
-        attempts.append(attempt)
         checks.update(attempt["checks"])
         service_tab = attempt["service_tab"]
         verification = attempt["verification"]
         if attempt["failure"] is None:
+            current_attempt = None
             break
         recovery_prompt = (
             "Execution failed or readiness was not reached after the required "
@@ -283,6 +340,12 @@ try:
         "readiness_summary": "The usability check succeeded.",
     }}
 except BaseException as exc:
+    if current_attempt is not None:
+        checks.update(current_attempt.get("checks", {{}}))
+        service_tab = current_attempt.get("service_tab", service_tab)
+        verification = current_attempt.get("verification", verification)
+        if current_attempt.get("failure") is None:
+            current_attempt["failure"] = str(exc)
     interrupt_error = None
     if isinstance(exc, TimeoutError) and turn_active and client is not None and tab is not None:
         try:
@@ -327,5 +390,5 @@ if last_report is not None:
     endpoint = last_report.get("endpoint")
     if isinstance(endpoint, str) and endpoint.strip():
         result["connection"]["endpoint"] = endpoint.strip()
-print(json.dumps(result))
+print(serialize_environment_setup_result(result))
 """

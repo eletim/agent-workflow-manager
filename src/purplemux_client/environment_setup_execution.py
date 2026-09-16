@@ -41,16 +41,25 @@ def _completed_command(
     command: str,
     cwd: str,
     remaining: Callable[[], float],
+    on_created: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     remaining()
     created: list[str] = []
+
+    def record_created(session: str, _result_path: str) -> None:
+        created.append(session)
+        if on_created is not None:
+            on_created(session)
+
     try:
         tab = client.start_shell(
             ShellCommandRequest(
                 command, cwd, f"Environment Setup {name}", deadline_check=remaining
             ),
-            on_created=lambda session, _result_path: created.append(session),
+            on_created=record_created,
         )
+        if on_created is not None:
+            on_created(tab)
     except MutationOutcomeUnknown:
         tab = created[0] if created else None
         _remaining_or_interrupt(client, tab, remaining)
@@ -153,15 +162,24 @@ def execute_environment_setup_commands(
     remaining: Callable[[], float],
     resume_at: str = "build",
     service_tab: str | None = None,
+    observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run supplied stages in order; return observations and the first failure."""
     stages = ("build", "start", "ready_check")
     if resume_at not in stages:
         raise ValueError(f"invalid Environment Setup resume stage: {resume_at}")
+    attempt = observation if observation is not None else {}
     checks: dict[str, dict[str, object]] = {}
     verification: dict[str, object] | None = None
     failure: str | None = None
     failed_stage: str | None = None
+    attempt.update(
+        checks=checks,
+        verification=verification,
+        service_tab=service_tab,
+        failure=failure,
+        failed_stage=failed_stage,
+    )
     for stage in stages[stages.index(resume_at) :]:
         command = {"build": build, "start": start, "ready_check": ready_check}[stage]
         outcome: dict[str, object]
@@ -173,9 +191,28 @@ def execute_environment_setup_commands(
                 break
         elif command is None:
             continue
+        pending: dict[str, object] = {
+            "command": command,
+            "workspace_id": client.workspace_id,
+        }
+        checks[stage] = pending
+        if stage == "ready_check":
+            attempt["verification"] = pending
+        attempt["failed_stage"] = stage
+
+        def record_tab(created_tab: str) -> None:
+            pending["tab_id"] = created_tab
+            if stage == "start":
+                attempt["service_tab"] = created_tab
+
         if stage == "start":
             remaining()
             created: list[str] = []
+
+            def record_created(tab: str, _result_path: str) -> None:
+                created.append(tab)
+                record_tab(tab)
+
             try:
                 service_tab = client.start_shell(
                     ShellCommandRequest(
@@ -184,8 +221,9 @@ def execute_environment_setup_commands(
                         "Environment Setup start",
                         deadline_check=remaining,
                     ),
-                    on_created=lambda tab, _result_path: created.append(tab),
+                    on_created=record_created,
                 )
+                record_tab(service_tab)
             except MutationOutcomeUnknown:
                 service_tab = created[0] if created else None
                 _remaining_or_interrupt(client, service_tab, remaining)
@@ -227,14 +265,24 @@ def execute_environment_setup_commands(
                 outcome = _service_outcome(client, service_tab, command)
         else:
             outcome = _completed_command(
-                client, name=stage, command=command, cwd=cwd, remaining=remaining
+                client,
+                name=stage,
+                command=command,
+                cwd=cwd,
+                remaining=remaining,
+                on_created=record_tab,
             )
         if stage == "ready_check":
             verification = outcome
+            attempt["verification"] = outcome
             if ready_check is not None:
                 checks[stage] = outcome
+            else:
+                checks.pop(stage, None)
         else:
             checks[stage] = outcome
+        if stage == "start":
+            attempt["service_tab"] = service_tab
         if outcome.get("error") or outcome.get("exit_code") not in (None, 0):
             failure = f"Environment Setup {stage} failed: {outcome}"
             failed_stage = stage
@@ -263,10 +311,10 @@ def execute_environment_setup_commands(
             failure = f"Environment Setup start observation failed: {service}"
             failed_stage = "ready_check"
     remaining()
-    return {
-        "checks": checks,
-        "verification": verification,
-        "service_tab": service_tab,
-        "failure": failure,
-        "failed_stage": failed_stage,
-    }
+    attempt.update(
+        verification=verification,
+        service_tab=service_tab,
+        failure=failure,
+        failed_stage=failed_stage,
+    )
+    return attempt

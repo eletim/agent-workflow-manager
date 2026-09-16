@@ -262,9 +262,19 @@ def test_unresolved_launch_stops_without_replay(tmp_path: Path, stage: str) -> N
     client = ManagedClient({stage: [None], "verify": [0]})
     client.launch_error = stage
     client.launch_uncertain = True
+    observation: dict = {}
     with pytest.raises(MutationOutcomeUnknown, match="unresolved"):
-        execute(client, tmp_path, **{stage: stage}, verification_command="verify")
+        execute(
+            client,
+            tmp_path,
+            **{stage: stage},
+            verification_command="verify",
+            observation=observation,
+        )
     assert [request.command for request in client.requests] == [stage]
+    assert observation["checks"][stage]["tab_id"] == "tab-1"
+    if stage == "start":
+        assert observation["service_tab"] == "tab-1"
 
 
 def test_uncertain_start_launch_with_completed_result_continues(tmp_path: Path) -> None:
@@ -309,6 +319,16 @@ def test_deadline_after_launch_interrupts_command(tmp_path: Path, stage: str) ->
             raise TimeoutError("Environment Setup timed out")
         return 1
 
+    observation: dict = {}
     with pytest.raises(TimeoutError, match="timed out"):
-        execute(client, tmp_path, **{stage: command}, remaining=remaining)
+        execute(
+            client,
+            tmp_path,
+            **{stage: command},
+            remaining=remaining,
+            observation=observation,
+        )
     assert client.interrupted == ["tab-1"]
+    assert observation["checks"][stage]["tab_id"] == "tab-1"
+    if stage == "ready_check":
+        assert observation["verification"]["tab_id"] == "tab-1"
