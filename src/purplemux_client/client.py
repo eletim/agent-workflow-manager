@@ -300,13 +300,15 @@ class PurpleMuxRuntime:
 
         def dispatch() -> WorkspaceState:
             nonlocal response_id, response_initial_tab
-            if request.deadline_check is not None:
-                self.command_timeout_seconds = min(
-                    self.command_timeout_seconds, request.deadline_check()
-                )
+            timeout_seconds = (
+                min(self.command_timeout_seconds, request.deadline_check())
+                if request.deadline_check is not None
+                else self.command_timeout_seconds
+            )
             data = self._mutation_json(
                 ["workspace", "create", "--cwd", cwd, "--name", correlated_name],
                 "create workspace",
+                timeout_seconds=timeout_seconds,
             )
             candidate = data.get("id") or data.get("workspaceId")
             if isinstance(candidate, str) and candidate:
@@ -539,9 +541,21 @@ class PurpleMuxRuntime:
             return _parse_json_object(completed.stdout, operation)
         raise AssertionError("unreachable")
 
-    def _mutation_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+    def _mutation_json(
+        self,
+        args: Sequence[str],
+        operation: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         return _run_mutation_json(
-            self._runner, self.executable, args, operation, self.command_timeout_seconds
+            self._runner,
+            self.executable,
+            args,
+            operation,
+            self.command_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds,
         )
 
 
@@ -1389,10 +1403,11 @@ class PurpleMuxCLIClient:
 
         def dispatch() -> TabState:
             nonlocal response_id
-            if deadline_check is not None:
-                self.command_timeout_seconds = min(
-                    self.command_timeout_seconds, deadline_check()
-                )
+            timeout_seconds = (
+                min(self.command_timeout_seconds, deadline_check())
+                if deadline_check is not None
+                else self.command_timeout_seconds
+            )
             data = self._mutation_json(
                 [
                     "tab",
@@ -1405,6 +1420,7 @@ class PurpleMuxCLIClient:
                     panel_type,
                 ],
                 "create tab",
+                timeout_seconds=timeout_seconds,
             )
             candidate = data.get("tabId") or data.get("tab_id") or data.get("id")
             if isinstance(candidate, str) and candidate:
@@ -1574,9 +1590,21 @@ class PurpleMuxCLIClient:
                 )
             self._sleep(self.poll_interval_seconds)
 
-    def _mutation_json(self, args: Sequence[str], operation: str) -> dict[str, Any]:
+    def _mutation_json(
+        self,
+        args: Sequence[str],
+        operation: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         return _run_mutation_json(
-            self._runner, self.executable, args, operation, self.command_timeout_seconds
+            self._runner,
+            self.executable,
+            args,
+            operation,
+            self.command_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds,
         )
 
     def _read_turn_baseline(self, session_id: str) -> _TurnBaseline:

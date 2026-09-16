@@ -41,6 +41,7 @@ class FakeRunner:
     ) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.tabs: dict[str, dict[str, object]] = {}
         self.workspace_directories = workspace_directories
 
@@ -58,6 +59,7 @@ class FakeRunner:
         assert check is False
         command = list(args)
         self.calls.append(command)
+        self.timeouts.append(timeout)
         if command[1:3] == ["tab", "list"]:
             return completed({"tabs": list(self.tabs.values())})
         if command[1:] == ["workspaces"]:
@@ -148,6 +150,27 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
     assert create[-2:] == ["-t", "codex-cli"]
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
+
+
+def test_session_deadline_only_limits_tab_create_command() -> None:
+    runner = FakeRunner([completed({"tabId": "tab-123"})])
+    cli = client(runner, command_timeout_seconds=30)
+    deadline_request = CreateSessionRequest(
+        worker="codex",
+        cwd="/workspace/project",
+        command="codex",
+        deadline_check=lambda: 0.5,
+    )
+
+    assert cli.create_session(deadline_request) == "tab-123"
+    create_index = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if call[1:3] == ["tab", "create"]
+    )
+    assert runner.timeouts[create_index] == 0.5
+    assert cli.command_timeout_seconds == 30
+    assert runner.timeouts[create_index + 1] == 30
 
 
 def test_codex_project_is_trusted_before_tab_creation() -> None:

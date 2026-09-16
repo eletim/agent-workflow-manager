@@ -255,6 +255,9 @@ class WorkflowValidator:
         self, tree: ast.Module, issues: list[ValidationIssue]
     ) -> None:
         aliases: dict[str, str] = {}
+        callback_names = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
         for node in tree.body:
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -308,7 +311,7 @@ class WorkflowValidator:
                 if keyword.arg == "deadline_check":
                     if not (
                         isinstance(keyword.value, ast.Name)
-                        and keyword.value.id == "remaining"
+                        and keyword.value.id in callback_names
                     ):
                         malformed = True
                     continue

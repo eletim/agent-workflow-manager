@@ -53,7 +53,8 @@ def test_generates_python_from_declarative_inputs(
     assert repository_lookup == [("/source/repo", "dev/v0.4.1")]
     assert "prepare_run_revision(" in code
     assert "revision='dev/v0.4.1'" in code
-    assert "owned_by_run=True, command_timeout_seconds=min(remaining(), 30)" in code
+    assert "PurpleMuxRuntime(owned_by_run=True)" in code
+    assert "client.command_timeout_seconds" not in code
     assert "worker='claude-code'" in code
     assert "deadline = time.monotonic() + 120" in code
     assert "Build command: python -m build" in code
@@ -172,11 +173,8 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
     client = Client()
 
     class Runtime:
-        def __init__(
-            self, *, owned_by_run: bool, command_timeout_seconds: float
-        ) -> None:
+        def __init__(self, *, owned_by_run: bool) -> None:
             assert owned_by_run
-            assert command_timeout_seconds > 0
 
         def create_workspace(self, _request: object) -> SimpleNamespace:
             return SimpleNamespace(id="ws-1")
@@ -241,10 +239,8 @@ def test_generated_workflow_stops_creating_resources_after_deadline(
             return "tab-1"
 
     class Runtime:
-        def __init__(
-            self, *, owned_by_run: bool, command_timeout_seconds: float
-        ) -> None:
-            assert owned_by_run and command_timeout_seconds > 0
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
 
         def create_workspace(self, request: object) -> SimpleNamespace:
             if phase == "workspace":

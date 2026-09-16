@@ -175,9 +175,7 @@ try:
     )
     remaining()
     cwd = str(context.execution_root)
-    runtime = PurpleMuxRuntime(
-        owned_by_run=True, command_timeout_seconds=min(remaining(), 30)
-    )
+    runtime = PurpleMuxRuntime(owned_by_run=True)
     workspace = runtime.create_workspace(
         CreateWorkspaceRequest(
             cwd=cwd, name="AWM Environment Setup", deadline_check=remaining
@@ -185,7 +183,6 @@ try:
     )
     remaining()
     client = runtime.workspace(workspace.id)
-    client.command_timeout_seconds = min(remaining(), 30)
     tab = client.create_session(
         CreateSessionRequest(
             worker={config.environment_agent!r},

@@ -464,6 +464,26 @@ context = prepare_run_repository(repo={str(repository)!r}, base_branch="main")
     assert missing.issues[0].kind == "execution_context"
 
 
+def test_static_validation_accepts_any_declared_deadline_callback(
+    tmp_path: Path,
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    source = f"""
+from purplemux_client import prepare_run_revision
+WORKFLOW_DRY_RUN = 1
+def budget_left():
+    return 1.0
+prepare_run_revision(repo={str(repository)!r}, revision="main", deadline_check=budget_left)
+"""
+
+    assert WorkflowValidator().validate(source).valid
+    undefined = WorkflowValidator().validate(
+        source.replace("deadline_check=budget_left", "deadline_check=missing_callback")
+    )
+    assert not undefined.valid
+    assert any(issue.kind == "execution_context" for issue in undefined.issues)
+
+
 def test_static_validation_resolves_relative_repository_from_workflow_cwd(
     tmp_path: Path,
 ) -> None:
