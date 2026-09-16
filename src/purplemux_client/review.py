@@ -127,21 +127,32 @@ def serialize_review_result(
 ) -> str:
     """Keep a complete Review JSON value within the runner's stdout limit."""
     summary = report["summary"]
-    findings = report.get("findings", [])
     result: dict[str, Any] = {
         "verdict": report["verdict"],
         "summary": summary[:16384],
-        "findings": [finding[:512] for finding in findings[:100]],
         "repositories": list(repositories[:32]),
     }
     truncated: dict[str, int] = {}
     if len(summary) > 16384:
         truncated["summary_chars"] = len(summary) - 16384
-    if len(findings) > 100:
-        truncated["findings"] = len(findings) - 100
-    clipped_findings = sum(len(finding) > 512 for finding in findings[:100])
-    if clipped_findings:
-        truncated["finding_texts"] = clipped_findings
+    for name in (
+        "findings",
+        "observed_facts",
+        "evidence",
+        "hypotheses",
+        "observability_gaps",
+    ):
+        if name not in report and name != "findings":
+            continue
+        entries = report.get(name, [])
+        result[name] = [entry[:512] for entry in entries[:100]]
+        if len(entries) > 100:
+            truncated[name] = len(entries) - 100
+        clipped = sum(len(entry) > 512 for entry in entries[:100])
+        if clipped:
+            truncated["finding_texts" if name == "findings" else f"{name}_texts"] = (
+                clipped
+            )
     omitted_repositories = len(repositories) - len(result["repositories"])
     if omitted_repositories:
         truncated["repositories"] = omitted_repositories
@@ -283,6 +294,7 @@ def generate_review_workflow(config: ReviewInput) -> str:
 import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
+from purplemux_client.errors import MutationOutcomeUnknown, WorkerFailure, WorkerInterrupted
 from purplemux_client.review import require_ext_review_contract, serialize_review_result, snapshot_review_repositories
 
 WORKFLOW_OUTLINE = ["Review"]
@@ -304,12 +316,15 @@ def busy_timeout(_warning):
     raise TimeoutError("Review timed out while the agent was busy")
 
 
-def turn(message):
-    remaining()
+def turn(message, *, finish=False):
+    seconds = max(remaining() if not finish else deadline - time.monotonic(), 0)
+    if finish:
+        seconds = max(seconds, 60)
     try:
         client.send_input(tab, message)
-        client.wait_for_turn_completion(tab, remaining(), on_busy_timeout=busy_timeout)
-        remaining()
+        client.wait_for_turn_completion(tab, seconds, on_busy_timeout=busy_timeout)
+        if not finish:
+            remaining()
         return client.read_result(tab)
     finally:
         verify_repositories()
@@ -347,19 +362,36 @@ try:
                + "Do not modify the repositories or send input to observed external terminals. ")
     if START is not None:
         turn(context + "First, follow this start instruction and report what you did: " + START)
-    report = turn(context + "Perform this check: " + CHECK + "\\nReturn a JSON object with verdict PASS, FAIL, or BLOCKED, a non-empty summary, and an optional findings array of strings. Base the verdict on observed evidence.")
     try:
-        result = json.loads(report)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("Review agent did not return JSON") from exc
+        report = turn(context + "Perform this check: " + CHECK + "\\nReturn one JSON object with verdict PASS, FAIL, or BLOCKED and a non-empty summary. Optional findings, observed_facts, evidence, hypotheses, and observability_gaps are arrays of strings. Report BLOCKED when observation times out or is unavailable; describe what could not be observed in observability_gaps. Base PASS or FAIL on observed evidence.")
+    except (TimeoutError, WorkerFailure) as exc:
+        if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
+            raise
+        result = {{
+            "verdict": "BLOCKED",
+            "summary": "Review observation was unavailable: " + str(exc),
+            "observability_gaps": [str(exc)],
+        }}
+    else:
+        try:
+            result = json.loads(report)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Review agent did not return JSON") from exc
     if (not isinstance(result, dict) or result.get("verdict") not in ("PASS", "FAIL", "BLOCKED")
             or not isinstance(result.get("summary"), str) or not result["summary"].strip()
-            or not isinstance(result.get("findings", []), list)
-            or any(not isinstance(item, str) for item in result.get("findings", []))):
+            or any(not isinstance(result.get(name, []), list)
+                   or any(not isinstance(item, str) for item in result.get(name, []))
+                   for name in ("findings", "observed_facts", "evidence", "hypotheses", "observability_gaps"))):
         raise RuntimeError("Review agent returned an invalid report")
     serialized_result = serialize_review_result(result, REPOSITORIES)
     if FINISH is not None:
-        turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH)
+        try:
+            turn("The check produced this report: " + serialized_result + "\\nNow follow this finish instruction and report what you did: " + FINISH, finish=True)
+        except (TimeoutError, WorkerFailure) as exc:
+            if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
+                raise
+            result.setdefault("observability_gaps", []).append("Finish could not be confirmed: " + str(exc))
+            serialized_result = serialize_review_result(result, REPOSITORIES)
     client.close_session(tab)
     tab = None
     verify_repositories()
