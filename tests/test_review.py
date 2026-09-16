@@ -164,10 +164,14 @@ def test_review_generation_api_feeds_ordinary_run(
 
 
 @pytest.mark.parametrize("oversized", [False, True])
+@pytest.mark.parametrize("finish_unavailable", [False, True])
+@pytest.mark.parametrize("full_gaps", [False, True])
 def test_generated_review_sequences_optional_turns_and_reports_result(
     repositories: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
     oversized: bool,
+    finish_unavailable: bool,
+    full_gaps: bool,
 ) -> None:
     import purplemux_client
     import purplemux_client.review as review_module
@@ -190,7 +194,8 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
         def wait_for_turn_completion(
             self, _tab: str, _seconds: float, **_kwargs: object
         ) -> None:
-            pass
+            if len(messages) == 3 and finish_unavailable:
+                raise TimeoutError("finish timed out")
 
         def read_result(self, _tab: str) -> str:
             if len(messages) == 2:
@@ -201,6 +206,14 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
                         if not oversized
                         else "x" * 1_100_000,
                         "findings": ["A" if not oversized else "y" * 1_100_000],
+                        "observed_facts": ["Request returned 500"],
+                        "evidence": ["Browser response"],
+                        "hypotheses": ["Handler omitted"],
+                        "observability_gaps": (
+                            [f"Existing gap {index}" for index in range(100)]
+                            if full_gaps
+                            else ["Production logs unavailable"]
+                        ),
                     }
                 )
             return "done"
@@ -251,16 +264,107 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     assert len(retained) <= 1_000_000
     result = json.loads(retained)
     assert result["verdict"] == "FAIL"
+    assert result["observed_facts"] == ["Request returned 500"]
+    assert result["evidence"] == ["Browser response"]
+    assert result["hypotheses"] == ["Handler omitted"]
+    expected_gaps = (
+        [f"Existing gap {index}" for index in range(100)]
+        if full_gaps
+        else ["Production logs unavailable"]
+    )
+    if finish_unavailable:
+        expected_gaps.insert(0, "Finish could not be confirmed: finish timed out")
+    if full_gaps and finish_unavailable:
+        expected_gaps.pop()
+    assert result["observability_gaps"] == expected_gaps
+    if full_gaps and finish_unavailable:
+        assert result["truncated"]["observability_gaps"] == 1
     assert result["repositories"] == [str(path) for path in repositories]
     if oversized:
-        assert result["truncated"] == {
+        expected_truncated = {
             "summary_chars": 1_100_000 - 16384,
             "finding_texts": 1,
         }
+        if full_gaps and finish_unavailable:
+            expected_truncated["observability_gaps"] = 1
+        assert result["truncated"] == expected_truncated
         assert len(result["summary"]) == 16384
         assert len(result["findings"][0]) == 512
         assert len(messages[2]) < 1_000_000
     assert steps == [("Review", "started"), ("Review", "completed")]
+    assert closed == ["agent-tab"]
+
+
+@pytest.mark.parametrize("unavailable", ["timeout", "result unavailable"])
+def test_generated_review_unavailable_returns_blocked_and_runs_finish(
+    repositories: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, unavailable: str
+) -> None:
+    import purplemux_client
+    import purplemux_client.review as review_module
+    from purplemux_client.errors import WorkerFailure
+
+    messages: list[str] = []
+    closed: list[str] = []
+
+    class Client:
+        def create_session(self, _request: object) -> str:
+            return "agent-tab"
+
+        def wait_until_ready(self, _tab: str, _seconds: float) -> None:
+            pass
+
+        def send_input(self, _tab: str, message: str) -> None:
+            messages.append(message)
+
+        def wait_for_turn_completion(
+            self, _tab: str, _seconds: float, **_kwargs: object
+        ) -> None:
+            if len(messages) == 1:
+                if unavailable == "timeout":
+                    raise TimeoutError("observation deadline exceeded")
+                raise WorkerFailure("result unavailable")
+
+        def read_result(self, _tab: str) -> str:
+            return "finish complete"
+
+        def close_session(self, tab: str) -> None:
+            closed.append(tab)
+
+    client = Client()
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="review-workspace")
+
+        def workspace(self, _workspace_id: str) -> Client:
+            return client
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
+    )
+    monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
+    config = parse_review_json(
+        declaration(repositories, finish="Close the observation")
+    )
+    output = StringIO()
+    with redirect_stdout(output):
+        exec(compile(generate_review_workflow(config), "<review>", "exec"), {})
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "BLOCKED"
+    expected = (
+        "observation deadline exceeded"
+        if unavailable == "timeout"
+        else "result unavailable"
+    )
+    assert expected in result["summary"]
+    assert result["observability_gaps"] == [expected]
+    assert "Close the observation" in messages[1]
     assert closed == ["agent-tab"]
 
 
@@ -277,6 +381,48 @@ def test_review_result_stays_complete_with_worst_case_json_escaping() -> None:
     assert result["verdict"] == "PASS"
     assert result["truncated"]["repositories"] > 0
     assert result["truncated"]["findings"] == 20
+
+
+def test_review_compacts_escaped_optional_arrays_without_losing_verdict() -> None:
+    names = (
+        "findings",
+        "observed_facts",
+        "evidence",
+        "hypotheses",
+        "observability_gaps",
+    )
+    report = {"verdict": "FAIL", "summary": "Observed a failure"}
+    report.update({name: ["\0" * 512] * 100 for name in names})
+    payload = serialize_review_result(report, ())
+    result = json.loads(payload)
+    assert len(payload) + 1 <= 1_000_000
+    assert result["verdict"] == "FAIL"
+    assert result["summary"] == "Observed a failure"
+    assert sum(result["truncated"].get(name, 0) for name in names) > 0
+    for name in names:
+        assert result[name] == ["\0" * 512] * len(result[name])
+        assert len(result[name]) + result["truncated"].get(name, 0) == 100
+
+
+def test_review_compaction_preserves_finish_failure_with_escaped_arrays() -> None:
+    other_entry = "\0" * 440 + "x" * 72
+    report = {
+        "verdict": "PASS",
+        "summary": "The check passed",
+        "findings": [other_entry] * 100,
+        "observed_facts": [other_entry] * 100,
+        "evidence": [other_entry] * 100,
+        "hypotheses": [other_entry] * 100,
+        "observability_gaps": ["\0" * 512] * 100,
+    }
+    failure = "Finish could not be confirmed: " + "\0" * 512
+    payload = serialize_review_result(report, (), finish_failure=failure)
+    result = json.loads(payload)
+    assert len(payload) + 1 <= 1_000_000
+    assert result["verdict"] == "PASS"
+    assert len(result["observability_gaps"]) == 1
+    assert result["observability_gaps"][0].startswith("Finish could not be confirmed: ")
+    assert result["truncated"]["observability_gaps"] == 100
 
 
 def test_review_snapshot_detects_changes_in_every_declared_repository(
