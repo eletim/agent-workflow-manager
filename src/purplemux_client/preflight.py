@@ -15,7 +15,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from purplemux_client import __all__ as PURPLEMUX_CLIENT_API
-from purplemux_client.execution_context import _inspect_repository_declaration
+from purplemux_client.execution_context import (
+    _inspect_repository_declaration,
+    inspect_run_revision,
+)
 from purplemux_client.issue_driven import inspect_issue_driven_topology
 
 PREFLIGHT_NAME = "WORKFLOW_PREFLIGHT"
@@ -271,13 +274,18 @@ class WorkflowValidator:
                 name = aliases.get(root, root) + (
                     separator + remainder if separator else ""
                 )
-            if name != "purplemux_client.prepare_run_repository":
+            if name not in {
+                "purplemux_client.prepare_run_repository",
+                "purplemux_client.prepare_run_revision",
+            }:
                 continue
+            revision_call = name == "purplemux_client.prepare_run_revision"
+            revision_key = "revision" if revision_call else "base_branch"
             if node.args:
                 issues.append(
                     ValidationIssue(
                         "execution_context",
-                        "prepare_run_repository arguments must be explicit keywords",
+                        f"{name.rsplit('.', 1)[-1]} arguments must be explicit keywords",
                         node.lineno,
                         node.col_offset + 1,
                     )
@@ -287,7 +295,7 @@ class WorkflowValidator:
             malformed = False
             allowed = {
                 "repo",
-                "base_branch",
+                revision_key,
                 "remote",
                 "worktree_root",
                 "command_timeout_seconds",
@@ -301,18 +309,18 @@ class WorkflowValidator:
                 except (ValueError, TypeError):
                     malformed = True
                     break
-            if malformed or not {"repo", "base_branch"}.issubset(values):
+            if malformed or not {"repo", revision_key}.issubset(values):
                 issues.append(
                     ValidationIssue(
                         "execution_context",
-                        "prepare_run_repository requires literal repo and base_branch keywords",
+                        f"{name.rsplit('.', 1)[-1]} requires literal repo and {revision_key} keywords",
                         node.lineno,
                         node.col_offset + 1,
                     )
                 )
                 continue
             repo = values["repo"]
-            base_branch = values["base_branch"]
+            base_branch = values[revision_key]
             remote = values.get("remote", "origin")
             worktree_root = values.get("worktree_root")
             timeout = values.get("command_timeout_seconds", 30.0)
@@ -327,20 +335,29 @@ class WorkflowValidator:
                 issues.append(
                     ValidationIssue(
                         "execution_context",
-                        "prepare_run_repository repository settings have invalid literal types",
+                        f"{name.rsplit('.', 1)[-1]} repository settings have invalid literal types",
                         node.lineno,
                         node.col_offset + 1,
                     )
                 )
                 continue
             try:
-                _inspect_repository_declaration(
-                    repo=repo,
-                    base_branch=base_branch,
-                    remote=remote,
-                    command_timeout_seconds=float(timeout),
-                    cwd=self._cwd,
-                )
+                if revision_call:
+                    inspect_run_revision(
+                        repo=repo,
+                        revision=base_branch,
+                        remote=remote,
+                        command_timeout_seconds=float(timeout),
+                        cwd=self._cwd,
+                    )
+                else:
+                    _inspect_repository_declaration(
+                        repo=repo,
+                        base_branch=base_branch,
+                        remote=remote,
+                        command_timeout_seconds=float(timeout),
+                        cwd=self._cwd,
+                    )
             except (OSError, TypeError, ValueError, RuntimeError) as exc:
                 issues.append(
                     ValidationIssue(

@@ -202,6 +202,110 @@ def prepare_run_repository(
         remote=remote,
         command_timeout_seconds=command_timeout_seconds,
     )
+    return _prepare_repository_worktree(
+        preparation, root, command_timeout_seconds, fetch_kind="branch"
+    )
+
+
+def inspect_run_revision(
+    *,
+    repo: str | os.PathLike[str],
+    revision: str,
+    remote: str = "origin",
+    command_timeout_seconds: float = 30.0,
+    cwd: Path | None = None,
+) -> tuple[RepositoryPreparation, str]:
+    """Resolve a remote branch or tag, or a full local commit ID."""
+    if not isinstance(revision, str) or not revision or "\0" in revision:
+        raise ValueError("revision must be a non-empty string without nulls")
+    if command_timeout_seconds <= 0:
+        raise ValueError("command_timeout_seconds must be positive")
+    requested = Path(repo).expanduser()
+    if not requested.is_absolute() and cwd is not None:
+        requested = cwd / requested
+    requested = requested.resolve()
+    if not requested.is_dir():
+        raise WorkerFailure(f"repository directory does not exist: {requested}")
+    source = Path(
+        _git_read(requested, ["rev-parse", "--show-toplevel"], command_timeout_seconds)
+    ).resolve()
+    remotes = _git_read(source, ["remote"], command_timeout_seconds).splitlines()
+    if remote not in remotes:
+        raise WorkerFailure(f"Git remote {remote!r} does not exist in {source}")
+    if _OBJECT_ID_RE.fullmatch(revision.lower()):
+        sha = revision.lower()
+        if (
+            _git_read(source, ["cat-file", "-t", sha], command_timeout_seconds)
+            != "commit"
+        ):
+            raise WorkerFailure(f"revision {revision!r} is not a commit")
+        return RepositoryPreparation(source, remote, "", sha, sha), "commit"
+    if revision.startswith("-") or revision.startswith("refs/"):
+        raise ValueError("revision must be a branch or tag name, or full commit SHA")
+    branch_ref = f"refs/heads/{revision}"
+    tag_ref = f"refs/tags/{revision}"
+    refs = _git_read(
+        source,
+        ["ls-remote", remote, branch_ref, tag_ref, f"{tag_ref}^{{}}"],
+        command_timeout_seconds,
+    ).splitlines()
+    matches = dict(line.split("\t", 1)[::-1] for line in refs if "\t" in line)
+    if branch_ref in matches and tag_ref in matches:
+        raise WorkerFailure(f"revision {revision!r} names both a branch and a tag")
+    if branch_ref in matches:
+        return inspect_run_repository(
+            repo=source,
+            base_branch=revision,
+            remote=remote,
+            command_timeout_seconds=command_timeout_seconds,
+        ), "branch"
+    if tag_ref in matches:
+        sha = matches.get(f"{tag_ref}^{{}}", matches[tag_ref]).lower()
+        if not _OBJECT_ID_RE.fullmatch(sha):
+            raise WorkerFailure(f"revision {revision!r} did not resolve to a commit")
+        return RepositoryPreparation(source, remote, "", tag_ref, sha), "tag"
+    raise WorkerFailure(f"revision {revision!r} was not found on {remote}")
+
+
+def prepare_run_revision(
+    *,
+    repo: str | os.PathLike[str],
+    revision: str,
+    remote: str = "origin",
+    worktree_root: str | os.PathLike[str] | None = None,
+    command_timeout_seconds: float = 30.0,
+) -> RepositoryExecutionContext:
+    """Prepare a detached worktree from a branch, tag, or full commit SHA."""
+    preparation, kind = inspect_run_revision(
+        repo=repo,
+        revision=revision,
+        remote=remote,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+    if kind == "branch":
+        return prepare_run_repository(
+            repo=repo,
+            base_branch=revision,
+            remote=remote,
+            worktree_root=worktree_root,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+    if worktree_root is not None and not isinstance(worktree_root, (str, os.PathLike)):
+        raise TypeError("worktree_root must be a path or None")
+    root_value = DEFAULT_WORKTREE_ROOT if worktree_root is None else worktree_root
+    root = Path(root_value).expanduser().resolve()
+    return _prepare_repository_worktree(
+        preparation, root, command_timeout_seconds, fetch_kind=kind
+    )
+
+
+def _prepare_repository_worktree(
+    preparation: RepositoryPreparation,
+    root: Path,
+    command_timeout_seconds: float,
+    *,
+    fetch_kind: str,
+) -> RepositoryExecutionContext:
     repository_name = _safe_name(preparation.source_repository.name)
     execution_root = root / (f"awm-run-{repository_name}-{uuid.uuid4().hex[:12]}")
     before = _inspect_candidate(
@@ -232,26 +336,34 @@ def prepare_run_repository(
     def dispatch() -> None:
         try:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fetched = _run_git_mutation_process_group(
-                [
-                    "fetch",
-                    "--no-tags",
-                    preparation.remote,
+            if fetch_kind == "branch":
+                fetch_ref = (
                     f"+refs/heads/{preparation.base_branch}:"
-                    f"refs/remotes/{preparation.remote}/{preparation.base_branch}",
-                ],
-                cwd=preparation.source_repository,
-                timeout=command_timeout_seconds,
-            )
-            if fetched.returncode != 0:
-                detail = fetched.stderr.strip() or fetched.stdout.strip() or "no output"
-                raise AuthoritativeMutationRejection(
-                    f"Git remote-base fetch exited {fetched.returncode}: {detail}"
+                    f"refs/remotes/{preparation.remote}/{preparation.base_branch}"
                 )
-            try:
                 verification_ref = (
                     f"refs/remotes/{preparation.remote}/{preparation.base_branch}"
                 )
+            elif fetch_kind == "tag":
+                fetch_ref = preparation.base_ref
+                verification_ref = "FETCH_HEAD"
+            else:
+                fetch_ref = ""
+                verification_ref = preparation.base_sha
+            if fetch_ref:
+                fetched = _run_git_mutation_process_group(
+                    ["fetch", "--no-tags", preparation.remote, fetch_ref],
+                    cwd=preparation.source_repository,
+                    timeout=command_timeout_seconds,
+                )
+                if fetched.returncode != 0:
+                    detail = (
+                        fetched.stderr.strip() or fetched.stdout.strip() or "no output"
+                    )
+                    raise AuthoritativeMutationRejection(
+                        f"Git revision fetch exited {fetched.returncode}: {detail}"
+                    )
+            try:
                 fetched_sha = _git_read(
                     preparation.source_repository,
                     ["rev-parse", "--verify", f"{verification_ref}^{{commit}}"],

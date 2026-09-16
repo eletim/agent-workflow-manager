@@ -26,11 +26,11 @@ def declaration(**overrides: object) -> str:
 def repository_lookup(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     calls: list[tuple[str, str]] = []
 
-    def inspect(*, repo: str, base_branch: str) -> SimpleNamespace:
-        calls.append((repo, base_branch))
-        return SimpleNamespace(source_repository=Path(repo))
+    def inspect(*, repo: str, revision: str) -> tuple[SimpleNamespace, str]:
+        calls.append((repo, revision))
+        return SimpleNamespace(source_repository=Path(repo)), "branch"
 
-    monkeypatch.setattr(setup, "_inspect_repository_declaration", inspect)
+    monkeypatch.setattr(setup, "inspect_run_revision", inspect)
     return calls
 
 
@@ -48,8 +48,9 @@ def test_generates_python_from_declarative_inputs(
     code = setup.generate_environment_setup_workflow(config)
     ast.parse(code)
     assert repository_lookup == [("/source/repo", "dev/v0.4.1")]
-    assert "prepare_run_repository(" in code
-    assert "base_branch='dev/v0.4.1'" in code
+    assert "prepare_run_revision(" in code
+    assert "revision='dev/v0.4.1'" in code
+    assert "PurpleMuxRuntime(owned_by_run=True)" in code
     assert "worker='claude-code'" in code
     assert "deadline = time.monotonic() + 120" in code
     assert "Build command: python -m build" in code

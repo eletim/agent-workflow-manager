@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from purplemux_client import inspect_run_repository, prepare_run_repository
+from purplemux_client import (
+    inspect_run_repository,
+    inspect_run_revision,
+    prepare_run_repository,
+    prepare_run_revision,
+)
 from purplemux_client.preflight import WorkflowValidator
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
 
@@ -79,6 +85,71 @@ def test_prepare_creates_fresh_detached_worktree_and_returns_identity(
         == "HEAD"
     )
     assert git(repository, "branch", "--show-current") == "main"
+
+
+def test_prepare_run_revision_accepts_tag_and_commit_without_changing_source(
+    tmp_path: Path,
+) -> None:
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "-a", "release-1", "-m", "release")
+    git(repository, "push", "origin", "refs/tags/release-1")
+    git(repository, "switch", "-qc", "ambient-work")
+    (repository / "untracked").write_text("keep me", encoding="utf-8")
+
+    for revision, expected_kind in (("release-1", "tag"), (sha, "commit")):
+        preparation, kind = inspect_run_revision(repo=repository, revision=revision)
+        assert kind == expected_kind
+        assert preparation.base_sha == sha
+        result = prepare_run_revision(
+            repo=repository,
+            revision=revision,
+            worktree_root=tmp_path / "managed-worktrees",
+        )
+        assert git(result.execution_root, "rev-parse", "HEAD") == sha
+        assert (
+            git(result.execution_root, "rev-parse", "--symbolic-full-name", "HEAD")
+            == "HEAD"
+        )
+
+    assert git(repository, "branch", "--show-current") == "ambient-work"
+    assert (repository / "untracked").read_text(encoding="utf-8") == "keep me"
+
+
+def test_prepare_run_revision_rejects_ambiguous_branch_and_tag(tmp_path: Path) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "main")
+    git(repository, "push", "origin", "refs/tags/main")
+
+    with pytest.raises(Exception, match="both a branch and a tag"):
+        inspect_run_revision(repo=repository, revision="main")
+
+
+def test_generated_environment_workflow_validates_tag_and_commit(
+    tmp_path: Path,
+) -> None:
+    from purplemux_client.environment_setup import (
+        generate_environment_setup_workflow,
+        parse_environment_setup_json,
+    )
+
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "release-1")
+    git(repository, "push", "origin", "refs/tags/release-1")
+    for revision in ("release-1", sha):
+        parsed = parse_environment_setup_json(
+            json.dumps(
+                {
+                    "mode": "environment-setup",
+                    "repository": str(repository),
+                    "revision": revision,
+                    "environment_agent": "codex",
+                    "timeout": 120,
+                }
+            )
+        )
+        assert parsed.revision == revision
+        code = generate_environment_setup_workflow(parsed)
+        assert WorkflowValidator().validate(code).valid
 
 
 def test_prepare_ignores_ambient_checkout_branch_and_dirty_state(

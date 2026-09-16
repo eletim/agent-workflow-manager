@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from purplemux_client.errors import WorkerFailure
-from purplemux_client.execution_context import _inspect_repository_declaration
+from purplemux_client.execution_context import inspect_run_revision
 
 _REQUIRED = {"mode", "repository", "revision", "environment_agent", "timeout"}
 _OPTIONAL = {"build", "start", "ready_check"}
@@ -87,8 +87,8 @@ def parse_environment_setup_json(source: str) -> EnvironmentSetupInput:
     if type(timeout) is not int or not 1 <= timeout <= 86400:
         raise ValueError("timeout must be an integer from 1 to 86400 seconds")
     try:
-        preparation = _inspect_repository_declaration(
-            repo=value["repository"], base_branch=value["revision"]
+        preparation, _kind = inspect_run_revision(
+            repo=value["repository"], revision=value["revision"]
         )
     except (ValueError, WorkerFailure) as exc:
         raise ValueError(f"repository/revision: {exc}") from exc
@@ -126,7 +126,7 @@ from purplemux_client import (
     CreateWorkspaceRequest,
     PurpleMuxRuntime,
     emit_step,
-    prepare_run_repository,
+    prepare_run_revision,
 )
 
 WORKFLOW_OUTLINE = ["Environment Setup"]
@@ -142,11 +142,11 @@ def remaining():
 emit_step("Environment Setup", "started")
 try:
     deadline = time.monotonic() + {config.timeout}
-    context = prepare_run_repository(
-        repo={config.repository!r}, base_branch={config.revision!r}
+    context = prepare_run_revision(
+        repo={config.repository!r}, revision={config.revision!r}
     )
     cwd = str(context.execution_root)
-    runtime = PurpleMuxRuntime()
+    runtime = PurpleMuxRuntime(owned_by_run=True)
     workspace = runtime.create_workspace(
         CreateWorkspaceRequest(cwd=cwd, name="AWM Environment Setup")
     )

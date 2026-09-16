@@ -263,7 +263,9 @@ from purplemux_client import (
     emit_finding,
     emit_issue_driven_repositories,
     inspect_run_repository,
+    inspect_run_revision,
     prepare_run_repository,
+    prepare_run_revision,
     reconcile_inline_task_pr_body,
     register_run_resource,
     require_inline_task_pr_fingerprint,
@@ -631,12 +633,22 @@ prepare_run_repository(
     *, repo, base_branch, remote="origin", worktree_root=None,
     command_timeout_seconds=30.0
 ) -> RepositoryExecutionContext
+inspect_run_revision(
+    *, repo, revision, remote="origin", command_timeout_seconds=30.0
+) -> tuple[RepositoryPreparation, str]
+prepare_run_revision(
+    *, repo, revision, remote="origin", worktree_root=None,
+    command_timeout_seconds=30.0
+) -> RepositoryExecutionContext
 run_correlation(logical_name) -> str
 ```
 
 `inspect_run_repository()` is read-only. `prepare_run_repository()` is an
 inspection-aware mutation that creates and registers an isolated worktree, or
 reconciles the exact correlated worktree if the mutation outcome was uncertain.
+`inspect_run_revision()` and `prepare_run_revision()` also accept remote tags
+and full local commit SHAs. Branches use the existing repository preparation
+path. A name shared by a remote branch and tag is rejected as ambiguous.
 `run_correlation()` is deterministic within one Runner run (and process-stable
 outside it); use it for logical resource names, never as a secret.
 

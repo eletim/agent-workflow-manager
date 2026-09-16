@@ -71,7 +71,8 @@ every prompt.
 
 `POST /api/environment-setup/generate` accepts `{"json": "..."}` with an
 `environment-setup` declaration. Required fields are `mode`, `repository`
-(an existing local Git repository), `revision` (an existing `origin` branch),
+(an existing local Git repository), `revision` (an existing `origin` branch or
+tag, or a full local commit SHA),
 `environment_agent` (`codex` or `claude-code`), and `timeout` (1–86400 seconds).
 Optional non-empty strings are `build`, `start`, and `ready_check`. The endpoint
 validates the inputs and returns the normalized configuration and generated
