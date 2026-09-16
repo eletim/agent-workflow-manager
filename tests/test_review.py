@@ -163,6 +163,44 @@ def test_review_generation_api_feeds_ordinary_run(
         runner.close()
 
 
+def test_generated_review_submits_with_identity_and_source_without_stubbed_generator(
+    repositories: tuple[Path, Path], tmp_path: Path
+) -> None:
+    source = declaration(repositories)
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "runs.json"
+    )
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    try:
+        status, generated = request(
+            address,
+            "POST",
+            "/api/review/generate",
+            json.dumps({"json": source}),
+            token=server.request_token,
+        )
+        assert status == 200
+        status, started = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": generated["generatedCode"], "reviewJson": source}),
+            token=server.request_token,
+        )
+        assert status == 202
+        assert started["mode"] == "review"
+        assert started["reviewJson"] == source
+        assert started["code"] == generated["generatedCode"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        runner.close()
+
+
 def test_review_run_binds_code_and_retains_source_in_history(
     repositories: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

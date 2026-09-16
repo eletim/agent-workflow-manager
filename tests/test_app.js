@@ -119,6 +119,7 @@ function snapshot({
   purplemuxPort = 9123,
   issueDrivenJson = undefined,
   environmentSetupJson = undefined,
+  reviewJson = undefined,
   resumedFromRunId = null,
 }) {
   const result = {
@@ -159,6 +160,7 @@ function snapshot({
   if (prompt !== undefined) result.prompt = prompt;
   if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
   if (environmentSetupJson !== undefined) result.environmentSetupJson = environmentSetupJson;
+  if (reviewJson !== undefined) result.reviewJson = reviewJson;
   return result;
 }
 
@@ -225,9 +227,10 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "workflow-mode", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "prompt-fields",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
     "environment-setup-generate", "environment-setup-success", "environment-setup-error",
+    "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
     "repository-config-add", "repository-config-list", "repository-config-message",
@@ -4102,6 +4105,49 @@ test("Environment Setup generates, submits, and restores an ordinary Run", async
     ["/api/validate", {code: generatedCode, args: []}],
     ["/api/dry-run", {code: generatedCode, args: []}],
   ]);
+});
+
+test("Review generation submits source settings through the Run API", async () => {
+  const source = JSON.stringify({mode: "review", repositories: ["/repo"], check: "Inspect errors"});
+  const generatedCode = "print('review')";
+  const calls = [];
+  const running = snapshot({runId: 9, state: "running", stdout: "", mode: "review", code: generatedCode, reviewJson: source});
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/review/generate") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({generatedCode});
+      }
+      if (url === "/api/run") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response(running, 202);
+      }
+      return undefined;
+    },
+  });
+  await elements["review-mode"].dispatch("click");
+  elements["review-json"].value = source;
+  await elements["review-generate"].dispatch("click");
+  assert.equal(elements["review-python"].value, generatedCode);
+  await elements.run.dispatch("click");
+  assert.deepEqual(calls.at(-1), ["/api/run", {code: generatedCode, args: [], reviewJson: source}]);
+  assert.match(elements["active-context"].textContent, /Review Run #9/);
+  assert.equal(elements["review-json"].value, source);
+  assert.equal(elements["review-json"].readOnly, true);
+  assert.equal(elements["workflow-fields"].hidden, true);
+});
+
+test("Review history reopens with Review identity and retained JSON", async () => {
+  const source = '{"mode":"review","repositories":["/repo"],"check":"Inspect errors"}';
+  const run = snapshot({runId: 7, state: "success", stdout: "done", mode: "review", code: "# generated", reviewJson: source});
+  const {elements} = await loadApp({runs: [{runId: 7, state: "success", mode: "review"}], details: {7: run}});
+  assert.match(elements["run-list"].children.find(item => item.dataset.runId === "7").textContent, /Review/);
+  assert.match(elements["active-context"].textContent, /Review Run #7/);
+  assert.equal(elements["review-json"].value, source);
+  assert.equal(elements["review-python"].value, "# generated");
+  assert.equal(elements["review-json"].readOnly, true);
+  assert.equal(elements["workflow-fields"].hidden, true);
 });
 
 test("Environment Setup generation errors clear stale generated Python", async () => {

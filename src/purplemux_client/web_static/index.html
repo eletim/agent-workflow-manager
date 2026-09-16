@@ -37,6 +37,7 @@
         <div class="mode-switch" role="group" aria-label="Execution mode">
           <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
           <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
+          <button id="review-mode" type="button" aria-pressed="false">Review</button>
           <button id="issue-driven-mode" type="button" aria-pressed="false">Issue Driven</button>
           <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Python Workflow</button>
         </div>
@@ -121,6 +122,22 @@
           <p id="environment-setup-success" class="validation-success" hidden>✓ JSON/schema valid</p>
           <p id="environment-setup-error" class="repository-config-message" hidden></p>
           <textarea id="environment-setup-python" spellcheck="false" readonly aria-label="Generated Environment Setup workflow"></textarea>
+        </div>
+
+        <div id="review-fields" hidden>
+          <label for="review-json">Review JSON</label>
+          <textarea id="review-json" spellcheck="false">{
+  "mode": "review",
+  "repositories": ["/path/to/project"],
+  "check": "Review error handling"
+}</textarea>
+          <div class="generated-heading">
+            <label for="review-python">Generated Python (read-only)</label>
+            <button id="review-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="review-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <p id="review-error" class="repository-config-message" hidden></p>
+          <textarea id="review-python" spellcheck="false" readonly aria-label="Generated Review workflow"></textarea>
         </div>
 
         <div id="workflow-fields">
