@@ -188,7 +188,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             },
             False,
             False,
-            None,
+            "agent blocked: service exited after ready check",
         ),
         (
             {
@@ -199,6 +199,16 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
             False,
             False,
             None,
+        ),
+        (
+            {
+                "status": "READY",
+                "summary": "metadata interrupt fails",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "agent interruption failed: cannot stop agent",
         ),
     ],
 )
@@ -241,7 +251,8 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
                 on_busy_timeout("still busy")  # type: ignore[operator]
             if (
                 report is not None
-                and report.get("summary") == "metadata timeout"
+                and report.get("summary")
+                in {"metadata timeout", "metadata interrupt fails"}
                 and self.reads >= 1
             ):
                 raise TimeoutError("endpoint report timed out")
@@ -256,7 +267,7 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
                 and report.get("summary") == "final blocked"
             ):
                 return json.dumps(
-                    {"status": "BLOCKED", "summary": "endpoint unavailable"}
+                    {"status": "BLOCKED", "summary": "service exited after ready check"}
                 )
             if (
                 self.reads > 1
@@ -299,6 +310,11 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
 
         def interrupt(self, tab: str) -> None:
             interrupted.append(tab)
+            if (
+                report is not None
+                and report.get("summary") == "metadata interrupt fails"
+            ):
+                raise RuntimeError("cannot stop agent")
 
     client = Client()
 
@@ -342,7 +358,6 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         result = json.loads(output.getvalue())
         assert result["status"] == "READY"
         if report is not None and report.get("summary") in {
-            "final blocked",
             "metadata timeout",
         }:
             assert result["summary"] == report["summary"]
@@ -388,13 +403,18 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             assert result["attempts"][0]["failed_stage"] == "start"
         if report is not None and report.get("summary") == "final blocked":
             assert result["attempts"][0]["failure"] is None
+            assert result["observed_facts"]["agent_reports"][-1]["status"] == "BLOCKED"
+        if report is not None and report.get("summary") == "metadata interrupt fails":
+            assert "endpoint report timed out" in result["summary"]
+            assert "cannot stop agent" in result["observed_facts"]["error"]
     assert events == [
         ("Environment Setup", "started"),
         ("Environment Setup", "completed" if expected_error is None else "failed"),
     ]
-    metadata_timeout = (
-        report is not None and report.get("summary") == "metadata timeout"
-    )
+    metadata_timeout = report is not None and report.get("summary") in {
+        "metadata timeout",
+        "metadata interrupt fails",
+    }
     assert interrupted == (["tab-1"] if busy_timeout or metadata_timeout else [])
 
 

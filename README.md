@@ -91,8 +91,10 @@ requires a permanent product fix. The start terminal
 remains available for inspection and control. The declared timeout applies to
 preparation, session creation, agent turns, and commands. The workflow records
 observed outcomes and accepts `READY` only when the commands and usability check
-succeed. Uncertain launches are not replayed unless the terminal result confirms
-the command failed. A busy agent is interrupted at timeout.
+succeed and the final service inspection does not report a readiness failure.
+An absent endpoint does not block readiness. Uncertain launches are not replayed
+unless the terminal result confirms the command failed. A busy agent is
+interrupted at timeout.
 The workflow returns one JSON result with `status` (`READY` or `BLOCKED`),
 `summary`, `resolved_revision` (the verified commit SHA when preparation
 succeeds), and `working_path` (the detached worktree when available). It also

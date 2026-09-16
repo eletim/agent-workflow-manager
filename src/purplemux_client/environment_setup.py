@@ -390,22 +390,31 @@ try:
         endpoint_report = ask_agent(
             "The managed commands and usability check succeeded. Inspect their "
             "observed output and the running service when present. Return one "
-            "JSON object with a non-empty summary and endpoint only if you "
-            "observed a usable connection address. An endpoint is optional. "
+            "JSON object with status READY or BLOCKED and a non-empty summary. "
+            "Report BLOCKED if the service is no longer usable. Include endpoint "
+            "only if you observed a usable connection address; no endpoint is "
+            "needed for READY. "
             "Do not infer an address from configuration alone. Command "
             "observations: "
             + json.dumps({{"checks": checks, "verification": verification}}),
             turn_limit=30,
         )
-    except Exception:
+    except Exception as endpoint_error:
         if turn_active:
             try:
                 client.interrupt(tab)
-            except Exception:
-                pass
+            except Exception as interruption:
+                raise RuntimeError(
+                    f"Environment Setup final agent turn failed: {{endpoint_error}}; "
+                    f"agent interruption failed: {{interruption}}"
+                ) from interruption
             turn_active = False
     else:
         agent_reports.append(endpoint_report)
+        if endpoint_report.get("status") == "BLOCKED":
+            raise RuntimeError(
+                f"Environment Setup agent blocked: {{endpoint_report['summary']}}"
+            )
     result = {{
         "status": "READY",
         "summary": report["summary"],
