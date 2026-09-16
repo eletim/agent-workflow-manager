@@ -300,12 +300,11 @@ def execute_environment_setup_commands(
     ):
         service = _service_outcome(client, service_tab, start)
         checks["start"] = service
-        if service.get("running") is False and (
-            failed_stage == "ready_check"
-            or service.get("error")
-            or service.get("exit_code") != 0
-        ):
-            failure = f"Environment Setup start failed: {service}"
+        if service.get("running") is False:
+            failure = (
+                "Environment Setup start terminal exited; the ready check cannot "
+                f"establish that the prepared service started: {service}"
+            )
             failed_stage = "start"
         elif service.get("error"):
             failure = f"Environment Setup start observation failed: {service}"

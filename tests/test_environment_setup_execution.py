@@ -277,13 +277,32 @@ def test_unresolved_launch_stops_without_replay(tmp_path: Path, stage: str) -> N
         assert observation["service_tab"] == "tab-1"
 
 
-def test_uncertain_start_launch_with_completed_result_continues(tmp_path: Path) -> None:
+def test_uncertain_start_launch_with_completed_result_remains_unverified(
+    tmp_path: Path,
+) -> None:
     client = ManagedClient({"start": [0], "ready": [0]})
     client.launch_error = "start"
     client.launch_uncertain = True
     attempt = execute(client, tmp_path, start="start", ready_check="ready")
-    assert attempt["failure"] is None
+    assert attempt["failed_stage"] == "start"
+    assert "start terminal exited" in attempt["failure"]
+    assert attempt["verification"]["exit_code"] == 0
     assert [request.command for request in client.requests] == ["start", "ready"]
+
+
+def test_exited_background_start_cannot_claim_existing_service(tmp_path: Path) -> None:
+    class PortConflictClient(ManagedClient):
+        def capture_screen(self, tab: str) -> str:
+            if tab == "tab-1":
+                return "child failed to bind port: address already in use"
+            return "pre-existing service answered ready check"
+
+    client = PortConflictClient({"serve &": [0], "ready": [0]})
+    attempt = execute(client, tmp_path, start="serve &", ready_check="ready")
+    assert attempt["failed_stage"] == "start"
+    assert attempt["checks"]["start"]["exit_code"] == 0
+    assert "address already in use" in attempt["failure"]
+    assert attempt["verification"]["exit_code"] == 0
 
 
 def test_command_deadline_interrupts_managed_terminal(tmp_path: Path) -> None:

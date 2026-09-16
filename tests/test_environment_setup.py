@@ -193,6 +193,16 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
         (
             {
                 "status": "READY",
+                "summary": "background start",
+                "verification_command": "printf usable; test -d .",
+            },
+            False,
+            False,
+            "agent blocked: cannot confirm service",
+        ),
+        (
+            {
+                "status": "READY",
                 "summary": "final blocked",
                 "verification_command": "printf usable; test -d .",
             },
@@ -291,6 +301,14 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
 
         def read_result(self, _tab: str) -> str:
             self.reads += 1
+            if (
+                self.reads > 1
+                and report is not None
+                and report.get("summary") == "background start"
+            ):
+                return json.dumps(
+                    {"status": "BLOCKED", "summary": "cannot confirm service"}
+                )
             if (
                 self.reads > 1
                 and report is not None
@@ -397,7 +415,8 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             1 if late_completion else 120,
             build="printf built",
             start="serve"
-            if report is not None and report.get("summary") == "start interrupted"
+            if report is not None
+            and report.get("summary") in {"start interrupted", "background start"}
             else None,
             ready_check="test -f file"
             if report is not None and report.get("summary") == "initial blocked"
@@ -470,6 +489,10 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
             assert result["process"]["tab_id"] == "shell-2"
             assert result["service_tab"] == "shell-2"
             assert result["attempts"][0]["failed_stage"] == "start"
+        if report is not None and report.get("summary") == "background start":
+            assert result["checks"]["start"]["exit_code"] == 0
+            assert result["verification"]["exit_code"] == 0
+            assert "start terminal exited" in result["attempts"][0]["failure"]
         if report is not None and report.get("summary") == "final blocked":
             assert result["attempts"][0]["failure"] is None
             assert result["observed_facts"]["agent_reports"][-1]["status"] == "BLOCKED"
