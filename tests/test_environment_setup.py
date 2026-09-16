@@ -140,6 +140,7 @@ def test_omitted_commands_are_not_in_generated_prompt() -> None:
                 "checks": {"build": "passed"},
                 "verification": "service responded successfully",
                 "verification_command": "printf usable; test -d .",
+                "endpoint": "http://127.0.0.1:8000/health",
                 "resolved_revision": "unverified",
                 "working_path": "/wrong/path",
             },
@@ -287,7 +288,10 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         assert result["status"] == "READY"
         assert result["resolved_revision"] == "a" * 40
         assert result["working_path"] == str(tmp_path)
-        assert result["connection"] == {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        expected_connection = {"workspace_id": "ws-1", "agent_tab_id": "tab-1"}
+        if report is not None and "endpoint" in report:
+            expected_connection["endpoint"] = report["endpoint"]
+        assert result["connection"] == expected_connection
         assert result["process"] is None
         assert result["execution_summary"]
         assert result["readiness_summary"]
@@ -296,9 +300,10 @@ def test_generated_workflow_fails_on_failed_command_or_busy_timeout(
         assert result["verification"]["output"] == f"observed shell-{2 + offset}"
         assert len(result["attempts"]) == 1 + offset
         if offset:
-            assert client.reads == 2
+            assert client.reads == 3
             assert "Environment Setup build failed" in client.prompts[1]
             assert "temporary environment or setup changes" in client.prompts[1]
+        assert "observed a usable connection address" in client.prompts[-1]
     else:
         with redirect_stdout(output):
             exec(compile(code, "<environment-setup>", "exec"), {})

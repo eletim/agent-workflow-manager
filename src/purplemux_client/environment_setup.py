@@ -134,7 +134,9 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
             "Return only one JSON object with status READY or BLOCKED, a non-empty "
             "summary, and verification_command when required. READY means "
             "preparation is complete; the workflow will decide final readiness "
-            "from observed command outcomes. Include errors in a BLOCKED summary.",
+            "from observed command outcomes. Include an endpoint only if you "
+            "have observed a usable connection address. Include errors in a "
+            "BLOCKED summary.",
         )
     )
     prompt = "\n".join(instructions)
@@ -194,6 +196,7 @@ verification = None
 service_tab = None
 attempts = []
 agent_reports = []
+report = None
 result = None
 try:
     deadline = time.monotonic() + {config.timeout}
@@ -250,8 +253,9 @@ try:
             "requires a permanent product fix or the environment cannot be "
             "repaired. Do not change product code to conceal a product failure. "
             "Return one JSON object "
-            "with status, non-empty summary, and verification_command if no "
-            "ready_check was supplied. Failure observations: "
+            "with status, non-empty summary, verification_command if no "
+            "ready_check was supplied, and endpoint only if you observed a "
+            "usable connection address. Failure observations: "
             + json.dumps(attempt)
         )
         report = ask_agent(recovery_prompt)
@@ -259,6 +263,18 @@ try:
         if report.get("status") != "READY":
             raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}; {{attempt['failure']}}")
         resume_at = attempt["failed_stage"]
+    remaining()
+    report = ask_agent(
+        "The managed commands and usability check succeeded. Inspect their "
+        "observed output and the running service when present. Return one JSON "
+        "object with status READY, a non-empty summary, and endpoint only if "
+        "you observed a usable connection address. Do not infer an address "
+        "from configuration alone. Command observations: "
+        + json.dumps({{"checks": checks, "verification": verification}})
+    )
+    agent_reports.append(report)
+    if report.get("status") != "READY":
+        raise RuntimeError(f"Environment Setup agent blocked: {{report['summary']}}")
     remaining()
     result = {{
         "status": "READY",
@@ -306,5 +322,10 @@ result.update({{
     "verification": verification,
     "attempts": attempts,
 }})
+last_report = agent_reports[-1] if agent_reports else None
+if last_report is not None:
+    endpoint = last_report.get("endpoint")
+    if isinstance(endpoint, str) and endpoint.strip():
+        result["connection"]["endpoint"] = endpoint.strip()
 print(json.dumps(result))
 """

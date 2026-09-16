@@ -96,7 +96,8 @@ the command failed. A busy agent is interrupted at timeout.
 The workflow returns one JSON result with `status` (`READY` or `BLOCKED`),
 `summary`, `resolved_revision` (the verified commit SHA when preparation
 succeeds), and `working_path` (the detached worktree when available). It also
-includes `connection` with workspace and agent tab IDs, `process` with the
+includes `connection` with workspace and agent tab IDs and an observed
+`endpoint` when available, `process` with the
 observed start process outcome, `checks`, `verification`, `attempts`, and
 execution and readiness summaries. A `BLOCKED` result includes
 `observed_facts` with the error and agent reports, so a later Python Workflow
