@@ -149,6 +149,35 @@ def test_failed_ready_check_retains_service_for_recovery(tmp_path: Path) -> None
     ]
 
 
+def test_failed_ready_check_restarts_exited_service(tmp_path: Path) -> None:
+    class ExitingServiceClient(ManagedClient):
+        def read_shell_result(self, tab: str) -> ShellResult:
+            if tab == "tab-1" and len(self.requests) >= 2:
+                self.results[tab] = 2
+            return super().read_shell_result(tab)
+
+    client = ExitingServiceClient({"start": [None, None], "ready": [1, 0]})
+    failed = execute(client, tmp_path, start="start", ready_check="ready")
+    assert failed["failed_stage"] == "start"
+    assert failed["verification"]["exit_code"] == 1
+    assert failed["checks"]["start"]["exit_code"] == 2
+    recovered = execute(
+        client,
+        tmp_path,
+        start="start",
+        ready_check="ready",
+        resume_at=failed["failed_stage"],
+        service_tab=failed["service_tab"],
+    )
+    assert recovered["failure"] is None
+    assert [request.command for request in client.requests] == [
+        "start",
+        "ready",
+        "start",
+        "ready",
+    ]
+
+
 def test_service_failure_is_observable(tmp_path: Path) -> None:
     client = ManagedClient({"start": [2], "ready": [0]})
     failed = execute(client, tmp_path, start="start", ready_check="ready")

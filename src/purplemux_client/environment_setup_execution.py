@@ -231,7 +231,11 @@ def execute_environment_setup_commands(
             failure = f"Environment Setup {stage} failed: {outcome}"
             failed_stage = stage
             break
-    if failure is None and service_tab is not None and start is not None:
+    if (
+        service_tab is not None
+        and start is not None
+        and (failure is None or failed_stage == "ready_check")
+    ):
         service = _service_outcome(client, service_tab, start)
         checks["start"] = service
         if service.get("error") or service.get("exit_code") not in (None, 0):

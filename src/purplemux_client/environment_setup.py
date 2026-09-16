@@ -114,7 +114,9 @@ def generate_environment_setup_workflow(config: EnvironmentSetupInput) -> str:
         "each supplied build, start, and ready_check command exactly as given, "
         "in that order, before considering any alternative. Do not run or "
         "substitute these commands yourself. Skip instructions that were omitted. "
-        "Report BLOCKED if the environment cannot be prepared.",
+        "You may make temporary setup changes in the execution directory. "
+        "Report BLOCKED if readiness requires a permanent product fix or "
+        "the environment cannot be prepared.",
     ]
     for label, command in (
         ("Build", config.build),
@@ -230,11 +232,15 @@ try:
             verification = attempt["verification"]
             break
         recovery_prompt = (
-            "The supplied command failed after its required first attempt. "
-            "Inspect the repository, README, scripts, configuration, and the "
-            "managed terminal logs. Repair the environment, then report READY "
-            "so the workflow can retry the failed command within the timeout; "
-            "report BLOCKED if repair is impossible. Return one JSON object "
+            "Execution failed or readiness was not reached after the required "
+            "first attempt. Inspect repository files and managed terminal logs, "
+            "including the failed command output and the start terminal if present. "
+            "Make necessary temporary environment or setup changes in the "
+            "execution directory, then report READY so the workflow can retry "
+            "the failed stage within the timeout. Report BLOCKED if readiness "
+            "requires a permanent product fix or the environment cannot be "
+            "repaired. Do not change product code to conceal a product failure. "
+            "Return one JSON object "
             "with status, non-empty summary, and verification_command if no "
             "ready_check was supplied. Failure observations: "
             + json.dumps(attempt)
