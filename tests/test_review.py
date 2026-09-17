@@ -907,6 +907,12 @@ def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -
     assert sibling_index.read_bytes() != sibling_before
     assert snapshot_review_repositories((str(linked),)) == baseline
 
+    subprocess.run(
+        ["git", "-C", str(sibling), "update-index", "--split-index"], check=True
+    )
+    assert list(sibling_index.parent.glob("sharedindex.*"))
+    assert snapshot_review_repositories((str(linked),)) == baseline
+
     (linked / "tracked.txt").write_text("changed")
     assert snapshot_review_repositories((str(linked),)) != baseline
     (linked / "tracked.txt").write_text("original")
@@ -1170,6 +1176,50 @@ def test_review_monitor_accepts_index_replacement_events(
             ),
         )
         monitor.assert_unchanged()
+    finally:
+        monitor.close()
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("location", ["common", "sibling", "worktree"])
+def test_review_monitor_handles_sharedindex_housekeeping(
+    tmp_path: Path, location: str
+) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+    monitor = object.__new__(ReviewWriteMonitor)
+    monitor._fd = read_fd
+    monitor._repositories = (str(tmp_path),)
+    parent = (
+        tmp_path / "worktrees" / "sibling"
+        if location == "sibling"
+        else tmp_path / location
+    )
+    name = b"sharedindex.0123456789abcdef\0"
+    monitor._paths = {1: parent, 2: parent / name[:-1].decode()}
+    monitor._owners = {1: {str(tmp_path)}, 2: {str(tmp_path)}}
+    monitor._git_dirs = {tmp_path / "common", tmp_path}
+    try:
+        events = (
+            (1, 0x100, name),
+            (1, 0x002, name),
+            (1, 0x008, name),
+            (1, 0x200, name),
+            (2, 0x400, b""),
+            (2, 0x8000, b""),
+        )
+        os.write(
+            write_fd,
+            b"".join(
+                struct.pack("iIII", descriptor, mask, 0, len(event_name))
+                + event_name
+                for descriptor, mask, event_name in events
+            ),
+        )
+        if location == "worktree":
+            with pytest.raises(RuntimeError, match="Review repository change detected"):
+                monitor.assert_unchanged()
+        else:
+            monitor.assert_unchanged()
     finally:
         monitor.close()
         os.close(write_fd)

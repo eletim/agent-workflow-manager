@@ -258,8 +258,11 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                         continue
                     if (
                         git_admin
-                        and path.parent == root
                         and name.startswith("sharedindex.")
+                        and (
+                            path.parent == root
+                            or path.parent.parent == common_dir / "worktrees"
+                        )
                     ):
                         continue
                     entry(path, path.relative_to(root))
@@ -447,7 +450,10 @@ class ReviewWriteMonitor:
                 parent = self._paths.get(descriptor)
                 event_path = parent / os.fsdecode(name) if parent and name else parent
                 if event_path is not None and (
-                    event_path.name == "index"
+                    (
+                        event_path.name == "index"
+                        or event_path.name.startswith("sharedindex.")
+                    )
                     and (
                         event_path.parent in self._git_dirs
                         or event_path.parent.parent.parent in self._git_dirs
@@ -455,7 +461,7 @@ class ReviewWriteMonitor:
                     )
                 ):
                     # The final snapshot checks semantic index state. Git may
-                    # replace its index just to refresh cached file metadata.
+                    # rewrite index storage just to refresh cached file metadata.
                     continue
                 key = (descriptor, name)
                 git_lock = (
