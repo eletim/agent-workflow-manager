@@ -780,6 +780,21 @@ def test_review_snapshot_ignores_index_refresh_but_detects_index_state(
     assert snapshot_review_repositories((str(repository),)) != baseline
 
 
+def test_review_snapshot_detects_intent_to_add_for_empty_file(
+    repositories: tuple[Path, Path],
+) -> None:
+    repository = repositories[0]
+    (repository / "empty.txt").touch()
+    subprocess.run(["git", "-C", str(repository), "add", "empty.txt"], check=True)
+    baseline = snapshot_review_repositories((str(repository),))
+    subprocess.run(
+        ["git", "-C", str(repository), "reset", "-q", "--", "empty.txt"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repository), "add", "-N", "empty.txt"], check=True)
+    assert snapshot_review_repositories((str(repository),)) != baseline
+
+
 def test_review_snapshot_covers_linked_worktree_git_config(tmp_path: Path) -> None:
     repository = tmp_path / "source"
     linked = tmp_path / "linked"
@@ -872,6 +887,7 @@ def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -
         check=True,
     )
     os.utime(linked / "tracked.txt", ns=(1_000_000_000, 1_000_000_000))
+    os.utime(sibling / "tracked.txt", ns=(1_000_000_000, 1_000_000_000))
     baseline = snapshot_review_repositories((str(linked),))
     git_dir = Path(
         subprocess.run(
@@ -884,6 +900,11 @@ def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -
     before = (git_dir / "index").read_bytes()
     subprocess.run(["git", "-C", str(linked), "status", "--short"], check=True)
     assert (git_dir / "index").read_bytes() != before
+    assert snapshot_review_repositories((str(linked),)) == baseline
+    sibling_index = repository / ".git" / "worktrees" / sibling.name / "index"
+    sibling_before = sibling_index.read_bytes()
+    subprocess.run(["git", "-C", str(sibling), "status", "--short"], check=True)
+    assert sibling_index.read_bytes() != sibling_before
     assert snapshot_review_repositories((str(linked),)) == baseline
 
     (linked / "tracked.txt").write_text("changed")

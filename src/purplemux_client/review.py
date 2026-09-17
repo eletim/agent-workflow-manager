@@ -206,6 +206,7 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
     snapshots = []
     for repository in repositories:
         digest = hashlib.sha256()
+        index_paths: set[Path] = set()
 
         def field(target: Any, value: bytes) -> None:
             target.update(len(value).to_bytes(8, "big"))
@@ -245,9 +246,20 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                 directories.sort()
                 for name in sorted(directories + files):
                     path = Path(current) / name
-                    if git_admin and (
-                        path == git_dir / "index"
-                        or (path.parent == root and name.startswith("sharedindex."))
+                    if (
+                        git_admin
+                        and name == "index"
+                        and (
+                            path.parent in (git_dir, common_dir)
+                            or path.parent.parent == common_dir / "worktrees"
+                        )
+                    ):
+                        index_paths.add(path)
+                        continue
+                    if (
+                        git_admin
+                        and path.parent == root
+                        and name.startswith("sharedindex.")
                     ):
                         continue
                     entry(path, path.relative_to(root))
@@ -256,8 +268,6 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
             ("rev-parse", "HEAD"),
             ("symbolic-ref", "-q", "HEAD"),
             ("show-ref",),
-            ("ls-files", "-v", "--stage", "-z"),
-            ("ls-files", "--resolve-undo", "-z"),
             ("config", "--local", "--list", "--null", "--show-origin"),
             ("rev-parse", "--git-dir"),
             ("rev-parse", "--git-common-dir"),
@@ -272,8 +282,6 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
             field(digest, str(result.returncode).encode())
             field(digest, result.stdout)
             if result.returncode and args in (
-                ("ls-files", "-v", "--stage", "-z"),
-                ("ls-files", "--resolve-undo", "-z"),
                 ("config", "--local", "--list", "--null", "--show-origin"),
                 ("rev-parse", "--git-dir"),
                 ("rev-parse", "--git-common-dir"),
@@ -294,6 +302,27 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
         for admin_dir in dict.fromkeys((git_dir, common_dir)):
             field(digest, os.fsencode(admin_dir))
             tree(admin_dir, git_admin=True)
+        for index_path in sorted(index_paths):
+            field(digest, os.fsencode(index_path))
+            for args in (
+                ("ls-files", "-v", "--stage", "-z"),
+                ("ls-files", "--resolve-undo", "-z"),
+                ("diff", "--cached", "--raw", "-z", "--no-ext-diff"),
+            ):
+                result = subprocess.run(
+                    ["git", f"--git-dir={index_path.parent}", *args],
+                    env={**os.environ, "GIT_INDEX_FILE": str(index_path)},
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError(
+                        f"Could not inspect Git index {index_path}: "
+                        f"{result.stderr.decode(errors='replace')}"
+                    )
+                field(digest, b" ".join(part.encode() for part in args))
+                field(digest, result.stdout)
         snapshots.append(digest.hexdigest())
     return tuple(snapshots)
 

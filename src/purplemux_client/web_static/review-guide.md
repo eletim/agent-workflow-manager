@@ -50,9 +50,9 @@ in monitored paths. It exempts Git index refresh operations because read-only
 inspection can update cached metadata; an index change reverted before the
 final fingerprint is not detected. The final fingerprint covers tracked,
 ignored, and untracked files plus meaningful Git state, including staged
-entries, refs, config, and Git objects in linked worktrees. It tolerates index
-metadata refreshes caused by read-only Git inspection. A detected write or
-changed fingerprint fails the Run
+entries, intent-to-add state, refs, config, and Git objects across linked
+worktrees. It tolerates index metadata refreshes in those worktrees caused by
+read-only Git inspection. A detected write or changed fingerprint fails the Run
 instead of producing a trustworthy Review verdict. Review fails closed if write
 monitoring is unavailable.
 
