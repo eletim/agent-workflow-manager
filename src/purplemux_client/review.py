@@ -233,7 +233,9 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
         def fail_walk(error: OSError) -> None:
             raise error
 
-        def tree(root: Path, *, exclude_git: bool = False) -> None:
+        def tree(
+            root: Path, *, exclude_git: bool = False, git_admin: bool = False
+        ) -> None:
             for current, directories, files in os.walk(
                 root, followlinks=False, onerror=fail_walk
             ):
@@ -243,13 +245,25 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                 directories.sort()
                 for name in sorted(directories + files):
                     path = Path(current) / name
+                    if git_admin and (
+                        (
+                            name == "index"
+                            and (
+                                path.parent == root
+                                or path.parent.parent == root / "worktrees"
+                            )
+                        )
+                        or (path.parent == root and name.startswith("sharedindex."))
+                    ):
+                        continue
                     entry(path, path.relative_to(root))
 
         for args in (
             ("rev-parse", "HEAD"),
             ("symbolic-ref", "-q", "HEAD"),
             ("show-ref",),
-            ("ls-files", "--stage", "-z"),
+            ("ls-files", "-v", "--stage", "-z"),
+            ("ls-files", "--resolve-undo", "-z"),
             ("config", "--local", "--list", "--null", "--show-origin"),
             ("rev-parse", "--git-dir"),
             ("rev-parse", "--git-common-dir"),
@@ -264,7 +278,8 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
             field(digest, str(result.returncode).encode())
             field(digest, result.stdout)
             if result.returncode and args in (
-                ("ls-files", "--stage", "-z"),
+                ("ls-files", "-v", "--stage", "-z"),
+                ("ls-files", "--resolve-undo", "-z"),
                 ("config", "--local", "--list", "--null", "--show-origin"),
                 ("rev-parse", "--git-dir"),
                 ("rev-parse", "--git-common-dir"),
@@ -284,7 +299,7 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
         tree(Path(repository), exclude_git=True)
         for admin_dir in dict.fromkeys((git_dir, common_dir)):
             field(digest, os.fsencode(admin_dir))
-            tree(admin_dir)
+            tree(admin_dir, git_admin=True)
         snapshots.append(digest.hexdigest())
     return tuple(snapshots)
 
@@ -407,6 +422,18 @@ class ReviewWriteMonitor:
                 name = events[offset : offset + length].split(b"\0", 1)[0]
                 offset += length
                 parent = self._paths.get(descriptor)
+                event_path = parent / os.fsdecode(name) if parent and name else parent
+                if event_path is not None and (
+                    event_path.name == "index"
+                    and (
+                        event_path.parent in self._git_dirs
+                        or event_path.parent.parent.parent in self._git_dirs
+                        and event_path.parent.parent.name == "worktrees"
+                    )
+                ):
+                    # The final snapshot checks semantic index state. Git may
+                    # replace its index just to refresh cached file metadata.
+                    continue
                 key = (descriptor, name)
                 git_lock = (
                     parent is not None
@@ -419,6 +446,9 @@ class ReviewWriteMonitor:
                 if git_lock and mask in (0x002, 0x008) and key in pending_locks:
                     continue
                 if git_lock and mask == self._DELETE and key in pending_locks:
+                    pending_locks.remove(key)
+                    continue
+                if git_lock and mask == 0x040 and key in pending_locks:
                     pending_locks.remove(key)
                     continue
                 changed = sorted(self._owners.get(descriptor, self._repositories))

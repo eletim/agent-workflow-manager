@@ -751,6 +751,35 @@ def test_review_snapshot_separates_file_records_and_covers_git_config(
     assert snapshot_review_repositories(paths)[0] != baseline[0]
 
 
+def test_review_snapshot_ignores_index_refresh_but_detects_index_state(
+    repositories: tuple[Path, Path],
+) -> None:
+    repository = repositories[0]
+    tracked = repository / "tracked.txt"
+    tracked.write_text("original")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    os.utime(tracked, ns=(1_000_000_000, 1_000_000_000))
+    baseline = snapshot_review_repositories((str(repository),))
+    index = repository / ".git" / "index"
+    before = index.read_bytes()
+    subprocess.run(["git", "-C", str(repository), "status", "--short"], check=True)
+    assert index.read_bytes() != before
+    assert snapshot_review_repositories((str(repository),)) == baseline
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "update-index",
+            "--assume-unchanged",
+            "tracked.txt",
+        ],
+        check=True,
+    )
+    assert snapshot_review_repositories((str(repository),)) != baseline
+
+
 def test_review_snapshot_covers_linked_worktree_git_config(tmp_path: Path) -> None:
     repository = tmp_path / "source"
     linked = tmp_path / "linked"
@@ -790,6 +819,60 @@ def test_review_snapshot_covers_linked_worktree_git_config(tmp_path: Path) -> No
         ["git", "-C", str(linked), "config", "--local", "review.test", "enabled"],
         check=True,
     )
+    assert snapshot_review_repositories((str(linked),)) != baseline
+
+
+def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -> None:
+    repository = tmp_path / "source"
+    linked = tmp_path / "linked"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    (repository / "tracked.txt").write_text("original")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Review Test",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            str(linked),
+        ],
+        check=True,
+    )
+    os.utime(linked / "tracked.txt", ns=(1_000_000_000, 1_000_000_000))
+    baseline = snapshot_review_repositories((str(linked),))
+    git_dir = Path(
+        subprocess.run(
+            ["git", "-C", str(linked), "rev-parse", "--absolute-git-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    before = (git_dir / "index").read_bytes()
+    subprocess.run(["git", "-C", str(linked), "status", "--short"], check=True)
+    assert (git_dir / "index").read_bytes() != before
+    assert snapshot_review_repositories((str(linked),)) == baseline
+
+    (linked / "tracked.txt").write_text("changed")
     assert snapshot_review_repositories((str(linked),)) != baseline
 
 
@@ -882,6 +965,24 @@ def test_review_monitor_ignores_transient_git_lock(
         monitor.close()
 
 
+def test_review_monitor_allows_index_metadata_refresh(
+    repositories: tuple[Path, Path],
+) -> None:
+    repository = repositories[0]
+    tracked = repository / "tracked.txt"
+    tracked.write_text("original")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    os.utime(tracked, ns=(1_000_000_000, 1_000_000_000))
+    baseline = snapshot_review_repositories((str(repository),))
+    monitor = ReviewWriteMonitor((str(repository),))
+    try:
+        subprocess.run(["git", "-C", str(repository), "status", "--short"], check=True)
+        monitor.assert_unchanged()
+        assert snapshot_review_repositories((str(repository),)) == baseline
+    finally:
+        monitor.close()
+
+
 @pytest.mark.parametrize("change", ["write", "create_delete", "move", "git_lock_move"])
 def test_review_monitor_detects_real_changes_even_when_restored(
     repositories: tuple[Path, Path], change: str
@@ -903,9 +1004,9 @@ def test_review_monitor_detects_real_changes_even_when_restored(
             original.rename(moved)
             moved.rename(original)
         else:
-            lock = repository / ".git" / "index.lock"
-            lock.write_text("new index")
-            lock.rename(repository / ".git" / "index")
+            lock = repository / ".git" / "config.lock"
+            lock.write_text("new config")
+            lock.rename(repository / ".git" / "config")
         with pytest.raises(RuntimeError, match="Review repository change detected"):
             monitor.assert_unchanged()
     finally:
@@ -956,6 +1057,36 @@ def test_review_monitor_accepts_paired_git_lock_events(tmp_path: Path) -> None:
             b"".join(
                 struct.pack("iIII", 1, mask, 0, len(name)) + name
                 for mask in (0x100, 0x002, 0x008, 0x200)
+            ),
+        )
+        monitor.assert_unchanged()
+    finally:
+        monitor.close()
+        os.close(write_fd)
+
+
+def test_review_monitor_accepts_index_replacement_events(tmp_path: Path) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+    monitor = object.__new__(ReviewWriteMonitor)
+    monitor._fd = read_fd
+    monitor._repositories = (str(tmp_path),)
+    monitor._paths = {1: tmp_path, 2: tmp_path / "index"}
+    monitor._owners = {1: {str(tmp_path)}, 2: {str(tmp_path)}}
+    monitor._git_dirs = {tmp_path}
+    try:
+        events = (
+            (1, 0x100, b"index.lock\0"),
+            (1, 0x008, b"index.lock\0"),
+            (1, 0x040, b"index.lock\0"),
+            (1, 0x080, b"index\0"),
+            (2, 0x400, b""),
+            (2, 0x8000, b""),
+        )
+        os.write(
+            write_fd,
+            b"".join(
+                struct.pack("iIII", descriptor, mask, 0, len(name)) + name
+                for descriptor, mask, name in events
             ),
         )
         monitor.assert_unchanged()
