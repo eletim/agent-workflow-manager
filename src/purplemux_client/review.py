@@ -292,7 +292,10 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
 class ReviewWriteMonitor:
     """Record filesystem writes during a Review, including restored writes."""
 
-    _WRITE_EVENTS = 0x002 | 0x004 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+    _WRITE_EVENTS = 0x002 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+    _EVENT = struct.Struct("iIII")
+    _CREATE = 0x100
+    _DELETE = 0x200
 
     def __init__(self, repositories: tuple[str, ...]) -> None:
         if sys.platform != "linux":
@@ -300,15 +303,23 @@ class ReviewWriteMonitor:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.inotify_init1.argtypes = [ctypes.c_int]
         libc.inotify_init1.restype = ctypes.c_int
-        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+        ]
         libc.inotify_add_watch.restype = ctypes.c_int
         self._libc = libc
         self._fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
         if self._fd < 0:
-            raise OSError(ctypes.get_errno(), "Could not start Review repository write monitor")
+            raise OSError(
+                ctypes.get_errno(), "Could not start Review repository write monitor"
+            )
         self._watched: dict[Path, int] = {}
+        self._paths: dict[int, Path] = {}
         self._owners: dict[int, set[str]] = {}
         self._repositories = repositories
+        self._git_dirs: set[Path] = set()
 
         def fail_walk(error: OSError) -> None:
             raise error
@@ -325,19 +336,24 @@ class ReviewWriteMonitor:
                         check=True,
                     )
                     roots.append((Path(repository) / result.stdout.strip()).resolve())
+                self._git_dirs.update(roots[1:])
                 for root in roots:
                     if not root.is_dir():
-                        raise RuntimeError(f"Could not watch Review repository path {root}")
+                        raise RuntimeError(
+                            f"Could not watch Review repository path {root}"
+                        )
                     for current, directories, files in os.walk(
                         root, followlinks=False, onerror=fail_walk
                     ):
                         directories[:] = [
-                            name for name in directories
+                            name
+                            for name in directories
                             if not (Path(current) / name).is_symlink()
                         ]
                         candidates = [Path(current)]
                         candidates.extend(
-                            Path(current) / name for name in files
+                            Path(current) / name
+                            for name in files
                             if not (Path(current) / name).is_symlink()
                         )
                         for candidate in candidates:
@@ -345,30 +361,76 @@ class ReviewWriteMonitor:
                             descriptor = self._watched.get(path)
                             if descriptor is None:
                                 descriptor = libc.inotify_add_watch(
-                                    self._fd, os.fsencode(path),
+                                    self._fd,
+                                    os.fsencode(path),
                                     self._WRITE_EVENTS | 0x02000000,  # IN_DONT_FOLLOW
                                 )
                                 if descriptor < 0:
                                     raise OSError(
-                                        ctypes.get_errno(), f"Could not watch Review repository path {path}"
+                                        ctypes.get_errno(),
+                                        f"Could not watch Review repository path {path}",
                                     )
                                 self._watched[path] = descriptor
+                                self._paths[descriptor] = path
                             self._owners.setdefault(descriptor, set()).add(repository)
         except BaseException:
             self.close()
             raise
 
     def assert_unchanged(self) -> None:
-        try:
-            events = os.read(self._fd, 65536)
-        except BlockingIOError as exc:
-            if exc.errno == errno.EAGAIN:
-                return
-            raise
-        if events:
-            descriptor = struct.unpack_from("i", events)[0]
-            changed = sorted(self._owners.get(descriptor, self._repositories))
-            raise RuntimeError("Review repository change detected during observation: " + json.dumps(changed))
+        pending_locks: set[tuple[int, bytes]] = set()
+        while True:
+            try:
+                events = os.read(self._fd, 65536)
+            except BlockingIOError as exc:
+                if exc.errno == errno.EAGAIN:
+                    break
+                raise
+            if not events:
+                raise RuntimeError(
+                    "Review repository write monitor closed unexpectedly"
+                )
+            offset = 0
+            while offset < len(events):
+                if len(events) - offset < self._EVENT.size:
+                    raise RuntimeError(
+                        "Review repository write monitor received a truncated event"
+                    )
+                descriptor, mask, _cookie, length = self._EVENT.unpack_from(
+                    events, offset
+                )
+                offset += self._EVENT.size
+                if length > len(events) - offset:
+                    raise RuntimeError(
+                        "Review repository write monitor received a truncated event"
+                    )
+                name = events[offset : offset + length].split(b"\0", 1)[0]
+                offset += length
+                parent = self._paths.get(descriptor)
+                key = (descriptor, name)
+                git_lock = (
+                    parent is not None
+                    and name.endswith(b".lock")
+                    and parent in self._git_dirs
+                )
+                if git_lock and mask == self._CREATE and key not in pending_locks:
+                    pending_locks.add(key)
+                    continue
+                if git_lock and mask in (0x002, 0x008) and key in pending_locks:
+                    continue
+                if git_lock and mask == self._DELETE and key in pending_locks:
+                    pending_locks.remove(key)
+                    continue
+                changed = sorted(self._owners.get(descriptor, self._repositories))
+                raise RuntimeError(
+                    "Review repository change detected during observation: "
+                    + json.dumps(changed)
+                )
+        if pending_locks:
+            raise RuntimeError(
+                "Review repository change detected during observation: "
+                + json.dumps(sorted(self._repositories))
+            )
 
     def close(self) -> None:
         if self._fd >= 0:

@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import stat
+import struct
 import subprocess
 import threading
 from contextlib import redirect_stdout
@@ -852,6 +853,115 @@ def test_review_monitor_detects_restored_write_through_external_hard_link(
             monitor.assert_unchanged()
     finally:
         monitor.close()
+
+
+def test_review_monitor_ignores_attribute_only_event(
+    repositories: tuple[Path, Path],
+) -> None:
+    path = repositories[0] / "existing.txt"
+    path.write_text("original")
+    monitor = ReviewWriteMonitor((str(repositories[0]),))
+    try:
+        os.utime(path, None)
+        monitor.assert_unchanged()
+    finally:
+        monitor.close()
+
+
+def test_review_monitor_ignores_transient_git_lock(
+    repositories: tuple[Path, Path],
+) -> None:
+    repository = repositories[0]
+    lock = repository / ".git" / "index.lock"
+    monitor = ReviewWriteMonitor((str(repository),))
+    try:
+        lock.write_text("temporary Git inspection state")
+        lock.unlink()
+        monitor.assert_unchanged()
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize("change", ["write", "create_delete", "move", "git_lock_move"])
+def test_review_monitor_detects_real_changes_even_when_restored(
+    repositories: tuple[Path, Path], change: str
+) -> None:
+    repository = repositories[0]
+    original = repository / "existing.txt"
+    original.write_text("original")
+    monitor = ReviewWriteMonitor((str(repository),))
+    try:
+        if change == "write":
+            original.write_text("changed")
+            original.write_text("original")
+        elif change == "create_delete":
+            temporary = repository / "temporary.txt"
+            temporary.write_text("new")
+            temporary.unlink()
+        elif change == "move":
+            moved = repository / "moved.txt"
+            original.rename(moved)
+            moved.rename(original)
+        else:
+            lock = repository / ".git" / "index.lock"
+            lock.write_text("new index")
+            lock.rename(repository / ".git" / "index")
+        with pytest.raises(RuntimeError, match="Review repository change detected"):
+            monitor.assert_unchanged()
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize(
+    "mask,name",
+    [
+        (0x4000, b""),  # IN_Q_OVERFLOW
+        (0x8000, b""),  # IN_IGNORED
+        (0x100, b"index.lock"),  # Unpaired lock creation
+        (0x002, b""),  # Content write
+        (0x100, b"file.txt"),  # Ordinary creation
+    ],
+)
+def test_review_monitor_fails_closed_on_unreliable_or_real_events(
+    tmp_path: Path, mask: int, name: bytes
+) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+    monitor = object.__new__(ReviewWriteMonitor)
+    monitor._fd = read_fd
+    monitor._repositories = (str(tmp_path),)
+    monitor._paths = {1: tmp_path}
+    monitor._owners = {1: {str(tmp_path)}}
+    monitor._git_dirs = {tmp_path}
+    try:
+        os.write(write_fd, struct.pack("iIII", 1, mask, 0, len(name)) + name)
+        with pytest.raises(RuntimeError, match="Review repository change detected"):
+            monitor.assert_unchanged()
+    finally:
+        monitor.close()
+        os.close(write_fd)
+
+
+def test_review_monitor_accepts_paired_git_lock_events(tmp_path: Path) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+    monitor = object.__new__(ReviewWriteMonitor)
+    monitor._fd = read_fd
+    monitor._repositories = (str(tmp_path),)
+    monitor._paths = {1: tmp_path}
+    monitor._owners = {1: {str(tmp_path)}}
+    monitor._git_dirs = {tmp_path}
+    name = b"index.lock\0"
+    try:
+        os.write(
+            write_fd,
+            b"".join(
+                struct.pack("iIII", 1, mask, 0, len(name)) + name
+                for mask in (0x100, 0x002, 0x008, 0x200)
+            ),
+        )
+        monitor.assert_unchanged()
+    finally:
+        monitor.close()
+        os.close(write_fd)
 
 
 @pytest.mark.parametrize("restored", [False, True])
