@@ -1019,6 +1019,30 @@ def test_review_monitor_ignores_transient_git_lock(
         monitor.close()
 
 
+def test_review_monitor_detects_restored_config_lock_write(tmp_path: Path) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+    monitor = object.__new__(ReviewWriteMonitor)
+    monitor._fd = read_fd
+    monitor._repositories = (str(tmp_path),)
+    monitor._paths = {1: tmp_path}
+    monitor._owners = {1: {str(tmp_path)}}
+    monitor._git_dirs = {tmp_path}
+    name = b"config.lock\0"
+    try:
+        os.write(
+            write_fd,
+            b"".join(
+                struct.pack("iIII", 1, mask, 0, len(name)) + name
+                for mask in (0x100, 0x002, 0x008, 0x200)
+            ),
+        )
+        with pytest.raises(RuntimeError, match="Review repository change detected"):
+            monitor.assert_unchanged()
+    finally:
+        monitor.close()
+        os.close(write_fd)
+
+
 def test_review_monitor_allows_index_metadata_refresh(
     repositories: tuple[Path, Path],
 ) -> None:

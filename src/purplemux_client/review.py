@@ -466,12 +466,11 @@ class ReviewWriteMonitor:
                 key = (descriptor, name)
                 git_lock = (
                     parent is not None
-                    and name.endswith(b".lock")
+                    and name == b"index.lock"
                     and (
                         parent in self._git_dirs
                         or (
-                            name == b"index.lock"
-                            and parent.parent.name == "worktrees"
+                            parent.parent.name == "worktrees"
                             and parent.parent.parent in self._git_dirs
                         )
                     )
