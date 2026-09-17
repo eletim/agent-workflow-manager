@@ -1090,12 +1090,16 @@ def test_review_monitor_fails_closed_on_unreliable_or_real_events(
         os.close(write_fd)
 
 
-def test_review_monitor_accepts_paired_git_lock_events(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sibling", [False, True])
+def test_review_monitor_accepts_paired_git_lock_events(
+    tmp_path: Path, sibling: bool
+) -> None:
     read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
     monitor = object.__new__(ReviewWriteMonitor)
     monitor._fd = read_fd
     monitor._repositories = (str(tmp_path),)
-    monitor._paths = {1: tmp_path}
+    git_dir = tmp_path / "worktrees" / "sibling" if sibling else tmp_path
+    monitor._paths = {1: git_dir}
     monitor._owners = {1: {str(tmp_path)}}
     monitor._git_dirs = {tmp_path}
     name = b"index.lock\0"
@@ -1113,12 +1117,40 @@ def test_review_monitor_accepts_paired_git_lock_events(tmp_path: Path) -> None:
         os.close(write_fd)
 
 
-def test_review_monitor_accepts_index_replacement_events(tmp_path: Path) -> None:
+def test_review_monitor_rejects_sibling_config_lock_move(tmp_path: Path) -> None:
     read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
     monitor = object.__new__(ReviewWriteMonitor)
     monitor._fd = read_fd
     monitor._repositories = (str(tmp_path),)
-    monitor._paths = {1: tmp_path, 2: tmp_path / "index"}
+    monitor._paths = {1: tmp_path / "worktrees" / "sibling"}
+    monitor._owners = {1: {str(tmp_path)}}
+    monitor._git_dirs = {tmp_path}
+    name = b"config.lock\0"
+    try:
+        os.write(
+            write_fd,
+            b"".join(
+                struct.pack("iIII", 1, mask, 0, len(name)) + name
+                for mask in (0x100, 0x002, 0x008, 0x040)
+            ),
+        )
+        with pytest.raises(RuntimeError, match="Review repository change detected"):
+            monitor.assert_unchanged()
+    finally:
+        monitor.close()
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("sibling", [False, True])
+def test_review_monitor_accepts_index_replacement_events(
+    tmp_path: Path, sibling: bool
+) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+    monitor = object.__new__(ReviewWriteMonitor)
+    monitor._fd = read_fd
+    monitor._repositories = (str(tmp_path),)
+    git_dir = tmp_path / "worktrees" / "sibling" if sibling else tmp_path
+    monitor._paths = {1: git_dir, 2: git_dir / "index"}
     monitor._owners = {1: {str(tmp_path)}, 2: {str(tmp_path)}}
     monitor._git_dirs = {tmp_path}
     try:

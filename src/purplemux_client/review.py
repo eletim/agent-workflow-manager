@@ -461,7 +461,14 @@ class ReviewWriteMonitor:
                 git_lock = (
                     parent is not None
                     and name.endswith(b".lock")
-                    and parent in self._git_dirs
+                    and (
+                        parent in self._git_dirs
+                        or (
+                            name == b"index.lock"
+                            and parent.parent.name == "worktrees"
+                            and parent.parent.parent in self._git_dirs
+                        )
+                    )
                 )
                 if git_lock and mask == self._CREATE and key not in pending_locks:
                     pending_locks.add(key)
