@@ -825,6 +825,7 @@ def test_review_snapshot_covers_linked_worktree_git_config(tmp_path: Path) -> No
 def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -> None:
     repository = tmp_path / "source"
     linked = tmp_path / "linked"
+    sibling = tmp_path / "sibling"
     repository.mkdir()
     subprocess.run(["git", "init", "-q", str(repository)], check=True)
     (repository / "tracked.txt").write_text("original")
@@ -841,6 +842,19 @@ def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -
             "commit",
             "-qm",
             "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            str(sibling),
         ],
         check=True,
     )
@@ -873,6 +887,19 @@ def test_review_snapshot_ignores_linked_worktree_index_refresh(tmp_path: Path) -
     assert snapshot_review_repositories((str(linked),)) == baseline
 
     (linked / "tracked.txt").write_text("changed")
+    assert snapshot_review_repositories((str(linked),)) != baseline
+    (linked / "tracked.txt").write_text("original")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(sibling),
+            "update-index",
+            "--assume-unchanged",
+            "tracked.txt",
+        ],
+        check=True,
+    )
     assert snapshot_review_repositories((str(linked),)) != baseline
 
 

@@ -45,11 +45,14 @@ observation. Do not send input to an observed terminal or modify a declared
 repository. Review requires a running PurpleMux 0.5.0 or newer server and a
 matching CLI with public `ext-review` support; it checks this contract before
 creating its workspace. On Linux, the workflow monitors writes to every declared
-repository and its Git administrative directories, including writes that are
-later restored. The final fingerprint covers tracked, ignored, and untracked
-files plus meaningful Git state, including staged entries, refs, config, and
-Git objects in linked worktrees. It tolerates index metadata refreshes caused
-by read-only Git inspection. A detected write or changed fingerprint fails the Run
+repository and its Git administrative directories, including restored writes
+in monitored paths. It exempts Git index refresh operations because read-only
+inspection can update cached metadata; an index change reverted before the
+final fingerprint is not detected. The final fingerprint covers tracked,
+ignored, and untracked files plus meaningful Git state, including staged
+entries, refs, config, and Git objects in linked worktrees. It tolerates index
+metadata refreshes caused by read-only Git inspection. A detected write or
+changed fingerprint fails the Run
 instead of producing a trustworthy Review verdict. Review fails closed if write
 monitoring is unavailable.
 

@@ -246,13 +246,7 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                 for name in sorted(directories + files):
                     path = Path(current) / name
                     if git_admin and (
-                        (
-                            name == "index"
-                            and (
-                                path.parent == root
-                                or path.parent.parent == root / "worktrees"
-                            )
-                        )
+                        path == git_dir / "index"
                         or (path.parent == root and name.startswith("sharedindex."))
                     ):
                         continue
@@ -305,7 +299,7 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
 
 
 class ReviewWriteMonitor:
-    """Record filesystem writes during a Review, including restored writes."""
+    """Record filesystem writes during a Review, except index refreshes."""
 
     _WRITE_EVENTS = 0x002 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
     _EVENT = struct.Struct("iIII")
