@@ -4371,7 +4371,7 @@ def recovery_authoritative_state(
     github: GitHubRepository,
     plan: WorkItemPlan | None = None,
 ) -> str:
-    """Inspect current Git and Base PR state after a workflow failure."""
+    """Inspect current Git and PR state after a workflow failure."""
     state: dict[str, object] = {
         "repository": str(config.repo),
         "integration_branch": config.integration_branch,
@@ -4419,6 +4419,38 @@ def recovery_authoritative_state(
         )
     except Exception as exc:
         state["remote_heads_inspection_error"] = short_error(exc)
+    if plan is not None and plan.active is not None:
+        active = plan.active
+        try:
+            branch = repo.inspect_branch(active.branch)
+            state["active_branch"] = {
+                "name": branch.name,
+                "local_sha": branch.local_sha,
+                "remote_sha": branch.remote_sha,
+                "current": branch.current,
+            }
+        except Exception as exc:
+            state["active_branch_inspection_error"] = short_error(exc)
+        active_prs = []
+        for status in ("OPEN", "MERGED", "CLOSED"):
+            try:
+                pr = github.find_pr(
+                    head=active.branch, base=config.integration_branch, state=status
+                )
+                if pr is not None:
+                    active_prs.append(
+                        {
+                            "number": pr.number,
+                            "state": pr.state,
+                            "draft": pr.is_draft,
+                            "head_sha": pr.head_sha,
+                            "base_sha": pr.base_sha,
+                            "merge_commit_sha": pr.merge_commit_sha,
+                        }
+                    )
+            except Exception as exc:
+                state[f"active_pr_{status.lower()}_inspection_error"] = short_error(exc)
+        state["active_prs"] = active_prs
     try:
         pr = github.find_pr(
             head=config.integration_branch, base=config.main_branch, state="OPEN"

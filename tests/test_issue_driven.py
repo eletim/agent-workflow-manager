@@ -2511,8 +2511,18 @@ def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
             current_branch="feature/work-item-repair-guide", dirty=False, status=()
         ),
         inspect_remote_branches=lambda branches: {branch: None for branch in branches},
+        inspect_branch=lambda branch: BranchState(branch, "c" * 40, "d" * 40, True),
     )
-    github = SimpleNamespace(find_pr=lambda **kwargs: None)
+    active_pr = topology_pr(head_branch=issue.branch, head_sha="d" * 40)
+
+    def find_pr(**kwargs):
+        if kwargs == {"head": issue.branch, "base": "dev/v1", "state": "MERGED"}:
+            raise WorkerFailure("historical PR inspection failed")
+        if kwargs == {"head": issue.branch, "base": "dev/v1", "state": "OPEN"}:
+            return active_pr
+        return None
+
+    github = SimpleNamespace(find_pr=find_pr)
     state = json.loads(
         workflow["recovery_authoritative_state"](config, repo, github, plan)
     )
@@ -2523,6 +2533,25 @@ def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
     assert work_item["active"]["task"] == "Repair the workflow guide."
     assert work_item["active"]["branch"] == "feature/work-item-repair-guide"
     assert work_item["active"]["task_fingerprint"] == issue.task_fingerprint
+    assert state["active_branch"] == {
+        "name": issue.branch,
+        "local_sha": "c" * 40,
+        "remote_sha": "d" * 40,
+        "current": True,
+    }
+    assert state["active_prs"] == [
+        {
+            "number": active_pr.number,
+            "state": "OPEN",
+            "draft": True,
+            "head_sha": "d" * 40,
+            "base_sha": active_pr.base_sha,
+            "merge_commit_sha": None,
+        }
+    ]
+    assert state["active_pr_merged_inspection_error"] == (
+        "historical PR inspection failed"
+    )
 
 
 def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
