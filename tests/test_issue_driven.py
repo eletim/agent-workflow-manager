@@ -2476,6 +2476,53 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
     state = json.loads(received[0][3])
     assert state["remote_heads"]["dev/v1"] == "a" * 40
     assert state["worktree"]["current_branch"] == "feature/work"
+    assert state["work_item_plan"]["status"] == (
+        "unavailable before plan preparation completed"
+    )
+
+
+def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
+    workflow = load_generated_workflow(
+        work_items=[{"id": "repair-guide", "task": "Repair the workflow guide."}]
+    )
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-repair-guide",
+        "repair-guide",
+        "Repair the workflow guide.",
+        hashlib.sha256(b"Repair the workflow guide.").hexdigest(),
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.position = 1
+    plan.finalized = True
+    workflow["inspect_dynamic_work_item_topology"] = lambda *args, **kwargs: None
+    workflow["run_outline_step"] = lambda name, action: action()
+    workflow["process_issue"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("work item failed")
+    )
+    with pytest.raises(WorkerFailure, match="work item failed"):
+        workflow["process_work_items"](config, None, None, None, None, plan)
+
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="feature/work-item-repair-guide", dirty=False, status=()
+        ),
+        inspect_remote_branches=lambda branches: {branch: None for branch in branches},
+    )
+    github = SimpleNamespace(find_pr=lambda **kwargs: None)
+    state = json.loads(
+        workflow["recovery_authoritative_state"](config, repo, github, plan)
+    )
+    work_item = state["work_item_plan"]
+    assert work_item["position"] == 1
+    assert work_item["finalized"] is True
+    assert work_item["active"]["id"] == "repair-guide"
+    assert work_item["active"]["task"] == "Repair the workflow guide."
+    assert work_item["active"]["branch"] == "feature/work-item-repair-guide"
+    assert work_item["active"]["task_fingerprint"] == issue.task_fingerprint
 
 
 def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:

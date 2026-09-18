@@ -62,7 +62,7 @@ MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
-MAX_RECOVERY_STATE_BYTES = 8_000
+MAX_RECOVERY_STATE_BYTES = 32_000
 MAX_RECOVERY_REPORT_BYTES = 2_000
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
@@ -244,6 +244,7 @@ class WorkItemPlan:
     finalized: bool = False
     persisted_source: str | None = None
     skipped: list[PlannerSkip] = field(default_factory=list)
+    active: Issue | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -3350,6 +3351,7 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
+        plan.active = recovered_issue
         inspect_dynamic_work_item_topology(
             recovered_issue, config, recover_missing_inline_identity=True
         )
@@ -3359,6 +3361,7 @@ def process_work_items(
                 issue, config, client, repo, github
             ),
         )
+        plan.active = None
     if plan.finalized:
         return plan.snapshot
     planner = create_agent(
@@ -3397,12 +3400,14 @@ def process_work_items(
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
+        plan.active = issue
         inspect_dynamic_work_item_topology(issue, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         run_outline_step(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
+        plan.active = None
         if plan_pr is None:
             plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
@@ -4361,7 +4366,10 @@ def report_repository_delivery(config: Config, ready: PullRequestState | None) -
 
 
 def recovery_authoritative_state(
-    config: Config, repo: GitRepository, github: GitHubRepository
+    config: Config,
+    repo: GitRepository,
+    github: GitHubRepository,
+    plan: WorkItemPlan | None = None,
 ) -> str:
     """Inspect current Git and Base PR state after a workflow failure."""
     state: dict[str, object] = {
@@ -4369,6 +4377,33 @@ def recovery_authoritative_state(
         "integration_branch": config.integration_branch,
         "final_branch": config.main_branch,
     }
+    if plan is None:
+        state["work_item_plan"] = {
+            "status": "unavailable before plan preparation completed",
+            "seed_count": len(config.issues),
+        }
+    else:
+        active = plan.active
+        next_item = plan.remaining[0] if plan.remaining else None
+        state["work_item_plan"] = {
+            "position": plan.position,
+            "total": len(plan.items),
+            "finalized": plan.finalized,
+            "active": (
+                None
+                if active is None
+                else {
+                    **planner_work_item_json(active),
+                    "branch": active.branch,
+                    "task_fingerprint": active.task_fingerprint,
+                }
+            ),
+            "next_item": (
+                None
+                if next_item is None
+                else {**planner_work_item_json(next_item), "branch": next_item.branch}
+            ),
+        }
     try:
         worktree = repo.inspect_worktree()
         state["worktree"] = {
@@ -4423,6 +4458,7 @@ def run_repository(
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
+    plan: WorkItemPlan | None = None
     try:
         plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
         work_items = run_outline_step(
@@ -4437,7 +4473,10 @@ def run_repository(
         return ready
     except Exception as exc:
         report = recover_error(
-            client, config, exc, recovery_authoritative_state(config, repo, github)
+            client,
+            config,
+            exc,
+            recovery_authoritative_state(config, repo, github, plan),
         )
         print(
             f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
