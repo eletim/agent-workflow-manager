@@ -14,6 +14,7 @@ import pytest
 from purplemux_client.client import (
     WORKFLOW_HOST_WORKSPACE_ENV,
     CreateWorkspaceRequest,
+    PurpleMuxCLIClient,
     PurpleMuxRuntime,
     ShellCommandRequest,
     ShellResult,
@@ -36,6 +37,8 @@ class _ManagedClient:
     def __init__(self) -> None:
         self.release = threading.Event()
         self.exit_code = 0
+        self.stdout = ""
+        self.stderr = ""
         self.request: ShellCommandRequest | None = None
         self.interrupted = False
         self.start_error: BaseException | None = None
@@ -78,7 +81,7 @@ class _ManagedClient:
         self.read_calls += 1
         if self.read_errors:
             raise self.read_errors.pop(0)
-        return ShellResult(self.exit_code)
+        return ShellResult(self.exit_code, stdout=self.stdout, stderr=self.stderr)
 
     def interrupt(self, session_id: str) -> None:
         assert session_id == "tab-workflow"
@@ -239,6 +242,8 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
 
 def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) -> None:
     client = _ManagedClient()
+    client.stdout = "before stop\n"
+    client.stderr = "stop warning\n"
     runtime = _ManagedRuntime(client)
     runner = PythonRunner(
         workflow_cwd=tmp_path,
@@ -251,8 +256,60 @@ def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) 
         stopped = _wait_for_state(runner, "stopped")
         assert client.interrupted is True
         assert stopped.exit_code == 130
+        assert stopped.stdout == "before stop\n"
+        assert stopped.stderr == "stop warning\n"
     finally:
         runner.close()
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_managed_result_output_is_bounded_and_reloaded(
+    tmp_path: Path, exit_code: int
+) -> None:
+    client = _ManagedClient()
+    client.exit_code = exit_code
+    client.stdout = "prefix-stdout-tail\n"
+    client.stderr = "prefix-stderr-tail\n"
+    history = tmp_path / "history.json"
+    output_limit = 12 if exit_code == 0 else 1000
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        run_history_file=history,
+        max_output_chars=output_limit,
+        runtime_factory=lambda: _ManagedRuntime(client),  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    try:
+        run_id = runner.start("print('managed')")
+        assert client.request is not None
+        assert client.request.max_output_chars == output_limit
+        client.release.set()
+        finished = _wait_for_state(runner, "success" if exit_code == 0 else "failed")
+        assert finished.exit_code == exit_code
+        if exit_code == 0:
+            assert finished.stdout == "[output truncated; showing tail]\nstdout-tail\n"
+        else:
+            assert finished.stdout == client.stdout
+        assert "stderr-tail\n" in finished.stderr
+        assert finished.as_json()["stdout"] == finished.stdout
+        assert finished.as_json()["stderr"] == finished.stderr
+        if exit_code:
+            assert "Workflow failed (exit code 7)" in finished.stderr
+    finally:
+        runner.close()
+
+    restored = PythonRunner(run_history_file=history, max_output_chars=output_limit)
+    try:
+        after = restored.snapshot(run_id)
+        assert (after.state, after.stdout, after.stderr) == (
+            finished.state,
+            finished.stdout,
+            finished.stderr,
+        )
+        assert after.stdout_entries == finished.stdout_entries
+        assert after.stderr_entries == finished.stderr_entries
+    finally:
+        restored.close()
 
 
 def test_managed_launch_retains_failed_initial_tab_discovery(tmp_path: Path) -> None:
@@ -389,9 +446,12 @@ def test_authoritative_start_failure_tracks_created_tab_and_result(
 class _ExecutingManagedClient(_ManagedClient):
     """Execute the generated shell command while retaining structured completion."""
 
-    def __init__(self, result_root: Path) -> None:
+    def __init__(
+        self, result_root: Path, *, capture_shell_result: bool = False
+    ) -> None:
         super().__init__()
         self.result_root = result_root
+        self.capture_shell_result = capture_shell_result
 
     def start_shell(self, request, *, on_created=None):
         import subprocess
@@ -399,10 +459,21 @@ class _ExecutingManagedClient(_ManagedClient):
         self.request = request
         tab_id = "tab-workflow"
         result_dir = tempfile.mkdtemp(prefix="awm-shell-", dir=self.result_root)
+        self.result_path = Path(result_dir) / "result.json"
         if on_created is not None:
-            on_created(tab_id, str(Path(result_dir) / "result.json"))
+            on_created(tab_id, str(self.result_path))
+        command = (
+            PurpleMuxCLIClient._shell_wrapper(
+                request.command,
+                request.cwd,
+                str(self.result_path),
+                request.max_output_chars,
+            )
+            if self.capture_shell_result
+            else request.command
+        )
         self.process = subprocess.Popen(
-            ["bash", "-c", request.command],
+            ["bash", "-c", command],
             cwd=request.cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -414,6 +485,12 @@ class _ExecutingManagedClient(_ManagedClient):
 
     def read_shell_result(self, session_id):
         assert self.process.returncode is not None
+        if self.capture_shell_result:
+            return ShellResult(
+                json.loads(self.result_path.read_text())["exitCode"],
+                stdout=Path(f"{self.result_path}.stdout").read_text(),
+                stderr=Path(f"{self.result_path}.stderr").read_text(),
+            )
         return ShellResult(self.process.returncode)
 
     def interrupt(self, session_id):
@@ -425,6 +502,48 @@ class _ExecutingManagedClient(_ManagedClient):
     def close_session(self, session_id):
         self.process.kill()
         self.process.wait(timeout=3)
+
+
+def test_managed_run_finishes_while_detached_child_keeps_output_open(
+    tmp_path: Path,
+) -> None:
+    client = _ExecutingManagedClient(tmp_path, capture_shell_result=True)
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        run_history_file=tmp_path / "history.json",
+        runtime_factory=lambda: _ManagedRuntime(client),  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    release = tmp_path / "release-child"
+    child_done = tmp_path / "child-done"
+    child_code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.02)\n"
+        "print('late child output', flush=True)\n"
+        f"Path({str(child_done)!r}).touch()\n"
+    )
+    code = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+        "start_new_session=True)\n"
+        "print('parent output', flush=True)\n"
+    )
+    try:
+        run_id = runner.start(code)
+        finished = _wait_for_state(runner, "success")
+        assert finished.run_id == run_id
+        assert finished.stdout == "parent output\n"
+        assert finished.stderr == ""
+        assert not release.exists()
+        release.touch()
+        deadline = time.monotonic() + 3
+        while not child_done.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        release.touch()
+        runner.close()
 
 
 @pytest.mark.parametrize("target_id", [None, "remote"])

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
+import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -428,6 +431,114 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     assert "bash -lc" in wrapper
     assert 'printf \'{"exitCode":%s}' in wrapper
     cli.close_session(session_id)
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_managed_shell_result_captures_both_visible_streams(
+    tmp_path: Path, exit_code: int
+) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command=(
+                "printf 'public stdout\\n'; "
+                "printf 'public stderr\\n' >&2; "
+                f"exit {exit_code}"
+            ),
+            cwd=str(tmp_path),
+            name="Captured shell",
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    execution = subprocess.run(
+        ["bash", "-c", wrapper], capture_output=True, text=True, timeout=5
+    )
+    assert execution.returncode == 0
+    assert execution.stdout == "public stdout\n"
+    assert execution.stderr == "public stderr\n"
+    result = cli._read_shell_result_file(session_id)
+    assert result is not None
+    assert (result.exit_code, result.stdout, result.stderr) == (
+        exit_code,
+        execution.stdout,
+        execution.stderr,
+    )
+    cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
+def test_visible_managed_shell_keeps_stderr_separate(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command="printf 'out\\n'; printf 'err\\n' >&2",
+            cwd=str(tmp_path),
+            name="Visible capture",
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    socket = f"awm-test-{os.getpid()}-{time.monotonic_ns()}"
+    tmux = ["tmux", "-L", socket]
+    subprocess.run(tmux + ["new-session", "-d", "-s", "managed-shell"], check=True)
+    try:
+        subprocess.run(
+            tmux + ["send-keys", "-t", "managed-shell", wrapper, "Enter"], check=True
+        )
+        deadline = time.monotonic() + 3
+        result = None
+        while result is None:
+            assert time.monotonic() < deadline
+            result = cli._read_shell_result_file(session_id)
+            time.sleep(0.02)
+        assert (result.exit_code, result.stdout, result.stderr) == (
+            0,
+            "out\n",
+            "err\n",
+        )
+    finally:
+        subprocess.run(tmux + ["kill-server"], check=False, capture_output=True)
+        cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
+def test_managed_shell_capture_bounds_sidecars_before_result_read(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    script = (
+        'import sys; sys.stdout.write("é" * 100000 + "stdout"); '
+        'sys.stderr.write("日" * 100000 + "stderr")'
+    )
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+            cwd=str(tmp_path),
+            name="Bounded capture",
+            max_output_chars=8,
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    execution = subprocess.run(
+        ["bash", "-c", wrapper], capture_output=True, text=True, timeout=10
+    )
+    assert execution.returncode == 0
+    assert execution.stdout == "é" * 100000 + "stdout"
+    assert execution.stderr == "日" * 100000 + "stderr"
+    result = cli._read_shell_result_file(session_id)
+    assert result is not None
+    assert result.stdout == "éééstdout"
+    assert result.stderr == "日日日stderr"
+    result_path = cli._shell_runs[session_id].result_path
+    assert os.stat(f"{result_path}.stdout").st_size <= 9 * 4
+    assert os.stat(f"{result_path}.stderr").st_size <= 9 * 4
+    cli._cleanup_shell_result(cli._shell_runs[session_id])
 
 
 def test_start_shell_bounds_tab_reads_create_and_send_by_deadline(tmp_path) -> None:

@@ -561,12 +561,7 @@ function runPresentation(run) {
 function renderReviewResult(result) {
   reviewResultPanel.hidden = result.mode !== "review" || result.runId == null;
   if (reviewResultPanel.hidden) return;
-  let report;
-  try {
-    report = JSON.parse(result.stdout || "");
-  } catch {
-    report = null;
-  }
+  const report = result.reviewResult;
   if (report && typeof report === "object" && !Array.isArray(report)
     && ["PASS", "FAIL", "BLOCKED"].includes(report.verdict)
     && typeof report.summary === "string") {
@@ -988,7 +983,13 @@ function renderRunList(runs, cleanupOwnership = []) {
     const resumed = run.resumedFromRunId == null
       ? ""
       : `  Resume of #${run.resumedFromRunId}`;
-    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
+    const reviewLabel = ["PASS", "FAIL", "BLOCKED"].includes(run.reviewVerdict)
+      ? run.reviewVerdict
+      : run.state === "running" ? "pending" : "none saved";
+    const reviewVerdict = run.mode === "review"
+      ? `  Review result: ${reviewLabel}`
+      : "";
+    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}${reviewVerdict}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";

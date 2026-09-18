@@ -10,6 +10,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from purplemux_client.codex_trust import ensure_codex_project_trust
@@ -121,11 +122,12 @@ class ShellCommandRequest:
     name: str
     correlation_id: str | None = None
     deadline_check: Callable[[], float] | None = None
+    max_output_chars: int = 1_000_000
 
 
 @dataclass(frozen=True)
 class ShellResult:
-    """Structured completion plus display-only failure diagnostics."""
+    """Structured completion, captured streams, and display-only diagnostics."""
 
     exit_code: int
     diagnostic_output: str | None = None
@@ -133,6 +135,8 @@ class ShellResult:
     cwd: str | None = None
     workspace_id: str | None = None
     tab_id: str | None = None
+    stdout: str = ""
+    stderr: str = ""
 
     def failure_message(self, step_name: str) -> str:
         """Format a failed step for display without deriving its outcome from text."""
@@ -899,6 +903,8 @@ class PurpleMuxCLIClient:
             raise ValueError("shell terminal name must not be empty")
         if "\0" in request.command or "\0" in request.name or "\0" in request.cwd:
             raise ValueError("shell request values must not contain null bytes")
+        if request.max_output_chars < 1:
+            raise ValueError("max_output_chars must be positive")
         cwd = os.path.abspath(os.path.expanduser(request.cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"shell working directory is not a directory: {cwd}")
@@ -935,7 +941,9 @@ class PurpleMuxCLIClient:
         self._shell_runs[session_id] = _ShellRun(result_path=result_path, cwd=cwd)
         if on_created is not None:
             on_created(session_id, result_path)
-        wrapper = self._shell_wrapper(request.command, cwd, result_path)
+        wrapper = self._shell_wrapper(
+            request.command, cwd, result_path, request.max_output_chars
+        )
         try:
             self._send_mutation(
                 session_id,
@@ -1009,7 +1017,7 @@ class PurpleMuxCLIClient:
             self._sleep(self.poll_interval_seconds)
 
     def read_shell_result(self, session_id: str) -> ShellResult:
-        """Return the structured exit code for a completed managed shell command."""
+        """Return the structured result for a completed managed shell command."""
         result = self._completed_shell_runs.get(session_id)
         if result is None:
             result = self._read_shell_result_file(session_id)
@@ -1291,6 +1299,8 @@ class PurpleMuxCLIClient:
             cwd=shell_run.cwd,
             workspace_id=self.workspace_id,
             tab_id=session_id,
+            stdout=result.stdout,
+            stderr=result.stderr,
         )
 
     @staticmethod
@@ -1303,14 +1313,34 @@ class PurpleMuxCLIClient:
         return tail or None
 
     @staticmethod
-    def _shell_wrapper(command: str, cwd: str, result_path: str) -> str:
+    def _shell_wrapper(
+        command: str, cwd: str, result_path: str, max_output_chars: int = 1_000_000
+    ) -> str:
         command_text = shlex.quote(command)
         cwd_text = shlex.quote(cwd)
         result_text = shlex.quote(result_path)
         pending_result_text = shlex.quote(f"{result_path}.pending")
+        stdout_text = shlex.quote(f"{result_path}.stdout")
+        stderr_text = shlex.quote(f"{result_path}.stderr")
+        stdout_pipe = shlex.quote(f"{result_path}.stdout.pipe")
+        stderr_pipe = shlex.quote(f"{result_path}.stderr.pipe")
+        command_done = shlex.quote(f"{result_path}.command_done")
+        capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_capture"
+        capture_chars = max_output_chars + 1
         return (
+            f"mkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
+            f"{capture} {stdout_text} {command_done} {capture_chars} 1 "
+            f"< {stdout_pipe} & __awm_stdout_pid=$!; "
+            f"{capture} {stderr_text} {command_done} {capture_chars} 2 "
+            f"< {stderr_pipe} & __awm_stderr_pid=$!; "
             f"__awm_exit=0; (cd -- {cwd_text} && bash -lc {command_text}) "
-            f"|| __awm_exit=$?; printf '{{\"exitCode\":%s}}\\n' "
+            f"> {stdout_pipe} 2> {stderr_pipe} || __awm_exit=$?; "
+            f": > {command_done}; "
+            f"until test -f {stdout_text} && test -f {stderr_text}; do "
+            f"kill -0 $__awm_stdout_pid && kill -0 $__awm_stderr_pid "
+            f"|| exit 1; sleep 0.02; done; "
+            f"rm -- {stdout_pipe} {stderr_pipe} {command_done}; "
+            f"printf '{{\"exitCode\":%s}}\\n' "
             f'"$__awm_exit" > {pending_result_text} && '
             f"mv -- {pending_result_text} {result_text}"
         )
@@ -1333,11 +1363,34 @@ class PurpleMuxCLIClient:
             raise WorkerFailure(
                 f"shell terminal {session_id} published an invalid exit code"
             )
-        return ShellResult(exit_code=exit_code)
+        stdout_path = Path(f"{shell_run.result_path}.stdout")
+        stderr_path = Path(f"{shell_run.result_path}.stderr")
+        if stdout_path.exists() or stderr_path.exists():
+            try:
+                stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+                stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise WorkerFailure(
+                    f"shell terminal {session_id} published unreadable output"
+                ) from exc
+        else:
+            # Older result files published only the exit code.
+            stdout = stderr = ""
+        return ShellResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
 
     @staticmethod
     def _cleanup_shell_result(shell_run: _ShellRun) -> None:
-        for path in (shell_run.result_path, f"{shell_run.result_path}.pending"):
+        for path in (
+            shell_run.result_path,
+            f"{shell_run.result_path}.pending",
+            f"{shell_run.result_path}.stdout",
+            f"{shell_run.result_path}.stderr",
+            f"{shell_run.result_path}.stdout.pending",
+            f"{shell_run.result_path}.stderr.pending",
+            f"{shell_run.result_path}.command_done",
+            f"{shell_run.result_path}.stdout.pipe",
+            f"{shell_run.result_path}.stderr.pipe",
+        ):
             try:
                 os.unlink(path)
             except FileNotFoundError:
