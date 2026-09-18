@@ -2457,9 +2457,13 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
     workflow["GitHubRepository"] = SimpleNamespace(open=lambda *args, **kwargs: github)
     workflow["create_runtime"] = lambda config: object()
     workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
-    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
-        WorkerFailure("plan failed")
-    )
+    attempts: list[int] = []
+
+    def fail_plan(*args):
+        attempts.append(1)
+        raise WorkerFailure("plan failed")
+
+    workflow["prepare_work_item_plan_pr"] = fail_plan
     received: list[tuple[object, object, object, str]] = []
 
     def recover(client, config, error, state):
@@ -2475,6 +2479,7 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
     )
     with pytest.raises(WorkerFailure, match="plan failed"):
         workflow["run_repository"](config)
+    assert len(attempts) == 1
     assert findings == []
     assert len(received) == 1
     assert str(received[0][2]) == "plan failed"
@@ -2484,6 +2489,40 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
     assert state["work_item_plan"]["status"] == (
         "unavailable before plan preparation completed"
     )
+
+
+@pytest.mark.parametrize(("repaired", "retry_safe"), [(False, False), (True, False)])
+def test_repository_recovery_rejects_unrecoverable_report(
+    repaired: bool, retry_safe: bool
+) -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: "inspected state"
+    attempts: list[int] = []
+
+    def fail_plan(*args):
+        attempts.append(1)
+        raise WorkerFailure("plan failed")
+
+    workflow["prepare_work_item_plan_pr"] = fail_plan
+    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+        repaired, retry_safe, "No safe continuation.", "Inspected state."
+    )
+    workflow["emit_finding"] = lambda *args, **kwargs: pytest.fail(
+        "unverified recovery must not emit a warning"
+    )
+
+    with pytest.raises(WorkerFailure, match="plan failed"):
+        workflow["run_repository"](config)
+    assert len(attempts) == 1
 
 
 def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> None:
@@ -2589,13 +2628,21 @@ def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
     )
     workflow["create_runtime"] = lambda config: object()
     workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
-    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
-        MutationOutcomeUnknown("response lost")
-    )
+    attempts: list[int] = []
+
+    def unknown_plan(*args):
+        attempts.append(1)
+        raise MutationOutcomeUnknown("response lost")
+
+    workflow["prepare_work_item_plan_pr"] = unknown_plan
     workflow["recover_error"] = lambda *args: pytest.fail("must not recover")
+    workflow["recovery_authoritative_state"] = lambda *args: pytest.fail(
+        "unknown mutation must not enter recovery"
+    )
 
     with pytest.raises(MutationOutcomeUnknown, match="response lost"):
         workflow["run_repository"](config)
+    assert len(attempts) == 1
 
 
 def test_repository_recovery_has_a_finite_retry_limit() -> None:
@@ -2626,13 +2673,20 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
         raise WorkerFailure("plan failed")
 
     workflow["prepare_work_item_plan_pr"] = fail
-    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
-        True, True, "Repaired plan.", "Inspected remote state."
-    )
+    recoveries: list[int] = []
+
+    def recover(*args):
+        recoveries.append(1)
+        return workflow["RecoveryReport"](
+            True, True, "Repaired plan.", "Inspected remote state."
+        )
+
+    workflow["recover_error"] = recover
 
     with pytest.raises(WorkerFailure, match="retry limit exceeded"):
         workflow["run_repository"](config)
     assert len(attempts) == workflow["MAX_REPOSITORY_RECOVERIES"] + 1
+    assert len(recoveries) == workflow["MAX_REPOSITORY_RECOVERIES"]
 
 
 def test_retry_preserves_completed_merged_item_outcome() -> None:
