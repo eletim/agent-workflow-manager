@@ -4628,6 +4628,16 @@ def run_repository(
             require_recovery_retry_state(
                 recovery_authoritative_state(config, repo, github, plan)
             )
+            emit_finding(
+                "runtime",
+                f"Recovered workflow error: {short_error(exc)}",
+                status="warning",
+            )
+            emit_finding(
+                "runtime",
+                f"Recovery repair: {report.summary} Evidence: {report.evidence}",
+                status="warning",
+            )
             POLICY_CONFLICT_WARNINGS.clear()
             AGENT_TURN_TIMEOUT_WARNINGS.clear()
             continue
