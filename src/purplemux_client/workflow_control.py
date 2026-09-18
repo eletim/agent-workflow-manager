@@ -14,7 +14,7 @@ class WorkflowControlServer:
             def do_POST(self) -> None:
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 1_000_000:
+                    if not 0 < size <= 2_000_000:
                         raise ValueError("invalid control request size")
                     payload = json.loads(self.rfile.read(size))
                     if not isinstance(payload, dict):
