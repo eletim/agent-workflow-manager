@@ -767,6 +767,12 @@ class RunnerSnapshot:
             "checked": self.checked,
         }
         payload.update(self._family_json())
+        if self.review_json is not None:
+            payload["reviewVerdict"] = (
+                self.review_result["verdict"]
+                if self.state == "success" and self.review_result is not None
+                else None
+            )
         if self.resumed_from_run_id is not None:
             payload["resumedFromRunId"] = self.resumed_from_run_id
         if self.prompt is not None:
