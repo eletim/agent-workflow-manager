@@ -64,6 +64,7 @@ MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
 MAX_RECOVERY_STATE_BYTES = 32_000
 MAX_RECOVERY_REPORT_BYTES = 2_000
+MAX_REPOSITORY_RECOVERIES = 2
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -376,6 +377,7 @@ class RepositoryDelivery:
 
 
 ISSUE_HANDOFF_RESULTS: list[IssueHandoffResult] = []
+COMPLETED_ISSUE_PRS: dict[int | str, PullRequestState] = {}
 
 
 @dataclass(frozen=True)
@@ -1360,6 +1362,7 @@ def record_issue_handoff_result(
         existing for existing in ISSUE_HANDOFF_RESULTS if existing.issue != issue
     ]
     ISSUE_HANDOFF_RESULTS.append(result)
+    COMPLETED_ISSUE_PRS[issue] = pr
 
 
 def human_handoff_prompt(
@@ -2547,17 +2550,45 @@ def process_issue(
             warning_scope=issue.result_id,
         )
     prepared = prepare_issue(repo, github, issue, config)
+    previous_result = next(
+        (result for result in ISSUE_HANDOFF_RESULTS if result.issue == issue.result_id),
+        None,
+    )
+    previous_pr = COMPLETED_ISSUE_PRS.get(issue.result_id)
     if isinstance(prepared, PullRequestState):
         rehydrate_policy_conflicts(prepared.body, config, issue_number=issue.result_id)
-        print(f"Skipping already-merged {issue.label}", flush=True)
-        warnings = summary_warnings(issue.result_id)
+        if (
+            previous_result is not None
+            and previous_pr is not None
+            and previous_result.outcome != "skipped"
+            and (
+                previous_result.pr_number != prepared.number
+                or previous_pr.head_sha != prepared.head_sha
+            )
+        ):
+            raise WorkerFailure(f"completed {issue.label} PR changed during recovery")
+        completed_here = (
+            previous_result is not None
+            and previous_pr is not None
+            and previous_result.outcome != "skipped"
+            and previous_result.pr_number == prepared.number
+            and previous_pr.head_sha == prepared.head_sha
+        )
+        outcome = previous_result.outcome if completed_here else "skipped"
+        reviews = previous_result.reviews if completed_here else 0
+        warnings = (
+            tuple(dict.fromkeys((*previous_result.warnings, *summary_warnings(issue.result_id))))[:3]
+            if completed_here
+            else summary_warnings(issue.result_id)
+        )
+        print(f"Already merged {issue.label}", flush=True)
         record_issue_handoff_result(
-            issue.result_id, issue.label, prepared, "skipped", 0, warnings
+            issue.result_id, issue.label, prepared, outcome, reviews, warnings
         )
         emit_issue_result(
             issue.result_id,
-            "skipped",
-            0,
+            outcome,
+            reviews,
             prepared.number,
             prepared.url,
             warnings=warnings,
@@ -2565,6 +2596,49 @@ def process_issue(
         )
         return prepared
     existing_pr, start_sha, reused_existing_work = prepared
+    if (
+        not MERGE_TO_INTEGRATION
+        and previous_result is not None
+        and previous_pr is not None
+        and previous_result.outcome in ("approved", "continued_with_warning")
+        and not previous_pr.is_draft
+    ):
+        if (
+            existing_pr is None
+            or previous_result.pr_number != existing_pr.number
+        ):
+            raise WorkerFailure(f"reviewed {issue.label} PR changed during recovery")
+        pushed = repo.require_pushed(issue.branch)
+        if pushed.local_sha != previous_pr.head_sha:
+            raise WorkerFailure(f"reviewed {issue.label} head changed during recovery")
+        ready = github.require_pr(
+            number=existing_pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=previous_pr.head_sha,
+            expected_base_sha=previous_pr.base_sha,
+            draft=False,
+        )
+        require_inline_task_pr_fingerprint(ready, issue.task_fingerprint)
+        record_issue_handoff_result(
+            issue.result_id,
+            issue.label,
+            ready,
+            previous_result.outcome,
+            previous_result.reviews,
+            previous_result.warnings,
+        )
+        emit_issue_result(
+            issue.result_id,
+            previous_result.outcome,
+            previous_result.reviews,
+            ready.number,
+            ready.url,
+            warnings=previous_result.warnings,
+            label=issue.label,
+        )
+        return ready
     if existing_pr is not None:
         existing_pr = return_to_draft_for_review(
             github,
@@ -4479,6 +4553,28 @@ def recovery_authoritative_state(
     return json.dumps(state, ensure_ascii=True)
 
 
+def require_recovery_retry_state(source: str) -> None:
+    """Require the topology needed to safely start a fresh repository pass."""
+    state = json.loads(source)
+    if any(key.endswith("_inspection_error") for key in state):
+        raise WorkerFailure("recovery outcome is uncertain: topology inspection failed")
+    worktree = state.get("worktree")
+    remote_heads = state.get("remote_heads")
+    if (
+        not isinstance(worktree, dict)
+        or worktree.get("dirty") is not False
+        or not isinstance(remote_heads, dict)
+        or not remote_heads.get(state["integration_branch"])
+        or not remote_heads.get(state["final_branch"])
+        or "base_pr" not in state
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: repository state is incomplete")
+    if state["work_item_plan"].get("active") is not None and (
+        "active_branch" not in state or "active_prs" not in state
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: active work item is incomplete")
+
+
 def run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
@@ -4486,6 +4582,7 @@ def run_repository(
     POLICY_CONFLICT_WARNINGS.clear()
     AGENT_TURN_TIMEOUT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
+    COMPLETED_ISSUE_PRS.clear()
     emit_issue_driven_context(
         config.slug,
         config.integration_branch,
@@ -4499,32 +4596,45 @@ def run_repository(
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
-    plan: WorkItemPlan | None = None
-    try:
-        plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
-        work_items = run_outline_step(
-            "Work items",
-            lambda: process_work_items(config, client, repo, github, plan_pr, plan),
-        )
-        ready = integration_delivery(
-            config, work_items, client, repo, github, deferred_deliveries
-        )
+    for recovery_attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        plan: WorkItemPlan | None = None
+        delivery_count = len(deferred_deliveries) if deferred_deliveries is not None else 0
+        try:
+            plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
+            work_items = run_outline_step(
+                "Work items",
+                lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+            )
+            ready = integration_delivery(
+                config, work_items, client, repo, github, deferred_deliveries
+            )
+        except Exception as exc:
+            if isinstance(exc, MutationOutcomeUnknown) or (
+                deferred_deliveries is not None
+                and len(deferred_deliveries) != delivery_count
+            ):
+                raise
+            if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
+                raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            state = recovery_authoritative_state(config, repo, github, plan)
+            report = recover_error(client, config, exc, state)
+            print(
+                f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
+                f"Evidence: {report.evidence}",
+                flush=True,
+            )
+            if not report.repaired or not report.retry_safe:
+                raise
+            require_recovery_retry_state(
+                recovery_authoritative_state(config, repo, github, plan)
+            )
+            POLICY_CONFLICT_WARNINGS.clear()
+            AGENT_TURN_TIMEOUT_WARNINGS.clear()
+            continue
         if deferred_deliveries is None:
             report_repository_delivery(config, ready)
         return ready
-    except Exception as exc:
-        report = recover_error(
-            client,
-            config,
-            exc,
-            recovery_authoritative_state(config, repo, github, plan),
-        )
-        print(
-            f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
-            f"Evidence: {report.evidence}",
-            flush=True,
-        )
-        raise
+    raise AssertionError("unreachable")
 
 
 def main() -> None:

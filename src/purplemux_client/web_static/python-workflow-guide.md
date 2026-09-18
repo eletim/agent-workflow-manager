@@ -601,6 +601,7 @@ The supported Git inspection and assertion methods are:
 ```python
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
+repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -882,8 +883,11 @@ Workflow recovery is authored as a new run manually. Its ordinary Python code sh
 branches and commits, GitHub PR topology, and any relevant PurpleMux resources
 before reusing external work or making a new mutation. Keep mutation-once and
 `MutationOutcomeUnknown` protections: reconcile a possibly dispatched mutation
-from authoritative state and never retry it blindly. This recovery model does
-not add a graph, state machine, durable execution store, or automatic retry.
+from authoritative state and never retry it blindly. The generated Issue Driven
+workflow may use a dedicated recovery agent and retry its repository pass at most
+twice after a repair. Python checks fresh Git and PR state before each retry and
+stops if the recovery outcome or an inspection is uncertain. This recovery model
+does not add a graph, state machine, or durable execution store.
 
 Use these examples when reasoning about resumability, even if an external caller
 records its own phase label:
