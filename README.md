@@ -77,8 +77,9 @@ Choose **Review** in the Runner to inspect local Git repositories or observe an
 external terminal. Enter a JSON declaration, select **Validate JSON & Generate**
 to inspect the generated Python, then use **Validate**, **Dry Run**, and **Run**.
 Progress, Stop, Result, and history use the ordinary Run surfaces. The Review
-result panel shows the structured verdict when one is available. The original
-JSON and generated Python are retained in history.
+result panel shows the structured verdict when one is available. Structured
+verdicts are saved with Run history and remain visible in history and detail
+after reload. The original JSON and generated Python are retained in history.
 
 The [Review Guide](src/purplemux_client/web_static/review-guide.md) gives the
 field schema, an example, the read-only browser and `ext-review` observation

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import select
 import shlex
 import subprocess
 import sys
@@ -466,6 +468,49 @@ def test_managed_shell_result_captures_both_visible_streams(
         execution.stderr,
     )
     cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
+def test_managed_shell_preserves_tty_and_live_unflushed_output(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    script = (
+        'import sys, time; '
+        'print(f"tty={sys.stdout.isatty()},{sys.stderr.isatty()}"); '
+        'sys.stdout.write("early"); sys.stderr.write("error"); time.sleep(1)'
+    )
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+            cwd=str(tmp_path),
+            name="Terminal capture",
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    master, slave = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            ["bash", "-c", wrapper], stdin=slave, stdout=slave, stderr=slave
+        )
+        os.close(slave)
+        slave = -1
+        visible = b""
+        while b"early" not in visible or b"error" not in visible:
+            assert select.select([master], [], [], 2)[0], visible
+            visible += os.read(master, 65536)
+        assert b"tty=True,True" in visible
+        assert process.poll() is None
+        assert process.wait(timeout=5) == 0
+        result = cli._read_shell_result_file(session_id)
+        assert result is not None
+        assert result.stdout == "tty=True,True\nearly"
+        assert result.stderr == "error"
+    finally:
+        if slave != -1:
+            os.close(slave)
+        os.close(master)
+        cli._cleanup_shell_result(cli._shell_runs[session_id])
 
 
 def test_managed_shell_capture_bounds_sidecars_before_result_read(

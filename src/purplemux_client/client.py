@@ -1326,8 +1326,12 @@ class PurpleMuxCLIClient:
         stderr_pipe = shlex.quote(f"{result_path}.stderr.pipe")
         command_done = shlex.quote(f"{result_path}.command_done")
         capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_capture"
+        pty_capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_pty"
         capture_chars = max_output_chars + 1
         return (
+            f"if test -t 1 && test -t 2; then "
+            f"{pty_capture} {cwd_text} {command_text} {result_text} {capture_chars}; "
+            f"else "
             f"mkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
             f"{capture} {stdout_text} {command_done} {capture_chars} 1 "
             f"< {stdout_pipe} & __awm_stdout_pid=$!; "
@@ -1342,7 +1346,7 @@ class PurpleMuxCLIClient:
             f"rm -- {stdout_pipe} {stderr_pipe} {command_done}; "
             f"printf '{{\"exitCode\":%s}}\\n' "
             f'"$__awm_exit" > {pending_result_text} && '
-            f"mv -- {pending_result_text} {result_text}"
+            f"mv -- {pending_result_text} {result_text}; fi"
         )
 
     def _read_shell_result_file(self, session_id: str) -> ShellResult | None:
