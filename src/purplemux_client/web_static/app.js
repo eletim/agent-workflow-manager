@@ -561,12 +561,7 @@ function runPresentation(run) {
 function renderReviewResult(result) {
   reviewResultPanel.hidden = result.mode !== "review" || result.runId == null;
   if (reviewResultPanel.hidden) return;
-  let report;
-  try {
-    report = JSON.parse(result.stdout || "");
-  } catch {
-    report = null;
-  }
+  const report = result.reviewResult;
   if (report && typeof report === "object" && !Array.isArray(report)
     && ["PASS", "FAIL", "BLOCKED"].includes(report.verdict)
     && typeof report.summary === "string") {

@@ -484,6 +484,7 @@ class RunnerSnapshot:
     issue_driven_json: str | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
+    review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
@@ -508,6 +509,7 @@ class RunnerSnapshot:
         issue_driven_json = payload.pop("issue_driven_json")
         environment_setup_json = payload.pop("environment_setup_json")
         review_json = payload.pop("review_json")
+        review_result = payload.pop("review_result")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
         if issue_driven_json is not None:
             payload["issueDrivenJson"] = issue_driven_json
@@ -515,6 +517,7 @@ class RunnerSnapshot:
             payload["environmentSetupJson"] = environment_setup_json
         if review_json is not None:
             payload["reviewJson"] = review_json
+            payload["reviewResult"] = review_result
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
         if self.prompt is not None:
@@ -869,6 +872,7 @@ class _RunRecord:
     issue_driven_json: str | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
+    review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
@@ -1110,6 +1114,7 @@ class PythonRunner:
             "issueDrivenJson": run.issue_driven_json,
             "environmentSetupJson": run.environment_setup_json,
             "reviewJson": run.review_json,
+            "reviewResult": run.review_result,
             "resumedFromRunId": run.resumed_from_run_id,
         }
 
@@ -1208,6 +1213,7 @@ class PythonRunner:
         issue_driven_json = value.get("issueDrivenJson")
         environment_setup_json = value.get("environmentSetupJson")
         review_json = value.get("reviewJson")
+        review_result = value.get("reviewResult")
         resumed_from_run_id = value.get("resumedFromRunId")
         if (
             isinstance(run_id, bool)
@@ -1232,6 +1238,7 @@ class PythonRunner:
                 and not isinstance(environment_setup_json, str)
             )
             or (review_json is not None and not isinstance(review_json, str))
+            or (review_result is not None and review_json is None)
             or (
                 resumed_from_run_id is not None
                 and (
@@ -1243,6 +1250,10 @@ class PythonRunner:
             )
         ):
             raise ValueError
+        if review_result is not None:
+            from purplemux_client.review import validate_review_result
+
+            validate_review_result(review_result)
 
         parent_run = value.get("parentRun")
         child_runs = value.get("childRuns", [])
@@ -1543,6 +1554,7 @@ class PythonRunner:
             issue_driven_json=issue_driven_json,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
+            review_result=review_result,
             resumed_from_run_id=resumed_from_run_id,
             parent_run=parent_run,
             child_runs=tuple(child_runs),
@@ -2083,6 +2095,14 @@ class PythonRunner:
                 raise PermissionError("invalid running Workflow credential")
             parent_id = parent.run_id
             operation = payload.get("operation")
+            if operation == "review_result":
+                if parent.review_json is None or parent.review_result is not None:
+                    raise ValueError("Review result is unavailable for this Run")
+                from purplemux_client.review import validate_review_result
+
+                parent.review_result = validate_review_result(payload.get("result"))
+                self._mark_changed()
+                return {}
             target_id = payload.get("target_id")
             if target_id is not None and (
                 not isinstance(target_id, str) or not target_id
@@ -2649,6 +2669,7 @@ class PythonRunner:
             issue_driven_json=run.issue_driven_json,
             environment_setup_json=run.environment_setup_json,
             review_json=run.review_json,
+            review_result=run.review_result if run.state == "success" else None,
             resumed_from_run_id=run.resumed_from_run_id,
             parent_run=run.parent_run,
             child_runs=run.child_runs,
@@ -4315,6 +4336,8 @@ class PythonRunner:
                     if exit_code == 0
                     else "failed"
                 )
+                if run.state != "success":
+                    run.review_result = None
                 self._finish_active_repository(run)
                 attempt_state = run.state
                 run.attempts.append(
@@ -4402,6 +4425,8 @@ class PythonRunner:
                 if exit_code == 0
                 else "failed"
             )
+            if run.state != "success":
+                run.review_result = None
             self._finish_active_repository(run)
             if diagnostic:
                 self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)
