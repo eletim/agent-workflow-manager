@@ -499,7 +499,9 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     assert closed == ["agent-tab"]
 
 
-@pytest.mark.parametrize("unavailable", ["timeout", "busy timeout", "result unavailable"])
+@pytest.mark.parametrize(
+    "unavailable", ["timeout", "busy timeout", "result unavailable"]
+)
 def test_generated_review_unavailable_returns_blocked_and_skips_finish(
     repositories: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, unavailable: str
 ) -> None:
@@ -578,7 +580,10 @@ def test_generated_review_unavailable_returns_blocked_and_skips_finish(
     assert result["observability_gaps"] == (
         [expected]
         if unavailable == "result unavailable"
-        else ["Finish could not run because check completion was not confirmed", expected]
+        else [
+            "Finish could not run because check completion was not confirmed",
+            expected,
+        ]
     )
     assert len(messages) == (2 if unavailable == "result unavailable" else 1)
     if unavailable == "result unavailable":
@@ -667,7 +672,11 @@ def test_generated_review_start_unavailable_blocks_without_check_or_finish(
     assert "start observation" in result["summary"]
     assert result["observability_gaps"] == [
         "Start completion could not be confirmed: "
-        + ("start observation timed out" if unavailable == "timeout" else "start result unavailable")
+        + (
+            "start observation timed out"
+            if unavailable == "timeout"
+            else "start result unavailable"
+        )
     ]
     assert len(messages) == 1
     assert "Start observation" in messages[0]
@@ -717,7 +726,9 @@ def test_generated_review_agent_readiness_timeout_returns_blocked(
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
     monkeypatch.setattr(
-        review_module, "require_ext_review_contract", lambda **_kwargs: "/usr/bin/purplemux"
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
     )
     monkeypatch.setattr(
         purplemux_client,
@@ -1329,8 +1340,7 @@ def test_review_monitor_handles_sharedindex_housekeeping(
         os.write(
             write_fd,
             b"".join(
-                struct.pack("iIII", descriptor, mask, 0, len(event_name))
-                + event_name
+                struct.pack("iIII", descriptor, mask, 0, len(event_name)) + event_name
                 for descriptor, mask, event_name in events
             ),
         )
