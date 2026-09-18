@@ -731,6 +731,7 @@ _REVIEW_FIX_DISPOSITIONS = {
     "fixed",
     "no_change_after_re_evaluation",
     "review_limit_reached",
+    "review_limit_reached_after_head_change",
     "reviewer_changed_head",
     "head_changed_before_disposition",
 }
@@ -993,6 +994,71 @@ def new_review_audit(
     )
 
 
+def whole_continuation_audit(
+    round_number: int, head_sha: str, disposition: str,
+) -> ReviewAuditRecord:
+    result = json.dumps({
+        "verdict": "CHANGES_REQUESTED",
+        "findings": ["Whole-version review continued with a warning."],
+        "policy_conflicts": [],
+    })
+    audit = new_review_audit(
+        "whole_version_continuation", round_number,
+        "CHANGES_REQUESTED", head_sha, result,
+    )
+    return ReviewAuditRecord(
+        audit.audit_id, audit.role, audit.round, audit.verdict,
+        audit.reviewed_sha, audit.findings, disposition,
+    )
+
+
+def whole_continuation_warning(disposition: str, limit: int) -> str:
+    if disposition == "review_limit_reached_after_head_change":
+        return (
+            f"Whole-version review limit {limit} was already reached "
+            "before the current head could complete review; keeping the Base PR "
+            "Draft and continuing without reviewer approval."
+        )
+    if disposition == "review_limit_reached":
+        return (
+            f"Whole-version review limit {limit} reached with "
+            "CHANGES_REQUESTED; keeping the Base PR Draft and continuing "
+            "without reviewer approval."
+        )
+    if disposition == "no_change_after_re_evaluation":
+        return (
+            "Whole-version reviewer requested changes, but the fixer "
+            "re-evaluated the findings and produced no code changes; "
+            "keeping the Base PR Draft and continuing without reviewer approval."
+        )
+    raise WorkerFailure("whole-version continuation disposition is invalid")
+
+
+def persist_whole_limit_head_change(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    *,
+    round_number: int,
+    reviewed_sha: str,
+    head: str,
+    base: str,
+) -> PullRequestState:
+    """Keep the exhausted loop count when an individual role changed the head."""
+    result = json.dumps({
+        "verdict": "CHANGES_REQUESTED",
+        "findings": ["Review head changed after the whole-version review limit."],
+        "policy_conflicts": [],
+    })
+    return persist_review_audit(
+        github, pr,
+        new_review_audit(
+            "whole_version_limit", round_number,
+            "CHANGES_REQUESTED", reviewed_sha, result,
+        ),
+        head=head, base=base,
+    )
+
+
 def allocate_review_audit(
     body: str, role: str, verdict: str, reviewed_sha: str, result: str
 ) -> ReviewAuditRecord:
@@ -1051,16 +1117,7 @@ def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
     records = [existing for existing in records if existing.audit_id != record.audit_id]
     records.append(record)
     while len(records) > MAX_REVIEW_AUDIT_RECORDS:
-        removable = next(
-            (
-                index
-                for index, existing in enumerate(records[:-1])
-                if any(
-                    later.role == existing.role for later in records[index + 1 :]
-                )
-            ),
-            None,
-        )
+        removable = _removable_review_audit_index(records)
         if removable is None:
             raise WorkerFailure(
                 "PR review audit cannot retain every role within its record bound"
@@ -1105,16 +1162,7 @@ def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
             and len(result.encode()) <= MAX_BASE_PR_BODY_BYTES
         ):
             return result
-        removable = next(
-            (
-                index
-                for index, existing in enumerate(records[:-1])
-                if any(
-                    later.role == existing.role for later in records[index + 1 :]
-                )
-            ),
-            None,
-        )
+        removable = _removable_review_audit_index(records)
         if removable is None:
             break
         records.pop(removable)
@@ -1122,6 +1170,28 @@ def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
         "PR review audit cannot retain the latest record for every role within "
         "the shared PR-body byte budget"
     )
+
+
+def _removable_review_audit_index(records: list[ReviewAuditRecord]) -> int | None:
+    """Retain the last role result and the evidence for a changed-head continuation."""
+    protected = {max(i for i, entry in enumerate(records) if entry.role == role)
+                 for role in {entry.role for entry in records}}
+    whole_roles = {
+        "scenario_gate", "design_principles", "whole_version", "version_readme",
+        "whole_version_limit",
+    }
+    for dispositions in (
+        {"review_limit_reached"},
+        {"reviewer_changed_head", "head_changed_before_disposition"},
+    ):
+        candidates = [
+            i for i, entry in enumerate(records)
+            if entry.role in whole_roles
+            and entry.fix_disposition in dispositions
+        ]
+        if candidates:
+            protected.add(candidates[-1])
+    return next((i for i in range(len(records)) if i not in protected), None)
 
 
 def persist_review_audit(
@@ -3688,6 +3758,80 @@ def review_whole_version(
         head=config.integration_branch,
         base=config.main_branch,
     )
+    audits = review_audit_from_body(pr.body)
+    latest_continuation = next(
+        (record for record in reversed(audits)
+         if record.role == "whole_version_continuation"),
+        None,
+    )
+    continuation = (
+        latest_continuation
+        if latest_continuation is not None
+        and latest_continuation.reviewed_sha == pr.head_sha
+        and latest_continuation.fix_disposition in (
+            "review_limit_reached", "review_limit_reached_after_head_change",
+            "no_change_after_re_evaluation",
+        )
+        else None
+    )
+    if continuation is not None:
+        warning = whole_continuation_warning(
+            continuation.fix_disposition, continuation.round
+        )
+        pr = require_warning_delivery(
+            repo, github, pr, head=config.integration_branch,
+            base=config.main_branch, expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+        )
+        emit_finding("github", warning, status="warning")
+        return pr, ReviewDelivery(
+            "continued_with_warning", pr.head_sha, pr.base_sha,
+            continuation.round, (warning,),
+        )
+    whole_roles = {
+        "scenario_gate", "design_principles", "whole_version", "version_readme",
+        "whole_version_limit",
+    }
+    latest_changed_head = next(
+        (record for record in reversed(audits)
+         if record.role in whole_roles
+         and record.fix_disposition in (
+             "reviewer_changed_head", "head_changed_before_disposition"
+         )),
+        None,
+    )
+    prior_limit = (
+        latest_changed_head
+        if latest_changed_head is not None
+        and latest_changed_head.round >= MAX_REVIEWS
+        and latest_changed_head.fix_sha == pr.head_sha
+        else None
+    )
+    required_roles = {"design_principles", "whole_version", "version_readme"}
+    if SCENARIOS:
+        required_roles.add("scenario_gate")
+    latest_by_role = {
+        role: next(
+            (record for record in reversed(audits) if record.role == role), None
+        )
+        for role in required_roles
+    }
+    complete_current_head = all(
+        record is not None
+        and record.reviewed_sha == pr.head_sha
+        and record.fix_disposition != "pending"
+        for record in latest_by_role.values()
+    )
+    completed_warning = next(
+        (record for record in latest_by_role.values()
+         if record is not None
+         and record.fix_disposition in (
+             "review_limit_reached", "no_change_after_re_evaluation"
+         )),
+        None,
+    ) if complete_current_head else None
+    if completed_warning is not None:
+        prior_limit = None
     fixer = create_agent(
         client,
         config,
@@ -3723,7 +3867,10 @@ def review_whole_version(
         else None
     )
     delivery: ReviewDelivery | None = None
-    for review_number in range(1, MAX_REVIEWS + 1):
+    for review_number in (
+        () if prior_limit is not None or completed_warning is not None
+        else range(1, MAX_REVIEWS + 1)
+    ):
         result: str
         resumed_records = tuple(
             record
@@ -3811,6 +3958,12 @@ def review_whole_version(
                     base=config.main_branch,
                     fix_sha=scenario_sha,
                 )
+                if review_number == MAX_REVIEWS:
+                    pr = persist_whole_limit_head_change(
+                        github, pr, round_number=review_number,
+                        reviewed_sha=scenario_audit.reviewed_sha,
+                        head=config.integration_branch, base=config.main_branch,
+                    )
                 emit_finding(
                     "git",
                     "Scenario Gate review changed the integration branch; "
@@ -3898,6 +4051,12 @@ def review_whole_version(
                 base=config.main_branch,
                 fix_sha=principles_sha,
             )
+            if review_number == MAX_REVIEWS:
+                pr = persist_whole_limit_head_change(
+                    github, pr, round_number=review_number,
+                    reviewed_sha=principles_audit.reviewed_sha,
+                    head=config.integration_branch, base=config.main_branch,
+                )
             emit_finding(
                 "git",
                 "design-principles review changed the integration branch; "
@@ -3971,6 +4130,12 @@ def review_whole_version(
                 base=config.main_branch,
                 fix_sha=reviewed_sha,
             )
+            if review_number == MAX_REVIEWS:
+                pr = persist_whole_limit_head_change(
+                    github, pr, round_number=review_number,
+                    reviewed_sha=whole_audit.reviewed_sha,
+                    head=config.integration_branch, base=config.main_branch,
+                )
             emit_finding(
                 "git",
                 "whole-version review changed the integration branch; "
@@ -4049,6 +4214,12 @@ def review_whole_version(
                 base=config.main_branch,
                 fix_sha=reviewed_sha,
             )
+            if review_number == MAX_REVIEWS:
+                pr = persist_whole_limit_head_change(
+                    github, pr, round_number=review_number,
+                    reviewed_sha=version_audit.reviewed_sha,
+                    head=config.integration_branch, base=config.main_branch,
+                )
             emit_finding(
                 "git",
                 "version and README review changed the integration branch; "
@@ -4198,6 +4369,15 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 expected_head_sha=current.head_sha,
                 expected_base_sha=current.base_sha,
             )
+            pr = persist_review_audit(
+                github, pr,
+                whole_continuation_audit(
+                    review_number, current.head_sha,
+                    "review_limit_reached" if review_number == MAX_REVIEWS
+                    else "no_change_after_re_evaluation",
+                ),
+                head=config.integration_branch, base=config.main_branch,
+            )
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", "Whole-version review")
             emit_finding("github", warning, status="warning")
@@ -4209,6 +4389,41 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 (warning,),
             )
         break
+    if prior_limit is not None or completed_warning is not None:
+        continuation_round = (
+            MAX_REVIEWS if prior_limit is not None else completed_warning.round
+        )
+        disposition = (
+            "review_limit_reached_after_head_change" if prior_limit is not None
+            else completed_warning.fix_disposition
+        )
+        warning = whole_continuation_warning(disposition, continuation_round)
+        run_final_checks(client, config)
+        checked_sha, changed = require_agent_result(
+            repo, client, fixer, config.integration_branch, pr.head_sha,
+            allow_unchanged=True, iteration=continuation_round,
+        )
+        if changed or checked_sha != pr.head_sha:
+            raise WorkerFailure(
+                "final checks changed the integration branch at the review limit"
+            )
+        pr = require_warning_delivery(
+            repo, github, pr, head=config.integration_branch,
+            base=config.main_branch, expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+        )
+        pr = persist_review_audit(
+            github, pr,
+            whole_continuation_audit(
+                continuation_round, pr.head_sha, disposition,
+            ),
+            head=config.integration_branch, base=config.main_branch,
+        )
+        emit_finding("github", warning, status="warning")
+        delivery = ReviewDelivery(
+            "continued_with_warning", pr.head_sha, pr.base_sha,
+            continuation_round, (warning,),
+        )
     if delivery is None:
         raise WorkerFailure("whole-version review ended without a review outcome")
     return pr, delivery
