@@ -2291,6 +2291,7 @@ class PythonRunner:
                     cwd=str(run_cwd),
                     name=tab_name,
                     correlation_id=correlation,
+                    max_output_chars=self._max_output_chars,
                 ),
                 on_created=created,
             )

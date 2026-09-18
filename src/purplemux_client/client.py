@@ -122,6 +122,7 @@ class ShellCommandRequest:
     name: str
     correlation_id: str | None = None
     deadline_check: Callable[[], float] | None = None
+    max_output_chars: int = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -902,6 +903,8 @@ class PurpleMuxCLIClient:
             raise ValueError("shell terminal name must not be empty")
         if "\0" in request.command or "\0" in request.name or "\0" in request.cwd:
             raise ValueError("shell request values must not contain null bytes")
+        if request.max_output_chars < 1:
+            raise ValueError("max_output_chars must be positive")
         cwd = os.path.abspath(os.path.expanduser(request.cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"shell working directory is not a directory: {cwd}")
@@ -938,7 +941,9 @@ class PurpleMuxCLIClient:
         self._shell_runs[session_id] = _ShellRun(result_path=result_path, cwd=cwd)
         if on_created is not None:
             on_created(session_id, result_path)
-        wrapper = self._shell_wrapper(request.command, cwd, result_path)
+        wrapper = self._shell_wrapper(
+            request.command, cwd, result_path, request.max_output_chars
+        )
         try:
             self._send_mutation(
                 session_id,
@@ -1308,7 +1313,9 @@ class PurpleMuxCLIClient:
         return tail or None
 
     @staticmethod
-    def _shell_wrapper(command: str, cwd: str, result_path: str) -> str:
+    def _shell_wrapper(
+        command: str, cwd: str, result_path: str, max_output_chars: int = 1_000_000
+    ) -> str:
         command_text = shlex.quote(command)
         cwd_text = shlex.quote(cwd)
         result_text = shlex.quote(result_path)
@@ -1317,13 +1324,18 @@ class PurpleMuxCLIClient:
         stderr_text = shlex.quote(f"{result_path}.stderr")
         stdout_pipe = shlex.quote(f"{result_path}.stdout.pipe")
         stderr_pipe = shlex.quote(f"{result_path}.stderr.pipe")
+        capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_capture"
+        capture_chars = max_output_chars + 1
         return (
             f"mkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
-            f"tee -- {stdout_text} < {stdout_pipe} & __awm_stdout_pid=$!; "
-            f"tee -- {stderr_text} < {stderr_pipe} >&2 & __awm_stderr_pid=$!; "
+            f"{capture} {stdout_text} {capture_chars} 1 "
+            f"< {stdout_pipe} & __awm_stdout_pid=$!; "
+            f"{capture} {stderr_text} {capture_chars} 2 "
+            f"< {stderr_pipe} & __awm_stderr_pid=$!; "
             f"__awm_exit=0; (cd -- {cwd_text} && bash -lc {command_text}) "
             f"> {stdout_pipe} 2> {stderr_pipe} || __awm_exit=$?; "
-            f"wait $__awm_stdout_pid; wait $__awm_stderr_pid; "
+            f"wait $__awm_stdout_pid || exit 1; "
+            f"wait $__awm_stderr_pid || exit 1; "
             f"rm -- {stdout_pipe} {stderr_pipe}; "
             f"printf '{{\"exitCode\":%s}}\\n' "
             f'"$__awm_exit" > {pending_result_text} && '

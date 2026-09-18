@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -463,6 +465,42 @@ def test_managed_shell_result_captures_both_visible_streams(
         execution.stdout,
         execution.stderr,
     )
+    cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
+def test_managed_shell_capture_bounds_sidecars_before_result_read(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    script = (
+        'import sys; sys.stdout.write("é" * 100000 + "stdout"); '
+        'sys.stderr.write("日" * 100000 + "stderr")'
+    )
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+            cwd=str(tmp_path),
+            name="Bounded capture",
+            max_output_chars=8,
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    execution = subprocess.run(
+        ["bash", "-c", wrapper], capture_output=True, text=True, timeout=10
+    )
+    assert execution.returncode == 0
+    assert execution.stdout == "é" * 100000 + "stdout"
+    assert execution.stderr == "日" * 100000 + "stderr"
+    result = cli._read_shell_result_file(session_id)
+    assert result is not None
+    assert result.stdout == "éééstdout"
+    assert result.stderr == "日日日stderr"
+    result_path = cli._shell_runs[session_id].result_path
+    assert os.stat(f"{result_path}.stdout").st_size <= 9 * 4
+    assert os.stat(f"{result_path}.stderr").st_size <= 9 * 4
     cli._cleanup_shell_result(cli._shell_runs[session_id])
 
 

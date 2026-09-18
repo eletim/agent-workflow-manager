@@ -280,6 +280,8 @@ def test_managed_result_output_is_bounded_and_reloaded(
     runner.configure_event_endpoint("http://127.0.0.1:1")
     try:
         run_id = runner.start("print('managed')")
+        assert client.request is not None
+        assert client.request.max_output_chars == output_limit
         client.release.set()
         finished = _wait_for_state(runner, "success" if exit_code == 0 else "failed")
         assert finished.exit_code == exit_code
