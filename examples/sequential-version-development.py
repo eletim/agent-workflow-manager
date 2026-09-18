@@ -64,6 +64,7 @@ MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
 MAX_RECOVERY_STATE_BYTES = 32_000
 MAX_RECOVERY_REPORT_BYTES = 2_000
+MAX_REPOSITORY_RECOVERIES = 2
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -4479,6 +4480,28 @@ def recovery_authoritative_state(
     return json.dumps(state, ensure_ascii=True)
 
 
+def require_recovery_retry_state(source: str) -> None:
+    """Require the topology needed to safely start a fresh repository pass."""
+    state = json.loads(source)
+    if any(key.endswith("_inspection_error") for key in state):
+        raise WorkerFailure("recovery outcome is uncertain: topology inspection failed")
+    worktree = state.get("worktree")
+    remote_heads = state.get("remote_heads")
+    if (
+        not isinstance(worktree, dict)
+        or worktree.get("dirty") is not False
+        or not isinstance(remote_heads, dict)
+        or not remote_heads.get(state["integration_branch"])
+        or not remote_heads.get(state["final_branch"])
+        or "base_pr" not in state
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: repository state is incomplete")
+    if state["work_item_plan"].get("active") is not None and (
+        "active_branch" not in state or "active_prs" not in state
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: active work item is incomplete")
+
+
 def run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
@@ -4499,32 +4522,46 @@ def run_repository(
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
-    plan: WorkItemPlan | None = None
-    try:
-        plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
-        work_items = run_outline_step(
-            "Work items",
-            lambda: process_work_items(config, client, repo, github, plan_pr, plan),
-        )
-        ready = integration_delivery(
-            config, work_items, client, repo, github, deferred_deliveries
-        )
+    for recovery_attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        plan: WorkItemPlan | None = None
+        delivery_count = len(deferred_deliveries) if deferred_deliveries is not None else 0
+        try:
+            plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
+            work_items = run_outline_step(
+                "Work items",
+                lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+            )
+            ready = integration_delivery(
+                config, work_items, client, repo, github, deferred_deliveries
+            )
+        except Exception as exc:
+            if isinstance(exc, MutationOutcomeUnknown) or (
+                deferred_deliveries is not None
+                and len(deferred_deliveries) != delivery_count
+            ):
+                raise
+            if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
+                raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            state = recovery_authoritative_state(config, repo, github, plan)
+            report = recover_error(client, config, exc, state)
+            print(
+                f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
+                f"Evidence: {report.evidence}",
+                flush=True,
+            )
+            if not report.repaired or not report.retry_safe:
+                raise
+            require_recovery_retry_state(
+                recovery_authoritative_state(config, repo, github, plan)
+            )
+            POLICY_CONFLICT_WARNINGS.clear()
+            AGENT_TURN_TIMEOUT_WARNINGS.clear()
+            ISSUE_HANDOFF_RESULTS.clear()
+            continue
         if deferred_deliveries is None:
             report_repository_delivery(config, ready)
         return ready
-    except Exception as exc:
-        report = recover_error(
-            client,
-            config,
-            exc,
-            recovery_authoritative_state(config, repo, github, plan),
-        )
-        print(
-            f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
-            f"Evidence: {report.evidence}",
-            flush=True,
-        )
-        raise
+    raise AssertionError("unreachable")
 
 
 def main() -> None:

@@ -2481,6 +2481,138 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
     )
 
 
+def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_remote_branches=lambda branches: {
+            branch: "a" * 40 for branch in branches
+        },
+    )
+    github = SimpleNamespace(find_pr=lambda **kwargs: None)
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(open=lambda *args, **kwargs: github)
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["run_outline_step"] = lambda name, action: action()
+    plans: list[object] = []
+
+    def prepare(*args):
+        if not plans:
+            plans.append("failed")
+            raise WorkerFailure("plan failed")
+        plan = workflow["WorkItemPlan"](config)
+        plans.append(plan)
+        return None, plan
+
+    workflow["prepare_work_item_plan_pr"] = prepare
+    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+        True, True, "Repaired plan.", "Inspected remote state."
+    )
+    workflow["process_work_items"] = lambda *args: ()
+    workflow["integration_delivery"] = lambda *args: "delivered"
+    workflow["report_repository_delivery"] = lambda *args: None
+
+    assert workflow["run_repository"](config) == "delivered"
+    assert len(plans) == 2
+    assert plans[1] is not plans[0]
+
+
+def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=True, status=(" M file",)
+        ),
+        inspect_remote_branches=lambda branches: {
+            branch: "a" * 40 for branch in branches
+        },
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: SimpleNamespace(find_pr=lambda **kwargs: None)
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    attempts: list[int] = []
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (
+        attempts.append(1),
+        (_ for _ in ()).throw(WorkerFailure("plan failed")),
+    )
+    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+        True, True, "Repaired plan.", "Inspected remote state."
+    )
+
+    with pytest.raises(WorkerFailure, match="recovery outcome is uncertain"):
+        workflow["run_repository"](config)
+    assert len(attempts) == 1
+
+
+def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        MutationOutcomeUnknown("response lost")
+    )
+    workflow["recover_error"] = lambda *args: pytest.fail("must not recover")
+
+    with pytest.raises(MutationOutcomeUnknown, match="response lost"):
+        workflow["run_repository"](config)
+
+
+def test_repository_recovery_has_a_finite_retry_limit() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: json.dumps(
+        {
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "work_item_plan": {"active": None},
+            "worktree": {"dirty": False},
+            "remote_heads": {"dev/v1": "a" * 40, "main": "b" * 40},
+            "base_pr": None,
+        }
+    )
+    attempts: list[int] = []
+
+    def fail(*args):
+        attempts.append(1)
+        raise WorkerFailure("plan failed")
+
+    workflow["prepare_work_item_plan_pr"] = fail
+    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+        True, True, "Repaired plan.", "Inspected remote state."
+    )
+
+    with pytest.raises(WorkerFailure, match="retry limit exceeded"):
+        workflow["run_repository"](config)
+    assert len(attempts) == workflow["MAX_REPOSITORY_RECOVERIES"] + 1
+
+
 def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
     workflow = load_generated_workflow(
         work_items=[{"id": "repair-guide", "task": "Repair the workflow guide."}]
