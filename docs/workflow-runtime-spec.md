@@ -113,6 +113,18 @@ Checkpoint and in-place Resume are not part of the Workflow contract. A failed
 or stopped Python process is not reconstructed or replayed. Its run record,
 output, findings, and owned resources remain inspectable until explicit Cleanup.
 
+While an Issue Driven workflow is still running, its plain Python code may handle
+a repository step failure with a bounded recovery attempt. It inspects current
+Git, GitHub, worktree, and work-item plan state, then starts a fresh recovery agent
+for that error. The agent returns a validated, size-limited report with a repair
+decision, retry-safety decision, summary, and post-repair evidence. Python
+re-inspects authoritative state before restarting the repository pass with a
+fresh plan. A verified repair emits runtime warning Findings containing the
+original error and the repair evidence; these remain visible even if the pass
+later succeeds. An unrepaired, unsafe, or uncertain outcome fails the run. The
+retry limit is finite, and an unknown mutation outcome is never retried. The
+Runner stores the Findings but does not interpret the report or schedule retries.
+
 For Issue Driven mode, the UI's Review & Resume action confirms the original
 immutable settings and starts a distinct run. Prompt and custom Python Workflow
 recovery is authored as a new run manually. The new workflow uses normal Python inspection of
