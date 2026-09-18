@@ -570,9 +570,9 @@ The generated Python remains an implementation detail rather than an editable or
 historical UI field.
 
 **Python Workflow** executes arbitrary Python with the current Python interpreter in a
-visible PurpleMux-managed Bash tab. PurpleMux terminal output is the detailed
-stdout/stderr inspection surface; AWM shows structured Progress, Findings,
-bounded failure diagnostics, the managed-shell exit code, and the
+visible PurpleMux-managed Bash tab. AWM saves bounded stdout and stderr in Run
+history and detail, alongside structured Progress, Findings, bounded failure
+diagnostics, the managed-shell exit code, and the
 idle/running/success/failed/stopped/validation_failed state. Validate remains a
 side-effect-free static check and Dry Run remains a pre-execution local
 inspection. Run performs preflight before creating the PurpleMux workspace and
