@@ -2870,6 +2870,65 @@ def test_retry_preserves_ready_warning_after_no_change_re_evaluation() -> None:
     assert (result.outcome, result.warnings) == ("continued_with_warning", (warning,))
 
 
+@pytest.mark.parametrize("persisted_head_change", [True, False])
+def test_retry_review_limit_before_current_head_requires_persisted_transition(
+    persisted_head_change: bool,
+) -> None:
+    workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    ready = topology_pr(number=90, head_branch=issue.branch, draft=False)
+    previous_head = "e" * 40
+    approved_result = '{"verdict":"APPROVED","findings":[],"policy_conflicts":[]}'
+    requested_result = (
+        '{"verdict":"CHANGES_REQUESTED","findings":["Repair behavior."],'
+        '"policy_conflicts":[]}'
+    )
+    scope = workflow["new_review_audit"](
+        "scope_design", workflow["MAX_SCOPE_REVIEWS"], "APPROVED",
+        previous_head, approved_result,
+    )
+    correction = workflow["new_review_audit"](
+        "correctness", 1, "CHANGES_REQUESTED", previous_head, requested_result,
+    )
+    correction = replace(
+        correction, fix_disposition="fixed",
+        fix_sha=ready.head_sha if persisted_head_change else "d" * 40,
+    )
+    correctness = workflow["new_review_audit"](
+        "correctness", 2, "APPROVED", ready.head_sha, approved_result,
+    )
+    for audit in (scope, correction, correctness):
+        ready = replace(ready, body=workflow["with_review_audit"](ready.body, audit))
+    warning = (
+        f"{issue.label} scope/design review limit {workflow['MAX_SCOPE_REVIEWS']} "
+        "was already reached before the current head could complete this phase; "
+        "continuing without reviewer approval."
+    )
+    workflow["record_issue_handoff_result"](
+        issue.result_id, issue.label, ready, "continued_with_warning", 8, (warning,)
+    )
+    workflow["prepare_issue"] = lambda *args: (ready, ready.head_sha, True)
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(dirty=False),
+        require_pushed=lambda branch: BranchState(
+            branch, ready.head_sha, ready.head_sha, True
+        ),
+    )
+    github = SimpleNamespace(require_pr=lambda **kwargs: ready)
+    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail("review reran")
+    workflow["emit_issue_result"] = lambda *args, **kwargs: None
+
+    if persisted_head_change:
+        assert workflow["process_issue"](issue, config, object(), repo, github) is ready
+        assert workflow["ISSUE_HANDOFF_RESULTS"][0].warnings == (warning,)
+    else:
+        with pytest.raises(WorkerFailure, match="persisted scope_design review evidence"):
+            workflow["process_issue"](issue, config, object(), repo, github)
+
+
 def test_retry_rejects_ready_pr_without_persisted_review_evidence() -> None:
     workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
     issue = workflow["Issue"](90, "feature/issue-90")

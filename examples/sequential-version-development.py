@@ -2623,12 +2623,15 @@ def process_issue(
         )
         require_inline_task_pr_fingerprint(ready, issue.task_fingerprint)
         audits = review_audit_from_body(ready.body)
-        for role in ("scope_design", "correctness"):
+        for role, phase, limit in (
+            ("scope_design", "scope/design", MAX_SCOPE_REVIEWS),
+            ("correctness", "correctness", MAX_REVIEWS),
+        ):
             role_audits = [
                 record for record in audits
                 if record.role == role and record.reviewed_sha == ready.head_sha
             ]
-            if not role_audits or not any(
+            reviewed_current_head = any(
                 (record.verdict == "APPROVED" and record.fix_disposition == "not_required")
                 or (
                     previous_result.outcome == "continued_with_warning"
@@ -2639,7 +2642,33 @@ def process_issue(
                     )
                 )
                 for record in role_audits
-            ):
+            )
+            limit_warning = (
+                f"{issue.label} {phase} review limit {limit} was already "
+                "reached before the current head could complete this phase; continuing "
+                "without reviewer approval."
+            )
+            limit_before_current_head = (
+                previous_result.outcome == "continued_with_warning"
+                and limit_warning in previous_result.warnings
+                and any(
+                    record.role == role
+                    and record.round >= limit
+                    and record.reviewed_sha != ready.head_sha
+                    and record.fix_disposition != "pending"
+                    for record in audits
+                )
+                and any(
+                    record.fix_sha == ready.head_sha
+                    and record.fix_disposition in (
+                        "fixed",
+                        "reviewer_changed_head",
+                        "head_changed_before_disposition",
+                    )
+                    for record in audits
+                )
+            )
+            if not (reviewed_current_head or limit_before_current_head):
                 raise WorkerFailure(
                     f"reviewed {issue.label} lacks persisted {role} review evidence"
                 )
