@@ -62,6 +62,8 @@ MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
+MAX_RECOVERY_STATE_BYTES = 8_000
+MAX_RECOVERY_REPORT_BYTES = 2_000
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -595,6 +597,82 @@ def run_validated_turn(
                 warning_scope=warning_scope,
             )
     raise AssertionError("unreachable")
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    repaired: bool
+    retry_safe: bool
+    summary: str
+    evidence: str
+
+
+def parse_recovery_report(source: str) -> RecoveryReport:
+    """Accept only a bounded account with evidence for a safe retry."""
+    if len(source.encode("utf-8")) > MAX_RECOVERY_REPORT_BYTES:
+        raise WorkerFailure("recovery report exceeds its size limit")
+    try:
+        value = json.loads(source)
+    except (UnicodeError, ValueError) as exc:
+        raise WorkerFailure("recovery report must be one JSON object") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "repaired",
+        "retry_safe",
+        "summary",
+        "evidence",
+    }:
+        raise WorkerFailure("recovery report has invalid fields")
+    if type(value["repaired"]) is not bool or type(value["retry_safe"]) is not bool:
+        raise WorkerFailure("recovery report decisions must be booleans")
+    for field_name in ("summary", "evidence"):
+        field_value = value[field_name]
+        if (
+            not isinstance(field_value, str)
+            or not field_value
+            or field_value != field_value.strip()
+            or "\n" in field_value
+            or "\0" in field_value
+            or len(field_value.encode("utf-8")) > 500
+        ):
+            raise WorkerFailure(f"recovery report {field_name} is invalid")
+    if value["retry_safe"] and not value["repaired"]:
+        raise WorkerFailure("recovery cannot recommend retry without a repair")
+    return RecoveryReport(**value)
+
+
+def recover_error(
+    client: PurpleMuxCLIClient,
+    config: Config,
+    error: BaseException,
+    authoritative_state: str,
+) -> RecoveryReport:
+    """Start a dedicated recovery Agent for this error, never a resident agent."""
+    if not isinstance(authoritative_state, str) or not authoritative_state.strip():
+        raise WorkerFailure("recovery requires current authoritative state")
+    if len(authoritative_state.encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
+        raise WorkerFailure("recovery authoritative state exceeds its size limit")
+    agent = create_agent(
+        client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
+    )
+    _, report = run_validated_turn(
+        client,
+        agent,
+        "Recovery assessment",
+        "Investigate this workflow error using the current authoritative state "
+        "below. Make only a safe, necessary repair, then re-inspect the affected "
+        "state. If the outcome is uncertain, report retry_safe as false. "
+        "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
+        "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
+        "fingerprint markers. Return exactly one JSON object with boolean "
+        "repaired and retry_safe fields and concise single-line summary and "
+        "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
+        "the state after repair when recommending retry. No other fields or "
+        "prose.\n\n"
+        f"Error: {short_error(error)}\n\n"
+        f"Current authoritative state:\n{authoritative_state}",
+        parse_recovery_report,
+    )
+    return report
 
 
 def implementer_prompt(prompt: str) -> str:

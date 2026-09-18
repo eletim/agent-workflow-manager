@@ -2240,6 +2240,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
             calls[text] = agent_type.id
 
     assert calls == {
+        "Recovery agent": "IMPLEMENTER_AGENT",
         " worktree cleanup": "IMPLEMENTER_AGENT",
         " implementer": "IMPLEMENTER_AGENT",
         " scope reviewer": "REVIEWER_AGENT",
@@ -2378,6 +2379,57 @@ def load_generated_workflow(**overrides: object) -> dict[str, object]:
     finally:
         del sys.modules[module_name]
     return module.__dict__
+
+
+def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    agents: list[tuple[str, str]] = []
+    prompts: list[str] = []
+    workflow["create_agent"] = lambda client, config, *, agent_type, name: (
+        agents.append((agent_type, name)) or f"recovery-{len(agents)}"
+    )
+
+    def run_validated(client, agent, name, prompt, validator):
+        prompts.append(prompt)
+        return "", validator(
+            json.dumps(
+                {
+                    "repaired": True,
+                    "retry_safe": True,
+                    "summary": "Restored the missing remote branch.",
+                    "evidence": "Remote branch now points to the expected commit.",
+                }
+            )
+        )
+
+    workflow["run_validated_turn"] = run_validated
+    first = workflow["recover_error"](
+        None, config, RuntimeError("first"), "branch: absent"
+    )
+    second = workflow["recover_error"](
+        None, config, RuntimeError("second"), "branch: present"
+    )
+
+    assert agents == [("codex", "Recovery agent"), ("codex", "Recovery agent")]
+    assert first.retry_safe and second.repaired
+    assert "first" in prompts[0] and "branch: absent" in prompts[0]
+    assert "second" in prompts[1] and "branch: present" in prompts[1]
+
+
+def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    parse_report = workflow["parse_recovery_report"]
+    for value in (
+        '{"repaired":false,"retry_safe":true,"summary":"ok","evidence":"ok"}',
+        '{"repaired":1,"retry_safe":false,"summary":"ok","evidence":"ok"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":""}',
+        "x" * 2001,
+    ):
+        with pytest.raises(WorkerFailure, match="recovery"):
+            parse_report(value)
 
 
 def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None:
