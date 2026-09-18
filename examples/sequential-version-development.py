@@ -30,6 +30,7 @@ from purplemux_client import (
     PurpleMuxRuntime,
     ShellCommandRequest,
     WorkerFailure,
+    WorkerInterrupted,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -2621,6 +2622,22 @@ def process_issue(
             draft=False,
         )
         require_inline_task_pr_fingerprint(ready, issue.task_fingerprint)
+        audits = review_audit_from_body(ready.body)
+        for role in ("scope_design", "correctness"):
+            role_audits = [
+                record for record in audits
+                if record.role == role and record.reviewed_sha == ready.head_sha
+            ]
+            if not role_audits or not any(
+                record.verdict == "APPROVED"
+                and record.fix_disposition == "not_required"
+                or previous_result.outcome == "continued_with_warning"
+                and record.fix_disposition == "review_limit_reached"
+                for record in role_audits
+            ):
+                raise WorkerFailure(
+                    f"reviewed {issue.label} lacks persisted {role} review evidence"
+                )
         record_issue_handoff_result(
             issue.result_id,
             issue.label,
@@ -4460,6 +4477,43 @@ def recovery_authoritative_state(
         "integration_branch": config.integration_branch,
         "final_branch": config.main_branch,
     }
+    if plan is not None:
+        try:
+            base_pr = github.find_pr(
+                head=config.integration_branch, base=config.main_branch, state="OPEN"
+            )
+            if base_pr is not None:
+                persisted = work_item_plan_from_body(base_pr.body, config)
+            else:
+                merged = github.find_pr(
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="MERGED",
+                )
+                if merged is not None:
+                    persisted = work_item_plan_from_body(merged.body, config)
+                else:
+                    final = repo.inspect_branch(config.main_branch)
+                    if final.remote_sha is None:
+                        raise WorkerFailure("final remote branch is missing")
+                    body = repo.inspect_remote_note(
+                        deferred_work_item_plan_ref(config), final.remote_sha
+                    )
+                    persisted = (
+                        WorkItemPlan(config)
+                        if body is None
+                        else work_item_plan_from_body(body, config)
+                    )
+            if serialized_work_item_plan(persisted) != serialized_work_item_plan(plan):
+                state["process_plan_differs_from_persisted"] = True
+            if plan.active is not None:
+                if plan.active not in persisted.items:
+                    raise WorkerFailure("active work item differs from persisted plan")
+                persisted.active = plan.active
+            plan = persisted
+        except Exception as exc:
+            state["work_item_plan_inspection_error"] = short_error(exc)
+            plan = None
     if plan is None:
         state["work_item_plan"] = {
             "status": "unavailable before plan preparation completed",
@@ -4553,7 +4607,7 @@ def recovery_authoritative_state(
     return json.dumps(state, ensure_ascii=True)
 
 
-def require_recovery_retry_state(source: str) -> None:
+def require_recovery_retry_state(source: str, expected_source: str | None = None) -> None:
     """Require the topology needed to safely start a fresh repository pass."""
     state = json.loads(source)
     if any(key.endswith("_inspection_error") for key in state):
@@ -4573,6 +4627,49 @@ def require_recovery_retry_state(source: str) -> None:
         "active_branch" not in state or "active_prs" not in state
     ):
         raise WorkerFailure("recovery outcome is uncertain: active work item is incomplete")
+    active = state["work_item_plan"].get("active")
+    if active is not None:
+        branch = state["active_branch"]
+        prs = state["active_prs"]
+        if (
+            branch.get("name") != active["branch"]
+            or branch.get("current") != (worktree.get("current_branch") == active["branch"])
+            or not branch.get("local_sha")
+            or branch.get("remote_sha") != branch.get("local_sha")
+            or len(prs) > 1
+            or any(
+                not isinstance(pr.get("number"), int)
+                or pr.get("state") not in ("OPEN", "MERGED", "CLOSED")
+                or (pr.get("state") == "OPEN" and (
+                    pr.get("head_sha") != branch["remote_sha"]
+                    or pr.get("base_sha") != remote_heads[state["integration_branch"]]
+                ))
+                for pr in prs
+            )
+        ):
+            raise WorkerFailure("recovery outcome is uncertain: active branch or PR changed")
+    base_pr = state["base_pr"]
+    if base_pr is not None and (
+        base_pr.get("head_sha") != remote_heads[state["integration_branch"]]
+        or base_pr.get("base_sha") != remote_heads[state["final_branch"]]
+        or not isinstance(base_pr.get("number"), int)
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: Base PR changed")
+    if expected_source is not None:
+        expected = json.loads(expected_source)
+        prior_prs = expected.get("active_prs")
+        if isinstance(prior_prs, list) and prior_prs:
+            prior_numbers = {pr.get("number") for pr in prior_prs}
+            current_prs = state.get("active_prs")
+            if not isinstance(current_prs, list) or any(
+                pr.get("number") not in prior_numbers for pr in current_prs
+            ):
+                raise WorkerFailure("recovery outcome is uncertain: active PR identity changed")
+        prior_base = expected.get("base_pr")
+        if prior_base is not None and base_pr is not None and (
+            prior_base.get("number") != base_pr.get("number")
+        ):
+            raise WorkerFailure("recovery outcome is uncertain: Base PR identity changed")
 
 
 def run_repository(
@@ -4609,7 +4706,7 @@ def run_repository(
                 config, work_items, client, repo, github, deferred_deliveries
             )
         except Exception as exc:
-            if isinstance(exc, MutationOutcomeUnknown) or (
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)) or (
                 deferred_deliveries is not None
                 and len(deferred_deliveries) != delivery_count
             ):
@@ -4626,7 +4723,7 @@ def run_repository(
             if not report.repaired or not report.retry_safe:
                 raise
             require_recovery_retry_state(
-                recovery_authoritative_state(config, repo, github, plan)
+                recovery_authoritative_state(config, repo, github, plan), state
             )
             emit_finding(
                 "runtime",
@@ -4638,8 +4735,6 @@ def run_repository(
                 f"Recovery repair: {report.summary} Evidence: {report.evidence}",
                 status="warning",
             )
-            POLICY_CONFLICT_WARNINGS.clear()
-            AGENT_TURN_TIMEOUT_WARNINGS.clear()
             continue
         if deferred_deliveries is None:
             report_repository_delivery(config, ready)

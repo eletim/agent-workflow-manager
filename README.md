@@ -197,6 +197,13 @@ each declared repository, so matching branch or PR names in another repository
 cannot supply its recovery state. Prompt and custom Python Workflow runs continue
 to use manual recovery.
 
+During an active Issue Driven run, a repository step failure can start a fresh
+recovery agent. After a verified repair, the workflow re-inspects persisted plan,
+Git, and PR state and retries the repository pass at most twice. An interrupted
+agent turn or uncertain mutation outcome stops the run. Each successful recovery
+records WARN findings for the original error and repair evidence; timeout and
+policy conflict warnings from earlier attempts remain in the final handoff.
+
 For one-shot delivery, replace the initial `issues` / `work_items` list with a
 single `one_shot_issue`. The generated workflow starts with an empty plan and its
 dedicated manager reads that source Issue before every planning turn, decomposes

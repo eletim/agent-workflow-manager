@@ -131,8 +131,9 @@ recovery is authored as a new run manually. The new workflow uses normal Python 
 authoritative Git, GitHub, and PurpleMux state before deciding whether existing
 external work can be reused. Mutation helpers retain their mutation-once,
 postcondition reconciliation, and `MutationOutcomeUnknown` behavior; an unknown
-outcome is inspected and must never be blindly retried. This is not a durable
-workflow engine, graph, state machine, or automatic retry facility. Obsolete
+outcome is inspected and must never be blindly retried. The Issue Driven Python
+workflow can retry its repository pass after verified repair as described above;
+the Runner does not provide a general automatic retry facility. Obsolete
 checkpoint fields from older data or inherited environments are ignored and
 must never trigger replay.
 

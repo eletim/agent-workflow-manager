@@ -20,6 +20,7 @@ from purplemux_client import (
     MutationOutcomeUnknown,
     PullRequestState,
     WorkerFailure,
+    WorkerInterrupted,
 )
 from purplemux_client.github import PullRequestSnapshot
 from purplemux_client.issue_driven import (
@@ -2548,6 +2549,10 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
 
     def prepare(*args):
         if not plans:
+            workflow["POLICY_CONFLICT_WARNINGS"].append((None, "earlier policy warning"))
+            workflow["AGENT_TURN_TIMEOUT_WARNINGS"].append(
+                workflow["AgentTurnTimeoutWarning"](None, "earlier turn", "earlier timeout")
+            )
             plans.append("failed")
             raise WorkerFailure("plan failed")
         plan = workflow["WorkItemPlan"](config)
@@ -2569,6 +2574,9 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     assert workflow["run_repository"](config) == "delivered"
     assert len(plans) == 2
     assert plans[1] is not plans[0]
+    assert workflow["summary_warnings"](None) == (
+        "earlier timeout", "earlier policy warning"
+    )
     assert findings == [
         ("runtime", "Recovered workflow error: plan failed", "warning"),
         (
@@ -2643,6 +2651,47 @@ def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
     with pytest.raises(MutationOutcomeUnknown, match="response lost"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+
+
+def test_repository_does_not_recover_interrupted_turn() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](Path("/repo"), "acme/project", "dev/v1", "main", (), "true")
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    workflow["GitHubRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerInterrupted("turn interrupted")
+    )
+    workflow["recover_error"] = lambda *args: pytest.fail("interruption entered recovery")
+    with pytest.raises(WorkerInterrupted, match="interrupted"):
+        workflow["run_repository"](config)
+
+
+def test_retry_state_rejects_mismatched_active_and_base_pr_heads() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    state = {
+        "integration_branch": "dev/v1", "final_branch": "main",
+        "work_item_plan": {"active": {"branch": "feature/issue-90"}},
+        "worktree": {"dirty": False, "current_branch": "feature/issue-90"},
+        "remote_heads": {"dev/v1": "a" * 40, "main": "b" * 40},
+        "active_branch": {"name": "feature/issue-90", "local_sha": "c" * 40,
+                          "remote_sha": "c" * 40, "current": True},
+        "active_prs": [{"number": 90, "state": "OPEN", "head_sha": "d" * 40,
+                        "base_sha": "a" * 40}],
+        "base_pr": None,
+    }
+    with pytest.raises(WorkerFailure, match="active branch or PR changed"):
+        workflow["require_recovery_retry_state"](json.dumps(state))
+    state["active_prs"][0]["head_sha"] = "c" * 40
+    state["base_pr"] = {"number": 91, "head_sha": "d" * 40, "base_sha": "b" * 40}
+    with pytest.raises(WorkerFailure, match="Base PR changed"):
+        workflow["require_recovery_retry_state"](json.dumps(state))
+    state["base_pr"]["head_sha"] = "a" * 40
+    expected = json.dumps(state)
+    state["active_prs"][0]["number"] = 92
+    with pytest.raises(WorkerFailure, match="active PR identity changed"):
+        workflow["require_recovery_retry_state"](json.dumps(state), expected)
 
 
 def test_repository_recovery_has_a_finite_retry_limit() -> None:
@@ -2724,6 +2773,12 @@ def test_retry_preserves_reviewed_ready_item_without_reopening_review() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
     )
     ready = topology_pr(number=90, head_branch=issue.branch, draft=False)
+    for role in ("scope_design", "correctness"):
+        audit = workflow["new_review_audit"](
+            role, 1, "APPROVED", ready.head_sha,
+            '{"verdict":"APPROVED","findings":[],"policy_conflicts":[]}',
+        )
+        ready = replace(ready, body=workflow["with_review_audit"](ready.body, audit))
     workflow["record_issue_handoff_result"](
         issue.result_id, issue.label, ready, "approved", 2, ()
     )
@@ -2777,6 +2832,26 @@ def test_retry_rejects_changed_reviewed_ready_pr_before_draft_mutation() -> None
         workflow["process_issue"](issue, config, object(), repo, github)
 
 
+def test_retry_rejects_ready_pr_without_persisted_review_evidence() -> None:
+    workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    ready = topology_pr(number=90, head_branch=issue.branch, draft=False)
+    workflow["record_issue_handoff_result"](
+        issue.result_id, issue.label, ready, "approved", 2, ()
+    )
+    workflow["prepare_issue"] = lambda *args: (ready, ready.head_sha, True)
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(dirty=False),
+        require_pushed=lambda branch: BranchState(branch, ready.head_sha, ready.head_sha, True),
+    )
+    github = SimpleNamespace(require_pr=lambda **kwargs: ready)
+    with pytest.raises(WorkerFailure, match="persisted scope_design review evidence"):
+        workflow["process_issue"](issue, config, object(), repo, github)
+
+
 def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
     workflow = load_generated_workflow(
         work_items=[{"id": "repair-guide", "task": "Repair the workflow guide."}]
@@ -2808,6 +2883,7 @@ def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
         ),
         inspect_remote_branches=lambda branches: {branch: None for branch in branches},
         inspect_branch=lambda branch: BranchState(branch, "c" * 40, "d" * 40, True),
+        inspect_remote_note=lambda *args: workflow["serialized_work_item_plan"](plan),
     )
     active_pr = topology_pr(head_branch=issue.branch, head_sha="d" * 40)
 
@@ -2848,6 +2924,26 @@ def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
     assert state["active_pr_merged_inspection_error"] == (
         "historical PR inspection failed"
     )
+
+
+def test_recovery_context_uses_persisted_plan_over_process_plan() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (workflow["Issue"](90, "feature/issue-90"),), "true"
+    )
+    process_plan = workflow["WorkItemPlan"](config)
+    process_plan.position = 1
+    persisted_plan = workflow["WorkItemPlan"](config)
+    repo = SimpleNamespace(
+        inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
+        inspect_remote_note=lambda *args: workflow["serialized_work_item_plan"](persisted_plan),
+        inspect_worktree=lambda: SimpleNamespace(current_branch="dev/v1", dirty=False, status=()),
+        inspect_remote_branches=lambda branches: {branch: "a" * 40 for branch in branches},
+    )
+    github = SimpleNamespace(find_pr=lambda **kwargs: None)
+    state = json.loads(workflow["recovery_authoritative_state"](config, repo, github, process_plan))
+    assert state["work_item_plan"]["position"] == 0
+    assert state["process_plan_differs_from_persisted"] is True
 
 
 def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
