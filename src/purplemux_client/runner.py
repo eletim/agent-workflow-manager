@@ -3226,6 +3226,9 @@ class PythonRunner:
                 "result.json.pending",
                 "result.json.stdout",
                 "result.json.stderr",
+                "result.json.stdout.pending",
+                "result.json.stderr.pending",
+                "result.json.command_done",
                 "result.json.stdout.pipe",
                 "result.json.stderr.pipe",
             )

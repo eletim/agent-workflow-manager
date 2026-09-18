@@ -14,6 +14,7 @@ import pytest
 from purplemux_client.client import (
     WORKFLOW_HOST_WORKSPACE_ENV,
     CreateWorkspaceRequest,
+    PurpleMuxCLIClient,
     PurpleMuxRuntime,
     ShellCommandRequest,
     ShellResult,
@@ -445,9 +446,12 @@ def test_authoritative_start_failure_tracks_created_tab_and_result(
 class _ExecutingManagedClient(_ManagedClient):
     """Execute the generated shell command while retaining structured completion."""
 
-    def __init__(self, result_root: Path) -> None:
+    def __init__(
+        self, result_root: Path, *, capture_shell_result: bool = False
+    ) -> None:
         super().__init__()
         self.result_root = result_root
+        self.capture_shell_result = capture_shell_result
 
     def start_shell(self, request, *, on_created=None):
         import subprocess
@@ -455,10 +459,21 @@ class _ExecutingManagedClient(_ManagedClient):
         self.request = request
         tab_id = "tab-workflow"
         result_dir = tempfile.mkdtemp(prefix="awm-shell-", dir=self.result_root)
+        self.result_path = Path(result_dir) / "result.json"
         if on_created is not None:
-            on_created(tab_id, str(Path(result_dir) / "result.json"))
+            on_created(tab_id, str(self.result_path))
+        command = (
+            PurpleMuxCLIClient._shell_wrapper(
+                request.command,
+                request.cwd,
+                str(self.result_path),
+                request.max_output_chars,
+            )
+            if self.capture_shell_result
+            else request.command
+        )
         self.process = subprocess.Popen(
-            ["bash", "-c", request.command],
+            ["bash", "-c", command],
             cwd=request.cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -470,6 +485,12 @@ class _ExecutingManagedClient(_ManagedClient):
 
     def read_shell_result(self, session_id):
         assert self.process.returncode is not None
+        if self.capture_shell_result:
+            return ShellResult(
+                json.loads(self.result_path.read_text())["exitCode"],
+                stdout=Path(f"{self.result_path}.stdout").read_text(),
+                stderr=Path(f"{self.result_path}.stderr").read_text(),
+            )
         return ShellResult(self.process.returncode)
 
     def interrupt(self, session_id):
@@ -481,6 +502,48 @@ class _ExecutingManagedClient(_ManagedClient):
     def close_session(self, session_id):
         self.process.kill()
         self.process.wait(timeout=3)
+
+
+def test_managed_run_finishes_while_detached_child_keeps_output_open(
+    tmp_path: Path,
+) -> None:
+    client = _ExecutingManagedClient(tmp_path, capture_shell_result=True)
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        run_history_file=tmp_path / "history.json",
+        runtime_factory=lambda: _ManagedRuntime(client),  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    release = tmp_path / "release-child"
+    child_done = tmp_path / "child-done"
+    child_code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.02)\n"
+        "print('late child output', flush=True)\n"
+        f"Path({str(child_done)!r}).touch()\n"
+    )
+    code = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+        "start_new_session=True)\n"
+        "print('parent output', flush=True)\n"
+    )
+    try:
+        run_id = runner.start(code)
+        finished = _wait_for_state(runner, "success")
+        assert finished.run_id == run_id
+        assert finished.stdout == "parent output\n"
+        assert finished.stderr == ""
+        assert not release.exists()
+        release.touch()
+        deadline = time.monotonic() + 3
+        while not child_done.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        release.touch()
+        runner.close()
 
 
 @pytest.mark.parametrize("target_id", [None, "remote"])

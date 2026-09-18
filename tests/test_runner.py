@@ -1148,7 +1148,11 @@ def test_managed_shell_result_cleanup_removes_captured_output_and_pipes(
     result.write_text('{"exitCode":0}', encoding="utf-8")
     for stream in ("stdout", "stderr"):
         (directory / f"result.json.{stream}").write_text(stream, encoding="utf-8")
+        (directory / f"result.json.{stream}.pending").write_text(
+            stream, encoding="utf-8"
+        )
         os.mkfifo(directory / f"result.json.{stream}.pipe")
+    (directory / "result.json.command_done").touch()
     resource = RunResource(
         "managed_shell_result",
         str(directory),

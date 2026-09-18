@@ -1324,19 +1324,22 @@ class PurpleMuxCLIClient:
         stderr_text = shlex.quote(f"{result_path}.stderr")
         stdout_pipe = shlex.quote(f"{result_path}.stdout.pipe")
         stderr_pipe = shlex.quote(f"{result_path}.stderr.pipe")
+        command_done = shlex.quote(f"{result_path}.command_done")
         capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_capture"
         capture_chars = max_output_chars + 1
         return (
             f"mkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
-            f"{capture} {stdout_text} {capture_chars} 1 "
+            f"{capture} {stdout_text} {command_done} {capture_chars} 1 "
             f"< {stdout_pipe} & __awm_stdout_pid=$!; "
-            f"{capture} {stderr_text} {capture_chars} 2 "
+            f"{capture} {stderr_text} {command_done} {capture_chars} 2 "
             f"< {stderr_pipe} & __awm_stderr_pid=$!; "
             f"__awm_exit=0; (cd -- {cwd_text} && bash -lc {command_text}) "
             f"> {stdout_pipe} 2> {stderr_pipe} || __awm_exit=$?; "
-            f"wait $__awm_stdout_pid || exit 1; "
-            f"wait $__awm_stderr_pid || exit 1; "
-            f"rm -- {stdout_pipe} {stderr_pipe}; "
+            f": > {command_done}; "
+            f"until test -f {stdout_text} && test -f {stderr_text}; do "
+            f"kill -0 $__awm_stdout_pid && kill -0 $__awm_stderr_pid "
+            f"|| exit 1; sleep 0.02; done; "
+            f"rm -- {stdout_pipe} {stderr_pipe} {command_done}; "
             f"printf '{{\"exitCode\":%s}}\\n' "
             f'"$__awm_exit" > {pending_result_text} && '
             f"mv -- {pending_result_text} {result_text}"
@@ -1382,6 +1385,9 @@ class PurpleMuxCLIClient:
             f"{shell_run.result_path}.pending",
             f"{shell_run.result_path}.stdout",
             f"{shell_run.result_path}.stderr",
+            f"{shell_run.result_path}.stdout.pending",
+            f"{shell_run.result_path}.stderr.pending",
+            f"{shell_run.result_path}.command_done",
             f"{shell_run.result_path}.stdout.pipe",
             f"{shell_run.result_path}.stderr.pipe",
         ):
