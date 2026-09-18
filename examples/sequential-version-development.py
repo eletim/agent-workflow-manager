@@ -2629,10 +2629,15 @@ def process_issue(
                 if record.role == role and record.reviewed_sha == ready.head_sha
             ]
             if not role_audits or not any(
-                record.verdict == "APPROVED"
-                and record.fix_disposition == "not_required"
-                or previous_result.outcome == "continued_with_warning"
-                and record.fix_disposition == "review_limit_reached"
+                (record.verdict == "APPROVED" and record.fix_disposition == "not_required")
+                or (
+                    previous_result.outcome == "continued_with_warning"
+                    and record.verdict == "CHANGES_REQUESTED"
+                    and record.fix_disposition in (
+                        "review_limit_reached",
+                        "no_change_after_re_evaluation",
+                    )
+                )
                 for record in role_audits
             ):
                 raise WorkerFailure(

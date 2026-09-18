@@ -2832,6 +2832,44 @@ def test_retry_rejects_changed_reviewed_ready_pr_before_draft_mutation() -> None
         workflow["process_issue"](issue, config, object(), repo, github)
 
 
+def test_retry_preserves_ready_warning_after_no_change_re_evaluation() -> None:
+    workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    ready = topology_pr(number=90, head_branch=issue.branch, draft=False)
+    approved = workflow["new_review_audit"](
+        "scope_design", 1, "APPROVED", ready.head_sha,
+        '{"verdict":"APPROVED","findings":[],"policy_conflicts":[]}',
+    )
+    requested = workflow["new_review_audit"](
+        "correctness", 1, "CHANGES_REQUESTED", ready.head_sha,
+        '{"verdict":"CHANGES_REQUESTED","findings":["Recheck behavior."],"policy_conflicts":[]}',
+    )
+    requested = replace(requested, fix_disposition="no_change_after_re_evaluation")
+    for audit in (approved, requested):
+        ready = replace(ready, body=workflow["with_review_audit"](ready.body, audit))
+    warning = "correctness finding re-evaluated without code changes"
+    workflow["record_issue_handoff_result"](
+        issue.result_id, issue.label, ready, "continued_with_warning", 2, (warning,)
+    )
+    workflow["prepare_issue"] = lambda *args: (ready, ready.head_sha, True)
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(dirty=False),
+        require_pushed=lambda branch: BranchState(
+            branch, ready.head_sha, ready.head_sha, True
+        ),
+    )
+    github = SimpleNamespace(require_pr=lambda **kwargs: ready)
+    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail("review reran")
+    workflow["emit_issue_result"] = lambda *args, **kwargs: None
+
+    assert workflow["process_issue"](issue, config, object(), repo, github) is ready
+    result = workflow["ISSUE_HANDOFF_RESULTS"][0]
+    assert (result.outcome, result.warnings) == ("continued_with_warning", (warning,))
+
+
 def test_retry_rejects_ready_pr_without_persisted_review_evidence() -> None:
     workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
     issue = workflow["Issue"](90, "feature/issue-90")
