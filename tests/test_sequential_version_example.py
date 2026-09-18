@@ -3783,8 +3783,9 @@ def test_review_audit_pruning_keeps_pending_fix_disposition(
 
 
 @pytest.mark.parametrize("resumed", (False, True))
+@pytest.mark.parametrize("lost_phase", ("scope/design", "correctness"))
 def test_missing_audit_after_fixes_restarts_review_and_completes_work_item(
-    monkeypatch: pytest.MonkeyPatch, resumed: bool,
+    monkeypatch: pytest.MonkeyPatch, resumed: bool, lost_phase: str,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     globals_ = workflow["process_issue"].__globals__
@@ -3859,26 +3860,29 @@ def test_missing_audit_after_fixes_restarts_review_and_completes_work_item(
         turns.append(name)
         if name.endswith("implementation"):
             return "implemented"
-        if name.endswith("scope/design fixes"):
+        if name.endswith(f"{lost_phase} fixes"):
             return "fixed"
         if name.endswith("scope/design review"):
             review_heads.append(current.head_sha)
-            if len(review_heads) == 1:
+            if lost_phase == "scope/design" and len(review_heads) == 1:
                 return review_result("CHANGES_REQUESTED", ("Correct the scope.",))
             return review_result()
         if name.endswith("correctness review"):
+            if lost_phase == "correctness" and current.head_sha == "review-head":
+                return review_result("CHANGES_REQUESTED", ("Correct the behavior.",))
             return review_result()
         pytest.fail(f"unexpected agent turn: {name}")
 
-    agent_results = iter(
-        (
-            ("review-head", True),
-            ("review-head", False),
-            ("fixed-head", True),
-            ("fixed-head", False),
-            ("fixed-head", False),
-        )
-    )
+    agent_results_by_turn = [
+        ("review-head", True),
+        ("review-head", False),
+        ("fixed-head", True),
+        ("fixed-head", False),
+        ("fixed-head", False),
+    ]
+    if lost_phase == "correctness":
+        agent_results_by_turn.insert(2, ("review-head", False))
+    agent_results = iter(agent_results_by_turn)
     monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(globals_, "prepare_issue", lambda *args: (
         current if resumed else None, "review-head", resumed
@@ -3899,13 +3903,17 @@ def test_missing_audit_after_fixes_restarts_review_and_completes_work_item(
     records = workflow["review_audit_from_body"](ready.body)
     assert fix_delivered
     assert review_heads == ["review-head", "fixed-head"]
-    assert turns == [
-        "Issue #311 implementation",
-        "Issue #311 scope/design review",
-        "Issue #311 scope/design fixes",
-        "Issue #311 scope/design review",
-        "Issue #311 correctness review",
-    ]
+    expected_turns = ["Issue #311 implementation", "Issue #311 scope/design review"]
+    if lost_phase == "correctness":
+        expected_turns.append("Issue #311 correctness review")
+    expected_turns.extend(
+        (
+            f"Issue #311 {lost_phase} fixes",
+            "Issue #311 scope/design review",
+            "Issue #311 correctness review",
+        )
+    )
+    assert turns == expected_turns
     assert ready.is_draft is False
     assert any(
         lost_audit_id in {record.audit_id for record in update}
@@ -3913,7 +3921,7 @@ def test_missing_audit_after_fixes_restarts_review_and_completes_work_item(
     )
     assert lost_audit_id not in {record.audit_id for record in records}
     assert any(
-        record.role == "scope_design"
+        record.role == lost_phase.replace("/", "_")
         and record.reviewed_sha == "fixed-head"
         and record.verdict == "APPROVED"
         for record in records

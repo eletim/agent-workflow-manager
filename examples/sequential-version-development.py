@@ -2624,6 +2624,7 @@ def review_issue_phase(
     restart_scope_on_change: bool = False,
 ) -> IssueReviewPhaseResult:
     """Retry a lost audit only after verifying the current delivery topology."""
+    reviewed_head_sha = pr.head_sha
     for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
         try:
             return _review_issue_phase(
@@ -2652,6 +2653,10 @@ def review_issue_phase(
                 raise WorkerFailure("review audit recovery requires a safe Draft PR")
             require_inline_task_pr_fingerprint(pr, issue.task_fingerprint)
             review_offset = 0
+            if restart_scope_on_change and pr.head_sha != reviewed_head_sha:
+                return IssueReviewPhaseResult(
+                    pr, "head_changed", pr.head_sha, pr.base_sha, review_offset
+                )
             emit_finding(
                 "github",
                 f"{issue.label} {phase} audit is missing; reviewing current head "
