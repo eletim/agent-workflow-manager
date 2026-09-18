@@ -36,6 +36,8 @@ class _ManagedClient:
     def __init__(self) -> None:
         self.release = threading.Event()
         self.exit_code = 0
+        self.stdout = ""
+        self.stderr = ""
         self.request: ShellCommandRequest | None = None
         self.interrupted = False
         self.start_error: BaseException | None = None
@@ -78,7 +80,7 @@ class _ManagedClient:
         self.read_calls += 1
         if self.read_errors:
             raise self.read_errors.pop(0)
-        return ShellResult(self.exit_code)
+        return ShellResult(self.exit_code, stdout=self.stdout, stderr=self.stderr)
 
     def interrupt(self, session_id: str) -> None:
         assert session_id == "tab-workflow"
@@ -239,6 +241,8 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
 
 def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) -> None:
     client = _ManagedClient()
+    client.stdout = "before stop\n"
+    client.stderr = "stop warning\n"
     runtime = _ManagedRuntime(client)
     runner = PythonRunner(
         workflow_cwd=tmp_path,
@@ -251,8 +255,58 @@ def test_stop_interrupts_managed_shell_and_uses_its_exit_result(tmp_path: Path) 
         stopped = _wait_for_state(runner, "stopped")
         assert client.interrupted is True
         assert stopped.exit_code == 130
+        assert stopped.stdout == "before stop\n"
+        assert stopped.stderr == "stop warning\n"
     finally:
         runner.close()
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_managed_result_output_is_bounded_and_reloaded(
+    tmp_path: Path, exit_code: int
+) -> None:
+    client = _ManagedClient()
+    client.exit_code = exit_code
+    client.stdout = "prefix-stdout-tail\n"
+    client.stderr = "prefix-stderr-tail\n"
+    history = tmp_path / "history.json"
+    output_limit = 12 if exit_code == 0 else 1000
+    runner = PythonRunner(
+        workflow_cwd=tmp_path,
+        run_history_file=history,
+        max_output_chars=output_limit,
+        runtime_factory=lambda: _ManagedRuntime(client),  # type: ignore[arg-type]
+    )
+    runner.configure_event_endpoint("http://127.0.0.1:1")
+    try:
+        run_id = runner.start("print('managed')")
+        client.release.set()
+        finished = _wait_for_state(runner, "success" if exit_code == 0 else "failed")
+        assert finished.exit_code == exit_code
+        if exit_code == 0:
+            assert finished.stdout == "[output truncated; showing tail]\nstdout-tail\n"
+        else:
+            assert finished.stdout == client.stdout
+        assert "stderr-tail\n" in finished.stderr
+        assert finished.as_json()["stdout"] == finished.stdout
+        assert finished.as_json()["stderr"] == finished.stderr
+        if exit_code:
+            assert "Workflow failed (exit code 7)" in finished.stderr
+    finally:
+        runner.close()
+
+    restored = PythonRunner(run_history_file=history, max_output_chars=output_limit)
+    try:
+        after = restored.snapshot(run_id)
+        assert (after.state, after.stdout, after.stderr) == (
+            finished.state,
+            finished.stdout,
+            finished.stderr,
+        )
+        assert after.stdout_entries == finished.stdout_entries
+        assert after.stderr_entries == finished.stderr_entries
+    finally:
+        restored.close()
 
 
 def test_managed_launch_retains_failed_initial_tab_discovery(tmp_path: Path) -> None:

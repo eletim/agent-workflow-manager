@@ -430,6 +430,42 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     cli.close_session(session_id)
 
 
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_managed_shell_result_captures_both_visible_streams(
+    tmp_path: Path, exit_code: int
+) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command=(
+                "printf 'public stdout\\n'; "
+                "printf 'public stderr\\n' >&2; "
+                f"exit {exit_code}"
+            ),
+            cwd=str(tmp_path),
+            name="Captured shell",
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    execution = subprocess.run(
+        ["bash", "-c", wrapper], capture_output=True, text=True, timeout=5
+    )
+    assert execution.returncode == 0
+    assert execution.stdout == "public stdout\n"
+    assert execution.stderr == "public stderr\n"
+    result = cli._read_shell_result_file(session_id)
+    assert result is not None
+    assert (result.exit_code, result.stdout, result.stderr) == (
+        exit_code,
+        execution.stdout,
+        execution.stderr,
+    )
+    cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
 def test_start_shell_bounds_tab_reads_create_and_send_by_deadline(tmp_path) -> None:
     runner = FakeRunner(
         [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
