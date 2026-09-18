@@ -27,3 +27,23 @@ def test_issue_driven_overview_documents_optional_scenario_gate() -> None:
     assert "integration-head commit\n(After)" in README
     assert "not fixed expected-output assertions" in README
     assert "embedded in generated plain Python" in README
+
+
+def test_whole_review_documents_dedicated_design_principles_conformance() -> None:
+    assert "dedicated Design Principles reviewer" in README
+    assert "`docs/design-principles.md` from the exact integration head" in README
+    assert "reviews solely\nfor conformance" in README
+    assert "bounded whole-review loop" in README
+
+
+def test_human_context_and_durable_decision_record_are_distinguished() -> None:
+    section = README.split("## Human context and durable decisions", maxsplit=1)[1]
+    section = section.split("## Issue Driven mode", maxsplit=1)[0]
+
+    assert "`docs/design-principles.md`" in section
+    assert "`docs/representative-scenarios.md`" in section
+    assert "add the One-Shot Issue" in section
+    assert "not the configurable `scenarios` list" in section
+    assert "persisted work-item plan" in section
+    assert "managed Review\naudit sections on child and Base PRs" in section
+    assert "only the portion" in section
