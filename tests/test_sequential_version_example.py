@@ -3782,28 +3782,56 @@ def test_review_audit_pruning_keeps_pending_fix_disposition(
     )
 
 
-@pytest.mark.parametrize("reload_workflow", (False, True))
-def test_missing_audit_rechecks_topology_and_runs_fresh_review(
-    monkeypatch: pytest.MonkeyPatch, reload_workflow: bool,
+@pytest.mark.parametrize("resumed", (False, True))
+def test_missing_audit_after_fixes_restarts_review_and_completes_work_item(
+    monkeypatch: pytest.MonkeyPatch, resumed: bool,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
-    if reload_workflow:
-        workflow = runpy.run_path(str(EXAMPLE))
-    globals_ = workflow["review_issue_phase"].__globals__
+    globals_ = workflow["process_issue"].__globals__
     issue = workflow["Issue"](311, "feature/issue-311")
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
     )
     current = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
-    attempts: list[tuple[str, int]] = []
+    original_body = "Child PR."
+    prior = workflow["new_review_audit"](
+        "correctness", 1, "APPROVED", "prior-head", review_result()
+    )
+    if resumed:
+        original_body = workflow["with_review_audit"](original_body, prior)
+    current = replace(current, body=original_body)
+    review_heads: list[str] = []
+    turns: list[str] = []
+    persisted: list[tuple] = []
+    lost_audit_id: str | None = None
+    fix_delivered = False
 
     class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, current.base_sha, current.base_sha, False)
+
         def require_clean(self) -> None:
-            attempts.append(("clean", 0))
+            assert current.head_sha == "fixed-head"
 
         def require_pushed(self, branch: str) -> BranchState:
             assert branch == issue.branch
             return BranchState(branch, current.head_sha, current.head_sha, True)
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            nonlocal current, fix_delivered, lost_audit_id
+            assert branch == issue.branch
+            assert expected_local_sha == "fixed-head"
+            assert not fix_delivered
+            records = workflow["review_audit_from_body"](current.body)
+            lost_audit_id = records[-1].audit_id
+            assert records[-1].fix_disposition == "pending"
+            current = replace(current, head_sha="fixed-head", body=original_body)
+            fix_delivered = True
+            return BranchState(branch, "fixed-head", "fixed-head", True)
 
     class GitHub:
         def require_pr(self, **kwargs: object) -> PullRequestState:
@@ -3812,26 +3840,96 @@ def test_missing_audit_rechecks_topology_and_runs_fresh_review(
             assert kwargs["draft"] is True
             return current
 
-    def review(*args: object, review_offset: int, **kwargs: object):
-        attempts.append(("review", review_offset))
-        if len([entry for entry in attempts if entry[0] == "review"]) == 1:
-            raise workflow["MissingReviewAudit"](
-                "review audit record disappeared before fix disposition"
-            )
-        assert args[7] == current
-        return workflow["IssueReviewPhaseResult"](
-            current, "approved", current.head_sha, current.base_sha, 1
-        )
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=body)
+            persisted.append(workflow["review_audit_from_body"](body))
+            return current
 
-    monkeypatch.setitem(globals_, "_review_issue_phase", review)
-    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
-    result = workflow["review_issue_phase"](
-        issue, config, object(), Repository(), GitHub(), "implementer", "reviewer",
-        current, phase="correctness", prompt="review", max_reviews=4,
-        review_offset=2,
+        def set_draft(self, number: int, *, draft: bool, **kwargs: object):
+            nonlocal current
+            assert number == current.number
+            assert draft is False
+            current = replace(current, is_draft=False)
+            return current
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        name = str(args[2])
+        turns.append(name)
+        if name.endswith("implementation"):
+            return "implemented"
+        if name.endswith("scope/design fixes"):
+            return "fixed"
+        if name.endswith("scope/design review"):
+            review_heads.append(current.head_sha)
+            if len(review_heads) == 1:
+                return review_result("CHANGES_REQUESTED", ("Correct the scope.",))
+            return review_result()
+        if name.endswith("correctness review"):
+            return review_result()
+        pytest.fail(f"unexpected agent turn: {name}")
+
+    agent_results = iter(
+        (
+            ("review-head", True),
+            ("review-head", False),
+            ("fixed-head", True),
+            ("fixed-head", False),
+            ("fixed-head", False),
+        )
     )
-    assert result.outcome == "approved"
-    assert attempts == [("review", 2), ("clean", 0), ("review", 0)]
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(globals_, "prepare_issue", lambda *args: (
+        current if resumed else None, "review-head", resumed
+    ))
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *args, **kwargs: current)
+    monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_, "require_agent_result", lambda *args, **kwargs: next(agent_results)
+    )
+    monkeypatch.setitem(globals_, "emit_issue_navigation", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_issue_result", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    ready = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="workspace"), Repository(), GitHub()
+    )
+    records = workflow["review_audit_from_body"](ready.body)
+    assert fix_delivered
+    assert review_heads == ["review-head", "fixed-head"]
+    assert turns == [
+        "Issue #311 implementation",
+        "Issue #311 scope/design review",
+        "Issue #311 scope/design fixes",
+        "Issue #311 scope/design review",
+        "Issue #311 correctness review",
+    ]
+    assert ready.is_draft is False
+    assert any(
+        lost_audit_id in {record.audit_id for record in update}
+        for update in persisted
+    )
+    assert lost_audit_id not in {record.audit_id for record in records}
+    assert any(
+        record.role == "scope_design"
+        and record.reviewed_sha == "fixed-head"
+        and record.verdict == "APPROVED"
+        for record in records
+    )
+    assert any(
+        record.role == "correctness"
+        and record.reviewed_sha == "fixed-head"
+        and record.verdict == "APPROVED"
+        for record in records
+    )
+    assert any(
+        record.role == "scope_design" and record.reviewed_sha == "fixed-head"
+        for update in persisted for record in update
+    )
+    if resumed:
+        assert prior in records
 
 
 def test_missing_audit_does_not_retry_with_dirty_worktree(
