@@ -576,7 +576,7 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 7
+    assert source.count("run_validated_turn(") == 8
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:
@@ -3494,6 +3494,248 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
         and "without reviewer approval" in message
         for _, status, message in findings
     )
+
+
+def test_whole_warning_retries_from_durable_audit_after_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = runpy.run_path(str(EXAMPLE))
+    config = first["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    marker = first["whole_continuation_audit"](
+        2, current.head_sha, "review_limit_reached"
+    )
+    current = replace(current, body=first["with_review_audit"](current.body, marker))
+    second = runpy.run_path(str(EXAMPLE))
+    globals_ = second["review_whole_version"].__globals__
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == current.head_sha
+            return current
+
+    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(
+        globals_, "create_agent", lambda *args, **kwargs: pytest.fail("review restarted")
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    pr, delivery = second["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, config.issues
+    )
+
+    assert pr == current
+    assert delivery.outcome == "continued_with_warning"
+    assert delivery.reviews == 2
+    assert "review limit 2 reached" in delivery.warnings[0]
+
+
+@pytest.mark.parametrize(
+    "changed_role",
+    (
+        "scenario_gate", "design_principles", "whole_version",
+        "version_readme", "whole_version_limit",
+    ),
+)
+def test_whole_limit_after_head_change_persists_retry_decision(
+    monkeypatch: pytest.MonkeyPatch, changed_role: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha="new-head",
+    )
+    previous = workflow["new_review_audit"](
+        changed_role, 2, "CHANGES_REQUESTED", "old-head",
+        review_result("CHANGES_REQUESTED", ("Correct the integration issue.",)),
+    )
+    current = replace(
+        current,
+        body=workflow["with_review_audit"](
+            current.body,
+            replace(previous, fix_disposition="reviewer_changed_head", fix_sha="new-head"),
+        ),
+    )
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            current = replace(current, body=body)
+            return current
+
+    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
+    monkeypatch.setitem(
+        globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
+    )
+    monkeypatch.setitem(globals_, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(
+        globals_, "require_agent_result",
+        lambda *args, **kwargs: (current.head_sha, False),
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    pr, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, config.issues
+    )
+    assert delivery.outcome == "continued_with_warning"
+    assert "already reached" in delivery.warnings[0]
+    marker = workflow["review_audit_from_body"](pr.body)[-1]
+    assert marker.role == "whole_version_continuation"
+    assert marker.fix_disposition == "review_limit_reached_after_head_change"
+
+    recovered = runpy.run_path(str(EXAMPLE))
+    recovered_globals = recovered["review_whole_version"].__globals__
+    monkeypatch.setitem(recovered_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(
+        recovered_globals, "create_agent",
+        lambda *args, **kwargs: pytest.fail("recovery restarted review"),
+    )
+    monkeypatch.setitem(recovered_globals, "emit_finding", lambda *args, **kwargs: None)
+    _, retry = recovered["review_whole_version"](
+        config, object(), Repository(), GitHub(), pr, config.issues
+    )
+    assert (
+        retry.outcome, retry.head_sha, retry.base_sha, retry.reviews, retry.warnings
+    ) == (
+        delivery.outcome, delivery.head_sha, delivery.base_sha,
+        delivery.reviews, delivery.warnings,
+    )
+
+
+def test_limit_head_change_marker_survives_recovery_transition() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    current = replace(
+        open_pr(head="dev/v1", base="main", draft=True), head_sha="new-head"
+    )
+
+    class GitHub:
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            current = replace(current, body=body)
+            return current
+
+    github = GitHub()
+    current = workflow["persist_whole_limit_head_change"](
+        github, current, round_number=2, reviewed_sha="old-head",
+        head="dev/v1", base="main",
+    )
+    assert workflow["review_audit_from_body"](current.body)[0].fix_disposition == (
+        "pending"
+    )
+    current = workflow["reconcile_review_audits_after_head_change"](
+        github, current, head="dev/v1", base="main"
+    )
+    recovered = workflow["review_audit_from_body"](current.body)[0]
+    assert recovered.role == "whole_version_limit"
+    assert recovered.round == 2
+    assert recovered.fix_disposition == "head_changed_before_disposition"
+    assert recovered.fix_sha == "new-head"
+
+
+def test_whole_retry_finishes_warning_after_dispositions_but_before_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    body = current.body
+    for role, verdict in (
+        ("design_principles", "APPROVED"),
+        ("whole_version", "CHANGES_REQUESTED"),
+        ("version_readme", "APPROVED"),
+    ):
+        result = review_result(
+            verdict, ("Correct the integration issue.",)
+            if verdict == "CHANGES_REQUESTED" else (),
+        )
+        record = workflow["new_review_audit"](
+            role, 2, verdict, current.head_sha, result
+        )
+        if verdict == "CHANGES_REQUESTED":
+            record = replace(record, fix_disposition="review_limit_reached")
+        body = workflow["with_review_audit"](body, record)
+    current = replace(current, body=body)
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            current = replace(current, body=body)
+            return current
+
+    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
+    monkeypatch.setitem(
+        globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
+    )
+    monkeypatch.setitem(globals_, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(
+        globals_, "require_agent_result",
+        lambda *args, **kwargs: (current.head_sha, False),
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    pr, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, config.issues
+    )
+    assert delivery.outcome == "continued_with_warning"
+    assert workflow["review_audit_from_body"](pr.body)[-1].role == (
+        "whole_version_continuation"
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_role",
+    ("scenario_gate", "design_principles", "whole_version", "version_readme"),
+)
+def test_review_audit_pruning_keeps_head_change_continuation_evidence(
+    monkeypatch: pytest.MonkeyPatch, changed_role: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    monkeypatch.setitem(
+        workflow["with_review_audit"].__globals__, "MAX_REVIEW_AUDIT_BYTES", 1_200
+    )
+    prior = workflow["new_review_audit"](
+        changed_role, 2, "CHANGES_REQUESTED", "old-head",
+        review_result("CHANGES_REQUESTED", ("Correct the integration issue.",)),
+    )
+    prior = replace(
+        prior, fix_disposition="reviewer_changed_head", fix_sha="new-head"
+    )
+    body = workflow["with_review_audit"]("Base PR.", prior)
+    for round_number in range(3, 22):
+        record = workflow["new_review_audit"](
+            changed_role, round_number, "APPROVED", f"head-{round_number}",
+            review_result(),
+        )
+        body = workflow["with_review_audit"](body, record)
+    assert prior in workflow["review_audit_from_body"](body)
 
 
 def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
