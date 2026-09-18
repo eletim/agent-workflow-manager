@@ -120,6 +120,7 @@ function snapshot({
   issueDrivenJson = undefined,
   environmentSetupJson = undefined,
   reviewJson = undefined,
+  reviewResult = undefined,
   resumedFromRunId = null,
 }) {
   const result = {
@@ -161,6 +162,7 @@ function snapshot({
   if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
   if (environmentSetupJson !== undefined) result.environmentSetupJson = environmentSetupJson;
   if (reviewJson !== undefined) result.reviewJson = reviewJson;
+  if (reviewResult !== undefined) result.reviewResult = reviewResult;
   return result;
 }
 
@@ -4149,7 +4151,7 @@ test("Review generates read-only Python, starts a Run, and shows saved settings 
   const generatedCode = "print('review')";
   const report = {verdict: "FAIL", summary: "One issue", findings: ["Missing check"], evidence: ["file.py:4"]};
   const running = snapshot({runId: 9, state: "running", stdout: "", mode: "review", code: generatedCode, reviewJson: source});
-  const finished = snapshot({runId: 9, state: "success", stdout: JSON.stringify(report), mode: "review", code: generatedCode, reviewJson: source});
+  const finished = snapshot({runId: 9, state: "success", stdout: "Diagnostic output only", mode: "review", code: generatedCode, reviewJson: source, reviewResult: report});
   const calls = [];
   const {elements} = await loadApp({
     runs: [{runId: 9, state: "success", mode: "review"}],
@@ -4177,7 +4179,24 @@ test("Review generates read-only Python, starts a Run, and shows saved settings 
   assert.equal(elements["review-json"].readOnly, true);
   assert.match(elements["review-result-status"].textContent, /Verdict: FAIL — One issue/);
   assert.match(elements["review-result-json"].textContent, /Missing check/);
+  assert.equal(elements.stdout.textContent, "Diagnostic output only");
   assert.match(selectedRun(elements).textContent, /Review/);
+});
+
+test("Review panel ignores verdict text in stdout without a saved result", async () => {
+  const detail = snapshot({
+    runId: 1, state: "success", mode: "review", reviewJson: "{}",
+    stdout: JSON.stringify({verdict: "PASS", summary: "Only in stdout"}),
+    reviewResult: null,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", mode: "review"}],
+    details: {1: detail},
+    validation: {body: {}, status: 200},
+  });
+  assert.equal(elements["review-result-status"].textContent,
+    "No structured Review result was saved. See stdout and stderr.");
+  assert.equal(elements["review-result-json"].textContent, "");
 });
 
 test("Review generation errors clear stale code and remain visible", async () => {
