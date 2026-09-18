@@ -983,7 +983,13 @@ function renderRunList(runs, cleanupOwnership = []) {
     const resumed = run.resumedFromRunId == null
       ? ""
       : `  Resume of #${run.resumedFromRunId}`;
-    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
+    const reviewLabel = ["PASS", "FAIL", "BLOCKED"].includes(run.reviewVerdict)
+      ? run.reviewVerdict
+      : run.state === "running" ? "pending" : "none saved";
+    const reviewVerdict = run.mode === "review"
+      ? `  Review result: ${reviewLabel}`
+      : "";
+    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}${reviewVerdict}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";

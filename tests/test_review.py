@@ -298,6 +298,7 @@ def test_review_result_is_durable_and_independent_of_output(
         run_id = runner.start(code, review_json=source)
         snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
         assert snapshot.as_json()["reviewResult"] == result
+        assert snapshot.as_summary_json()["reviewVerdict"] == verdict
         assert snapshot.stdout.endswith("the decision\n")
         assert snapshot.stderr.endswith("diagnostic too\n")
         assert json.dumps(result) not in snapshot.stdout + snapshot.stderr
@@ -308,6 +309,7 @@ def test_review_result_is_durable_and_independent_of_output(
     try:
         restored_snapshot = restored.snapshot(run_id)
         assert restored_snapshot.as_json()["reviewResult"] == result
+        assert restored_snapshot.as_summary_json()["reviewVerdict"] == verdict
         assert restored_snapshot.stdout == snapshot.stdout
         assert restored_snapshot.stderr == snapshot.stderr
         assert (
@@ -335,6 +337,7 @@ def test_review_result_requires_valid_report_and_successful_run(
             ).as_json()["reviewResult"]
             is None
         )
+        assert runner.snapshot(output_only).as_summary_json()["reviewVerdict"] is None
 
         invalid = runner.start(
             "from purplemux_client.review import publish_review_result\n"
@@ -360,6 +363,7 @@ def test_review_result_requires_valid_report_and_successful_run(
             ).as_json()["reviewResult"]
             is None
         )
+        assert runner.snapshot(failed).as_summary_json()["reviewVerdict"] is None
     finally:
         runner.close()
 

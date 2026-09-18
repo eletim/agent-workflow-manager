@@ -4199,6 +4199,35 @@ test("Review panel ignores verdict text in stdout without a saved result", async
   assert.equal(elements["review-result-json"].textContent, "");
 });
 
+for (const verdict of ["PASS", "FAIL", "BLOCKED", null]) {
+  test(`reloaded Review history and detail show saved ${verdict ?? "missing"} result`, async () => {
+    const report = verdict === null ? null : {
+      verdict, summary: `Saved ${verdict} summary`, findings: [], evidence: [],
+    };
+    const detail = snapshot({
+      runId: 1, state: "success", mode: "review", reviewJson: "{}",
+      reviewResult: report,
+      stdout: "Verdict: PASS from stdout",
+    });
+    const {elements} = await loadApp({
+      runs: [{runId: 1, state: "success", mode: "review", reviewVerdict: verdict}],
+      details: {1: detail},
+      validation: {body: {}, status: 200},
+    });
+    assert.match(runItem(elements, 1).textContent,
+      new RegExp(`Review result: ${verdict ?? "none saved"}`));
+    if (verdict === null) {
+      assert.equal(elements["review-result-status"].textContent,
+        "No structured Review result was saved. See stdout and stderr.");
+      assert.equal(elements["review-result-json"].textContent, "");
+    } else {
+      assert.equal(elements["review-result-status"].textContent,
+        `Verdict: ${verdict} — Saved ${verdict} summary`);
+      assert.equal(JSON.parse(elements["review-result-json"].textContent).verdict, verdict);
+    }
+  });
+}
+
 test("Review generation errors clear stale code and remain visible", async () => {
   const {elements} = await loadApp({runs: [], details: {}, validation: {body: {}, status: 200}, fetchOverride(url) {
     if (url === "/api/review/generate") return response({error: "invalid Review JSON"}, 422);
