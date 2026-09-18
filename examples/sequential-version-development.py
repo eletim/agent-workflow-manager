@@ -62,6 +62,8 @@ MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
+MAX_RECOVERY_STATE_BYTES = 32_000
+MAX_RECOVERY_REPORT_BYTES = 2_000
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -242,6 +244,7 @@ class WorkItemPlan:
     finalized: bool = False
     persisted_source: str | None = None
     skipped: list[PlannerSkip] = field(default_factory=list)
+    active: Issue | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -595,6 +598,97 @@ def run_validated_turn(
                 warning_scope=warning_scope,
             )
     raise AssertionError("unreachable")
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    repaired: bool
+    retry_safe: bool
+    summary: str
+    evidence: str
+
+
+def parse_recovery_report(source: str) -> RecoveryReport:
+    """Accept only a bounded account with evidence for a safe retry."""
+    try:
+        source_bytes = source.encode("utf-8")
+    except UnicodeError as exc:
+        raise WorkerFailure("recovery report is not valid UTF-8") from exc
+    if len(source_bytes) > MAX_RECOVERY_REPORT_BYTES:
+        raise WorkerFailure("recovery report exceeds its size limit")
+    try:
+        value = json.loads(source)
+    except (UnicodeError, ValueError) as exc:
+        raise WorkerFailure("recovery report must be one JSON object") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "repaired",
+        "retry_safe",
+        "summary",
+        "evidence",
+    }:
+        raise WorkerFailure("recovery report has invalid fields")
+    if type(value["repaired"]) is not bool or type(value["retry_safe"]) is not bool:
+        raise WorkerFailure("recovery report decisions must be booleans")
+    for field_name in ("summary", "evidence"):
+        field_value = value[field_name]
+        if (
+            not isinstance(field_value, str)
+            or not field_value
+            or field_value != field_value.strip()
+            or any(
+                character in "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                for character in field_value
+            )
+            or "\0" in field_value
+        ):
+            raise WorkerFailure(f"recovery report {field_name} is invalid")
+        try:
+            field_bytes = field_value.encode("utf-8")
+        except UnicodeError as exc:
+            raise WorkerFailure(f"recovery report {field_name} is invalid UTF-8") from exc
+        if len(field_bytes) > 500:
+            raise WorkerFailure(f"recovery report {field_name} is too long")
+    if value["retry_safe"] and not value["repaired"]:
+        raise WorkerFailure("recovery cannot recommend retry without a repair")
+    return RecoveryReport(**value)
+
+
+def recover_error(
+    client: PurpleMuxCLIClient,
+    config: Config,
+    error: BaseException,
+    authoritative_state: str,
+) -> RecoveryReport:
+    """Start a dedicated recovery Agent for this error, never a resident agent."""
+    if not isinstance(authoritative_state, str) or not authoritative_state.strip():
+        raise WorkerFailure("recovery requires current authoritative state")
+    if len(authoritative_state.encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
+        raise WorkerFailure("recovery authoritative state exceeds its size limit")
+    agent = create_agent(
+        client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
+    )
+    try:
+        _, report = run_validated_turn(
+            client,
+            agent,
+            "Recovery assessment",
+            "Investigate this workflow error using the current authoritative state "
+            "below. Make only a safe, necessary repair, then re-inspect the affected "
+            "state. If the outcome is uncertain, report retry_safe as false. "
+            "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
+            "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
+            "fingerprint markers. Return exactly one JSON object with boolean "
+            "repaired and retry_safe fields and concise single-line summary and "
+            "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
+            "the state after repair when recommending retry. No other fields or "
+            "prose.\n\n"
+            f"Error: {short_error(error)}\n\n"
+            f"Current authoritative state:\n{authoritative_state}",
+            parse_recovery_report,
+        )
+        return report
+    finally:
+        client.close_session(agent)
 
 
 def implementer_prompt(prompt: str) -> str:
@@ -3266,6 +3360,7 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
+        plan.active = recovered_issue
         inspect_dynamic_work_item_topology(
             recovered_issue, config, recover_missing_inline_identity=True
         )
@@ -3275,6 +3370,7 @@ def process_work_items(
                 issue, config, client, repo, github
             ),
         )
+        plan.active = None
     if plan.finalized:
         return plan.snapshot
     planner = create_agent(
@@ -3313,12 +3409,14 @@ def process_work_items(
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
+        plan.active = issue
         inspect_dynamic_work_item_topology(issue, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         run_outline_step(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
+        plan.active = None
         if plan_pr is None:
             plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
@@ -4276,6 +4374,111 @@ def report_repository_delivery(config: Config, ready: PullRequestState | None) -
         print(f"Policy Issue: {config.slug}#{config.policy_issue}", flush=True)
 
 
+def recovery_authoritative_state(
+    config: Config,
+    repo: GitRepository,
+    github: GitHubRepository,
+    plan: WorkItemPlan | None = None,
+) -> str:
+    """Inspect current Git and PR state after a workflow failure."""
+    state: dict[str, object] = {
+        "repository": str(config.repo),
+        "integration_branch": config.integration_branch,
+        "final_branch": config.main_branch,
+    }
+    if plan is None:
+        state["work_item_plan"] = {
+            "status": "unavailable before plan preparation completed",
+            "seed_count": len(config.issues),
+        }
+    else:
+        active = plan.active
+        next_item = plan.remaining[0] if plan.remaining else None
+        state["work_item_plan"] = {
+            "position": plan.position,
+            "total": len(plan.items),
+            "finalized": plan.finalized,
+            "active": (
+                None
+                if active is None
+                else {
+                    **planner_work_item_json(active),
+                    "branch": active.branch,
+                    "task_fingerprint": active.task_fingerprint,
+                }
+            ),
+            "next_item": (
+                None
+                if next_item is None
+                else {**planner_work_item_json(next_item), "branch": next_item.branch}
+            ),
+        }
+    try:
+        worktree = repo.inspect_worktree()
+        state["worktree"] = {
+            "current_branch": worktree.current_branch,
+            "dirty": worktree.dirty,
+            "status": [entry[:200] for entry in worktree.status[:20]],
+        }
+    except Exception as exc:
+        state["worktree_inspection_error"] = short_error(exc)
+    try:
+        state["remote_heads"] = repo.inspect_remote_branches(
+            (config.integration_branch, config.main_branch)
+        )
+    except Exception as exc:
+        state["remote_heads_inspection_error"] = short_error(exc)
+    if plan is not None and plan.active is not None:
+        active = plan.active
+        try:
+            branch = repo.inspect_branch(active.branch)
+            state["active_branch"] = {
+                "name": branch.name,
+                "local_sha": branch.local_sha,
+                "remote_sha": branch.remote_sha,
+                "current": branch.current,
+            }
+        except Exception as exc:
+            state["active_branch_inspection_error"] = short_error(exc)
+        active_prs = []
+        for status in ("OPEN", "MERGED", "CLOSED"):
+            try:
+                pr = github.find_pr(
+                    head=active.branch, base=config.integration_branch, state=status
+                )
+                if pr is not None:
+                    active_prs.append(
+                        {
+                            "number": pr.number,
+                            "state": pr.state,
+                            "draft": pr.is_draft,
+                            "head_sha": pr.head_sha,
+                            "base_sha": pr.base_sha,
+                            "merge_commit_sha": pr.merge_commit_sha,
+                        }
+                    )
+            except Exception as exc:
+                state[f"active_pr_{status.lower()}_inspection_error"] = short_error(exc)
+        state["active_prs"] = active_prs
+    try:
+        pr = github.find_pr(
+            head=config.integration_branch, base=config.main_branch, state="OPEN"
+        )
+        state["base_pr"] = (
+            None
+            if pr is None
+            else {
+                "number": pr.number,
+                "head_sha": pr.head_sha,
+                "base_sha": pr.base_sha,
+                "draft": pr.is_draft,
+            }
+        )
+    except Exception as exc:
+        state["base_pr_inspection_error"] = short_error(exc)
+    return json.dumps(state, ensure_ascii=True)
+
+
 def run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
@@ -4296,17 +4499,32 @@ def run_repository(
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
-    plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
-    work_items = run_outline_step(
-        "Work items",
-        lambda: process_work_items(config, client, repo, github, plan_pr, plan),
-    )
-    ready = integration_delivery(
-        config, work_items, client, repo, github, deferred_deliveries
-    )
-    if deferred_deliveries is None:
-        report_repository_delivery(config, ready)
-    return ready
+    plan: WorkItemPlan | None = None
+    try:
+        plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
+        work_items = run_outline_step(
+            "Work items",
+            lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+        )
+        ready = integration_delivery(
+            config, work_items, client, repo, github, deferred_deliveries
+        )
+        if deferred_deliveries is None:
+            report_repository_delivery(config, ready)
+        return ready
+    except Exception as exc:
+        report = recover_error(
+            client,
+            config,
+            exc,
+            recovery_authoritative_state(config, repo, github, plan),
+        )
+        print(
+            f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
+            f"Evidence: {report.evidence}",
+            flush=True,
+        )
+        raise
 
 
 def main() -> None:

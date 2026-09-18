@@ -2240,6 +2240,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
             calls[text] = agent_type.id
 
     assert calls == {
+        "Recovery agent": "IMPLEMENTER_AGENT",
         " worktree cleanup": "IMPLEMENTER_AGENT",
         " implementer": "IMPLEMENTER_AGENT",
         " scope reviewer": "REVIEWER_AGENT",
@@ -2378,6 +2379,198 @@ def load_generated_workflow(**overrides: object) -> dict[str, object]:
     finally:
         del sys.modules[module_name]
     return module.__dict__
+
+
+def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    agents: list[tuple[str, str]] = []
+    prompts: list[str] = []
+    closed: list[str] = []
+    client = SimpleNamespace(close_session=closed.append)
+    workflow["create_agent"] = lambda client, config, *, agent_type, name: (
+        agents.append((agent_type, name)) or f"recovery-{len(agents)}"
+    )
+
+    def run_validated(client, agent, name, prompt, validator):
+        prompts.append(prompt)
+        return "", validator(
+            json.dumps(
+                {
+                    "repaired": True,
+                    "retry_safe": True,
+                    "summary": "Restored the missing remote branch.",
+                    "evidence": "Remote branch now points to the expected commit.",
+                }
+            )
+        )
+
+    workflow["run_validated_turn"] = run_validated
+    first = workflow["recover_error"](
+        client, config, RuntimeError("first"), "branch: absent"
+    )
+    second = workflow["recover_error"](
+        client, config, RuntimeError("second"), "branch: present"
+    )
+
+    assert agents == [("codex", "Recovery agent"), ("codex", "Recovery agent")]
+    assert first.retry_safe and second.repaired
+    assert "first" in prompts[0] and "branch: absent" in prompts[0]
+    assert "second" in prompts[1] and "branch: present" in prompts[1]
+    assert closed == ["recovery-1", "recovery-2"]
+
+
+def test_recovery_closes_agent_when_its_turn_fails() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    closed: list[str] = []
+    client = SimpleNamespace(close_session=closed.append)
+    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
+    workflow["run_validated_turn"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        WorkerFailure("agent failed")
+    )
+
+    with pytest.raises(WorkerFailure, match="agent failed"):
+        workflow["recover_error"](client, config, RuntimeError("first"), "state")
+    assert closed == ["recovery-only"]
+
+
+def test_repository_failure_starts_recovery_with_current_inspection() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="feature/work", dirty=False, status=()
+        ),
+        inspect_remote_branches=lambda branches: {
+            branch: "a" * 40 for branch in branches
+        },
+    )
+    github = SimpleNamespace(find_pr=lambda **kwargs: None)
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(open=lambda *args, **kwargs: github)
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("plan failed")
+    )
+    received: list[tuple[object, object, object, str]] = []
+
+    def recover(client, config, error, state):
+        received.append((client, config, error, state))
+        return workflow["RecoveryReport"](
+            False, False, "No repair was safe.", "State checked."
+        )
+
+    workflow["recover_error"] = recover
+    with pytest.raises(WorkerFailure, match="plan failed"):
+        workflow["run_repository"](config)
+    assert len(received) == 1
+    assert str(received[0][2]) == "plan failed"
+    state = json.loads(received[0][3])
+    assert state["remote_heads"]["dev/v1"] == "a" * 40
+    assert state["worktree"]["current_branch"] == "feature/work"
+    assert state["work_item_plan"]["status"] == (
+        "unavailable before plan preparation completed"
+    )
+
+
+def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
+    workflow = load_generated_workflow(
+        work_items=[{"id": "repair-guide", "task": "Repair the workflow guide."}]
+    )
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-repair-guide",
+        "repair-guide",
+        "Repair the workflow guide.",
+        hashlib.sha256(b"Repair the workflow guide.").hexdigest(),
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.position = 1
+    plan.finalized = True
+    workflow["inspect_dynamic_work_item_topology"] = lambda *args, **kwargs: None
+    workflow["run_outline_step"] = lambda name, action: action()
+    workflow["process_issue"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("work item failed")
+    )
+    with pytest.raises(WorkerFailure, match="work item failed"):
+        workflow["process_work_items"](config, None, None, None, None, plan)
+
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="feature/work-item-repair-guide", dirty=False, status=()
+        ),
+        inspect_remote_branches=lambda branches: {branch: None for branch in branches},
+        inspect_branch=lambda branch: BranchState(branch, "c" * 40, "d" * 40, True),
+    )
+    active_pr = topology_pr(head_branch=issue.branch, head_sha="d" * 40)
+
+    def find_pr(**kwargs):
+        if kwargs == {"head": issue.branch, "base": "dev/v1", "state": "MERGED"}:
+            raise WorkerFailure("historical PR inspection failed")
+        if kwargs == {"head": issue.branch, "base": "dev/v1", "state": "OPEN"}:
+            return active_pr
+        return None
+
+    github = SimpleNamespace(find_pr=find_pr)
+    state = json.loads(
+        workflow["recovery_authoritative_state"](config, repo, github, plan)
+    )
+    work_item = state["work_item_plan"]
+    assert work_item["position"] == 1
+    assert work_item["finalized"] is True
+    assert work_item["active"]["id"] == "repair-guide"
+    assert work_item["active"]["task"] == "Repair the workflow guide."
+    assert work_item["active"]["branch"] == "feature/work-item-repair-guide"
+    assert work_item["active"]["task_fingerprint"] == issue.task_fingerprint
+    assert state["active_branch"] == {
+        "name": issue.branch,
+        "local_sha": "c" * 40,
+        "remote_sha": "d" * 40,
+        "current": True,
+    }
+    assert state["active_prs"] == [
+        {
+            "number": active_pr.number,
+            "state": "OPEN",
+            "draft": True,
+            "head_sha": "d" * 40,
+            "base_sha": active_pr.base_sha,
+            "merge_commit_sha": None,
+        }
+    ]
+    assert state["active_pr_merged_inspection_error"] == (
+        "historical PR inspection failed"
+    )
+
+
+def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    parse_report = workflow["parse_recovery_report"]
+    for value in (
+        '{"repaired":false,"retry_safe":true,"summary":"ok","evidence":"ok"}',
+        '{"repaired":1,"retry_safe":false,"summary":"ok","evidence":"ok"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":""}',
+        "x" * 2001,
+        '{"repaired":false,"retry_safe":false,"summary":"bad\\rline","evidence":"ok"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad\\u2028line"}',
+        '{"repaired":false,"retry_safe":false,"summary":"bad\\ud800","evidence":"ok"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad\\udfff"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad"}'
+        + "\ud800",
+    ):
+        with pytest.raises(WorkerFailure, match="recovery"):
+            parse_report(value)
 
 
 def test_generated_workflow_can_add_update_and_skip_pending_work_items() -> None:
