@@ -2613,6 +2613,94 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
     assert len(attempts) == workflow["MAX_REPOSITORY_RECOVERIES"] + 1
 
 
+def test_retry_preserves_completed_merged_item_outcome() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    merged = topology_pr(
+        number=90, state="MERGED", head_branch=issue.branch, draft=False
+    )
+    workflow["record_issue_handoff_result"](
+        issue.result_id, issue.label, merged, "approved", 2, ("reviewed",)
+    )
+    workflow["prepare_issue"] = lambda *args: merged
+    workflow["rehydrate_policy_conflicts"] = lambda *args, **kwargs: None
+    results: list[tuple[object, ...]] = []
+    workflow["emit_issue_result"] = lambda *args, **kwargs: results.append(args)
+    repo = SimpleNamespace(inspect_worktree=lambda: SimpleNamespace(dirty=False))
+
+    assert workflow["process_issue"](issue, config, object(), repo, object()) is merged
+    handoff = workflow["ISSUE_HANDOFF_RESULTS"][0]
+    assert (handoff.outcome, handoff.reviews, handoff.warnings) == (
+        "approved",
+        2,
+        ("reviewed",),
+    )
+    assert results[0][:3] == (90, "approved", 2)
+
+
+def test_retry_preserves_reviewed_ready_item_without_reopening_review() -> None:
+    workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    ready = topology_pr(number=90, head_branch=issue.branch, draft=False)
+    workflow["record_issue_handoff_result"](
+        issue.result_id, issue.label, ready, "approved", 2, ()
+    )
+    workflow["prepare_issue"] = lambda *args: (ready, ready.head_sha, True)
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(dirty=False),
+        require_pushed=lambda branch: BranchState(
+            branch, ready.head_sha, ready.head_sha, True
+        ),
+    )
+    inspections: list[dict[str, object]] = []
+
+    def require_pr(**kwargs):
+        inspections.append(kwargs)
+        return ready
+
+    github = SimpleNamespace(
+        require_pr=require_pr,
+        set_draft=lambda *args, **kwargs: pytest.fail("Ready PR was changed"),
+    )
+    workflow["create_agent"] = lambda *args, **kwargs: pytest.fail(
+        "reviewed item was rerun"
+    )
+    workflow["emit_issue_result"] = lambda *args, **kwargs: None
+
+    assert workflow["process_issue"](issue, config, object(), repo, github) is ready
+    assert inspections[0]["expected_head_sha"] == ready.head_sha
+    assert inspections[0]["expected_base_sha"] == ready.base_sha
+    assert inspections[0]["draft"] is False
+    assert workflow["ISSUE_HANDOFF_RESULTS"][0].outcome == "approved"
+
+
+def test_retry_rejects_changed_reviewed_ready_pr_before_draft_mutation() -> None:
+    workflow = load_generated_workflow(issues=[90], merge_to_integration=False)
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    reviewed = topology_pr(number=90, head_branch=issue.branch, draft=False)
+    changed = topology_pr(number=91, head_branch=issue.branch, draft=False)
+    workflow["record_issue_handoff_result"](
+        issue.result_id, issue.label, reviewed, "approved", 2, ()
+    )
+    workflow["prepare_issue"] = lambda *args: (changed, changed.head_sha, True)
+    repo = SimpleNamespace(inspect_worktree=lambda: SimpleNamespace(dirty=False))
+    github = SimpleNamespace(
+        set_draft=lambda *args, **kwargs: pytest.fail("changed PR was mutated")
+    )
+
+    with pytest.raises(WorkerFailure, match="PR changed during recovery"):
+        workflow["process_issue"](issue, config, object(), repo, github)
+
+
 def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
     workflow = load_generated_workflow(
         work_items=[{"id": "repair-guide", "task": "Repair the workflow guide."}]

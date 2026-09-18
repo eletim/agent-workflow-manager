@@ -377,6 +377,7 @@ class RepositoryDelivery:
 
 
 ISSUE_HANDOFF_RESULTS: list[IssueHandoffResult] = []
+COMPLETED_ISSUE_PRS: dict[int | str, PullRequestState] = {}
 
 
 @dataclass(frozen=True)
@@ -1361,6 +1362,7 @@ def record_issue_handoff_result(
         existing for existing in ISSUE_HANDOFF_RESULTS if existing.issue != issue
     ]
     ISSUE_HANDOFF_RESULTS.append(result)
+    COMPLETED_ISSUE_PRS[issue] = pr
 
 
 def human_handoff_prompt(
@@ -2548,17 +2550,45 @@ def process_issue(
             warning_scope=issue.result_id,
         )
     prepared = prepare_issue(repo, github, issue, config)
+    previous_result = next(
+        (result for result in ISSUE_HANDOFF_RESULTS if result.issue == issue.result_id),
+        None,
+    )
+    previous_pr = COMPLETED_ISSUE_PRS.get(issue.result_id)
     if isinstance(prepared, PullRequestState):
         rehydrate_policy_conflicts(prepared.body, config, issue_number=issue.result_id)
-        print(f"Skipping already-merged {issue.label}", flush=True)
-        warnings = summary_warnings(issue.result_id)
+        if (
+            previous_result is not None
+            and previous_pr is not None
+            and previous_result.outcome != "skipped"
+            and (
+                previous_result.pr_number != prepared.number
+                or previous_pr.head_sha != prepared.head_sha
+            )
+        ):
+            raise WorkerFailure(f"completed {issue.label} PR changed during recovery")
+        completed_here = (
+            previous_result is not None
+            and previous_pr is not None
+            and previous_result.outcome != "skipped"
+            and previous_result.pr_number == prepared.number
+            and previous_pr.head_sha == prepared.head_sha
+        )
+        outcome = previous_result.outcome if completed_here else "skipped"
+        reviews = previous_result.reviews if completed_here else 0
+        warnings = (
+            tuple(dict.fromkeys((*previous_result.warnings, *summary_warnings(issue.result_id))))[:3]
+            if completed_here
+            else summary_warnings(issue.result_id)
+        )
+        print(f"Already merged {issue.label}", flush=True)
         record_issue_handoff_result(
-            issue.result_id, issue.label, prepared, "skipped", 0, warnings
+            issue.result_id, issue.label, prepared, outcome, reviews, warnings
         )
         emit_issue_result(
             issue.result_id,
-            "skipped",
-            0,
+            outcome,
+            reviews,
             prepared.number,
             prepared.url,
             warnings=warnings,
@@ -2566,6 +2596,49 @@ def process_issue(
         )
         return prepared
     existing_pr, start_sha, reused_existing_work = prepared
+    if (
+        not MERGE_TO_INTEGRATION
+        and previous_result is not None
+        and previous_pr is not None
+        and previous_result.outcome in ("approved", "continued_with_warning")
+        and not previous_pr.is_draft
+    ):
+        if (
+            existing_pr is None
+            or previous_result.pr_number != existing_pr.number
+        ):
+            raise WorkerFailure(f"reviewed {issue.label} PR changed during recovery")
+        pushed = repo.require_pushed(issue.branch)
+        if pushed.local_sha != previous_pr.head_sha:
+            raise WorkerFailure(f"reviewed {issue.label} head changed during recovery")
+        ready = github.require_pr(
+            number=existing_pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=previous_pr.head_sha,
+            expected_base_sha=previous_pr.base_sha,
+            draft=False,
+        )
+        require_inline_task_pr_fingerprint(ready, issue.task_fingerprint)
+        record_issue_handoff_result(
+            issue.result_id,
+            issue.label,
+            ready,
+            previous_result.outcome,
+            previous_result.reviews,
+            previous_result.warnings,
+        )
+        emit_issue_result(
+            issue.result_id,
+            previous_result.outcome,
+            previous_result.reviews,
+            ready.number,
+            ready.url,
+            warnings=previous_result.warnings,
+            label=issue.label,
+        )
+        return ready
     if existing_pr is not None:
         existing_pr = return_to_draft_for_review(
             github,
@@ -4509,6 +4582,7 @@ def run_repository(
     POLICY_CONFLICT_WARNINGS.clear()
     AGENT_TURN_TIMEOUT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
+    COMPLETED_ISSUE_PRS.clear()
     emit_issue_driven_context(
         config.slug,
         config.integration_branch,
@@ -4556,7 +4630,6 @@ def run_repository(
             )
             POLICY_CONFLICT_WARNINGS.clear()
             AGENT_TURN_TIMEOUT_WARNINGS.clear()
-            ISSUE_HANDOFF_RESULTS.clear()
             continue
         if deferred_deliveries is None:
             report_repository_delivery(config, ready)
