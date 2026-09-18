@@ -2469,8 +2469,13 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         )
 
     workflow["recover_error"] = recover
+    findings: list[tuple[str, str, str]] = []
+    workflow["emit_finding"] = lambda category, message, *, status: findings.append(
+        (category, message, status)
+    )
     with pytest.raises(WorkerFailure, match="plan failed"):
         workflow["run_repository"](config)
+    assert findings == []
     assert len(received) == 1
     assert str(received[0][2]) == "plan failed"
     state = json.loads(received[0][3])
@@ -2517,10 +2522,22 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     workflow["process_work_items"] = lambda *args: ()
     workflow["integration_delivery"] = lambda *args: "delivered"
     workflow["report_repository_delivery"] = lambda *args: None
+    findings: list[tuple[str, str, str]] = []
+    workflow["emit_finding"] = lambda category, message, *, status: findings.append(
+        (category, message, status)
+    )
 
     assert workflow["run_repository"](config) == "delivered"
     assert len(plans) == 2
     assert plans[1] is not plans[0]
+    assert findings == [
+        ("runtime", "Recovered workflow error: plan failed", "warning"),
+        (
+            "runtime",
+            "Recovery repair: Repaired plan. Evidence: Inspected remote state.",
+            "warning",
+        ),
+    ]
 
 
 def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() -> None:
@@ -2550,10 +2567,15 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
     workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
         True, True, "Repaired plan.", "Inspected remote state."
     )
+    findings: list[tuple[str, str, str]] = []
+    workflow["emit_finding"] = lambda category, message, *, status: findings.append(
+        (category, message, status)
+    )
 
     with pytest.raises(WorkerFailure, match="recovery outcome is uncertain"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+    assert findings == []
 
 
 def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
