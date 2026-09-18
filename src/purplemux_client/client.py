@@ -1327,26 +1327,7 @@ class PurpleMuxCLIClient:
         command_done = shlex.quote(f"{result_path}.command_done")
         capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_capture"
         capture_chars = max_output_chars + 1
-        pane_capture = (
-            f"{capture} {stdout_text} {command_done} {capture_chars} -1"
-        )
         return (
-            f"if test -n \"${{TMUX_PANE:-}}\" && test -t 1 && test -t 2; then "
-            f"tmux pipe-pane -t \"$TMUX_PANE\" {shlex.quote(pane_capture)} "
-            f"|| exit 1; "
-            f"__awm_exit=0; (cd -- {cwd_text} && bash -lc {command_text}) "
-            f"|| __awm_exit=$?; "
-            f": > {command_done}; "
-            f"__awm_capture_wait=0; "
-            f"until test -f {stdout_text} || test $__awm_capture_wait -ge 500; do "
-            f"sleep 0.02; __awm_capture_wait=$((__awm_capture_wait + 1)); done; "
-            f"tmux pipe-pane -t \"$TMUX_PANE\"; "
-            f"test -f {stdout_text} || exit 1; "
-            f": > {stderr_text}; "
-            f"printf '{{\"exitCode\":%s}}\\n' "
-            f'"$__awm_exit" > {pending_result_text} && '
-            f"mv -- {pending_result_text} {result_text}; "
-            f"else "
             f"mkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
             f"{capture} {stdout_text} {command_done} {capture_chars} 1 "
             f"< {stdout_pipe} & __awm_stdout_pid=$!; "
@@ -1361,7 +1342,7 @@ class PurpleMuxCLIClient:
             f"rm -- {stdout_pipe} {stderr_pipe} {command_done}; "
             f"printf '{{\"exitCode\":%s}}\\n' "
             f'"$__awm_exit" > {pending_result_text} && '
-            f"mv -- {pending_result_text} {result_text}; fi"
+            f"mv -- {pending_result_text} {result_text}"
         )
 
     def _read_shell_result_file(self, session_id: str) -> ShellResult | None:
