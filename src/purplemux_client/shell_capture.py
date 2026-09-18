@@ -6,6 +6,7 @@ import codecs
 import os
 import select
 import sys
+import time
 from collections import deque
 from pathlib import Path
 
@@ -48,9 +49,10 @@ def capture(
         chunk = os.read(0, 65536)
         if not chunk:
             return False
-        remaining = memoryview(chunk)
-        while remaining:
-            remaining = remaining[os.write(destination_fd, remaining) :]
+        if destination_fd >= 0:
+            remaining = memoryview(chunk)
+            while remaining:
+                remaining = remaining[os.write(destination_fd, remaining) :]
         if not published:
             retain(decoder.decode(chunk))
         return True
@@ -61,8 +63,18 @@ def capture(
                 publish()
             return
         if not published and command_done.exists():
-            # Drain bytes already queued when the command exited. Detached
-            # children may keep the pipe open; their later output is forwarded.
+            # Drain bytes queued when the command exited. Detached children
+            # may keep the pipe open; publish without waiting for their EOF.
+            if destination_fd < 0:
+                # tmux may still be delivering the final pane bytes. Wait for a
+                # short quiet period, with a deadline for detached writers.
+                deadline = time.monotonic() + 0.5
+                quiet_until = time.monotonic() + 0.1
+                while time.monotonic() < min(deadline, quiet_until):
+                    if select.select([0], [], [], 0.02)[0]:
+                        if not forward():
+                            break
+                        quiet_until = time.monotonic() + 0.1
             for _ in range(256):
                 if not select.select([0], [], [], 0)[0]:
                     break

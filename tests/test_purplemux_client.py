@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import pty
-import select
 import shlex
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -488,28 +487,83 @@ def test_managed_shell_preserves_tty_and_live_unflushed_output(tmp_path: Path) -
         )
     )
     wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
-    master, slave = pty.openpty()
+    socket = f"awm-test-{os.getpid()}-{time.monotonic_ns()}"
+    session = "managed-shell"
+    tmux = ["tmux", "-L", socket]
+    subprocess.run(tmux + ["new-session", "-d", "-s", session], check=True)
     try:
-        process = subprocess.Popen(
-            ["bash", "-c", wrapper], stdin=slave, stdout=slave, stderr=slave
+        subprocess.run(
+            tmux + ["send-keys", "-t", session, wrapper, "Enter"], check=True
         )
-        os.close(slave)
-        slave = -1
-        visible = b""
-        while b"early" not in visible or b"error" not in visible:
-            assert select.select([master], [], [], 2)[0], visible
-            visible += os.read(master, 65536)
-        assert b"tty=True,True" in visible
-        assert process.poll() is None
-        assert process.wait(timeout=5) == 0
+        deadline = time.monotonic() + 3
+        visible = ""
+        while "tty=True,True" not in visible:
+            assert time.monotonic() < deadline, visible
+            visible = subprocess.run(
+                tmux + ["capture-pane", "-p", "-t", session],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            time.sleep(0.02)
+        assert "tty=True,True" in visible
+        assert "early" in visible
+        assert "error" in visible
+        assert cli._read_shell_result_file(session_id) is None
+        deadline = time.monotonic() + 3
+        result = None
+        while result is None:
+            assert time.monotonic() < deadline
+            result = cli._read_shell_result_file(session_id)
+            time.sleep(0.02)
         result = cli._read_shell_result_file(session_id)
         assert result is not None
-        assert result.stdout == "tty=True,True\nearly"
-        assert result.stderr == "error"
+        assert "tty=True,True" in result.stdout
+        assert "early" in result.stdout
+        assert "error" in result.stdout
+        assert result.stderr == ""
     finally:
-        if slave != -1:
-            os.close(slave)
-        os.close(master)
+        subprocess.run(tmux + ["kill-server"], check=False, capture_output=True)
+        cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
+def test_managed_shell_completes_with_detached_writer(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    script = (
+        "import os, time\n"
+        "if os.fork():\n"
+        "    os.write(1, b'done\\n')\n"
+        "    os._exit(0)\n"
+        "time.sleep(5)\n"
+    )
+    session_id = cli.start_shell(
+        ShellCommandRequest(
+            command=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+            cwd=str(tmp_path),
+            name="Detached writer",
+        )
+    )
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    socket = f"awm-test-{os.getpid()}-{time.monotonic_ns()}"
+    tmux = ["tmux", "-L", socket]
+    subprocess.run(tmux + ["new-session", "-d", "-s", "managed-shell"], check=True)
+    try:
+        subprocess.run(
+            tmux + ["send-keys", "-t", "managed-shell", wrapper, "Enter"], check=True
+        )
+        deadline = time.monotonic() + 2
+        result = None
+        while result is None:
+            assert time.monotonic() < deadline, "detached writer delayed completion"
+            result = cli._read_shell_result_file(session_id)
+            time.sleep(0.02)
+        assert result.exit_code == 0
+        assert "done" in result.stdout
+    finally:
+        subprocess.run(tmux + ["kill-server"], check=False, capture_output=True)
         cli._cleanup_shell_result(cli._shell_runs[session_id])
 
 
