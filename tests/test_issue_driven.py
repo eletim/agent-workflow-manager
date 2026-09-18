@@ -2388,6 +2388,8 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     )
     agents: list[tuple[str, str]] = []
     prompts: list[str] = []
+    closed: list[str] = []
+    client = SimpleNamespace(close_session=closed.append)
     workflow["create_agent"] = lambda client, config, *, agent_type, name: (
         agents.append((agent_type, name)) or f"recovery-{len(agents)}"
     )
@@ -2407,16 +2409,73 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
 
     workflow["run_validated_turn"] = run_validated
     first = workflow["recover_error"](
-        None, config, RuntimeError("first"), "branch: absent"
+        client, config, RuntimeError("first"), "branch: absent"
     )
     second = workflow["recover_error"](
-        None, config, RuntimeError("second"), "branch: present"
+        client, config, RuntimeError("second"), "branch: present"
     )
 
     assert agents == [("codex", "Recovery agent"), ("codex", "Recovery agent")]
     assert first.retry_safe and second.repaired
     assert "first" in prompts[0] and "branch: absent" in prompts[0]
     assert "second" in prompts[1] and "branch: present" in prompts[1]
+    assert closed == ["recovery-1", "recovery-2"]
+
+
+def test_recovery_closes_agent_when_its_turn_fails() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    closed: list[str] = []
+    client = SimpleNamespace(close_session=closed.append)
+    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
+    workflow["run_validated_turn"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        WorkerFailure("agent failed")
+    )
+
+    with pytest.raises(WorkerFailure, match="agent failed"):
+        workflow["recover_error"](client, config, RuntimeError("first"), "state")
+    assert closed == ["recovery-only"]
+
+
+def test_repository_failure_starts_recovery_with_current_inspection() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="feature/work", dirty=False, status=()
+        ),
+        inspect_remote_branches=lambda branches: {
+            branch: "a" * 40 for branch in branches
+        },
+    )
+    github = SimpleNamespace(find_pr=lambda **kwargs: None)
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(open=lambda *args, **kwargs: github)
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("plan failed")
+    )
+    received: list[tuple[object, object, object, str]] = []
+
+    def recover(client, config, error, state):
+        received.append((client, config, error, state))
+        return workflow["RecoveryReport"](
+            False, False, "No repair was safe.", "State checked."
+        )
+
+    workflow["recover_error"] = recover
+    with pytest.raises(WorkerFailure, match="plan failed"):
+        workflow["run_repository"](config)
+    assert len(received) == 1
+    assert str(received[0][2]) == "plan failed"
+    state = json.loads(received[0][3])
+    assert state["remote_heads"]["dev/v1"] == "a" * 40
+    assert state["worktree"]["current_branch"] == "feature/work"
 
 
 def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
@@ -2427,6 +2486,8 @@ def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
         '{"repaired":1,"retry_safe":false,"summary":"ok","evidence":"ok"}',
         '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":""}',
         "x" * 2001,
+        '{"repaired":false,"retry_safe":false,"summary":"bad\\rline","evidence":"ok"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad\\u2028line"}',
     ):
         with pytest.raises(WorkerFailure, match="recovery"):
             parse_report(value)

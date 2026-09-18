@@ -630,7 +630,10 @@ def parse_recovery_report(source: str) -> RecoveryReport:
             not isinstance(field_value, str)
             or not field_value
             or field_value != field_value.strip()
-            or "\n" in field_value
+            or any(
+                character in "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                for character in field_value
+            )
             or "\0" in field_value
             or len(field_value.encode("utf-8")) > 500
         ):
@@ -654,25 +657,28 @@ def recover_error(
     agent = create_agent(
         client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
     )
-    _, report = run_validated_turn(
-        client,
-        agent,
-        "Recovery assessment",
-        "Investigate this workflow error using the current authoritative state "
-        "below. Make only a safe, necessary repair, then re-inspect the affected "
-        "state. If the outcome is uncertain, report retry_safe as false. "
-        "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
-        "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
-        "fingerprint markers. Return exactly one JSON object with boolean "
-        "repaired and retry_safe fields and concise single-line summary and "
-        "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
-        "the state after repair when recommending retry. No other fields or "
-        "prose.\n\n"
-        f"Error: {short_error(error)}\n\n"
-        f"Current authoritative state:\n{authoritative_state}",
-        parse_recovery_report,
-    )
-    return report
+    try:
+        _, report = run_validated_turn(
+            client,
+            agent,
+            "Recovery assessment",
+            "Investigate this workflow error using the current authoritative state "
+            "below. Make only a safe, necessary repair, then re-inspect the affected "
+            "state. If the outcome is uncertain, report retry_safe as false. "
+            "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
+            "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
+            "fingerprint markers. Return exactly one JSON object with boolean "
+            "repaired and retry_safe fields and concise single-line summary and "
+            "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
+            "the state after repair when recommending retry. No other fields or "
+            "prose.\n\n"
+            f"Error: {short_error(error)}\n\n"
+            f"Current authoritative state:\n{authoritative_state}",
+            parse_recovery_report,
+        )
+        return report
+    finally:
+        client.close_session(agent)
 
 
 def implementer_prompt(prompt: str) -> str:
@@ -4354,6 +4360,49 @@ def report_repository_delivery(config: Config, ready: PullRequestState | None) -
         print(f"Policy Issue: {config.slug}#{config.policy_issue}", flush=True)
 
 
+def recovery_authoritative_state(
+    config: Config, repo: GitRepository, github: GitHubRepository
+) -> str:
+    """Inspect current Git and Base PR state after a workflow failure."""
+    state: dict[str, object] = {
+        "repository": str(config.repo),
+        "integration_branch": config.integration_branch,
+        "final_branch": config.main_branch,
+    }
+    try:
+        worktree = repo.inspect_worktree()
+        state["worktree"] = {
+            "current_branch": worktree.current_branch,
+            "dirty": worktree.dirty,
+            "status": [entry[:200] for entry in worktree.status[:20]],
+        }
+    except Exception as exc:
+        state["worktree_inspection_error"] = short_error(exc)
+    try:
+        state["remote_heads"] = repo.inspect_remote_branches(
+            (config.integration_branch, config.main_branch)
+        )
+    except Exception as exc:
+        state["remote_heads_inspection_error"] = short_error(exc)
+    try:
+        pr = github.find_pr(
+            head=config.integration_branch, base=config.main_branch, state="OPEN"
+        )
+        state["base_pr"] = (
+            None
+            if pr is None
+            else {
+                "number": pr.number,
+                "head_sha": pr.head_sha,
+                "base_sha": pr.base_sha,
+                "draft": pr.is_draft,
+            }
+        )
+    except Exception as exc:
+        state["base_pr_inspection_error"] = short_error(exc)
+    return json.dumps(state, ensure_ascii=True)
+
+
 def run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
@@ -4374,17 +4423,28 @@ def run_repository(
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
     client = create_runtime(config)
-    plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
-    work_items = run_outline_step(
-        "Work items",
-        lambda: process_work_items(config, client, repo, github, plan_pr, plan),
-    )
-    ready = integration_delivery(
-        config, work_items, client, repo, github, deferred_deliveries
-    )
-    if deferred_deliveries is None:
-        report_repository_delivery(config, ready)
-    return ready
+    try:
+        plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
+        work_items = run_outline_step(
+            "Work items",
+            lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+        )
+        ready = integration_delivery(
+            config, work_items, client, repo, github, deferred_deliveries
+        )
+        if deferred_deliveries is None:
+            report_repository_delivery(config, ready)
+        return ready
+    except Exception as exc:
+        report = recover_error(
+            client, config, exc, recovery_authoritative_state(config, repo, github)
+        )
+        print(
+            f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
+            f"Evidence: {report.evidence}",
+            flush=True,
+        )
+        raise
 
 
 def main() -> None:
