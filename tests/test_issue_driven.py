@@ -2564,6 +2564,10 @@ def test_recovery_report_fails_closed_on_invalid_or_unbounded_output() -> None:
         "x" * 2001,
         '{"repaired":false,"retry_safe":false,"summary":"bad\\rline","evidence":"ok"}',
         '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad\\u2028line"}',
+        '{"repaired":false,"retry_safe":false,"summary":"bad\\ud800","evidence":"ok"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad\\udfff"}',
+        '{"repaired":false,"retry_safe":false,"summary":"ok","evidence":"bad"}'
+        + "\ud800",
     ):
         with pytest.raises(WorkerFailure, match="recovery"):
             parse_report(value)

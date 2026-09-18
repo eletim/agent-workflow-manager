@@ -610,7 +610,11 @@ class RecoveryReport:
 
 def parse_recovery_report(source: str) -> RecoveryReport:
     """Accept only a bounded account with evidence for a safe retry."""
-    if len(source.encode("utf-8")) > MAX_RECOVERY_REPORT_BYTES:
+    try:
+        source_bytes = source.encode("utf-8")
+    except UnicodeError as exc:
+        raise WorkerFailure("recovery report is not valid UTF-8") from exc
+    if len(source_bytes) > MAX_RECOVERY_REPORT_BYTES:
         raise WorkerFailure("recovery report exceeds its size limit")
     try:
         value = json.loads(source)
@@ -636,9 +640,14 @@ def parse_recovery_report(source: str) -> RecoveryReport:
                 for character in field_value
             )
             or "\0" in field_value
-            or len(field_value.encode("utf-8")) > 500
         ):
             raise WorkerFailure(f"recovery report {field_name} is invalid")
+        try:
+            field_bytes = field_value.encode("utf-8")
+        except UnicodeError as exc:
+            raise WorkerFailure(f"recovery report {field_name} is invalid UTF-8") from exc
+        if len(field_bytes) > 500:
+            raise WorkerFailure(f"recovery report {field_name} is too long")
     if value["retry_safe"] and not value["repaired"]:
         raise WorkerFailure("recovery cannot recommend retry without a repair")
     return RecoveryReport(**value)
