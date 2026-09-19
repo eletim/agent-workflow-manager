@@ -1634,15 +1634,12 @@ async function browseDirectory(path) {
   }
 }
 
-function releaseDirectoryPickerScrollLock() {
-  if (!document.body.classList.contains("directory-picker-open")) return;
-  document.body.classList.remove("directory-picker-open");
+function invalidateDirectoryPickerRequests() {
   directoryPickerRequestGeneration += 1;
 }
 
-function closeDirectoryPicker() {
-  releaseDirectoryPickerScrollLock();
-  directoryPickerDialog.close();
+function releaseDirectoryPickerScrollLock() {
+  document.body.classList.remove("directory-picker-open");
 }
 
 directoryPickerOpen.addEventListener("click", () => {
@@ -1657,10 +1654,13 @@ directoryPickerOpen.addEventListener("click", () => {
 });
 
 directoryPickerClose.addEventListener("click", () => {
-  closeDirectoryPicker();
+  directoryPickerDialog.close();
 });
 
-directoryPickerDialog.addEventListener("close", releaseDirectoryPickerScrollLock);
+directoryPickerDialog.addEventListener("close", () => {
+  invalidateDirectoryPickerRequests();
+  releaseDirectoryPickerScrollLock();
+});
 
 directoryPickerParent.addEventListener("click", () => {
   if (directoryPickerParentPath !== null) {
@@ -1672,7 +1672,7 @@ directoryPickerSelect.addEventListener("click", () => {
   if (directoryPickerCurrentPath === null || activeRunId !== null) return;
   promptCwd.value = directoryPickerCurrentPath;
   promptDraft.cwd = directoryPickerCurrentPath;
-  closeDirectoryPicker();
+  directoryPickerDialog.close();
   promptCwd.focus();
 });
 

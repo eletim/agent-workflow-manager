@@ -102,7 +102,11 @@ class Element {
 
   showModal() { this.open = true; }
 
-  close() { this.open = false; }
+  close() {
+    this.open = false;
+    const event = {preventDefault() {}};
+    for (const listener of this.listeners.get("close") || []) listener(event);
+  }
 }
 
 function snapshot({
@@ -1589,7 +1593,35 @@ test("Prompt directory picker releases page scroll lock when dismissed", async (
   await elements["directory-picker-open"].dispatch("click");
   assert.equal(elements.body.classList.contains("directory-picker-open"), true);
 
+  await elements["directory-picker-close"].dispatch("click");
+  assert.equal(elements["directory-picker-dialog"].open, false);
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
+
+  await elements["directory-picker-open"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
   await elements["directory-picker-dialog"].dispatch("close");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
+});
+
+test("closing the directory picker invalidates its pending request", async () => {
+  const listing = deferred();
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") return listing.promise;
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  await elements["directory-picker-open"].dispatch("click");
+  await elements["directory-picker-close"].dispatch("click");
+  listing.resolve(response({path: "/stale", parent: "/", directories: []}));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(elements["directory-picker-path"].textContent, "");
   assert.equal(elements.body.classList.contains("directory-picker-open"), false);
 });
 
