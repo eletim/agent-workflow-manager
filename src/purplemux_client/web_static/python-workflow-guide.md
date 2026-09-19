@@ -652,6 +652,9 @@ github.create_draft_pr(
     *, head, base, expected_head_sha, expected_base_sha, title, body,
     correlation_id
 ) -> PullRequestState
+github.create_issue_comment(
+    issue, *, body, correlation_id
+) -> str
 github.set_draft(
     pr, *, draft, expected_head, expected_head_sha, expected_base,
     expected_base_sha
@@ -669,6 +672,8 @@ github.merge_pr(
 `state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
+`create_issue_comment()` appends one correlation-marked Issue comment and
+reconciles a lost mutation response without duplicating that comment.
 `update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
 concurrent body or review-state change. `merge_pr()` supports only an immediate
 merge commit and verifies
@@ -760,7 +765,8 @@ The following categories are normative:
 - **Inspection-aware, reconciliation-capable mutation:**
   `prepare_run_repository()`; workspace/tab creation and identity-checked
   deletion/close; `interrupt()`; every Git mutation listed above; and
-  `create_draft_pr()`, `set_draft()`, `update_pr_body()`, and `merge_pr()`. Each
+  `create_draft_pr()`, `create_issue_comment()`, `set_draft()`,
+  `update_pr_body()`, and `merge_pr()`. Each
   captures exact preconditions, dispatches at most once, and inspects an
   authoritative postcondition. It can return the confirmed desired result,
   report a proven rejection/conflict, or raise `MutationOutcomeUnknown` if

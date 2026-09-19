@@ -1110,6 +1110,8 @@ def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() 
     assert "canonical source when decomposing or refining" in code
     assert "short inline mini tasks" in code
     assert "Do not create GitHub Issues" in code
+    assert "rationale must be a concise single-line explanation" in code
+    assert "github.create_issue_comment(" in code
     assert "one_shot_issue" in code
     assert "One-shot source Issue:" in code
 
@@ -1178,9 +1180,17 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
                     ],
                     "complete": False,
                     "policy_conflicts": [],
+                    "rationale": "This task isolates the required public behavior.",
                 }
             ),
-            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "The planned work is complete.",
+                }
+            ),
         )
     )
     processed: list[object] = []
@@ -1196,13 +1206,17 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     )
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+    comments: list[str] = []
+    github = SimpleNamespace(
+        create_issue_comment=lambda _issue, **kwargs: comments.append(kwargs["body"])
+    )
     plan = workflow["WorkItemPlan"](config)
 
     effective = workflow["process_work_items"](
         config,
         SimpleNamespace(),
         SimpleNamespace(),
-        SimpleNamespace(),
+        github,
         SimpleNamespace(),
         plan,
     )
@@ -1210,6 +1224,10 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     assert [item.key for item in processed] == ["focused-change"]
     assert [item.key for item in inspected] == ["focused-change"]
     assert [item.key for item in effective] == ["focused-change"]
+    assert len(comments) == 2
+    assert "### Decomposition rationale" in comments[0]
+    assert "Added Mini task focused-change" in comments[0]
+    assert "No changes from the previous planning result" in comments[1]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
     assert all(
         "git show\ndev/v1:docs/design-principles.md" in prompt for prompt in prompts
@@ -1250,6 +1268,7 @@ def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
                     "actions": [{"action": "add", "item": 169}],
                     "complete": False,
                     "policy_conflicts": [],
+                    "rationale": "A focused task is required.",
                 }
             ),
         )
@@ -1276,6 +1295,7 @@ def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
                 ],
                 "complete": True,
                 "policy_conflicts": [],
+                "rationale": "The obsolete task is already satisfied.",
             }
         ),
     )
@@ -1359,9 +1379,17 @@ def test_planner_recovers_invalid_policy_conflicts_in_the_same_session() -> None
                     "actions": [],
                     "complete": True,
                     "policy_conflicts": ["conflict without a configured policy"],
+                    "rationale": "No implementation work remains.",
                 }
             ),
-            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "No implementation work remains.",
+                }
+            ),
         )
     )
     turns: list[tuple[str, str]] = []
@@ -1373,12 +1401,13 @@ def test_planner_recovers_invalid_policy_conflicts_in_the_same_session() -> None
 
     workflow["run_turn"] = run_turn
     workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+    github = SimpleNamespace(create_issue_comment=lambda *args, **kwargs: None)
 
     effective = workflow["process_work_items"](
         config,
         SimpleNamespace(),
         SimpleNamespace(),
-        SimpleNamespace(),
+        github,
         None,
         workflow["WorkItemPlan"](config),
     )
@@ -1417,6 +1446,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
             ],
             "complete": False,
             "policy_conflicts": [],
+            "rationale": "The focused task covers the remaining requirement.",
         }
     )
 
@@ -1426,6 +1456,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
         return _args[-1]
 
     workflow["persist_work_item_plan"] = persist
+    github = SimpleNamespace(create_issue_comment=lambda *args, **kwargs: None)
     workflow["inspect_dynamic_work_item_topology"] = lambda *_args: (
         _ for _ in ()
     ).throw(WorkerFailure(topology_error))
@@ -1438,7 +1469,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
             config,
             SimpleNamespace(),
             SimpleNamespace(),
-            SimpleNamespace(),
+            github,
             SimpleNamespace(),
             workflow["WorkItemPlan"](config),
         )
@@ -4158,6 +4189,9 @@ def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
             created = replace(created, body=str(kwargs["body"]))
             return created
 
+        def create_issue_comment(self, *args: object, **kwargs: object) -> None:
+            return None
+
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
             return BranchState(branch, integration_sha, integration_sha, True)
@@ -4199,8 +4233,14 @@ def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
                 ],
                 "complete": False,
                 "policy_conflicts": [],
+                "rationale": "The first task is the remaining focused work.",
             },
-            {"actions": [], "complete": True, "policy_conflicts": []},
+            {
+                "actions": [],
+                "complete": True,
+                "policy_conflicts": [],
+                "rationale": "The planned work is complete.",
+            },
         )
     )
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
@@ -4284,6 +4324,9 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
             create_calls += 1
             pytest.fail("an identical branch pair cannot have a pull request")
 
+        def create_issue_comment(self, *args: object, **kwargs: object) -> None:
+            return None
+
     repository = Repository()
     github = GitHub()
     findings: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -4298,7 +4341,12 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["create_agent"] = lambda *args, **kwargs: "planner"
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
-        {"actions": [], "complete": True, "policy_conflicts": []}
+        {
+            "actions": [],
+            "complete": True,
+            "policy_conflicts": [],
+            "rationale": "No implementation work is required.",
+        }
     )
 
     plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, github)
