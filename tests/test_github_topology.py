@@ -75,6 +75,7 @@ class FakeGitHubRunner:
         self.prs = prs or []
         self.delay_seconds = delay_seconds
         self.refs = {"feature/65": HEAD_SHA, "dev/v0.1.4": BASE_SHA}
+        self.comments: list[dict[str, object]] = []
         self.queue_entry: object = None
         self.mutation_outcome = "success"
         self.concurrent_wrong_base = False
@@ -98,6 +99,13 @@ class FakeGitHubRunner:
             return self._done({"ok": True})
         if command[1:3] == ["api", "repos/acme/project"]:
             return self._done({"full_name": "acme/project"})
+        if (
+            len(command) >= 3
+            and command[1] == "api"
+            and "/issues/" in command[2]
+            and "/comments?" in command[2]
+        ):
+            return self._done(self.comments)
         if len(command) >= 3 and command[1] == "api" and "pulls?" in command[2]:
             endpoint = command[2]
             page = int(re.search(r"[?&]page=(\d+)", endpoint).group(1))  # type: ignore[union-attr]
@@ -196,6 +204,17 @@ class FakeGitHubRunner:
                 for index, value in enumerate(command)
                 if value in {"-f", "-F"}
             }
+            if "/issues/" in command[4] and command[4].endswith("/comments"):
+                comment = {
+                    "id": len(self.comments) + 1,
+                    "html_url": (
+                        "https://github.com/acme/project/issues/169"
+                        f"#issuecomment-{len(self.comments) + 1}"
+                    ),
+                    "body": fields["body"],
+                }
+                self.comments.append(comment)
+                return self._mutation_result(comment)
             created = pr_data(
                 max((int(item["number"]) for item in self.prs), default=0) + 1,
                 head=fields["head"],
@@ -437,6 +456,41 @@ def test_transient_github_mutation_error_is_not_retried() -> None:
             expected_base_sha=BASE_SHA,
         )
     assert mutation_calls == 1
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "timeout_after_apply",
+        "malformed_after_apply",
+        "nonzero_after_apply",
+        "interrupt_after_apply",
+    ],
+)
+def test_issue_comment_is_appended_once_and_reconciles_response_loss(
+    outcome: str,
+) -> None:
+    runner = FakeGitHubRunner()
+    github = repository(runner)
+    runner.mutation_outcome = outcome
+
+    url = github.create_issue_comment(
+        169,
+        body="## One-Shot Planning\n\nStructured summary.",
+        correlation_id="planning-1",
+    )
+    repeated = github.create_issue_comment(
+        169,
+        body="## One-Shot Planning\n\nStructured summary.",
+        correlation_id="planning-1",
+    )
+
+    assert url == repeated
+    assert len(runner.comments) == 1
+    assert "agent-workflow-manager:issue-comment:planning-1" in str(
+        runner.comments[0]["body"]
+    )
 
 
 def test_open_discovery_rejects_wrong_base_and_ambiguity() -> None:

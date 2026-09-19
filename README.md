@@ -258,6 +258,12 @@ original Issue as its work definition:
 }
 ```
 
+After every one-shot planning decision, the workflow appends a structured
+comment to the source Issue. Each comment records the current internal work-item
+decomposition, the planner's decomposition rationale, and the changes from the
+previous planning result. Replanning appends a new comment instead of replacing
+history; the workflow does not create child Issues or publish raw agent logs.
+
 The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`,
 `scope_max_reviews`, `turn_timeout`, the two agent fields, and `scenarios` are optional; every
 other field is required. When omitted, `scope_max_reviews` retains the existing

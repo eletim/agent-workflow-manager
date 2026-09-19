@@ -533,6 +533,96 @@ class GitHubRepository:
             },
         )
 
+    def create_issue_comment(
+        self,
+        issue: int,
+        *,
+        body: str,
+        correlation_id: str,
+    ) -> str:
+        """Append one correlation-safe comment to an exact repository Issue."""
+        self._validate_identity()
+        if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
+            raise ValueError("issue must be a positive integer")
+        if not body.strip() or "\0" in body:
+            raise ValueError(
+                "issue comment body must be non-empty and contain no nulls"
+            )
+        if not _CORRELATION_RE.fullmatch(correlation_id):
+            raise ValueError(
+                "correlation_id must be 1..64 non-secret identifier characters"
+            )
+        marker = f"<!-- agent-workflow-manager:issue-comment:{correlation_id} -->"
+        marked_body = f"{body.rstrip()}\n\n{marker}"
+
+        def matching_comments() -> tuple[dict[str, Any], ...]:
+            data = self._read_json(
+                [
+                    "api",
+                    f"repos/{self.slug}/issues/{issue}/comments"
+                    "?per_page=100&sort=created&direction=desc",
+                ]
+            )
+            if not isinstance(data, list):
+                raise WorkerFailure("GitHub Issue comments response is not a list")
+            matches = tuple(
+                comment
+                for comment in data
+                if isinstance(comment, dict) and marker in str(comment.get("body", ""))
+            )
+            if len(matches) > 1:
+                raise WorkerFailure(
+                    f"Issue #{issue} has duplicate planning comment correlations"
+                )
+            if matches and matches[0].get("body") != marked_body:
+                raise WorkerFailure(
+                    f"Issue #{issue} planning comment correlation has changed body"
+                )
+            return matches
+
+        before = matching_comments()
+        if before:
+            url = before[0].get("html_url")
+            if not isinstance(url, str) or not url:
+                raise WorkerFailure("GitHub Issue comment has no usable URL")
+            return url
+
+        def postcondition() -> str:
+            matches = matching_comments()
+            if not matches:
+                raise _PostconditionAbsent("created Issue comment is not visible")
+            url = matches[0].get("html_url")
+            if not isinstance(url, str) or not url:
+                raise WorkerFailure("GitHub Issue comment has no usable URL")
+            return url
+
+        def pre_dispatch() -> None:
+            if matching_comments():
+                raise WorkerFailure("planning comment correlation already exists")
+
+        return self._mutate(
+            operation="create Issue comment",
+            target=f"{self.slug}#{issue}",
+            pre_state=before,
+            args=[
+                "api",
+                "--method",
+                "POST",
+                f"repos/{self.slug}/issues/{issue}/comments",
+                "-f",
+                f"body={marked_body}",
+            ],
+            pre_dispatch=pre_dispatch,
+            unchanged=lambda: not matching_comments(),
+            postcondition=postcondition,
+            plan={
+                "kind": "create_issue_comment",
+                "repository": self.slug,
+                "issue": issue,
+                "correlationId": correlation_id,
+            },
+        )
+
     def set_draft(
         self,
         pr: int,

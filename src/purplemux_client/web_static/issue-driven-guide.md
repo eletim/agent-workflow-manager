@@ -252,6 +252,12 @@ To deliver one large Issue without preparing its work-item list, use
 }
 ```
 
+Every successful one-shot planning turn appends one structured comment to the
+source Issue with the current internal work-item decomposition, its rationale,
+and changes from the previous planning result. Later replanning adds another
+comment so the history remains chronological. It does not create child Issues
+or include raw stdout and agent conversation logs.
+
 The workflow starts this mode with an empty plan. Before every dispatch, the
 dedicated manager reads the source Issue and adds short inline mini tasks whose
 instructions focus on purpose and non-negotiable design decisions. It may update

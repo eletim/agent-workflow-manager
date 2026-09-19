@@ -61,6 +61,7 @@ MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
+MAX_PLANNER_RATIONALE_BYTES = 2_000
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
 MAX_RECOVERY_STATE_BYTES = 32_000
@@ -357,6 +358,8 @@ class PlannerDecision:
     complete: bool
     policy_conflicts: tuple[str, ...] = ()
     skipped: tuple[PlannerSkip, ...] = ()
+    rationale: str | None = None
+    changes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -778,6 +781,9 @@ _RAW_REVIEW_OUTPUT = re.compile(
 )
 _OPAQUE_SECRET_LIKE_VALUE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_./+=-]{32,}")
 _PERSISTENCE_SAFE_REVIEW_TEXT = re.compile(r"^[^\x00-\x1f\x7f<>{}`=]+$")
+_PLANNER_LOW_LEVEL_TEXT = re.compile(
+    r"(?i)(?:^|[ \t])(?:user|assistant|system|developer|tool|stdout|stderr)\s*:"
+)
 
 
 def _safe_review_text(value: object, *, max_bytes: int) -> bool:
@@ -3080,9 +3086,23 @@ decomposing the remaining work into short inline mini tasks. Each task must stat
 its purpose and any non-negotiable design decision, while leaving implementation
 detail to the implementer. Do not create GitHub Issues or implement the source
 Issue as one undivided work item. Numeric Issue additions are invalid in one-shot
-mode.
+mode. Do not include stdout or agent conversation logs in tasks or rationale.
+Tasks, rationale, and skip reasons that will be published must be concise
+single-line summaries, never copied stdout, stderr, or conversation transcripts.
 
 """
+    decision_keys = (
+        '"actions", "complete", "policy_conflicts", and\n"rationale"'
+        if config.one_shot_issue is not None
+        else '"actions", "complete", and\n"policy_conflicts"'
+    )
+    rationale_contract = (
+        f" rationale must be a concise single-line explanation of why the current "
+        f"decomposition is appropriate, at most {MAX_PLANNER_RATIONALE_BYTES} UTF-8 "
+        "bytes, without logs or secrets."
+        if config.one_shot_issue is not None
+        else ""
+    )
     return f"""Review the workflow-owned work-item plan before its next dispatch.
 You are the planning role only: do not edit files, implement work, or mutate Git
 or GitHub. Inspect repository and GitHub state read-only when useful. Preserve
@@ -3103,8 +3123,8 @@ Integration branch: {config.integration_branch}
 Processed work items: {json.dumps(processed, ensure_ascii=False)}
 Pending work items: {json.dumps(remaining, ensure_ascii=False)}
 
-Return exactly one JSON object with keys "actions", "complete", and
-"policy_conflicts". policy_conflicts must be an array containing at most
+Return exactly one JSON object with keys {decision_keys}.{rationale_contract}
+policy_conflicts must be an array containing at most
 {MAX_PLANNER_POLICY_CONFLICTS} concise strings of at most
 {MAX_POLICY_CONFLICT_DETAIL_CHARS} characters each, and must be empty when no
 conflict exists. Actions run in order and have one of these exact shapes:
@@ -3145,6 +3165,28 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
         task,
         fingerprint,
     )
+
+
+def planner_text_is_publishable(value: str) -> bool:
+    return (
+        value.splitlines() == [value]
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F for character in value
+        )
+        and "```" not in value
+        and _PLANNER_LOW_LEVEL_TEXT.search(value) is None
+        and _RAW_REVIEW_OUTPUT.search(value) is None
+        and _SENSITIVE_REVIEW_TEXT.search(value) is None
+        and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
+    )
+
+
+def require_publishable_planner_task(issue: Issue) -> None:
+    assert issue.task is not None
+    if not planner_text_is_publishable(issue.task):
+        raise WorkerFailure(
+            "one-shot planner task must not contain logs or secret-like values"
+        )
 
 
 def planner_key(value: object) -> int | str:
@@ -3195,6 +3237,8 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     except json.JSONDecodeError as exc:
         raise WorkerFailure(f"planner returned invalid JSON: {exc.msg}") from exc
     expected_fields = {"actions", "complete", "policy_conflicts"}
+    if plan.config.one_shot_issue is not None:
+        expected_fields.add("rationale")
     if not isinstance(decision, dict) or set(decision) != expected_fields:
         raise WorkerFailure(
             "planner decision must contain only actions, complete, and "
@@ -3203,6 +3247,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     actions = decision["actions"]
     complete = decision["complete"]
     policy_conflicts = decision["policy_conflicts"]
+    rationale = decision.get("rationale")
     if (
         not isinstance(actions, list)
         or len(actions) > MAX_PLANNER_ACTIONS
@@ -3211,6 +3256,11 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
     ):
         raise WorkerFailure("planner decision has invalid bounded values")
+    if plan.config.one_shot_issue is not None:
+        if not _safe_review_text(
+            rationale, max_bytes=MAX_PLANNER_RATIONALE_BYTES
+        ) or not planner_text_is_publishable(rationale):
+            raise WorkerFailure("planner rationale is invalid or unsafe")
     for conflict in policy_conflicts:
         conflict_has_surrogate = isinstance(conflict, str) and any(
             0xD800 <= ord(character) <= 0xDFFF for character in conflict
@@ -3232,6 +3282,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     candidate.position = plan.position
     candidate.skipped = list(plan.skipped)
     skipped_before = len(candidate.skipped)
+    changes: list[str] = []
     try:
         for action in actions:
             if not isinstance(action, dict) or not isinstance(
@@ -3240,16 +3291,18 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 raise WorkerFailure("planner action is invalid")
             kind = action["action"]
             if kind == "add" and set(action) == {"action", "item"}:
-                candidate.add(planner_added_issue(action["item"]))
+                added = planner_added_issue(action["item"])
+                candidate.add(added)
+                changes.append(f"Added {added.label}.")
             elif kind == "update" and set(action) == {"action", "key", "task"}:
                 key = planner_key(action["key"])
                 index = candidate._remaining_index(key)
                 current = candidate.items[index]
                 if current.task_id is None:
                     raise WorkerFailure("planner can update only an inline mini task")
-                candidate.update(
-                    key, planner_inline_issue(current.task_id, action["task"])
-                )
+                updated = planner_inline_issue(current.task_id, action["task"])
+                candidate.update(key, updated)
+                changes.append(f"Updated {current.label}.")
             elif kind == "skip" and set(action) == {"action", "key", "reason"}:
                 reason = action["reason"]
                 reason_has_surrogate = isinstance(reason, str) and any(
@@ -3264,11 +3317,27 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                     or reason_has_surrogate
                 ):
                     raise WorkerFailure("planner skip reason is invalid")
+                if (
+                    plan.config.one_shot_issue is not None
+                    and not planner_text_is_publishable(reason)
+                ):
+                    raise WorkerFailure(
+                        "one-shot planner skip reason must not contain logs or "
+                        "secret-like values"
+                    )
                 candidate.skip(planner_key(action["key"]), reason)
+                summary = reason if len(reason) <= 160 else f"{reason[:159]}…"
+                changes.append(
+                    f"Skipped {candidate.skipped[-1].issue.label}: {summary}"
+                )
             else:
                 raise WorkerFailure("planner action has an unsupported shape")
     except ValueError as exc:
         raise WorkerFailure(f"planner decision is invalid: {exc}") from exc
+
+    if plan.config.one_shot_issue is not None:
+        for issue in candidate.items:
+            require_publishable_planner_task(issue)
 
     if complete and candidate.remaining:
         raise WorkerFailure("planner cannot complete while work items remain")
@@ -3283,6 +3352,35 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         complete,
         tuple(policy_conflicts),
         tuple(candidate.skipped[skipped_before:]),
+        rationale,
+        tuple(changes),
+    )
+
+
+def one_shot_planning_comment(
+    plan: WorkItemPlan, decision: PlannerDecision
+) -> str:
+    if plan.config.one_shot_issue is None or decision.rationale is None:
+        raise ValueError("planning comments require a one-shot planner decision")
+    items = []
+    for index, issue in enumerate(plan.items):
+        status = "processed" if index < plan.position else "pending"
+        assert issue.task_id is not None and issue.task is not None
+        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {issue.task}")
+    decomposition = "\n".join(items) if items else "No work items remain."
+    changes = (
+        "\n".join(f"- {change}" for change in decision.changes)
+        if decision.changes
+        else "- No changes from the previous planning result."
+    )
+    return (
+        "## One-Shot Planning\n\n"
+        "### Work item decomposition\n\n"
+        f"{decomposition}\n\n"
+        "### Decomposition rationale\n\n"
+        f"{decision.rationale}\n\n"
+        "### Changes from previous planning\n\n"
+        f"{changes}"
     )
 
 
@@ -3666,6 +3764,16 @@ def process_work_items(
                 skipped.issue.result_id,
                 skipped.reason,
                 label=skipped.issue.label,
+            )
+        if config.one_shot_issue is not None:
+            comment = one_shot_planning_comment(plan, planner_decision)
+            github.create_issue_comment(
+                config.one_shot_issue,
+                body=comment,
+                correlation_id=run_correlation(
+                    "one-shot-planning-comment-"
+                    + hashlib.sha256(comment.encode()).hexdigest()[:16]
+                ),
             )
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:
