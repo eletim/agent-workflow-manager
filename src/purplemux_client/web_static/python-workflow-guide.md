@@ -605,6 +605,7 @@ The supported Git inspection and assertion methods are:
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
+repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -623,6 +624,10 @@ agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
+
+`inspect_remote_branch_heads()` enumerates the remote directly and does not
+trust local tracking refs. Use it when a workflow must compare a configured
+development branch with the remote's current branch set.
 
 The inspection-aware Git operations that may mutate are:
 
@@ -653,6 +658,9 @@ The supported GitHub inspections and mutations are:
 
 ```python
 github.find_pr(*, head, base, state) -> PullRequestState | None
+github.compare_commits(*, base_sha, head_sha) -> Literal[
+    "ahead", "behind", "diverged", "identical"
+]
 github.require_pr(
     *, head, base, number=None, state="OPEN", expected_head_sha=None,
     expected_base_sha=None, draft=None
@@ -678,7 +686,9 @@ github.merge_pr(
 ) -> MergeResult
 ```
 
-`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
+`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`.
+`compare_commits()` checks the relationship between two exact authoritative
+GitHub commit IDs without changing repository state. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
 `create_issue_comment()` appends one correlation-marked Issue comment and

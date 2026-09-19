@@ -90,6 +90,10 @@ REVIEWER_CHECKOUT_GUARD = (
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
     "git show, or gh pr diff only."
 )
+DEVELOPMENT_BRANCH_VERSION = re.compile(
+    r"^(?P<series>.+/v)(?P<major>0|[1-9][0-9]*)\."
+    r"(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)$"
+)
 
 
 class MissingReviewAudit(WorkerFailure):
@@ -459,6 +463,62 @@ def issue_driven_repository_declarations():
 
 def short_error(exc: BaseException) -> str:
     return str(exc).replace("\n", " ")[:500]
+
+
+def newer_development_branches(
+    integration_branch: str, remote_branches: dict[str, str]
+) -> tuple[str, ...]:
+    """Return newer-named remote branches in the configured patch series."""
+    configured = DEVELOPMENT_BRANCH_VERSION.fullmatch(integration_branch)
+    if configured is None:
+        return ()
+    series = configured["series"]
+    major = int(configured["major"])
+    minor = int(configured["minor"])
+    patch = int(configured["patch"])
+    candidates: list[tuple[int, str]] = []
+    for branch in remote_branches:
+        candidate = DEVELOPMENT_BRANCH_VERSION.fullmatch(branch)
+        if candidate is None:
+            continue
+        if (
+            candidate["series"] == series
+            and int(candidate["major"]) == major
+            and int(candidate["minor"]) == minor
+            and int(candidate["patch"]) > patch
+        ):
+            candidates.append((int(candidate["patch"]), branch))
+    return tuple(branch for _, branch in sorted(candidates, reverse=True))
+
+
+def warn_if_stale_integration_branch(
+    config: Config, repo: GitRepository, github: GitHubRepository
+) -> None:
+    """Warn when the remote contains a newer branch in the same patch series."""
+    if DEVELOPMENT_BRANCH_VERSION.fullmatch(config.integration_branch) is None:
+        return
+    remote_branches = repo.inspect_remote_branch_heads()
+    configured_sha = remote_branches.get(config.integration_branch)
+    if configured_sha is None:
+        return
+    for newer in newer_development_branches(
+        config.integration_branch, remote_branches
+    ):
+        newer_sha = remote_branches[newer]
+        if (
+            github.compare_commits(base_sha=configured_sha, head_sha=newer_sha)
+            != "ahead"
+        ):
+            continue
+        warning = (
+            f"configured integration branch {config.integration_branch} @ "
+            f"{configured_sha} may be stale; authoritative remote branch {newer} "
+            f"@ {newer_sha} is ahead in the same development series. Verify the "
+            "intended base; the workflow will not change it automatically."
+        )
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("git", warning, status="warning")
+        return
 
 
 def inspect_pr(
@@ -5255,6 +5315,7 @@ def run_repository(
         command_timeout_seconds=COMMAND_TIMEOUT,
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
+    warn_if_stale_integration_branch(config, repo, github)
     client = create_runtime(config)
     for recovery_attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
         plan: WorkItemPlan | None = None
