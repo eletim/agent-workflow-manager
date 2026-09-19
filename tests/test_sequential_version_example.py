@@ -1792,8 +1792,14 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+            expected_agent: str,
         ) -> BranchState:
+            assert expected_agent == "codex"
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
@@ -1898,8 +1904,14 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             return BranchState(branch, self.local_sha, None, True)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+            expected_agent: str,
         ) -> BranchState:
+            assert expected_agent == "codex"
             events.append(f"commit:{self.local_sha}")
             assert branch == issue.branch
             assert self.local_sha != previous_sha or allow_unchanged
@@ -4033,8 +4045,14 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
             return SimpleNamespace(dirty=False)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+            expected_agent: str | None = None,
         ) -> BranchState:
+            assert expected_agent is None
             return BranchState(branch, draft.head_sha, draft.head_sha, True)
 
     class GitHub:
@@ -4121,8 +4139,14 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+            expected_agent: str,
         ) -> BranchState:
+            assert expected_agent == "codex"
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 

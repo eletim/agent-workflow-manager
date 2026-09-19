@@ -407,9 +407,12 @@ class GitRepository:
         *,
         previous_sha: str,
         allow_unchanged: bool = False,
+        expected_agent: str | None = None,
     ) -> BranchState:
         """Require a clean committed result on the current logical branch."""
         self._validate_sha(previous_sha)
+        if expected_agent is not None and expected_agent not in {"codex", "claude"}:
+            raise ValueError("expected_agent must be codex or claude")
         self.require_clean()
         state = self.require_current_branch(branch)
         if state.local_sha is None:
@@ -427,7 +430,66 @@ class GitRepository:
                 f"branch {branch!r} no longer descends from pre-turn commit "
                 f"{previous_sha}"
             )
+        if expected_agent is not None:
+            self._require_agent_commit_provenance(
+                previous_sha, state.local_sha, expected_agent
+            )
         return state
+
+    def _require_agent_commit_provenance(
+        self, previous_sha: str, current_sha: str, expected_agent: str
+    ) -> None:
+        coauthor = {
+            "codex": "Codex <noreply@openai.com>",
+            "claude": "Claude <noreply@anthropic.com>",
+        }[expected_agent]
+        commits = self._read(
+            ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
+        )
+        for commit_sha in commits.splitlines():
+            agent = self._read(
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:key=AWM-Agent,valueonly)",
+                    commit_sha,
+                ]
+            ).splitlines()
+            process = self._read(
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:key=AWM-Process,valueonly)",
+                    commit_sha,
+                ]
+            ).splitlines()
+            coauthors = self._read(
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:key=Co-authored-by,valueonly)",
+                    commit_sha,
+                ]
+            ).splitlines()
+            if agent != [expected_agent]:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must have exactly one "
+                    f"AWM-Agent trailer naming {expected_agent}"
+                )
+            if len(process) != 1 or process[0] not in {
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+                "recovery",
+            }:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must have exactly one valid "
+                    "AWM-Process trailer"
+                )
+            if coauthor not in coauthors:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must attribute {coauthor} as a co-author"
+                )
 
     def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
         """Push a clean exact local branch only when its remote is absent or behind."""

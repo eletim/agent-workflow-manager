@@ -677,8 +677,11 @@ reconciles a lost mutation response without duplicating that comment.
 `update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
 concurrent body or review-state change. `merge_pr()` supports only an immediate
 merge commit and verifies
-its parents and the resulting base ref; it never queues, squashes, rebases, or
-enables auto-merge.
+its parents, the resulting base ref, and the `AWM-Automation` / `AWM-Process`
+trailers that identify the scripted merge. It never queues, squashes, rebases,
+or enables auto-merge, and it does not identify AWM as a co-author. CodingAgent
+commits separately carry a normalized co-author plus machine-readable
+`AWM-Agent` and `AWM-Process` trailers, which are verified before delivery.
 
 The repository execution helpers are:
 

@@ -84,6 +84,10 @@ IMPLEMENTATION_PRINCIPLE = (
     "reduced code size by mixing responsibilities unnaturally or by "
     "over-generalizing distinct behavior into shared abstractions."
 )
+AGENT_COAUTHORS = {
+    "codex": "Codex <noreply@openai.com>",
+    "claude": "Claude <noreply@anthropic.com>",
+}
 REVIEWER_CHECKOUT_GUARD = (
     "Never change the checkout: do not run git checkout, git switch, git restore, "
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
@@ -684,18 +688,21 @@ def recover_error(
             client,
             agent,
             "Recovery assessment",
-            "Investigate this workflow error using the current authoritative state "
-            "below. Make only a safe, necessary repair, then re-inspect the affected "
-            "state. If the outcome is uncertain, report retry_safe as false. "
-            "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
-            "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
-            "fingerprint markers. Return exactly one JSON object with boolean "
-            "repaired and retry_safe fields and concise single-line summary and "
-            "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
-            "the state after repair when recommending retry. No other fields or "
-            "prose.\n\n"
-            f"Error: {short_error(error)}\n\n"
-            f"Current authoritative state:\n{authoritative_state}",
+            implementer_prompt(
+                "Investigate this workflow error using the current authoritative "
+                "state below. Make only a safe, necessary repair, then re-inspect "
+                "the affected state. If the outcome is uncertain, report retry_safe "
+                "as false. Do not reset, rebase, stash, force-push, merge a work-item "
+                "PR, create unrelated PRs, discard ambiguous work, or edit "
+                "agent-workflow-manager fingerprint markers. Return exactly one JSON "
+                "object with boolean repaired and retry_safe fields and concise "
+                "single-line summary and evidence strings (at most 500 UTF-8 bytes "
+                "each). Include evidence from the state after repair when "
+                "recommending retry. No other fields or prose.\n\n"
+                f"Error: {short_error(error)}\n\n"
+                f"Current authoritative state:\n{authoritative_state}",
+                process="recovery",
+            ),
             parse_recovery_report,
         )
         return report
@@ -703,13 +710,21 @@ def recover_error(
         client.close_session(agent)
 
 
-def implementer_prompt(prompt: str) -> str:
+def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
     """Add the shared change-boundary policy to an implementation turn."""
+    if process not in {"implementation", "reviewer-fix", "cleanup", "recovery"}:
+        raise ValueError(f"unsupported implementation process: {process!r}")
+    coauthor = AGENT_COAUTHORS[IMPLEMENTER_AGENT]
     return (
         f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
-        "work-item plan."
+        "work-item plan.\n\n"
+        "Every commit you create must end with these exact Git trailers, preserving "
+        "any additional trailers the agent adds:\n"
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {IMPLEMENTER_AGENT}\n"
+        f"AWM-Process: {process}"
     )
 
 
@@ -2013,7 +2028,7 @@ Do not push, modify PR state, merge, start a review, reset, stash, rebase,
 force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
-ignored, removed, or could not resolve."""),
+ignored, removed, or could not resolve.""", process="cleanup"),
         iteration=iteration,
         warning_scope=warning_scope,
     )
@@ -2050,7 +2065,10 @@ def require_agent_result(
         warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
-        branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
+        branch,
+        previous_sha=previous_sha,
+        allow_unchanged=allow_unchanged,
+        expected_agent=IMPLEMENTER_AGENT,
     )
     assert result.local_sha is not None
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
@@ -2529,7 +2547,8 @@ def _review_issue_phase(
                 policy_context(config, scope=f"fixes for {issue.label}")
                 + f"""Re-evaluate every {phase} review finding below. If warranted,
 fix, test, commit, and leave the worktree clean. If no change is warranted,
-leave it clean and explain why; do not create an empty commit.\n\n{result}"""
+leave it clean and explain why; do not create an empty commit.\n\n{result}""",
+                process="reviewer-fix",
             ),
             iteration=review_number,
             pr=pr,
@@ -4443,6 +4462,7 @@ def _review_whole_version(
                         policy_context(config, scope="whole-version fixes")
                         + f"""Re-evaluate every finding. If warranted, fix, test, commit,
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                        process="reviewer-fix",
                     ),
                     iteration=review_number,
                 )

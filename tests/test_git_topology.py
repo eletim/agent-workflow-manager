@@ -299,6 +299,57 @@ def test_committed_result_requires_new_commit_and_clean_worktree(
         )
 
 
+@pytest.mark.parametrize(
+    ("agent", "coauthor"),
+    [
+        ("codex", "Codex <noreply@openai.com>"),
+        ("claude", "Claude <noreply@anthropic.com>"),
+    ],
+)
+def test_committed_result_requires_uniform_agent_provenance(
+    repositories: tuple[Path, Path, Path], agent: str, coauthor: str
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = f"feature/{agent}-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        f"Co-authored-by: {coauthor}\nAWM-Agent: {agent}\nAWM-Process: implementation",
+    )
+
+    result = repo.require_committed_result(
+        branch, previous_sha=base, expected_agent=agent
+    )
+
+    assert result.local_sha == git(work, "rev-parse", "HEAD")
+
+
+def test_committed_result_rejects_missing_agent_provenance(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    repo.prepare_feature_branch(
+        "feature/missing-provenance", base="main", expected_base_sha=base
+    )
+    git(work, "commit", "--allow-empty", "-m", "unattributed result")
+
+    with pytest.raises(WorkerFailure, match="AWM-Agent trailer"):
+        repo.require_committed_result(
+            "feature/missing-provenance",
+            previous_sha=base,
+            expected_agent="codex",
+        )
+
+
 @pytest.mark.parametrize("remote_relationship", ["ahead", "diverged"])
 def test_delivery_refuses_remote_ahead_or_diverged(
     repositories: tuple[Path, Path, Path], remote_relationship: str

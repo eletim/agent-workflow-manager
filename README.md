@@ -423,6 +423,13 @@ If review or final checks introduce a commit, the Workflow pushes and rebinds th
 exact Draft PR, invalidates the prior approval, and repeats review and checks
 before making the PR Ready.
 
+CodingAgent prompts require every implementation, review-fix, cleanup, and
+recovery commit to retain the configured agent as a co-author and to include
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
+result check verifies that provenance before a branch can advance. Scripted
+merge commits instead record `AWM-Automation: agent-workflow-manager` and
+`AWM-Process: merge`; AWM is automation provenance, not a co-author.
+
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,
 or an unproven final page fails closed. Ready/Draft changes require the exact

@@ -2447,6 +2447,30 @@ def test_generated_workflow_selects_role_specific_agents(
     assert "CreateSessionRequest(agent_type, str(config.repo), agent_type" in code
 
 
+@pytest.mark.parametrize(
+    ("agent", "coauthor"),
+    [
+        ("codex", "Codex <noreply@openai.com>"),
+        ("claude", "Claude <noreply@anthropic.com>"),
+    ],
+)
+def test_generated_workflow_requires_agent_commit_provenance(
+    agent: str, coauthor: str
+) -> None:
+    workflow = load_generated_workflow(implementer_agent=agent)
+
+    implementation = workflow["implementer_prompt"]("Implement it.")
+    reviewer_fix = workflow["implementer_prompt"](
+        "Fix the review.", process="reviewer-fix"
+    )
+
+    for prompt in (implementation, reviewer_fix):
+        assert f"Co-authored-by: {coauthor}" in prompt
+        assert f"AWM-Agent: {agent}" in prompt
+    assert "AWM-Process: implementation" in implementation
+    assert "AWM-Process: reviewer-fix" in reviewer_fix
+
+
 def test_generated_workflow_routes_every_agent_session_by_role() -> None:
     tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
     calls: dict[str, str] = {}
