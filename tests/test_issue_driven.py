@@ -2703,6 +2703,9 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="feature/work", dirty=False, status=()
         ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2754,7 +2757,15 @@ def test_repository_recovery_rejects_unrecoverable_report(
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
         open=lambda *args, **kwargs: object()
     )
@@ -2785,10 +2796,20 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
+    recovery_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_recovery_commit(branch: str, **kwargs: object) -> BranchState:
+        recovery_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=require_recovery_commit,
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2828,6 +2849,17 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     assert workflow["run_repository"](config) == "delivered"
     assert len(plans) == 2
     assert plans[1] is not plans[0]
+    assert recovery_checks == [
+        (
+            "dev/v1",
+            {
+                "previous_sha": "b" * 40,
+                "allow_unchanged": True,
+                "expected_agent": "codex",
+                "expected_process": "recovery",
+            },
+        )
+    ]
     assert workflow["summary_warnings"](None) == (
         "earlier timeout", "earlier policy warning"
     )
@@ -2849,6 +2881,12 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=True, status=(" M file",)
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
         ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
@@ -2953,7 +2991,18 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
         open=lambda *args, **kwargs: object()
     )

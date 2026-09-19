@@ -2049,6 +2049,7 @@ def require_agent_result(
     previous_sha: str,
     *,
     allow_unchanged: bool,
+    expected_process: str,
     iteration: int | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
@@ -2066,6 +2067,7 @@ def require_agent_result(
         previous_sha=previous_sha,
         allow_unchanged=allow_unchanged,
         expected_agent=IMPLEMENTER_AGENT,
+        expected_process=expected_process,
     )
     assert result.local_sha is not None
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
@@ -2450,6 +2452,7 @@ def _review_issue_phase(
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2564,6 +2567,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="reviewer-fix",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2916,6 +2920,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        expected_process="implementation",
         warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
@@ -4117,6 +4122,7 @@ def _review_whole_version(
                 config.integration_branch,
                 pr.head_sha,
                 allow_unchanged=True,
+                expected_process="cleanup",
                 iteration=review_number,
             )
             if scenario_reviewer_changed:
@@ -4210,6 +4216,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if principles_reviewer_changed:
@@ -4290,6 +4297,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -4373,6 +4381,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -4471,6 +4480,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     config.integration_branch,
                     current.head_sha,
                     allow_unchanged=True,
+                    expected_process="reviewer-fix",
                     iteration=review_number,
                 )
                 if changed:
@@ -4521,6 +4531,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             config.integration_branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if checks_changed:
@@ -4594,7 +4605,8 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
         run_final_checks(client, config)
         checked_sha, changed = require_agent_result(
             repo, client, fixer, config.integration_branch, pr.head_sha,
-            allow_unchanged=True, iteration=continuation_round,
+            allow_unchanged=True, expected_process="cleanup",
+            iteration=continuation_round,
         )
         if changed or checked_sha != pr.head_sha:
             raise WorkerFailure(
@@ -4835,6 +4847,8 @@ def integration_delivery(
                     config.integration_branch,
                     previous_sha=pr.head_sha,
                     allow_unchanged=True,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="cleanup",
                 )
                 assert checked.local_sha is not None
                 checked_sha = checked.local_sha
@@ -4847,6 +4861,7 @@ def integration_delivery(
                     config.integration_branch,
                     pr.head_sha,
                     allow_unchanged=True,
+                    expected_process="cleanup",
                     iteration=check_number,
                 )
             if not checks_changed:
@@ -5193,6 +5208,15 @@ def run_repository(
                 raise
             if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
                 raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            recovery_worktree = repo.inspect_worktree()
+            recovery_branch = recovery_worktree.current_branch
+            if recovery_branch is None:
+                raise WorkerFailure("repository recovery requires a current branch") from exc
+            recovery_start = repo.inspect_branch(recovery_branch)
+            if recovery_start.local_sha is None:
+                raise WorkerFailure(
+                    "repository recovery requires a local branch commit"
+                ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
             report = recover_error(client, config, exc, state)
             print(
@@ -5202,6 +5226,13 @@ def run_repository(
             )
             if not report.repaired or not report.retry_safe:
                 raise
+            repo.require_committed_result(
+                recovery_branch,
+                previous_sha=recovery_start.local_sha,
+                allow_unchanged=True,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process="recovery",
+            )
             require_recovery_retry_state(
                 recovery_authoritative_state(config, repo, github, plan), state
             )

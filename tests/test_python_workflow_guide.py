@@ -90,6 +90,7 @@ def test_guide_keeps_agent_context_role_minimal_and_decisions_durable() -> None:
 def test_guide_documents_agent_provenance_verification() -> None:
     guide = GUIDE.read_text(encoding="utf-8")
 
-    assert 'require_committed_result(..., expected_agent="codex")' in guide
+    assert 'expected_agent="codex",\nexpected_process="implementation")' in guide
     assert "`agent_commit_coauthor()` supplies the same normalized co-author" in guide
     assert "expected_agent=None" in guide
+    assert "expected_process=None" in guide

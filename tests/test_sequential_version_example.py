@@ -1798,8 +1798,10 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
             previous_sha: str,
             allow_unchanged: bool,
             expected_agent: str,
+            expected_process: str,
         ) -> BranchState:
             assert expected_agent == "codex"
+            assert expected_process in {"implementation", "cleanup"}
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
@@ -1910,8 +1912,10 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             previous_sha: str,
             allow_unchanged: bool,
             expected_agent: str,
+            expected_process: str,
         ) -> BranchState:
             assert expected_agent == "codex"
+            assert expected_process in {"implementation", "cleanup"}
             events.append(f"commit:{self.local_sha}")
             assert branch == issue.branch
             assert self.local_sha != previous_sha or allow_unchanged
@@ -4051,8 +4055,10 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
             previous_sha: str,
             allow_unchanged: bool,
             expected_agent: str | None = None,
+            expected_process: str | None = None,
         ) -> BranchState:
-            assert expected_agent is None
+            assert expected_agent == "codex"
+            assert expected_process == "cleanup"
             return BranchState(branch, draft.head_sha, draft.head_sha, True)
 
     class GitHub:
@@ -4145,8 +4151,10 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             previous_sha: str,
             allow_unchanged: bool,
             expected_agent: str,
+            expected_process: str,
         ) -> BranchState:
             assert expected_agent == "codex"
+            assert expected_process == "cleanup"
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 

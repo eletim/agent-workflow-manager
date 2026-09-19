@@ -420,11 +420,23 @@ class GitRepository:
         previous_sha: str,
         allow_unchanged: bool = False,
         expected_agent: str | None = None,
+        expected_process: str | None = None,
     ) -> BranchState:
         """Require a clean committed result on the current logical branch."""
         self._validate_sha(previous_sha)
-        if expected_agent is not None:
+        if (expected_agent is None) != (expected_process is None):
+            raise ValueError(
+                "expected_agent and expected_process must be provided together"
+            )
+        if expected_agent is not None and expected_process is not None:
             agent_commit_coauthor(expected_agent)
+            if expected_process not in {
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+                "recovery",
+            }:
+                raise ValueError("expected_process is not a supported agent process")
         self.require_clean()
         state = self.require_current_branch(branch)
         if state.local_sha is None:
@@ -442,14 +454,18 @@ class GitRepository:
                 f"branch {branch!r} no longer descends from pre-turn commit "
                 f"{previous_sha}"
             )
-        if expected_agent is not None:
+        if expected_agent is not None and expected_process is not None:
             self._require_agent_commit_provenance(
-                previous_sha, state.local_sha, expected_agent
+                previous_sha, state.local_sha, expected_agent, expected_process
             )
         return state
 
     def _require_agent_commit_provenance(
-        self, previous_sha: str, current_sha: str, expected_agent: str
+        self,
+        previous_sha: str,
+        current_sha: str,
+        expected_agent: str,
+        expected_process: str,
     ) -> None:
         coauthor = agent_commit_coauthor(expected_agent)
         commits = self._read(
@@ -485,15 +501,10 @@ class GitRepository:
                     f"commit {commit_sha} must have exactly one "
                     f"AWM-Agent trailer naming {expected_agent}"
                 )
-            if len(process) != 1 or process[0] not in {
-                "implementation",
-                "reviewer-fix",
-                "cleanup",
-                "recovery",
-            }:
+            if process != [expected_process]:
                 raise WorkerFailure(
-                    f"commit {commit_sha} must have exactly one valid "
-                    "AWM-Process trailer"
+                    f"commit {commit_sha} must have exactly one AWM-Process "
+                    f"trailer naming {expected_process}"
                 )
             if coauthor not in coauthors:
                 raise WorkerFailure(

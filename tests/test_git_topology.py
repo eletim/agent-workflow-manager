@@ -337,7 +337,10 @@ def test_committed_result_requires_uniform_agent_provenance(
     )
 
     result = repo.require_committed_result(
-        branch, previous_sha=base, expected_agent=agent
+        branch,
+        previous_sha=base,
+        expected_agent=agent,
+        expected_process="implementation",
     )
 
     assert result.local_sha == git(work, "rev-parse", "HEAD")
@@ -359,7 +362,48 @@ def test_committed_result_rejects_missing_agent_provenance(
             "feature/missing-provenance",
             previous_sha=base,
             expected_agent="codex",
+            expected_process="implementation",
         )
+
+
+def test_committed_result_requires_the_expected_process(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/wrong-process"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "mislabeled implementation",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\n"
+        "AWM-Process: cleanup",
+    )
+
+    with pytest.raises(WorkerFailure, match="AWM-Process.*implementation"):
+        repo.require_committed_result(
+            branch,
+            previous_sha=base,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+
+def test_committed_result_requires_agent_and_process_together(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+
+    with pytest.raises(ValueError, match="provided together"):
+        repo.require_committed_result("main", previous_sha=base, expected_agent="codex")
 
 
 @pytest.mark.parametrize("remote_relationship", ["ahead", "diverged"])
