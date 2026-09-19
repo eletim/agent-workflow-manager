@@ -1076,6 +1076,12 @@ def test_generated_workflow_can_create_integration_from_final_branch() -> None:
     assert "base='dev/v0.2.4'" in code
     assert "expected_base_sha=context.base_sha" in code
     assert "repository.ensure_pushed(\n        'dev/v0.2.5'," in code
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+    assert parse_args.index("warn_if_stale_integration_branch(") < parse_args.index(
+        "repository.prepare_feature_branch("
+    )
 
 
 def test_generated_workflow_requires_existing_integration_by_default() -> None:
@@ -1502,7 +1508,7 @@ def test_one_shot_planning_comment_escapes_planner_controlled_text() -> None:
 
     comment = workflow["one_shot_planning_comment"](plan, decision)
 
-    assert "`publishable&#45;task` (pending)" in comment
+    assert "`publishable-task` (pending)" in comment
     assert "<!-- hidden -->" not in comment
     assert "@team" not in comment
     assert "![tracking](" not in comment
@@ -4291,12 +4297,22 @@ def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> No
     )
     workflow["inspect_issue_driven_topology"] = lambda **kwargs: ()
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repository)
+    github = object()
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: github
+    )
+    workflow["warn_if_stale_integration_branch"] = (
+        lambda config, checked_repo, checked_github: calls.append(
+            ("warn", config.integration_branch, checked_repo, checked_github)
+        )
+    )
 
     config = workflow["parse_args"]()  # type: ignore[operator]
 
     assert config.integration_branch == "dev/v0.2.5"
     assert config.main_branch == "dev/v0.2.4"
     assert calls == [
+        ("warn", "dev/v0.2.5", repository, github),
         ("prepare", "dev/v0.2.5", "dev/v0.2.4", final_sha),
         ("push", "dev/v0.2.5", final_sha),
     ]

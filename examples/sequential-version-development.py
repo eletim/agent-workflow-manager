@@ -3534,9 +3534,8 @@ def one_shot_planning_comment(
     for index, issue in enumerate(plan.items):
         status = "processed" if index < plan.position else "pending"
         assert issue.task_id is not None and issue.task is not None
-        task_id = escape_planner_markdown(issue.task_id)
         task = escape_planner_markdown(issue.task)
-        items.append(f"{index + 1}. `{task_id}` ({status}) — {task}")
+        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {task}")
     decomposition = "\n".join(items) if items else "No work items remain."
     changes = (
         "\n".join(f"- {escape_planner_markdown(change)}" for change in decision.changes)
@@ -5339,7 +5338,8 @@ def run_repository(
         command_timeout_seconds=COMMAND_TIMEOUT,
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
-    warn_if_stale_integration_branch(config, repo, github)
+    if not config.make_integration_branch:
+        warn_if_stale_integration_branch(config, repo, github)
     client = create_runtime(config)
     for recovery_attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
         plan: WorkItemPlan | None = None
