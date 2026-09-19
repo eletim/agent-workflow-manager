@@ -3162,13 +3162,17 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
     )
 
 
+def planner_text_is_publishable(value: str) -> bool:
+    return (
+        _RAW_REVIEW_OUTPUT.search(value) is None
+        and _SENSITIVE_REVIEW_TEXT.search(value) is None
+        and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
+    )
+
+
 def require_publishable_planner_task(issue: Issue) -> None:
     assert issue.task is not None
-    if (
-        _RAW_REVIEW_OUTPUT.search(issue.task) is not None
-        or _SENSITIVE_REVIEW_TEXT.search(issue.task) is not None
-        or _OPAQUE_SECRET_LIKE_VALUE.search(issue.task) is not None
-    ):
+    if not planner_text_is_publishable(issue.task):
         raise WorkerFailure(
             "one-shot planner task must not contain logs or secret-like values"
         )
@@ -3277,8 +3281,6 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
             if kind == "add" and set(action) == {"action", "item"}:
                 added = planner_added_issue(action["item"])
                 candidate.add(added)
-                if plan.config.one_shot_issue is not None:
-                    require_publishable_planner_task(added)
                 changes.append(f"Added {added.label}.")
             elif kind == "update" and set(action) == {"action", "key", "task"}:
                 key = planner_key(action["key"])
@@ -3287,8 +3289,6 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 if current.task_id is None:
                     raise WorkerFailure("planner can update only an inline mini task")
                 updated = planner_inline_issue(current.task_id, action["task"])
-                if plan.config.one_shot_issue is not None:
-                    require_publishable_planner_task(updated)
                 candidate.update(key, updated)
                 changes.append(f"Updated {current.label}.")
             elif kind == "skip" and set(action) == {"action", "key", "reason"}:
@@ -3305,6 +3305,14 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                     or reason_has_surrogate
                 ):
                     raise WorkerFailure("planner skip reason is invalid")
+                if (
+                    plan.config.one_shot_issue is not None
+                    and not planner_text_is_publishable(reason)
+                ):
+                    raise WorkerFailure(
+                        "one-shot planner skip reason must not contain logs or "
+                        "secret-like values"
+                    )
                 candidate.skip(planner_key(action["key"]), reason)
                 summary = reason if len(reason) <= 160 else f"{reason[:159]}…"
                 changes.append(
@@ -3314,6 +3322,10 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 raise WorkerFailure("planner action has an unsupported shape")
     except ValueError as exc:
         raise WorkerFailure(f"planner decision is invalid: {exc}") from exc
+
+    if plan.config.one_shot_issue is not None:
+        for issue in candidate.items:
+            require_publishable_planner_task(issue)
 
     if complete and candidate.remaining:
         raise WorkerFailure("planner cannot complete while work items remain")

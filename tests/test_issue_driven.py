@@ -1358,6 +1358,87 @@ def test_one_shot_planner_rejects_unpublishable_task_text_transactionally(
     assert plan.snapshot == original
 
 
+def test_one_shot_planner_revalidates_recovered_task_text() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(
+        workflow["planner_inline_issue"](
+            "recovered-task", "Investigate token: secret123 before delivery."
+        )
+    )
+    recovered = workflow["work_item_plan_from_body"](
+        workflow["with_work_item_plan"]("Base PR", plan), config
+    )
+
+    with pytest.raises(WorkerFailure, match="must not contain logs or secret-like"):
+        workflow["apply_planner_decision"](
+            recovered,
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": False,
+                    "policy_conflicts": [],
+                    "rationale": "The recovered task remains necessary.",
+                }
+            ),
+        )
+
+    assert recovered.snapshot[0].task == (
+        "Investigate token: secret123 before delivery."
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_reason",
+    [
+        "Skipped after finding API token: secret123 in the requirement.",
+        "Traceback (most recent call last): task is obsolete.",
+        "Duplicate of abcdefghijklmnopqrstuvwxyz1234567890.",
+    ],
+)
+def test_one_shot_planner_rejects_unpublishable_skip_reason_transactionally(
+    unsafe_reason: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(
+        workflow["planner_inline_issue"](
+            "obsolete-task", "Implement the focused behavior."
+        )
+    )
+    original = plan.snapshot
+
+    with pytest.raises(
+        WorkerFailure, match="skip reason must not contain logs or secret-like"
+    ):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "skip",
+                            "key": "obsolete-task",
+                            "reason": unsafe_reason,
+                        }
+                    ],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "The task is no longer required.",
+                }
+            ),
+        )
+
+    assert plan.snapshot == original
+    assert plan.skipped == []
+
+
 def test_one_shot_planning_comment_keeps_validated_task_text() -> None:
     workflow = load_generated_workflow(one_shot_issue=169)
     config = workflow["Config"](
