@@ -274,6 +274,47 @@ def test_newer_named_branch_without_forward_progress_does_not_warn(
     assert capsys.readouterr().out == ""
 
 
+def test_missing_integration_branch_warns_when_newer_branch_is_ahead_of_base(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.4.7",
+        "main",
+        (),
+        "true",
+        make_integration_branch=True,
+    )
+    repo = SimpleNamespace(
+        inspect_remote_branch_heads=lambda: {
+            "main": "a" * 40,
+            "dev/v0.4.8": "b" * 40,
+        }
+    )
+    comparisons: list[tuple[str, str]] = []
+    github = SimpleNamespace(
+        compare_commits=lambda *, base_sha, head_sha: (
+            comparisons.append((base_sha, head_sha)) or "ahead"
+        )
+    )
+    findings: list[str] = []
+    monkeypatch.setitem(
+        workflow["warn_if_stale_integration_branch"].__globals__,
+        "emit_finding",
+        lambda _category, message, *, status: findings.append(message),
+    )
+
+    workflow["warn_if_stale_integration_branch"](config, repo, github)
+
+    assert comparisons == [("a" * 40, "b" * 40)]
+    assert len(findings) == 1
+    assert "dev/v0.4.7 is absent" in findings[0]
+    assert "would be created from main" in findings[0]
+    assert capsys.readouterr().out == f"WARN: {findings[0]}\n"
+
+
 def test_outline_step_logs_terminal_progress_without_replacing_events(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

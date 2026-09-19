@@ -560,20 +560,33 @@ class GitHubRepository:
         marked_body = f"{body.rstrip()}\n\n{marker}"
 
         def matching_comments() -> tuple[dict[str, Any], ...]:
-            data = self._read_json(
-                [
-                    "api",
-                    f"repos/{self.slug}/issues/{issue}/comments"
-                    "?per_page=100&sort=created&direction=desc",
-                ]
-            )
-            if not isinstance(data, list):
-                raise WorkerFailure("GitHub Issue comments response is not a list")
-            matches = tuple(
-                comment
-                for comment in data
-                if isinstance(comment, dict) and marker in str(comment.get("body", ""))
-            )
+            matches: list[dict[str, Any]] = []
+            for page in range(1, self.max_pages + 1):
+                data = self._read_json(
+                    [
+                        "api",
+                        f"repos/{self.slug}/issues/{issue}/comments"
+                        f"?per_page={self.page_size}&page={page}",
+                    ]
+                )
+                if not isinstance(data, list):
+                    raise WorkerFailure(
+                        "GitHub Issue comment enumeration returned a non-list page"
+                    )
+                page_items = cast(list[object], data)
+                matches.extend(
+                    comment
+                    for comment in page_items
+                    if isinstance(comment, dict)
+                    and marker in str(comment.get("body", ""))
+                )
+                if len(page_items) < self.page_size:
+                    break
+            else:
+                raise WorkerFailure(
+                    f"Issue comment enumeration exceeded the "
+                    f"{self.max_pages}-page safety bound"
+                )
             if len(matches) > 1:
                 raise WorkerFailure(
                     f"Issue #{issue} has duplicate planning comment correlations"
@@ -582,7 +595,7 @@ class GitHubRepository:
                 raise WorkerFailure(
                     f"Issue #{issue} planning comment correlation has changed body"
                 )
-            return matches
+            return tuple(matches)
 
         before = matching_comments()
         if before:

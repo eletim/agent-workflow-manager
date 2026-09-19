@@ -1387,6 +1387,7 @@ def _fixed_config_function(
         "git diff --check",
         WORKFLOW_POLICY_ISSUE,
         {config.one_shot_issue!r},
+        {config.make_integration_branch!r},
     )
 
 

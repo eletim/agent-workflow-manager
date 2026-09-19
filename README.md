@@ -285,7 +285,13 @@ is reused only when it contains that exact starting commit and passes the normal
 safe recovery checks. While the two remote heads are identical, Base PR creation
 is deferred; it is created after the first Issue merge advances the integration
 branch. An existing Base PR is still recovered normally. The final PR still
-targets `final_branch`. During deferral, planner decisions—including empty
+targets `final_branch`. At startup, a warning asks the user to verify the intended
+base when a remote `dev/vX.Y.Z` branch with a higher patch version in the same
+major/minor series is ahead of the configured integration head, or ahead of the
+`final_branch` head from which a missing integration branch would be created.
+Newer names that are identical, behind, divergent, or in another series do not
+trigger the warning, and the workflow never changes the configured branch
+automatically. During deferral, planner decisions—including empty
 one-shot plans and dynamic items—use an AWM-owned remote Git note as authoritative
 recovery state without changing scheduling semantics. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design

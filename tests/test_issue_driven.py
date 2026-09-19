@@ -1227,7 +1227,7 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     assert [item.key for item in effective] == ["focused-change"]
     assert len(comments) == 2
     assert "### Decomposition rationale" in comments[0]
-    assert "Added Mini task focused-change" in comments[0]
+    assert "Added Mini task focused&#45;change" in comments[0]
     assert "No changes from the previous planning result" in comments[1]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
     assert all(
@@ -1486,21 +1486,27 @@ def test_one_shot_planner_rejects_low_level_rationale(
     assert plan.snapshot == ()
 
 
-def test_one_shot_planning_comment_keeps_validated_task_text() -> None:
+def test_one_shot_planning_comment_escapes_planner_controlled_text() -> None:
     workflow = load_generated_workflow(one_shot_issue=169)
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
     )
     plan = workflow["WorkItemPlan"](config)
-    task = "Implement the focused behavior."
+    task = "Implement <!-- hidden --> @team ![tracking](https://example.com/pixel)."
     plan.add(workflow["planner_inline_issue"]("publishable-task", task))
     decision = workflow["PlannerDecision"](
-        False, rationale="This task isolates the remaining work."
+        False,
+        rationale="Rationale <!-- hidden --> @team ![tracking](https://example.com/r).",
+        changes=("Skipped Mini task: <!-- hidden --> @team ![tracking](x).",),
     )
 
     comment = workflow["one_shot_planning_comment"](plan, decision)
 
-    assert f"`publishable-task` (pending) — {task}" in comment
+    assert "`publishable&#45;task` (pending)" in comment
+    assert "<!-- hidden -->" not in comment
+    assert "@team" not in comment
+    assert "![tracking](" not in comment
+    assert comment.count("&#64;team") == 3
 
 
 @pytest.mark.parametrize("issue_number", [197, 225])

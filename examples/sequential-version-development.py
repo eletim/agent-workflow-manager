@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import re
+import string
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -230,6 +231,7 @@ class Config:
     check_command: str
     policy_issue: int | None = None
     one_shot_issue: int | None = None
+    make_integration_branch: bool = False
 
 
 @dataclass(frozen=True)
@@ -500,21 +502,33 @@ def warn_if_stale_integration_branch(
     remote_branches = repo.inspect_remote_branch_heads()
     configured_sha = remote_branches.get(config.integration_branch)
     if configured_sha is None:
-        return
-    for newer in newer_development_branches(
-        config.integration_branch, remote_branches
-    ):
+        if not config.make_integration_branch:
+            return
+        configured_sha = remote_branches.get(config.main_branch)
+        if configured_sha is None:
+            return
+    for newer in newer_development_branches(config.integration_branch, remote_branches):
         newer_sha = remote_branches[newer]
         if (
             github.compare_commits(base_sha=configured_sha, head_sha=newer_sha)
             != "ahead"
         ):
             continue
+        if config.integration_branch in remote_branches:
+            subject = (
+                f"configured integration branch {config.integration_branch} @ "
+                f"{configured_sha} may be stale"
+            )
+        else:
+            subject = (
+                f"configured integration branch {config.integration_branch} is "
+                f"absent and would be created from {config.main_branch} @ "
+                f"{configured_sha}"
+            )
         warning = (
-            f"configured integration branch {config.integration_branch} @ "
-            f"{configured_sha} may be stale; authoritative remote branch {newer} "
-            f"@ {newer_sha} is ahead in the same development series. Verify the "
-            "intended base; the workflow will not change it automatically."
+            f"{subject}; authoritative remote branch {newer} @ {newer_sha} is "
+            "ahead in the same development series. Verify the intended base; "
+            "the workflow will not change it automatically."
         )
         print(f"WARN: {warning}", flush=True)
         emit_finding("git", warning, status="warning")
@@ -3503,6 +3517,14 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     )
 
 
+def escape_planner_markdown(value: str) -> str:
+    """Render planner-controlled text without active Markdown or mentions."""
+    return "".join(
+        f"&#{ord(character)};" if character in string.punctuation else character
+        for character in value
+    )
+
+
 def one_shot_planning_comment(
     plan: WorkItemPlan, decision: PlannerDecision
 ) -> str:
@@ -3512,10 +3534,12 @@ def one_shot_planning_comment(
     for index, issue in enumerate(plan.items):
         status = "processed" if index < plan.position else "pending"
         assert issue.task_id is not None and issue.task is not None
-        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {issue.task}")
+        task_id = escape_planner_markdown(issue.task_id)
+        task = escape_planner_markdown(issue.task)
+        items.append(f"{index + 1}. `{task_id}` ({status}) — {task}")
     decomposition = "\n".join(items) if items else "No work items remain."
     changes = (
-        "\n".join(f"- {change}" for change in decision.changes)
+        "\n".join(f"- {escape_planner_markdown(change)}" for change in decision.changes)
         if decision.changes
         else "- No changes from the previous planning result."
     )
@@ -3524,7 +3548,7 @@ def one_shot_planning_comment(
         "### Work item decomposition\n\n"
         f"{decomposition}\n\n"
         "### Decomposition rationale\n\n"
-        f"{decision.rationale}\n\n"
+        f"{escape_planner_markdown(decision.rationale)}\n\n"
         "### Changes from previous planning\n\n"
         f"{changes}"
     )
