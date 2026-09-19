@@ -3327,7 +3327,14 @@ def one_shot_planning_comment(
     for index, issue in enumerate(plan.items):
         status = "processed" if index < plan.position else "pending"
         assert issue.task_id is not None and issue.task is not None
-        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {issue.task}")
+        task = issue.task
+        if (
+            _RAW_REVIEW_OUTPUT.search(task) is not None
+            or _SENSITIVE_REVIEW_TEXT.search(task) is not None
+            or _OPAQUE_SECRET_LIKE_VALUE.search(task) is not None
+        ):
+            task = "[task text omitted because it may contain logs or secrets]"
+        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {task}")
     decomposition = "\n".join(items) if items else "No work items remain."
     changes = (
         "\n".join(f"- {change}" for change in decision.changes)

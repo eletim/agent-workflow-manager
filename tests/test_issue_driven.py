@@ -1307,6 +1307,34 @@ def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
     assert plan.position == 0
 
 
+@pytest.mark.parametrize(
+    "unsafe_task",
+    [
+        "Use API token: secret123 while updating the client.",
+        "Investigate this output: Traceback (most recent call last): failure",
+        "Replace opaque value abcdefghijklmnopqrstuvwxyz1234567890.",
+    ],
+)
+def test_one_shot_planning_comment_omits_unsafe_task_text(
+    unsafe_task: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(workflow["planner_inline_issue"]("unsafe-task", unsafe_task))
+    decision = workflow["PlannerDecision"](
+        False, rationale="This task isolates the remaining work."
+    )
+
+    comment = workflow["one_shot_planning_comment"](plan, decision)
+
+    assert "`unsafe-task` (pending)" in comment
+    assert "[task text omitted because it may contain logs or secrets]" in comment
+    assert unsafe_task not in comment
+
+
 @pytest.mark.parametrize("issue_number", [197, 225])
 def test_planner_already_implemented_skip_requires_current_code_evidence(
     issue_number: int,
