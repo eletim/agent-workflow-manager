@@ -3162,6 +3162,18 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
     )
 
 
+def require_publishable_planner_task(issue: Issue) -> None:
+    assert issue.task is not None
+    if (
+        _RAW_REVIEW_OUTPUT.search(issue.task) is not None
+        or _SENSITIVE_REVIEW_TEXT.search(issue.task) is not None
+        or _OPAQUE_SECRET_LIKE_VALUE.search(issue.task) is not None
+    ):
+        raise WorkerFailure(
+            "one-shot planner task must not contain logs or secret-like values"
+        )
+
+
 def planner_key(value: object) -> int | str:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise WorkerFailure("planner work-item key is invalid")
@@ -3265,6 +3277,8 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
             if kind == "add" and set(action) == {"action", "item"}:
                 added = planner_added_issue(action["item"])
                 candidate.add(added)
+                if plan.config.one_shot_issue is not None:
+                    require_publishable_planner_task(added)
                 changes.append(f"Added {added.label}.")
             elif kind == "update" and set(action) == {"action", "key", "task"}:
                 key = planner_key(action["key"])
@@ -3272,9 +3286,10 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 current = candidate.items[index]
                 if current.task_id is None:
                     raise WorkerFailure("planner can update only an inline mini task")
-                candidate.update(
-                    key, planner_inline_issue(current.task_id, action["task"])
-                )
+                updated = planner_inline_issue(current.task_id, action["task"])
+                if plan.config.one_shot_issue is not None:
+                    require_publishable_planner_task(updated)
+                candidate.update(key, updated)
                 changes.append(f"Updated {current.label}.")
             elif kind == "skip" and set(action) == {"action", "key", "reason"}:
                 reason = action["reason"]
@@ -3327,14 +3342,7 @@ def one_shot_planning_comment(
     for index, issue in enumerate(plan.items):
         status = "processed" if index < plan.position else "pending"
         assert issue.task_id is not None and issue.task is not None
-        task = issue.task
-        if (
-            _RAW_REVIEW_OUTPUT.search(task) is not None
-            or _SENSITIVE_REVIEW_TEXT.search(task) is not None
-            or _OPAQUE_SECRET_LIKE_VALUE.search(task) is not None
-        ):
-            task = "[task text omitted because it may contain logs or secrets]"
-        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {task}")
+        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {issue.task}")
     decomposition = "\n".join(items) if items else "No work items remain."
     changes = (
         "\n".join(f"- {change}" for change in decision.changes)
