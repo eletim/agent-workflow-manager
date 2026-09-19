@@ -2464,12 +2464,22 @@ def test_generated_workflow_requires_agent_commit_provenance(
     reviewer_fix = workflow["implementer_prompt"](
         "Fix the review.", process="reviewer-fix"
     )
+    implementation_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: implementation"
+    )
+    reviewer_fix_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: reviewer-fix"
+    )
 
     for prompt in (implementation, reviewer_fix):
         assert f"Co-authored-by: {coauthor}" in prompt
         assert f"AWM-Agent: {agent}" in prompt
-    assert "AWM-Process: implementation" in implementation
-    assert "AWM-Process: reviewer-fix" in reviewer_fix
+    assert implementation_trailers in implementation
+    assert reviewer_fix_trailers in reviewer_fix
     assert "agent_commit_coauthor(IMPLEMENTER_AGENT)" in source
     assert "AGENT_COAUTHORS" not in source
 

@@ -1880,14 +1880,23 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
 
 
+@pytest.mark.parametrize(
+    ("primary_sha", "allow_unchanged", "expected_process"),
+    [
+        ("primary", True, "reviewer-fix"),
+        ("previous", False, "implementation"),
+    ],
+)
 def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
     monkeypatch: pytest.MonkeyPatch,
+    primary_sha: str,
+    allow_unchanged: bool,
+    expected_process: str,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     globals_ = workflow["require_agent_result"].__globals__
     branch = "feature/process-boundaries"
     previous_sha = "previous"
-    primary_sha = "primary"
     cleanup_sha = "cleanup"
     provenance: list[tuple[str, str, dict[str, object]]] = []
 
@@ -1938,8 +1947,8 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
         "tab",
         branch,
         previous_sha,
-        allow_unchanged=True,
-        expected_process="reviewer-fix",
+        allow_unchanged=allow_unchanged,
+        expected_process=expected_process,
     ) == (cleanup_sha, True)
     assert provenance == [
         (
@@ -1947,7 +1956,7 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
             primary_sha,
             {
                 "expected_agent": "codex",
-                "expected_process": "reviewer-fix",
+                "expected_process": expected_process,
                 "allow_unchanged": True,
             },
         ),
@@ -1956,6 +1965,67 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
             cleanup_sha,
             {"expected_agent": "codex", "expected_process": "cleanup"},
         ),
+    ]
+
+
+def test_failed_mutating_turn_validates_commits_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    branch = "feature/failed-turn"
+    provenance: list[tuple[str, str, dict[str, object]]] = []
+
+    class Repository:
+        local_sha = "before"
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end, kwargs))
+
+    repository = Repository()
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, tab: str, timeout: int) -> None:
+            pass
+
+        def send_input(self, tab: str, prompt: str) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *args: object, **kwargs: object) -> None:
+            repository.local_sha = "failed-turn-commit"
+            raise WorkerFailure("turn failed")
+
+    globals_ = workflow["run_turn"].__globals__
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    with pytest.raises(WorkerFailure, match="turn failed"):
+        workflow["run_turn"](
+            Client(),
+            "tab",
+            "Implementation",
+            "prompt",
+            repository=repository,
+            branch=branch,
+            expected_process="implementation",
+        )
+    assert provenance == [
+        (
+            "before",
+            "failed-turn-commit",
+            {
+                "expected_agent": "codex",
+                "expected_process": "implementation",
+                "allow_unchanged": True,
+            },
+        )
     ]
 
 

@@ -510,7 +510,22 @@ def run_turn(
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
 ) -> str:
+    if (repository is None) != (branch is None) or (repository is None) != (
+        expected_process is None
+    ):
+        raise ValueError(
+            "repository, branch, and expected_process must be provided together"
+        )
+    before_sha: str | None = None
+    if repository is not None and branch is not None:
+        before = repository.require_current_branch(branch)
+        if before.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} does not exist")
+        before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
         name,
@@ -531,6 +546,25 @@ def run_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
+    def verify_turn_commits() -> None:
+        if (
+            repository is None
+            or branch is None
+            or expected_process is None
+            or before_sha is None
+        ):
+            return
+        after = repository.require_current_branch(branch)
+        if after.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} disappeared")
+        repository.require_agent_commit_provenance(
+            before_sha,
+            after.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process=expected_process,
+            allow_unchanged=True,
+        )
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
@@ -549,7 +583,9 @@ def run_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
+        verify_turn_commits()
         raise
+    verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -2028,6 +2064,9 @@ worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve.""", process="cleanup"),
         iteration=iteration,
         warning_scope=warning_scope,
+        repository=repo,
+        branch=branch,
+        expected_process="cleanup",
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -2070,14 +2109,15 @@ def require_agent_result(
         allow_unchanged=True,
     )
     assert result.local_sha is not None
+    cleanup_changed = result.local_sha != post_turn.local_sha
     repo.require_agent_commit_provenance(
         previous_sha,
         post_turn.local_sha,
         expected_agent=IMPLEMENTER_AGENT,
         expected_process=expected_process,
-        allow_unchanged=allow_unchanged,
+        allow_unchanged=allow_unchanged or cleanup_changed,
     )
-    if result.local_sha != post_turn.local_sha:
+    if cleanup_changed:
         repo.require_agent_commit_provenance(
             post_turn.local_sha,
             result.local_sha,
@@ -2567,6 +2607,9 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            repository=repo,
+            branch=issue.branch,
+            expected_process="reviewer-fix",
         )
         emit_policy_conflicts(
             fix_result,
@@ -2920,6 +2963,9 @@ def process_issue(
         implementation_prompt,
         pr=existing_pr,
         warning_scope=issue.result_id,
+        repository=repo,
+        branch=issue.branch,
+        expected_process="implementation",
     )
     emit_policy_conflicts(
         implementation_result,
@@ -4485,6 +4531,9 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                         process="reviewer-fix",
                     ),
                     iteration=review_number,
+                    repository=repo,
+                    branch=config.integration_branch,
+                    expected_process="reviewer-fix",
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
