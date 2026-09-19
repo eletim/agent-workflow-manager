@@ -355,6 +355,8 @@ turn_start_sha = feature.local_sha
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
+    expected_agent="codex",
+    expected_process="implementation",
 )
 # Push is also orchestration-owned gap absorption if the agent omitted it. This
 # only creates the exact remote branch or fast-forwards it; remote-ahead or
@@ -422,6 +424,13 @@ state cannot be resolved safely; an already-clean path does not invoke cleanup.
 If review or final checks introduce a commit, the Workflow pushes and rebinds the
 exact Draft PR, invalidates the prior approval, and repeats review and checks
 before making the PR Ready.
+
+CodingAgent prompts require every implementation, review-fix, cleanup, and
+recovery commit to retain the configured agent as a co-author and to include
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
+result check verifies that provenance before a branch can advance. Scripted
+merge commits instead record `AWM-Automation: agent-workflow-manager` and
+`AWM-Process: merge`; AWM is automation provenance, not a co-author.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,

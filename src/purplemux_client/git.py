@@ -22,6 +22,18 @@ from purplemux_client.operations import (
 )
 
 _OBJECT_ID_RE = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+_AGENT_COMMIT_COAUTHORS = {
+    "codex": "Codex <noreply@openai.com>",
+    "claude": "Claude <noreply@anthropic.com>",
+}
+
+
+def agent_commit_coauthor(agent: str) -> str:
+    """Return the normalized co-author identity for a supported coding agent."""
+    try:
+        return _AGENT_COMMIT_COAUTHORS[agent]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("agent must be codex or claude") from exc
 
 
 class GitCommandRunner(Protocol):
@@ -407,9 +419,24 @@ class GitRepository:
         *,
         previous_sha: str,
         allow_unchanged: bool = False,
+        expected_agent: str | None = None,
+        expected_process: str | None = None,
     ) -> BranchState:
         """Require a clean committed result on the current logical branch."""
         self._validate_sha(previous_sha)
+        if (expected_agent is None) != (expected_process is None):
+            raise ValueError(
+                "expected_agent and expected_process must be provided together"
+            )
+        if expected_agent is not None and expected_process is not None:
+            agent_commit_coauthor(expected_agent)
+            if expected_process not in {
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+                "recovery",
+            }:
+                raise ValueError("expected_process is not a supported agent process")
         self.require_clean()
         state = self.require_current_branch(branch)
         if state.local_sha is None:
@@ -427,7 +454,90 @@ class GitRepository:
                 f"branch {branch!r} no longer descends from pre-turn commit "
                 f"{previous_sha}"
             )
+        if expected_agent is not None and expected_process is not None:
+            self.require_agent_commit_provenance(
+                previous_sha,
+                state.local_sha,
+                expected_agent=expected_agent,
+                expected_process=expected_process,
+            )
         return state
+
+    def require_agent_commit_provenance(
+        self,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        expected_process: str,
+        allow_unchanged: bool = False,
+    ) -> None:
+        """Verify agent trailers on one exact, immutable commit range."""
+        self._validate_sha(previous_sha)
+        self._validate_sha(current_sha)
+        coauthor = agent_commit_coauthor(expected_agent)
+        if expected_process not in {
+            "implementation",
+            "reviewer-fix",
+            "cleanup",
+            "recovery",
+        }:
+            raise ValueError("expected_process is not a supported agent process")
+        if current_sha == previous_sha:
+            if allow_unchanged:
+                return
+            raise WorkerFailure("agent turn produced no new commit")
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._has_commit(current_sha):
+            raise WorkerFailure(f"current commit {current_sha} is not available")
+        if not self._is_ancestor(previous_sha, current_sha):
+            raise WorkerFailure(
+                f"commit {current_sha} does not descend from pre-turn commit "
+                f"{previous_sha}"
+            )
+        commits = self._read(
+            ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
+        )
+        for commit_sha in commits.splitlines():
+            agent = self._read(
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:key=AWM-Agent,valueonly)",
+                    commit_sha,
+                ]
+            ).splitlines()
+            process = self._read(
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:key=AWM-Process,valueonly)",
+                    commit_sha,
+                ]
+            ).splitlines()
+            coauthors = self._read(
+                [
+                    "show",
+                    "-s",
+                    "--format=%(trailers:key=Co-authored-by,valueonly)",
+                    commit_sha,
+                ]
+            ).splitlines()
+            if agent != [expected_agent]:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must have exactly one "
+                    f"AWM-Agent trailer naming {expected_agent}"
+                )
+            if process != [expected_process]:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must have exactly one AWM-Process "
+                    f"trailer naming {expected_process}"
+                )
+            if coauthor not in coauthors:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must attribute {coauthor} as a co-author"
+                )
 
     def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
         """Push a clean exact local branch only when its remote is absent or behind."""

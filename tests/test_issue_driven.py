@@ -2447,6 +2447,43 @@ def test_generated_workflow_selects_role_specific_agents(
     assert "CreateSessionRequest(agent_type, str(config.repo), agent_type" in code
 
 
+@pytest.mark.parametrize(
+    ("agent", "coauthor"),
+    [
+        ("codex", "Codex <noreply@openai.com>"),
+        ("claude", "Claude <noreply@anthropic.com>"),
+    ],
+)
+def test_generated_workflow_requires_agent_commit_provenance(
+    agent: str, coauthor: str
+) -> None:
+    source = generate_issue_driven_workflow(parse(payload(implementer_agent=agent)))
+    workflow = load_generated_workflow(implementer_agent=agent)
+
+    implementation = workflow["implementer_prompt"]("Implement it.")
+    reviewer_fix = workflow["implementer_prompt"](
+        "Fix the review.", process="reviewer-fix"
+    )
+    implementation_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: implementation"
+    )
+    reviewer_fix_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: reviewer-fix"
+    )
+
+    for prompt in (implementation, reviewer_fix):
+        assert f"Co-authored-by: {coauthor}" in prompt
+        assert f"AWM-Agent: {agent}" in prompt
+    assert implementation_trailers in implementation
+    assert reviewer_fix_trailers in reviewer_fix
+    assert "agent_commit_coauthor(IMPLEMENTER_AGENT)" in source
+    assert "AGENT_COAUTHORS" not in source
+
+
 def test_generated_workflow_routes_every_agent_session_by_role() -> None:
     tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
     calls: dict[str, str] = {}
@@ -2676,6 +2713,12 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="feature/work", dirty=False, status=()
         ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2727,7 +2770,22 @@ def test_repository_recovery_rejects_unrecoverable_report(
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    recovery_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_recovery_commit(branch: str, **kwargs: object) -> BranchState:
+        recovery_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=require_recovery_commit,
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
         open=lambda *args, **kwargs: object()
     )
@@ -2751,6 +2809,17 @@ def test_repository_recovery_rejects_unrecoverable_report(
     with pytest.raises(WorkerFailure, match="plan failed"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+    assert recovery_checks == [
+        (
+            "dev/v1",
+            {
+                "previous_sha": "b" * 40,
+                "allow_unchanged": True,
+                "expected_agent": "codex",
+                "expected_process": "recovery",
+            },
+        )
+    ]
 
 
 def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> None:
@@ -2758,10 +2827,20 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
+    recovery_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_recovery_commit(branch: str, **kwargs: object) -> BranchState:
+        recovery_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=require_recovery_commit,
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2801,6 +2880,17 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     assert workflow["run_repository"](config) == "delivered"
     assert len(plans) == 2
     assert plans[1] is not plans[0]
+    assert recovery_checks == [
+        (
+            "dev/v1",
+            {
+                "previous_sha": "b" * 40,
+                "allow_unchanged": True,
+                "expected_agent": "codex",
+                "expected_process": "recovery",
+            },
+        )
+    ]
     assert workflow["summary_warnings"](None) == (
         "earlier timeout", "earlier policy warning"
     )
@@ -2822,6 +2912,12 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=True, status=(" M file",)
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
         ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
@@ -2926,7 +3022,18 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
         open=lambda *args, **kwargs: object()
     )

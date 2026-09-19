@@ -31,6 +31,7 @@ from purplemux_client import (
     ShellCommandRequest,
     WorkerFailure,
     WorkerInterrupted,
+    agent_commit_coauthor,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -509,7 +510,22 @@ def run_turn(
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
 ) -> str:
+    if (repository is None) != (branch is None) or (repository is None) != (
+        expected_process is None
+    ):
+        raise ValueError(
+            "repository, branch, and expected_process must be provided together"
+        )
+    before_sha: str | None = None
+    if repository is not None and branch is not None:
+        before = repository.require_current_branch(branch)
+        if before.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} does not exist")
+        before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
         name,
@@ -530,6 +546,25 @@ def run_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
+    def verify_turn_commits() -> None:
+        if (
+            repository is None
+            or branch is None
+            or expected_process is None
+            or before_sha is None
+        ):
+            return
+        after = repository.require_current_branch(branch)
+        if after.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} disappeared")
+        repository.require_agent_commit_provenance(
+            before_sha,
+            after.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process=expected_process,
+            allow_unchanged=True,
+        )
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
@@ -548,7 +583,14 @@ def run_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
+        try:
+            verify_turn_commits()
+        except BaseException as provenance_error:
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                raise exc from provenance_error
+            raise
         raise
+    verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -684,18 +726,21 @@ def recover_error(
             client,
             agent,
             "Recovery assessment",
-            "Investigate this workflow error using the current authoritative state "
-            "below. Make only a safe, necessary repair, then re-inspect the affected "
-            "state. If the outcome is uncertain, report retry_safe as false. "
-            "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
-            "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
-            "fingerprint markers. Return exactly one JSON object with boolean "
-            "repaired and retry_safe fields and concise single-line summary and "
-            "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
-            "the state after repair when recommending retry. No other fields or "
-            "prose.\n\n"
-            f"Error: {short_error(error)}\n\n"
-            f"Current authoritative state:\n{authoritative_state}",
+            implementer_prompt(
+                "Investigate this workflow error using the current authoritative "
+                "state below. Make only a safe, necessary repair, then re-inspect "
+                "the affected state. If the outcome is uncertain, report retry_safe "
+                "as false. Do not reset, rebase, stash, force-push, merge a work-item "
+                "PR, create unrelated PRs, discard ambiguous work, or edit "
+                "agent-workflow-manager fingerprint markers. Return exactly one JSON "
+                "object with boolean repaired and retry_safe fields and concise "
+                "single-line summary and evidence strings (at most 500 UTF-8 bytes "
+                "each). Include evidence from the state after repair when "
+                "recommending retry. No other fields or prose.\n\n"
+                f"Error: {short_error(error)}\n\n"
+                f"Current authoritative state:\n{authoritative_state}",
+                process="recovery",
+            ),
             parse_recovery_report,
         )
         return report
@@ -703,13 +748,21 @@ def recover_error(
         client.close_session(agent)
 
 
-def implementer_prompt(prompt: str) -> str:
+def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
     """Add the shared change-boundary policy to an implementation turn."""
+    if process not in {"implementation", "reviewer-fix", "cleanup", "recovery"}:
+        raise ValueError(f"unsupported implementation process: {process!r}")
+    coauthor = agent_commit_coauthor(IMPLEMENTER_AGENT)
     return (
         f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
-        "work-item plan."
+        "work-item plan.\n\n"
+        "Every commit you create must end with these exact Git trailers, preserving "
+        "any additional trailers the agent adds:\n"
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {IMPLEMENTER_AGENT}\n"
+        f"AWM-Process: {process}"
     )
 
 
@@ -2013,9 +2066,12 @@ Do not push, modify PR state, merge, start a review, reset, stash, rebase,
 force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
-ignored, removed, or could not resolve."""),
+ignored, removed, or could not resolve.""", process="cleanup"),
         iteration=iteration,
         warning_scope=warning_scope,
+        repository=repo,
+        branch=branch,
+        expected_process="cleanup",
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -2037,10 +2093,13 @@ def require_agent_result(
     previous_sha: str,
     *,
     allow_unchanged: bool,
+    expected_process: str,
     iteration: int | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
-    repo.require_current_branch(branch)
+    post_turn = repo.require_current_branch(branch)
+    if post_turn.local_sha is None:
+        raise WorkerFailure(f"local branch {branch!r} does not exist")
     require_clean_worktree(
         repo,
         client,
@@ -2050,9 +2109,26 @@ def require_agent_result(
         warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
-        branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
+        branch,
+        previous_sha=previous_sha,
+        allow_unchanged=True,
     )
     assert result.local_sha is not None
+    cleanup_changed = result.local_sha != post_turn.local_sha
+    repo.require_agent_commit_provenance(
+        previous_sha,
+        post_turn.local_sha,
+        expected_agent=IMPLEMENTER_AGENT,
+        expected_process=expected_process,
+        allow_unchanged=allow_unchanged or cleanup_changed,
+    )
+    if cleanup_changed:
+        repo.require_agent_commit_provenance(
+            post_turn.local_sha,
+            result.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process="cleanup",
+        )
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
     return result.local_sha, result.local_sha != previous_sha
 
@@ -2435,6 +2511,7 @@ def _review_issue_phase(
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2529,11 +2606,15 @@ def _review_issue_phase(
                 policy_context(config, scope=f"fixes for {issue.label}")
                 + f"""Re-evaluate every {phase} review finding below. If warranted,
 fix, test, commit, and leave the worktree clean. If no change is warranted,
-leave it clean and explain why; do not create an empty commit.\n\n{result}"""
+leave it clean and explain why; do not create an empty commit.\n\n{result}""",
+                process="reviewer-fix",
             ),
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            repository=repo,
+            branch=issue.branch,
+            expected_process="reviewer-fix",
         )
         emit_policy_conflicts(
             fix_result,
@@ -2548,6 +2629,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="reviewer-fix",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2886,6 +2968,9 @@ def process_issue(
         implementation_prompt,
         pr=existing_pr,
         warning_scope=issue.result_id,
+        repository=repo,
+        branch=issue.branch,
+        expected_process="implementation",
     )
     emit_policy_conflicts(
         implementation_result,
@@ -2900,6 +2985,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        expected_process="implementation",
         warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
@@ -4101,6 +4187,7 @@ def _review_whole_version(
                 config.integration_branch,
                 pr.head_sha,
                 allow_unchanged=True,
+                expected_process="cleanup",
                 iteration=review_number,
             )
             if scenario_reviewer_changed:
@@ -4194,6 +4281,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if principles_reviewer_changed:
@@ -4274,6 +4362,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -4357,6 +4446,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -4443,8 +4533,12 @@ def _review_whole_version(
                         policy_context(config, scope="whole-version fixes")
                         + f"""Re-evaluate every finding. If warranted, fix, test, commit,
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                        process="reviewer-fix",
                     ),
                     iteration=review_number,
+                    repository=repo,
+                    branch=config.integration_branch,
+                    expected_process="reviewer-fix",
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
@@ -4454,6 +4548,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     config.integration_branch,
                     current.head_sha,
                     allow_unchanged=True,
+                    expected_process="reviewer-fix",
                     iteration=review_number,
                 )
                 if changed:
@@ -4504,6 +4599,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             config.integration_branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if checks_changed:
@@ -4577,7 +4673,8 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
         run_final_checks(client, config)
         checked_sha, changed = require_agent_result(
             repo, client, fixer, config.integration_branch, pr.head_sha,
-            allow_unchanged=True, iteration=continuation_round,
+            allow_unchanged=True, expected_process="cleanup",
+            iteration=continuation_round,
         )
         if changed or checked_sha != pr.head_sha:
             raise WorkerFailure(
@@ -4818,6 +4915,8 @@ def integration_delivery(
                     config.integration_branch,
                     previous_sha=pr.head_sha,
                     allow_unchanged=True,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="cleanup",
                 )
                 assert checked.local_sha is not None
                 checked_sha = checked.local_sha
@@ -4830,6 +4929,7 @@ def integration_delivery(
                     config.integration_branch,
                     pr.head_sha,
                     allow_unchanged=True,
+                    expected_process="cleanup",
                     iteration=check_number,
                 )
             if not checks_changed:
@@ -5176,12 +5276,28 @@ def run_repository(
                 raise
             if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
                 raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            recovery_worktree = repo.inspect_worktree()
+            recovery_branch = recovery_worktree.current_branch
+            if recovery_branch is None:
+                raise WorkerFailure("repository recovery requires a current branch") from exc
+            recovery_start = repo.inspect_branch(recovery_branch)
+            if recovery_start.local_sha is None:
+                raise WorkerFailure(
+                    "repository recovery requires a local branch commit"
+                ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
             report = recover_error(client, config, exc, state)
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
                 flush=True,
+            )
+            repo.require_committed_result(
+                recovery_branch,
+                previous_sha=recovery_start.local_sha,
+                allow_unchanged=True,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process="recovery",
             )
             if not report.repaired or not report.retry_safe:
                 raise

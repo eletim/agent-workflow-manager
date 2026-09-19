@@ -174,7 +174,15 @@ class FakeGitHubRunner:
             branch = command[2].split("/git/ref/heads/", 1)[1].replace("%2F", "/")
             return self._done({"object": {"sha": self.refs[branch]}})
         if len(command) >= 3 and command[1] == "api" and "/git/commits/" in command[2]:
-            return self._done({"parents": [{"sha": BASE_SHA}, {"sha": HEAD_SHA}]})
+            return self._done(
+                {
+                    "message": "Merge title\n\nAutomated merge by "
+                    "agent-workflow-manager.\n\n"
+                    "AWM-Automation: agent-workflow-manager\n"
+                    "AWM-Process: merge",
+                    "parents": [{"sha": BASE_SHA}, {"sha": HEAD_SHA}],
+                }
+            )
         if (
             len(command) >= 5
             and command[1:4] == ["api", "--method", "PUT"]
@@ -985,3 +993,8 @@ def test_merge_uses_immediate_endpoint_and_verifies_commit_topology() -> None:
     assert mutation_calls[0][1] == "api"
     assert "pr" not in mutation_calls[0]
     assert not any("auto" in value or "queue" in value for value in mutation_calls[0])
+    assert (
+        "commit_message=Automated merge by agent-workflow-manager.\n\n"
+        "AWM-Automation: agent-workflow-manager\nAWM-Process: merge"
+        in mutation_calls[0]
+    )

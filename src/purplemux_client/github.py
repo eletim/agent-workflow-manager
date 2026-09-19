@@ -43,6 +43,10 @@ pullRequest{id}}}
 _QUEUE_QUERY = """
 query($id:ID!){node(id:$id){... on PullRequest{mergeQueueEntry{id state}}}}
 """.strip()
+_AWM_MERGE_MESSAGE = """Automated merge by agent-workflow-manager.
+
+AWM-Automation: agent-workflow-manager
+AWM-Process: merge"""
 
 
 class GitHubCommandRunner(Protocol):
@@ -817,6 +821,8 @@ class GitHubRepository:
                 f"sha={expected_head_sha}",
                 "-f",
                 "merge_method=merge",
+                "-f",
+                f"commit_message={_AWM_MERGE_MESSAGE}",
             ],
             pre_dispatch=lambda: self._require_merge_preconditions(
                 pr,
@@ -870,6 +876,11 @@ class GitHubRepository:
         commit = self._read_object(
             ["api", f"repos/{self.slug}/git/commits/{merge_sha}"]
         )
+        message = commit.get("message")
+        if not isinstance(message, str) or not message.endswith(_AWM_MERGE_MESSAGE):
+            raise WorkerFailure(
+                "merge commit does not record agent-workflow-manager automation"
+            )
         parents = commit.get("parents")
         if not isinstance(parents, list):
             raise WorkerFailure("merge commit response has no parents")

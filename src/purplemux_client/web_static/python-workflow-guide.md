@@ -193,7 +193,10 @@ a unique `awm-run/...` local branch. Recovery inspects logical and prior-run
 private refs, selects their single furthest descendant of the exact authoritative
 base, and fails closed if safe candidates diverge. A recovered commit can satisfy
 an unchanged agent turn; otherwise require the CodingAgent's new commit and clean
-worktree with `require_committed_result()`. Use `ensure_pushed()` to complete
+worktree with `require_committed_result(..., expected_agent="codex",
+expected_process="implementation")` (or the agent and process for that turn).
+`agent_commit_coauthor()` supplies the same normalized co-author identity to the
+prompt that this postcondition verifies. Use `ensure_pushed()` to complete
 delivery through the logical remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
 Workflow must then create or reuse and verify the exact Draft PR before starting
@@ -609,8 +612,14 @@ repo.require_clean() -> None
 repo.require_current_branch(branch) -> BranchState
 repo.require_pushed(branch) -> BranchState
 repo.require_committed_result(
-    branch, *, previous_sha, allow_unchanged=False
+    branch, *, previous_sha, allow_unchanged=False,
+    expected_agent=None, expected_process=None
 ) -> BranchState
+repo.require_agent_commit_provenance(
+    previous_sha, current_sha, *, expected_agent, expected_process,
+    allow_unchanged=False
+) -> None
+agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
@@ -677,8 +686,11 @@ reconciles a lost mutation response without duplicating that comment.
 `update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
 concurrent body or review-state change. `merge_pr()` supports only an immediate
 merge commit and verifies
-its parents and the resulting base ref; it never queues, squashes, rebases, or
-enables auto-merge.
+its parents, the resulting base ref, and the `AWM-Automation` / `AWM-Process`
+trailers that identify the scripted merge. It never queues, squashes, rebases,
+or enables auto-merge, and it does not identify AWM as a co-author. CodingAgent
+commits separately carry a normalized co-author plus machine-readable
+`AWM-Agent` and `AWM-Process` trailers, which are verified before delivery.
 
 The repository execution helpers are:
 

@@ -37,6 +37,7 @@ from purplemux_client.git import (
     FeatureRecoveryState,
     GitRepository,
     WorktreeState,
+    agent_commit_coauthor,
 )
 from purplemux_client.github import (
     GitHubRepository,
@@ -115,6 +116,7 @@ __all__ = [
     "WorkerNeedsInput",
     "WorkspaceState",
     "WorktreeState",
+    "agent_commit_coauthor",
     "emit_step",
     "emit_finding",
     "emit_issue_driven_context",
