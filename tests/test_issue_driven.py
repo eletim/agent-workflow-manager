@@ -1076,6 +1076,12 @@ def test_generated_workflow_can_create_integration_from_final_branch() -> None:
     assert "base='dev/v0.2.4'" in code
     assert "expected_base_sha=context.base_sha" in code
     assert "repository.ensure_pushed(\n        'dev/v0.2.5'," in code
+    parse_args = code.split("def parse_args() -> Config:\n", 1)[1].split(
+        "def short_error(", 1
+    )[0]
+    assert parse_args.index("warn_if_stale_integration_branch(") < parse_args.index(
+        "repository.prepare_feature_branch("
+    )
 
 
 def test_generated_workflow_requires_existing_integration_by_default() -> None:
@@ -1110,6 +1116,9 @@ def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() 
     assert "canonical source when decomposing or refining" in code
     assert "short inline mini tasks" in code
     assert "Do not create GitHub Issues" in code
+    assert "rationale must be a concise single-line explanation" in code
+    assert "never copied stdout, stderr, or conversation transcripts" in code
+    assert "github.create_issue_comment(" in code
     assert "one_shot_issue" in code
     assert "One-shot source Issue:" in code
 
@@ -1178,9 +1187,17 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
                     ],
                     "complete": False,
                     "policy_conflicts": [],
+                    "rationale": "This task isolates the required public behavior.",
                 }
             ),
-            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "The planned work is complete.",
+                }
+            ),
         )
     )
     processed: list[object] = []
@@ -1196,13 +1213,17 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     )
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+    comments: list[str] = []
+    github = SimpleNamespace(
+        create_issue_comment=lambda _issue, **kwargs: comments.append(kwargs["body"])
+    )
     plan = workflow["WorkItemPlan"](config)
 
     effective = workflow["process_work_items"](
         config,
         SimpleNamespace(),
         SimpleNamespace(),
-        SimpleNamespace(),
+        github,
         SimpleNamespace(),
         plan,
     )
@@ -1210,6 +1231,10 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     assert [item.key for item in processed] == ["focused-change"]
     assert [item.key for item in inspected] == ["focused-change"]
     assert [item.key for item in effective] == ["focused-change"]
+    assert len(comments) == 2
+    assert "### Decomposition rationale" in comments[0]
+    assert "Added Mini task focused&#45;change" in comments[0]
+    assert "No changes from the previous planning result" in comments[1]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
     assert all(
         "git show\ndev/v1:docs/design-principles.md" in prompt for prompt in prompts
@@ -1250,6 +1275,7 @@ def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
                     "actions": [{"action": "add", "item": 169}],
                     "complete": False,
                     "policy_conflicts": [],
+                    "rationale": "A focused task is required.",
                 }
             ),
         )
@@ -1276,6 +1302,7 @@ def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
                 ],
                 "complete": True,
                 "policy_conflicts": [],
+                "rationale": "The obsolete task is already satisfied.",
             }
         ),
     )
@@ -1285,6 +1312,207 @@ def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
 
     assert plan.snapshot == ()
     assert plan.position == 0
+
+
+@pytest.mark.parametrize(
+    "unsafe_task",
+    [
+        "Use API token: secret123 while updating the client.",
+        "Investigate this output: Traceback (most recent call last): failure",
+        "Replace opaque value abcdefghijklmnopqrstuvwxyz1234567890.",
+        "collected 12 items\n12 passed in 0.21s",
+        "User: Show the current plan. Assistant: Here is the complete plan.",
+        "stdout: build completed successfully",
+    ],
+)
+@pytest.mark.parametrize("action_kind", ["add", "update"])
+def test_one_shot_planner_rejects_unpublishable_task_text_transactionally(
+    unsafe_task: str, action_kind: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    if action_kind == "add":
+        action = {
+            "action": "add",
+            "item": {"id": "publishable-task", "task": unsafe_task},
+        }
+    else:
+        plan.add(
+            workflow["planner_inline_issue"](
+                "publishable-task", "Implement the focused behavior."
+            )
+        )
+        action = {
+            "action": "update",
+            "key": "publishable-task",
+            "task": unsafe_task,
+        }
+    original = plan.snapshot
+
+    with pytest.raises(WorkerFailure, match="must not contain logs or secret-like"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [action],
+                    "complete": False,
+                    "policy_conflicts": [],
+                    "rationale": "This task isolates the remaining work.",
+                }
+            ),
+        )
+
+    assert plan.snapshot == original
+
+
+def test_one_shot_planner_revalidates_recovered_task_text() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(
+        workflow["planner_inline_issue"](
+            "recovered-task", "Investigate token: secret123 before delivery."
+        )
+    )
+    recovered = workflow["work_item_plan_from_body"](
+        workflow["with_work_item_plan"]("Base PR", plan), config
+    )
+
+    with pytest.raises(WorkerFailure, match="must not contain logs or secret-like"):
+        workflow["apply_planner_decision"](
+            recovered,
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": False,
+                    "policy_conflicts": [],
+                    "rationale": "The recovered task remains necessary.",
+                }
+            ),
+        )
+
+    assert recovered.snapshot[0].task == (
+        "Investigate token: secret123 before delivery."
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_reason",
+    [
+        "Skipped after finding API token: secret123 in the requirement.",
+        "Traceback (most recent call last): task is obsolete.",
+        "Duplicate of abcdefghijklmnopqrstuvwxyz1234567890.",
+        "collected 12 items\n12 passed in 0.21s",
+        "User: Is this obsolete? Assistant: Yes, skip it.",
+        "stderr: no matching tests were collected",
+    ],
+)
+def test_one_shot_planner_rejects_unpublishable_skip_reason_transactionally(
+    unsafe_reason: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    plan.add(
+        workflow["planner_inline_issue"](
+            "obsolete-task", "Implement the focused behavior."
+        )
+    )
+    original = plan.snapshot
+
+    with pytest.raises(
+        WorkerFailure, match="skip reason must not contain logs or secret-like"
+    ):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "skip",
+                            "key": "obsolete-task",
+                            "reason": unsafe_reason,
+                        }
+                    ],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "The task is no longer required.",
+                }
+            ),
+        )
+
+    assert plan.snapshot == original
+    assert plan.skipped == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_rationale",
+    [
+        "User: Why this plan? Assistant: It isolates the remaining work.",
+        "stdout: planning completed successfully",
+    ],
+)
+def test_one_shot_planner_rejects_low_level_rationale(
+    unsafe_rationale: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    with pytest.raises(WorkerFailure, match="rationale is invalid or unsafe"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "add",
+                            "item": {
+                                "id": "publishable-task",
+                                "task": "Implement the focused behavior.",
+                            },
+                        }
+                    ],
+                    "complete": False,
+                    "policy_conflicts": [],
+                    "rationale": unsafe_rationale,
+                }
+            ),
+        )
+
+    assert plan.snapshot == ()
+
+
+def test_one_shot_planning_comment_escapes_planner_controlled_text() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+    task = "Implement <!-- hidden --> @team ![tracking](https://example.com/pixel)."
+    plan.add(workflow["planner_inline_issue"]("publishable-task", task))
+    decision = workflow["PlannerDecision"](
+        False,
+        rationale="Rationale <!-- hidden --> @team ![tracking](https://example.com/r).",
+        changes=("Skipped Mini task: <!-- hidden --> @team ![tracking](x).",),
+    )
+
+    comment = workflow["one_shot_planning_comment"](plan, decision)
+
+    assert "`publishable-task` (pending)" in comment
+    assert "<!-- hidden -->" not in comment
+    assert "@team" not in comment
+    assert "![tracking](" not in comment
+    assert comment.count("&#64;team") == 3
 
 
 @pytest.mark.parametrize("issue_number", [197, 225])
@@ -1359,9 +1587,17 @@ def test_planner_recovers_invalid_policy_conflicts_in_the_same_session() -> None
                     "actions": [],
                     "complete": True,
                     "policy_conflicts": ["conflict without a configured policy"],
+                    "rationale": "No implementation work remains.",
                 }
             ),
-            json.dumps({"actions": [], "complete": True, "policy_conflicts": []}),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "No implementation work remains.",
+                }
+            ),
         )
     )
     turns: list[tuple[str, str]] = []
@@ -1373,12 +1609,13 @@ def test_planner_recovers_invalid_policy_conflicts_in_the_same_session() -> None
 
     workflow["run_turn"] = run_turn
     workflow["persist_work_item_plan"] = lambda plan, *_args: _args[-1]
+    github = SimpleNamespace(create_issue_comment=lambda *args, **kwargs: None)
 
     effective = workflow["process_work_items"](
         config,
         SimpleNamespace(),
         SimpleNamespace(),
-        SimpleNamespace(),
+        github,
         None,
         workflow["WorkItemPlan"](config),
     )
@@ -1417,6 +1654,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
             ],
             "complete": False,
             "policy_conflicts": [],
+            "rationale": "The focused task covers the remaining requirement.",
         }
     )
 
@@ -1426,6 +1664,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
         return _args[-1]
 
     workflow["persist_work_item_plan"] = persist
+    github = SimpleNamespace(create_issue_comment=lambda *args, **kwargs: None)
     workflow["inspect_dynamic_work_item_topology"] = lambda *_args: (
         _ for _ in ()
     ).throw(WorkerFailure(topology_error))
@@ -1438,7 +1677,7 @@ def test_dynamic_topology_failure_remains_undispatched_for_recovery(
             config,
             SimpleNamespace(),
             SimpleNamespace(),
-            SimpleNamespace(),
+            github,
             SimpleNamespace(),
             workflow["WorkItemPlan"](config),
         )
@@ -2220,6 +2459,43 @@ def test_generated_workflow_selects_role_specific_agents(
     assert "CreateSessionRequest(agent_type, str(config.repo), agent_type" in code
 
 
+@pytest.mark.parametrize(
+    ("agent", "coauthor"),
+    [
+        ("codex", "Codex <noreply@openai.com>"),
+        ("claude", "Claude <noreply@anthropic.com>"),
+    ],
+)
+def test_generated_workflow_requires_agent_commit_provenance(
+    agent: str, coauthor: str
+) -> None:
+    source = generate_issue_driven_workflow(parse(payload(implementer_agent=agent)))
+    workflow = load_generated_workflow(implementer_agent=agent)
+
+    implementation = workflow["implementer_prompt"]("Implement it.")
+    reviewer_fix = workflow["implementer_prompt"](
+        "Fix the review.", process="reviewer-fix"
+    )
+    implementation_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: implementation"
+    )
+    reviewer_fix_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: reviewer-fix"
+    )
+
+    for prompt in (implementation, reviewer_fix):
+        assert f"Co-authored-by: {coauthor}" in prompt
+        assert f"AWM-Agent: {agent}" in prompt
+    assert implementation_trailers in implementation
+    assert reviewer_fix_trailers in reviewer_fix
+    assert "agent_commit_coauthor(IMPLEMENTER_AGENT)" in source
+    assert "AGENT_COAUTHORS" not in source
+
+
 def test_generated_workflow_routes_every_agent_session_by_role() -> None:
     tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
     calls: dict[str, str] = {}
@@ -2449,6 +2725,12 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="feature/work", dirty=False, status=()
         ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2500,7 +2782,22 @@ def test_repository_recovery_rejects_unrecoverable_report(
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    recovery_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_recovery_commit(branch: str, **kwargs: object) -> BranchState:
+        recovery_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=require_recovery_commit,
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
         open=lambda *args, **kwargs: object()
     )
@@ -2524,6 +2821,17 @@ def test_repository_recovery_rejects_unrecoverable_report(
     with pytest.raises(WorkerFailure, match="plan failed"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+    assert recovery_checks == [
+        (
+            "dev/v1",
+            {
+                "previous_sha": "b" * 40,
+                "allow_unchanged": True,
+                "expected_agent": "codex",
+                "expected_process": "recovery",
+            },
+        )
+    ]
 
 
 def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> None:
@@ -2531,10 +2839,20 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
+    recovery_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_recovery_commit(branch: str, **kwargs: object) -> BranchState:
+        recovery_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=require_recovery_commit,
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2574,6 +2892,17 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     assert workflow["run_repository"](config) == "delivered"
     assert len(plans) == 2
     assert plans[1] is not plans[0]
+    assert recovery_checks == [
+        (
+            "dev/v1",
+            {
+                "previous_sha": "b" * 40,
+                "allow_unchanged": True,
+                "expected_agent": "codex",
+                "expected_process": "recovery",
+            },
+        )
+    ]
     assert workflow["summary_warnings"](None) == (
         "earlier timeout", "earlier policy warning"
     )
@@ -2595,6 +2924,12 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=True, status=(" M file",)
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
         ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
@@ -2699,7 +3034,18 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
         open=lambda *args, **kwargs: object()
     )
@@ -3951,12 +4297,22 @@ def test_generated_setup_pushes_exact_final_head_as_new_integration_base() -> No
     )
     workflow["inspect_issue_driven_topology"] = lambda **kwargs: ()
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repository)
+    github = object()
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: github
+    )
+    workflow["warn_if_stale_integration_branch"] = (
+        lambda config, checked_repo, checked_github: calls.append(
+            ("warn", config.integration_branch, checked_repo, checked_github)
+        )
+    )
 
     config = workflow["parse_args"]()  # type: ignore[operator]
 
     assert config.integration_branch == "dev/v0.2.5"
     assert config.main_branch == "dev/v0.2.4"
     assert calls == [
+        ("warn", "dev/v0.2.5", repository, github),
         ("prepare", "dev/v0.2.5", "dev/v0.2.4", final_sha),
         ("push", "dev/v0.2.5", final_sha),
     ]
@@ -4158,6 +4514,9 @@ def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
             created = replace(created, body=str(kwargs["body"]))
             return created
 
+        def create_issue_comment(self, *args: object, **kwargs: object) -> None:
+            return None
+
     class Repository:
         def synchronize_branch(self, branch: str) -> BranchState:
             return BranchState(branch, integration_sha, integration_sha, True)
@@ -4199,8 +4558,14 @@ def test_deferred_empty_one_shot_plan_persists_before_dispatch() -> None:
                 ],
                 "complete": False,
                 "policy_conflicts": [],
+                "rationale": "The first task is the remaining focused work.",
             },
-            {"actions": [], "complete": True, "policy_conflicts": []},
+            {
+                "actions": [],
+                "complete": True,
+                "policy_conflicts": [],
+                "rationale": "The planned work is complete.",
+            },
         )
     )
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(next(decisions))
@@ -4284,6 +4649,9 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
             create_calls += 1
             pytest.fail("an identical branch pair cannot have a pull request")
 
+        def create_issue_comment(self, *args: object, **kwargs: object) -> None:
+            return None
+
     repository = Repository()
     github = GitHub()
     findings: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -4298,7 +4666,12 @@ def test_deferred_one_shot_plan_can_complete_without_implementation_changes() ->
     workflow["run_outline_step"] = lambda _name, action: action()
     workflow["create_agent"] = lambda *args, **kwargs: "planner"
     workflow["run_turn"] = lambda *args, **kwargs: json.dumps(
-        {"actions": [], "complete": True, "policy_conflicts": []}
+        {
+            "actions": [],
+            "complete": True,
+            "policy_conflicts": [],
+            "rationale": "No implementation work is required.",
+        }
     )
 
     plan_pr, plan = workflow["prepare_work_item_plan_pr"](config, repository, github)

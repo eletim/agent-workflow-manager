@@ -51,6 +51,14 @@ dispatch position in an AWM-owned remote Git note without advancing either
 branch. This also supports dynamic and empty one-shot plans. The final PR remains
 `integration_branch` to `final_branch`.
 
+At startup, the workflow warns when an authoritative remote `dev/vX.Y.Z` branch
+with a higher patch version in the same major/minor series is ahead of the
+configured integration head. If `make_integration_branch` is true and that head
+is absent, it instead checks whether the newer branch is ahead of the exact
+`final_branch` head from which the configured branch would be created. Identical,
+behind, divergent, differently named, and other-series branches do not trigger
+the warning. The warning never changes the configured branch automatically.
+
 For a multi-repository run, replace the four top-level repository fields with a
 `repositories` array. Each entry independently declares `repository`,
 `integration_branch`, `final_branch`, and `issues`. Their order is significant.
@@ -251,6 +259,12 @@ To deliver one large Issue without preparing its work-item list, use
   "merge_final": false
 }
 ```
+
+Every successful one-shot planning turn appends one structured comment to the
+source Issue with the current internal work-item decomposition, its rationale,
+and changes from the previous planning result. Later replanning adds another
+comment so the history remains chronological. It does not create child Issues
+or include raw stdout and agent conversation logs.
 
 The workflow starts this mode with an empty plan. Before every dispatch, the
 dedicated manager reads the source Issue and adds short inline mini tasks whose

@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from purplemux_client import GitRepository, MutationOutcomeUnknown, WorkerFailure
+from purplemux_client import (
+    GitRepository,
+    MutationOutcomeUnknown,
+    WorkerFailure,
+    agent_commit_coauthor,
+)
 from purplemux_client.git import (
     _QuiescentMutationTimeout,
     _run_git_mutation_process_group,
@@ -40,6 +45,13 @@ def test_inspect_github_repository_resolves_nested_directory(tmp_path: Path) -> 
 
     assert identity.slug == "acme/widgets"
     assert identity.url == "https://github.com/acme/widgets"
+
+
+def test_agent_commit_coauthor_is_the_normalized_identity_source() -> None:
+    assert agent_commit_coauthor("codex") == "Codex <noreply@openai.com>"
+    assert agent_commit_coauthor("claude") == "Claude <noreply@anthropic.com>"
+    with pytest.raises(ValueError, match="codex or claude"):
+        agent_commit_coauthor("other")
 
 
 @pytest.mark.parametrize(
@@ -211,6 +223,22 @@ def test_remote_branch_batch_ignores_stale_tracking_refs(
     assert git(work, "rev-parse", "refs/remotes/origin/main") == stale_sha
 
 
+def test_remote_branch_enumeration_uses_authoritative_remote_heads(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    main_sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "branch", "dev/v1.2.3")
+    git(seed, "push", "origin", "dev/v1.2.3")
+    git(work, "branch", "local-only")
+
+    result = repo.inspect_remote_branch_heads()
+
+    assert result == {"dev/v1.2.3": main_sha, "main": main_sha}
+    assert "local-only" not in result
+
+
 def test_remote_notes_persist_recovery_state_without_moving_branches(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:
@@ -297,6 +325,148 @@ def test_committed_result_requires_new_commit_and_clean_worktree(
         repo.require_committed_result(
             "feature/postcondition", previous_sha=base, allow_unchanged=True
         )
+
+
+@pytest.mark.parametrize(
+    ("agent", "coauthor"),
+    [
+        ("codex", "Codex <noreply@openai.com>"),
+        ("claude", "Claude <noreply@anthropic.com>"),
+    ],
+)
+def test_committed_result_requires_uniform_agent_provenance(
+    repositories: tuple[Path, Path, Path], agent: str, coauthor: str
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = f"feature/{agent}-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        f"Co-authored-by: {coauthor}\nAWM-Agent: {agent}\nAWM-Process: implementation",
+    )
+
+    result = repo.require_committed_result(
+        branch,
+        previous_sha=base,
+        expected_agent=agent,
+        expected_process="implementation",
+    )
+
+    assert result.local_sha == git(work, "rev-parse", "HEAD")
+
+
+def test_committed_result_rejects_missing_agent_provenance(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    repo.prepare_feature_branch(
+        "feature/missing-provenance", base="main", expected_base_sha=base
+    )
+    git(work, "commit", "--allow-empty", "-m", "unattributed result")
+
+    with pytest.raises(WorkerFailure, match="AWM-Agent trailer"):
+        repo.require_committed_result(
+            "feature/missing-provenance",
+            previous_sha=base,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+
+def test_committed_result_requires_the_expected_process(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/wrong-process"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "mislabeled implementation",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\n"
+        "AWM-Process: cleanup",
+    )
+
+    with pytest.raises(WorkerFailure, match="AWM-Process.*implementation"):
+        repo.require_committed_result(
+            branch,
+            previous_sha=base,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+
+def test_agent_provenance_verifies_exact_turn_ranges(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/process-boundaries"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "implementation",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\n"
+        "AWM-Process: implementation",
+    )
+    implementation = git(work, "rev-parse", "HEAD")
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "cleanup",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\n"
+        "AWM-Process: cleanup",
+    )
+    cleanup = git(work, "rev-parse", "HEAD")
+
+    repo.require_agent_commit_provenance(
+        base,
+        implementation,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+    repo.require_agent_commit_provenance(
+        implementation,
+        cleanup,
+        expected_agent="codex",
+        expected_process="cleanup",
+    )
+
+
+def test_committed_result_requires_agent_and_process_together(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+
+    with pytest.raises(ValueError, match="provided together"):
+        repo.require_committed_result("main", previous_sha=base, expected_agent="codex")
 
 
 @pytest.mark.parametrize("remote_relationship", ["ahead", "diverged"])

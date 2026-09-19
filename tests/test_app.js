@@ -29,6 +29,21 @@ class Element {
     this.checked = false;
     this.children = [];
     this.className = "";
+    this.classList = {
+      add: (...tokens) => {
+        const classes = new Set(this.className.split(/\s+/).filter(Boolean));
+        for (const token of tokens) classes.add(token);
+        this.className = [...classes].join(" ");
+      },
+      contains: (token) => this.className.split(/\s+/).includes(token),
+      remove: (...tokens) => {
+        const removed = new Set(tokens);
+        this.className = this.className
+          .split(/\s+/)
+          .filter((token) => token && !removed.has(token))
+          .join(" ");
+      },
+    };
     this.dataset = {};
     this.disabled = false;
     this.hidden = false;
@@ -87,7 +102,11 @@ class Element {
 
   showModal() { this.open = true; }
 
-  close() { this.open = false; }
+  close() {
+    this.open = false;
+    const event = {preventDefault() {}};
+    for (const listener of this.listeners.get("close") || []) listener(event);
+  }
 }
 
 function snapshot({
@@ -270,6 +289,7 @@ async function loadApp({
     "save-settings", "test-notification",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
+  elements.body = new Element();
   elements.favicon = new Element();
   elements.favicon.setAttribute("href", "/favicon.svg");
   elements["validation-panel"].hidden = true;
@@ -280,7 +300,7 @@ async function loadApp({
   const calls = [];
   const eventSources = [];
   const document = {
-    body: new Element(),
+    body: elements.body,
     createElement() { return new Element(); },
     createTextNode(text) { return {textContent: text}; },
     execCommand() { return true; },
@@ -1534,6 +1554,7 @@ test("Prompt directory picker navigates and selects its resolved current path", 
   await elements["directory-picker-open"].dispatch("click");
   await waitFor(() => elements["directory-picker-list"].children.length === 1);
 
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
   assert.equal(elements["directory-picker-path"].textContent, "/typed/project");
   assert.equal(elements["directory-picker-list"].children[0].textContent, "📁 source");
   await elements["directory-picker-parent"].dispatch("click");
@@ -1548,10 +1569,60 @@ test("Prompt directory picker navigates and selects its resolved current path", 
   );
 
   await elements["directory-picker-select"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
   assert.equal(elements["prompt-cwd"].value, "/typed/project/source");
   assert.deepEqual(requestedPaths, [
     "/typed/project", "/typed", "/typed/project", "/typed/project/source",
   ]);
+});
+
+test("Prompt directory picker releases page scroll lock when dismissed", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") {
+        return response({path: "/work", parent: "/", directories: []});
+      }
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  await elements["directory-picker-open"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
+
+  await elements["directory-picker-close"].dispatch("click");
+  assert.equal(elements["directory-picker-dialog"].open, false);
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
+
+  await elements["directory-picker-open"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
+  await elements["directory-picker-dialog"].dispatch("close");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
+});
+
+test("closing the directory picker invalidates its pending request", async () => {
+  const listing = deferred();
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") return listing.promise;
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  await elements["directory-picker-open"].dispatch("click");
+  await elements["directory-picker-close"].dispatch("click");
+  listing.resolve(response({path: "/stale", parent: "/", directories: []}));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(elements["directory-picker-path"].textContent, "");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
 });
 
 test("Prompt directory picker reports invalid manual paths without replacing them", async () => {

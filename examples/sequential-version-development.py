@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import re
+import string
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,7 @@ from purplemux_client import (
     ShellCommandRequest,
     WorkerFailure,
     WorkerInterrupted,
+    agent_commit_coauthor,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -61,6 +63,7 @@ MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
+MAX_PLANNER_RATIONALE_BYTES = 2_000
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
 MAX_RECOVERY_STATE_BYTES = 32_000
@@ -87,6 +90,10 @@ REVIEWER_CHECKOUT_GUARD = (
     "Never change the checkout: do not run git checkout, git switch, git restore, "
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
     "git show, or gh pr diff only."
+)
+DEVELOPMENT_BRANCH_VERSION = re.compile(
+    r"^(?P<series>.+/v)(?P<major>0|[1-9][0-9]*)\."
+    r"(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)$"
 )
 
 
@@ -224,6 +231,7 @@ class Config:
     check_command: str
     policy_issue: int | None = None
     one_shot_issue: int | None = None
+    make_integration_branch: bool = False
 
 
 @dataclass(frozen=True)
@@ -357,6 +365,8 @@ class PlannerDecision:
     complete: bool
     policy_conflicts: tuple[str, ...] = ()
     skipped: tuple[PlannerSkip, ...] = ()
+    rationale: str | None = None
+    changes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -457,6 +467,74 @@ def short_error(exc: BaseException) -> str:
     return str(exc).replace("\n", " ")[:500]
 
 
+def newer_development_branches(
+    integration_branch: str, remote_branches: dict[str, str]
+) -> tuple[str, ...]:
+    """Return newer-named remote branches in the configured patch series."""
+    configured = DEVELOPMENT_BRANCH_VERSION.fullmatch(integration_branch)
+    if configured is None:
+        return ()
+    series = configured["series"]
+    major = int(configured["major"])
+    minor = int(configured["minor"])
+    patch = int(configured["patch"])
+    candidates: list[tuple[int, str]] = []
+    for branch in remote_branches:
+        candidate = DEVELOPMENT_BRANCH_VERSION.fullmatch(branch)
+        if candidate is None:
+            continue
+        if (
+            candidate["series"] == series
+            and int(candidate["major"]) == major
+            and int(candidate["minor"]) == minor
+            and int(candidate["patch"]) > patch
+        ):
+            candidates.append((int(candidate["patch"]), branch))
+    return tuple(branch for _, branch in sorted(candidates, reverse=True))
+
+
+def warn_if_stale_integration_branch(
+    config: Config, repo: GitRepository, github: GitHubRepository
+) -> None:
+    """Warn when the remote contains a newer branch in the same patch series."""
+    if DEVELOPMENT_BRANCH_VERSION.fullmatch(config.integration_branch) is None:
+        return
+    remote_branches = repo.inspect_remote_branch_heads()
+    configured_sha = remote_branches.get(config.integration_branch)
+    if configured_sha is None:
+        if not config.make_integration_branch:
+            return
+        configured_sha = remote_branches.get(config.main_branch)
+        if configured_sha is None:
+            return
+    for newer in newer_development_branches(config.integration_branch, remote_branches):
+        newer_sha = remote_branches[newer]
+        if (
+            github.compare_commits(base_sha=configured_sha, head_sha=newer_sha)
+            != "ahead"
+        ):
+            continue
+        if config.integration_branch in remote_branches:
+            subject = (
+                f"configured integration branch {config.integration_branch} @ "
+                f"{configured_sha} may be stale"
+            )
+        else:
+            subject = (
+                f"configured integration branch {config.integration_branch} is "
+                f"absent and would be created from {config.main_branch} @ "
+                f"{configured_sha}"
+            )
+        warning = (
+            f"{subject}; authoritative remote branch {newer} @ {newer_sha} is "
+            "ahead in the same development series. Verify the intended base; "
+            "the workflow will not change it automatically."
+        )
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("git", warning, status="warning")
+        return
+
+
 def inspect_pr(
     github: GitHubRepository, *, head: str, base: str
 ) -> PullRequestState | None:
@@ -506,7 +584,22 @@ def run_turn(
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
 ) -> str:
+    if (repository is None) != (branch is None) or (repository is None) != (
+        expected_process is None
+    ):
+        raise ValueError(
+            "repository, branch, and expected_process must be provided together"
+        )
+    before_sha: str | None = None
+    if repository is not None and branch is not None:
+        before = repository.require_current_branch(branch)
+        if before.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} does not exist")
+        before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
         name,
@@ -527,6 +620,25 @@ def run_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
+    def verify_turn_commits() -> None:
+        if (
+            repository is None
+            or branch is None
+            or expected_process is None
+            or before_sha is None
+        ):
+            return
+        after = repository.require_current_branch(branch)
+        if after.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} disappeared")
+        repository.require_agent_commit_provenance(
+            before_sha,
+            after.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process=expected_process,
+            allow_unchanged=True,
+        )
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
@@ -545,7 +657,14 @@ def run_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
+        try:
+            verify_turn_commits()
+        except BaseException as provenance_error:
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                raise exc from provenance_error
+            raise
         raise
+    verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -681,18 +800,21 @@ def recover_error(
             client,
             agent,
             "Recovery assessment",
-            "Investigate this workflow error using the current authoritative state "
-            "below. Make only a safe, necessary repair, then re-inspect the affected "
-            "state. If the outcome is uncertain, report retry_safe as false. "
-            "Do not reset, rebase, stash, force-push, merge a work-item PR, create "
-            "unrelated PRs, discard ambiguous work, or edit agent-workflow-manager "
-            "fingerprint markers. Return exactly one JSON object with boolean "
-            "repaired and retry_safe fields and concise single-line summary and "
-            "evidence strings (at most 500 UTF-8 bytes each). Include evidence from "
-            "the state after repair when recommending retry. No other fields or "
-            "prose.\n\n"
-            f"Error: {short_error(error)}\n\n"
-            f"Current authoritative state:\n{authoritative_state}",
+            implementer_prompt(
+                "Investigate this workflow error using the current authoritative "
+                "state below. Make only a safe, necessary repair, then re-inspect "
+                "the affected state. If the outcome is uncertain, report retry_safe "
+                "as false. Do not reset, rebase, stash, force-push, merge a work-item "
+                "PR, create unrelated PRs, discard ambiguous work, or edit "
+                "agent-workflow-manager fingerprint markers. Return exactly one JSON "
+                "object with boolean repaired and retry_safe fields and concise "
+                "single-line summary and evidence strings (at most 500 UTF-8 bytes "
+                "each). Include evidence from the state after repair when "
+                "recommending retry. No other fields or prose.\n\n"
+                f"Error: {short_error(error)}\n\n"
+                f"Current authoritative state:\n{authoritative_state}",
+                process="recovery",
+            ),
             parse_recovery_report,
         )
         return report
@@ -700,13 +822,21 @@ def recover_error(
         client.close_session(agent)
 
 
-def implementer_prompt(prompt: str) -> str:
+def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
     """Add the shared change-boundary policy to an implementation turn."""
+    if process not in {"implementation", "reviewer-fix", "cleanup", "recovery"}:
+        raise ValueError(f"unsupported implementation process: {process!r}")
+    coauthor = agent_commit_coauthor(IMPLEMENTER_AGENT)
     return (
         f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
-        "work-item plan."
+        "work-item plan.\n\n"
+        "Every commit you create must end with these exact Git trailers, preserving "
+        "any additional trailers the agent adds:\n"
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {IMPLEMENTER_AGENT}\n"
+        f"AWM-Process: {process}"
     )
 
 
@@ -778,6 +908,9 @@ _RAW_REVIEW_OUTPUT = re.compile(
 )
 _OPAQUE_SECRET_LIKE_VALUE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_./+=-]{32,}")
 _PERSISTENCE_SAFE_REVIEW_TEXT = re.compile(r"^[^\x00-\x1f\x7f<>{}`=]+$")
+_PLANNER_LOW_LEVEL_TEXT = re.compile(
+    r"(?i)(?:^|[ \t])(?:user|assistant|system|developer|tool|stdout|stderr)\s*:"
+)
 
 
 def _safe_review_text(value: object, *, max_bytes: int) -> bool:
@@ -2007,9 +2140,12 @@ Do not push, modify PR state, merge, start a review, reset, stash, rebase,
 force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
-ignored, removed, or could not resolve."""),
+ignored, removed, or could not resolve.""", process="cleanup"),
         iteration=iteration,
         warning_scope=warning_scope,
+        repository=repo,
+        branch=branch,
+        expected_process="cleanup",
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -2031,10 +2167,13 @@ def require_agent_result(
     previous_sha: str,
     *,
     allow_unchanged: bool,
+    expected_process: str,
     iteration: int | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
-    repo.require_current_branch(branch)
+    post_turn = repo.require_current_branch(branch)
+    if post_turn.local_sha is None:
+        raise WorkerFailure(f"local branch {branch!r} does not exist")
     require_clean_worktree(
         repo,
         client,
@@ -2044,9 +2183,26 @@ def require_agent_result(
         warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
-        branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
+        branch,
+        previous_sha=previous_sha,
+        allow_unchanged=True,
     )
     assert result.local_sha is not None
+    cleanup_changed = result.local_sha != post_turn.local_sha
+    repo.require_agent_commit_provenance(
+        previous_sha,
+        post_turn.local_sha,
+        expected_agent=IMPLEMENTER_AGENT,
+        expected_process=expected_process,
+        allow_unchanged=allow_unchanged or cleanup_changed,
+    )
+    if cleanup_changed:
+        repo.require_agent_commit_provenance(
+            post_turn.local_sha,
+            result.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process="cleanup",
+        )
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
     return result.local_sha, result.local_sha != previous_sha
 
@@ -2429,6 +2585,7 @@ def _review_issue_phase(
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2523,11 +2680,15 @@ def _review_issue_phase(
                 policy_context(config, scope=f"fixes for {issue.label}")
                 + f"""Re-evaluate every {phase} review finding below. If warranted,
 fix, test, commit, and leave the worktree clean. If no change is warranted,
-leave it clean and explain why; do not create an empty commit.\n\n{result}"""
+leave it clean and explain why; do not create an empty commit.\n\n{result}""",
+                process="reviewer-fix",
             ),
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            repository=repo,
+            branch=issue.branch,
+            expected_process="reviewer-fix",
         )
         emit_policy_conflicts(
             fix_result,
@@ -2542,6 +2703,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="reviewer-fix",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2880,6 +3042,9 @@ def process_issue(
         implementation_prompt,
         pr=existing_pr,
         warning_scope=issue.result_id,
+        repository=repo,
+        branch=issue.branch,
+        expected_process="implementation",
     )
     emit_policy_conflicts(
         implementation_result,
@@ -2894,6 +3059,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        expected_process="implementation",
         warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
@@ -3080,9 +3246,23 @@ decomposing the remaining work into short inline mini tasks. Each task must stat
 its purpose and any non-negotiable design decision, while leaving implementation
 detail to the implementer. Do not create GitHub Issues or implement the source
 Issue as one undivided work item. Numeric Issue additions are invalid in one-shot
-mode.
+mode. Do not include stdout or agent conversation logs in tasks or rationale.
+Tasks, rationale, and skip reasons that will be published must be concise
+single-line summaries, never copied stdout, stderr, or conversation transcripts.
 
 """
+    decision_keys = (
+        '"actions", "complete", "policy_conflicts", and\n"rationale"'
+        if config.one_shot_issue is not None
+        else '"actions", "complete", and\n"policy_conflicts"'
+    )
+    rationale_contract = (
+        f" rationale must be a concise single-line explanation of why the current "
+        f"decomposition is appropriate, at most {MAX_PLANNER_RATIONALE_BYTES} UTF-8 "
+        "bytes, without logs or secrets."
+        if config.one_shot_issue is not None
+        else ""
+    )
     return f"""Review the workflow-owned work-item plan before its next dispatch.
 You are the planning role only: do not edit files, implement work, or mutate Git
 or GitHub. Inspect repository and GitHub state read-only when useful. Preserve
@@ -3103,8 +3283,8 @@ Integration branch: {config.integration_branch}
 Processed work items: {json.dumps(processed, ensure_ascii=False)}
 Pending work items: {json.dumps(remaining, ensure_ascii=False)}
 
-Return exactly one JSON object with keys "actions", "complete", and
-"policy_conflicts". policy_conflicts must be an array containing at most
+Return exactly one JSON object with keys {decision_keys}.{rationale_contract}
+policy_conflicts must be an array containing at most
 {MAX_PLANNER_POLICY_CONFLICTS} concise strings of at most
 {MAX_POLICY_CONFLICT_DETAIL_CHARS} characters each, and must be empty when no
 conflict exists. Actions run in order and have one of these exact shapes:
@@ -3145,6 +3325,28 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
         task,
         fingerprint,
     )
+
+
+def planner_text_is_publishable(value: str) -> bool:
+    return (
+        value.splitlines() == [value]
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F for character in value
+        )
+        and "```" not in value
+        and _PLANNER_LOW_LEVEL_TEXT.search(value) is None
+        and _RAW_REVIEW_OUTPUT.search(value) is None
+        and _SENSITIVE_REVIEW_TEXT.search(value) is None
+        and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
+    )
+
+
+def require_publishable_planner_task(issue: Issue) -> None:
+    assert issue.task is not None
+    if not planner_text_is_publishable(issue.task):
+        raise WorkerFailure(
+            "one-shot planner task must not contain logs or secret-like values"
+        )
 
 
 def planner_key(value: object) -> int | str:
@@ -3195,6 +3397,8 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     except json.JSONDecodeError as exc:
         raise WorkerFailure(f"planner returned invalid JSON: {exc.msg}") from exc
     expected_fields = {"actions", "complete", "policy_conflicts"}
+    if plan.config.one_shot_issue is not None:
+        expected_fields.add("rationale")
     if not isinstance(decision, dict) or set(decision) != expected_fields:
         raise WorkerFailure(
             "planner decision must contain only actions, complete, and "
@@ -3203,6 +3407,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     actions = decision["actions"]
     complete = decision["complete"]
     policy_conflicts = decision["policy_conflicts"]
+    rationale = decision.get("rationale")
     if (
         not isinstance(actions, list)
         or len(actions) > MAX_PLANNER_ACTIONS
@@ -3211,6 +3416,11 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
     ):
         raise WorkerFailure("planner decision has invalid bounded values")
+    if plan.config.one_shot_issue is not None:
+        if not _safe_review_text(
+            rationale, max_bytes=MAX_PLANNER_RATIONALE_BYTES
+        ) or not planner_text_is_publishable(rationale):
+            raise WorkerFailure("planner rationale is invalid or unsafe")
     for conflict in policy_conflicts:
         conflict_has_surrogate = isinstance(conflict, str) and any(
             0xD800 <= ord(character) <= 0xDFFF for character in conflict
@@ -3232,6 +3442,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     candidate.position = plan.position
     candidate.skipped = list(plan.skipped)
     skipped_before = len(candidate.skipped)
+    changes: list[str] = []
     try:
         for action in actions:
             if not isinstance(action, dict) or not isinstance(
@@ -3240,16 +3451,18 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 raise WorkerFailure("planner action is invalid")
             kind = action["action"]
             if kind == "add" and set(action) == {"action", "item"}:
-                candidate.add(planner_added_issue(action["item"]))
+                added = planner_added_issue(action["item"])
+                candidate.add(added)
+                changes.append(f"Added {added.label}.")
             elif kind == "update" and set(action) == {"action", "key", "task"}:
                 key = planner_key(action["key"])
                 index = candidate._remaining_index(key)
                 current = candidate.items[index]
                 if current.task_id is None:
                     raise WorkerFailure("planner can update only an inline mini task")
-                candidate.update(
-                    key, planner_inline_issue(current.task_id, action["task"])
-                )
+                updated = planner_inline_issue(current.task_id, action["task"])
+                candidate.update(key, updated)
+                changes.append(f"Updated {current.label}.")
             elif kind == "skip" and set(action) == {"action", "key", "reason"}:
                 reason = action["reason"]
                 reason_has_surrogate = isinstance(reason, str) and any(
@@ -3264,11 +3477,27 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                     or reason_has_surrogate
                 ):
                     raise WorkerFailure("planner skip reason is invalid")
+                if (
+                    plan.config.one_shot_issue is not None
+                    and not planner_text_is_publishable(reason)
+                ):
+                    raise WorkerFailure(
+                        "one-shot planner skip reason must not contain logs or "
+                        "secret-like values"
+                    )
                 candidate.skip(planner_key(action["key"]), reason)
+                summary = reason if len(reason) <= 160 else f"{reason[:159]}…"
+                changes.append(
+                    f"Skipped {candidate.skipped[-1].issue.label}: {summary}"
+                )
             else:
                 raise WorkerFailure("planner action has an unsupported shape")
     except ValueError as exc:
         raise WorkerFailure(f"planner decision is invalid: {exc}") from exc
+
+    if plan.config.one_shot_issue is not None:
+        for issue in candidate.items:
+            require_publishable_planner_task(issue)
 
     if complete and candidate.remaining:
         raise WorkerFailure("planner cannot complete while work items remain")
@@ -3283,6 +3512,44 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         complete,
         tuple(policy_conflicts),
         tuple(candidate.skipped[skipped_before:]),
+        rationale,
+        tuple(changes),
+    )
+
+
+def escape_planner_markdown(value: str) -> str:
+    """Render planner-controlled text without active Markdown or mentions."""
+    return "".join(
+        f"&#{ord(character)};" if character in string.punctuation else character
+        for character in value
+    )
+
+
+def one_shot_planning_comment(
+    plan: WorkItemPlan, decision: PlannerDecision
+) -> str:
+    if plan.config.one_shot_issue is None or decision.rationale is None:
+        raise ValueError("planning comments require a one-shot planner decision")
+    items = []
+    for index, issue in enumerate(plan.items):
+        status = "processed" if index < plan.position else "pending"
+        assert issue.task_id is not None and issue.task is not None
+        task = escape_planner_markdown(issue.task)
+        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {task}")
+    decomposition = "\n".join(items) if items else "No work items remain."
+    changes = (
+        "\n".join(f"- {escape_planner_markdown(change)}" for change in decision.changes)
+        if decision.changes
+        else "- No changes from the previous planning result."
+    )
+    return (
+        "## One-Shot Planning\n\n"
+        "### Work item decomposition\n\n"
+        f"{decomposition}\n\n"
+        "### Decomposition rationale\n\n"
+        f"{escape_planner_markdown(decision.rationale)}\n\n"
+        "### Changes from previous planning\n\n"
+        f"{changes}"
     )
 
 
@@ -3667,6 +3934,16 @@ def process_work_items(
                 skipped.reason,
                 label=skipped.issue.label,
             )
+        if config.one_shot_issue is not None:
+            comment = one_shot_planning_comment(plan, planner_decision)
+            github.create_issue_comment(
+                config.one_shot_issue,
+                body=comment,
+                correlation_id=run_correlation(
+                    "one-shot-planning-comment-"
+                    + hashlib.sha256(comment.encode()).hexdigest()[:16]
+                ),
+            )
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:
             return plan.snapshot
@@ -3993,6 +4270,7 @@ def _review_whole_version(
                 config.integration_branch,
                 pr.head_sha,
                 allow_unchanged=True,
+                expected_process="cleanup",
                 iteration=review_number,
             )
             if scenario_reviewer_changed:
@@ -4086,6 +4364,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if principles_reviewer_changed:
@@ -4166,6 +4445,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -4249,6 +4529,7 @@ def _review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -4335,8 +4616,12 @@ def _review_whole_version(
                         policy_context(config, scope="whole-version fixes")
                         + f"""Re-evaluate every finding. If warranted, fix, test, commit,
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                        process="reviewer-fix",
                     ),
                     iteration=review_number,
+                    repository=repo,
+                    branch=config.integration_branch,
+                    expected_process="reviewer-fix",
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
@@ -4346,6 +4631,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     config.integration_branch,
                     current.head_sha,
                     allow_unchanged=True,
+                    expected_process="reviewer-fix",
                     iteration=review_number,
                 )
                 if changed:
@@ -4396,6 +4682,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             config.integration_branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if checks_changed:
@@ -4469,7 +4756,8 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
         run_final_checks(client, config)
         checked_sha, changed = require_agent_result(
             repo, client, fixer, config.integration_branch, pr.head_sha,
-            allow_unchanged=True, iteration=continuation_round,
+            allow_unchanged=True, expected_process="cleanup",
+            iteration=continuation_round,
         )
         if changed or checked_sha != pr.head_sha:
             raise WorkerFailure(
@@ -4710,6 +4998,8 @@ def integration_delivery(
                     config.integration_branch,
                     previous_sha=pr.head_sha,
                     allow_unchanged=True,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="cleanup",
                 )
                 assert checked.local_sha is not None
                 checked_sha = checked.local_sha
@@ -4722,6 +5012,7 @@ def integration_delivery(
                     config.integration_branch,
                     pr.head_sha,
                     allow_unchanged=True,
+                    expected_process="cleanup",
                     iteration=check_number,
                 )
             if not checks_changed:
@@ -5047,6 +5338,8 @@ def run_repository(
         command_timeout_seconds=COMMAND_TIMEOUT,
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
+    if not config.make_integration_branch:
+        warn_if_stale_integration_branch(config, repo, github)
     client = create_runtime(config)
     for recovery_attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
         plan: WorkItemPlan | None = None
@@ -5068,12 +5361,28 @@ def run_repository(
                 raise
             if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
                 raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            recovery_worktree = repo.inspect_worktree()
+            recovery_branch = recovery_worktree.current_branch
+            if recovery_branch is None:
+                raise WorkerFailure("repository recovery requires a current branch") from exc
+            recovery_start = repo.inspect_branch(recovery_branch)
+            if recovery_start.local_sha is None:
+                raise WorkerFailure(
+                    "repository recovery requires a local branch commit"
+                ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
             report = recover_error(client, config, exc, state)
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
                 flush=True,
+            )
+            repo.require_committed_result(
+                recovery_branch,
+                previous_sha=recovery_start.local_sha,
+                allow_unchanged=True,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process="recovery",
             )
             if not report.repaired or not report.retry_safe:
                 raise

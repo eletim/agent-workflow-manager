@@ -47,3 +47,8 @@ def test_human_context_and_durable_decision_record_are_distinguished() -> None:
     assert "persisted work-item plan" in section
     assert "managed Review\naudit sections on child and Base PRs" in section
     assert "only the portion" in section
+
+
+def test_git_delivery_example_verifies_agent_provenance() -> None:
+    assert 'expected_agent="codex"' in README
+    assert 'expected_process="implementation"' in README
