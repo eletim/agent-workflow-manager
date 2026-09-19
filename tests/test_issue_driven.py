@@ -2716,6 +2716,9 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         inspect_branch=lambda branch: BranchState(
             branch, "b" * 40, "b" * 40, True
         ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "b" * 40, "b" * 40, True
+        ),
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
@@ -2767,6 +2770,12 @@ def test_repository_recovery_rejects_unrecoverable_report(
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
+    recovery_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_recovery_commit(branch: str, **kwargs: object) -> BranchState:
+        recovery_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
@@ -2774,6 +2783,7 @@ def test_repository_recovery_rejects_unrecoverable_report(
         inspect_branch=lambda branch: BranchState(
             branch, "b" * 40, "b" * 40, True
         ),
+        require_committed_result=require_recovery_commit,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -2799,6 +2809,17 @@ def test_repository_recovery_rejects_unrecoverable_report(
     with pytest.raises(WorkerFailure, match="plan failed"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+    assert recovery_checks == [
+        (
+            "dev/v1",
+            {
+                "previous_sha": "b" * 40,
+                "allow_unchanged": True,
+                "expected_agent": "codex",
+                "expected_process": "recovery",
+            },
+        )
+    ]
 
 
 def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> None:

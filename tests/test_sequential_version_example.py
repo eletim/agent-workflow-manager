@@ -16,6 +16,7 @@ from purplemux_client import (
     GitRepository,
     PullRequestState,
     WorkerFailure,
+    WorkerInterrupted,
 )
 from purplemux_client.preflight import WorkflowValidator
 
@@ -2027,6 +2028,43 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             },
         )
     ]
+
+
+def test_interrupted_turn_is_not_masked_by_provenance_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    branch = "feature/interrupted-turn"
+
+    class Repository:
+        def require_current_branch(self, current: str) -> BranchState:
+            return BranchState(current, "head", None, True)
+
+        def require_agent_commit_provenance(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            raise WorkerFailure("invalid provenance")
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, tab: str, timeout: int) -> None:
+            raise WorkerInterrupted("turn interrupted")
+
+    globals_ = workflow["run_turn"].__globals__
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    with pytest.raises(WorkerInterrupted, match="turn interrupted"):
+        workflow["run_turn"](
+            Client(),
+            "tab",
+            "Implementation",
+            "prompt",
+            repository=Repository(),
+            branch=branch,
+            expected_process="implementation",
+        )
 
 
 def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(

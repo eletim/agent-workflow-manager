@@ -583,7 +583,12 @@ def run_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
-        verify_turn_commits()
+        try:
+            verify_turn_commits()
+        except BaseException as provenance_error:
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                raise exc from provenance_error
+            raise
         raise
     verify_turn_commits()
     emit_step(
@@ -5287,8 +5292,6 @@ def run_repository(
                 f"Evidence: {report.evidence}",
                 flush=True,
             )
-            if not report.repaired or not report.retry_safe:
-                raise
             repo.require_committed_result(
                 recovery_branch,
                 previous_sha=recovery_start.local_sha,
@@ -5296,6 +5299,8 @@ def run_repository(
                 expected_agent=IMPLEMENTER_AGENT,
                 expected_process="recovery",
             )
+            if not report.repaired or not report.retry_safe:
+                raise
             require_recovery_retry_state(
                 recovery_authoritative_state(config, repo, github, plan), state
             )
