@@ -605,6 +605,7 @@ The supported Git inspection and assertion methods are:
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
+repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -623,6 +624,10 @@ agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
+
+`inspect_remote_branch_heads()` enumerates the remote directly and does not
+trust local tracking refs. Use it when a workflow must compare a configured
+development branch with the remote's current branch set.
 
 The inspection-aware Git operations that may mutate are:
 

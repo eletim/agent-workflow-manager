@@ -283,6 +283,29 @@ class GitRepository:
             result[branch] = fields[0]
         return result
 
+    def inspect_remote_branch_heads(self) -> dict[str, str]:
+        """Enumerate authoritative remote branch heads without using local refs."""
+        self._validate_identity()
+        completed = self._command(
+            ["ls-remote", "--heads", self.remote],
+            {0},
+        )
+        prefix = "refs/heads/"
+        result: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or not fields[1].startswith(prefix)
+                or not _OBJECT_ID_RE.fullmatch(fields[0])
+            ):
+                raise WorkerFailure("unexpected ls-remote branch enumeration result")
+            branch = fields[1].removeprefix(prefix)
+            if not branch or branch in result:
+                raise WorkerFailure("ambiguous ls-remote branch enumeration result")
+            result[branch] = fields[0]
+        return result
+
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
         """Read a note from an AWM-owned remote ref without changing branch heads."""
         self._validate_identity()

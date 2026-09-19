@@ -223,6 +223,22 @@ def test_remote_branch_batch_ignores_stale_tracking_refs(
     assert git(work, "rev-parse", "refs/remotes/origin/main") == stale_sha
 
 
+def test_remote_branch_enumeration_uses_authoritative_remote_heads(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    main_sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "branch", "dev/v1.2.3")
+    git(seed, "push", "origin", "dev/v1.2.3")
+    git(work, "branch", "local-only")
+
+    result = repo.inspect_remote_branch_heads()
+
+    assert result == {"dev/v1.2.3": main_sha, "main": main_sha}
+    assert "local-only" not in result
+
+
 def test_remote_notes_persist_recovery_state_without_moving_branches(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:

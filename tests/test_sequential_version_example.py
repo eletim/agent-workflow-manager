@@ -177,6 +177,63 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+@pytest.mark.parametrize(
+    ("configured", "branches", "expected"),
+    [
+        (
+            "dev/v0.4.7",
+            {
+                "dev/v0.4.7": "a" * 40,
+                "dev/v0.4.8": "b" * 40,
+                "dev/v0.5.0": "c" * 40,
+                "release/v0.4.9": "d" * 40,
+            },
+            "dev/v0.4.8",
+        ),
+        ("dev/v0.4.8", {"dev/v0.4.7": "a" * 40}, None),
+        ("dev/v1", {"dev/v1.0.1": "a" * 40}, None),
+    ],
+)
+def test_newer_development_branch_is_limited_to_the_same_remote_patch_series(
+    configured: str, branches: dict[str, str], expected: str | None
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+
+    assert workflow["newer_development_branch"](configured, branches) == expected
+
+
+def test_stale_integration_branch_warning_uses_remote_state_without_rewriting(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v0.4.7", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_remote_branch_heads=lambda: {
+            "dev/v0.4.7": "a" * 40,
+            "dev/v0.4.8": "b" * 40,
+        }
+    )
+    findings: list[tuple[str, str, str]] = []
+    monkeypatch.setitem(
+        workflow["warn_if_stale_integration_branch"].__globals__,
+        "emit_finding",
+        lambda category, message, *, status: findings.append(
+            (category, message, status)
+        ),
+    )
+
+    workflow["warn_if_stale_integration_branch"](config, repo)
+
+    assert len(findings) == 1
+    assert findings[0][0::2] == ("git", "warning")
+    assert "dev/v0.4.7" in findings[0][1]
+    assert "dev/v0.4.8" in findings[0][1]
+    assert "will not change it automatically" in findings[0][1]
+    assert capsys.readouterr().out == f"WARN: {findings[0][1]}\n"
+
+
 def test_outline_step_logs_terminal_progress_without_replacing_events(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
