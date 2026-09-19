@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from purplemux_client import GitRepository, MutationOutcomeUnknown, WorkerFailure
+from purplemux_client import (
+    GitRepository,
+    MutationOutcomeUnknown,
+    WorkerFailure,
+    agent_commit_coauthor,
+)
 from purplemux_client.git import (
     _QuiescentMutationTimeout,
     _run_git_mutation_process_group,
@@ -40,6 +45,13 @@ def test_inspect_github_repository_resolves_nested_directory(tmp_path: Path) -> 
 
     assert identity.slug == "acme/widgets"
     assert identity.url == "https://github.com/acme/widgets"
+
+
+def test_agent_commit_coauthor_is_the_normalized_identity_source() -> None:
+    assert agent_commit_coauthor("codex") == "Codex <noreply@openai.com>"
+    assert agent_commit_coauthor("claude") == "Claude <noreply@anthropic.com>"
+    with pytest.raises(ValueError, match="codex or claude"):
+        agent_commit_coauthor("other")
 
 
 @pytest.mark.parametrize(

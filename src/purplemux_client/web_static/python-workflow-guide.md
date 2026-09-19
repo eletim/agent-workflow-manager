@@ -193,12 +193,14 @@ a unique `awm-run/...` local branch. Recovery inspects logical and prior-run
 private refs, selects their single furthest descendant of the exact authoritative
 base, and fails closed if safe candidates diverge. A recovered commit can satisfy
 an unchanged agent turn; otherwise require the CodingAgent's new commit and clean
-worktree with `require_committed_result()`. Use `ensure_pushed()` to complete
-delivery through the logical remote branch name. It creates an absent branch or
-fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
-Workflow must then create or reuse and verify the exact Draft PR before starting
-review. Push and PR creation may be agent conveniences, but are not CodingAgent
-hard postconditions.
+worktree with `require_committed_result(..., expected_agent="codex")` (or
+`"claude"`). `agent_commit_coauthor()` supplies the same normalized co-author
+identity to the prompt that this postcondition verifies. Use `ensure_pushed()` to
+complete delivery through the logical remote branch name. It creates an absent
+branch or fast-forwards a behind branch only; remote-ahead and divergence fail
+closed. The Workflow must then create or reuse and verify the exact Draft PR
+before starting review. Push and PR creation may be agent conveniences, but are
+not CodingAgent hard postconditions.
 
 The workflow process itself runs in a PurpleMux Bash tab from a stable
 Runner-controlled directory;
@@ -609,8 +611,9 @@ repo.require_clean() -> None
 repo.require_current_branch(branch) -> BranchState
 repo.require_pushed(branch) -> BranchState
 repo.require_committed_result(
-    branch, *, previous_sha, allow_unchanged=False
+    branch, *, previous_sha, allow_unchanged=False, expected_agent=None
 ) -> BranchState
+agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```

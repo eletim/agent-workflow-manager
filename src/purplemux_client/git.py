@@ -22,6 +22,18 @@ from purplemux_client.operations import (
 )
 
 _OBJECT_ID_RE = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+_AGENT_COMMIT_COAUTHORS = {
+    "codex": "Codex <noreply@openai.com>",
+    "claude": "Claude <noreply@anthropic.com>",
+}
+
+
+def agent_commit_coauthor(agent: str) -> str:
+    """Return the normalized co-author identity for a supported coding agent."""
+    try:
+        return _AGENT_COMMIT_COAUTHORS[agent]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("agent must be codex or claude") from exc
 
 
 class GitCommandRunner(Protocol):
@@ -411,8 +423,8 @@ class GitRepository:
     ) -> BranchState:
         """Require a clean committed result on the current logical branch."""
         self._validate_sha(previous_sha)
-        if expected_agent is not None and expected_agent not in {"codex", "claude"}:
-            raise ValueError("expected_agent must be codex or claude")
+        if expected_agent is not None:
+            agent_commit_coauthor(expected_agent)
         self.require_clean()
         state = self.require_current_branch(branch)
         if state.local_sha is None:
@@ -439,10 +451,7 @@ class GitRepository:
     def _require_agent_commit_provenance(
         self, previous_sha: str, current_sha: str, expected_agent: str
     ) -> None:
-        coauthor = {
-            "codex": "Codex <noreply@openai.com>",
-            "claude": "Claude <noreply@anthropic.com>",
-        }[expected_agent]
+        coauthor = agent_commit_coauthor(expected_agent)
         commits = self._read(
             ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
         )

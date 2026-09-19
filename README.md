@@ -355,6 +355,7 @@ turn_start_sha = feature.local_sha
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
+    expected_agent="codex",
 )
 # Push is also orchestration-owned gap absorption if the agent omitted it. This
 # only creates the exact remote branch or fast-forwards it; remote-ahead or

@@ -85,3 +85,11 @@ def test_guide_keeps_agent_context_role_minimal_and_decisions_durable() -> None:
     assert "managed Review audit sections on child and Base PRs" in guide
     assert "durable GitHub decision record" in guide
     assert "only the context and recorded decisions needed for that role" in guide
+
+
+def test_guide_documents_agent_provenance_verification() -> None:
+    guide = GUIDE.read_text(encoding="utf-8")
+
+    assert 'require_committed_result(..., expected_agent="codex")' in guide
+    assert "`agent_commit_coauthor()` supplies the same normalized co-author" in guide
+    assert "expected_agent=None" in guide

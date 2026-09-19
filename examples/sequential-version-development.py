@@ -31,6 +31,7 @@ from purplemux_client import (
     ShellCommandRequest,
     WorkerFailure,
     WorkerInterrupted,
+    agent_commit_coauthor,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -84,10 +85,6 @@ IMPLEMENTATION_PRINCIPLE = (
     "reduced code size by mixing responsibilities unnaturally or by "
     "over-generalizing distinct behavior into shared abstractions."
 )
-AGENT_COAUTHORS = {
-    "codex": "Codex <noreply@openai.com>",
-    "claude": "Claude <noreply@anthropic.com>",
-}
 REVIEWER_CHECKOUT_GUARD = (
     "Never change the checkout: do not run git checkout, git switch, git restore, "
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
@@ -714,7 +711,7 @@ def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
     """Add the shared change-boundary policy to an implementation turn."""
     if process not in {"implementation", "reviewer-fix", "cleanup", "recovery"}:
         raise ValueError(f"unsupported implementation process: {process!r}")
-    coauthor = AGENT_COAUTHORS[IMPLEMENTER_AGENT]
+    coauthor = agent_commit_coauthor(IMPLEMENTER_AGENT)
     return (
         f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "

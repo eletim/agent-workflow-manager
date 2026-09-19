@@ -2457,6 +2457,7 @@ def test_generated_workflow_selects_role_specific_agents(
 def test_generated_workflow_requires_agent_commit_provenance(
     agent: str, coauthor: str
 ) -> None:
+    source = generate_issue_driven_workflow(parse(payload(implementer_agent=agent)))
     workflow = load_generated_workflow(implementer_agent=agent)
 
     implementation = workflow["implementer_prompt"]("Implement it.")
@@ -2469,6 +2470,8 @@ def test_generated_workflow_requires_agent_commit_provenance(
         assert f"AWM-Agent: {agent}" in prompt
     assert "AWM-Process: implementation" in implementation
     assert "AWM-Process: reviewer-fix" in reviewer_fix
+    assert "agent_commit_coauthor(IMPLEMENTER_AGENT)" in source
+    assert "AGENT_COAUTHORS" not in source
 
 
 def test_generated_workflow_routes_every_agent_session_by_role() -> None:
