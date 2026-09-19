@@ -781,6 +781,9 @@ _RAW_REVIEW_OUTPUT = re.compile(
 )
 _OPAQUE_SECRET_LIKE_VALUE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_./+=-]{32,}")
 _PERSISTENCE_SAFE_REVIEW_TEXT = re.compile(r"^[^\x00-\x1f\x7f<>{}`=]+$")
+_PLANNER_LOW_LEVEL_TEXT = re.compile(
+    r"(?i)(?:^|[ \t])(?:user|assistant|system|developer|tool|stdout|stderr)\s*:"
+)
 
 
 def _safe_review_text(value: object, *, max_bytes: int) -> bool:
@@ -3084,6 +3087,8 @@ its purpose and any non-negotiable design decision, while leaving implementation
 detail to the implementer. Do not create GitHub Issues or implement the source
 Issue as one undivided work item. Numeric Issue additions are invalid in one-shot
 mode. Do not include stdout or agent conversation logs in tasks or rationale.
+Tasks, rationale, and skip reasons that will be published must be concise
+single-line summaries, never copied stdout, stderr, or conversation transcripts.
 
 """
     decision_keys = (
@@ -3164,7 +3169,13 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
 
 def planner_text_is_publishable(value: str) -> bool:
     return (
-        _RAW_REVIEW_OUTPUT.search(value) is None
+        value.splitlines() == [value]
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F for character in value
+        )
+        and "```" not in value
+        and _PLANNER_LOW_LEVEL_TEXT.search(value) is None
+        and _RAW_REVIEW_OUTPUT.search(value) is None
         and _SENSITIVE_REVIEW_TEXT.search(value) is None
         and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
     )
@@ -3245,10 +3256,11 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
     ):
         raise WorkerFailure("planner decision has invalid bounded values")
-    if plan.config.one_shot_issue is not None and not _safe_review_text(
-        rationale, max_bytes=MAX_PLANNER_RATIONALE_BYTES
-    ):
-        raise WorkerFailure("planner rationale is invalid or unsafe")
+    if plan.config.one_shot_issue is not None:
+        if not _safe_review_text(
+            rationale, max_bytes=MAX_PLANNER_RATIONALE_BYTES
+        ) or not planner_text_is_publishable(rationale):
+            raise WorkerFailure("planner rationale is invalid or unsafe")
     for conflict in policy_conflicts:
         conflict_has_surrogate = isinstance(conflict, str) and any(
             0xD800 <= ord(character) <= 0xDFFF for character in conflict

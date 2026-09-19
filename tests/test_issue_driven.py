@@ -1111,6 +1111,7 @@ def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() 
     assert "short inline mini tasks" in code
     assert "Do not create GitHub Issues" in code
     assert "rationale must be a concise single-line explanation" in code
+    assert "never copied stdout, stderr, or conversation transcripts" in code
     assert "github.create_issue_comment(" in code
     assert "one_shot_issue" in code
     assert "One-shot source Issue:" in code
@@ -1313,6 +1314,9 @@ def test_one_shot_planner_skip_retains_the_same_authoritative_reason() -> None:
         "Use API token: secret123 while updating the client.",
         "Investigate this output: Traceback (most recent call last): failure",
         "Replace opaque value abcdefghijklmnopqrstuvwxyz1234567890.",
+        "collected 12 items\n12 passed in 0.21s",
+        "User: Show the current plan. Assistant: Here is the complete plan.",
+        "stdout: build completed successfully",
     ],
 )
 @pytest.mark.parametrize("action_kind", ["add", "update"])
@@ -1397,6 +1401,9 @@ def test_one_shot_planner_revalidates_recovered_task_text() -> None:
         "Skipped after finding API token: secret123 in the requirement.",
         "Traceback (most recent call last): task is obsolete.",
         "Duplicate of abcdefghijklmnopqrstuvwxyz1234567890.",
+        "collected 12 items\n12 passed in 0.21s",
+        "User: Is this obsolete? Assistant: Yes, skip it.",
+        "stderr: no matching tests were collected",
     ],
 )
 def test_one_shot_planner_rejects_unpublishable_skip_reason_transactionally(
@@ -1437,6 +1444,46 @@ def test_one_shot_planner_rejects_unpublishable_skip_reason_transactionally(
 
     assert plan.snapshot == original
     assert plan.skipped == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_rationale",
+    [
+        "User: Why this plan? Assistant: It isolates the remaining work.",
+        "stdout: planning completed successfully",
+    ],
+)
+def test_one_shot_planner_rejects_low_level_rationale(
+    unsafe_rationale: str,
+) -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    plan = workflow["WorkItemPlan"](config)
+
+    with pytest.raises(WorkerFailure, match="rationale is invalid or unsafe"):
+        workflow["apply_planner_decision"](
+            plan,
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "add",
+                            "item": {
+                                "id": "publishable-task",
+                                "task": "Implement the focused behavior.",
+                            },
+                        }
+                    ],
+                    "complete": False,
+                    "policy_conflicts": [],
+                    "rationale": unsafe_rationale,
+                }
+            ),
+        )
+
+    assert plan.snapshot == ()
 
 
 def test_one_shot_planning_comment_keeps_validated_task_text() -> None:
