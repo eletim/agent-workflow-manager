@@ -658,6 +658,9 @@ The supported GitHub inspections and mutations are:
 
 ```python
 github.find_pr(*, head, base, state) -> PullRequestState | None
+github.compare_commits(*, base_sha, head_sha) -> Literal[
+    "ahead", "behind", "diverged", "identical"
+]
 github.require_pr(
     *, head, base, number=None, state="OPEN", expected_head_sha=None,
     expected_base_sha=None, draft=None
@@ -683,7 +686,9 @@ github.merge_pr(
 ) -> MergeResult
 ```
 
-`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
+`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`.
+`compare_commits()` checks the relationship between two exact authoritative
+GitHub commit IDs without changing repository state. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
 `create_issue_comment()` appends one correlation-marked Issue comment and
