@@ -169,3 +169,14 @@ def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
     assert ".output-panel { min-width: 0; }" in styles
     assert 'id="issue-summary-panel"' in INDEX.read_text(encoding="utf-8")
     assert "grid-template-columns: 20px minmax(0, 1fr)" in styles
+
+
+def test_directory_picker_contains_scrolling_to_its_list() -> None:
+    styles = STYLES.read_text(encoding="utf-8")
+
+    assert "body.directory-picker-open { overflow: hidden; }" in styles
+    assert ".directory-picker-dialog[open]" in styles
+    assert "grid-template-rows: auto auto minmax(0, 1fr) auto" in styles
+    assert "max-height: calc(100dvh - 32px)" in styles
+    assert ".directory-picker-list" in styles
+    assert "overflow-y: auto" in styles

@@ -8,6 +8,7 @@
 * { box-sizing: border-box; }
 html, body { max-width: 100%; overflow-x: hidden; overflow-x: clip; }
 body { margin: 0; }
+body.directory-picker-open { overflow: hidden; }
 main { width: min(1100px, calc(100% - 40px)); min-width: 0; margin: 32px auto; }
 
 header, .controls, .header-actions, .guide-toolbar, .guide-actions,
@@ -457,7 +458,13 @@ dialog {
 }
 dialog::backdrop { background: rgb(5 7 11 / 75%); }
 .directory-picker-dialog {
-  height: min(620px, calc(100% - 32px));
+  height: min(620px, calc(100dvh - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+}
+.directory-picker-dialog[open] {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 .directory-picker-toolbar, .directory-picker-navigation,
 .directory-picker-actions {
@@ -483,7 +490,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   display: grid;
   align-content: start;
   gap: 6px;
-  height: calc(100% - 174px);
+  min-height: 0;
   padding: 0 16px;
   overflow-y: auto;
 }
@@ -612,7 +619,6 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .guide-toolbar, .directory-picker-toolbar { align-items: flex-start; }
   .guide-actions { flex-wrap: wrap; justify-content: flex-end; }
   .directory-picker-navigation { align-items: stretch; flex-direction: column; }
-  .directory-picker-list { height: calc(100% - 220px); }
   .directory-picker-actions button { width: 100%; }
   .settings-heading { align-items: flex-start; }
   .mobile-connection { align-items: flex-start; flex-direction: column; }
