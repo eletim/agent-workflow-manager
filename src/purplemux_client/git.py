@@ -455,19 +455,47 @@ class GitRepository:
                 f"{previous_sha}"
             )
         if expected_agent is not None and expected_process is not None:
-            self._require_agent_commit_provenance(
-                previous_sha, state.local_sha, expected_agent, expected_process
+            self.require_agent_commit_provenance(
+                previous_sha,
+                state.local_sha,
+                expected_agent=expected_agent,
+                expected_process=expected_process,
             )
         return state
 
-    def _require_agent_commit_provenance(
+    def require_agent_commit_provenance(
         self,
         previous_sha: str,
         current_sha: str,
+        *,
         expected_agent: str,
         expected_process: str,
+        allow_unchanged: bool = False,
     ) -> None:
+        """Verify agent trailers on one exact, immutable commit range."""
+        self._validate_sha(previous_sha)
+        self._validate_sha(current_sha)
         coauthor = agent_commit_coauthor(expected_agent)
+        if expected_process not in {
+            "implementation",
+            "reviewer-fix",
+            "cleanup",
+            "recovery",
+        }:
+            raise ValueError("expected_process is not a supported agent process")
+        if current_sha == previous_sha:
+            if allow_unchanged:
+                return
+            raise WorkerFailure("agent turn produced no new commit")
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._has_commit(current_sha):
+            raise WorkerFailure(f"current commit {current_sha} is not available")
+        if not self._is_ancestor(previous_sha, current_sha):
+            raise WorkerFailure(
+                f"commit {current_sha} does not descend from pre-turn commit "
+                f"{previous_sha}"
+            )
         commits = self._read(
             ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
         )

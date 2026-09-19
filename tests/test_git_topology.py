@@ -395,6 +395,53 @@ def test_committed_result_requires_the_expected_process(
         )
 
 
+def test_agent_provenance_verifies_exact_turn_ranges(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/process-boundaries"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "implementation",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\n"
+        "AWM-Process: implementation",
+    )
+    implementation = git(work, "rev-parse", "HEAD")
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "cleanup",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\n"
+        "AWM-Process: cleanup",
+    )
+    cleanup = git(work, "rev-parse", "HEAD")
+
+    repo.require_agent_commit_provenance(
+        base,
+        implementation,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+    repo.require_agent_commit_provenance(
+        implementation,
+        cleanup,
+        expected_agent="codex",
+        expected_process="cleanup",
+    )
+
+
 def test_committed_result_requires_agent_and_process_together(
     repositories: tuple[Path, Path, Path],
 ) -> None:

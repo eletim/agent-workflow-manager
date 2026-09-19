@@ -615,6 +615,10 @@ repo.require_committed_result(
     branch, *, previous_sha, allow_unchanged=False,
     expected_agent=None, expected_process=None
 ) -> BranchState
+repo.require_agent_commit_provenance(
+    previous_sha, current_sha, *, expected_agent, expected_process,
+    allow_unchanged=False
+) -> None
 agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None

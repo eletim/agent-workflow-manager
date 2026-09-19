@@ -2053,7 +2053,9 @@ def require_agent_result(
     iteration: int | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
-    repo.require_current_branch(branch)
+    post_turn = repo.require_current_branch(branch)
+    if post_turn.local_sha is None:
+        raise WorkerFailure(f"local branch {branch!r} does not exist")
     require_clean_worktree(
         repo,
         client,
@@ -2065,11 +2067,23 @@ def require_agent_result(
     result = repo.require_committed_result(
         branch,
         previous_sha=previous_sha,
-        allow_unchanged=allow_unchanged,
-        expected_agent=IMPLEMENTER_AGENT,
-        expected_process=expected_process,
+        allow_unchanged=True,
     )
     assert result.local_sha is not None
+    repo.require_agent_commit_provenance(
+        previous_sha,
+        post_turn.local_sha,
+        expected_agent=IMPLEMENTER_AGENT,
+        expected_process=expected_process,
+        allow_unchanged=allow_unchanged,
+    )
+    if result.local_sha != post_turn.local_sha:
+        repo.require_agent_commit_provenance(
+            post_turn.local_sha,
+            result.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process="cleanup",
+        )
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
     return result.local_sha, result.local_sha != previous_sha
 

@@ -1797,13 +1797,15 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
             *,
             previous_sha: str,
             allow_unchanged: bool,
-            expected_agent: str,
-            expected_process: str,
         ) -> BranchState:
-            assert expected_agent == "codex"
-            assert expected_process in {"implementation", "cleanup"}
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["expected_process"] in {"implementation", "cleanup"}
 
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
@@ -1878,6 +1880,85 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
 
 
+def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["require_agent_result"].__globals__
+    branch = "feature/process-boundaries"
+    previous_sha = "previous"
+    primary_sha = "primary"
+    cleanup_sha = "cleanup"
+    provenance: list[tuple[str, str, dict[str, object]]] = []
+
+    class Repository:
+        def __init__(self) -> None:
+            self.local_sha = primary_sha
+            self.dirty = True
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                dirty=self.dirty,
+                current_branch=branch,
+                status=(" M pending.py",) if self.dirty else (),
+            )
+
+        def require_committed_result(
+            self, current: str, *, previous_sha: str, allow_unchanged: bool
+        ) -> BranchState:
+            assert (current, previous_sha, allow_unchanged) == (
+                branch,
+                "previous",
+                True,
+            )
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end, kwargs))
+
+    repository = Repository()
+
+    def clean(*args: object, **kwargs: object) -> str:
+        repository.local_sha = cleanup_sha
+        repository.dirty = False
+        return "cleaned"
+
+    monkeypatch.setitem(globals_, "run_turn", clean)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    assert workflow["require_agent_result"](
+        repository,
+        object(),
+        "tab",
+        branch,
+        previous_sha,
+        allow_unchanged=True,
+        expected_process="reviewer-fix",
+    ) == (cleanup_sha, True)
+    assert provenance == [
+        (
+            previous_sha,
+            primary_sha,
+            {
+                "expected_agent": "codex",
+                "expected_process": "reviewer-fix",
+                "allow_unchanged": True,
+            },
+        ),
+        (
+            primary_sha,
+            cleanup_sha,
+            {"expected_agent": "codex", "expected_process": "cleanup"},
+        ),
+    ]
+
+
 def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1911,15 +1992,17 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             *,
             previous_sha: str,
             allow_unchanged: bool,
-            expected_agent: str,
-            expected_process: str,
         ) -> BranchState:
-            assert expected_agent == "codex"
-            assert expected_process in {"implementation", "cleanup"}
             events.append(f"commit:{self.local_sha}")
             assert branch == issue.branch
             assert self.local_sha != previous_sha or allow_unchanged
             return BranchState(branch, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["expected_process"] in {"implementation", "cleanup"}
 
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
@@ -4150,13 +4233,15 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             *,
             previous_sha: str,
             allow_unchanged: bool,
-            expected_agent: str,
-            expected_process: str,
         ) -> BranchState:
-            assert expected_agent == "codex"
-            assert expected_process == "cleanup"
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["expected_process"] == "cleanup"
 
         def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")
