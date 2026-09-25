@@ -1505,6 +1505,98 @@ test("rejected Issue Driven Run keeps its backend planned preview", async () => 
   assert.equal(elements.validation.children[0].textContent, "Line 1: rejected");
 });
 
+test("Issue Driven edits invalidate pending Validate and Dry Run renders", async () => {
+  const delayedValidation = deferred();
+  const delayedDryRun = deferred();
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Reviewer", agent: "codex", purpose: "Reviews changes."}],
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode: "# generated", issueDrivenValidation: [], runPreview});
+      }
+      if (url === "/api/validate") return delayedValidation.promise;
+      if (url === "/api/dry-run") return delayedDryRun.promise;
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[90]}';
+  const pendingValidation = elements.validate.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["issue-driven-json"].value = '{"issues":[91]}';
+  await elements["issue-driven-json"].dispatch("input");
+  delayedValidation.resolve(response({validation: [], outline: ["stale validation"]}));
+  await pendingValidation;
+  assert.equal(elements["outline-panel"].hidden, true);
+
+  const pendingDryRun = elements["dry-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["issue-driven-json"].value = '{"issues":[92]}';
+  await elements["issue-driven-json"].dispatch("input");
+  delayedDryRun.resolve(response({
+    validation: [],
+    outline: ["stale dry run"],
+    dryRun: {status: "complete", findings: [], nextMutation: null},
+  }));
+  await pendingDryRun;
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["dry-run-panel"].hidden, true);
+});
+
+test("unchanged Issue Driven draft restores its backend planned preview", async () => {
+  const source = JSON.stringify({
+    mode: "issue-driven",
+    repository: "/work/repository",
+    issues: [90],
+  });
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Implementer", agent: "codex", purpose: "Implements changes."}],
+  };
+  const viewedRun = snapshot({
+    runId: 1,
+    mode: "issue-driven",
+    issueDrivenJson: source,
+    executionContext: {sourceRepository: "/work/repository"},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", mode: "issue-driven"}],
+    details: {1: viewedRun},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode: "# generated", issueDrivenValidation: [], runPreview});
+      }
+      return undefined;
+    },
+  });
+
+  await elements["new-run"].dispatch("click");
+  elements["issue-driven-json"].value = source;
+  await elements["issue-driven-json"].dispatch("input");
+  await elements["issue-driven-generate"].dispatch("click");
+  await elements["workflow-mode"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["issue-driven-python"].value, "# generated");
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+  assert.equal(elements["outline-agents"].children[0].textContent, "Implementer (codex)");
+});
+
 test("failed Issue Driven run previews immutable settings and resumes as a new run", async () => {
   const source = '{\n  "mode": "issue-driven",\n  "one_shot_issue": 196\n}';
   const failed = snapshot({
