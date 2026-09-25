@@ -3845,6 +3845,18 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     }
     ast.parse(generated["generatedCode"])
 
+    status, without_final_review = request(
+        address,
+        "POST",
+        "/api/issue-driven/generate",
+        json.dumps({"json": json.dumps({**json.loads(source), "final_review": False})}),
+        token=token,
+    )
+    assert status == 200
+    reviewer_purpose = without_final_review["runPreview"]["agents"][1]["purpose"]
+    assert "whole-version review" not in reviewer_purpose
+    assert reviewer_purpose.endswith("delivery handoff.")
+
     status, mismatch = request(
         address,
         "POST",

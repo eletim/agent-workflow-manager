@@ -1503,6 +1503,12 @@ def issue_driven_workflow_outline(config: IssueDrivenConfig) -> tuple[str, ...]:
 
 def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview:
     """Describe the generated run without predicting its eventual execution."""
+    reviewer_purpose = "Plans work items, independently reviews scope and correctness, "
+    reviewer_purpose += (
+        "and prepares whole-version review and handoff."
+        if config.final_review
+        else "and prepares delivery handoff."
+    )
     return IssueDrivenRunPreview(
         phases=issue_driven_workflow_outline(config),
         agents=(
@@ -1517,10 +1523,7 @@ def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview
             IssueDrivenAgentPurpose(
                 role="Reviewer",
                 agent=config.reviewer_agent,
-                purpose=(
-                    "Plans work items, independently reviews scope and correctness, "
-                    "and prepares whole-version review and handoff."
-                ),
+                purpose=reviewer_purpose,
             ),
         ),
     )

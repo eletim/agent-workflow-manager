@@ -1292,6 +1292,12 @@ function renderOutline(labels, events, plannedPreview = null) {
   }
 }
 
+function currentPlannedRunPreview() {
+  return activeRunId === null && currentMode === "issue-driven"
+    ? issueDrivenRunPreview
+    : null;
+}
+
 function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips = []) {
   const latest = new Map();
   for (const event of events) {
@@ -2240,7 +2246,11 @@ runButton.addEventListener("click", async () => {
           && activeRunId === null
         ) {
           renderValidation(error.result.validation);
-          renderOutline(error.result.outline || [], []);
+          renderOutline(
+            error.result.outline || [],
+            [],
+            currentPlannedRunPreview(),
+          );
         }
       } else if (selectionGeneration === activeRunGeneration) {
         stderr.textContent = String(error);
@@ -2294,7 +2304,7 @@ validateButton.addEventListener("click", async () => {
         renderOutline(
           result.outline || [],
           [],
-          currentMode === "issue-driven" ? issueDrivenRunPreview : null,
+          currentPlannedRunPreview(),
         );
       }
     } catch (error) {
@@ -2308,7 +2318,7 @@ validateButton.addEventListener("click", async () => {
         renderOutline(
           error.result.outline || [],
           [],
-          currentMode === "issue-driven" ? issueDrivenRunPreview : null,
+          currentPlannedRunPreview(),
         );
       } else if (
         requestGeneration === validationRequestGeneration
@@ -2334,13 +2344,18 @@ dryRunButton.addEventListener("click", async () => {
       });
       if (selectionGeneration === activeRunGeneration && activeRunId === null) {
         renderValidation(result.validation || []);
-        renderOutline(result.outline || [], []);
+        renderOutline(result.outline || [], [], currentPlannedRunPreview());
         renderDryRun(result);
       }
     } catch (error) {
       if (selectionGeneration === activeRunGeneration && activeRunId === null) {
         if (error.result) {
           renderValidation(error.result.validation || []);
+          renderOutline(
+            error.result.outline || [],
+            [],
+            currentPlannedRunPreview(),
+          );
           renderDryRun(error.result);
         } else {
           stderr.textContent = String(error);

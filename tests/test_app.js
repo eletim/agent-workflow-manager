@@ -1414,6 +1414,11 @@ test("non-Run async actions use the same pending feedback", async () => {
 
 test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async () => {
   const generatedCode = "WORKFLOW_DRY_RUN = 1\nprint('generated')";
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Implementer", agent: "codex", purpose: "Implements changes."}],
+  };
   const submissions = [];
   const started = snapshot({
     runId: 12,
@@ -1427,13 +1432,13 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
     validation: {body: {}, status: 200},
     fetchOverride(url, options) {
       if (url === "/api/issue-driven/generate") {
-        return response({generatedCode, issueDrivenValidation: []});
+        return response({generatedCode, issueDrivenValidation: [], runPreview});
       }
       if (url === "/api/dry-run") {
         submissions.push([url, JSON.parse(options.body)]);
         return response({
           validation: [],
-          outline: [],
+          outline: ["Work items"],
           dryRun: {status: "complete", findings: [], nextMutation: null},
         });
       }
@@ -1448,6 +1453,9 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
   await elements["issue-driven-mode"].dispatch("click");
   elements["issue-driven-json"].value = "{}";
   await elements["dry-run"].dispatch("click");
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+  assert.equal(elements["outline-agents"].children[0].textContent, "Implementer (codex)");
   await elements.run.dispatch("click");
 
   assert.deepEqual(submissions, [
@@ -1458,6 +1466,43 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
   assert.equal(elements.run.dataset.pending, undefined);
   assert.equal(elements.run.getAttribute("aria-busy"), undefined);
   assert.equal(elements.run.disabled, true);
+});
+
+test("rejected Issue Driven Run keeps its backend planned preview", async () => {
+  const generatedCode = "WORKFLOW_OUTLINE = ['Work items']";
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Reviewer", agent: "claude", purpose: "Reviews changes."}],
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode, issueDrivenValidation: [], runPreview});
+      }
+      if (url === "/api/run") {
+        return response({
+          error: "workflow validation failed",
+          validation: [{line: 1, message: "rejected"}],
+          outline: ["Work items"],
+        }, 422);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = "{}";
+  await elements.run.dispatch("click");
+
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+  assert.equal(elements["outline-agents"].children[0].textContent, "Reviewer (claude)");
+  assert.equal(elements.validation.children[0].textContent, "Line 1: rejected");
 });
 
 test("failed Issue Driven run previews immutable settings and resumes as a new run", async () => {
