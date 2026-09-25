@@ -248,7 +248,7 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "prompt-fields",
     "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
     "review-result-panel", "review-result-status", "review-result-json",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
@@ -796,6 +796,25 @@ test("Settings opens Notifications repeatedly without losing form state", async 
   await elements["settings-open"].dispatch("click");
   assert.equal(elements["settings-dialog"].open, true);
   assert.equal(elements["notify-topic"].value, "edited-topic");
+});
+
+test("Issue Driven is the default draft and developer modes remain available", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["issue-driven-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
+  assert.equal(elements["developer-views"].open, false);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+
+  await elements["workflow-mode"].dispatch("click");
+
+  assert.equal(elements["workflow-fields"].hidden, false);
+  assert.equal(elements["developer-views"].open, true);
 });
 
 test("Settings shows the configured remote URL and its QR code", async () => {
@@ -1368,6 +1387,8 @@ test("Run pending feedback clears after failure and permits a retry", async () =
     },
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   const pendingRun = elements.run.dispatch("click");
   assert.equal(elements.run.disabled, true);
   assert.equal(elements.run.dataset.pending, "true");
@@ -1903,6 +1924,8 @@ test("Dry Run renders topology findings and the first mutation frontier", async 
       return undefined;
     },
   });
+
+  await elements["workflow-mode"].dispatch("click");
 
   await elements["dry-run"].dispatch("click");
 
@@ -2734,6 +2757,8 @@ test("validation displays a valid draft outline before execution", async () => {
     },
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   assert.equal(elements["outline-panel"].hidden, true);
   await elements.validate.dispatch("click");
 
@@ -2931,6 +2956,8 @@ test("successful validation is explicit when no run exists", async () => {
     validation: {status: 200, body: {validation: []}},
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   assert.equal(elements["validation-panel"].hidden, true);
 
   await elements.validate.dispatch("click");
@@ -2958,6 +2985,8 @@ test("validation issues replace success feedback", async () => {
       }, 422);
     },
   });
+
+  await elements["workflow-mode"].dispatch("click");
 
   await elements.validate.dispatch("click");
   assert.equal(elements["validation-success"].hidden, false);
@@ -3701,6 +3730,8 @@ test("Workflow, Prompt, and Issue Driven drafts survive run selection independen
     validation: {status: 200, body: {validation: []}},
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   elements["run-arguments"].value = "workflow draft";
   elements.code.value = "print('workflow draft')";
   await elements["prompt-mode"].dispatch("click");
@@ -3962,6 +3993,8 @@ test("an SSE-discovered run cannot supersede a pending Run action", async () => 
     },
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   elements.code.value = "print('mine')";
   const submission = elements.run.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
@@ -4019,7 +4052,7 @@ test("edits made while Run is pending remain in the retained draft", async () =>
   assert.equal(elements.code.value, "print('after')");
 });
 
-test("a run auto-selected via SSE while drafting captures in-progress edits first", async () => {
+test("a run auto-selected via SSE captures the default Issue Driven draft first", async () => {
   const runs = [];
   const details = {};
   const {elements, eventSource} = await loadApp({
@@ -4029,8 +4062,8 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   });
 
   // No runs exist yet, so the fields hold an untouched draft nobody submitted.
-  elements["run-arguments"].value = "in-progress-arg";
-  elements.code.value = "print('in progress')";
+  elements["issue-driven-json"].value = '{"issues":[321]}';
+  elements["issue-driven-python"].value = "# generated in progress";
 
   // Another session starts a run concurrently; this client only learns about
   // it through the next SSE-triggered refresh, not through any explicit
@@ -4045,8 +4078,9 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
 
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["run-arguments"].value, "in-progress-arg");
-  assert.equal(elements.code.value, "print('in progress')");
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["issue-driven-json"].value, '{"issues":[321]}');
+  assert.equal(elements["issue-driven-python"].value, "# generated in progress");
 });
 
 test("completed Workflow runs expose explicit Cleanup and retain their history", async () => {

@@ -5,6 +5,7 @@ const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
 const reviewModeButton = document.querySelector("#review-mode");
 const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
+const developerViews = document.querySelector("#developer-views");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
 const reviewFields = document.querySelector("#review-fields");
@@ -153,7 +154,7 @@ let activeGuide = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
-let currentMode = "workflow";
+let currentMode = "issue-driven";
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
@@ -434,10 +435,13 @@ function applyModeVisibility() {
   recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
-  issueDrivenModeButton.className = issueDrivenMode ? "selected" : "";
+  issueDrivenModeButton.className = issueDrivenMode
+    ? "issue-driven-entry selected"
+    : "issue-driven-entry";
   reviewModeButton.className = reviewMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
+  if (!issueDrivenMode) developerViews.open = true;
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
   reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
@@ -594,9 +598,11 @@ function renderRun(result) {
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
-  currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
-    ? result.mode
-    : "workflow";
+  if (result.runId != null) {
+    currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
+      ? result.mode
+      : "workflow";
+  }
   const running = result.state === "running";
   const presentation = runPresentation(result);
   statusBadge.textContent = presentation.label;
