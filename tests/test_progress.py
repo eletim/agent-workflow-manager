@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 
 import pytest
 
 from purplemux_client import (
+    emit_agent_turn,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -57,6 +59,44 @@ def test_emit_step_writes_one_json_event(monkeypatch: pytest.MonkeyPatch) -> Non
         "tab": "tab-1",
         "pr_number": 42,
         "pr_url": "https://github.com/example/repo/pull/42",
+    }
+
+
+def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    prompt = "目的を確認する。\n" + "actual prompt 🎯\n" * 500
+    try:
+        emit_agent_turn(
+            7, "Review the current head", "reviewer", 2, "started", prompt=prompt
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        chunks = [json.loads(line) for line in stream]
+
+    assert chunks
+    assert all(
+        len(
+            (
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode()
+        )
+        <= MAX_PROGRESS_EVENT_BYTES
+        for item in chunks
+    )
+    encoded = "".join(item["data"] for item in chunks)
+    payload = json.loads(base64.b64decode(encoded).decode())
+    assert payload == {
+        "turn_id": 7,
+        "purpose": "Review the current head",
+        "role": "reviewer",
+        "attempt": 2,
+        "status": "started",
+        "prompt": prompt,
     }
 
 

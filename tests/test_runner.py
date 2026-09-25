@@ -90,6 +90,66 @@ def test_simple_stdout(runner: PythonRunner) -> None:
     assert result.stderr == ""
 
 
+def test_issue_driven_agent_turn_trace_is_linked_and_survives_history(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    prompt = "inspect exactly\n" + "detail 🎯\n" * 600
+    result = "completed exactly\n" + "evidence\n" * 600
+    code = f"""\
+from purplemux_client import emit_agent_turn
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", prompt={prompt!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", result={result!r})
+emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", prompt="review prompt")
+emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent stopped")
+"""
+    try:
+        run_id = runner.start(code, issue_driven_json='{"mode":"issue-driven"}')
+        snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        trace = snapshot.as_json()["agentTurns"]
+        assert trace == [
+            {
+                "turnId": 1,
+                "purpose": "Implement the work item",
+                "prompt": prompt,
+                "role": "implementer",
+                "attempt": 1,
+                "status": "completed",
+                "result": result,
+                "error": None,
+                "previousTurnId": None,
+                "nextTurnId": 2,
+                "repository": None,
+                "startedAt": trace[0]["startedAt"],
+                "completedAt": trace[0]["completedAt"],
+            },
+            {
+                "turnId": 2,
+                "purpose": "Review the work item",
+                "prompt": "review prompt",
+                "role": "reviewer",
+                "attempt": 3,
+                "status": "failed",
+                "result": None,
+                "error": "agent stopped",
+                "previousTurnId": 1,
+                "nextTurnId": None,
+                "repository": None,
+                "startedAt": trace[1]["startedAt"],
+                "completedAt": trace[1]["completedAt"],
+            },
+        ]
+    finally:
+        runner.close()
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        assert restored.snapshot(run_id).as_json()["agentTurns"] == trace
+    finally:
+        restored.close()
+
+
 def test_obsolete_recovery_metadata_is_ignored(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2643,6 +2643,73 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
         assert prohibited in code
 
 
+def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    observed: list[tuple[object, ...]] = []
+    prompt = "Exact prompt with spacing.\n\nDo not reconstruct me. 🎯"
+
+    class Client:
+        workspace_id = "workspace-1"
+
+        def wait_until_ready(self, tab, timeout):
+            assert (tab, timeout) == ("tab-1", workflow["READY_TIMEOUT"])
+
+        def send_input(self, tab, sent_prompt):
+            assert tab == "tab-1"
+            assert sent_prompt == prompt
+            assert observed[-1][4] == "started"
+            assert observed[-1][-1] == {"prompt": prompt}
+
+        def wait_for_turn_completion(self, tab, timeout, *, on_busy_timeout):
+            assert (tab, timeout) == ("tab-1", workflow["TURN_TIMEOUT"])
+
+        def read_result(self, tab):
+            assert tab == "tab-1"
+            return "exact result"
+
+    workflow["emit_agent_turn"] = lambda *args, **kwargs: observed.append(
+        (*args, kwargs)
+    )
+
+    result = workflow["run_turn"](
+        Client(), "tab-1", "Implement the issue", prompt, role="implementer"
+    )
+
+    assert result == "exact result"
+    assert [event[4] for event in observed] == ["started", "completed"]
+    assert observed[1][-1] == {"result": "exact result"}
+
+
+def test_agent_turn_trace_failure_cannot_change_workflow_result() -> None:
+    workflow = load_generated_workflow(issues=[90])
+
+    class Client:
+        workspace_id = "workspace-1"
+
+        def wait_until_ready(self, *_args):
+            return None
+
+        def send_input(self, *_args):
+            return None
+
+        def wait_for_turn_completion(self, *_args, **_kwargs):
+            return None
+
+        def read_result(self, *_args):
+            return "authoritative result"
+
+    workflow["emit_agent_turn"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("observation unavailable")
+    )
+
+    assert (
+        workflow["run_turn"](
+            Client(), "tab-1", "Implement the issue", "prompt", role="implementer"
+        )
+        == "authoritative result"
+    )
+
+
 def load_generated_workflow(**overrides: object) -> dict[str, object]:
     value = payload(**overrides)
     if "one_shot_issue" in overrides or "work_items" in overrides:
@@ -2671,7 +2738,8 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
         agents.append((agent_type, name)) or f"recovery-{len(agents)}"
     )
 
-    def run_validated(client, agent, name, prompt, validator):
+    def run_validated(client, agent, name, prompt, validator, *, role):
+        assert role == "recovery"
         prompts.append(prompt)
         return "", validator(
             json.dumps(

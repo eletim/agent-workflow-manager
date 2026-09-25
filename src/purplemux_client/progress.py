@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import threading
@@ -26,6 +27,7 @@ RESOURCE_ACK_FD_ENV = "PURPLEMUX_RUNNER_RESOURCE_ACK_FD"
 EVENT_URL_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_URL"
 EVENT_TOKEN_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_TOKEN"
 MAX_PROGRESS_EVENT_BYTES = 4096
+_AGENT_TURN_CHUNK_CHARS = 2_400
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
 
@@ -74,6 +76,80 @@ def emit_step(
         if value is not None:
             event[key] = value
     _write_event(event, drop_oversized=True)
+
+
+def emit_agent_turn(
+    turn_id: int,
+    purpose: str,
+    role: str,
+    attempt: int,
+    status: Literal["started", "completed", "failed"],
+    *,
+    prompt: str | None = None,
+    result: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Publish one observation-only Issue Driven agent-turn transition.
+
+    Large prompts and results are transported in independently bounded chunks.
+    Delivery is best-effort like every other progress event and therefore can
+    never become workflow control state.
+    """
+    _validate_positive_number("turn_id", turn_id)
+    _validate_positive_number("attempt", attempt)
+    if not isinstance(purpose, str) or not purpose.strip():
+        raise ValueError("agent turn purpose must be a non-empty string")
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("agent turn role must be a non-empty string")
+    if status == "started":
+        if not isinstance(prompt, str) or result is not None or error is not None:
+            raise ValueError("a started agent turn requires only its exact prompt")
+    elif status == "completed":
+        if not isinstance(result, str) or prompt is not None or error is not None:
+            raise ValueError("a completed agent turn requires only its result")
+    elif status == "failed":
+        if (
+            not isinstance(error, str)
+            or not error
+            or prompt is not None
+            or result is not None
+        ):
+            raise ValueError("a failed agent turn requires only its error")
+    else:
+        raise ValueError("agent turn status must be started, completed, or failed")
+
+    payload: dict[str, object] = {
+        "turn_id": turn_id,
+        "purpose": purpose,
+        "role": role,
+        "attempt": attempt,
+        "status": status,
+    }
+    if prompt is not None:
+        payload["prompt"] = prompt
+    if result is not None:
+        payload["result"] = result
+    if error is not None:
+        payload["error"] = error
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    ).decode("ascii")
+    chunks = tuple(
+        encoded[index : index + _AGENT_TURN_CHUNK_CHARS]
+        for index in range(0, len(encoded), _AGENT_TURN_CHUNK_CHARS)
+    )
+    message_id = f"{turn_id}:{status}"
+    for index, chunk in enumerate(chunks):
+        _write_event(
+            {
+                "type": "agent_turn_trace_chunk",
+                "message_id": message_id,
+                "chunk_index": index,
+                "chunk_count": len(chunks),
+                "data": chunk,
+            },
+            drop_oversized=True,
+        )
 
 
 def emit_run_pr(pr_number: int, pr_url: str) -> None:

@@ -298,6 +298,7 @@ from purplemux_client import (
     WorkerNeedsInput,
     WorkspaceState,
     WorktreeState,
+    emit_agent_turn,
     emit_step,
     emit_finding,
     emit_issue_driven_repositories,
@@ -996,6 +997,30 @@ are dropped and the diagnostic stream retains only the latest 200 events. The
 latest PR-bearing event for each observed PR is retained separately and included
 in snapshots if its diagnostic event is evicted. Do not use events to drive the
 workflow, add statuses, or build decorators/state machines around it.
+
+Issue Driven workflows call `emit_agent_turn()` at the actual `send_input()`
+boundary with the same prompt object sent to the agent, then publish the
+completed result or failure. The observation helper transports large prompt and
+result values as bounded chunks so it does not alter or truncate them:
+
+```python
+emit_agent_turn(
+    turn_id,
+    purpose,                # concise human-readable reason for this turn
+    role,                   # planner, implementer, reviewer, or recovery
+    attempt,                # positive int
+    status,                 # "started", "completed", or "failed"
+    *,
+    prompt=None,            # exact prompt, required only for started
+    result=None,            # exact result, required only for completed
+    error=None,             # error text, required only for failed
+)
+```
+
+The Runner persists the ordered read-only trace in Issue Driven Run history and
+adds previous/next turn relationships. Trace publication is best-effort
+observation: generated Python still owns every branch, retry, and lifecycle
+decision, and a trace delivery failure must not change its behavior.
 
 When GitHub inspection or creation has authoritatively identified a PR, pass
 `pr_number` and `pr_url` together to attach read-only navigation to that Progress
