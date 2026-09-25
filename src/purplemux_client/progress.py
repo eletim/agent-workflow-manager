@@ -4,8 +4,10 @@ import base64
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Mapping
+from queue import SimpleQueue
 from typing import Literal
 from urllib import error, request
 from urllib.parse import urlparse
@@ -28,9 +30,13 @@ EVENT_URL_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_URL"
 EVENT_TOKEN_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_TOKEN"
 MAX_PROGRESS_EVENT_BYTES = 4096
 _AGENT_TURN_CHUNK_CHARS = 2_400
-_AGENT_TURN_HTTP_TIMEOUT_SECONDS = 0.05
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
+_agent_turn_http_queue: SimpleQueue[tuple[str, str, tuple[dict[str, object], ...]]] = (
+    SimpleQueue()
+)
+_agent_turn_http_thread: threading.Thread | None = None
+_agent_turn_http_thread_lock = threading.Lock()
 
 
 def emit_step(
@@ -140,20 +146,60 @@ def emit_agent_turn(
         for index in range(0, len(encoded), _AGENT_TURN_CHUNK_CHARS)
     )
     message_id = f"{turn_id}:{status}"
-    for index, chunk in enumerate(chunks):
-        delivered = _write_event(
-            {
-                "type": "agent_turn_trace_chunk",
-                "message_id": message_id,
-                "chunk_index": index,
-                "chunk_count": len(chunks),
-                "data": chunk,
-            },
-            drop_oversized=True,
-            http_timeout=_AGENT_TURN_HTTP_TIMEOUT_SECONDS,
+    events: tuple[dict[str, object], ...] = tuple(
+        {
+            "type": "agent_turn_trace_chunk",
+            "message_id": message_id,
+            "chunk_index": index,
+            "chunk_count": len(chunks),
+            "data": chunk,
+        }
+        for index, chunk in enumerate(chunks)
+    )
+    event_url = os.environ.get(EVENT_URL_ENV)
+    event_token = os.environ.get(EVENT_TOKEN_ENV)
+    if event_url is not None and event_token is not None:
+        _enqueue_agent_turn_http(event_url, event_token, events)
+        return
+    for event in events:
+        _write_event(event, drop_oversized=True)
+
+
+def _enqueue_agent_turn_http(
+    event_url: str,
+    event_token: str,
+    events: tuple[dict[str, object], ...],
+) -> None:
+    """Queue ordered trace delivery without waiting at the agent send boundary."""
+    global _agent_turn_http_thread
+
+    _agent_turn_http_queue.put((event_url, event_token, events))
+    with _agent_turn_http_thread_lock:
+        if _agent_turn_http_thread is not None and _agent_turn_http_thread.is_alive():
+            return
+        _agent_turn_http_thread = threading.Thread(
+            target=_deliver_agent_turn_http,
+            name="agent-turn-trace-delivery",
+            # Observation must never keep authoritative workflow execution alive.
+            daemon=True,
         )
-        if not delivered:
-            break
+        _agent_turn_http_thread.start()
+
+
+def _deliver_agent_turn_http() -> None:
+    """Preserve transition order and retry ambiguous failures until shutdown."""
+    while True:
+        event_url, event_token, events = _agent_turn_http_queue.get()
+        for event in events:
+            retry_delay = 0.05
+            while not _post_event(
+                event_url,
+                event_token,
+                event,
+                required=False,
+            ):
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 1.0)
 
 
 def emit_run_pr(pr_number: int, pr_url: str) -> None:
@@ -628,12 +674,7 @@ def acknowledge_run_resource(
             raise RuntimeError("Runner rejected resource ownership evidence")
 
 
-def _write_event(
-    event: Mapping[str, object],
-    *,
-    drop_oversized: bool = False,
-    http_timeout: float = 5,
-) -> bool:
+def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -> None:
     event_url = os.environ.get(EVENT_URL_ENV)
     event_token = os.environ.get(EVENT_TOKEN_ENV)
     if event_url is not None and event_token is not None:
@@ -642,32 +683,25 @@ def _write_event(
             if drop_oversized:
                 encoded = _truncate_event_error(event)
                 if encoded is None:
-                    return False
+                    return
                 event = json.loads(encoded)
             else:
                 raise ValueError("Runner event exceeds 4096 encoded bytes")
-        return bool(
-            _post_event(
-                event_url,
-                event_token,
-                event,
-                required=False,
-                timeout=http_timeout,
-            )
-        )
+        _post_event(event_url, event_token, event, required=False)
+        return
     fd_text = os.environ.get(PROGRESS_FD_ENV)
     if fd_text is None:
-        return False
+        return
     try:
         fd = int(fd_text)
     except ValueError:
-        return False
+        return
     encoded = _encode_event(event)
     if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
         if drop_oversized:
             encoded = _truncate_event_error(event)
             if encoded is None:
-                return False
+                return
         else:
             raise ValueError("Runner event exceeds 4096 encoded bytes")
     with _write_lock:
@@ -676,9 +710,8 @@ def _write_event(
             try:
                 written = os.write(fd, view)
             except OSError:
-                return False
+                return
             view = view[written:]
-    return True
 
 
 def _post_event(
@@ -687,7 +720,6 @@ def _post_event(
     event: Mapping[str, object],
     *,
     required: bool,
-    timeout: float = 5,
 ) -> object | None:
     encoded = _encode_event(event)
     if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
@@ -704,7 +736,7 @@ def _post_event(
         },
     )
     try:
-        with request.urlopen(submitted, timeout=timeout) as response:
+        with request.urlopen(submitted, timeout=5) as response:
             payload = response.read(MAX_PROGRESS_EVENT_BYTES + 1)
     except (error.URLError, OSError) as exc:
         if required:

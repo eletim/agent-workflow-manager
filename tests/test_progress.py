@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from urllib import error
 
 import pytest
@@ -103,18 +104,38 @@ def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
     }
 
 
-def test_emit_agent_turn_stops_after_one_fast_http_delivery_failure(
+def test_emit_agent_turn_http_delivery_is_decoupled_and_retries_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    timeouts: list[float] = []
+    first_request_started = threading.Event()
+    release_first_request = threading.Event()
+    attempts: list[int] = []
+    delivered: list[dict[str, object]] = []
 
-    def unavailable(_request: object, *, timeout: float) -> None:
-        timeouts.append(timeout)
-        raise error.URLError("event endpoint unavailable")
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"{}"
+
+    def briefly_stalled(submitted, *, timeout: float):
+        assert timeout == 5
+        event = json.loads(submitted.data)
+        attempts.append(event["chunk_index"])
+        if len(attempts) == 1:
+            first_request_started.set()
+            assert release_first_request.wait(2)
+            raise error.URLError("response arrived after the client timeout")
+        delivered.append(event)
+        return Response()
 
     monkeypatch.setenv(EVENT_URL_ENV, "http://127.0.0.1:1/events")
     monkeypatch.setenv(EVENT_TOKEN_ENV, "token")
-    monkeypatch.setattr("purplemux_client.progress.request.urlopen", unavailable)
+    monkeypatch.setattr("purplemux_client.progress.request.urlopen", briefly_stalled)
 
     emit_agent_turn(
         7,
@@ -125,7 +146,18 @@ def test_emit_agent_turn_stops_after_one_fast_http_delivery_failure(
         prompt="large prompt\n" * 2_000,
     )
 
-    assert timeouts == [0.05]
+    assert first_request_started.wait(1)
+    assert attempts == [0]
+    release_first_request.set()
+    for _ in range(100):
+        if delivered and len(delivered) == delivered[0]["chunk_count"]:
+            break
+        threading.Event().wait(0.01)
+
+    assert attempts[:2] == [0, 0]
+    assert [event["chunk_index"] for event in delivered] == list(
+        range(delivered[0]["chunk_count"])
+    )
 
 
 def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:
