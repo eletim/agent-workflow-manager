@@ -37,6 +37,33 @@ class IssueDrivenValidationError(ValueError):
         self.findings = tuple(findings)
 
 
+@dataclass(frozen=True)
+class IssueDrivenAgentPurpose:
+    role: str
+    agent: str
+    purpose: str
+
+    def as_json(self) -> dict[str, str]:
+        return {
+            "role": self.role,
+            "agent": self.agent,
+            "purpose": self.purpose,
+        }
+
+
+@dataclass(frozen=True)
+class IssueDrivenRunPreview:
+    phases: tuple[str, ...]
+    agents: tuple[IssueDrivenAgentPurpose, ...]
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "status": "planned",
+            "phases": list(self.phases),
+            "agents": [agent.as_json() for agent in self.agents],
+        }
+
+
 IssueTopologyClassification = Literal["new", "recoverable", "already_integrated"]
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -1466,12 +1493,43 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
     )
 
 
-def _workflow_outline(config: IssueDrivenConfig) -> str:
+def issue_driven_workflow_outline(config: IssueDrivenConfig) -> tuple[str, ...]:
     labels = ["Work items"]
     if config.final_review:
         labels.append("Whole-version review")
     labels.append("Final integration PR")
-    entries = "\n".join(f"    {label!r}," for label in labels)
+    return tuple(labels)
+
+
+def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview:
+    """Describe the generated run without predicting its eventual execution."""
+    return IssueDrivenRunPreview(
+        phases=issue_driven_workflow_outline(config),
+        agents=(
+            IssueDrivenAgentPurpose(
+                role="Implementer",
+                agent=config.implementer_agent,
+                purpose=(
+                    "Recovers work-item state, implements changes, and performs "
+                    "fixes and cleanup."
+                ),
+            ),
+            IssueDrivenAgentPurpose(
+                role="Reviewer",
+                agent=config.reviewer_agent,
+                purpose=(
+                    "Plans work items, independently reviews scope and correctness, "
+                    "and prepares whole-version review and handoff."
+                ),
+            ),
+        ),
+    )
+
+
+def _workflow_outline(config: IssueDrivenConfig) -> str:
+    entries = "\n".join(
+        f"    {label!r}," for label in issue_driven_workflow_outline(config)
+    )
     return f"WORKFLOW_OUTLINE = [\n{entries}\n]"
 
 

@@ -3821,6 +3821,28 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert generated["config"]["mode"] == "issue-driven"
     assert generated["config"]["implementer_agent"] == "claude"
     assert generated["config"]["reviewer_agent"] == "codex"
+    assert generated["runPreview"] == {
+        "status": "planned",
+        "phases": ["Work items", "Whole-version review", "Final integration PR"],
+        "agents": [
+            {
+                "role": "Implementer",
+                "agent": "claude",
+                "purpose": (
+                    "Recovers work-item state, implements changes, and performs "
+                    "fixes and cleanup."
+                ),
+            },
+            {
+                "role": "Reviewer",
+                "agent": "codex",
+                "purpose": (
+                    "Plans work items, independently reviews scope and correctness, "
+                    "and prepares whole-version review and handoff."
+                ),
+            },
+        ],
+    }
     ast.parse(generated["generatedCode"])
 
     status, mismatch = request(

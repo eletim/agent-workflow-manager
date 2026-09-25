@@ -272,7 +272,7 @@ async function loadApp({
     "resume-open", "resume-dialog", "resume-source", "resume-settings",
     "resume-cancel", "resume-confirm",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
-    "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
+    "validation-success", "validation", "outline-panel", "outline-title", "outline-description", "outline", "outline-agents", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
     "readiness-workspace", "readiness-provider", "run-readiness", "reconcile-readiness",
@@ -1048,6 +1048,14 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
           config: {mode: "issue-driven"},
           generatedCode,
           issueDrivenValidation: [],
+          runPreview: {
+            status: "planned",
+            phases: ["generated"],
+            agents: [
+              {role: "Implementer", agent: "claude", purpose: "Implements changes."},
+              {role: "Reviewer", agent: "codex", purpose: "Reviews changes."},
+            ],
+          },
         });
       }
       if (url === "/api/validate") {
@@ -1068,7 +1076,19 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.equal(elements["issue-driven-python"].value, generatedCode);
   assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
   assert.equal(elements["issue-driven-success"].hidden, false);
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.deepEqual(
+    elements["outline-agents"].children.map((item) => item.textContent),
+    ["Implementer (claude)", "Implements changes.", "Reviewer (codex)", "Reviews changes."],
+  );
   assert.deepEqual(outlineLabels(elements), ["generated"]);
+
+  elements["issue-driven-json"].value = '{"issues":[90]}';
+  await elements["issue-driven-json"].dispatch("input");
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["outline-title"].textContent, "Execution outline");
+  assert.equal(elements["outline-agents"].children.length, 0);
 });
 
 test("Issue Driven repository editor adds and edits repository declarations", async () => {
@@ -2153,6 +2173,7 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
   });
 
   assert.equal(elements["outline-panel"].hidden, false);
+  assert.equal(elements["outline-title"].textContent, "Execution outline");
   assert.deepEqual(outlineLabels(elements), ["prepare", "implement", "review", "ready PR"]);
   assert.deepEqual(
     elements.outline.children.map((item) => item.className),

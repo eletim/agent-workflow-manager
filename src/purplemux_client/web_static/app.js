@@ -108,7 +108,10 @@ const readinessState = document.querySelector("#readiness-state");
 const readinessCleanup = document.querySelector("#readiness-cleanup");
 const readinessGuidance = document.querySelector("#readiness-guidance");
 const outlinePanel = document.querySelector("#outline-panel");
+const outlineTitle = document.querySelector("#outline-title");
+const outlineDescription = document.querySelector("#outline-description");
 const outline = document.querySelector("#outline");
+const outlineAgents = document.querySelector("#outline-agents");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -167,6 +170,7 @@ let promptDraft = {
   prompt: promptText.value,
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+let issueDrivenRunPreview = null;
 let reviewDraft = {json: reviewJson.value, code: ""};
 let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
@@ -237,6 +241,8 @@ function invalidateIssueDrivenDraft() {
   issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
   issueDrivenSuccess.hidden = true;
   issueDrivenValidation.replaceChildren();
+  issueDrivenRunPreview = null;
+  if (activeRunId === null && currentMode === "issue-driven") renderOutline([], []);
 }
 
 function updateRepositoryConfig(index, key, value) {
@@ -1237,7 +1243,7 @@ async function refreshReadiness() {
   }
 }
 
-function renderOutline(labels, events) {
+function renderOutline(labels, events, plannedPreview = null) {
   const states = new Map(labels.map((label) => [label, "pending"]));
   for (const event of events) {
     if (!states.has(event.name)) continue;
@@ -1249,6 +1255,20 @@ function renderOutline(labels, events) {
   }
 
   outline.replaceChildren();
+  outlineTitle.textContent = plannedPreview ? "Planned run preview" : "Execution outline";
+  outlineDescription.hidden = !plannedPreview;
+  outlineDescription.textContent = plannedPreview
+    ? "Expected phases and agent purposes; these are a plan, not actual execution results."
+    : "";
+  outlineAgents.replaceChildren();
+  outlineAgents.hidden = !plannedPreview;
+  for (const agent of plannedPreview?.agents || []) {
+    const term = document.createElement("dt");
+    term.textContent = `${agent.role} (${agent.agent})`;
+    const description = document.createElement("dd");
+    description.textContent = agent.purpose;
+    outlineAgents.append(term, description);
+  }
   outlinePanel.hidden = labels.length === 0;
   for (const label of labels) {
     const state = states.get(label);
@@ -1897,7 +1917,11 @@ async function generateIssueDrivenCode() {
     ) {
       issueDrivenPython.value = result.generatedCode;
       issueDrivenDraft = {json: source, code: result.generatedCode};
+      issueDrivenRunPreview = result.runPreview || null;
       renderIssueDrivenValidation(result.issueDrivenValidation || []);
+      if (issueDrivenRunPreview) {
+        renderOutline(issueDrivenRunPreview.phases || [], [], issueDrivenRunPreview);
+      }
     }
     return result.generatedCode;
   } catch (error) {
@@ -2267,7 +2291,11 @@ validateButton.addEventListener("click", async () => {
         && activeRunId === null
       ) {
         renderValidation(result.validation || []);
-        renderOutline(result.outline || [], []);
+        renderOutline(
+          result.outline || [],
+          [],
+          currentMode === "issue-driven" ? issueDrivenRunPreview : null,
+        );
       }
     } catch (error) {
       if (
@@ -2277,7 +2305,11 @@ validateButton.addEventListener("click", async () => {
         && Array.isArray(error.result?.validation)
       ) {
         renderValidation(error.result.validation);
-        renderOutline(error.result.outline || [], []);
+        renderOutline(
+          error.result.outline || [],
+          [],
+          currentMode === "issue-driven" ? issueDrivenRunPreview : null,
+        );
       } else if (
         requestGeneration === validationRequestGeneration
         && selectionGeneration === activeRunGeneration

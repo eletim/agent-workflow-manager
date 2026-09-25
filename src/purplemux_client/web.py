@@ -25,6 +25,7 @@ from purplemux_client.external_targets import ExternalTargetSettings
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
+    issue_driven_run_preview,
     parse_issue_driven_json,
 )
 from purplemux_client.notification_settings import (
@@ -792,6 +793,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     "config": config.as_json(),
                     "generatedCode": code,
                     "issueDrivenValidation": [],
+                    "runPreview": issue_driven_run_preview(config).as_json(),
                 },
             )
             return
