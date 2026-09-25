@@ -41,6 +41,7 @@ class FakeRunner:
     ) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.tabs: dict[str, dict[str, object]] = {}
         self.workspace_directories = workspace_directories
 
@@ -58,6 +59,7 @@ class FakeRunner:
         assert check is False
         command = list(args)
         self.calls.append(command)
+        self.timeouts.append(timeout)
         if command[1:3] == ["tab", "list"]:
             return completed({"tabs": list(self.tabs.values())})
         if command[1:] == ["workspaces"]:
@@ -148,6 +150,27 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
     assert create[-2:] == ["-t", "codex-cli"]
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
+
+
+def test_session_deadline_only_limits_tab_create_command() -> None:
+    runner = FakeRunner([completed({"tabId": "tab-123"})])
+    cli = client(runner, command_timeout_seconds=30)
+    deadline_request = CreateSessionRequest(
+        worker="codex",
+        cwd="/workspace/project",
+        command="codex",
+        deadline_check=lambda: 0.5,
+    )
+
+    assert cli.create_session(deadline_request) == "tab-123"
+    create_index = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if call[1:3] == ["tab", "create"]
+    )
+    assert runner.timeouts[create_index] == 0.5
+    assert cli.command_timeout_seconds == 30
+    assert runner.timeouts[create_index + 1] == 30
 
 
 def test_codex_project_is_trusted_before_tab_creation() -> None:
@@ -405,6 +428,28 @@ def test_start_shell_creates_named_terminal_and_sends_cwd_command(
     assert "bash -lc" in wrapper
     assert 'printf \'{"exitCode":%s}' in wrapper
     cli.close_session(session_id)
+
+
+def test_start_shell_bounds_tab_reads_create_and_send_by_deadline(tmp_path) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+    cli.start_shell(
+        ShellCommandRequest(
+            command="true",
+            cwd=str(tmp_path),
+            name="Bounded shell",
+            deadline_check=lambda: 0.2,
+        )
+    )
+    launch_calls = [
+        (call[1:3], timeout) for call, timeout in zip(runner.calls, runner.timeouts)
+    ]
+    assert (["tab", "create"], 0.2) in launch_calls
+    assert (["tab", "send"], 0.2) in launch_calls
+    assert sum(command == ["tab", "list"] for command, _ in launch_calls) >= 2
+    assert all(timeout <= 0.2 for _, timeout in launch_calls)
 
 
 def test_run_ownership_is_opt_in_and_registers_shell_result_directory(

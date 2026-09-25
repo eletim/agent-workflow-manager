@@ -479,6 +479,33 @@ def test_run_history_lock_prevents_two_runners_from_overwriting_shared_state(
         successor.close()
 
 
+def test_environment_setup_history_restores_declaration_and_result(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    source = '{"mode":"environment-setup","repository":"/repo"}'
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        run_id = runner.start(
+            "import json; print(json.dumps({'status': 'READY', 'summary': 'usable'}))",
+            environment_setup_json=source,
+        )
+        finished = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        assert finished.as_json()["mode"] == "environment-setup"
+        assert finished.as_summary_json()["mode"] == "environment-setup"
+        assert json.loads(finished.stdout)["status"] == "READY"
+    finally:
+        runner.close()
+    restored = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        snapshot = restored.snapshot(run_id)
+        assert snapshot.environment_setup_json == source
+        assert snapshot.as_json()["environmentSetupJson"] == source
+        assert json.loads(snapshot.stdout)["summary"] == "usable"
+    finally:
+        restored.close()
+
+
 def test_resume_reuses_immutable_settings_and_persists_run_relationship(
     tmp_path: Path,
 ) -> None:
@@ -3585,6 +3612,85 @@ def test_runner_page_exposes_prompt_and_workflow_modes(
         "resume-confirm",
     ):
         assert f'id="{element_id}"' in page
+
+
+def test_environment_setup_generation_api(
+    web_server: tuple[tuple[str, int], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from purplemux_client import web
+    from purplemux_client.environment_setup import EnvironmentSetupInput
+
+    def parse(source: str) -> EnvironmentSetupInput:
+        if source != "valid":
+            raise ValueError("invalid environment setup")
+        return EnvironmentSetupInput("/source/repo", "main", "codex", 120)
+
+    monkeypatch.setattr(web, "parse_environment_setup_json", parse)
+    address, token = web_server
+    status, generated = request(
+        address,
+        "POST",
+        "/api/environment-setup/generate",
+        json.dumps({"json": "valid"}),
+        token=token,
+    )
+    assert status == 200
+    assert generated["config"]["revision"] == "main"
+    assert generated["revisionValidation"] == "verified"
+    ast.parse(generated["generatedCode"])
+
+    status, rejected = request(
+        address,
+        "POST",
+        "/api/environment-setup/generate",
+        json.dumps({"json": "invalid"}),
+        token=token,
+    )
+    assert status == 422
+    assert rejected == {"error": "invalid environment setup"}
+
+
+def test_environment_setup_run_rejects_changed_code_and_retains_input(
+    web_server: tuple[tuple[str, int], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from purplemux_client import web
+    from purplemux_client.environment_setup import EnvironmentSetupInput
+
+    source = '{"mode":"environment-setup"}'
+    monkeypatch.setattr(
+        web,
+        "parse_environment_setup_json",
+        lambda _source: EnvironmentSetupInput("/source/repo", "main", "codex", 120),
+    )
+    monkeypatch.setattr(
+        web, "generate_environment_setup_workflow", lambda _config: "print('ready')"
+    )
+    address, token = web_server
+    status, mismatch = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "print('changed')", "environmentSetupJson": source}),
+        token=token,
+    )
+    assert status == 400
+    assert mismatch == {"error": "code does not match environmentSetupJson"}
+
+    status, started = request(
+        address,
+        "POST",
+        "/api/run",
+        json.dumps({"code": "print('ready')", "environmentSetupJson": source}),
+        token=token,
+    )
+    assert status == 202
+    assert started["mode"] == "environment-setup"
+    assert started["environmentSetupJson"] == source
+    run_id = started["runId"]
+    status, detail = request(address, "GET", f"/api/runs/{run_id}", token=token)
+    assert status == 200
+    assert detail["environmentSetupJson"] == source
+    assert detail["mode"] == "environment-setup"
 
 
 def test_issue_driven_generation_api_is_distinct_from_python_validation(

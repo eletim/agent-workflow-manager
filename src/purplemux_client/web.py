@@ -16,6 +16,10 @@ from urllib.parse import parse_qs, urlparse
 import qrcode
 from qrcode.image.svg import SvgPathImage
 
+from purplemux_client.environment_setup import (
+    generate_environment_setup_workflow,
+    parse_environment_setup_json,
+)
 from purplemux_client.errors import TerminalSessionError
 from purplemux_client.external_targets import ExternalTargetSettings
 from purplemux_client.issue_driven import (
@@ -59,6 +63,10 @@ STATIC_FILES = {
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
     "/log-display.js": ("log-display.js", "text/javascript; charset=utf-8"),
     "/output-copy.js": ("output-copy.js", "text/javascript; charset=utf-8"),
+    "/environment-setup-guide.md": (
+        "environment-setup-guide.md",
+        "text/markdown; charset=utf-8",
+    ),
     "/issue-driven-guide.md": (
         "issue-driven-guide.md",
         "text/markdown; charset=utf-8",
@@ -781,6 +789,32 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/environment-setup/generate":
+            payload = self._read_json()
+            if payload is None:
+                return
+            source = payload.get("json")
+            if not isinstance(source, str) or set(payload) != {"json"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request must contain only a JSON source string"},
+                )
+                return
+            try:
+                config = parse_environment_setup_json(source)
+                code = generate_environment_setup_workflow(config)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "config": config.as_json(),
+                    "revisionValidation": config.revision_validation,
+                    "generatedCode": code,
+                },
+            )
+            return
         if path in {"/api/run", "/api/validate", "/api/dry-run"}:
             payload = self._read_json()
             if payload is None:
@@ -834,6 +868,35 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                         {"error": "code does not match issueDrivenJson"},
                     )
                     return
+            environment_setup_json = payload.get("environmentSetupJson")
+            if "environmentSetupJson" in payload:
+                if (
+                    path != "/api/run"
+                    or not isinstance(environment_setup_json, str)
+                    or "issueDrivenJson" in payload
+                ):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "environmentSetupJson is supported only for Run and must be a string"
+                        },
+                    )
+                    return
+                try:
+                    setup_code = generate_environment_setup_workflow(
+                        parse_environment_setup_json(environment_setup_json)
+                    )
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)}
+                    )
+                    return
+                if setup_code != code:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "code does not match environmentSetupJson"},
+                    )
+                    return
             try:
                 if path == "/api/validate":
                     result = self.server.runner.validate(code, args=args)
@@ -859,6 +922,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     code,
                     args=args,
                     issue_driven_json=issue_driven_json,
+                    environment_setup_json=environment_setup_json,
                     parent_identity=payload.get("parentRun"),
                 )
             except ValueError as exc:

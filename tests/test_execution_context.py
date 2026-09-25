@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
-from purplemux_client import inspect_run_repository, prepare_run_repository
+from purplemux_client import (
+    WorkerFailure,
+    inspect_run_repository,
+    inspect_run_revision,
+    prepare_run_repository,
+    prepare_run_revision,
+)
 from purplemux_client.preflight import WorkflowValidator
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
 
@@ -79,6 +88,291 @@ def test_prepare_creates_fresh_detached_worktree_and_returns_identity(
         == "HEAD"
     )
     assert git(repository, "branch", "--show-current") == "main"
+
+
+def test_prepare_run_revision_accepts_tag_and_commit_without_changing_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    metadata: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        execution_context,
+        "acknowledge_run_resource",
+        lambda _phase, _kind, _identity, values: metadata.append(values),
+    )
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "-a", "release-1", "-m", "release")
+    git(repository, "push", "origin", "refs/tags/release-1")
+    git(repository, "switch", "-qc", "ambient-work")
+    (repository / "untracked").write_text("keep me", encoding="utf-8")
+
+    for revision, expected_kind in (("release-1", "tag"), (sha, "commit")):
+        preparation, kind = inspect_run_revision(repo=repository, revision=revision)
+        assert kind == expected_kind
+        assert preparation.revision_kind == expected_kind
+        assert preparation.revision == revision
+        assert preparation.base_branch is None
+        assert preparation.base_sha == sha
+        result = prepare_run_revision(
+            repo=repository,
+            revision=revision,
+            worktree_root=tmp_path / "managed-worktrees",
+        )
+        assert git(result.execution_root, "rev-parse", "HEAD") == sha
+        assert result.revision_kind == expected_kind
+        assert result.base_branch is None
+        assert metadata[-1]["revision_kind"] == expected_kind
+        assert metadata[-1]["revision"] == revision
+        assert "base_branch" not in metadata[-1]
+        if expected_kind == "commit":
+            assert "remote" not in metadata[-1]
+        else:
+            assert metadata[-1]["remote"] == "origin"
+        assert (
+            git(result.execution_root, "rev-parse", "--symbolic-full-name", "HEAD")
+            == "HEAD"
+        )
+
+    assert git(repository, "branch", "--show-current") == "ambient-work"
+    assert (repository / "untracked").read_text(encoding="utf-8") == "keep me"
+
+
+def test_local_commit_revision_needs_no_remote_and_has_explicit_resource_identity(
+    tmp_path: Path,
+) -> None:
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "remote", "remove", "origin")
+    preparation, kind = inspect_run_revision(repo=repository, revision=sha)
+    assert kind == "commit"
+    assert preparation.remote is None
+    assert preparation.base_branch is None
+
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    code = (
+        "from purplemux_client import prepare_run_revision\n"
+        f"prepare_run_revision(repo={str(repository)!r}, revision={sha!r}, "
+        f"worktree_root={str(tmp_path / 'managed-worktrees')!r})\n"
+    )
+    try:
+        run_id = runner.start(code)
+        result = wait_until_finished(runner)
+        assert result.state == "success"
+        assert result.run_id == run_id
+        resource = next(
+            item for item in result.resources if item.kind == "git_worktree"
+        )
+        assert resource.metadata["revision_kind"] == "commit"
+        assert resource.metadata["revision"] == sha
+        assert resource.metadata["revision_ref"] == sha
+        assert "remote" not in resource.metadata
+        assert "base_branch" not in resource.metadata
+        context = result.as_json()["executionContext"]
+        assert context["revisionKind"] == "commit"
+        assert context["revision"] == sha
+        assert "remote" not in context
+        assert "baseBranch" not in context
+        cleaned = runner.cleanup(run_id)
+        assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
+    finally:
+        runner.close()
+
+
+def test_prepare_run_revision_rejects_ambiguous_branch_and_tag(tmp_path: Path) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "main")
+    git(repository, "push", "origin", "refs/tags/main")
+
+    with pytest.raises(Exception, match="both a branch and a tag"):
+        inspect_run_revision(repo=repository, revision="main")
+
+
+def test_non_commit_tag_is_rejected_when_object_is_local(tmp_path: Path) -> None:
+    from purplemux_client.environment_setup import parse_environment_setup_json
+
+    repository, _sha = repository_with_remote(tmp_path)
+    blob_sha = git(repository, "hash-object", "tracked")
+    git(repository, "update-ref", "refs/tags/blob-release", blob_sha)
+    git(repository, "push", "origin", "refs/tags/blob-release")
+
+    with pytest.raises(WorkerFailure, match="tag points to a blob"):
+        inspect_run_revision(repo=repository, revision="blob-release")
+    with pytest.raises(ValueError, match="tag points to a blob"):
+        parse_environment_setup_json(
+            json.dumps(
+                {
+                    "mode": "environment-setup",
+                    "repository": str(repository),
+                    "revision": "blob-release",
+                    "environment_agent": "codex",
+                    "timeout": 120,
+                }
+            )
+        )
+
+
+def test_remote_only_tag_validation_is_explicitly_provisional(tmp_path: Path) -> None:
+    from purplemux_client.environment_setup import (
+        generate_environment_setup_workflow,
+        parse_environment_setup_json,
+    )
+
+    repository, _sha = repository_with_remote(tmp_path)
+    writer = tmp_path / "writer"
+    git(tmp_path, "clone", "-b", "main", str(tmp_path / "remote.git"), str(writer))
+    git(writer, "config", "user.email", "test@example.com")
+    git(writer, "config", "user.name", "Test")
+    (writer / "new").write_text("unfetched\n", encoding="utf-8")
+    git(writer, "add", "new")
+    git(writer, "commit", "-qm", "unfetched")
+    git(writer, "tag", "remote-release")
+    git(writer, "push", "origin", "refs/tags/remote-release")
+
+    preparation, kind = inspect_run_revision(repo=repository, revision="remote-release")
+    assert kind == "tag"
+    assert preparation.revision_validation == "provisional"
+    config = parse_environment_setup_json(
+        json.dumps(
+            {
+                "mode": "environment-setup",
+                "repository": str(repository),
+                "revision": "remote-release",
+                "environment_agent": "codex",
+                "timeout": 120,
+            }
+        )
+    )
+    assert config.revision_validation == "provisional"
+    assert "REVISION_VALIDATION = 'provisional'" in generate_environment_setup_workflow(
+        config
+    )
+
+    blob_sha = git(writer, "hash-object", "new")
+    git(writer, "update-ref", "refs/tags/remote-blob", blob_sha)
+    git(writer, "push", "origin", "refs/tags/remote-blob")
+    blob_preparation, blob_kind = inspect_run_revision(
+        repo=repository, revision="remote-blob"
+    )
+    assert blob_kind == "tag"
+    assert blob_preparation.revision_validation == "provisional"
+    with pytest.raises(WorkerFailure, match="confirmed_rejected"):
+        prepare_run_revision(
+            repo=repository,
+            revision="remote-blob",
+            worktree_root=tmp_path / "blob-worktrees",
+        )
+    assert list((tmp_path / "blob-worktrees").iterdir()) == []
+
+
+def test_deadline_expiring_during_git_inspection_prevents_worktree_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    original_read = execution_context._git_read
+    reached_worktree_inspection = False
+
+    def slow_read(repository_path: Path, args: list[str], timeout: float) -> str:
+        nonlocal reached_worktree_inspection
+        if args[:2] == ["worktree", "list"]:
+            reached_worktree_inspection = True
+            time.sleep(0.1)
+        return original_read(repository_path, args, timeout)
+
+    monkeypatch.setattr(execution_context, "_git_read", slow_read)
+    deadline = time.monotonic() + 0.05
+
+    def remaining() -> float:
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("Environment Setup timed out")
+        return seconds
+
+    with pytest.raises(TimeoutError, match="Environment Setup timed out"):
+        prepare_run_revision(
+            repo=repository,
+            revision="main",
+            worktree_root=worktree_root,
+            deadline_check=remaining,
+        )
+    assert reached_worktree_inspection
+    assert not worktree_root.exists()
+
+
+def test_concurrent_tag_preparations_do_not_share_fetch_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    repository, first_sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "first")
+    (repository / "tracked").write_text("second\n", encoding="utf-8")
+    git(repository, "commit", "-qam", "second")
+    second_sha = git(repository, "rev-parse", "HEAD")
+    git(repository, "tag", "second")
+    git(repository, "push", "origin", "refs/tags/first", "refs/tags/second")
+
+    fetches_complete = Barrier(2)
+    original = execution_context._run_git_mutation_process_group
+
+    def interleaved_fetch(args: list[str], **kwargs: object):
+        result = original(args, **kwargs)
+        if args[0] == "fetch" and args[-1].startswith("refs/tags/"):
+            fetches_complete.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(
+        execution_context, "_run_git_mutation_process_group", interleaved_fetch
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            prepare_run_revision,
+            repo=repository,
+            revision="first",
+            worktree_root=tmp_path / "worktrees",
+        )
+        second = pool.submit(
+            prepare_run_revision,
+            repo=repository,
+            revision="second",
+            worktree_root=tmp_path / "worktrees",
+        )
+        results = (first.result(), second.result())
+    assert git(results[0].execution_root, "rev-parse", "HEAD") == first_sha
+    assert git(results[1].execution_root, "rev-parse", "HEAD") == second_sha
+
+
+def test_generated_environment_workflow_validates_tag_and_commit(
+    tmp_path: Path,
+) -> None:
+    from purplemux_client.environment_setup import (
+        generate_environment_setup_workflow,
+        parse_environment_setup_json,
+    )
+
+    repository, sha = repository_with_remote(tmp_path)
+    git(repository, "tag", "release-1")
+    git(repository, "push", "origin", "refs/tags/release-1")
+    for revision in ("release-1", sha):
+        parsed = parse_environment_setup_json(
+            json.dumps(
+                {
+                    "mode": "environment-setup",
+                    "repository": str(repository),
+                    "revision": revision,
+                    "environment_agent": "codex",
+                    "timeout": 120,
+                }
+            )
+        )
+        assert parsed.revision == revision
+        code = generate_environment_setup_workflow(parsed)
+        assert WorkflowValidator().validate(code).valid
 
 
 def test_prepare_ignores_ambient_checkout_branch_and_dirty_state(
@@ -168,6 +462,26 @@ context = prepare_run_repository(repo={str(repository)!r}, base_branch="main")
     assert not valid.dry_run_issues
     assert not missing.valid
     assert missing.issues[0].kind == "execution_context"
+
+
+def test_static_validation_accepts_any_declared_deadline_callback(
+    tmp_path: Path,
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    source = f"""
+from purplemux_client import prepare_run_revision
+WORKFLOW_DRY_RUN = 1
+def budget_left():
+    return 1.0
+prepare_run_revision(repo={str(repository)!r}, revision="main", deadline_check=budget_left)
+"""
+
+    assert WorkflowValidator().validate(source).valid
+    undefined = WorkflowValidator().validate(
+        source.replace("deadline_check=budget_left", "deadline_check=missing_callback")
+    )
+    assert not undefined.valid
+    assert any(issue.kind == "execution_context" for issue in undefined.issues)
 
 
 def test_static_validation_resolves_relative_repository_from_workflow_cwd(
@@ -284,6 +598,106 @@ print(context.execution_root)
         assert not Path(result.resources[0].identity).exists()
     finally:
         runner.close()
+
+
+@pytest.mark.parametrize("expiry_phase", ["postcondition", "finalization"])
+def test_deadline_after_worktree_creation_preserves_cleanup_ownership(
+    tmp_path: Path, expiry_phase: str
+) -> None:
+    repository, _sha = repository_with_remote(tmp_path)
+    worktree_root = tmp_path / "managed-worktrees"
+    code = f"""
+import purplemux_client.execution_context as execution_context
+from purplemux_client import prepare_run_repository
+
+expired = False
+original_mutation = execution_context._run_git_mutation_process_group
+original_path_identity = execution_context._path_identity
+
+def mutation(args, **kwargs):
+    global expired
+    result = original_mutation(args, **kwargs)
+    if {expiry_phase == "postcondition"!r} and args[:2] == ["worktree", "add"]:
+        expired = True
+    return result
+
+def path_identity(path):
+    global expired
+    value = original_path_identity(path)
+    if {expiry_phase == "finalization"!r}:
+        expired = True
+    return value
+
+def remaining():
+    if expired:
+        raise TimeoutError("Environment Setup timed out")
+    return 30.0
+
+execution_context._run_git_mutation_process_group = mutation
+execution_context._path_identity = path_identity
+prepare_run_repository(
+    repo={str(repository)!r},
+    base_branch="main",
+    worktree_root={str(worktree_root)!r},
+    deadline_check=remaining,
+)
+"""
+    runner = PythonRunner(managed_workflows=False)
+    try:
+        run_id = runner.start(code)
+        result = wait_until_finished(runner)
+        assert result.state == "failed"
+        assert len(result.resources) == 1
+        resource = result.resources[0]
+        assert resource.metadata["registration_state"] == "pending"
+        worktree = Path(resource.identity)
+        assert worktree.is_dir()
+
+        cleaned = runner.cleanup(run_id)
+        assert cleaned.resources[0].cleanup_state == "cleaned"
+        assert not worktree.exists()
+    finally:
+        runner.close()
+
+
+def test_post_creation_git_reads_use_remaining_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.execution_context as execution_context
+
+    repository, _sha = repository_with_remote(tmp_path)
+    original_mutation = execution_context._run_git_mutation_process_group
+    original_read = execution_context._git_read
+    created = False
+    post_creation_reads: list[tuple[list[str], float]] = []
+
+    def mutation(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal created
+        result = original_mutation(args, **kwargs)
+        if args[:2] == ["worktree", "add"]:
+            created = True
+        return result
+
+    def read(path: Path, args: list[str], timeout: float) -> str:
+        if created:
+            post_creation_reads.append((args, timeout))
+        return original_read(path, args, timeout)
+
+    monkeypatch.setattr(execution_context, "_run_git_mutation_process_group", mutation)
+    monkeypatch.setattr(execution_context, "_git_read", read)
+
+    context = prepare_run_repository(
+        repo=repository,
+        base_branch="main",
+        worktree_root=tmp_path / "managed-worktrees",
+        deadline_check=lambda: 0.5 if created else 30.0,
+    )
+    assert post_creation_reads
+    assert any(
+        args == ["rev-parse", "--absolute-git-dir"] for args, _ in post_creation_reads
+    )
+    assert all(timeout <= 0.5 for _, timeout in post_creation_reads)
+    git(repository, "worktree", "remove", "--force", str(context.execution_root))
 
 
 def test_cleanup_refuses_dirty_prepared_worktree(tmp_path: Path) -> None:

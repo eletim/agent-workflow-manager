@@ -382,18 +382,27 @@ class CleanupOwnershipSnapshot:
 def _is_verified_repository_context(resource: RunResource) -> bool:
     required = {
         "repository",
-        "remote",
-        "base_branch",
-        "base_ref",
         "base_sha",
         "path_identity",
         "git_file_identity",
         "git_dir",
     }
+    metadata = resource.metadata
+    kind = metadata.get("revision_kind")
+    if kind == "branch":
+        required.update(
+            {"revision", "revision_ref", "remote", "base_branch", "base_ref"}
+        )
+    elif kind == "tag":
+        required.update({"revision", "revision_ref", "remote"})
+    elif kind == "commit":
+        required.update({"revision", "revision_ref"})
+    else:
+        required.update({"remote", "base_branch", "base_ref"})
     return (
         resource.kind == "git_worktree"
-        and resource.metadata.get("registration_state") != "pending"
-        and required.issubset(resource.metadata)
+        and metadata.get("registration_state") != "pending"
+        and required.issubset(metadata)
     )
 
 
@@ -472,6 +481,7 @@ class RunnerSnapshot:
     issue_driven_repositories: tuple[IssueDrivenRepositorySummary, ...] = ()
     identity: str | None = None
     issue_driven_json: str | None = None
+    environment_setup_json: str | None = None
     resumed_from_run_id: int | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
@@ -487,12 +497,17 @@ class RunnerSnapshot:
             if self.prompt is not None
             else "issue-driven"
             if self.issue_driven_json is not None
+            else "environment-setup"
+            if self.environment_setup_json is not None
             else "workflow"
         )
         issue_driven_json = payload.pop("issue_driven_json")
+        environment_setup_json = payload.pop("environment_setup_json")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
         if issue_driven_json is not None:
             payload["issueDrivenJson"] = issue_driven_json
+        if environment_setup_json is not None:
+            payload["environmentSetupJson"] = environment_setup_json
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
         if self.prompt is not None:
@@ -721,6 +736,8 @@ class RunnerSnapshot:
                 if self.prompt is not None
                 else "issue-driven"
                 if self.issue_driven_json is not None
+                else "environment-setup"
+                if self.environment_setup_json is not None
                 else "workflow"
             ),
             "state": self.state,
@@ -768,16 +785,24 @@ class RunnerSnapshot:
             if not _is_verified_repository_context(resource):
                 continue
             metadata = resource.metadata
-            return {
+            context = {
                 "sourceRepository": metadata.get(
                     "source_repository", metadata.get("repository", "")
                 ),
-                "remote": metadata.get("remote", ""),
-                "baseBranch": metadata.get("base_branch", ""),
-                "baseRef": metadata.get("base_ref", ""),
                 "baseSha": metadata.get("base_sha", metadata.get("head", "")),
                 "executionRoot": resource.identity,
             }
+            for key, field_name in (
+                ("remote", "remote"),
+                ("base_branch", "baseBranch"),
+                ("base_ref", "baseRef"),
+                ("revision_kind", "revisionKind"),
+                ("revision", "revision"),
+                ("revision_ref", "revisionRef"),
+            ):
+                if key in metadata:
+                    context[field_name] = metadata[key]
+            return context
         return None
 
 
@@ -833,6 +858,7 @@ class _RunRecord:
     )
     issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
+    environment_setup_json: str | None = None
     resumed_from_run_id: int | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
@@ -1072,6 +1098,7 @@ class PythonRunner:
             ],
             "checked": run.checked,
             "issueDrivenJson": run.issue_driven_json,
+            "environmentSetupJson": run.environment_setup_json,
             "resumedFromRunId": run.resumed_from_run_id,
         }
 
@@ -1168,6 +1195,7 @@ class PythonRunner:
         outline = value.get("outline")
         exit_code = value.get("exitCode")
         issue_driven_json = value.get("issueDrivenJson")
+        environment_setup_json = value.get("environmentSetupJson")
         resumed_from_run_id = value.get("resumedFromRunId")
         if (
             isinstance(run_id, bool)
@@ -1186,6 +1214,10 @@ class PythonRunner:
             or not isinstance(exit_code, int)
             or (
                 issue_driven_json is not None and not isinstance(issue_driven_json, str)
+            )
+            or (
+                environment_setup_json is not None
+                and not isinstance(environment_setup_json, str)
             )
             or (
                 resumed_from_run_id is not None
@@ -1496,6 +1528,7 @@ class PythonRunner:
             issue_driven_repositories=issue_driven_repositories,
             checked=checked,
             issue_driven_json=issue_driven_json,
+            environment_setup_json=environment_setup_json,
             resumed_from_run_id=resumed_from_run_id,
             parent_run=parent_run,
             child_runs=tuple(child_runs),
@@ -1851,6 +1884,7 @@ class PythonRunner:
         args: Sequence[str] = (),
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
+        environment_setup_json: str | None = None,
         resumed_from_run_id: int | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
@@ -1883,6 +1917,7 @@ class PythonRunner:
                     child_env=child_env,
                     prompt=prompt,
                     issue_driven_json=issue_driven_json,
+                    environment_setup_json=environment_setup_json,
                     resumed_from_run_id=resumed_from_run_id,
                     parent_run_id=parent_run_id,
                     parent_identity=parent_identity,
@@ -1920,6 +1955,7 @@ class PythonRunner:
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
+        environment_setup_json: str | None = None,
         resumed_from_run_id: int | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
@@ -1939,6 +1975,7 @@ class PythonRunner:
                 run_args=run_args,
                 child_env=child_env,
                 issue_driven_json=issue_driven_json,
+                environment_setup_json=environment_setup_json,
                 resumed_from_run_id=resumed_from_run_id,
                 parent_run_id=parent_run_id,
                 parent_identity=parent_identity,
@@ -1961,6 +1998,7 @@ class PythonRunner:
             warning_findings=deque(maxlen=self._max_progress_events),
             prompt=prompt,
             issue_driven_json=issue_driven_json,
+            environment_setup_json=environment_setup_json,
             resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
@@ -2134,6 +2172,7 @@ class PythonRunner:
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
         issue_driven_json: str | None = None,
+        environment_setup_json: str | None = None,
         resumed_from_run_id: int | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
@@ -2182,6 +2221,7 @@ class PythonRunner:
             credential_path=credential_path,
             event_token=event_token,
             issue_driven_json=issue_driven_json,
+            environment_setup_json=environment_setup_json,
             resumed_from_run_id=resumed_from_run_id,
         )
         self._runs[run_id] = run
@@ -2585,6 +2625,7 @@ class PythonRunner:
             ),
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
+            environment_setup_json=run.environment_setup_json,
             resumed_from_run_id=run.resumed_from_run_id,
             parent_run=run.parent_run,
             child_runs=run.child_runs,
