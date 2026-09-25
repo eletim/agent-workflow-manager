@@ -336,6 +336,7 @@ a { color: #bcaaff; }
 
 .outline-panel { margin-top: 14px; }
 .outline-panel h2 { margin: 0 0 10px; }
+.outline-description { margin: 0 0 10px; color: #9ba3b5; }
 .outline-list {
   display: grid;
   gap: 6px;
@@ -356,6 +357,16 @@ a { color: #bcaaff; }
 .outline-item.running { color: #ffd66b; }
 .outline-item.completed { color: #75e2a8; }
 .outline-item.failed { color: #ff9ca8; }
+.outline-agents {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 12px;
+  margin: 14px 0 0;
+  font-size: 14px;
+}
+.outline-agents[hidden] { display: none; }
+.outline-agents dt { color: #e8eaf0; font-weight: 600; }
+.outline-agents dd { margin: 0; color: #9ba3b5; }
 
 .integration-pr-panel, .issue-summary-panel, .progress-panel { margin-top: 14px; }
 .integration-pr-panel h2 { margin: 0 0 10px; }

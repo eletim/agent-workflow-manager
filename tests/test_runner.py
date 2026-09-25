@@ -3821,7 +3821,41 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert generated["config"]["mode"] == "issue-driven"
     assert generated["config"]["implementer_agent"] == "claude"
     assert generated["config"]["reviewer_agent"] == "codex"
+    assert generated["runPreview"] == {
+        "status": "planned",
+        "phases": ["Work items", "Whole-version review", "Final integration PR"],
+        "agents": [
+            {
+                "role": "Implementer",
+                "agent": "claude",
+                "purpose": (
+                    "Recovers work-item state, implements changes, and performs "
+                    "fixes and cleanup."
+                ),
+            },
+            {
+                "role": "Reviewer",
+                "agent": "codex",
+                "purpose": (
+                    "Plans work items, independently reviews scope and correctness, "
+                    "and prepares whole-version review and handoff."
+                ),
+            },
+        ],
+    }
     ast.parse(generated["generatedCode"])
+
+    status, without_final_review = request(
+        address,
+        "POST",
+        "/api/issue-driven/generate",
+        json.dumps({"json": json.dumps({**json.loads(source), "final_review": False})}),
+        token=token,
+    )
+    assert status == 200
+    reviewer_purpose = without_final_review["runPreview"]["agents"][1]["purpose"]
+    assert "whole-version review" not in reviewer_purpose
+    assert reviewer_purpose.endswith("delivery handoff.")
 
     status, mismatch = request(
         address,

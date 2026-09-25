@@ -108,7 +108,10 @@ const readinessState = document.querySelector("#readiness-state");
 const readinessCleanup = document.querySelector("#readiness-cleanup");
 const readinessGuidance = document.querySelector("#readiness-guidance");
 const outlinePanel = document.querySelector("#outline-panel");
+const outlineTitle = document.querySelector("#outline-title");
+const outlineDescription = document.querySelector("#outline-description");
 const outline = document.querySelector("#outline");
+const outlineAgents = document.querySelector("#outline-agents");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -166,7 +169,8 @@ let promptDraft = {
   cwd: promptCwd.value,
   prompt: promptText.value,
 };
-let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+let issueDrivenDraft = {json: issueDrivenJson.value, code: "", preview: null};
+let issueDrivenRunPreview = null;
 let reviewDraft = {json: reviewJson.value, code: ""};
 let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
@@ -233,10 +237,13 @@ function issueDrivenRepositories(config) {
 
 function invalidateIssueDrivenDraft() {
   issueDrivenRequestGeneration += 1;
+  validationRequestGeneration += 1;
   issueDrivenPython.value = "";
-  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+  issueDrivenDraft = {json: issueDrivenJson.value, code: "", preview: null};
   issueDrivenSuccess.hidden = true;
   issueDrivenValidation.replaceChildren();
+  issueDrivenRunPreview = null;
+  if (activeRunId === null && currentMode === "issue-driven") renderOutline([], []);
 }
 
 function updateRepositoryConfig(index, key, value) {
@@ -457,7 +464,11 @@ function captureDraftIfEditing() {
     } else if (currentMode === "environment-setup") {
       environmentSetupDraft = {json: environmentSetupJson.value, code: environmentSetupPython.value};
     } else if (currentMode === "issue-driven") {
-      issueDrivenDraft = {json: issueDrivenJson.value, code: issueDrivenPython.value};
+      issueDrivenDraft = {
+        json: issueDrivenJson.value,
+        code: issueDrivenPython.value,
+        preview: issueDrivenRunPreview,
+      };
     } else if (currentMode === "review") {
       reviewDraft = {json: reviewJson.value, code: reviewPython.value};
     } else {
@@ -485,14 +496,17 @@ function inheritFolderIntoDraft(snapshot, mode) {
     const config = JSON.parse(issueDrivenDraft.json);
     if (config === null || Array.isArray(config) || typeof config !== "object") return;
     if (Array.isArray(config.repositories) && config.repositories.length > 0) {
+      if (config.repositories[0].repository === folder) return;
       config.repositories[0].repository = folder;
     } else {
+      if (config.repository === folder) return;
       config.repository = folder;
     }
     issueDrivenDraft = {
       ...issueDrivenDraft,
       json: JSON.stringify(config, null, 2),
       code: "",
+      preview: null,
     };
   } catch {
     // Preserve invalid in-progress JSON exactly; normal validation will show
@@ -868,6 +882,7 @@ async function enterDraftMode(mode = currentMode) {
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = issueDrivenDraft.json;
       issueDrivenPython.value = issueDrivenDraft.code;
+      issueDrivenRunPreview = issueDrivenDraft.preview;
     } else if (currentMode === "review") {
       reviewJson.value = reviewDraft.json;
       reviewPython.value = reviewDraft.code;
@@ -877,6 +892,13 @@ async function enterDraftMode(mode = currentMode) {
     }
   }
   renderCleanDraftState();
+  if (currentMode === "issue-driven" && issueDrivenRunPreview) {
+    renderOutline(
+      issueDrivenRunPreview.phases || [],
+      [],
+      issueDrivenRunPreview,
+    );
+  }
   showDraftLabel();
   applyFieldMode();
   await refresh();
@@ -1237,7 +1259,7 @@ async function refreshReadiness() {
   }
 }
 
-function renderOutline(labels, events) {
+function renderOutline(labels, events, plannedPreview = null) {
   const states = new Map(labels.map((label) => [label, "pending"]));
   for (const event of events) {
     if (!states.has(event.name)) continue;
@@ -1249,6 +1271,20 @@ function renderOutline(labels, events) {
   }
 
   outline.replaceChildren();
+  outlineTitle.textContent = plannedPreview ? "Planned run preview" : "Execution outline";
+  outlineDescription.hidden = !plannedPreview;
+  outlineDescription.textContent = plannedPreview
+    ? "Expected phases and agent purposes; these are a plan, not actual execution results."
+    : "";
+  outlineAgents.replaceChildren();
+  outlineAgents.hidden = !plannedPreview;
+  for (const agent of plannedPreview?.agents || []) {
+    const term = document.createElement("dt");
+    term.textContent = `${agent.role} (${agent.agent})`;
+    const description = document.createElement("dd");
+    description.textContent = agent.purpose;
+    outlineAgents.append(term, description);
+  }
   outlinePanel.hidden = labels.length === 0;
   for (const label of labels) {
     const state = states.get(label);
@@ -1270,6 +1306,12 @@ function renderOutline(labels, events) {
     item.append(marker, text);
     outline.append(item);
   }
+}
+
+function currentPlannedRunPreview() {
+  return activeRunId === null && currentMode === "issue-driven"
+    ? issueDrivenRunPreview
+    : null;
 }
 
 function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips = []) {
@@ -1896,8 +1938,16 @@ async function generateIssueDrivenCode() {
       && issueDrivenJson.value === source
     ) {
       issueDrivenPython.value = result.generatedCode;
-      issueDrivenDraft = {json: source, code: result.generatedCode};
+      issueDrivenRunPreview = result.runPreview || null;
+      issueDrivenDraft = {
+        json: source,
+        code: result.generatedCode,
+        preview: issueDrivenRunPreview,
+      };
       renderIssueDrivenValidation(result.issueDrivenValidation || []);
+      if (issueDrivenRunPreview) {
+        renderOutline(issueDrivenRunPreview.phases || [], [], issueDrivenRunPreview);
+      }
     }
     return result.generatedCode;
   } catch (error) {
@@ -2216,7 +2266,11 @@ runButton.addEventListener("click", async () => {
           && activeRunId === null
         ) {
           renderValidation(error.result.validation);
-          renderOutline(error.result.outline || [], []);
+          renderOutline(
+            error.result.outline || [],
+            [],
+            currentPlannedRunPreview(),
+          );
         }
       } else if (selectionGeneration === activeRunGeneration) {
         stderr.textContent = String(error);
@@ -2267,7 +2321,11 @@ validateButton.addEventListener("click", async () => {
         && activeRunId === null
       ) {
         renderValidation(result.validation || []);
-        renderOutline(result.outline || [], []);
+        renderOutline(
+          result.outline || [],
+          [],
+          currentPlannedRunPreview(),
+        );
       }
     } catch (error) {
       if (
@@ -2277,7 +2335,11 @@ validateButton.addEventListener("click", async () => {
         && Array.isArray(error.result?.validation)
       ) {
         renderValidation(error.result.validation);
-        renderOutline(error.result.outline || [], []);
+        renderOutline(
+          error.result.outline || [],
+          [],
+          currentPlannedRunPreview(),
+        );
       } else if (
         requestGeneration === validationRequestGeneration
         && selectionGeneration === activeRunGeneration
@@ -2292,6 +2354,7 @@ validateButton.addEventListener("click", async () => {
 dryRunButton.addEventListener("click", async () => {
   if (activeRunId !== null) return;
   await withPendingButton(dryRunButton, async () => {
+    const requestGeneration = ++validationRequestGeneration;
     const selectionGeneration = activeRunGeneration;
     try {
       const payload = await workflowSubmissionPayload();
@@ -2300,15 +2363,28 @@ dryRunButton.addEventListener("click", async () => {
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload),
       });
-      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
         renderValidation(result.validation || []);
-        renderOutline(result.outline || [], []);
+        renderOutline(result.outline || [], [], currentPlannedRunPreview());
         renderDryRun(result);
       }
     } catch (error) {
-      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
         if (error.result) {
           renderValidation(error.result.validation || []);
+          renderOutline(
+            error.result.outline || [],
+            [],
+            currentPlannedRunPreview(),
+          );
           renderDryRun(error.result);
         } else {
           stderr.textContent = String(error);
