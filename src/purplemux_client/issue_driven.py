@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -35,6 +36,33 @@ class IssueDrivenValidationError(ValueError):
     def __init__(self, findings: list[IssueDrivenFinding]) -> None:
         super().__init__("issue-driven JSON validation failed")
         self.findings = tuple(findings)
+
+
+@dataclass(frozen=True)
+class IssueDrivenAgentPurpose:
+    role: str
+    agent: str
+    purpose: str
+
+    def as_json(self) -> dict[str, str]:
+        return {
+            "role": self.role,
+            "agent": self.agent,
+            "purpose": self.purpose,
+        }
+
+
+@dataclass(frozen=True)
+class IssueDrivenRunPreview:
+    phases: tuple[str, ...]
+    agents: tuple[IssueDrivenAgentPurpose, ...]
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "status": "planned",
+            "phases": list(self.phases),
+            "agents": [agent.as_json() for agent in self.agents],
+        }
 
 
 IssueTopologyClassification = Literal["new", "recoverable", "already_integrated"]
@@ -1466,12 +1494,83 @@ def _fixed_config_functions(config: IssueDrivenConfig) -> str:
     )
 
 
-def _workflow_outline(config: IssueDrivenConfig) -> str:
+def issue_driven_workflow_outline(config: IssueDrivenConfig) -> tuple[str, ...]:
     labels = ["Work items"]
     if config.final_review:
         labels.append("Whole-version review")
     labels.append("Final integration PR")
-    entries = "\n".join(f"    {label!r}," for label in labels)
+    return tuple(labels)
+
+
+def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview:
+    """Describe the generated run without predicting its eventual execution."""
+    reviewer_purpose = "Plans work items, independently reviews scope and correctness, "
+    reviewer_purpose += (
+        "and prepares whole-version review and handoff."
+        if config.final_review
+        else "and prepares delivery handoff."
+    )
+    return IssueDrivenRunPreview(
+        phases=_workflow_preview_phases(config),
+        agents=(
+            IssueDrivenAgentPurpose(
+                role="Implementer",
+                agent=config.implementer_agent,
+                purpose=(
+                    "Recovers work-item state, implements changes, and performs "
+                    "fixes and cleanup."
+                ),
+            ),
+            IssueDrivenAgentPurpose(
+                role="Reviewer",
+                agent=config.reviewer_agent,
+                purpose=reviewer_purpose,
+            ),
+        ),
+    )
+
+
+def _workflow_preview_phases(config: IssueDrivenConfig) -> tuple[str, ...]:
+    """Read preview phase metadata from the canonical generated workflow."""
+    assignment = next(
+        (
+            node
+            for node in ast.parse(_canonical_source()).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "WORKFLOW_PREVIEW_PHASES"
+                for target in node.targets
+            )
+        ),
+        None,
+    )
+    if assignment is None:
+        raise RuntimeError("canonical workflow preview metadata is missing")
+    value = ast.literal_eval(assignment.value)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not item[0]
+            or item[1] not in ("always", "final_review")
+            for item in value
+        )
+    ):
+        raise RuntimeError("canonical workflow preview metadata is invalid")
+    return tuple(
+        label
+        for label, availability in value
+        if availability == "always" or config.final_review
+    )
+
+
+def _workflow_outline(config: IssueDrivenConfig) -> str:
+    entries = "\n".join(
+        f"    {label!r}," for label in issue_driven_workflow_outline(config)
+    )
     return f"WORKFLOW_OUTLINE = [\n{entries}\n]"
 
 

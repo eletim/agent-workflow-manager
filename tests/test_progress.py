@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import threading
+from urllib import error
 
 import pytest
 
 from purplemux_client import (
+    emit_agent_turn,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -19,6 +23,8 @@ from purplemux_client import (
     register_run_resource,
 )
 from purplemux_client.progress import (
+    EVENT_TOKEN_ENV,
+    EVENT_URL_ENV,
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
 )
@@ -58,6 +64,205 @@ def test_emit_step_writes_one_json_event(monkeypatch: pytest.MonkeyPatch) -> Non
         "pr_number": 42,
         "pr_url": "https://github.com/example/repo/pull/42",
     }
+
+
+def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    prompt = "目的を確認する。\n" + "actual prompt 🎯\n" * 500
+    try:
+        emit_agent_turn(
+            7,
+            "Review the current head",
+            "reviewer",
+            2,
+            "started",
+            repository="acme/project",
+            prompt=prompt,
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        chunks = [json.loads(line) for line in stream]
+
+    assert chunks
+    assert all(
+        len(
+            (
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode()
+        )
+        <= MAX_PROGRESS_EVENT_BYTES
+        for item in chunks
+    )
+    encoded = "".join(item["data"] for item in chunks)
+    payload = json.loads(base64.b64decode(encoded).decode())
+    assert payload == {
+        "turn_id": 7,
+        "purpose": "Review the current head",
+        "role": "reviewer",
+        "attempt": 2,
+        "status": "started",
+        "repository": "acme/project",
+        "prompt": prompt,
+    }
+
+
+def test_emit_agent_turn_completed_carries_authoritative_transition_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_agent_turn(
+            8,
+            "Review the current head",
+            "reviewer",
+            3,
+            "completed",
+            repository="acme/project",
+            phase="correctness-review",
+            work_item_id="validate-change",
+            work_item_label="Mini task validate-change",
+            transition_outcome="changes_requested",
+            commit_sha="a" * 40,
+            result="CHANGES_REQUESTED",
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        chunks = [json.loads(line) for line in stream]
+    encoded = "".join(item["data"] for item in chunks)
+    assert json.loads(base64.b64decode(encoded).decode()) == {
+        "turn_id": 8,
+        "purpose": "Review the current head",
+        "role": "reviewer",
+        "attempt": 3,
+        "status": "completed",
+        "repository": "acme/project",
+        "phase": "correctness-review",
+        "work_item_id": "validate-change",
+        "work_item_label": "Mini task validate-change",
+        "transition_outcome": "changes_requested",
+        "commit_sha": "a" * 40,
+        "result": "CHANGES_REQUESTED",
+    }
+
+
+def test_emit_agent_turn_http_delivery_is_decoupled_and_retries_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_request_started = threading.Event()
+    release_first_request = threading.Event()
+    attempts: list[int] = []
+    delivered: list[dict[str, object]] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"{}"
+
+    def briefly_stalled(submitted, *, timeout: float):
+        assert timeout == 5
+        event = json.loads(submitted.data)
+        attempts.append(event["chunk_index"])
+        if len(attempts) == 1:
+            first_request_started.set()
+            assert release_first_request.wait(2)
+            raise error.URLError("response arrived after the client timeout")
+        delivered.append(event)
+        return Response()
+
+    monkeypatch.setenv(EVENT_URL_ENV, "http://127.0.0.1:1/events")
+    monkeypatch.setenv(EVENT_TOKEN_ENV, "token")
+    monkeypatch.setattr("purplemux_client.progress.request.urlopen", briefly_stalled)
+
+    emit_agent_turn(
+        7,
+        "Review the current head",
+        "reviewer",
+        2,
+        "started",
+        repository="acme/project",
+        prompt="large prompt\n" * 2_000,
+    )
+
+    assert first_request_started.wait(1)
+    assert attempts == [0]
+    release_first_request.set()
+    for _ in range(100):
+        if delivered and len(delivered) == delivered[0]["chunk_count"]:
+            break
+        threading.Event().wait(0.01)
+
+    assert attempts[:2] == [0, 0]
+    assert [event["chunk_index"] for event in delivered] == list(
+        range(delivered[0]["chunk_count"])
+    )
+
+
+def test_permanent_agent_turn_rejection_does_not_block_later_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejected = threading.Event()
+    later_delivered = threading.Event()
+    attempts: list[str] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"{}"
+
+    def reject_then_accept(submitted, *, timeout: float):
+        assert timeout == 5
+        event = json.loads(submitted.data)
+        attempts.append(event["message_id"])
+        if event["message_id"] == "8:started":
+            rejected.set()
+            raise error.HTTPError(submitted.full_url, 400, "invalid", None, None)
+        later_delivered.set()
+        return Response()
+
+    monkeypatch.setenv(EVENT_URL_ENV, "http://127.0.0.1:1/events")
+    monkeypatch.setenv(EVENT_TOKEN_ENV, "token")
+    monkeypatch.setattr("purplemux_client.progress.request.urlopen", reject_then_accept)
+
+    emit_agent_turn(
+        8,
+        "Rejected turn",
+        "reviewer",
+        1,
+        "started",
+        repository="acme/project",
+        prompt="large rejected prompt\n" * 2_000,
+    )
+    assert rejected.wait(1)
+    emit_agent_turn(
+        9,
+        "Later turn",
+        "reviewer",
+        1,
+        "started",
+        repository="acme/project",
+        prompt="later prompt",
+    )
+
+    assert later_delivered.wait(1)
+    assert attempts == ["8:started", "9:started"]
 
 
 def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:

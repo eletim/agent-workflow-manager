@@ -141,6 +141,9 @@ function snapshot({
   reviewJson = undefined,
   reviewResult = undefined,
   resumedFromRunId = null,
+  recoverySource = null,
+  runPreview = null,
+  agentTurns = [],
 }) {
   const result = {
     args,
@@ -175,6 +178,9 @@ function snapshot({
     issueDrivenSummary,
     purplemuxPort,
     resumedFromRunId,
+    recoverySource,
+    runPreview,
+    agentTurns,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -245,10 +251,12 @@ async function loadApp({
   fetchOverride = null,
   clipboardOverride = null,
   confirmOverride = null,
+  initialStatusOverride = null,
+  selectLatest = true,
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "runtime-view", "runtime-panel", "prompt-fields",
     "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
     "review-result-panel", "review-result-status", "review-result-json",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
@@ -272,7 +280,7 @@ async function loadApp({
     "resume-open", "resume-dialog", "resume-source", "resume-settings",
     "resume-cancel", "resume-confirm",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
-    "validation-success", "validation", "outline-panel", "outline", "guide-dialog",
+    "validation-success", "validation", "outline-panel", "outline-title", "outline-description", "workflow-story-state", "workflow-story-navigation", "workflow-recovery-transition", "outline", "outline-agents", "actual-story-title", "agent-turns", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
     "readiness-workspace", "readiness-provider", "run-readiness", "reconcile-readiness",
@@ -293,6 +301,7 @@ async function loadApp({
   elements.favicon = new Element();
   elements.favicon.setAttribute("href", "/favicon.svg");
   elements["validation-panel"].hidden = true;
+  elements["runtime-panel"].hidden = true;
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
   elements["readiness-provider"].value = "codex";
@@ -316,7 +325,7 @@ async function loadApp({
     serverUrl: "https://example.invalid",
     topic: "test",
   };
-  const initial = {
+  const initial = initialStatusOverride || {
     ...snapshot({runId: null, state: "idle", stdout: ""}),
     cwd: "/work",
     exitCode: null,
@@ -396,12 +405,23 @@ async function loadApp({
   assert.ok(calls.some(([url]) => url === "/api/readiness"));
   assert.equal(eventSources.length, 1);
   assert.equal(eventSources[0].url, "/api/events");
+  // Most behavior tests operate on an explicitly selected saved run. Preserve
+  // that setup without making production startup selection implicit.
+  if (
+    selectLatest
+    && !new URL(locationHref).searchParams.has("run")
+    && selectedRun(elements) === undefined
+    && runs.length > 0
+  ) {
+    await runItem(elements, runs[runs.length - 1].runId).dispatch("click");
+  }
   return {
     calls,
     elements,
     location: context.window.location,
     eventSource: eventSources[0],
     logDisplay: context.runnerLogDisplay,
+    refresh: context.refresh,
   };
 }
 
@@ -798,6 +818,65 @@ test("Settings opens Notifications repeatedly without losing form state", async 
   assert.equal(elements["notify-topic"].value, "edited-topic");
 });
 
+test("Issue Driven is the default draft and developer modes remain available", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  assert.equal(elements["issue-driven-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
+  assert.equal(elements["developer-views"].open, false);
+  assert.equal(elements["runtime-panel"].open, false);
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+
+  await elements["runtime-view"].dispatch("click");
+  assert.equal(elements["runtime-panel"].open, true);
+  assert.equal(elements["runtime-panel"].hidden, false);
+
+  await elements["workflow-mode"].dispatch("click");
+
+  assert.equal(elements["workflow-fields"].hidden, false);
+  assert.equal(elements["developer-views"].open, true);
+});
+
+test("saved run history stays unselected across startup reconciliation", async () => {
+  const latest = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "saved output",
+    mode: "workflow",
+  });
+  const {calls, elements, eventSource} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", mode: "prompt", cwd: "/work/one"},
+      {runId: 2, state: "success", mode: "workflow", cwd: "/work/two"},
+    ],
+    details: {2: latest},
+    validation: {status: 200, body: {validation: []}},
+    initialStatusOverride: latest,
+    selectLatest: false,
+  });
+
+  assert.equal(selectedRun(elements), undefined);
+  assert.equal(elements["issue-driven-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements["developer-views"].open, false);
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+  assert.equal(calls.some(([url]) => url === "/api/runs/2"), false);
+  assert.ok(runItem(elements, 1));
+  assert.ok(runItem(elements, 2));
+
+  eventSource.emit("open");
+  await waitFor(() => calls.filter(([url]) => url === "/api/runs").length === 2);
+  assert.equal(selectedRun(elements), undefined);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+});
+
 test("Settings shows the configured remote URL and its QR code", async () => {
   const remoteUrl = "http://runner.example.ts.net:8765";
   const {elements} = await loadApp({
@@ -1048,6 +1127,14 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
           config: {mode: "issue-driven"},
           generatedCode,
           issueDrivenValidation: [],
+          runPreview: {
+            status: "planned",
+            phases: ["generated"],
+            agents: [
+              {role: "Implementer", agent: "claude", purpose: "Implements changes."},
+              {role: "Reviewer", agent: "codex", purpose: "Reviews changes."},
+            ],
+          },
         });
       }
       if (url === "/api/validate") {
@@ -1068,7 +1155,23 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.equal(elements["issue-driven-python"].value, generatedCode);
   assert.deepEqual(validatedPayload, {code: generatedCode, args: []});
   assert.equal(elements["issue-driven-success"].hidden, false);
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.equal(elements.outline.children[0].className, "outline-item planned");
+  assert.equal(elements.outline.children[0].children[0].textContent, "○");
+  assert.match(elements["workflow-story-state"].textContent, /^PLANNED/);
+  assert.equal(elements["agent-turns"].hidden, true);
+  assert.deepEqual(
+    elements["outline-agents"].children.map((item) => item.textContent),
+    ["Implementer (claude)", "Implements changes.", "Reviewer (codex)", "Reviews changes."],
+  );
   assert.deepEqual(outlineLabels(elements), ["generated"]);
+
+  elements["issue-driven-json"].value = '{"issues":[90]}';
+  await elements["issue-driven-json"].dispatch("input");
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["outline-title"].textContent, "Execution outline");
+  assert.equal(elements["outline-agents"].children.length, 0);
 });
 
 test("Issue Driven repository editor adds and edits repository declarations", async () => {
@@ -1348,6 +1451,8 @@ test("Run pending feedback clears after failure and permits a retry", async () =
     },
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   const pendingRun = elements.run.dispatch("click");
   assert.equal(elements.run.disabled, true);
   assert.equal(elements.run.dataset.pending, "true");
@@ -1394,6 +1499,11 @@ test("non-Run async actions use the same pending feedback", async () => {
 
 test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async () => {
   const generatedCode = "WORKFLOW_DRY_RUN = 1\nprint('generated')";
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Implementer", agent: "codex", purpose: "Implements changes."}],
+  };
   const submissions = [];
   const started = snapshot({
     runId: 12,
@@ -1407,13 +1517,13 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
     validation: {body: {}, status: 200},
     fetchOverride(url, options) {
       if (url === "/api/issue-driven/generate") {
-        return response({generatedCode, issueDrivenValidation: []});
+        return response({generatedCode, issueDrivenValidation: [], runPreview});
       }
       if (url === "/api/dry-run") {
         submissions.push([url, JSON.parse(options.body)]);
         return response({
           validation: [],
-          outline: [],
+          outline: ["Work items"],
           dryRun: {status: "complete", findings: [], nextMutation: null},
         });
       }
@@ -1428,6 +1538,9 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
   await elements["issue-driven-mode"].dispatch("click");
   elements["issue-driven-json"].value = "{}";
   await elements["dry-run"].dispatch("click");
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+  assert.equal(elements["outline-agents"].children[0].textContent, "Implementer (codex)");
   await elements.run.dispatch("click");
 
   assert.deepEqual(submissions, [
@@ -1438,6 +1551,135 @@ test("Issue Driven Dry Run and Run reuse the generated Python endpoints", async 
   assert.equal(elements.run.dataset.pending, undefined);
   assert.equal(elements.run.getAttribute("aria-busy"), undefined);
   assert.equal(elements.run.disabled, true);
+});
+
+test("rejected Issue Driven Run keeps its backend planned preview", async () => {
+  const generatedCode = "WORKFLOW_OUTLINE = ['Work items']";
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Reviewer", agent: "claude", purpose: "Reviews changes."}],
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode, issueDrivenValidation: [], runPreview});
+      }
+      if (url === "/api/run") {
+        return response({
+          error: "workflow validation failed",
+          validation: [{line: 1, message: "rejected"}],
+          outline: ["Work items"],
+        }, 422);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = "{}";
+  await elements.run.dispatch("click");
+
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+  assert.equal(elements["outline-agents"].children[0].textContent, "Reviewer (claude)");
+  assert.equal(elements.validation.children[0].textContent, "Line 1: rejected");
+});
+
+test("Issue Driven edits invalidate pending Validate and Dry Run renders", async () => {
+  const delayedValidation = deferred();
+  const delayedDryRun = deferred();
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Reviewer", agent: "codex", purpose: "Reviews changes."}],
+  };
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode: "# generated", issueDrivenValidation: [], runPreview});
+      }
+      if (url === "/api/validate") return delayedValidation.promise;
+      if (url === "/api/dry-run") return delayedDryRun.promise;
+      return undefined;
+    },
+  });
+
+  await elements["issue-driven-mode"].dispatch("click");
+  elements["issue-driven-json"].value = '{"issues":[90]}';
+  const pendingValidation = elements.validate.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["issue-driven-json"].value = '{"issues":[91]}';
+  await elements["issue-driven-json"].dispatch("input");
+  delayedValidation.resolve(response({validation: [], outline: ["stale validation"]}));
+  await pendingValidation;
+  assert.equal(elements["outline-panel"].hidden, true);
+
+  const pendingDryRun = elements["dry-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["issue-driven-json"].value = '{"issues":[92]}';
+  await elements["issue-driven-json"].dispatch("input");
+  delayedDryRun.resolve(response({
+    validation: [],
+    outline: ["stale dry run"],
+    dryRun: {status: "complete", findings: [], nextMutation: null},
+  }));
+  await pendingDryRun;
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["dry-run-panel"].hidden, true);
+});
+
+test("unchanged Issue Driven draft restores its backend planned preview", async () => {
+  const source = JSON.stringify({
+    mode: "issue-driven",
+    repository: "/work/repository",
+    issues: [90],
+  });
+  const runPreview = {
+    status: "planned",
+    phases: ["Work items"],
+    agents: [{role: "Implementer", agent: "codex", purpose: "Implements changes."}],
+  };
+  const viewedRun = snapshot({
+    runId: 1,
+    mode: "issue-driven",
+    issueDrivenJson: source,
+    executionContext: {sourceRepository: "/work/repository"},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", mode: "issue-driven"}],
+    details: {1: viewedRun},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/issue-driven/generate") {
+        return response({generatedCode: "# generated", issueDrivenValidation: [], runPreview});
+      }
+      return undefined;
+    },
+  });
+
+  await elements["new-run"].dispatch("click");
+  elements["issue-driven-json"].value = source;
+  await elements["issue-driven-json"].dispatch("input");
+  await elements["issue-driven-generate"].dispatch("click");
+  await elements["workflow-mode"].dispatch("click");
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+
+  await runItem(elements, 1).dispatch("click");
+  await elements["new-run"].dispatch("click");
+  assert.equal(elements["issue-driven-python"].value, "# generated");
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.deepEqual(outlineLabels(elements), ["Work items"]);
+  assert.equal(elements["outline-agents"].children[0].textContent, "Implementer (codex)");
 });
 
 test("failed Issue Driven run previews immutable settings and resumes as a new run", async () => {
@@ -1456,6 +1698,11 @@ test("failed Issue Driven run previews immutable settings and resumes as a new r
     mode: "issue-driven",
     issueDrivenJson: source,
     resumedFromRunId: 4,
+    recoverySource: {
+      runId: 4,
+      identity: "a".repeat(32) + "-4",
+      state: "failed",
+    },
   });
   const runs = [{runId: 4, state: "failed", mode: "issue-driven"}];
   const details = {4: failed};
@@ -1491,6 +1738,36 @@ test("failed Issue Driven run previews immutable settings and resumes as a new r
   assert.match(elements["active-context"].textContent, /Issue Driven Run #5/);
   assert.match(elements["active-context"].textContent, /resumed from Run #4/);
   assert.match(runItem(elements, 5).textContent, /Resume of #4/);
+  const recoveryTransition = elements["workflow-recovery-transition"];
+  assert.equal(recoveryTransition.hidden, false);
+  assert.equal(recoveryTransition.children[1].textContent, "Run #4 (FAILED)");
+  assert.equal(
+    recoveryTransition.children[1].href,
+    `/?run=${"a".repeat(32)}-4`,
+  );
+  assert.equal(recoveryTransition.children[2].textContent, " → Run #5");
+});
+
+test("Recovery remains linked when the prior outcome is unavailable", async () => {
+  const identity = "b".repeat(32) + "-3";
+  const detail = snapshot({
+    runId: 5,
+    state: "running",
+    mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}',
+    resumedFromRunId: 3,
+    recoverySource: {runId: 3, identity, state: null},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 5, state: "running", mode: "issue-driven"}],
+    details: {5: detail},
+  });
+
+  const recoveryTransition = elements["workflow-recovery-transition"];
+  assert.equal(recoveryTransition.hidden, false);
+  assert.equal(recoveryTransition.children[1].textContent, "Run #3 (OUTCOME UNAVAILABLE)");
+  assert.equal(recoveryTransition.children[1].href, `/?run=${identity}`);
+  assert.equal(recoveryTransition.children[2].textContent, " → Run #5");
 });
 
 test("failed Prompt and custom Workflow runs do not offer Resume", async () => {
@@ -1746,6 +2023,8 @@ test("Dry Run renders topology findings and the first mutation frontier", async 
       return undefined;
     },
   });
+
+  await elements["workflow-mode"].dispatch("click");
 
   await elements["dry-run"].dispatch("click");
 
@@ -2153,6 +2432,7 @@ test("execution outline reflects matching progress and keeps dynamic progress", 
   });
 
   assert.equal(elements["outline-panel"].hidden, false);
+  assert.equal(elements["outline-title"].textContent, "Execution outline");
   assert.deepEqual(outlineLabels(elements), ["prepare", "implement", "review", "ready PR"]);
   assert.deepEqual(
     elements.outline.children.map((item) => item.className),
@@ -2391,6 +2671,183 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
   assert.equal(elements["issue-summary-panel"].hidden, true);
 });
 
+test("Issue Driven run presents authoritative agent turns as an actual workflow story", async () => {
+  const exactPrompt = "Review exactly this head.\n\nDo not reconstruct this prompt. 🎯";
+  const issueDrivenSummary = {
+    repository: "acme/project",
+    integrationBranch: "dev/v1",
+    finalBranch: "main",
+    terminalResult: "running",
+    warningCount: 0,
+    issues: [{
+      issue: "mini-task:story",
+      label: "Mini task story",
+      pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+      terminals: {
+        implementation: {workspaceId: "ws-run", tabId: "tab-implementation"},
+        scopeReview: {workspaceId: "ws-run", tabId: "tab-scope"},
+        correctnessReview: {workspaceId: "ws-run", tabId: "tab-correctness"},
+      },
+      warnings: [],
+    }],
+    wholeReview: null,
+    basePr: null,
+  };
+  const agentTurns = [
+    {
+      turnId: 1, purpose: "Review the current implementation", prompt: exactPrompt,
+      role: "reviewer", attempt: 1, status: "completed", phase: "correctness-review",
+      workItemId: "mini-task:story", workItemLabel: "Mini task story",
+      transitionOutcome: "changes_requested", result: "CHANGES_REQUESTED",
+      commitSha: "b".repeat(40),
+      nextTurnId: 2, completedAt: "2026-09-25T01:00:00Z", repository: "acme/project",
+    },
+    {
+      turnId: 2, purpose: "Fix the requested changes", prompt: "Fix prompt",
+      role: "implementer", attempt: 1, status: "completed", phase: "fix",
+      workItemId: "mini-task:story", workItemLabel: "Mini task story",
+      transitionOutcome: "continue_to_correctness_review", result: "Fixed",
+      commitSha: "c".repeat(40),
+      nextTurnId: 3, completedAt: "2026-09-25T01:01:00Z", repository: "acme/project",
+    },
+    {
+      turnId: 3, purpose: "Re-review the fixed head", prompt: "Re-review prompt",
+      role: "reviewer", attempt: 2, status: "started", phase: "correctness-review",
+      workItemId: "mini-task:story", workItemLabel: "Mini task story",
+      transitionOutcome: null, result: null, nextTurnId: null, completedAt: null,
+      commitSha: "c".repeat(40),
+      repository: "acme/project",
+    },
+  ];
+  const detail = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}',
+    outline: ["Work items", "Final integration PR"],
+    progress: [{name: "Work items", status: "started"}],
+    issueDrivenSummary,
+    runPreview: {
+      status: "planned",
+      phases: ["Work items", "Final integration PR"],
+      agents: [
+        {role: "Implementer", agent: "codex", purpose: "Implements and fixes."},
+        {role: "Reviewer", agent: "codex", purpose: "Reviews each head."},
+      ],
+    },
+    agentTurns,
+    executionContext: {
+      sourceRepository: "/work/project", executionRoot: "/managed/project",
+      baseRef: "origin/dev/v1", baseSha: "a".repeat(40),
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+    locationHref: "http://127.0.0.1:8765/",
+  });
+
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.equal(elements.outline.children[0].className, "outline-item planned");
+  assert.equal(elements.outline.children[0].children[0].textContent, "○");
+  assert.deepEqual(
+    elements["outline-agents"].children.map((item) => item.textContent),
+    ["Implementer (codex)", "Implements and fixes.", "Reviewer (codex)", "Reviews each head."],
+  );
+  assert.match(elements["workflow-story-state"].textContent, /^ACTUAL.*Current turn: Re-review/);
+  assert.equal(elements["actual-story-title"].hidden, false);
+  assert.equal(elements["agent-turns"].children.length, 3);
+  assert.match(
+    elements["agent-turns"].children[0].children.at(-1).textContent,
+    /Correctness Review → Fix · Changes Requested/,
+  );
+  assert.match(
+    elements["agent-turns"].children[1].children.at(-1).textContent,
+    /Fix → Correctness Review/,
+  );
+  const current = elements["agent-turns"].children[2];
+  assert.equal(current.className, "agent-turn current");
+  assert.match(current.children[0].textContent, /Turn 3 · Correctness Review/);
+  const promptDetails = elements["agent-turns"].children[0].children[4];
+  assert.equal(promptDetails.open, false);
+  assert.equal(promptDetails.children[0].textContent, "Show exact actual prompt");
+  assert.equal(promptDetails.children[1].textContent, exactPrompt);
+  assert.equal(elements["workflow-story-navigation"].children[0].href, "https://github.com/acme/project");
+  assert.equal(
+    elements["workflow-story-navigation"].children[2].href,
+    `https://github.com/acme/project/commit/${"a".repeat(40)}`,
+  );
+  const turnNavigation = elements["agent-turns"].children[0].children[3];
+  assert.equal(turnNavigation.children[2].textContent, "Commit bbbbbbbbbb");
+  assert.equal(
+    turnNavigation.children[2].href,
+    `https://github.com/acme/project/commit/${"b".repeat(40)}`,
+  );
+  assert.equal(turnNavigation.children[4].textContent, "PR #40");
+  assert.equal(turnNavigation.children[6].textContent, "PurpleMux terminal");
+  assert.equal(
+    turnNavigation.children[6].href,
+    "http://127.0.0.1:9123/?workspace=ws-run&tab=tab-correctness",
+  );
+});
+
+test("only the newest open tail is current while a run is active", async () => {
+  const agentTurns = [
+    {
+      turnId: 1, purpose: "Lost completion", prompt: "first", role: "reviewer",
+      attempt: 1, status: "started", completedAt: null, repository: "acme/project",
+    },
+    {
+      turnId: 2, purpose: "Recorded completion", prompt: "second", role: "reviewer",
+      attempt: 1, status: "completed", completedAt: "2026-09-25T01:00:00Z",
+      result: "done", repository: "acme/project",
+    },
+    {
+      turnId: 3, purpose: "Newest open turn", prompt: "third", role: "reviewer",
+      attempt: 1, status: "started", completedAt: null, repository: "acme/project",
+    },
+  ];
+  const detail = snapshot({
+    runId: 1, state: "running", mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}', agentTurns,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: detail},
+  });
+
+  const rendered = elements["agent-turns"].children;
+  assert.equal(rendered[0].className, "agent-turn started");
+  assert.match(rendered[0].children[2].textContent, /Completion event missing/);
+  assert.equal(rendered[2].className, "agent-turn current");
+  assert.match(rendered[2].children[2].textContent, /In progress/);
+  assert.match(elements["workflow-story-state"].textContent, /Current turn: Newest open turn/);
+});
+
+test("terminal runs never present an open trace as current or in progress", async () => {
+  const detail = snapshot({
+    runId: 1, state: "failed", mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}',
+    agentTurns: [{
+      turnId: 1, purpose: "Interrupted turn", prompt: "prompt", role: "implementer",
+      attempt: 1, status: "started", completedAt: null, repository: "acme/project",
+    }],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", mode: "issue-driven"}],
+    details: {1: detail},
+  });
+
+  const turn = elements["agent-turns"].children[0];
+  assert.equal(turn.className, "agent-turn started");
+  assert.doesNotMatch(turn.textContent, /CURRENT|In progress/);
+  assert.match(turn.children[2].textContent, /Run failed before completion was recorded/);
+  assert.doesNotMatch(elements["workflow-story-state"].textContent, /Current turn/);
+});
+
 test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped", async () => {
   const issueDrivenSummary = {
     terminalResult: "success",
@@ -2576,6 +3033,8 @@ test("validation displays a valid draft outline before execution", async () => {
     },
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   assert.equal(elements["outline-panel"].hidden, true);
   await elements.validate.dispatch("click");
 
@@ -2670,6 +3129,46 @@ test("SSE bursts coalesce to one active and one pending refresh", async () => {
     2,
   );
   assert.equal(elements.status.textContent, "✓ Success");
+});
+
+test("an older history response cannot regress known run identities", async () => {
+  const olderHistory = deferred();
+  const runs = [{runId: 1, state: "success", cwd: "/work/run-1"}];
+  let delayNextHistory = false;
+  let delayedHistory = false;
+  const {calls, elements, eventSource, refresh} = await loadApp({
+    runs,
+    details: {1: snapshot({runId: 1, state: "success", stdout: "saved"})},
+    validation: {status: 200, body: {validation: []}},
+    selectLatest: false,
+    fetchOverride(url) {
+      if (delayNextHistory && !delayedHistory && url === "/api/runs") {
+        delayedHistory = true;
+        return olderHistory.promise;
+      }
+      return undefined;
+    },
+  });
+
+  delayNextHistory = true;
+  eventSource.emit("runner-change");
+  await waitFor(() => delayedHistory);
+
+  // A newer reconciliation confirms Run #1 while the older request is still
+  // in flight. Its generation owns the known-history baseline.
+  await refresh();
+  olderHistory.resolve(response({runs: [], cleanupOwnership: []}));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const historyCalls = calls.filter(([url]) => url === "/api/runs").length;
+  eventSource.emit("runner-change");
+  await waitFor(() => (
+    calls.filter(([url]) => url === "/api/runs").length > historyCalls
+  ));
+
+  assert.equal(selectedRun(elements), undefined);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 });
 
 test("SSE refresh preserves the selected run while multiple runs change", async () => {
@@ -2773,6 +3272,8 @@ test("successful validation is explicit when no run exists", async () => {
     validation: {status: 200, body: {validation: []}},
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   assert.equal(elements["validation-panel"].hidden, true);
 
   await elements.validate.dispatch("click");
@@ -2800,6 +3301,8 @@ test("validation issues replace success feedback", async () => {
       }, 422);
     },
   });
+
+  await elements["workflow-mode"].dispatch("click");
 
   await elements.validate.dispatch("click");
   assert.equal(elements["validation-success"].hidden, false);
@@ -3543,6 +4046,8 @@ test("Workflow, Prompt, and Issue Driven drafts survive run selection independen
     validation: {status: 200, body: {validation: []}},
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   elements["run-arguments"].value = "workflow draft";
   elements.code.value = "print('workflow draft')";
   await elements["prompt-mode"].dispatch("click");
@@ -3804,6 +4309,8 @@ test("an SSE-discovered run cannot supersede a pending Run action", async () => 
     },
   });
 
+  await elements["workflow-mode"].dispatch("click");
+
   elements.code.value = "print('mine')";
   const submission = elements.run.dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
@@ -3861,7 +4368,7 @@ test("edits made while Run is pending remain in the retained draft", async () =>
   assert.equal(elements.code.value, "print('after')");
 });
 
-test("a run auto-selected via SSE while drafting captures in-progress edits first", async () => {
+test("a run auto-selected via SSE captures the default Issue Driven draft first", async () => {
   const runs = [];
   const details = {};
   const {elements, eventSource} = await loadApp({
@@ -3871,8 +4378,8 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
   });
 
   // No runs exist yet, so the fields hold an untouched draft nobody submitted.
-  elements["run-arguments"].value = "in-progress-arg";
-  elements.code.value = "print('in progress')";
+  elements["issue-driven-json"].value = '{"issues":[321]}';
+  elements["issue-driven-python"].value = "# generated in progress";
 
   // Another session starts a run concurrently; this client only learns about
   // it through the next SSE-triggered refresh, not through any explicit
@@ -3887,8 +4394,9 @@ test("a run auto-selected via SSE while drafting captures in-progress edits firs
 
   await elements["new-run"].dispatch("click");
 
-  assert.equal(elements["run-arguments"].value, "in-progress-arg");
-  assert.equal(elements.code.value, "print('in progress')");
+  await elements["issue-driven-mode"].dispatch("click");
+  assert.equal(elements["issue-driven-json"].value, '{"issues":[321]}');
+  assert.equal(elements["issue-driven-python"].value, "# generated in progress");
 });
 
 test("completed Workflow runs expose explicit Cleanup and retain their history", async () => {

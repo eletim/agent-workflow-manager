@@ -5,6 +5,9 @@ const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
 const reviewModeButton = document.querySelector("#review-mode");
 const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
+const developerViews = document.querySelector("#developer-views");
+const runtimeView = document.querySelector("#runtime-view");
+const runtimePanel = document.querySelector("#runtime-panel");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
 const reviewFields = document.querySelector("#review-fields");
@@ -108,7 +111,15 @@ const readinessState = document.querySelector("#readiness-state");
 const readinessCleanup = document.querySelector("#readiness-cleanup");
 const readinessGuidance = document.querySelector("#readiness-guidance");
 const outlinePanel = document.querySelector("#outline-panel");
+const outlineTitle = document.querySelector("#outline-title");
+const outlineDescription = document.querySelector("#outline-description");
 const outline = document.querySelector("#outline");
+const outlineAgents = document.querySelector("#outline-agents");
+const workflowStoryState = document.querySelector("#workflow-story-state");
+const workflowStoryNavigation = document.querySelector("#workflow-story-navigation");
+const workflowRecoveryTransition = document.querySelector("#workflow-recovery-transition");
+const actualStoryTitle = document.querySelector("#actual-story-title");
+const agentTurns = document.querySelector("#agent-turns");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -150,7 +161,7 @@ let activeGuide = null;
 let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
-let currentMode = "workflow";
+let currentMode = "issue-driven";
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
@@ -158,19 +169,22 @@ let rawStderr = "";
 // sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
 // retains the new-run args/code independently of whichever run is
 // currently being viewed, so switching runs never loses it. `explicitNewRun`
-// suppresses the "auto-select the latest run" behavior in refresh() once the
-// user has explicitly asked to compose or submit a new run.
+// suppresses auto-selection of a newly discovered run once the user has
+// explicitly asked to compose or submit a new run.
 let draft = {args: "", code: code.value};
 let promptDraft = {
   agent: promptAgent.value,
   cwd: promptCwd.value,
   prompt: promptText.value,
 };
-let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+let issueDrivenDraft = {json: issueDrivenJson.value, code: "", preview: null};
+let issueDrivenRunPreview = null;
 let reviewDraft = {json: reviewJson.value, code: ""};
 let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
+let knownRunIds = null;
+let knownRunIdsGeneration = 0;
 // The last detail response accepted for the selected run. This is the only
 // source used when carrying a reusable folder into a new-run draft; list
 // summaries and rendered text are intentionally insufficient.
@@ -233,10 +247,13 @@ function issueDrivenRepositories(config) {
 
 function invalidateIssueDrivenDraft() {
   issueDrivenRequestGeneration += 1;
+  validationRequestGeneration += 1;
   issueDrivenPython.value = "";
-  issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+  issueDrivenDraft = {json: issueDrivenJson.value, code: "", preview: null};
   issueDrivenSuccess.hidden = true;
   issueDrivenValidation.replaceChildren();
+  issueDrivenRunPreview = null;
+  if (activeRunId === null && currentMode === "issue-driven") renderOutline([], []);
 }
 
 function updateRepositoryConfig(index, key, value) {
@@ -427,10 +444,13 @@ function applyModeVisibility() {
   recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
-  issueDrivenModeButton.className = issueDrivenMode ? "selected" : "";
+  issueDrivenModeButton.className = issueDrivenMode
+    ? "issue-driven-entry selected"
+    : "issue-driven-entry";
   reviewModeButton.className = reviewMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
+  if (!issueDrivenMode) developerViews.open = true;
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
   reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
@@ -457,7 +477,11 @@ function captureDraftIfEditing() {
     } else if (currentMode === "environment-setup") {
       environmentSetupDraft = {json: environmentSetupJson.value, code: environmentSetupPython.value};
     } else if (currentMode === "issue-driven") {
-      issueDrivenDraft = {json: issueDrivenJson.value, code: issueDrivenPython.value};
+      issueDrivenDraft = {
+        json: issueDrivenJson.value,
+        code: issueDrivenPython.value,
+        preview: issueDrivenRunPreview,
+      };
     } else if (currentMode === "review") {
       reviewDraft = {json: reviewJson.value, code: reviewPython.value};
     } else {
@@ -485,14 +509,17 @@ function inheritFolderIntoDraft(snapshot, mode) {
     const config = JSON.parse(issueDrivenDraft.json);
     if (config === null || Array.isArray(config) || typeof config !== "object") return;
     if (Array.isArray(config.repositories) && config.repositories.length > 0) {
+      if (config.repositories[0].repository === folder) return;
       config.repositories[0].repository = folder;
     } else {
+      if (config.repository === folder) return;
       config.repository = folder;
     }
     issueDrivenDraft = {
       ...issueDrivenDraft,
       json: JSON.stringify(config, null, 2),
       code: "",
+      preview: null,
     };
   } catch {
     // Preserve invalid in-progress JSON exactly; normal validation will show
@@ -580,9 +607,11 @@ function renderRun(result) {
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
-  currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
-    ? result.mode
-    : "workflow";
+  if (result.runId != null) {
+    currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
+      ? result.mode
+      : "workflow";
+  }
   const running = result.state === "running";
   const presentation = runPresentation(result);
   statusBadge.textContent = presentation.label;
@@ -608,7 +637,13 @@ function renderRun(result) {
   checkedToggle.disabled = activeRunId === null || !checkable;
   checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
   checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
-  renderOutline(result.outline || [], result.progress || []);
+  const runPreview = result.mode === "issue-driven" ? result.runPreview || null : null;
+  renderOutline(
+    runPreview?.phases || result.outline || [],
+    result.progress || [],
+    runPreview,
+  );
+  renderIssueDrivenStory(result);
   renderProgress(
     result.progress || [],
     result.warningTimeline || [],
@@ -868,6 +903,7 @@ async function enterDraftMode(mode = currentMode) {
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = issueDrivenDraft.json;
       issueDrivenPython.value = issueDrivenDraft.code;
+      issueDrivenRunPreview = issueDrivenDraft.preview;
     } else if (currentMode === "review") {
       reviewJson.value = reviewDraft.json;
       reviewPython.value = reviewDraft.code;
@@ -877,6 +913,13 @@ async function enterDraftMode(mode = currentMode) {
     }
   }
   renderCleanDraftState();
+  if (currentMode === "issue-driven" && issueDrivenRunPreview) {
+    renderOutline(
+      issueDrivenRunPreview.phases || [],
+      [],
+      issueDrivenRunPreview,
+    );
+  }
   showDraftLabel();
   applyFieldMode();
   await refresh();
@@ -1237,18 +1280,48 @@ async function refreshReadiness() {
   }
 }
 
-function renderOutline(labels, events) {
-  const states = new Map(labels.map((label) => [label, "pending"]));
-  for (const event of events) {
-    if (!states.has(event.name)) continue;
-    states.set(event.name, {
-      started: "running",
-      completed: "completed",
-      failed: "failed",
-    }[event.status]);
+function renderOutline(labels, events, plannedPreview = null) {
+  const states = new Map(labels.map((label) => [
+    label,
+    plannedPreview ? "planned" : "pending",
+  ]));
+  if (!plannedPreview) {
+    for (const event of events) {
+      if (!states.has(event.name)) continue;
+      states.set(event.name, {
+        started: "running",
+        completed: "completed",
+        failed: "failed",
+      }[event.status]);
+    }
   }
 
   outline.replaceChildren();
+  outlineTitle.textContent = plannedPreview ? "Planned run preview" : "Execution outline";
+  outlineDescription.hidden = !plannedPreview;
+  outlineDescription.textContent = plannedPreview
+    ? "Expected phases and agent purposes; these are a plan, not actual execution results."
+    : "";
+  outlineAgents.replaceChildren();
+  outlineAgents.hidden = !plannedPreview;
+  workflowStoryState.hidden = !plannedPreview;
+  workflowStoryState.textContent = plannedPreview
+    ? "PLANNED · This preview describes the expected workflow before any agent turn runs."
+    : "";
+  workflowStoryNavigation.hidden = true;
+  workflowStoryNavigation.replaceChildren();
+  workflowRecoveryTransition.hidden = true;
+  workflowRecoveryTransition.replaceChildren();
+  actualStoryTitle.hidden = true;
+  agentTurns.hidden = true;
+  agentTurns.replaceChildren();
+  for (const agent of plannedPreview?.agents || []) {
+    const term = document.createElement("dt");
+    term.textContent = `${agent.role} (${agent.agent})`;
+    const description = document.createElement("dd");
+    description.textContent = agent.purpose;
+    outlineAgents.append(term, description);
+  }
   outlinePanel.hidden = labels.length === 0;
   for (const label of labels) {
     const state = states.get(label);
@@ -1259,6 +1332,7 @@ function renderOutline(labels, events) {
     marker.className = "outline-marker";
     marker.setAttribute("aria-hidden", "true");
     marker.textContent = {
+      planned: "○",
       pending: "○",
       running: "▶",
       completed: "✓",
@@ -1270,6 +1344,215 @@ function renderOutline(labels, events) {
     item.append(marker, text);
     outline.append(item);
   }
+}
+
+function storyPhaseLabel(value) {
+  if (typeof value !== "string" || value === "") return "Agent turn";
+  return value
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function githubRepositoryUrl(repository) {
+  return typeof repository === "string"
+    && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)
+    ? `https://github.com/${repository}`
+    : null;
+}
+
+function appendStoryLink(container, label, url) {
+  if (container.children.length || container.textContent) {
+    container.append(document.createTextNode(" · "));
+  }
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = label;
+  container.append(link);
+}
+
+function issueStoryNavigation(summary, turn) {
+  if (!summary || turn.workItemId == null) return null;
+  const repositories = summary.repositories || [summary];
+  const repository = repositories.find((item) => (
+    turn.repository == null || item.repository === turn.repository
+  ));
+  if (!repository) return null;
+  return (repository.issues || []).find((item) => (
+    String(item.issue) === String(turn.workItemId)
+  )) || null;
+}
+
+function appendTurnNavigation(container, turn, summary) {
+  const navigation = issueStoryNavigation(summary, turn);
+  if (!navigation) return;
+  if (navigation.pr?.url) {
+    appendStoryLink(container, `PR #${navigation.pr.number}`, navigation.pr.url);
+  }
+  const phase = (turn.phase || "").toLowerCase();
+  const terminals = navigation.terminals || {};
+  const terminal = phase.includes("scope")
+    ? terminals.scopeReview
+    : (phase.includes("correctness") || phase === "whole-review")
+      ? terminals.correctnessReview
+      : terminals.implementation;
+  if (terminal) appendPurpleMuxLink(container, "PurpleMux terminal", terminal);
+}
+
+function renderIssueDrivenStory(result) {
+  if (result.mode !== "issue-driven" || result.runId == null) return;
+  outlinePanel.hidden = false;
+  workflowStoryState.hidden = false;
+  const turns = result.agentTurns || [];
+  const tailTurn = turns.at(-1);
+  const currentTurn = result.state === "running"
+    && tailTurn?.status === "started"
+    && tailTurn.completedAt == null
+    ? tailTurn
+    : null;
+  const presentation = runPresentation(result);
+  workflowStoryState.textContent = currentTurn
+    ? `ACTUAL · ${presentation.label} · Current turn: ${currentTurn.purpose}`
+    : `ACTUAL · ${presentation.label} · ${turns.length} actual agent turn${turns.length === 1 ? "" : "s"} recorded`;
+
+  const summary = result.issueDrivenSummary;
+  const repositories = summary?.repositories || (summary ? [summary] : []);
+  workflowStoryNavigation.replaceChildren();
+  for (const repository of repositories) {
+    const url = githubRepositoryUrl(repository.repository);
+    if (url) appendStoryLink(workflowStoryNavigation, repository.repository, url);
+  }
+  const baseSha = result.executionContext?.baseSha;
+  if (repositories.length === 1 && typeof baseSha === "string") {
+    const repositoryUrl = githubRepositoryUrl(repositories[0].repository);
+    if (repositoryUrl) {
+      appendStoryLink(
+        workflowStoryNavigation,
+        `Base commit ${baseSha.slice(0, 10)}`,
+        `${repositoryUrl}/commit/${baseSha}`,
+      );
+    }
+  }
+  workflowStoryNavigation.hidden = workflowStoryNavigation.children.length === 0;
+
+  workflowRecoveryTransition.replaceChildren();
+  const recoverySource = result.recoverySource;
+  if (recoverySource?.identity) {
+    workflowRecoveryTransition.append(document.createTextNode("Recovery: "));
+    const source = document.createElement("a");
+    source.href = `/?run=${encodeURIComponent(recoverySource.identity)}`;
+    const priorOutcome = recoverySource.state
+      ? recoverySource.state.toUpperCase()
+      : "OUTCOME UNAVAILABLE";
+    source.textContent = `Run #${recoverySource.runId} (${priorOutcome})`;
+    workflowRecoveryTransition.append(
+      source,
+      document.createTextNode(` → Run #${result.runId}`),
+    );
+    workflowRecoveryTransition.hidden = false;
+  } else {
+    workflowRecoveryTransition.hidden = true;
+  }
+
+  agentTurns.replaceChildren();
+  agentTurns.hidden = turns.length === 0;
+  actualStoryTitle.hidden = turns.length === 0;
+  const turnsById = new Map(turns.map((turn) => [turn.turnId, turn]));
+  for (const turn of turns) {
+    const item = document.createElement("li");
+    const isOpen = turn.status === "started" && turn.completedAt == null;
+    const isCurrent = turn === currentTurn;
+    item.className = `agent-turn ${isCurrent ? "current" : turn.status}`;
+
+    const heading = document.createElement("div");
+    heading.className = "agent-turn-heading";
+    const scope = turn.workItemLabel || (turn.workItemId == null ? "" : `Work item ${turn.workItemId}`);
+    heading.textContent = `Turn ${turn.turnId} · ${storyPhaseLabel(turn.phase)} · ${turn.role} · Attempt ${turn.attempt}${scope ? ` · ${scope}` : ""}`;
+    if (isCurrent) {
+      const current = document.createElement("span");
+      current.className = "agent-turn-current";
+      current.textContent = "CURRENT";
+      heading.append(document.createTextNode(" "), current);
+    }
+
+    const purpose = document.createElement("p");
+    purpose.className = "agent-turn-purpose";
+    purpose.textContent = `Purpose: ${turn.purpose}`;
+
+    const outcome = document.createElement("p");
+    outcome.className = "agent-turn-outcome";
+    if (turn.status === "failed") {
+      outcome.textContent = `Outcome: Failed${turn.error ? ` — ${turn.error}` : ""}`;
+    } else if (isCurrent) {
+      outcome.textContent = "Outcome: In progress";
+    } else if (isOpen) {
+      outcome.textContent = result.state === "failed" || result.state === "stopped"
+        ? `Outcome: Run ${result.state} before completion was recorded`
+        : "Outcome: Completion event missing";
+    } else {
+      const transition = turn.transitionOutcome
+        ? storyPhaseLabel(turn.transitionOutcome)
+        : "Completed";
+      outcome.textContent = `Outcome: ${transition}`;
+    }
+
+    const navigation = document.createElement("p");
+    navigation.className = "agent-turn-navigation";
+    const repositoryUrl = githubRepositoryUrl(turn.repository);
+    if (repositoryUrl) appendStoryLink(navigation, turn.repository, repositoryUrl);
+    if (repositoryUrl && turn.commitSha) {
+      appendStoryLink(
+        navigation,
+        `Commit ${turn.commitSha.slice(0, 10)}`,
+        `${repositoryUrl}/commit/${turn.commitSha}`,
+      );
+    }
+    appendTurnNavigation(navigation, turn, summary);
+
+    const promptDetails = document.createElement("details");
+    promptDetails.className = "agent-turn-prompt";
+    const promptSummary = document.createElement("summary");
+    promptSummary.textContent = "Show exact actual prompt";
+    const prompt = document.createElement("pre");
+    prompt.textContent = turn.prompt;
+    promptDetails.append(promptSummary, prompt);
+
+    item.append(heading, purpose, outcome);
+    if (navigation.children.length || navigation.textContent) item.append(navigation);
+    item.append(promptDetails);
+
+    if (turn.result != null) {
+      const resultDetails = document.createElement("details");
+      resultDetails.className = "agent-turn-result";
+      const resultSummary = document.createElement("summary");
+      resultSummary.textContent = "Show actual agent result";
+      const actualResult = document.createElement("pre");
+      actualResult.textContent = turn.result;
+      resultDetails.append(resultSummary, actualResult);
+      item.append(resultDetails);
+    }
+
+    const next = turnsById.get(turn.nextTurnId);
+    if (next) {
+      const transition = document.createElement("p");
+      transition.className = "agent-turn-transition";
+      const retry = turn.phase === next.phase && next.attempt > turn.attempt ? "Retry · " : "";
+      const outcomeLabel = turn.transitionOutcome
+        ? ` · ${storyPhaseLabel(turn.transitionOutcome)}`
+        : "";
+      transition.textContent = `Transition: ${retry}${storyPhaseLabel(turn.phase)} → ${storyPhaseLabel(next.phase)}${outcomeLabel}`;
+      item.append(transition);
+    }
+    agentTurns.append(item);
+  }
+}
+
+function currentPlannedRunPreview() {
+  return activeRunId === null && currentMode === "issue-driven"
+    ? issueDrivenRunPreview
+    : null;
 }
 
 function renderProgress(events, findings = [], warningsOmitted = 0, plannerSkips = []) {
@@ -1682,6 +1965,12 @@ async function refresh() {
   try {
     const {runs, cleanupOwnership = []} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
+    if (requestGeneration <= knownRunIdsGeneration) return;
+    const newlyDiscoveredRuns = knownRunIds === null
+      ? []
+      : runs.filter((run) => !knownRunIds.has(run.runId));
+    knownRunIds = new Set(runs.map((run) => run.runId));
+    knownRunIdsGeneration = requestGeneration;
     if (activeRunId === null && requestedRunIdentity !== null) {
       const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
       requestedRunIdentity = null;
@@ -1695,12 +1984,16 @@ async function refresh() {
         explicitNewRun = true;
         stderr.textContent = "The linked Run is no longer available.";
       }
-    } else if (activeRunId === null && !explicitNewRun && runs.length > 0) {
+    } else if (
+      activeRunId === null
+      && !explicitNewRun
+      && newlyDiscoveredRuns.length > 0
+    ) {
       // A run just appeared (e.g. discovered via SSE) while the fields held
       // in-progress draft edits nobody submitted yet; retain them before
       // auto-selecting, exactly as an explicit run-list click would.
       captureDraftIfEditing();
-      activeRunId = runs[runs.length - 1].runId;
+      activeRunId = newlyDiscoveredRuns[newlyDiscoveredRuns.length - 1].runId;
       activeRunSnapshot = null;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;
@@ -1896,8 +2189,16 @@ async function generateIssueDrivenCode() {
       && issueDrivenJson.value === source
     ) {
       issueDrivenPython.value = result.generatedCode;
-      issueDrivenDraft = {json: source, code: result.generatedCode};
+      issueDrivenRunPreview = result.runPreview || null;
+      issueDrivenDraft = {
+        json: source,
+        code: result.generatedCode,
+        preview: issueDrivenRunPreview,
+      };
       renderIssueDrivenValidation(result.issueDrivenValidation || []);
+      if (issueDrivenRunPreview) {
+        renderOutline(issueDrivenRunPreview.phases || [], [], issueDrivenRunPreview);
+      }
     }
     return result.generatedCode;
   } catch (error) {
@@ -2216,7 +2517,11 @@ runButton.addEventListener("click", async () => {
           && activeRunId === null
         ) {
           renderValidation(error.result.validation);
-          renderOutline(error.result.outline || [], []);
+          renderOutline(
+            error.result.outline || [],
+            [],
+            currentPlannedRunPreview(),
+          );
         }
       } else if (selectionGeneration === activeRunGeneration) {
         stderr.textContent = String(error);
@@ -2249,6 +2554,12 @@ reviewModeButton.addEventListener("click", async () => {
   await enterDraftMode("review");
 });
 
+runtimeView.addEventListener("click", () => {
+  runtimePanel.hidden = false;
+  runtimePanel.open = true;
+  runtimePanel.scrollIntoView?.({behavior: "smooth", block: "start"});
+});
+
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
   await withPendingButton(validateButton, async () => {
@@ -2267,7 +2578,11 @@ validateButton.addEventListener("click", async () => {
         && activeRunId === null
       ) {
         renderValidation(result.validation || []);
-        renderOutline(result.outline || [], []);
+        renderOutline(
+          result.outline || [],
+          [],
+          currentPlannedRunPreview(),
+        );
       }
     } catch (error) {
       if (
@@ -2277,7 +2592,11 @@ validateButton.addEventListener("click", async () => {
         && Array.isArray(error.result?.validation)
       ) {
         renderValidation(error.result.validation);
-        renderOutline(error.result.outline || [], []);
+        renderOutline(
+          error.result.outline || [],
+          [],
+          currentPlannedRunPreview(),
+        );
       } else if (
         requestGeneration === validationRequestGeneration
         && selectionGeneration === activeRunGeneration
@@ -2292,6 +2611,7 @@ validateButton.addEventListener("click", async () => {
 dryRunButton.addEventListener("click", async () => {
   if (activeRunId !== null) return;
   await withPendingButton(dryRunButton, async () => {
+    const requestGeneration = ++validationRequestGeneration;
     const selectionGeneration = activeRunGeneration;
     try {
       const payload = await workflowSubmissionPayload();
@@ -2300,15 +2620,28 @@ dryRunButton.addEventListener("click", async () => {
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload),
       });
-      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
         renderValidation(result.validation || []);
-        renderOutline(result.outline || [], []);
+        renderOutline(result.outline || [], [], currentPlannedRunPreview());
         renderDryRun(result);
       }
     } catch (error) {
-      if (selectionGeneration === activeRunGeneration && activeRunId === null) {
+      if (
+        requestGeneration === validationRequestGeneration
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === null
+      ) {
         if (error.result) {
           renderValidation(error.result.validation || []);
+          renderOutline(
+            error.result.outline || [],
+            [],
+            currentPlannedRunPreview(),
+          );
           renderDryRun(error.result);
         } else {
           stderr.textContent = String(error);
@@ -2493,10 +2826,16 @@ async function initialize() {
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
-  if (initialStatus.state === "validation_failed") {
-    renderValidation(initialStatus.validation || []);
+  if (initialStatus.runId == null) {
+    if (initialStatus.state === "validation_failed") {
+      renderValidation(initialStatus.validation || []);
+    }
+    renderRun(initialStatus);
+  } else {
+    renderCleanDraftState();
+    showDraftLabel();
+    applyFieldMode();
   }
-  renderRun(initialStatus);
   await refresh();
   connectEvents();
   try {

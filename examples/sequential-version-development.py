@@ -16,6 +16,7 @@ import re
 import string
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import count
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -33,6 +34,7 @@ from purplemux_client import (
     WorkerFailure,
     WorkerInterrupted,
     agent_commit_coauthor,
+    emit_agent_turn,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -57,6 +59,17 @@ WORKFLOW_OUTLINE = [
     "Implement and independently review",
     "Deliver the exact Issue topology",
     "Review and deliver the whole version",
+]
+WORKFLOW_PREVIEW_PHASES = [
+    ("Work-item planning", "always"),
+    ("Implementation", "always"),
+    ("Scope / Design review", "always"),
+    ("Correctness review", "always"),
+    ("Review fixes", "always"),
+    ("Recovery", "always"),
+    ("Whole-version review", "final_review"),
+    ("Whole-version fixes", "final_review"),
+    ("Final integration PR", "always"),
 ]
 MAX_REVIEWS = 4
 MAX_SCOPE_REVIEWS = 6
@@ -242,6 +255,8 @@ class AgentTurnTimeoutWarning:
 
 
 AGENT_TURN_TIMEOUT_WARNINGS: list[AgentTurnTimeoutWarning] = []
+AGENT_TURN_IDS = count(1)
+DEFERRED_AGENT_TURN_TRACES: list[_AgentTurnExecution] = []
 
 
 @dataclass(frozen=True)
@@ -575,19 +590,38 @@ def create_agent(
     )
 
 
-def run_turn(
+@dataclass(frozen=True)
+class _AgentTurnExecution:
+    result: str
+    turn_id: int
+    purpose: str
+    role: str
+    attempt: int
+    phase: str | None
+    work_item_id: int | str | None
+    work_item_label: str | None
+    repository_identity: str
+    commit_sha: str | None = None
+
+
+def _execute_turn(
     client: PurpleMuxCLIClient,
     tab: str,
     name: str,
     prompt: str,
     *,
+    repository_identity: str,
+    role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
     repository: GitRepository | None = None,
     branch: str | None = None,
     expected_process: str | None = None,
-) -> str:
+) -> _AgentTurnExecution:
     if (repository is None) != (branch is None) or (repository is None) != (
         expected_process is None
     ):
@@ -601,6 +635,15 @@ def run_turn(
             raise WorkerFailure(f"local branch {branch!r} does not exist")
         before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
+    trace_context = {"repository": repository_identity}
+    if phase is not None:
+        trace_context["phase"] = phase
+    if work_item_id is not None:
+        trace_context["work_item_id"] = work_item_id
+        trace_context["work_item_label"] = work_item_label
+    initial_commit_sha = before_sha or (pr.head_sha if pr is not None else None)
+    if initial_commit_sha is not None:
+        trace_context["commit_sha"] = initial_commit_sha
     emit_step(
         name,
         "started",
@@ -620,14 +663,14 @@ def run_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
-    def verify_turn_commits() -> None:
+    def verify_turn_commits() -> str | None:
         if (
             repository is None
             or branch is None
             or expected_process is None
             or before_sha is None
         ):
-            return
+            return pr.head_sha if pr is not None else None
         after = repository.require_current_branch(branch)
         if after.local_sha is None:
             raise WorkerFailure(f"local branch {branch!r} disappeared")
@@ -638,15 +681,47 @@ def run_turn(
             expected_process=expected_process,
             allow_unchanged=True,
         )
+        return after.local_sha
 
+    result_observed = False
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
+        turn_id = next(AGENT_TURN_IDS)
+        turn_attempt = iteration or 1
+        try:
+            emit_agent_turn(
+                turn_id,
+                name,
+                role,
+                turn_attempt,
+                "started",
+                prompt=prompt,
+                **trace_context,
+            )
+        except Exception:
+            # The trace is observation-only and must never control execution.
+            pass
         client.send_input(tab, prompt)
         client.wait_for_turn_completion(
             tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
         )
         result = client.read_result(tab)
+        result_observed = True
+        commit_sha = verify_turn_commits()
     except BaseException as exc:
+        if "turn_id" in locals():
+            try:
+                emit_agent_turn(
+                    turn_id,
+                    name,
+                    role,
+                    turn_attempt,
+                    "failed",
+                    error=short_error(exc),
+                    **trace_context,
+                )
+            except Exception:
+                pass
         emit_step(
             name,
             "failed",
@@ -657,14 +732,14 @@ def run_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
-        try:
-            verify_turn_commits()
-        except BaseException as provenance_error:
-            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
-                raise exc from provenance_error
-            raise
+        if not result_observed:
+            try:
+                verify_turn_commits()
+            except BaseException as provenance_error:
+                if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                    raise exc from provenance_error
+                raise
         raise
-    verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -674,7 +749,124 @@ def run_turn(
         **navigation,
     )
     terminal_progress("DONE", name, iteration=iteration)
-    return result
+    return _AgentTurnExecution(
+        result,
+        turn_id,
+        name,
+        role,
+        turn_attempt,
+        phase,
+        work_item_id,
+        work_item_label,
+        repository_identity,
+        commit_sha,
+    )
+
+
+def _emit_completed_turn(
+    execution: _AgentTurnExecution, transition_outcome: str | None
+) -> None:
+    """Observe the already-decided outcome without participating in control flow."""
+    trace_context = {"repository": execution.repository_identity}
+    if execution.phase is not None:
+        trace_context["phase"] = execution.phase
+    if execution.work_item_id is not None:
+        trace_context["work_item_id"] = execution.work_item_id
+        trace_context["work_item_label"] = execution.work_item_label
+    if execution.commit_sha is not None:
+        trace_context["commit_sha"] = execution.commit_sha
+    try:
+        emit_agent_turn(
+            execution.turn_id,
+            execution.purpose,
+            execution.role,
+            execution.attempt,
+            "completed",
+            result=execution.result,
+            transition_outcome=transition_outcome,
+            **trace_context,
+        )
+    except Exception:
+        pass
+    finally:
+        if execution in DEFERRED_AGENT_TURN_TRACES:
+            DEFERRED_AGENT_TURN_TRACES.remove(execution)
+
+
+def _deferred_turn_result(turn: str | _AgentTurnExecution) -> str:
+    return turn.result if isinstance(turn, _AgentTurnExecution) else turn
+
+
+def _complete_deferred_turn(
+    turn: str | _AgentTurnExecution, transition_outcome: str
+) -> None:
+    if isinstance(turn, _AgentTurnExecution):
+        _emit_completed_turn(turn, transition_outcome)
+
+
+def _complete_deferred_validated_turn(
+    executions: list[_AgentTurnExecution], transition_outcome: str
+) -> None:
+    if executions:
+        _emit_completed_turn(executions.pop(), transition_outcome)
+
+
+def _finalize_deferred_agent_turns(transition_outcome: str) -> None:
+    """Complete agent-success traces when later workflow checks fail."""
+    while DEFERRED_AGENT_TURN_TRACES:
+        _emit_completed_turn(DEFERRED_AGENT_TURN_TRACES[0], transition_outcome)
+
+
+def _terminal_failure_outcome(exc: BaseException) -> str:
+    if isinstance(exc, (WorkerInterrupted, KeyboardInterrupt)):
+        return "interrupted"
+    if isinstance(exc, MutationOutcomeUnknown):
+        return "mutation_outcome_unknown"
+    return "workflow_failed"
+
+
+def run_turn(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    name: str,
+    prompt: str,
+    *,
+    repository_identity: str,
+    role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: str | None = None,
+    iteration: int | None = None,
+    pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
+    _defer_trace: bool = False,
+) -> str | _AgentTurnExecution:
+    execution = _execute_turn(
+        client,
+        tab,
+        name,
+        prompt,
+        repository_identity=repository_identity,
+        role=role,
+        phase=phase,
+        work_item_id=work_item_id,
+        work_item_label=work_item_label,
+        iteration=iteration,
+        pr=pr,
+        warning_scope=warning_scope,
+        repository=repository,
+        branch=branch,
+        expected_process=expected_process,
+    )
+    if _defer_trace:
+        DEFERRED_AGENT_TURN_TRACES.append(execution)
+        return execution
+    _emit_completed_turn(execution, transition_outcome)
+    return execution.result
 
 
 ValidatedOutput = TypeVar("ValidatedOutput")
@@ -687,24 +879,45 @@ def run_validated_turn(
     prompt: str,
     validator: Callable[[str], ValidatedOutput],
     *,
+    repository_identity: str,
+    role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: Callable[[ValidatedOutput], str] | None = None,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
+    _deferred_execution: list[_AgentTurnExecution] | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
-    result = run_turn(
+    turn = run_turn(
         client,
         tab,
         name,
         prompt,
+        repository_identity=repository_identity,
         iteration=iteration,
         pr=pr,
         warning_scope=warning_scope,
+        role=role,
+        phase=phase,
+        work_item_id=work_item_id,
+        work_item_label=work_item_label,
+        _defer_trace=True,
     )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+        result = turn.result if isinstance(turn, _AgentTurnExecution) else turn
         try:
-            return result, validator(result)
+            value = validator(result)
         except WorkerFailure as exc:
+            if isinstance(turn, _AgentTurnExecution):
+                _emit_completed_turn(
+                    turn,
+                    "correct_output"
+                    if correction < MAX_MACHINE_OUTPUT_CORRECTIONS
+                    else "invalid_output",
+                )
             if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
                 raise WorkerFailure(
                     f"{name} returned invalid output after "
@@ -712,7 +925,7 @@ def run_validated_turn(
                     f"{short_error(exc)}"
                 ) from exc
             validation_error = short_error(exc)
-            result = run_turn(
+            turn = run_turn(
                 client,
                 tab,
                 f"{name} output correction",
@@ -721,10 +934,29 @@ def run_validated_turn(
                 "Return the complete corrected response only, following the "
                 "original response contract. Correct the output in this same "
                 "session; do not repeat the underlying task or mutate any state.",
+                repository_identity=repository_identity,
                 iteration=correction + 1,
                 pr=pr,
                 warning_scope=warning_scope,
+                role=role,
+                phase="output-correction",
+                work_item_id=work_item_id,
+                work_item_label=work_item_label,
+                _defer_trace=True,
             )
+            continue
+        outcome: str | None = None
+        if transition_outcome is not None:
+            try:
+                outcome = transition_outcome(value)
+            except Exception:
+                pass
+        if isinstance(turn, _AgentTurnExecution):
+            if _deferred_execution is None:
+                _emit_completed_turn(turn, outcome)
+            else:
+                _deferred_execution.append(turn)
+        return result, value
     raise AssertionError("unreachable")
 
 
@@ -786,12 +1018,28 @@ def recover_error(
     config: Config,
     error: BaseException,
     authoritative_state: str,
+    *,
+    deferred_execution: list[_AgentTurnExecution] | None = None,
 ) -> RecoveryReport:
     """Start a dedicated recovery Agent for this error, never a resident agent."""
     if not isinstance(authoritative_state, str) or not authoritative_state.strip():
         raise WorkerFailure("recovery requires current authoritative state")
     if len(authoritative_state.encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
         raise WorkerFailure("recovery authoritative state exceeds its size limit")
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    try:
+        active = json.loads(authoritative_state).get("work_item_plan", {}).get("active")
+        if isinstance(active, dict):
+            if isinstance(active.get("issue"), int):
+                work_item_id = active["issue"]
+                work_item_label = f"Issue #{work_item_id}"
+            elif isinstance(active.get("id"), str):
+                task_id = active["id"]
+                work_item_id = f"mini-task:{task_id}"
+                work_item_label = f"Mini task {task_id}"
+    except (AttributeError, TypeError, ValueError):
+        pass
     agent = create_agent(
         client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
     )
@@ -816,6 +1064,12 @@ def recover_error(
                 process="recovery",
             ),
             parse_recovery_report,
+            repository_identity=config.slug,
+            role="recovery",
+            phase="recovery",
+            work_item_id=work_item_id,
+            work_item_label=work_item_label,
+            _deferred_execution=deferred_execution,
         )
         return report
     finally:
@@ -1760,6 +2014,8 @@ def update_base_pr_human_handoff(
             writer,
             "Base PR human handoff",
             human_handoff_prompt(config, work_items, pr, delivery, warnings),
+            repository_identity=config.slug,
+            role="reviewer",
             pr=pr,
         )
         handoff = validate_human_handoff(
@@ -1893,6 +2149,8 @@ def update_multi_repository_human_handoffs(
             writer,
             "Multi-repository human handoff",
             multi_repository_handoff_prompt(tuple(deliveries)),
+            repository_identity=writer_delivery.config.slug,
+            role="reviewer",
             pr=writer_delivery.pr,
         )
         handoff = validate_human_handoff(
@@ -2141,6 +2399,8 @@ force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve.""", process="cleanup"),
+        repository_identity=repo.expected_github_slug,
+        role="implementer",
         iteration=iteration,
         warning_scope=warning_scope,
         repository=repo,
@@ -2539,15 +2799,22 @@ def _review_issue_phase(
             and record.reviewed_sha == pr.head_sha
             and record.role == role
         )
+        review_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,
             reviewer,
             f"{issue.label} {phase} review",
             f"{prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
             decision,
+            repository_identity=config.slug,
+            role="reviewer",
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            phase=("scope-review" if phase == "scope/design" else "correctness-review"),
+            work_item_id=issue.result_id,
+            work_item_label=issue.label,
+            _deferred_execution=review_execution,
         )
         emit_policy_conflicts(
             result,
@@ -2621,6 +2888,7 @@ def _review_issue_phase(
                 f"{phase} review changed {issue.branch}; outcome invalidated at "
                 f"{reviewed_sha}",
             )
+            _complete_deferred_validated_turn(review_execution, "head_changed")
             if restart_scope_on_change:
                 return IssueReviewPhaseResult(
                     pr, "head_changed", pr.head_sha, pr.base_sha, review_number
@@ -2636,6 +2904,7 @@ def _review_issue_phase(
                 head=issue.branch,
                 base=config.integration_branch,
             )
+            _complete_deferred_validated_turn(review_execution, "approved")
             return IssueReviewPhaseResult(
                 current, "approved", current.head_sha, current.base_sha, review_number
             )
@@ -2664,6 +2933,9 @@ def _review_issue_phase(
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
+            _complete_deferred_validated_turn(
+                review_execution, "continued_with_warning"
+            )
             return IssueReviewPhaseResult(
                 current,
                 "continued_with_warning",
@@ -2672,7 +2944,8 @@ def _review_issue_phase(
                 review_number,
                 (warning,),
             )
-        fix_result = run_turn(
+        _complete_deferred_validated_turn(review_execution, "changes_requested")
+        fix_turn = run_turn(
             client,
             implementer,
             f"{issue.label} {phase} fixes",
@@ -2683,13 +2956,20 @@ fix, test, commit, and leave the worktree clean. If no change is warranted,
 leave it clean and explain why; do not create an empty commit.\n\n{result}""",
                 process="reviewer-fix",
             ),
+            repository_identity=config.slug,
+            role="implementer",
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
             repository=repo,
             branch=issue.branch,
             expected_process="reviewer-fix",
+            phase="reviewer-fix",
+            work_item_id=issue.result_id,
+            work_item_label=issue.label,
+            _defer_trace=True,
         )
+        fix_result = _deferred_turn_result(fix_turn)
         emit_policy_conflicts(
             fix_result,
             config,
@@ -2733,6 +3013,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
+            _complete_deferred_turn(fix_turn, "continued_with_warning")
             return IssueReviewPhaseResult(
                 current,
                 "continued_with_warning",
@@ -2761,6 +3042,9 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             head=issue.branch,
             base=config.integration_branch,
             fix_sha=fixed_sha,
+        )
+        _complete_deferred_turn(
+            fix_turn, "restart_scope_review" if restart_scope_on_change else "re_review"
         )
         if restart_scope_on_change:
             return IssueReviewPhaseResult(
@@ -3035,17 +3319,24 @@ def process_issue(
     implementation_prompt, scope_prompt, correctness_prompt = issue_prompts(
         issue, config
     )
-    implementation_result = run_turn(
+    implementation_turn = run_turn(
         client,
         implementer,
         f"{issue.label} implementation",
         implementation_prompt,
+        repository_identity=config.slug,
+        role="implementer",
         pr=existing_pr,
         warning_scope=issue.result_id,
         repository=repo,
         branch=issue.branch,
         expected_process="implementation",
+        phase="implementation",
+        work_item_id=issue.result_id,
+        work_item_label=issue.label,
+        _defer_trace=True,
     )
+    implementation_result = _deferred_turn_result(implementation_turn)
     emit_policy_conflicts(
         implementation_result,
         config,
@@ -3086,6 +3377,7 @@ def process_issue(
     pr = ensure_issue_pr_metadata(github, pr, issue, config)
     if pr.head_sha != implementation_sha:
         raise WorkerFailure("delivered PR head does not match committed result")
+    _complete_deferred_turn(implementation_turn, "continue_to_scope_review")
     emit_step(
         f"{issue.label}",
         "started",
@@ -3910,6 +4202,7 @@ def process_work_items(
         name="Work-item planner",
     )
     for planner_turn in range(1, MAX_PLANNER_TURNS + 1):
+        planning_execution: list[_AgentTurnExecution] = []
         _, planner_decision = run_validated_turn(
             client,
             planner,
@@ -3919,7 +4212,11 @@ def process_work_items(
             )
             + planner_prompt(plan, config),
             lambda source: apply_planner_decision(plan, source),
+            repository_identity=config.slug,
+            role="planner",
             iteration=planner_turn,
+            phase="planning",
+            _deferred_execution=planning_execution,
         )
         for conflict in planner_decision.policy_conflicts:
             record_policy_conflict(
@@ -3946,12 +4243,18 @@ def process_work_items(
             )
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:
+            _complete_deferred_validated_turn(
+                planning_execution, "planning_complete"
+            )
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
         plan.active = issue
         inspect_dynamic_work_item_topology(issue, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
+        _complete_deferred_validated_turn(
+            planning_execution, "dispatch_work_item"
+        )
         run_outline_step(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
@@ -4237,6 +4540,7 @@ def _review_whole_version(
         whole_audit: ReviewAuditRecord | None = None
         changes_requested = bool(resumed_records)
         if scenario_reviewer is not None:
+            scenario_execution: list[_AgentTurnExecution] = []
             result, verdict = run_validated_turn(
                 client,
                 scenario_reviewer,
@@ -4248,7 +4552,12 @@ def _review_whole_version(
                 )
                 + scenario_gate_prompt(pr, config, work_items),
                 decision,
+                repository_identity=config.slug,
+                role="reviewer",
                 iteration=review_number,
+                pr=pr,
+                phase="whole-review",
+                _deferred_execution=scenario_execution,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
             scenario_audit = allocate_review_audit(
@@ -4315,12 +4624,19 @@ def _review_whole_version(
                     "Scenario Gate review changed the integration branch; "
                     f"approval invalidated at {scenario_sha}",
                 )
+                _complete_deferred_validated_turn(
+                    scenario_execution, "head_changed"
+                )
                 continue
             review_results.append(result)
             changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
+            _complete_deferred_validated_turn(
+                scenario_execution, verdict.lower()
+            )
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
+        principles_execution: list[_AgentTurnExecution] = []
         principles_result, principles_verdict = run_validated_turn(
             client,
             design_principles_reviewer,
@@ -4332,7 +4648,12 @@ def _review_whole_version(
             )
             + design_principles_review_prompt(pr, config, work_items),
             decision,
+            repository_identity=config.slug,
+            role="reviewer",
             iteration=review_number,
+            pr=pr,
+            phase="whole-review",
+            _deferred_execution=principles_execution,
         )
         review_results.append(principles_result)
         changes_requested = (
@@ -4409,7 +4730,14 @@ def _review_whole_version(
                 "design-principles review changed the integration branch; "
                 f"approval invalidated at {principles_sha}",
             )
+            _complete_deferred_validated_turn(
+                principles_execution, "head_changed"
+            )
             continue
+        _complete_deferred_validated_turn(
+            principles_execution, principles_verdict.lower()
+        )
+        whole_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,
             reviewer,
@@ -4421,7 +4749,12 @@ def _review_whole_version(
             )
             + whole_version_review_prompt(pr, config, work_items),
             decision,
+            repository_identity=config.slug,
+            role="reviewer",
             iteration=review_number,
+            pr=pr,
+            phase="whole-review",
+            _deferred_execution=whole_execution,
         )
         review_results.append(result)
         changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
@@ -4489,7 +4822,10 @@ def _review_whole_version(
                 "whole-version review changed the integration branch; "
                 f"approval invalidated at {reviewed_sha}",
             )
+            _complete_deferred_validated_turn(whole_execution, "head_changed")
             continue
+        _complete_deferred_validated_turn(whole_execution, verdict.lower())
+        version_execution: list[_AgentTurnExecution] = []
         version_result, version_verdict = run_validated_turn(
             client,
             version_readme_reviewer,
@@ -4501,7 +4837,12 @@ def _review_whole_version(
             )
             + version_readme_review_prompt(pr, config, work_items),
             decision,
+            repository_identity=config.slug,
+            role="reviewer",
             iteration=review_number,
+            pr=pr,
+            phase="whole-review",
+            _deferred_execution=version_execution,
         )
         review_results.append(version_result)
         changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
@@ -4574,7 +4915,11 @@ def _review_whole_version(
                 "version and README review changed the integration branch; "
                 f"approval invalidated at {reviewed_sha}",
             )
+            _complete_deferred_validated_turn(version_execution, "head_changed")
             continue
+        _complete_deferred_validated_turn(
+            version_execution, version_verdict.lower()
+        )
         result = "\n\n".join(
             review_result
             for review_result in review_results
@@ -4608,7 +4953,7 @@ def _review_whole_version(
                     base=config.main_branch,
                 )
             else:
-                fix_result = run_turn(
+                fix_turn = run_turn(
                     client,
                     fixer,
                     "Whole-version fixes",
@@ -4618,11 +4963,16 @@ def _review_whole_version(
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
                         process="reviewer-fix",
                     ),
+                    repository_identity=config.slug,
+                    role="implementer",
                     iteration=review_number,
                     repository=repo,
                     branch=config.integration_branch,
                     expected_process="reviewer-fix",
+                    phase="whole-fix",
+                    _defer_trace=True,
                 )
+                fix_result = _deferred_turn_result(fix_turn)
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
                     repo,
@@ -4658,6 +5008,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                         base=config.main_branch,
                         fix_sha=fixed_sha,
                     )
+                    _complete_deferred_turn(fix_turn, "re_review")
                     continue
                 current = ensure_base_pr_policy_notes(github, current, config)
                 current = review_audit_dispositions(
@@ -4674,6 +5025,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     "keeping the Base PR Draft and continuing without reviewer "
                     "approval."
                 )
+                _complete_deferred_turn(fix_turn, "continued_with_warning")
         run_final_checks(client, config)
         checked_sha, checks_changed = require_agent_result(
             repo,
@@ -5318,7 +5670,7 @@ def require_recovery_retry_state(source: str, expected_source: str | None = None
             raise WorkerFailure("recovery outcome is uncertain: Base PR identity changed")
 
 
-def run_repository(
+def _run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
 ) -> PullRequestState | None:
@@ -5354,13 +5706,16 @@ def run_repository(
                 config, work_items, client, repo, github, deferred_deliveries
             )
         except Exception as exc:
-            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)) or (
-                deferred_deliveries is not None
-                and len(deferred_deliveries) != delivery_count
-            ):
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                _finalize_deferred_agent_turns(_terminal_failure_outcome(exc))
+                raise
+            if deferred_deliveries is not None and len(deferred_deliveries) != delivery_count:
+                _finalize_deferred_agent_turns("workflow_failed")
                 raise
             if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
+                _finalize_deferred_agent_turns("workflow_failed")
                 raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            _finalize_deferred_agent_turns("recover_workflow")
             recovery_worktree = repo.inspect_worktree()
             recovery_branch = recovery_worktree.current_branch
             if recovery_branch is None:
@@ -5371,7 +5726,14 @@ def run_repository(
                     "repository recovery requires a local branch commit"
                 ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
-            report = recover_error(client, config, exc, state)
+            recovery_execution: list[_AgentTurnExecution] = []
+            report = recover_error(
+                client,
+                config,
+                exc,
+                state,
+                deferred_execution=recovery_execution,
+            )
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
@@ -5385,9 +5747,15 @@ def run_repository(
                 expected_process="recovery",
             )
             if not report.repaired or not report.retry_safe:
+                _complete_deferred_validated_turn(
+                    recovery_execution, "stop_workflow"
+                )
                 raise
             require_recovery_retry_state(
                 recovery_authoritative_state(config, repo, github, plan), state
+            )
+            _complete_deferred_validated_turn(
+                recovery_execution, "retry_workflow"
             )
             emit_finding(
                 "runtime",
@@ -5404,6 +5772,18 @@ def run_repository(
             report_repository_delivery(config, ready)
         return ready
     raise AssertionError("unreachable")
+
+
+def run_repository(
+    config: Config,
+    deferred_deliveries: list[RepositoryDelivery] | None = None,
+) -> PullRequestState | None:
+    """Run one repository and close every deferred trace on every exit path."""
+    try:
+        return _run_repository(config, deferred_deliveries)
+    except BaseException as exc:
+        _finalize_deferred_agent_turns(_terminal_failure_outcome(exc))
+        raise
 
 
 def main() -> None:

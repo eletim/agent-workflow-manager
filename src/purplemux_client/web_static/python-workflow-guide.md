@@ -298,6 +298,7 @@ from purplemux_client import (
     WorkerNeedsInput,
     WorkspaceState,
     WorktreeState,
+    emit_agent_turn,
     emit_step,
     emit_finding,
     emit_issue_driven_repositories,
@@ -996,6 +997,43 @@ are dropped and the diagnostic stream retains only the latest 200 events. The
 latest PR-bearing event for each observed PR is retained separately and included
 in snapshots if its diagnostic event is evicted. Do not use events to drive the
 workflow, add statuses, or build decorators/state machines around it.
+
+Issue Driven workflows call `emit_agent_turn()` at the actual `send_input()`
+boundary with the same prompt object sent to the agent, then publish the
+completed result or failure. The observation helper transports large prompt and
+result values as bounded chunks so it does not alter or truncate them:
+
+```python
+emit_agent_turn(
+    turn_id,
+    purpose,                # concise human-readable reason for this turn
+    role,                   # planner, implementer, reviewer, or recovery
+    attempt,                # positive int
+    status,                 # "started", "completed", or "failed"
+    *,
+    repository=None,       # repository identity; omitted by legacy workflows
+    phase=None,             # generated workflow phase, when applicable
+    work_item_id=None,      # authoritative Issue/mini-task identity
+    work_item_label=None,   # supplied together with work_item_id
+    transition_outcome=None, # workflow-selected outcome for completed
+    prompt=None,            # exact prompt, required only for started
+    result=None,            # exact result, required only for completed
+    error=None,             # error text, required only for failed
+)
+```
+
+The Runner persists the ordered read-only trace in Issue Driven Run history and
+adds previous/next turn relationships. Managed runs append every transition to
+a Runner-owned spool that is reconciled before terminal history is persisted;
+background HTTP delivery supplies live updates without delaying an agent turn.
+Planning, work-item implementation/review/fix, whole-version review/fix,
+machine-output correction, and recovery turns attach their authoritative phase
+and explicit transition outcome in generated Python. Work-item turns also carry
+the plan-owned identity and label; the Runner does not derive any of these
+control-flow facts.
+Trace publication is observation only: generated Python still owns every
+branch, retry, and lifecycle decision, and a delivery failure must not change
+its behavior.
 
 When GitHub inspection or creation has authoritatively identified a PR, pass
 `pr_number` and `pr_url` together to attach read-only navigation to that Progress

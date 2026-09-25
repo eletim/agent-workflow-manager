@@ -71,6 +71,27 @@ record. Give each agent only the portion of human context and recorded decisions
 needed for its current role instead of accumulating every available artifact in
 every prompt.
 
+Issue Driven Run detail also exposes a read-only `agentTurns` trace. Each ordered
+entry records the turn's human-readable `purpose`, `role`, `attempt`, exact
+`prompt` captured at the agent send boundary, lifecycle `status`, result or
+error, authoritative workflow `phase` and work-item identity when applicable,
+the generated workflow's explicit `transitionOutcome`, timestamps, repository
+context, and `previousTurnId` / `nextTurnId` relationships. The Runner persists
+this observation with Run history; it is not workflow recovery state and never
+participates in sequencing, retries, or any other decision made by the generated
+plain-Python Workflow.
+
+Before a run starts, the backend supplies a deterministic **Planned run preview**
+covering work-item planning, implementation, Scope / Design and Correctness
+reviews, review fixes, recovery, optional whole-version review and fixes, and the
+final integration PR. This is a capability preview, not a prediction: the
+generated workflow inspects Git and pull-request state as it runs, and those
+checks select the actual turns, retries, recovery work, warning continuations,
+and delivery path shown in Run detail. Planned phases therefore remain distinct
+from the ordered `agentTurns` and progress events that were actually observed.
+The exact prompt for an observed turn is retained without reconstruction but is
+disclosed only on demand by expanding that turn's prompt control in Run detail.
+
 ## Review mode
 
 Choose **Review** in the Runner to inspect local Git repositories or observe an
@@ -150,8 +171,10 @@ A stopped Run may end without a complete readiness JSON result.
 
 ## Issue Driven mode
 
-The UI offers `Prompt | Environment Setup | Issue Driven | Review | Python Workflow`. Issue Driven mode accepts
-only a small JSON configuration, validates it separately from Python, and
+The UI opens in **Issue Driven**, its primary normal-use entry point. Prompt,
+Environment Setup, Review, Python Workflow, Runtime, and Diagnostics remain
+available under **Developer & detail views**. Issue Driven accepts only a small
+JSON configuration, validates it separately from Python, and
 deterministically expands it into the canonical sequential plain-Python workflow.
 The generated Python is visible for inspection and is then passed unchanged to the
 existing Static Validation, Dry Run, and Run path. JSON is configuration, not an
@@ -588,8 +611,9 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI has five explicit modes: **Prompt**, **Environment Setup**,
-**Issue Driven**, **Review**, and **Python Workflow**. Prompt accepts an agent,
+The trusted local Runner UI opens in **Issue Driven** and keeps **Prompt**,
+**Environment Setup**, **Review**, and **Python Workflow** in its developer/detail
+navigation. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt
@@ -609,9 +633,10 @@ tab. Stop uses the public PurpleMux interrupt/result lifecycle, closing the tab
 only if needed to reach a deterministic stopped state. If neither structured
 completion nor tab closure can be confirmed, AWM reports the uncertainty and
 keeps the run non-terminal so events remain accepted and Cleanup stays disabled.
-The primary workflow surface keeps Python and its execution controls visible;
-optional arguments are under **Advanced options**, while the explicit mutating
-agent-readiness probe is under **Diagnostics** near **Settings**.
+The Python Workflow developer view keeps Python and its execution controls visible;
+optional arguments are under **Advanced options**. Runtime history and the explicit
+mutating agent-readiness probe remain accessible from **Developer & detail views**;
+the probe itself stays under **Diagnostics** near **Settings**.
 
 Failed and stopped runs remain available for inspection, including their output
 and run-owned resources, but are never continued in place. Recovery starts a new

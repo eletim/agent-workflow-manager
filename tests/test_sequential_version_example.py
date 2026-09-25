@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import runpy
 import subprocess
@@ -14,6 +15,7 @@ import pytest
 from purplemux_client import (
     BranchState,
     GitRepository,
+    MutationOutcomeUnknown,
     PullRequestState,
     WorkerFailure,
     WorkerInterrupted,
@@ -374,7 +376,12 @@ def test_run_turn_retains_busy_timeout_warning_for_summary_and_handoff(
 
     assert (
         workflow["run_turn"](
-            Client(), "tab-1", "Issue #240 implementation", "work", warning_scope=240
+            Client(),
+            "tab-1",
+            "Issue #240 implementation",
+            "work",
+            repository_identity="acme/project",
+            warning_scope=240,
         )
         == "done"
     )
@@ -724,14 +731,34 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
     responses = iter(("Looks approved", corrected))
     turns: list[tuple[str, str, str]] = []
 
-    def run_turn(_client, tab, name, prompt, **_kwargs):
-        turns.append((tab, name, prompt))
-        return next(responses)
+    outcomes: list[str | None] = []
 
-    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+    def execute_turn(_client, tab, name, prompt, **kwargs):
+        turns.append((tab, name, prompt))
+        return workflow["_AgentTurnExecution"](
+            next(responses),
+            len(turns),
+            name,
+            kwargs.get("role", "agent"),
+            kwargs.get("iteration") or 1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
+        )
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
+    workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
+        lambda _execution, outcome: outcomes.append(outcome)
+    )
 
     result, verdict = workflow["run_validated_turn"](
-        object(), "reviewer-tab", "Scope review", "Review this.", workflow["decision"]
+        object(),
+        "reviewer-tab",
+        "Scope review",
+        "Review this.",
+        workflow["decision"],
+        repository_identity="acme/project",
     )
 
     assert result == corrected
@@ -740,17 +767,173 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
     assert turns[1][1] == "Scope review output correction"
     assert "reviewer response must be one JSON object" in turns[1][2]
     assert "complete corrected response only" in turns[1][2]
+    assert outcomes == ["correct_output", None]
+
+
+def test_validated_transition_traces_the_control_path_decision_once() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    result = review_result("APPROVED")
+    validation_calls: list[str] = []
+    outcomes: list[str | None] = []
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = (
+        lambda _client, _tab, name, _prompt, **kwargs: workflow[
+            "_AgentTurnExecution"
+        ](
+            result,
+            1,
+            name,
+            kwargs.get("role", "agent"),
+            1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
+        )
+    )
+    workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
+        lambda _execution, outcome: outcomes.append(outcome)
+    )
+
+    def validate(source: str) -> str:
+        validation_calls.append(source)
+        return workflow["decision"](source)
+
+    assert workflow["run_validated_turn"](
+        object(),
+        "reviewer-tab",
+        "Correctness review",
+        "Review this.",
+        validate,
+        repository_identity="acme/project",
+        transition_outcome=lambda verdict: verdict.lower(),
+    ) == (result, "APPROVED")
+    assert validation_calls == [result]
+    assert outcomes == ["approved"]
+    assert (
+        inspect.signature(workflow["run_turn"])
+        .parameters["transition_outcome"]
+        .default
+        is None
+    )
+
+
+def test_validated_transition_can_wait_for_authoritative_branch_checks() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    result = review_result("CHANGES_REQUESTED", ("Fix the boundary check.",))
+    outcomes: list[str | None] = []
+    execution = workflow["_AgentTurnExecution"](
+        result,
+        1,
+        "Scope review",
+        "reviewer",
+        1,
+        "scope-review",
+        90,
+        "Issue #90",
+        "acme/project",
+    )
+    workflow["run_validated_turn"].__globals__["run_turn"] = lambda *_args, **_kwargs: (
+        execution
+    )
+    workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
+        lambda _execution, outcome: outcomes.append(outcome)
+    )
+    deferred: list[object] = []
+
+    assert workflow["run_validated_turn"](
+        object(),
+        "reviewer-tab",
+        "Scope review",
+        "Review this.",
+        workflow["decision"],
+        repository_identity="acme/project",
+        transition_outcome=lambda verdict: verdict.lower(),
+        _deferred_execution=deferred,
+    ) == (result, "CHANGES_REQUESTED")
+    assert outcomes == []
+
+    workflow["_complete_deferred_validated_turn"](deferred, "head_changed")
+    assert outcomes == ["head_changed"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [
+        (WorkerFailure("PR postcondition failed"), "workflow_failed"),
+        (WorkerInterrupted("turn interrupted"), "interrupted"),
+        (MutationOutcomeUnknown("push response lost"), "mutation_outcome_unknown"),
+    ],
+)
+def test_post_agent_failure_finalizes_deferred_result_for_selected_branch(
+    monkeypatch: pytest.MonkeyPatch, failure: WorkerFailure, outcome: str
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_repository"].__globals__
+    execution = workflow["_AgentTurnExecution"](
+        "agent completed before the PR check failed",
+        1,
+        "Issue #90 implementation",
+        "implementer",
+        1,
+        "implementation",
+        90,
+        "Issue #90",
+        "acme/project",
+        "a" * 40,
+    )
+    emitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fail_after_agent(*_args: object) -> None:
+        globals_["DEFERRED_AGENT_TURN_TRACES"].append(execution)
+        raise failure
+
+    monkeypatch.setitem(globals_, "_run_repository", fail_after_agent)
+    monkeypatch.setitem(
+        globals_,
+        "emit_agent_turn",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    with pytest.raises(type(failure), match=str(failure)):
+        workflow["run_repository"](object())
+
+    assert emitted == [
+        (
+            (1, "Issue #90 implementation", "implementer", 1, "completed"),
+            {
+                "result": "agent completed before the PR check failed",
+                "transition_outcome": outcome,
+                "repository": "acme/project",
+                "phase": "implementation",
+                "work_item_id": 90,
+                "work_item_label": "Issue #90",
+                "commit_sha": "a" * 40,
+            },
+        )
+    ]
+    assert globals_["DEFERRED_AGENT_TURN_TRACES"] == []
 
 
 def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     turns: list[str] = []
 
-    def run_turn(_client, _tab, name, _prompt, **_kwargs):
+    def execute_turn(_client, _tab, name, _prompt, **kwargs):
         turns.append(name)
-        return "APPROVE"
+        return workflow["_AgentTurnExecution"](
+            "APPROVE",
+            len(turns),
+            name,
+            kwargs.get("role", "agent"),
+            kwargs.get("iteration") or 1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
+        )
 
-    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+    workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
 
     with pytest.raises(WorkerFailure, match="after 2 correction attempts"):
         workflow["run_validated_turn"](
@@ -759,6 +942,7 @@ def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
             "Scenario Gate",
             "Review this.",
             workflow["decision"],
+            repository_identity="acme/project",
         )
 
     assert turns == [
@@ -1675,6 +1859,8 @@ def test_clean_worktree_does_not_invoke_cleanup_turn(
     require_clean_worktree = workflow["require_clean_worktree"]
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def inspect_worktree(self) -> SimpleNamespace:
             return SimpleNamespace(dirty=False, current_branch="feature/issue-116")
 
@@ -1707,6 +1893,8 @@ def test_dirty_worktree_gets_focused_cleanup_and_is_rechecked(
     prompts: list[str] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def inspect_worktree(self) -> SimpleNamespace:
             return next(states)
 
@@ -1795,6 +1983,8 @@ def test_ambiguous_dirty_worktree_fails_with_remaining_paths(
     )
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def inspect_worktree(self) -> SimpleNamespace:
             return dirty
 
@@ -1916,6 +2106,8 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     events: list[str] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = implementation_sha
             self.dirty = False
@@ -2040,6 +2232,8 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
     provenance: list[tuple[str, str, dict[str, object]]] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = primary_sha
             self.dirty = True
@@ -2151,6 +2345,7 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             "tab",
             "Implementation",
             "prompt",
+            repository_identity="acme/project",
             repository=repository,
             branch=branch,
             expected_process="implementation",
@@ -2166,6 +2361,67 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             },
         )
     ]
+
+
+def test_post_result_provenance_failure_closes_started_agent_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    branch = "feature/provenance-failure"
+    provenance_checks: list[tuple[str, str]] = []
+
+    class Repository:
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, "agent-head", None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **_kwargs: object
+        ) -> None:
+            provenance_checks.append((start, end))
+            raise WorkerFailure("invalid agent commit provenance")
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def read_result(self, *_args: object) -> str:
+            return "agent completed"
+
+    events: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    globals_ = workflow["run_turn"].__globals__
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        globals_,
+        "emit_agent_turn",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent commit provenance"):
+        workflow["run_turn"](
+            Client(),
+            "tab",
+            "Implementation",
+            "prompt",
+            repository_identity="acme/project",
+            repository=Repository(),
+            branch=branch,
+            expected_process="implementation",
+        )
+
+    assert provenance_checks == [("agent-head", "agent-head")]
+    assert [args[4] for args, _kwargs in events] == ["started", "failed"]
+    assert events[-1][1]["error"] == "invalid agent commit provenance"
+    assert "result" not in events[-1][1]
 
 
 def test_interrupted_turn_is_not_masked_by_provenance_failure(
@@ -2199,6 +2455,7 @@ def test_interrupted_turn_is_not_masked_by_provenance_failure(
             "tab",
             "Implementation",
             "prompt",
+            repository_identity="acme/project",
             repository=Repository(),
             branch=branch,
             expected_process="implementation",
@@ -2222,6 +2479,8 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = start_sha
 
@@ -4449,6 +4708,8 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     events: list[str] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = initial_sha
             self.dirty = False

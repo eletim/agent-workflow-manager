@@ -12,7 +12,7 @@
       <header>
         <div>
           <p class="eyebrow">Trusted local development tool</p>
-          <h1>Python Runner</h1>
+          <h1>Agent Workflow Manager</h1>
         </div>
         <div class="header-actions">
           <button id="guide-open">Workflow Guide</button>
@@ -21,26 +21,24 @@
         </div>
       </header>
 
-      <details id="runs-panel" class="panel runs-panel" open>
-        <summary class="runs-heading">
-          <span class="runs-title">Runs</span>
-          <span id="runs-empty">No runs yet.</span>
-          <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
-        </summary>
-        <div class="run-history-actions">
-          <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
-        </div>
-        <div id="run-list" class="run-list"></div>
-      </details>
-
       <section class="panel editor-panel">
-        <div class="mode-switch" role="group" aria-label="Execution mode">
-          <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
-          <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
-          <button id="issue-driven-mode" type="button" aria-pressed="false">Issue Driven</button>
-          <button id="review-mode" type="button" aria-pressed="false">Review</button>
-          <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Python Workflow</button>
-        </div>
+        <nav class="execution-navigation" aria-label="Workflow type">
+          <button id="issue-driven-mode" class="issue-driven-entry selected" type="button" aria-pressed="true">
+            <span>Issue Driven</span>
+            <small>Plan and deliver work from GitHub Issues or inline mini tasks</small>
+          </button>
+          <details id="developer-views" class="developer-views">
+            <summary>Developer &amp; detail views</summary>
+            <div class="mode-switch" role="group" aria-label="Developer workflow type">
+              <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
+              <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
+              <button id="review-mode" type="button" aria-pressed="false">Review</button>
+              <button id="workflow-mode" type="button" aria-pressed="false">Python Workflow</button>
+              <button id="runtime-view" type="button">Runtime</button>
+              <a href="#diagnostics-panel">Diagnostics</a>
+            </div>
+          </details>
+        </nav>
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
           <nav id="run-family" aria-label="Run family" hidden></nav>
@@ -71,7 +69,7 @@
           <textarea id="prompt-text" spellcheck="true"></textarea>
         </div>
 
-        <div id="issue-driven-fields" hidden>
+        <div id="issue-driven-fields">
           <div class="repository-config-heading">
             <div>
               <h2>Repositories</h2>
@@ -142,7 +140,7 @@
           <textarea id="review-python" spellcheck="false" readonly aria-label="Generated Review workflow"></textarea>
         </div>
 
-        <div id="workflow-fields">
+        <div id="workflow-fields" hidden>
           <label for="code">Python</label>
           <textarea id="code" spellcheck="false">from purplemux_client import emit_step
 
@@ -168,6 +166,33 @@ emit_step("workspace create", "completed")</textarea>
           <span id="exit-code">Exit code: —</span>
         </div>
       </section>
+
+      <section id="outline-panel" class="panel outline-panel" aria-live="polite" hidden>
+        <h2 id="outline-title">Execution outline</h2>
+        <p id="outline-description" class="outline-description" hidden></p>
+        <p id="workflow-story-state" class="workflow-story-state" hidden></p>
+        <p id="workflow-story-navigation" class="workflow-story-navigation" hidden></p>
+        <ol id="outline" class="outline-list"></ol>
+        <dl id="outline-agents" class="outline-agents" hidden></dl>
+        <p id="workflow-recovery-transition" class="agent-turn-transition" hidden></p>
+        <h3 id="actual-story-title" class="actual-story-title" hidden>Actual agent turns</h3>
+        <ol id="agent-turns" class="agent-turn-list" hidden></ol>
+      </section>
+
+      <details id="runtime-panel" class="panel runtime-panel" hidden>
+        <summary class="runtime-heading">Runtime</summary>
+        <div class="runtime-content">
+          <details id="runs-panel" class="panel runs-panel" open>
+            <summary class="runs-heading">
+              <span class="runs-title">Runs</span>
+              <span id="runs-empty">No runs yet.</span>
+              <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
+            </summary>
+            <div class="run-history-actions">
+              <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
+            </div>
+            <div id="run-list" class="run-list"></div>
+          </details>
 
       <section id="recovery-panel" class="panel recovery-panel" aria-live="polite" hidden>
         <h2>Recovery</h2>
@@ -197,11 +222,6 @@ emit_step("workspace create", "completed")</textarea>
         <ol id="topology-findings" class="validation-list"></ol>
         <h3>Next planned mutation</h3>
         <pre id="next-mutation">No reachable mutation.</pre>
-      </section>
-
-      <section id="outline-panel" class="panel outline-panel" aria-live="polite" hidden>
-        <h2>Execution outline</h2>
-        <ol id="outline" class="outline-list"></ol>
       </section>
 
       <section id="integration-pr-panel" class="panel integration-pr-panel" aria-live="polite" hidden>
@@ -247,6 +267,8 @@ emit_step("workspace create", "completed")</textarea>
           </div>
         </div>
       </section>
+        </div>
+      </details>
 
       <details id="diagnostics-panel" class="panel settings-panel diagnostics-panel">
         <summary>Diagnostics</summary>
