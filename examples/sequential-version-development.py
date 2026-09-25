@@ -88,6 +88,12 @@ REVIEWER_CHECKOUT_GUARD = (
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
     "git show, or gh pr diff only."
 )
+
+
+class MissingReviewAudit(WorkerFailure):
+    """A recorded review cannot be given its fix disposition."""
+
+
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
@@ -1176,6 +1182,9 @@ def _removable_review_audit_index(records: list[ReviewAuditRecord]) -> int | Non
     """Retain the last role result and the evidence for a changed-head continuation."""
     protected = {max(i for i, entry in enumerate(records) if entry.role == role)
                  for role in {entry.role for entry in records}}
+    protected.update(
+        i for i, entry in enumerate(records) if entry.fix_disposition == "pending"
+    )
     whole_roles = {
         "scenario_gate", "design_principles", "whole_version", "version_readme",
         "whole_version_limit",
@@ -1262,7 +1271,7 @@ def review_audit_dispositions(
         records = review_audit_from_body(body)
         matching = [record for record in records if record.audit_id == audit_id]
         if len(matching) != 1:
-            raise WorkerFailure("review audit record disappeared before fix disposition")
+            raise MissingReviewAudit("review audit record disappeared before fix disposition")
         record = matching[0]
         body = with_review_audit(
             body,
@@ -2301,7 +2310,7 @@ def require_warning_delivery(
     return current
 
 
-def review_issue_phase(
+def _review_issue_phase(
     issue: Issue,
     config: Config,
     client: PurpleMuxCLIClient,
@@ -2596,6 +2605,65 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
                 pr, "head_changed", pr.head_sha, pr.base_sha, review_number
             )
     raise WorkerFailure(f"{issue.label} {phase} review ended unexpectedly")
+
+
+def review_issue_phase(
+    issue: Issue,
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+    implementer: str,
+    reviewer: str,
+    pr: PullRequestState,
+    *,
+    phase: str,
+    prompt: str,
+    max_reviews: int,
+    review_offset: int = 0,
+    restart_scope_on_change: bool = False,
+) -> IssueReviewPhaseResult:
+    """Retry a lost audit only after verifying the current delivery topology."""
+    reviewed_head_sha = pr.head_sha
+    for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        try:
+            return _review_issue_phase(
+                issue, config, client, repo, github, implementer, reviewer, pr,
+                phase=phase, prompt=prompt, max_reviews=max_reviews,
+                review_offset=review_offset,
+                restart_scope_on_change=restart_scope_on_change,
+            )
+        except MissingReviewAudit:
+            if attempt == MAX_REPOSITORY_RECOVERIES:
+                raise
+            repo.require_clean()
+            pushed = repo.require_pushed(issue.branch)
+            if pushed.local_sha is None or pushed.remote_sha != pushed.local_sha:
+                raise WorkerFailure("review audit recovery requires a pushed head")
+            pr = github.require_pr(
+                number=pr.number,
+                head=issue.branch,
+                base=config.integration_branch,
+                state="OPEN",
+                expected_head_sha=pushed.local_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
+            )
+            if pr.auto_merge_enabled or pr.merge_queue_entry is not None:
+                raise WorkerFailure("review audit recovery requires a safe Draft PR")
+            require_inline_task_pr_fingerprint(pr, issue.task_fingerprint)
+            review_offset = 0
+            if restart_scope_on_change and pr.head_sha != reviewed_head_sha:
+                return IssueReviewPhaseResult(
+                    pr, "head_changed", pr.head_sha, pr.base_sha, review_offset
+                )
+            emit_finding(
+                "github",
+                f"{issue.label} {phase} audit is missing; reviewing current head "
+                f"{pr.head_sha} again",
+                status="warning",
+            )
+    raise WorkerFailure("review audit recovery retry limit exceeded")
 
 
 def process_issue(
@@ -3743,7 +3811,7 @@ def version_readme_review_prompt(
     )
 
 
-def review_whole_version(
+def _review_whole_version(
     config: Config,
     client: PurpleMuxCLIClient,
     repo: GitRepository,
@@ -4427,6 +4495,44 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
     if delivery is None:
         raise WorkerFailure("whole-version review ended without a review outcome")
     return pr, delivery
+
+
+def review_whole_version(
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+    pr: PullRequestState,
+    work_items: tuple[Issue, ...],
+) -> tuple[PullRequestState, ReviewDelivery]:
+    """Repeat a whole review when its audit vanished after safe reinspection."""
+    for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        try:
+            return _review_whole_version(config, client, repo, github, pr, work_items)
+        except MissingReviewAudit:
+            if attempt == MAX_REPOSITORY_RECOVERIES:
+                raise
+            repo.require_clean()
+            pushed = repo.require_pushed(config.integration_branch)
+            if pushed.local_sha is None or pushed.remote_sha != pushed.local_sha:
+                raise WorkerFailure("review audit recovery requires a pushed head")
+            pr = github.require_pr(
+                number=pr.number,
+                head=config.integration_branch,
+                base=config.main_branch,
+                state="OPEN",
+                expected_head_sha=pushed.local_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
+            )
+            if pr.auto_merge_enabled or pr.merge_queue_entry is not None:
+                raise WorkerFailure("review audit recovery requires a safe Draft PR")
+            emit_finding(
+                "github",
+                f"Whole-version audit is missing; reviewing current head {pr.head_sha} again",
+                status="warning",
+            )
+    raise WorkerFailure("review audit recovery retry limit exceeded")
 
 
 def integration_delivery(
