@@ -167,6 +167,16 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </section>
 
+      <section id="outline-panel" class="panel outline-panel" aria-live="polite" hidden>
+        <h2 id="outline-title">Execution outline</h2>
+        <p id="outline-description" class="outline-description" hidden></p>
+        <p id="workflow-story-state" class="workflow-story-state" hidden></p>
+        <p id="workflow-story-navigation" class="workflow-story-navigation" hidden></p>
+        <ol id="outline" class="outline-list"></ol>
+        <dl id="outline-agents" class="outline-agents" hidden></dl>
+        <ol id="agent-turns" class="agent-turn-list" hidden></ol>
+      </section>
+
       <details id="runtime-panel" class="panel runtime-panel" hidden>
         <summary class="runtime-heading">Runtime</summary>
         <div class="runtime-content">
@@ -210,13 +220,6 @@ emit_step("workspace create", "completed")</textarea>
         <ol id="topology-findings" class="validation-list"></ol>
         <h3>Next planned mutation</h3>
         <pre id="next-mutation">No reachable mutation.</pre>
-      </section>
-
-      <section id="outline-panel" class="panel outline-panel" aria-live="polite" hidden>
-        <h2 id="outline-title">Execution outline</h2>
-        <p id="outline-description" class="outline-description" hidden></p>
-        <ol id="outline" class="outline-list"></ol>
-        <dl id="outline-agents" class="outline-agents" hidden></dl>
       </section>
 
       <section id="integration-pr-panel" class="panel integration-pr-panel" aria-live="polite" hidden>

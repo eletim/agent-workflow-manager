@@ -158,6 +158,20 @@ def test_issue_driven_is_primary_and_developer_views_remain_linked() -> None:
     assert 'href="#diagnostics-panel">Diagnostics</a>' in html
 
 
+def test_issue_driven_story_is_primary_while_runtime_detail_stays_collapsed() -> None:
+    story_ancestors = _ancestors("agent-turns")
+    progress_ancestors = _ancestors("progress")
+
+    assert not any(
+        tag == "details" and attributes.get("id") == "runtime-panel"
+        for tag, attributes in story_ancestors
+    )
+    assert any(
+        tag == "details" and attributes.get("id") == "runtime-panel"
+        for tag, attributes in progress_ancestors
+    )
+
+
 def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     ancestors = _ancestors("run-list")
 

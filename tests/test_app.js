@@ -141,6 +141,7 @@ function snapshot({
   reviewJson = undefined,
   reviewResult = undefined,
   resumedFromRunId = null,
+  agentTurns = [],
 }) {
   const result = {
     args,
@@ -175,6 +176,7 @@ function snapshot({
     issueDrivenSummary,
     purplemuxPort,
     resumedFromRunId,
+    agentTurns,
   };
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
@@ -274,7 +276,7 @@ async function loadApp({
     "resume-open", "resume-dialog", "resume-source", "resume-settings",
     "resume-cancel", "resume-confirm",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
-    "validation-success", "validation", "outline-panel", "outline-title", "outline-description", "outline", "outline-agents", "guide-dialog",
+    "validation-success", "validation", "outline-panel", "outline-title", "outline-description", "workflow-story-state", "workflow-story-navigation", "outline", "outline-agents", "agent-turns", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
     "readiness-workspace", "readiness-provider", "run-readiness", "reconcile-readiness",
@@ -1151,6 +1153,8 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.equal(elements["issue-driven-success"].hidden, false);
   assert.equal(elements["outline-title"].textContent, "Planned run preview");
   assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.match(elements["workflow-story-state"].textContent, /^PLANNED/);
+  assert.equal(elements["agent-turns"].hidden, true);
   assert.deepEqual(
     elements["outline-agents"].children.map((item) => item.textContent),
     ["Implementer (claude)", "Implements changes.", "Reviewer (codex)", "Reviews changes."],
@@ -2624,6 +2628,106 @@ test("terminal Issue Driven Summary renders structured outcomes and clears for N
 
   await elements["new-run"].dispatch("click");
   assert.equal(elements["issue-summary-panel"].hidden, true);
+});
+
+test("Issue Driven run presents authoritative agent turns as an actual workflow story", async () => {
+  const exactPrompt = "Review exactly this head.\n\nDo not reconstruct this prompt. 🎯";
+  const issueDrivenSummary = {
+    repository: "acme/project",
+    integrationBranch: "dev/v1",
+    finalBranch: "main",
+    terminalResult: "running",
+    warningCount: 0,
+    issues: [{
+      issue: "mini-task:story",
+      label: "Mini task story",
+      pr: {number: 40, url: "https://github.com/acme/project/pull/40"},
+      terminals: {
+        implementation: {workspaceId: "ws-run", tabId: "tab-implementation"},
+        scopeReview: {workspaceId: "ws-run", tabId: "tab-scope"},
+        correctnessReview: {workspaceId: "ws-run", tabId: "tab-correctness"},
+      },
+      warnings: [],
+    }],
+    wholeReview: null,
+    basePr: null,
+  };
+  const agentTurns = [
+    {
+      turnId: 1, purpose: "Review the current implementation", prompt: exactPrompt,
+      role: "reviewer", attempt: 1, status: "completed", phase: "correctness-review",
+      workItemId: "mini-task:story", workItemLabel: "Mini task story",
+      transitionOutcome: "changes_requested", result: "CHANGES_REQUESTED",
+      nextTurnId: 2, completedAt: "2026-09-25T01:00:00Z", repository: "acme/project",
+    },
+    {
+      turnId: 2, purpose: "Fix the requested changes", prompt: "Fix prompt",
+      role: "implementer", attempt: 1, status: "completed", phase: "fix",
+      workItemId: "mini-task:story", workItemLabel: "Mini task story",
+      transitionOutcome: "continue_to_correctness_review", result: "Fixed",
+      nextTurnId: 3, completedAt: "2026-09-25T01:01:00Z", repository: "acme/project",
+    },
+    {
+      turnId: 3, purpose: "Re-review the fixed head", prompt: "Re-review prompt",
+      role: "reviewer", attempt: 2, status: "started", phase: "correctness-review",
+      workItemId: "mini-task:story", workItemLabel: "Mini task story",
+      transitionOutcome: null, result: null, nextTurnId: null, completedAt: null,
+      repository: "acme/project",
+    },
+  ];
+  const detail = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "",
+    mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}',
+    outline: ["Work items", "Final integration PR"],
+    progress: [{name: "Work items", status: "started"}],
+    issueDrivenSummary,
+    agentTurns,
+    executionContext: {
+      sourceRepository: "/work/project", executionRoot: "/managed/project",
+      baseRef: "origin/dev/v1", baseSha: "a".repeat(40),
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: detail},
+    validation: {status: 200, body: {validation: []}},
+    locationHref: "http://127.0.0.1:8765/",
+  });
+
+  assert.equal(elements["outline-title"].textContent, "Actual workflow story");
+  assert.match(elements["outline-description"].textContent, /^ACTUAL/);
+  assert.match(elements["workflow-story-state"].textContent, /Current turn: Re-review/);
+  assert.equal(elements["agent-turns"].children.length, 3);
+  assert.match(
+    elements["agent-turns"].children[0].children.at(-1).textContent,
+    /Correctness Review → Fix · Changes Requested/,
+  );
+  assert.match(
+    elements["agent-turns"].children[1].children.at(-1).textContent,
+    /Fix → Correctness Review/,
+  );
+  const current = elements["agent-turns"].children[2];
+  assert.equal(current.className, "agent-turn current");
+  assert.match(current.children[0].textContent, /Turn 3 · Correctness Review/);
+  const promptDetails = elements["agent-turns"].children[0].children[4];
+  assert.equal(promptDetails.open, false);
+  assert.equal(promptDetails.children[0].textContent, "Show exact actual prompt");
+  assert.equal(promptDetails.children[1].textContent, exactPrompt);
+  assert.equal(elements["workflow-story-navigation"].children[0].href, "https://github.com/acme/project");
+  assert.equal(
+    elements["workflow-story-navigation"].children[2].href,
+    `https://github.com/acme/project/commit/${"a".repeat(40)}`,
+  );
+  const turnNavigation = elements["agent-turns"].children[0].children[3];
+  assert.equal(turnNavigation.children[2].textContent, "PR #40");
+  assert.equal(turnNavigation.children[4].textContent, "PurpleMux terminal");
+  assert.equal(
+    turnNavigation.children[4].href,
+    "http://127.0.0.1:9123/?workspace=ws-run&tab=tab-correctness",
+  );
 });
 
 test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped", async () => {
