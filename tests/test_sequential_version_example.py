@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import runpy
 import subprocess
@@ -724,11 +725,25 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
     responses = iter(("Looks approved", corrected))
     turns: list[tuple[str, str, str]] = []
 
-    def run_turn(_client, tab, name, prompt, **_kwargs):
-        turns.append((tab, name, prompt))
-        return next(responses)
+    outcomes: list[str | None] = []
 
-    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+    def execute_turn(_client, tab, name, prompt, **kwargs):
+        turns.append((tab, name, prompt))
+        return workflow["_AgentTurnExecution"](
+            next(responses),
+            len(turns),
+            name,
+            kwargs.get("role", "agent"),
+            kwargs.get("iteration") or 1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+        )
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
+    workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
+        lambda _execution, outcome: outcomes.append(outcome)
+    )
 
     result, verdict = workflow["run_validated_turn"](
         object(), "reviewer-tab", "Scope review", "Review this.", workflow["decision"]
@@ -740,17 +755,73 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
     assert turns[1][1] == "Scope review output correction"
     assert "reviewer response must be one JSON object" in turns[1][2]
     assert "complete corrected response only" in turns[1][2]
+    assert outcomes == ["correct_output", None]
+
+
+def test_validated_transition_traces_the_control_path_decision_once() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    result = review_result("APPROVED")
+    validation_calls: list[str] = []
+    outcomes: list[str | None] = []
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = (
+        lambda _client, _tab, name, _prompt, **kwargs: workflow[
+            "_AgentTurnExecution"
+        ](
+            result,
+            1,
+            name,
+            kwargs.get("role", "agent"),
+            1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+        )
+    )
+    workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
+        lambda _execution, outcome: outcomes.append(outcome)
+    )
+
+    def validate(source: str) -> str:
+        validation_calls.append(source)
+        return workflow["decision"](source)
+
+    assert workflow["run_validated_turn"](
+        object(),
+        "reviewer-tab",
+        "Correctness review",
+        "Review this.",
+        validate,
+        transition_outcome=lambda verdict: verdict.lower(),
+    ) == (result, "APPROVED")
+    assert validation_calls == [result]
+    assert outcomes == ["approved"]
+    assert (
+        inspect.signature(workflow["run_turn"])
+        .parameters["transition_outcome"]
+        .default
+        is None
+    )
 
 
 def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     turns: list[str] = []
 
-    def run_turn(_client, _tab, name, _prompt, **_kwargs):
+    def execute_turn(_client, _tab, name, _prompt, **kwargs):
         turns.append(name)
-        return "APPROVE"
+        return workflow["_AgentTurnExecution"](
+            "APPROVE",
+            len(turns),
+            name,
+            kwargs.get("role", "agent"),
+            kwargs.get("iteration") or 1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+        )
 
-    workflow["run_validated_turn"].__globals__["run_turn"] = run_turn
+    workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
 
     with pytest.raises(WorkerFailure, match="after 2 correction attempts"):
         workflow["run_validated_turn"](

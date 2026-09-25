@@ -99,8 +99,8 @@ def test_issue_driven_agent_turn_trace_is_linked_and_survives_history(
     result = "completed exactly\n" + "evidence\n" * 600
     code = f"""\
 from purplemux_client import emit_agent_turn
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", prompt={prompt!r})
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", result={result!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", prompt={prompt!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", result={result!r})
 emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", prompt="review prompt")
 emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent stopped")
 """
@@ -116,6 +116,10 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "role": "implementer",
                 "attempt": 1,
                 "status": "completed",
+                "phase": "implementation",
+                "workItemId": "mini-task",
+                "workItemLabel": "Mini task mini-task",
+                "transitionOutcome": "continue_to_scope_review",
                 "result": result,
                 "error": None,
                 "previousTurnId": None,
@@ -131,6 +135,10 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "role": "reviewer",
                 "attempt": 3,
                 "status": "failed",
+                "phase": None,
+                "workItemId": None,
+                "workItemLabel": None,
+                "transitionOutcome": None,
                 "result": None,
                 "error": "agent stopped",
                 "previousTurnId": 1,

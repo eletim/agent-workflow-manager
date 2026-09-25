@@ -161,6 +161,10 @@ class AgentTurnTrace:
     role: str
     attempt: int
     status: AgentTurnStatus
+    phase: str | None = None
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    transition_outcome: str | None = None
     result: str | None = None
     error: str | None = None
     previous_turn_id: int | None = None
@@ -185,6 +189,10 @@ class _AgentTurnTransition:
     role: str
     attempt: int
     status: AgentTurnStatus
+    phase: str | None = None
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    transition_outcome: str | None = None
     prompt: str | None = None
     result: str | None = None
     error: str | None = None
@@ -491,6 +499,10 @@ def _agent_turn_json(turn: AgentTurnTrace) -> dict[str, object]:
         "role": turn.role,
         "attempt": turn.attempt,
         "status": turn.status,
+        "phase": turn.phase,
+        "workItemId": turn.work_item_id,
+        "workItemLabel": turn.work_item_label,
+        "transitionOutcome": turn.transition_outcome,
         "result": turn.result,
         "error": turn.error,
         "previousTurnId": turn.previous_turn_id,
@@ -3912,6 +3924,10 @@ class PythonRunner:
         role = value.get("role")
         attempt = value.get("attempt")
         status = value.get("status")
+        phase = value.get("phase")
+        work_item_id = value.get("work_item_id")
+        work_item_label = value.get("work_item_label")
+        transition_outcome = value.get("transition_outcome")
         if (
             isinstance(turn_id, bool)
             or not isinstance(turn_id, int)
@@ -3924,9 +3940,35 @@ class PythonRunner:
             or not isinstance(attempt, int)
             or attempt < 1
             or status not in ("started", "completed", "failed")
+            or (phase is not None and (not isinstance(phase, str) or not phase.strip()))
+            or isinstance(work_item_id, bool)
+            or (work_item_id is not None and not isinstance(work_item_id, (int, str)))
+            or (isinstance(work_item_id, int) and work_item_id < 1)
+            or (isinstance(work_item_id, str) and not work_item_id.strip())
+            or (work_item_id is None) != (work_item_label is None)
+            or (
+                work_item_label is not None
+                and (
+                    not isinstance(work_item_label, str) or not work_item_label.strip()
+                )
+            )
+            or (
+                transition_outcome is not None
+                and (
+                    status != "completed"
+                    or not isinstance(transition_outcome, str)
+                    or not transition_outcome.strip()
+                )
+            )
         ):
             return None
         expected_fields = {"turn_id", "purpose", "role", "attempt", "status"}
+        if phase is not None:
+            expected_fields.add("phase")
+        if work_item_id is not None:
+            expected_fields.update(("work_item_id", "work_item_label"))
+        if transition_outcome is not None:
+            expected_fields.add("transition_outcome")
         content_field = {
             "started": "prompt",
             "completed": "result",
@@ -3943,6 +3985,10 @@ class PythonRunner:
             role,
             attempt,
             cast(AgentTurnStatus, status),
+            phase=phase,
+            work_item_id=work_item_id,
+            work_item_label=work_item_label,
+            transition_outcome=transition_outcome,
             prompt=content if status == "started" else None,
             result=content if status == "completed" else None,
             error=content if status == "failed" else None,
@@ -3968,6 +4014,9 @@ class PythonRunner:
                     transition.role,
                     transition.attempt,
                     "started",
+                    phase=transition.phase,
+                    work_item_id=transition.work_item_id,
+                    work_item_label=transition.work_item_label,
                     previous_turn_id=(
                         previous.turn_id if previous is not None else None
                     ),
@@ -3996,6 +4045,9 @@ class PythonRunner:
             or current.purpose != transition.purpose
             or current.role != transition.role
             or current.attempt != transition.attempt
+            or current.phase != transition.phase
+            or current.work_item_id != transition.work_item_id
+            or current.work_item_label != transition.work_item_label
         ):
             return False
         run.agent_turns[index] = replace(
@@ -4003,6 +4055,7 @@ class PythonRunner:
             status=transition.status,
             result=transition.result,
             error=transition.error,
+            transition_outcome=transition.transition_outcome,
             completed_at=self._accepted_at(),
         )
         return True

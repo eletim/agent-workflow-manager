@@ -93,6 +93,10 @@ def emit_agent_turn(
     attempt: int,
     status: Literal["started", "completed", "failed"],
     *,
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: str | None = None,
     prompt: str | None = None,
     result: str | None = None,
     error: str | None = None,
@@ -109,12 +113,32 @@ def emit_agent_turn(
         raise ValueError("agent turn purpose must be a non-empty string")
     if not isinstance(role, str) or not role.strip():
         raise ValueError("agent turn role must be a non-empty string")
+    if phase is not None and (not isinstance(phase, str) or not phase.strip()):
+        raise ValueError("agent turn phase must be a non-empty string or None")
+    if isinstance(work_item_id, bool) or (
+        work_item_id is not None and not isinstance(work_item_id, (int, str))
+    ):
+        raise TypeError("agent turn work_item_id must be an int, string, or None")
+    if isinstance(work_item_id, int) and work_item_id < 1:
+        raise ValueError("agent turn integer work_item_id must be positive")
+    if isinstance(work_item_id, str) and not work_item_id.strip():
+        raise ValueError("agent turn string work_item_id must be non-empty")
+    if (work_item_id is None) != (work_item_label is None):
+        raise ValueError("agent turn work-item id and label must be provided together")
+    if work_item_label is not None and (
+        not isinstance(work_item_label, str) or not work_item_label.strip()
+    ):
+        raise ValueError("agent turn work_item_label must be non-empty")
     if status == "started":
         if not isinstance(prompt, str) or result is not None or error is not None:
             raise ValueError("a started agent turn requires only its exact prompt")
     elif status == "completed":
         if not isinstance(result, str) or prompt is not None or error is not None:
             raise ValueError("a completed agent turn requires only its result")
+        if transition_outcome is not None and (
+            not isinstance(transition_outcome, str) or not transition_outcome.strip()
+        ):
+            raise ValueError("agent turn transition outcome must be non-empty")
     elif status == "failed":
         if (
             not isinstance(error, str)
@@ -123,6 +147,8 @@ def emit_agent_turn(
             or result is not None
         ):
             raise ValueError("a failed agent turn requires only its error")
+        if transition_outcome is not None:
+            raise ValueError("a failed agent turn cannot have a transition outcome")
     else:
         raise ValueError("agent turn status must be started, completed, or failed")
 
@@ -133,6 +159,13 @@ def emit_agent_turn(
         "attempt": attempt,
         "status": status,
     }
+    if phase is not None:
+        payload["phase"] = phase
+    if work_item_id is not None:
+        payload["work_item_id"] = work_item_id
+        payload["work_item_label"] = work_item_label
+    if transition_outcome is not None:
+        payload["transition_outcome"] = transition_outcome
     if prompt is not None:
         payload["prompt"] = prompt
     if result is not None:

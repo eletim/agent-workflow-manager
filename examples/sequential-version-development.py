@@ -578,20 +578,35 @@ def create_agent(
     )
 
 
-def run_turn(
+@dataclass(frozen=True)
+class _AgentTurnExecution:
+    result: str
+    turn_id: int
+    purpose: str
+    role: str
+    attempt: int
+    phase: str | None
+    work_item_id: int | str | None
+    work_item_label: str | None
+
+
+def _execute_turn(
     client: PurpleMuxCLIClient,
     tab: str,
     name: str,
     prompt: str,
     *,
     role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
     repository: GitRepository | None = None,
     branch: str | None = None,
     expected_process: str | None = None,
-) -> str:
+) -> _AgentTurnExecution:
     if (repository is None) != (branch is None) or (repository is None) != (
         expected_process is None
     ):
@@ -605,6 +620,12 @@ def run_turn(
             raise WorkerFailure(f"local branch {branch!r} does not exist")
         before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
+    trace_context = {}
+    if phase is not None:
+        trace_context["phase"] = phase
+    if work_item_id is not None:
+        trace_context["work_item_id"] = work_item_id
+        trace_context["work_item_label"] = work_item_label
     emit_step(
         name,
         "started",
@@ -655,6 +676,7 @@ def run_turn(
                 turn_attempt,
                 "started",
                 prompt=prompt,
+                **trace_context,
             )
         except Exception:
             # The trace is observation-only and must never control execution.
@@ -674,6 +696,7 @@ def run_turn(
                     turn_attempt,
                     "failed",
                     error=short_error(exc),
+                    **trace_context,
                 )
             except Exception:
                 pass
@@ -694,17 +717,6 @@ def run_turn(
                 raise exc from provenance_error
             raise
         raise
-    try:
-        emit_agent_turn(
-            turn_id,
-            name,
-            role,
-            turn_attempt,
-            "completed",
-            result=result,
-        )
-    except Exception:
-        pass
     verify_turn_commits()
     emit_step(
         name,
@@ -715,7 +727,82 @@ def run_turn(
         **navigation,
     )
     terminal_progress("DONE", name, iteration=iteration)
-    return result
+    return _AgentTurnExecution(
+        result,
+        turn_id,
+        name,
+        role,
+        turn_attempt,
+        phase,
+        work_item_id,
+        work_item_label,
+    )
+
+
+def _emit_completed_turn(
+    execution: _AgentTurnExecution, transition_outcome: str | None
+) -> None:
+    """Observe the already-decided outcome without participating in control flow."""
+    trace_context = {}
+    if execution.phase is not None:
+        trace_context["phase"] = execution.phase
+    if execution.work_item_id is not None:
+        trace_context["work_item_id"] = execution.work_item_id
+        trace_context["work_item_label"] = execution.work_item_label
+    try:
+        emit_agent_turn(
+            execution.turn_id,
+            execution.purpose,
+            execution.role,
+            execution.attempt,
+            "completed",
+            result=execution.result,
+            transition_outcome=transition_outcome,
+            **trace_context,
+        )
+    except Exception:
+        pass
+
+
+def run_turn(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    name: str,
+    prompt: str,
+    *,
+    role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: str | None = None,
+    iteration: int | None = None,
+    pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
+    _defer_trace: bool = False,
+) -> str | _AgentTurnExecution:
+    execution = _execute_turn(
+        client,
+        tab,
+        name,
+        prompt,
+        role=role,
+        phase=phase,
+        work_item_id=work_item_id,
+        work_item_label=work_item_label,
+        iteration=iteration,
+        pr=pr,
+        warning_scope=warning_scope,
+        repository=repository,
+        branch=branch,
+        expected_process=expected_process,
+    )
+    if _defer_trace:
+        return execution
+    _emit_completed_turn(execution, transition_outcome)
+    return execution.result
 
 
 ValidatedOutput = TypeVar("ValidatedOutput")
@@ -729,12 +816,16 @@ def run_validated_turn(
     validator: Callable[[str], ValidatedOutput],
     *,
     role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: Callable[[ValidatedOutput], str] | None = None,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
-    result = run_turn(
+    turn = run_turn(
         client,
         tab,
         name,
@@ -743,11 +834,23 @@ def run_validated_turn(
         pr=pr,
         warning_scope=warning_scope,
         role=role,
+        phase=phase,
+        work_item_id=work_item_id,
+        work_item_label=work_item_label,
+        _defer_trace=True,
     )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+        result = turn.result if isinstance(turn, _AgentTurnExecution) else turn
         try:
-            return result, validator(result)
+            value = validator(result)
         except WorkerFailure as exc:
+            if isinstance(turn, _AgentTurnExecution):
+                _emit_completed_turn(
+                    turn,
+                    "correct_output"
+                    if correction < MAX_MACHINE_OUTPUT_CORRECTIONS
+                    else "invalid_output",
+                )
             if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
                 raise WorkerFailure(
                     f"{name} returned invalid output after "
@@ -755,7 +858,7 @@ def run_validated_turn(
                     f"{short_error(exc)}"
                 ) from exc
             validation_error = short_error(exc)
-            result = run_turn(
+            turn = run_turn(
                 client,
                 tab,
                 f"{name} output correction",
@@ -768,7 +871,21 @@ def run_validated_turn(
                 pr=pr,
                 warning_scope=warning_scope,
                 role=role,
+                phase="output-correction",
+                work_item_id=work_item_id,
+                work_item_label=work_item_label,
+                _defer_trace=True,
             )
+            continue
+        outcome: str | None = None
+        if transition_outcome is not None:
+            try:
+                outcome = transition_outcome(value)
+            except Exception:
+                pass
+        if isinstance(turn, _AgentTurnExecution):
+            _emit_completed_turn(turn, outcome)
+        return result, value
     raise AssertionError("unreachable")
 
 
@@ -836,6 +953,20 @@ def recover_error(
         raise WorkerFailure("recovery requires current authoritative state")
     if len(authoritative_state.encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
         raise WorkerFailure("recovery authoritative state exceeds its size limit")
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    try:
+        active = json.loads(authoritative_state).get("work_item_plan", {}).get("active")
+        if isinstance(active, dict):
+            if isinstance(active.get("issue"), int):
+                work_item_id = active["issue"]
+                work_item_label = f"Issue #{work_item_id}"
+            elif isinstance(active.get("id"), str):
+                task_id = active["id"]
+                work_item_id = f"mini-task:{task_id}"
+                work_item_label = f"Mini task {task_id}"
+    except (AttributeError, TypeError, ValueError):
+        pass
     agent = create_agent(
         client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
     )
@@ -861,6 +992,12 @@ def recover_error(
             ),
             parse_recovery_report,
             role="recovery",
+            phase="recovery",
+            work_item_id=work_item_id,
+            work_item_label=work_item_label,
+            transition_outcome=lambda report: (
+                "retry_workflow" if report.retry_safe else "stop_workflow"
+            ),
         )
         return report
     finally:
@@ -2597,6 +2734,10 @@ def _review_issue_phase(
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            phase=("scope-review" if phase == "scope/design" else "correctness-review"),
+            work_item_id=issue.result_id,
+            work_item_label=issue.label,
+            transition_outcome=lambda value: value.lower(),
         )
         emit_policy_conflicts(
             result,
@@ -2739,6 +2880,10 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             repository=repo,
             branch=issue.branch,
             expected_process="reviewer-fix",
+            phase="reviewer-fix",
+            work_item_id=issue.result_id,
+            work_item_label=issue.label,
+            transition_outcome="verify_fix",
         )
         emit_policy_conflicts(
             fix_result,
@@ -3096,6 +3241,10 @@ def process_issue(
         repository=repo,
         branch=issue.branch,
         expected_process="implementation",
+        phase="implementation",
+        work_item_id=issue.result_id,
+        work_item_label=issue.label,
+        transition_outcome="continue_to_scope_review",
     )
     emit_policy_conflicts(
         implementation_result,
@@ -3972,6 +4121,10 @@ def process_work_items(
             lambda source: apply_planner_decision(plan, source),
             role="planner",
             iteration=planner_turn,
+            phase="planning",
+            transition_outcome=lambda value: (
+                "planning_complete" if value.complete else "dispatch_work_item"
+            ),
         )
         for conflict in planner_decision.policy_conflicts:
             record_policy_conflict(
@@ -4302,6 +4455,8 @@ def _review_whole_version(
                 decision,
                 role="reviewer",
                 iteration=review_number,
+                phase="whole-review",
+                transition_outcome=lambda value: value.lower(),
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
             scenario_audit = allocate_review_audit(
@@ -4387,6 +4542,8 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            phase="whole-review",
+            transition_outcome=lambda value: value.lower(),
         )
         review_results.append(principles_result)
         changes_requested = (
@@ -4477,6 +4634,8 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            phase="whole-review",
+            transition_outcome=lambda value: value.lower(),
         )
         review_results.append(result)
         changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
@@ -4558,6 +4717,8 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            phase="whole-review",
+            transition_outcome=lambda value: value.lower(),
         )
         review_results.append(version_result)
         changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
@@ -4679,6 +4840,8 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     repository=repo,
                     branch=config.integration_branch,
                     expected_process="reviewer-fix",
+                    phase="whole-fix",
+                    transition_outcome="verify_fix",
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
