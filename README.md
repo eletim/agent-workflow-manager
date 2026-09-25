@@ -74,10 +74,12 @@ every prompt.
 Issue Driven Run detail also exposes a read-only `agentTurns` trace. Each ordered
 entry records the turn's human-readable `purpose`, `role`, `attempt`, exact
 `prompt` captured at the agent send boundary, lifecycle `status`, result or
-error, timestamps, repository context, and `previousTurnId` / `nextTurnId`
-relationships. The Runner persists this observation with Run history; it is not
-workflow recovery state and never participates in sequencing, retries, or any
-other decision made by the generated plain-Python Workflow.
+error, authoritative workflow `phase` and work-item identity when applicable,
+the generated workflow's explicit `transitionOutcome`, timestamps, repository
+context, and `previousTurnId` / `nextTurnId` relationships. The Runner persists
+this observation with Run history; it is not workflow recovery state and never
+participates in sequencing, retries, or any other decision made by the generated
+plain-Python Workflow.
 
 ## Review mode
 

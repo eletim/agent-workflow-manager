@@ -104,6 +104,44 @@ def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
     }
 
 
+def test_emit_agent_turn_completed_carries_authoritative_transition_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
+    try:
+        emit_agent_turn(
+            8,
+            "Review the current head",
+            "reviewer",
+            3,
+            "completed",
+            phase="correctness-review",
+            work_item_id="validate-change",
+            work_item_label="Mini task validate-change",
+            transition_outcome="changes_requested",
+            result="CHANGES_REQUESTED",
+        )
+    finally:
+        os.close(write_fd)
+
+    with os.fdopen(read_fd, encoding="utf-8") as stream:
+        chunks = [json.loads(line) for line in stream]
+    encoded = "".join(item["data"] for item in chunks)
+    assert json.loads(base64.b64decode(encoded).decode()) == {
+        "turn_id": 8,
+        "purpose": "Review the current head",
+        "role": "reviewer",
+        "attempt": 3,
+        "status": "completed",
+        "phase": "correctness-review",
+        "work_item_id": "validate-change",
+        "work_item_label": "Mini task validate-change",
+        "transition_outcome": "changes_requested",
+        "result": "CHANGES_REQUESTED",
+    }
+
+
 def test_emit_agent_turn_http_delivery_is_decoupled_and_retries_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1011,6 +1011,10 @@ emit_agent_turn(
     attempt,                # positive int
     status,                 # "started", "completed", or "failed"
     *,
+    phase=None,             # generated workflow phase, when applicable
+    work_item_id=None,      # authoritative Issue/mini-task identity
+    work_item_label=None,   # supplied together with work_item_id
+    transition_outcome=None, # workflow-selected outcome for completed
     prompt=None,            # exact prompt, required only for started
     result=None,            # exact result, required only for completed
     error=None,             # error text, required only for failed
@@ -1021,6 +1025,11 @@ The Runner persists the ordered read-only trace in Issue Driven Run history and
 adds previous/next turn relationships. Managed runs append every transition to
 a Runner-owned spool that is reconciled before terminal history is persisted;
 background HTTP delivery supplies live updates without delaying an agent turn.
+Planning, work-item implementation/review/fix, whole-version review/fix,
+machine-output correction, and recovery turns attach their authoritative phase
+and explicit transition outcome in generated Python. Work-item turns also carry
+the plan-owned identity and label; the Runner does not derive any of these
+control-flow facts.
 Trace publication is observation only: generated Python still owns every
 branch, retry, and lifecycle decision, and a delivery failure must not change
 its behavior.

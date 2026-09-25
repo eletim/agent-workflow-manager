@@ -2658,7 +2658,12 @@ def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> No
             assert tab == "tab-1"
             assert sent_prompt == prompt
             assert observed[-1][4] == "started"
-            assert observed[-1][-1] == {"prompt": prompt}
+            assert observed[-1][-1] == {
+                "prompt": prompt,
+                "phase": "implementation",
+                "work_item_id": 90,
+                "work_item_label": "Issue #90",
+            }
 
         def wait_for_turn_completion(self, tab, timeout, *, on_busy_timeout):
             assert (tab, timeout) == ("tab-1", workflow["TURN_TIMEOUT"])
@@ -2672,12 +2677,52 @@ def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> No
     )
 
     result = workflow["run_turn"](
-        Client(), "tab-1", "Implement the issue", prompt, role="implementer"
+        Client(),
+        "tab-1",
+        "Implement the issue",
+        prompt,
+        role="implementer",
+        phase="implementation",
+        work_item_id=90,
+        work_item_label="Issue #90",
+        transition_outcome="continue_to_scope_review",
     )
 
     assert result == "exact result"
     assert [event[4] for event in observed] == ["started", "completed"]
-    assert observed[1][-1] == {"result": "exact result"}
+    assert observed[0][-1] == {
+        "prompt": prompt,
+        "phase": "implementation",
+        "work_item_id": 90,
+        "work_item_label": "Issue #90",
+    }
+    assert observed[1][-1] == {
+        "result": "exact result",
+        "transition_outcome": "continue_to_scope_review",
+        "phase": "implementation",
+        "work_item_id": 90,
+        "work_item_label": "Issue #90",
+    }
+
+
+def test_generated_workflow_classifies_all_issue_driven_turn_phases() -> None:
+    source = generate_issue_driven_workflow(parse(payload(issues=[90])))
+
+    for phase in (
+        "planning",
+        "implementation",
+        "scope-review",
+        "correctness-review",
+        "reviewer-fix",
+        "whole-review",
+        "whole-fix",
+        "output-correction",
+        "recovery",
+    ):
+        assert f'"{phase}"' in source
+    assert 'transition_outcome="continue_to_scope_review"' in source
+    assert 'transition_outcome="verify_fix"' in source
+    assert '"retry_workflow" if report.retry_safe else "stop_workflow"' in source
 
 
 def test_agent_turn_trace_failure_cannot_change_workflow_result() -> None:
@@ -2738,8 +2783,12 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
         agents.append((agent_type, name)) or f"recovery-{len(agents)}"
     )
 
-    def run_validated(client, agent, name, prompt, validator, *, role):
+    def run_validated(client, agent, name, prompt, validator, *, role, **kwargs):
         assert role == "recovery"
+        assert kwargs["phase"] == "recovery"
+        assert kwargs["transition_outcome"](
+            workflow["RecoveryReport"](True, True, "ok", "evidence")
+        ) == "retry_workflow"
         prompts.append(prompt)
         return "", validator(
             json.dumps(

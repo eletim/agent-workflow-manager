@@ -585,6 +585,10 @@ def run_turn(
     prompt: str,
     *,
     role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: str | Callable[[str], str] = "completed",
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
@@ -605,6 +609,12 @@ def run_turn(
             raise WorkerFailure(f"local branch {branch!r} does not exist")
         before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
+    trace_context = {}
+    if phase is not None:
+        trace_context["phase"] = phase
+    if work_item_id is not None:
+        trace_context["work_item_id"] = work_item_id
+        trace_context["work_item_label"] = work_item_label
     emit_step(
         name,
         "started",
@@ -655,6 +665,7 @@ def run_turn(
                 turn_attempt,
                 "started",
                 prompt=prompt,
+                **trace_context,
             )
         except Exception:
             # The trace is observation-only and must never control execution.
@@ -674,6 +685,7 @@ def run_turn(
                     turn_attempt,
                     "failed",
                     error=short_error(exc),
+                    **trace_context,
                 )
             except Exception:
                 pass
@@ -695,6 +707,11 @@ def run_turn(
             raise
         raise
     try:
+        outcome = (
+            transition_outcome(result)
+            if callable(transition_outcome)
+            else transition_outcome
+        )
         emit_agent_turn(
             turn_id,
             name,
@@ -702,6 +719,8 @@ def run_turn(
             turn_attempt,
             "completed",
             result=result,
+            transition_outcome=outcome,
+            **trace_context,
         )
     except Exception:
         pass
@@ -729,11 +748,27 @@ def run_validated_turn(
     validator: Callable[[str], ValidatedOutput],
     *,
     role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: Callable[[ValidatedOutput], str] | None = None,
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
+    validated: list[ValidatedOutput] = []
+
+    def classify(source: str) -> str:
+        try:
+            value = validator(source)
+        except WorkerFailure:
+            return "correct_output"
+        validated.append(value)
+        return (
+            transition_outcome(value) if transition_outcome is not None else "completed"
+        )
+
     result = run_turn(
         client,
         tab,
@@ -743,10 +778,15 @@ def run_validated_turn(
         pr=pr,
         warning_scope=warning_scope,
         role=role,
+        phase=phase,
+        work_item_id=work_item_id,
+        work_item_label=work_item_label,
+        transition_outcome=classify,
     )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
         try:
-            return result, validator(result)
+            value = validated.pop(0) if validated else validator(result)
+            return result, value
         except WorkerFailure as exc:
             if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
                 raise WorkerFailure(
@@ -755,6 +795,7 @@ def run_validated_turn(
                     f"{short_error(exc)}"
                 ) from exc
             validation_error = short_error(exc)
+            validated.clear()
             result = run_turn(
                 client,
                 tab,
@@ -768,6 +809,10 @@ def run_validated_turn(
                 pr=pr,
                 warning_scope=warning_scope,
                 role=role,
+                phase="output-correction",
+                work_item_id=work_item_id,
+                work_item_label=work_item_label,
+                transition_outcome=classify,
             )
     raise AssertionError("unreachable")
 
@@ -836,6 +881,19 @@ def recover_error(
         raise WorkerFailure("recovery requires current authoritative state")
     if len(authoritative_state.encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
         raise WorkerFailure("recovery authoritative state exceeds its size limit")
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    try:
+        active = json.loads(authoritative_state).get("work_item_plan", {}).get("active")
+        if isinstance(active, dict):
+            if isinstance(active.get("issue"), int):
+                work_item_id = active["issue"]
+                work_item_label = f"Issue #{work_item_id}"
+            elif isinstance(active.get("id"), str):
+                work_item_id = active["id"]
+                work_item_label = f"Mini task {work_item_id}"
+    except (AttributeError, TypeError, ValueError):
+        pass
     agent = create_agent(
         client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
     )
@@ -861,6 +919,12 @@ def recover_error(
             ),
             parse_recovery_report,
             role="recovery",
+            phase="recovery",
+            work_item_id=work_item_id,
+            work_item_label=work_item_label,
+            transition_outcome=lambda report: (
+                "retry_workflow" if report.retry_safe else "stop_workflow"
+            ),
         )
         return report
     finally:
@@ -2597,6 +2661,10 @@ def _review_issue_phase(
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            phase=("scope-review" if phase == "scope/design" else "correctness-review"),
+            work_item_id=issue.result_id,
+            work_item_label=issue.label,
+            transition_outcome=lambda value: value.lower(),
         )
         emit_policy_conflicts(
             result,
@@ -2739,6 +2807,10 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             repository=repo,
             branch=issue.branch,
             expected_process="reviewer-fix",
+            phase="reviewer-fix",
+            work_item_id=issue.result_id,
+            work_item_label=issue.label,
+            transition_outcome="verify_fix",
         )
         emit_policy_conflicts(
             fix_result,
@@ -3096,6 +3168,10 @@ def process_issue(
         repository=repo,
         branch=issue.branch,
         expected_process="implementation",
+        phase="implementation",
+        work_item_id=issue.result_id,
+        work_item_label=issue.label,
+        transition_outcome="continue_to_scope_review",
     )
     emit_policy_conflicts(
         implementation_result,
@@ -3972,6 +4048,10 @@ def process_work_items(
             lambda source: apply_planner_decision(plan, source),
             role="planner",
             iteration=planner_turn,
+            phase="planning",
+            transition_outcome=lambda value: (
+                "planning_complete" if value.complete else "dispatch_work_item"
+            ),
         )
         for conflict in planner_decision.policy_conflicts:
             record_policy_conflict(
@@ -4302,6 +4382,8 @@ def _review_whole_version(
                 decision,
                 role="reviewer",
                 iteration=review_number,
+                phase="whole-review",
+                transition_outcome=lambda value: value.lower(),
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
             scenario_audit = allocate_review_audit(
@@ -4387,6 +4469,8 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            phase="whole-review",
+            transition_outcome=lambda value: value.lower(),
         )
         review_results.append(principles_result)
         changes_requested = (
@@ -4477,6 +4561,8 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            phase="whole-review",
+            transition_outcome=lambda value: value.lower(),
         )
         review_results.append(result)
         changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
@@ -4558,6 +4644,8 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            phase="whole-review",
+            transition_outcome=lambda value: value.lower(),
         )
         review_results.append(version_result)
         changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
@@ -4679,6 +4767,8 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     repository=repo,
                     branch=config.integration_branch,
                     expected_process="reviewer-fix",
+                    phase="whole-fix",
+                    transition_outcome="verify_fix",
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
