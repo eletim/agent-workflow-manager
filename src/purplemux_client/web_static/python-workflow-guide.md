@@ -1018,9 +1018,12 @@ emit_agent_turn(
 ```
 
 The Runner persists the ordered read-only trace in Issue Driven Run history and
-adds previous/next turn relationships. Trace publication is best-effort
-observation: generated Python still owns every branch, retry, and lifecycle
-decision, and a trace delivery failure must not change its behavior.
+adds previous/next turn relationships. Managed runs append every transition to
+a Runner-owned spool that is reconciled before terminal history is persisted;
+background HTTP delivery supplies live updates without delaying an agent turn.
+Trace publication is observation only: generated Python still owns every
+branch, retry, and lifecycle decision, and a delivery failure must not change
+its behavior.
 
 When GitHub inspection or creation has authoritatively identified a PR, pass
 `pr_number` and `pr_url` together to attach read-only navigation to that Progress

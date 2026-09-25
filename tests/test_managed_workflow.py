@@ -23,9 +23,11 @@ from purplemux_client.client import (
 )
 from purplemux_client.errors import MutationOutcomeUnknown, WorkerFailure
 from purplemux_client.progress import (
+    AGENT_TURN_TRACE_FILE_ENV,
     EVENT_TOKEN_ENV,
     EVENT_URL_ENV,
     acknowledge_run_resource,
+    emit_agent_turn,
     emit_step,
 )
 from purplemux_client.runner import PythonRunner, RunnerSnapshot
@@ -162,7 +164,10 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        run_id = runner.start("print('visible only in PurpleMux')")
+        run_id = runner.start(
+            "print('visible only in PurpleMux')",
+            issue_driven_json='{"mode":"issue-driven"}',
+        )
         run = runner._runs[run_id]
         assert runtime.request is not None
         assert runtime.request.cwd == str(tmp_path)
@@ -182,6 +187,7 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         environment = run.credential_path.read_text(encoding="utf-8")
         assert f"export {CONTROL_TOKEN_ENV}=" in environment
         assert f"export {CONTROL_URL_ENV}=http://127.0.0.1:" in environment
+        assert f"export {AGENT_TURN_TRACE_FILE_ENV}=" in environment
         assert str(run.credential_path) in client.request.command
         assert (
             f"http://127.0.0.1:{server.server_address[1]}"
@@ -230,9 +236,37 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
         ]
         assert snapshot.resources[-1].metadata["registration_state"] == "verified"
 
+        assert run.agent_turn_trace_path is not None
+        agent_turn_trace_path = run.agent_turn_trace_path
+        monkeypatch.delenv(EVENT_URL_ENV)
+        monkeypatch.delenv(EVENT_TOKEN_ENV)
+        monkeypatch.setenv(AGENT_TURN_TRACE_FILE_ENV, str(run.agent_turn_trace_path))
+        emit_agent_turn(
+            1,
+            "Managed agent turn",
+            "implementer",
+            1,
+            "started",
+            prompt="exact managed prompt",
+        )
+        emit_agent_turn(
+            1,
+            "Managed agent turn",
+            "implementer",
+            1,
+            "completed",
+            result="exact managed result",
+        )
+        assert runner.snapshot(run_id).agent_turns == ()
+
         client.release.set()
         finished = _wait_for_state(runner, "success")
         assert finished.exit_code == 0
+        assert len(finished.agent_turns) == 1
+        assert finished.agent_turns[0].prompt == "exact managed prompt"
+        assert finished.agent_turns[0].result == "exact managed result"
+        assert finished.agent_turns[0].status == "completed"
+        assert not agent_turn_trace_path.exists()
         assert finished.stdout == ""
     finally:
         server.shutdown()

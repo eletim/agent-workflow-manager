@@ -28,6 +28,7 @@ PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESOURCE_ACK_FD_ENV = "PURPLEMUX_RUNNER_RESOURCE_ACK_FD"
 EVENT_URL_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_URL"
 EVENT_TOKEN_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_TOKEN"
+AGENT_TURN_TRACE_FILE_ENV = "AGENT_WORKFLOW_MANAGER_AGENT_TURN_TRACE_FILE"
 MAX_PROGRESS_EVENT_BYTES = 4096
 _AGENT_TURN_CHUNK_CHARS = 2_400
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
@@ -156,6 +157,7 @@ def emit_agent_turn(
         }
         for index, chunk in enumerate(chunks)
     )
+    _append_agent_turn_spool(events)
     event_url = os.environ.get(EVENT_URL_ENV)
     event_token = os.environ.get(EVENT_TOKEN_ENV)
     if event_url is not None and event_token is not None:
@@ -192,14 +194,67 @@ def _deliver_agent_turn_http() -> None:
         event_url, event_token, events = _agent_turn_http_queue.get()
         for event in events:
             retry_delay = 0.05
-            while not _post_event(
-                event_url,
-                event_token,
-                event,
-                required=False,
-            ):
+            while True:
+                outcome = _post_agent_turn_event(event_url, event_token, event)
+                if outcome == "delivered":
+                    break
+                if outcome == "rejected":
+                    break
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 1.0)
+            if outcome == "rejected":
+                break
+
+
+def _append_agent_turn_spool(events: tuple[dict[str, object], ...]) -> None:
+    path = os.environ.get(AGENT_TURN_TRACE_FILE_ENV)
+    if path is None:
+        return
+    encoded = b"".join(_encode_event(event) for event in events)
+    try:
+        flags = os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            with _write_lock:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+
+
+def _post_agent_turn_event(
+    url: str,
+    token: str,
+    event: Mapping[str, object],
+) -> Literal["delivered", "retry", "rejected"]:
+    encoded = _encode_event(event)
+    if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
+        return "rejected"
+    submitted = request.Request(
+        url,
+        data=encoded,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-AWM-Run-Token": token,
+        },
+    )
+    try:
+        with request.urlopen(submitted, timeout=5) as response:
+            response.read(MAX_PROGRESS_EVENT_BYTES + 1)
+    except error.HTTPError as exc:
+        return "retry" if 500 <= exc.code < 600 else "rejected"
+    except (error.URLError, OSError):
+        return "retry"
+    return "delivered"
 
 
 def emit_run_pr(pr_number: int, pr_url: str) -> None:
@@ -743,9 +798,9 @@ def _post_event(
             raise RuntimeError(
                 "Runner resource ownership event could not be delivered"
             ) from exc
-        return False
+        return None
     if not required:
-        return True
+        return None
     try:
         return json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:

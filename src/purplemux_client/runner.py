@@ -47,6 +47,7 @@ from purplemux_client.preflight import (
     WorkflowValidator,
 )
 from purplemux_client.progress import (
+    AGENT_TURN_TRACE_FILE_ENV,
     EVENT_TOKEN_ENV,
     EVENT_URL_ENV,
     MAX_PROGRESS_EVENT_BYTES,
@@ -927,6 +928,7 @@ class _RunRecord:
     managed_tab_id: str | None = None
     managed_tab_name: str | None = None
     credential_path: Path | None = None
+    agent_turn_trace_path: Path | None = field(default=None, repr=False)
     event_token: str | None = None
     control_token: str | None = None
     integration_pr: PullRequestNavigation | None = None
@@ -2345,9 +2347,17 @@ class PythonRunner:
         managed_env.pop(PROGRESS_FD_ENV, None)
         managed_env.pop(RESOURCE_ACK_FD_ENV, None)
         managed_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
+        managed_env.pop(AGENT_TURN_TRACE_FILE_ENV, None)
         managed_env[EVENT_URL_ENV] = event_url
         managed_env[EVENT_TOKEN_ENV] = event_token
         managed_env[RUN_IDENTITY_ENV] = self._run_identity(run_id)
+        agent_turn_trace_path: Path | None = None
+        if issue_driven_json is not None:
+            agent_turn_trace_file = tempfile.NamedTemporaryFile(delete=False)
+            agent_turn_trace_file.close()
+            agent_turn_trace_path = Path(agent_turn_trace_file.name)
+            agent_turn_trace_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            managed_env[AGENT_TURN_TRACE_FILE_ENV] = str(agent_turn_trace_path)
         try:
             for name, value in sorted(managed_env.items()):
                 if _SHELL_ENV_NAME.fullmatch(name):
@@ -2370,6 +2380,7 @@ class PythonRunner:
             findings=deque(maxlen=self._max_progress_events),
             warning_findings=deque(maxlen=self._max_progress_events),
             credential_path=credential_path,
+            agent_turn_trace_path=agent_turn_trace_path,
             event_token=event_token,
             issue_driven_json=issue_driven_json,
             environment_setup_json=environment_setup_json,
@@ -2483,6 +2494,8 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
+        if run.agent_turn_trace_path is not None:
+            run.agent_turn_trace_path.unlink(missing_ok=True)
         self._fail_workflow_launch(run, exc)
 
     def _fail_workflow_launch(self, run: _RunRecord, exc: BaseException) -> None:
@@ -4684,9 +4697,12 @@ class PythonRunner:
         diagnostic: str | None = None,
     ) -> None:
         exit_code = result.exit_code
+        trace_events = self._read_agent_turn_trace_spool(run)
         with self._lock:
             if run.state != "running":
                 return
+            for parsed in trace_events:
+                self._accept_parsed_event(run, parsed)
             if result.stdout:
                 self._append_output(run, "stdout", result.stdout, lock_held=True)
             if result.stderr:
@@ -4717,7 +4733,32 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
+        if run.agent_turn_trace_path is not None:
+            run.agent_turn_trace_path.unlink(missing_ok=True)
         self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
+
+    def _read_agent_turn_trace_spool(
+        self, run: _RunRecord
+    ) -> tuple[tuple[str, object], ...]:
+        path = run.agent_turn_trace_path
+        if path is None:
+            return ()
+        parsed_events: list[tuple[str, object]] = []
+        try:
+            with path.open("rb") as stream:
+                while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
+                    if len(line) > MAX_PROGRESS_EVENT_BYTES or not line.endswith(b"\n"):
+                        while line and not line.endswith(b"\n"):
+                            line = stream.readline(MAX_PROGRESS_EVENT_BYTES + 1)
+                        continue
+                    parsed = self._parse_runner_event(
+                        line.decode("utf-8", errors="replace")
+                    )
+                    if parsed is not None and parsed[0] == "agent_turn_trace_chunk":
+                        parsed_events.append(parsed)
+        except OSError:
+            return ()
+        return tuple(parsed_events)
 
     def _notify_terminal(
         self, run: _RunRecord, *, state: RunnerState, exit_code: int

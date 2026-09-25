@@ -160,6 +160,59 @@ def test_emit_agent_turn_http_delivery_is_decoupled_and_retries_chunks(
     )
 
 
+def test_permanent_agent_turn_rejection_does_not_block_later_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejected = threading.Event()
+    later_delivered = threading.Event()
+    attempts: list[str] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"{}"
+
+    def reject_then_accept(submitted, *, timeout: float):
+        assert timeout == 5
+        event = json.loads(submitted.data)
+        attempts.append(event["message_id"])
+        if event["message_id"] == "8:started":
+            rejected.set()
+            raise error.HTTPError(submitted.full_url, 400, "invalid", None, None)
+        later_delivered.set()
+        return Response()
+
+    monkeypatch.setenv(EVENT_URL_ENV, "http://127.0.0.1:1/events")
+    monkeypatch.setenv(EVENT_TOKEN_ENV, "token")
+    monkeypatch.setattr("purplemux_client.progress.request.urlopen", reject_then_accept)
+
+    emit_agent_turn(
+        8,
+        "Rejected turn",
+        "reviewer",
+        1,
+        "started",
+        prompt="large rejected prompt\n" * 2_000,
+    )
+    assert rejected.wait(1)
+    emit_agent_turn(
+        9,
+        "Later turn",
+        "reviewer",
+        1,
+        "started",
+        prompt="later prompt",
+    )
+
+    assert later_delivered.wait(1)
+    assert attempts == ["8:started", "9:started"]
+
+
 def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:
     read_fd, write_fd = os.pipe()
     monkeypatch.setenv(PROGRESS_FD_ENV, str(write_fd))
