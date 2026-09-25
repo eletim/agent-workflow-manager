@@ -190,7 +190,7 @@ class _AgentTurnTransition:
     role: str
     attempt: int
     status: AgentTurnStatus
-    repository: str
+    repository: str | None
     phase: str | None = None
     work_item_id: int | str | None = None
     work_item_label: str | None = None
@@ -4064,8 +4064,10 @@ class PythonRunner:
             or not isinstance(attempt, int)
             or attempt < 1
             or status not in ("started", "completed", "failed")
-            or not isinstance(repository, str)
-            or not repository.strip()
+            or (
+                "repository" in value
+                and (not isinstance(repository, str) or not repository.strip())
+            )
             or (phase is not None and (not isinstance(phase, str) or not phase.strip()))
             or isinstance(work_item_id, bool)
             or (work_item_id is not None and not isinstance(work_item_id, (int, str)))
@@ -4101,8 +4103,9 @@ class PythonRunner:
             "role",
             "attempt",
             "status",
-            "repository",
         }
+        if repository is not None:
+            expected_fields.add("repository")
         if phase is not None:
             expected_fields.add("phase")
         if work_item_id is not None:
@@ -4149,6 +4152,12 @@ class PythonRunner:
                 if transition.turn_id <= previous.turn_id:
                     return False
                 run.agent_turns[-1] = replace(previous, next_turn_id=transition.turn_id)
+            active_repository = self._active_issue_driven_repository(run)
+            repository = transition.repository or (
+                active_repository.context.repository
+                if active_repository is not None
+                else None
+            )
             run.agent_turns.append(
                 AgentTurnTrace(
                     transition.turn_id,
@@ -4164,7 +4173,7 @@ class PythonRunner:
                     previous_turn_id=(
                         previous.turn_id if previous is not None else None
                     ),
-                    repository=transition.repository,
+                    repository=repository,
                     started_at=self._accepted_at(),
                 )
             )
@@ -4188,7 +4197,10 @@ class PythonRunner:
             or current.phase != transition.phase
             or current.work_item_id != transition.work_item_id
             or current.work_item_label != transition.work_item_label
-            or current.repository != transition.repository
+            or (
+                transition.repository is not None
+                and current.repository != transition.repository
+            )
         ):
             return False
         run.agent_turns[index] = replace(

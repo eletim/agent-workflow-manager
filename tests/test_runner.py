@@ -164,6 +164,23 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", repository="
         restored.close()
 
 
+def test_legacy_agent_turn_without_repository_remains_accepted(
+    runner: PythonRunner,
+) -> None:
+    code = """\
+from purplemux_client import emit_agent_turn
+emit_agent_turn(1, "Legacy turn", "implementer", 1, "started", prompt="legacy prompt")
+emit_agent_turn(1, "Legacy turn", "implementer", 1, "completed", result="legacy result")
+"""
+    run_id = runner.start(code, issue_driven_json='{"mode":"issue-driven"}')
+    snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+
+    assert len(snapshot.agent_turns) == 1
+    assert snapshot.agent_turns[0].status == "completed"
+    assert snapshot.agent_turns[0].repository is None
+    assert snapshot.agent_turns[0].result == "legacy result"
+
+
 def test_obsolete_recovery_metadata_is_ignored(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -664,6 +681,46 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         assert resumed.resumed_from_run_id == first_id
         assert resumed.resumed_from_state == "failed"
         assert resumed.as_json()["recoverySource"]["state"] == "failed"
+    finally:
+        restored.close()
+
+
+def test_legacy_resume_keeps_source_identity_when_source_history_was_deleted(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        source_id = runner.start(
+            "raise SystemExit(7)", issue_driven_json='{"mode":"issue-driven"}'
+        )
+        wait_for(runner, lambda item: item.state == "failed", run_id=source_id)
+        resumed_id = runner.resume(source_id)
+        wait_for(runner, lambda item: item.state == "failed", run_id=resumed_id)
+    finally:
+        runner.close()
+
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    source_identity = next(
+        identity
+        for identity, record in history["runs"].items()
+        if record["runId"] == source_id
+    )
+    del history["runs"][source_identity]
+    resumed_record = next(
+        record for record in history["runs"].values() if record["runId"] == resumed_id
+    )
+    resumed_record.pop("resumedFromState")
+    history_file.write_text(json.dumps(history), encoding="utf-8")
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        recovery = restored.snapshot(resumed_id).as_json()["recoverySource"]
+        assert recovery == {
+            "runId": source_id,
+            "identity": source_identity,
+            "state": None,
+        }
     finally:
         restored.close()
 

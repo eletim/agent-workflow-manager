@@ -1746,6 +1746,28 @@ test("failed Issue Driven run previews immutable settings and resumes as a new r
   assert.equal(recoveryTransition.children[2].textContent, " → Run #5");
 });
 
+test("Recovery remains linked when the prior outcome is unavailable", async () => {
+  const identity = "b".repeat(32) + "-3";
+  const detail = snapshot({
+    runId: 5,
+    state: "running",
+    mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}',
+    resumedFromRunId: 3,
+    recoverySource: {runId: 3, identity, state: null},
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 5, state: "running", mode: "issue-driven"}],
+    details: {5: detail},
+  });
+
+  const recoveryTransition = elements["workflow-recovery-transition"];
+  assert.equal(recoveryTransition.hidden, false);
+  assert.equal(recoveryTransition.children[1].textContent, "Run #3 (OUTCOME UNAVAILABLE)");
+  assert.equal(recoveryTransition.children[1].href, `/?run=${identity}`);
+  assert.equal(recoveryTransition.children[2].textContent, " → Run #5");
+});
+
 test("failed Prompt and custom Workflow runs do not offer Resume", async () => {
   for (const mode of ["prompt", "workflow"]) {
     const failed = snapshot({

@@ -2753,7 +2753,12 @@ def test_agent_turn_trace_failure_cannot_change_workflow_result() -> None:
 
     assert (
         workflow["run_turn"](
-            Client(), "tab-1", "Implement the issue", "prompt", role="implementer"
+            Client(),
+            "tab-1",
+            "Implement the issue",
+            "prompt",
+            repository_identity="acme/project",
+            role="implementer",
         )
         == "authoritative result"
     )

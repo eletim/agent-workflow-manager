@@ -1433,11 +1433,14 @@ function renderIssueDrivenStory(result) {
 
   workflowRecoveryTransition.replaceChildren();
   const recoverySource = result.recoverySource;
-  if (recoverySource?.identity && recoverySource.state) {
+  if (recoverySource?.identity) {
     workflowRecoveryTransition.append(document.createTextNode("Recovery: "));
     const source = document.createElement("a");
     source.href = `/?run=${encodeURIComponent(recoverySource.identity)}`;
-    source.textContent = `Run #${recoverySource.runId} (${recoverySource.state.toUpperCase()})`;
+    const priorOutcome = recoverySource.state
+      ? recoverySource.state.toUpperCase()
+      : "OUTCOME UNAVAILABLE";
+    source.textContent = `Run #${recoverySource.runId} (${priorOutcome})`;
     workflowRecoveryTransition.append(
       source,
       document.createTextNode(` → Run #${result.runId}`),
