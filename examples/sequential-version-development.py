@@ -588,6 +588,7 @@ class _AgentTurnExecution:
     phase: str | None
     work_item_id: int | str | None
     work_item_label: str | None
+    repository_identity: str
     commit_sha: str | None = None
 
 
@@ -597,6 +598,7 @@ def _execute_turn(
     name: str,
     prompt: str,
     *,
+    repository_identity: str,
     role: str = "agent",
     phase: str | None = None,
     work_item_id: int | str | None = None,
@@ -621,7 +623,7 @@ def _execute_turn(
             raise WorkerFailure(f"local branch {branch!r} does not exist")
         before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
-    trace_context = {}
+    trace_context = {"repository": repository_identity}
     if phase is not None:
         trace_context["phase"] = phase
     if work_item_id is not None:
@@ -741,6 +743,7 @@ def _execute_turn(
         phase,
         work_item_id,
         work_item_label,
+        repository_identity,
         commit_sha,
     )
 
@@ -749,7 +752,7 @@ def _emit_completed_turn(
     execution: _AgentTurnExecution, transition_outcome: str | None
 ) -> None:
     """Observe the already-decided outcome without participating in control flow."""
-    trace_context = {}
+    trace_context = {"repository": execution.repository_identity}
     if execution.phase is not None:
         trace_context["phase"] = execution.phase
     if execution.work_item_id is not None:
@@ -778,6 +781,7 @@ def run_turn(
     name: str,
     prompt: str,
     *,
+    repository_identity: str,
     role: str = "agent",
     phase: str | None = None,
     work_item_id: int | str | None = None,
@@ -796,6 +800,7 @@ def run_turn(
         tab,
         name,
         prompt,
+        repository_identity=repository_identity,
         role=role,
         phase=phase,
         work_item_id=work_item_id,
@@ -823,6 +828,7 @@ def run_validated_turn(
     prompt: str,
     validator: Callable[[str], ValidatedOutput],
     *,
+    repository_identity: str,
     role: str = "agent",
     phase: str | None = None,
     work_item_id: int | str | None = None,
@@ -838,6 +844,7 @@ def run_validated_turn(
         tab,
         name,
         prompt,
+        repository_identity=repository_identity,
         iteration=iteration,
         pr=pr,
         warning_scope=warning_scope,
@@ -875,6 +882,7 @@ def run_validated_turn(
                 "Return the complete corrected response only, following the "
                 "original response contract. Correct the output in this same "
                 "session; do not repeat the underlying task or mutate any state.",
+                repository_identity=repository_identity,
                 iteration=correction + 1,
                 pr=pr,
                 warning_scope=warning_scope,
@@ -999,6 +1007,7 @@ def recover_error(
                 process="recovery",
             ),
             parse_recovery_report,
+            repository_identity=config.slug,
             role="recovery",
             phase="recovery",
             work_item_id=work_item_id,
@@ -1950,6 +1959,7 @@ def update_base_pr_human_handoff(
             writer,
             "Base PR human handoff",
             human_handoff_prompt(config, work_items, pr, delivery, warnings),
+            repository_identity=config.slug,
             role="reviewer",
             pr=pr,
         )
@@ -2084,6 +2094,7 @@ def update_multi_repository_human_handoffs(
             writer,
             "Multi-repository human handoff",
             multi_repository_handoff_prompt(tuple(deliveries)),
+            repository_identity=writer_delivery.config.slug,
             role="reviewer",
             pr=writer_delivery.pr,
         )
@@ -2333,6 +2344,7 @@ force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve.""", process="cleanup"),
+        repository_identity=repo.expected_github_slug,
         role="implementer",
         iteration=iteration,
         warning_scope=warning_scope,
@@ -2738,6 +2750,7 @@ def _review_issue_phase(
             f"{issue.label} {phase} review",
             f"{prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
             decision,
+            repository_identity=config.slug,
             role="reviewer",
             iteration=review_number,
             pr=pr,
@@ -2881,6 +2894,7 @@ fix, test, commit, and leave the worktree clean. If no change is warranted,
 leave it clean and explain why; do not create an empty commit.\n\n{result}""",
                 process="reviewer-fix",
             ),
+            repository_identity=config.slug,
             role="implementer",
             iteration=review_number,
             pr=pr,
@@ -3243,6 +3257,7 @@ def process_issue(
         implementer,
         f"{issue.label} implementation",
         implementation_prompt,
+        repository_identity=config.slug,
         role="implementer",
         pr=existing_pr,
         warning_scope=issue.result_id,
@@ -4127,6 +4142,7 @@ def process_work_items(
             )
             + planner_prompt(plan, config),
             lambda source: apply_planner_decision(plan, source),
+            repository_identity=config.slug,
             role="planner",
             iteration=planner_turn,
             phase="planning",
@@ -4461,6 +4477,7 @@ def _review_whole_version(
                 )
                 + scenario_gate_prompt(pr, config, work_items),
                 decision,
+                repository_identity=config.slug,
                 role="reviewer",
                 iteration=review_number,
                 pr=pr,
@@ -4549,6 +4566,7 @@ def _review_whole_version(
             )
             + design_principles_review_prompt(pr, config, work_items),
             decision,
+            repository_identity=config.slug,
             role="reviewer",
             iteration=review_number,
             pr=pr,
@@ -4642,6 +4660,7 @@ def _review_whole_version(
             )
             + whole_version_review_prompt(pr, config, work_items),
             decision,
+            repository_identity=config.slug,
             role="reviewer",
             iteration=review_number,
             pr=pr,
@@ -4726,6 +4745,7 @@ def _review_whole_version(
             )
             + version_readme_review_prompt(pr, config, work_items),
             decision,
+            repository_identity=config.slug,
             role="reviewer",
             iteration=review_number,
             pr=pr,
@@ -4847,6 +4867,7 @@ def _review_whole_version(
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
                         process="reviewer-fix",
                     ),
+                    repository_identity=config.slug,
                     role="implementer",
                     iteration=review_number,
                     repository=repo,

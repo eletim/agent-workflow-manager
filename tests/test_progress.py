@@ -74,7 +74,13 @@ def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
     prompt = "目的を確認する。\n" + "actual prompt 🎯\n" * 500
     try:
         emit_agent_turn(
-            7, "Review the current head", "reviewer", 2, "started", prompt=prompt
+            7,
+            "Review the current head",
+            "reviewer",
+            2,
+            "started",
+            repository="acme/project",
+            prompt=prompt,
         )
     finally:
         os.close(write_fd)
@@ -100,6 +106,7 @@ def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
         "role": "reviewer",
         "attempt": 2,
         "status": "started",
+        "repository": "acme/project",
         "prompt": prompt,
     }
 
@@ -116,6 +123,7 @@ def test_emit_agent_turn_completed_carries_authoritative_transition_context(
             "reviewer",
             3,
             "completed",
+            repository="acme/project",
             phase="correctness-review",
             work_item_id="validate-change",
             work_item_label="Mini task validate-change",
@@ -135,6 +143,7 @@ def test_emit_agent_turn_completed_carries_authoritative_transition_context(
         "role": "reviewer",
         "attempt": 3,
         "status": "completed",
+        "repository": "acme/project",
         "phase": "correctness-review",
         "work_item_id": "validate-change",
         "work_item_label": "Mini task validate-change",
@@ -183,6 +192,7 @@ def test_emit_agent_turn_http_delivery_is_decoupled_and_retries_chunks(
         "reviewer",
         2,
         "started",
+        repository="acme/project",
         prompt="large prompt\n" * 2_000,
     )
 
@@ -237,6 +247,7 @@ def test_permanent_agent_turn_rejection_does_not_block_later_turns(
         "reviewer",
         1,
         "started",
+        repository="acme/project",
         prompt="large rejected prompt\n" * 2_000,
     )
     assert rejected.wait(1)
@@ -246,6 +257,7 @@ def test_permanent_agent_turn_rejection_does_not_block_later_turns(
         "reviewer",
         1,
         "started",
+        repository="acme/project",
         prompt="later prompt",
     )
 

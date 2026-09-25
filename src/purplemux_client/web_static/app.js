@@ -1400,7 +1400,12 @@ function renderIssueDrivenStory(result) {
   outlinePanel.hidden = false;
   workflowStoryState.hidden = false;
   const turns = result.agentTurns || [];
-  const currentTurn = turns.find((turn) => turn.status === "started" && turn.completedAt == null);
+  const tailTurn = turns.at(-1);
+  const currentTurn = result.state === "running"
+    && tailTurn?.status === "started"
+    && tailTurn.completedAt == null
+    ? tailTurn
+    : null;
   const presentation = runPresentation(result);
   workflowStoryState.textContent = currentTurn
     ? `ACTUAL · ${presentation.label} · Current turn: ${currentTurn.purpose}`
@@ -1448,7 +1453,8 @@ function renderIssueDrivenStory(result) {
   const turnsById = new Map(turns.map((turn) => [turn.turnId, turn]));
   for (const turn of turns) {
     const item = document.createElement("li");
-    const isCurrent = turn.status === "started" && turn.completedAt == null;
+    const isOpen = turn.status === "started" && turn.completedAt == null;
+    const isCurrent = turn === currentTurn;
     item.className = `agent-turn ${isCurrent ? "current" : turn.status}`;
 
     const heading = document.createElement("div");
@@ -1472,6 +1478,10 @@ function renderIssueDrivenStory(result) {
       outcome.textContent = `Outcome: Failed${turn.error ? ` — ${turn.error}` : ""}`;
     } else if (isCurrent) {
       outcome.textContent = "Outcome: In progress";
+    } else if (isOpen) {
+      outcome.textContent = result.state === "failed" || result.state === "stopped"
+        ? `Outcome: Run ${result.state} before completion was recorded`
+        : "Outcome: Completion event missing";
     } else {
       const transition = turn.transitionOutcome
         ? storyPhaseLabel(turn.transitionOutcome)

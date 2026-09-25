@@ -190,6 +190,7 @@ class _AgentTurnTransition:
     role: str
     attempt: int
     status: AgentTurnStatus
+    repository: str
     phase: str | None = None
     work_item_id: int | str | None = None
     work_item_label: str | None = None
@@ -1400,6 +1401,21 @@ class PythonRunner:
             if issue_driven_preview_value is not None
             else None
         )
+        if issue_driven_preview is None and issue_driven_json is not None:
+            from purplemux_client.issue_driven import (
+                issue_driven_run_preview,
+                parse_issue_driven_json,
+            )
+
+            try:
+                issue_driven_preview = issue_driven_run_preview(
+                    parse_issue_driven_json(issue_driven_json)
+                ).as_json()
+            except (TypeError, ValueError):
+                # Early v1 histories did not validate or persist their preview.
+                # Keep otherwise readable legacy records available when their
+                # saved input no longer satisfies the current input schema.
+                pass
         if issue_driven_preview is not None and issue_driven_json is None:
             raise ValueError
         if review_result is not None:
@@ -1854,6 +1870,16 @@ class PythonRunner:
                 and isinstance(run, dict)
                 and run.get("identity") == identity
             ]
+            restored_by_id = {run.run_id: run for run in restored}
+            for run in restored:
+                if (
+                    run.resumed_from_run_id is None
+                    or run.resumed_from_state is not None
+                ):
+                    continue
+                source = restored_by_id.get(run.resumed_from_run_id)
+                if source is not None and source.state in ("failed", "stopped"):
+                    run.resumed_from_state = source.state
             restored_ownership = [
                 self._cleanup_ownership_from_history(ownership)
                 for identity, ownership in cleanup_ownership.items()
@@ -4020,6 +4046,7 @@ class PythonRunner:
         role = value.get("role")
         attempt = value.get("attempt")
         status = value.get("status")
+        repository = value.get("repository")
         phase = value.get("phase")
         work_item_id = value.get("work_item_id")
         work_item_label = value.get("work_item_label")
@@ -4037,6 +4064,8 @@ class PythonRunner:
             or not isinstance(attempt, int)
             or attempt < 1
             or status not in ("started", "completed", "failed")
+            or not isinstance(repository, str)
+            or not repository.strip()
             or (phase is not None and (not isinstance(phase, str) or not phase.strip()))
             or isinstance(work_item_id, bool)
             or (work_item_id is not None and not isinstance(work_item_id, (int, str)))
@@ -4066,7 +4095,14 @@ class PythonRunner:
             )
         ):
             return None
-        expected_fields = {"turn_id", "purpose", "role", "attempt", "status"}
+        expected_fields = {
+            "turn_id",
+            "purpose",
+            "role",
+            "attempt",
+            "status",
+            "repository",
+        }
         if phase is not None:
             expected_fields.add("phase")
         if work_item_id is not None:
@@ -4091,6 +4127,7 @@ class PythonRunner:
             role,
             attempt,
             cast(AgentTurnStatus, status),
+            repository,
             phase=phase,
             work_item_id=work_item_id,
             work_item_label=work_item_label,
@@ -4112,7 +4149,6 @@ class PythonRunner:
                 if transition.turn_id <= previous.turn_id:
                     return False
                 run.agent_turns[-1] = replace(previous, next_turn_id=transition.turn_id)
-            active_repository = self._active_issue_driven_repository(run)
             run.agent_turns.append(
                 AgentTurnTrace(
                     transition.turn_id,
@@ -4128,11 +4164,7 @@ class PythonRunner:
                     previous_turn_id=(
                         previous.turn_id if previous is not None else None
                     ),
-                    repository=(
-                        active_repository.context.repository
-                        if active_repository is not None
-                        else None
-                    ),
+                    repository=transition.repository,
                     started_at=self._accepted_at(),
                 )
             )
@@ -4156,6 +4188,7 @@ class PythonRunner:
             or current.phase != transition.phase
             or current.work_item_id != transition.work_item_id
             or current.work_item_label != transition.work_item_label
+            or current.repository != transition.repository
         ):
             return False
         run.agent_turns[index] = replace(

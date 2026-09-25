@@ -2663,6 +2663,7 @@ def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> No
                 "phase": "implementation",
                 "work_item_id": 90,
                 "work_item_label": "Issue #90",
+                "repository": "acme/project",
             }
 
         def wait_for_turn_completion(self, tab, timeout, *, on_busy_timeout):
@@ -2681,6 +2682,7 @@ def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> No
         "tab-1",
         "Implement the issue",
         prompt,
+        repository_identity="acme/project",
         role="implementer",
         phase="implementation",
         work_item_id=90,
@@ -2695,6 +2697,7 @@ def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> No
         "phase": "implementation",
         "work_item_id": 90,
         "work_item_label": "Issue #90",
+        "repository": "acme/project",
     }
     assert observed[1][-1] == {
         "result": "exact result",
@@ -2702,6 +2705,7 @@ def test_agent_turn_trace_captures_the_unchanged_prompt_at_send_boundary() -> No
         "phase": "implementation",
         "work_item_id": 90,
         "work_item_label": "Issue #90",
+        "repository": "acme/project",
     }
 
 

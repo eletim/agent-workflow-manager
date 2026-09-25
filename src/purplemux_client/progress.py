@@ -94,6 +94,7 @@ def emit_agent_turn(
     attempt: int,
     status: Literal["started", "completed", "failed"],
     *,
+    repository: str,
     phase: str | None = None,
     work_item_id: int | str | None = None,
     work_item_label: str | None = None,
@@ -115,6 +116,8 @@ def emit_agent_turn(
         raise ValueError("agent turn purpose must be a non-empty string")
     if not isinstance(role, str) or not role.strip():
         raise ValueError("agent turn role must be a non-empty string")
+    if not isinstance(repository, str) or not repository.strip():
+        raise ValueError("agent turn repository must be a non-empty string")
     if phase is not None and (not isinstance(phase, str) or not phase.strip()):
         raise ValueError("agent turn phase must be a non-empty string or None")
     if isinstance(work_item_id, bool) or (
@@ -162,6 +165,7 @@ def emit_agent_turn(
         "role": role,
         "attempt": attempt,
         "status": status,
+        "repository": repository,
     }
     if phase is not None:
         payload["phase"] = phase

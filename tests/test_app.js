@@ -2768,6 +2768,60 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
   );
 });
 
+test("only the newest open tail is current while a run is active", async () => {
+  const agentTurns = [
+    {
+      turnId: 1, purpose: "Lost completion", prompt: "first", role: "reviewer",
+      attempt: 1, status: "started", completedAt: null, repository: "acme/project",
+    },
+    {
+      turnId: 2, purpose: "Recorded completion", prompt: "second", role: "reviewer",
+      attempt: 1, status: "completed", completedAt: "2026-09-25T01:00:00Z",
+      result: "done", repository: "acme/project",
+    },
+    {
+      turnId: 3, purpose: "Newest open turn", prompt: "third", role: "reviewer",
+      attempt: 1, status: "started", completedAt: null, repository: "acme/project",
+    },
+  ];
+  const detail = snapshot({
+    runId: 1, state: "running", mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}', agentTurns,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: detail},
+  });
+
+  const rendered = elements["agent-turns"].children;
+  assert.equal(rendered[0].className, "agent-turn started");
+  assert.match(rendered[0].children[2].textContent, /Completion event missing/);
+  assert.equal(rendered[2].className, "agent-turn current");
+  assert.match(rendered[2].children[2].textContent, /In progress/);
+  assert.match(elements["workflow-story-state"].textContent, /Current turn: Newest open turn/);
+});
+
+test("terminal runs never present an open trace as current or in progress", async () => {
+  const detail = snapshot({
+    runId: 1, state: "failed", mode: "issue-driven",
+    issueDrivenJson: '{"mode":"issue-driven"}',
+    agentTurns: [{
+      turnId: 1, purpose: "Interrupted turn", prompt: "prompt", role: "implementer",
+      attempt: 1, status: "started", completedAt: null, repository: "acme/project",
+    }],
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", mode: "issue-driven"}],
+    details: {1: detail},
+  });
+
+  const turn = elements["agent-turns"].children[0];
+  assert.equal(turn.className, "agent-turn started");
+  assert.doesNotMatch(turn.textContent, /CURRENT|In progress/);
+  assert.match(turn.children[2].textContent, /Run failed before completion was recorded/);
+  assert.doesNotMatch(elements["workflow-story-state"].textContent, /Current turn/);
+});
+
 test("multi-repository Issue Driven Summary keeps duplicate issue numbers scoped", async () => {
   const issueDrivenSummary = {
     terminalResult: "success",

@@ -22,6 +22,10 @@ import purplemux_client.runner as runner_module
 import purplemux_client.web as web_module
 from purplemux_client import WorkspaceState
 from purplemux_client.errors import MutationOutcomeUnknown
+from purplemux_client.issue_driven import (
+    issue_driven_run_preview,
+    parse_issue_driven_json,
+)
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.preflight import WorkflowValidator
@@ -99,10 +103,10 @@ def test_issue_driven_agent_turn_trace_is_linked_and_survives_history(
     result = "completed exactly\n" + "evidence\n" * 600
     code = f"""\
 from purplemux_client import emit_agent_turn
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", commit_sha={"a" * 40!r}, prompt={prompt!r})
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", commit_sha={"b" * 40!r}, result={result!r})
-emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", prompt="review prompt")
-emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent stopped")
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", repository="acme/project", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", commit_sha={"a" * 40!r}, prompt={prompt!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", repository="acme/project", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", commit_sha={"b" * 40!r}, result={result!r})
+emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", repository="acme/project", prompt="review prompt")
+emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", repository="acme/project", error="agent stopped")
 """
     try:
         run_id = runner.start(code, issue_driven_json='{"mode":"issue-driven"}')
@@ -125,7 +129,7 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "error": None,
                 "previousTurnId": None,
                 "nextTurnId": 2,
-                "repository": None,
+                "repository": "acme/project",
                 "startedAt": trace[0]["startedAt"],
                 "completedAt": trace[0]["completedAt"],
             },
@@ -145,7 +149,7 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "error": "agent stopped",
                 "previousTurnId": 1,
                 "nextTurnId": None,
-                "repository": None,
+                "repository": "acme/project",
                 "startedAt": trace[1]["startedAt"],
                 "completedAt": trace[1]["completedAt"],
             },
@@ -585,7 +589,19 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         stop_timeout=0.5,
         run_history_file=history_file,
     )
-    source = '{"mode":"issue-driven","one_shot_issue":196}'
+    source = json.dumps(
+        {
+            "mode": "issue-driven",
+            "repository": "/work/project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "one_shot_issue": 196,
+            "max_reviews": 4,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
     preview = {
         "status": "planned",
         "phases": ["Work items", "Final integration PR"],
@@ -629,6 +645,13 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
     finally:
         runner.close()
 
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    for record in history["runs"].values():
+        record.pop("issueDrivenPreview", None)
+        record.pop("resumedFromState", None)
+    history_file.write_text(json.dumps(history), encoding="utf-8")
+    legacy_preview = issue_driven_run_preview(parse_issue_driven_json(source)).as_json()
+
     restored = PythonRunner(
         managed_workflows=False,
         stop_timeout=0.5,
@@ -637,9 +660,10 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
     try:
         resumed = restored.snapshot(resumed_id)
         assert resumed.issue_driven_json == source
-        assert resumed.issue_driven_preview == preview
+        assert resumed.issue_driven_preview == legacy_preview
         assert resumed.resumed_from_run_id == first_id
         assert resumed.resumed_from_state == "failed"
+        assert resumed.as_json()["recoverySource"]["state"] == "failed"
     finally:
         restored.close()
 

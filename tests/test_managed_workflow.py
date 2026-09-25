@@ -247,6 +247,7 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
             "implementer",
             1,
             "started",
+            repository="acme/project",
             prompt="exact managed prompt",
         )
         emit_agent_turn(
@@ -255,6 +256,7 @@ def test_http_workflow_uses_visible_managed_shell_and_authenticated_events(
             "implementer",
             1,
             "completed",
+            repository="acme/project",
             result="exact managed result",
         )
         assert runner.snapshot(run_id).agent_turns == ()
