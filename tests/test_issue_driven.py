@@ -3059,6 +3059,14 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
     workflow["run_outline_step"] = lambda name, action: action()
     plans: list[object] = []
+    deferred_execution = workflow["_AgentTurnExecution"](
+        "plan result", 1, "Plan work items", "planner", 1, "planning",
+        None, None, "acme/project",
+    )
+    transition_outcomes: list[str] = []
+    workflow["emit_agent_turn"] = lambda *args, **kwargs: transition_outcomes.append(
+        kwargs["transition_outcome"]
+    )
 
     def prepare(*args):
         if not plans:
@@ -3066,6 +3074,7 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
             workflow["AGENT_TURN_TIMEOUT_WARNINGS"].append(
                 workflow["AgentTurnTimeoutWarning"](None, "earlier turn", "earlier timeout")
             )
+            workflow["DEFERRED_AGENT_TURN_TRACES"].append(deferred_execution)
             plans.append("failed")
             raise WorkerFailure("plan failed")
         plan = workflow["WorkItemPlan"](config)
@@ -3101,6 +3110,7 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     assert workflow["summary_warnings"](None) == (
         "earlier timeout", "earlier policy warning"
     )
+    assert transition_outcomes == ["recover_workflow"]
     assert findings == [
         ("runtime", "Recovered workflow error: plan failed", "warning"),
         (
@@ -3167,9 +3177,18 @@ def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
     workflow["create_runtime"] = lambda config: object()
     workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
     attempts: list[int] = []
+    deferred_execution = workflow["_AgentTurnExecution"](
+        "plan result", 1, "Plan work items", "planner", 1, "planning",
+        None, None, "acme/project",
+    )
+    transition_outcomes: list[str] = []
+    workflow["emit_agent_turn"] = lambda *args, **kwargs: transition_outcomes.append(
+        kwargs["transition_outcome"]
+    )
 
     def unknown_plan(*args):
         attempts.append(1)
+        workflow["DEFERRED_AGENT_TURN_TRACES"].append(deferred_execution)
         raise MutationOutcomeUnknown("response lost")
 
     workflow["prepare_work_item_plan_pr"] = unknown_plan
@@ -3181,6 +3200,7 @@ def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
     with pytest.raises(MutationOutcomeUnknown, match="response lost"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+    assert transition_outcomes == ["mutation_outcome_unknown"]
 
 
 def test_repository_does_not_recover_interrupted_turn() -> None:
@@ -3190,12 +3210,24 @@ def test_repository_does_not_recover_interrupted_turn() -> None:
     workflow["GitHubRepository"] = SimpleNamespace(open=lambda *args, **kwargs: object())
     workflow["create_runtime"] = lambda config: object()
     workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
-    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
-        WorkerInterrupted("turn interrupted")
+    deferred_execution = workflow["_AgentTurnExecution"](
+        "plan result", 1, "Plan work items", "planner", 1, "planning",
+        None, None, "acme/project",
     )
+    transition_outcomes: list[str] = []
+    workflow["emit_agent_turn"] = lambda *args, **kwargs: transition_outcomes.append(
+        kwargs["transition_outcome"]
+    )
+
+    def interrupt_plan(*args):
+        workflow["DEFERRED_AGENT_TURN_TRACES"].append(deferred_execution)
+        raise WorkerInterrupted("turn interrupted")
+
+    workflow["prepare_work_item_plan_pr"] = interrupt_plan
     workflow["recover_error"] = lambda *args: pytest.fail("interruption entered recovery")
     with pytest.raises(WorkerInterrupted, match="interrupted"):
         workflow["run_repository"](config)
+    assert transition_outcomes == ["interrupted"]
 
 
 def test_retry_state_rejects_mismatched_active_and_base_pr_heads() -> None:

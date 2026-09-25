@@ -683,6 +683,7 @@ def _execute_turn(
         )
         return after.local_sha
 
+    result_observed = False
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         turn_id = next(AGENT_TURN_IDS)
@@ -705,6 +706,8 @@ def _execute_turn(
             tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
         )
         result = client.read_result(tab)
+        result_observed = True
+        commit_sha = verify_turn_commits()
     except BaseException as exc:
         if "turn_id" in locals():
             try:
@@ -729,14 +732,14 @@ def _execute_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
-        try:
-            verify_turn_commits()
-        except BaseException as provenance_error:
-            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
-                raise exc from provenance_error
-            raise
+        if not result_observed:
+            try:
+                verify_turn_commits()
+            except BaseException as provenance_error:
+                if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                    raise exc from provenance_error
+                raise
         raise
-    commit_sha = verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -812,6 +815,14 @@ def _finalize_deferred_agent_turns(transition_outcome: str) -> None:
     """Complete agent-success traces when later workflow checks fail."""
     while DEFERRED_AGENT_TURN_TRACES:
         _emit_completed_turn(DEFERRED_AGENT_TURN_TRACES[0], transition_outcome)
+
+
+def _terminal_failure_outcome(exc: BaseException) -> str:
+    if isinstance(exc, (WorkerInterrupted, KeyboardInterrupt)):
+        return "interrupted"
+    if isinstance(exc, MutationOutcomeUnknown):
+        return "mutation_outcome_unknown"
+    return "workflow_failed"
 
 
 def run_turn(
@@ -5695,14 +5706,16 @@ def _run_repository(
                 config, work_items, client, repo, github, deferred_deliveries
             )
         except Exception as exc:
-            _finalize_deferred_agent_turns("workflow_failed")
-            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)) or (
-                deferred_deliveries is not None
-                and len(deferred_deliveries) != delivery_count
-            ):
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                _finalize_deferred_agent_turns(_terminal_failure_outcome(exc))
+                raise
+            if deferred_deliveries is not None and len(deferred_deliveries) != delivery_count:
+                _finalize_deferred_agent_turns("workflow_failed")
                 raise
             if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
+                _finalize_deferred_agent_turns("workflow_failed")
                 raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            _finalize_deferred_agent_turns("recover_workflow")
             recovery_worktree = repo.inspect_worktree()
             recovery_branch = recovery_worktree.current_branch
             if recovery_branch is None:
@@ -5768,8 +5781,9 @@ def run_repository(
     """Run one repository and close every deferred trace on every exit path."""
     try:
         return _run_repository(config, deferred_deliveries)
-    finally:
-        _finalize_deferred_agent_turns("workflow_failed")
+    except BaseException as exc:
+        _finalize_deferred_agent_turns(_terminal_failure_outcome(exc))
+        raise
 
 
 def main() -> None:

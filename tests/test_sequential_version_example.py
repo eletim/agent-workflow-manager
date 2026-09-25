@@ -15,6 +15,7 @@ import pytest
 from purplemux_client import (
     BranchState,
     GitRepository,
+    MutationOutcomeUnknown,
     PullRequestState,
     WorkerFailure,
     WorkerInterrupted,
@@ -856,8 +857,16 @@ def test_validated_transition_can_wait_for_authoritative_branch_checks() -> None
     assert outcomes == ["head_changed"]
 
 
-def test_post_agent_workflow_failure_finalizes_deferred_result(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [
+        (WorkerFailure("PR postcondition failed"), "workflow_failed"),
+        (WorkerInterrupted("turn interrupted"), "interrupted"),
+        (MutationOutcomeUnknown("push response lost"), "mutation_outcome_unknown"),
+    ],
+)
+def test_post_agent_failure_finalizes_deferred_result_for_selected_branch(
+    monkeypatch: pytest.MonkeyPatch, failure: WorkerFailure, outcome: str
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     globals_ = workflow["run_repository"].__globals__
@@ -877,7 +886,7 @@ def test_post_agent_workflow_failure_finalizes_deferred_result(
 
     def fail_after_agent(*_args: object) -> None:
         globals_["DEFERRED_AGENT_TURN_TRACES"].append(execution)
-        raise WorkerFailure("PR postcondition failed")
+        raise failure
 
     monkeypatch.setitem(globals_, "_run_repository", fail_after_agent)
     monkeypatch.setitem(
@@ -886,7 +895,7 @@ def test_post_agent_workflow_failure_finalizes_deferred_result(
         lambda *args, **kwargs: emitted.append((args, kwargs)),
     )
 
-    with pytest.raises(WorkerFailure, match="PR postcondition failed"):
+    with pytest.raises(type(failure), match=str(failure)):
         workflow["run_repository"](object())
 
     assert emitted == [
@@ -894,7 +903,7 @@ def test_post_agent_workflow_failure_finalizes_deferred_result(
             (1, "Issue #90 implementation", "implementer", 1, "completed"),
             {
                 "result": "agent completed before the PR check failed",
-                "transition_outcome": "workflow_failed",
+                "transition_outcome": outcome,
                 "repository": "acme/project",
                 "phase": "implementation",
                 "work_item_id": 90,
@@ -2352,6 +2361,67 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             },
         )
     ]
+
+
+def test_post_result_provenance_failure_closes_started_agent_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    branch = "feature/provenance-failure"
+    provenance_checks: list[tuple[str, str]] = []
+
+    class Repository:
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, "agent-head", None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **_kwargs: object
+        ) -> None:
+            provenance_checks.append((start, end))
+            raise WorkerFailure("invalid agent commit provenance")
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def read_result(self, *_args: object) -> str:
+            return "agent completed"
+
+    events: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    globals_ = workflow["run_turn"].__globals__
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        globals_,
+        "emit_agent_turn",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent commit provenance"):
+        workflow["run_turn"](
+            Client(),
+            "tab",
+            "Implementation",
+            "prompt",
+            repository_identity="acme/project",
+            repository=Repository(),
+            branch=branch,
+            expected_process="implementation",
+        )
+
+    assert provenance_checks == [("agent-head", "agent-head")]
+    assert [args[4] for args, _kwargs in events] == ["started", "failed"]
+    assert events[-1][1]["error"] == "invalid agent commit provenance"
+    assert "result" not in events[-1][1]
 
 
 def test_interrupted_turn_is_not_masked_by_provenance_failure(
