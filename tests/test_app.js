@@ -245,6 +245,8 @@ async function loadApp({
   fetchOverride = null,
   clipboardOverride = null,
   confirmOverride = null,
+  initialStatusOverride = null,
+  selectLatest = true,
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
@@ -317,7 +319,7 @@ async function loadApp({
     serverUrl: "https://example.invalid",
     topic: "test",
   };
-  const initial = {
+  const initial = initialStatusOverride || {
     ...snapshot({runId: null, state: "idle", stdout: ""}),
     cwd: "/work",
     exitCode: null,
@@ -397,6 +399,16 @@ async function loadApp({
   assert.ok(calls.some(([url]) => url === "/api/readiness"));
   assert.equal(eventSources.length, 1);
   assert.equal(eventSources[0].url, "/api/events");
+  // Most behavior tests operate on an explicitly selected saved run. Preserve
+  // that setup without making production startup selection implicit.
+  if (
+    selectLatest
+    && !new URL(locationHref).searchParams.has("run")
+    && selectedRun(elements) === undefined
+    && runs.length > 0
+  ) {
+    await runItem(elements, runs[runs.length - 1].runId).dispatch("click");
+  }
   return {
     calls,
     elements,
@@ -822,6 +834,40 @@ test("Issue Driven is the default draft and developer modes remain available", a
 
   assert.equal(elements["workflow-fields"].hidden, false);
   assert.equal(elements["developer-views"].open, true);
+});
+
+test("saved run history stays unselected across startup reconciliation", async () => {
+  const latest = snapshot({
+    runId: 2,
+    state: "success",
+    stdout: "saved output",
+    mode: "workflow",
+  });
+  const {calls, elements, eventSource} = await loadApp({
+    runs: [
+      {runId: 1, state: "success", mode: "prompt", cwd: "/work/one"},
+      {runId: 2, state: "success", mode: "workflow", cwd: "/work/two"},
+    ],
+    details: {2: latest},
+    validation: {status: 200, body: {validation: []}},
+    initialStatusOverride: latest,
+    selectLatest: false,
+  });
+
+  assert.equal(selectedRun(elements), undefined);
+  assert.equal(elements["issue-driven-fields"].hidden, false);
+  assert.equal(elements["workflow-fields"].hidden, true);
+  assert.equal(elements["developer-views"].open, false);
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+  assert.equal(calls.some(([url]) => url === "/api/runs/2"), false);
+  assert.ok(runItem(elements, 1));
+  assert.ok(runItem(elements, 2));
+
+  eventSource.emit("open");
+  await waitFor(() => calls.filter(([url]) => url === "/api/runs").length === 2);
+  assert.equal(selectedRun(elements), undefined);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 });
 
 test("Settings shows the configured remote URL and its QR code", async () => {

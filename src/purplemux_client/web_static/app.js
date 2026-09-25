@@ -164,8 +164,8 @@ let rawStderr = "";
 // sourced from that run's authoritative /api/runs/{id} snapshot). `draft`
 // retains the new-run args/code independently of whichever run is
 // currently being viewed, so switching runs never loses it. `explicitNewRun`
-// suppresses the "auto-select the latest run" behavior in refresh() once the
-// user has explicitly asked to compose or submit a new run.
+// suppresses auto-selection of a newly discovered run once the user has
+// explicitly asked to compose or submit a new run.
 let draft = {args: "", code: code.value};
 let promptDraft = {
   agent: promptAgent.value,
@@ -178,6 +178,7 @@ let reviewDraft = {json: reviewJson.value, code: ""};
 let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
+let knownRunIds = null;
 // The last detail response accepted for the selected run. This is the only
 // source used when carrying a reusable folder into a new-run draft; list
 // summaries and rendered text are intentionally insufficient.
@@ -1732,6 +1733,10 @@ async function refresh() {
   try {
     const {runs, cleanupOwnership = []} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
+    const newlyDiscoveredRuns = knownRunIds === null
+      ? []
+      : runs.filter((run) => !knownRunIds.has(run.runId));
+    knownRunIds = new Set(runs.map((run) => run.runId));
     if (activeRunId === null && requestedRunIdentity !== null) {
       const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
       requestedRunIdentity = null;
@@ -1745,12 +1750,16 @@ async function refresh() {
         explicitNewRun = true;
         stderr.textContent = "The linked Run is no longer available.";
       }
-    } else if (activeRunId === null && !explicitNewRun && runs.length > 0) {
+    } else if (
+      activeRunId === null
+      && !explicitNewRun
+      && newlyDiscoveredRuns.length > 0
+    ) {
       // A run just appeared (e.g. discovered via SSE) while the fields held
       // in-progress draft edits nobody submitted yet; retain them before
       // auto-selecting, exactly as an explicit run-list click would.
       captureDraftIfEditing();
-      activeRunId = runs[runs.length - 1].runId;
+      activeRunId = newlyDiscoveredRuns[newlyDiscoveredRuns.length - 1].runId;
       activeRunSnapshot = null;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;
@@ -2583,10 +2592,16 @@ async function initialize() {
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
-  if (initialStatus.state === "validation_failed") {
-    renderValidation(initialStatus.validation || []);
+  if (initialStatus.runId == null) {
+    if (initialStatus.state === "validation_failed") {
+      renderValidation(initialStatus.validation || []);
+    }
+    renderRun(initialStatus);
+  } else {
+    renderCleanDraftState();
+    showDraftLabel();
+    applyFieldMode();
   }
-  renderRun(initialStatus);
   await refresh();
   connectEvents();
   try {

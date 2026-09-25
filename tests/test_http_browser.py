@@ -85,6 +85,12 @@ def test_copy_actions_on_insecure_http_origin(
             driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
         driver.find_element(By.ID, "runtime-view").click()
         wait.until(
+            lambda browser: browser.find_element(
+                By.CSS_SELECTOR, "#run-list .run-item"
+            ).is_displayed()
+        )
+        driver.find_element(By.CSS_SELECTOR, "#run-list .run-item").click()
+        wait.until(
             lambda browser: browser.find_element(By.ID, "stdout").text.endswith(
                 "  HTTP_STDOUT"
             )
@@ -194,11 +200,11 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
             )
 
         assert page_fits_viewport(driver)
+        assert driver.find_element(By.ID, "issue-driven-fields").is_displayed()
+        assert not driver.find_element(By.ID, "workflow-fields").is_displayed()
         for control_id in (
             "new-run",
-            "prompt-mode",
             "issue-driven-mode",
-            "workflow-mode",
             "validate",
             "dry-run",
             "run",
@@ -215,10 +221,13 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         developer_views = driver.find_element(By.ID, "developer-views")
         if developer_views.get_attribute("open") is None:
             driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
+        assert driver.find_element(By.ID, "prompt-mode").is_displayed()
+        assert driver.find_element(By.ID, "workflow-mode").is_displayed()
         driver.find_element(By.ID, "runtime-view").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "run-list").is_displayed()
         )
+        assert not driver.find_elements(By.CSS_SELECTOR, "#run-list .run-item.selected")
         assert runtime_panel.is_displayed()
         assert runtime_panel.get_attribute("open") is not None
 
