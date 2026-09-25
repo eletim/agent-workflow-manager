@@ -153,13 +153,18 @@ def test_issue_driven_is_primary_and_developer_views_remain_linked() -> None:
         "Diagnostics",
     ):
         assert f">{label}<" in html
-    assert 'href="#runs-panel">Runtime</a>' in html
+    assert 'id="runtime-view" type="button">Runtime</button>' in html
+    assert '<details id="runtime-panel" class="panel runtime-panel" hidden>' in html
     assert 'href="#diagnostics-panel">Diagnostics</a>' in html
 
 
 def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     ancestors = _ancestors("run-list")
 
+    assert any(
+        tag == "details" and attributes.get("id") == "runtime-panel"
+        for tag, attributes in ancestors
+    )
     assert any(
         tag == "details"
         and attributes.get("id") == "runs-panel"

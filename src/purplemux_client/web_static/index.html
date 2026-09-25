@@ -21,18 +21,6 @@
         </div>
       </header>
 
-      <details id="runs-panel" class="panel runs-panel" open>
-        <summary class="runs-heading">
-          <span class="runs-title">Runs</span>
-          <span id="runs-empty">No runs yet.</span>
-          <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
-        </summary>
-        <div class="run-history-actions">
-          <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
-        </div>
-        <div id="run-list" class="run-list"></div>
-      </details>
-
       <section class="panel editor-panel">
         <nav class="execution-navigation" aria-label="Workflow type">
           <button id="issue-driven-mode" class="issue-driven-entry selected" type="button" aria-pressed="true">
@@ -46,7 +34,7 @@
               <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
               <button id="review-mode" type="button" aria-pressed="false">Review</button>
               <button id="workflow-mode" type="button" aria-pressed="false">Python Workflow</button>
-              <a href="#runs-panel">Runtime</a>
+              <button id="runtime-view" type="button">Runtime</button>
               <a href="#diagnostics-panel">Diagnostics</a>
             </div>
           </details>
@@ -179,6 +167,21 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </section>
 
+      <details id="runtime-panel" class="panel runtime-panel" hidden>
+        <summary class="runtime-heading">Runtime</summary>
+        <div class="runtime-content">
+          <details id="runs-panel" class="panel runs-panel" open>
+            <summary class="runs-heading">
+              <span class="runs-title">Runs</span>
+              <span id="runs-empty">No runs yet.</span>
+              <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
+            </summary>
+            <div class="run-history-actions">
+              <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
+            </div>
+            <div id="run-list" class="run-list"></div>
+          </details>
+
       <section id="recovery-panel" class="panel recovery-panel" aria-live="polite" hidden>
         <h2>Recovery</h2>
         <p id="recovery-summary"></p>
@@ -259,6 +262,8 @@ emit_step("workspace create", "completed")</textarea>
           </div>
         </div>
       </section>
+        </div>
+      </details>
 
       <details id="diagnostics-panel" class="panel settings-panel diagnostics-panel">
         <summary>Diagnostics</summary>

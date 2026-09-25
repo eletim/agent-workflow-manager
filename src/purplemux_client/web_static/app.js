@@ -6,6 +6,8 @@ const reviewModeButton = document.querySelector("#review-mode");
 const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
 const developerViews = document.querySelector("#developer-views");
+const runtimeView = document.querySelector("#runtime-view");
+const runtimePanel = document.querySelector("#runtime-panel");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
 const reviewFields = document.querySelector("#review-fields");
@@ -2307,6 +2309,12 @@ issueDrivenModeButton.addEventListener("click", async () => {
 
 reviewModeButton.addEventListener("click", async () => {
   await enterDraftMode("review");
+});
+
+runtimeView.addEventListener("click", () => {
+  runtimePanel.hidden = false;
+  runtimePanel.open = true;
+  runtimePanel.scrollIntoView?.({behavior: "smooth", block: "start"});
 });
 
 validateButton.addEventListener("click", async () => {

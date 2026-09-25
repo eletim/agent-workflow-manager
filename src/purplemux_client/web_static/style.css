@@ -29,7 +29,16 @@ h2, label { font-size: 14px; font-weight: 650; }
   background: #171b24;
   padding: 16px;
 }
-.runs-panel { margin-bottom: 14px; }
+.runtime-panel { margin-top: 14px; padding: 0; }
+.runtime-heading {
+  padding: 16px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 650;
+}
+.runtime-panel[open] .runtime-heading { border-bottom: 1px solid #303746; }
+.runtime-content { padding: 0 14px 14px; }
+.runs-panel { margin-top: 14px; }
 .runs-heading {
   display: flex;
   align-items: center;

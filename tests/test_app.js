@@ -248,7 +248,7 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "runtime-view", "runtime-panel", "prompt-fields",
     "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
     "review-result-panel", "review-result-status", "review-result-json",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
@@ -293,6 +293,7 @@ async function loadApp({
   elements.favicon = new Element();
   elements.favicon.setAttribute("href", "/favicon.svg");
   elements["validation-panel"].hidden = true;
+  elements["runtime-panel"].hidden = true;
   elements["validation-success"].hidden = true;
   elements["validation-success"].textContent = "✓ Valid";
   elements["readiness-provider"].value = "codex";
@@ -809,7 +810,13 @@ test("Issue Driven is the default draft and developer modes remain available", a
   assert.equal(elements["workflow-fields"].hidden, true);
   assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
   assert.equal(elements["developer-views"].open, false);
+  assert.equal(elements["runtime-panel"].open, false);
+  assert.equal(elements["runtime-panel"].hidden, true);
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+
+  await elements["runtime-view"].dispatch("click");
+  assert.equal(elements["runtime-panel"].open, true);
+  assert.equal(elements["runtime-panel"].hidden, false);
 
   await elements["workflow-mode"].dispatch("click");
 
