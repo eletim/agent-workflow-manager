@@ -36,11 +36,14 @@
       <section class="panel editor-panel">
         <div class="mode-switch" role="group" aria-label="Execution mode">
           <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
+          <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
           <button id="issue-driven-mode" type="button" aria-pressed="false">Issue Driven</button>
+          <button id="review-mode" type="button" aria-pressed="false">Review</button>
           <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Python Workflow</button>
         </div>
         <div class="editor-mode-bar">
           <p id="active-context" class="active-context"></p>
+          <nav id="run-family" aria-label="Run family" hidden></nav>
           <button id="new-run" type="button">New run</button>
         </div>
         <div id="repository-navigation" class="repository-navigation" hidden>
@@ -101,6 +104,42 @@
           <p id="issue-driven-success" class="validation-success" hidden>✓ JSON/schema valid</p>
           <ol id="issue-driven-validation" class="validation-list"></ol>
           <textarea id="issue-driven-python" spellcheck="false" readonly aria-label="Generated Python workflow"></textarea>
+        </div>
+
+        <div id="environment-setup-fields" hidden>
+          <label for="environment-setup-json">Environment Setup JSON</label>
+          <textarea id="environment-setup-json" spellcheck="false">{
+  "mode": "environment-setup",
+  "repository": "~/DevEnv/project",
+  "revision": "origin/main",
+  "environment_agent": "codex",
+  "timeout": 3600
+}</textarea>
+          <div class="generated-heading">
+            <label for="environment-setup-python">Generated Python (read-only)</label>
+            <button id="environment-setup-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="environment-setup-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <p id="environment-setup-error" class="repository-config-message" hidden></p>
+          <textarea id="environment-setup-python" spellcheck="false" readonly aria-label="Generated Environment Setup workflow"></textarea>
+        </div>
+
+        <div id="review-fields" hidden>
+          <label for="review-json">Review JSON</label>
+          <textarea id="review-json" spellcheck="false">{
+  "mode": "review",
+  "repositories": ["~/DevEnv/project"],
+  "check": "Inspect the repository and report findings with evidence.",
+  "agent": "codex",
+  "timeout": 3600
+}</textarea>
+          <div class="generated-heading">
+            <label for="review-python">Generated Python (read-only)</label>
+            <button id="review-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="review-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <p id="review-error" class="repository-config-message" hidden></p>
+          <textarea id="review-python" spellcheck="false" readonly aria-label="Generated Review workflow"></textarea>
         </div>
 
         <div id="workflow-fields">
@@ -179,6 +218,12 @@ emit_step("workspace create", "completed")</textarea>
         <p id="issue-summary-base"></p>
         <p id="issue-summary-policy"></p>
         <p id="issue-summary-warnings"></p>
+      </section>
+
+      <section id="review-result-panel" class="panel" aria-live="polite" hidden>
+        <h2>Review result</h2>
+        <p id="review-result-status"></p>
+        <pre id="review-result-json"></pre>
       </section>
 
       <section class="panel progress-panel" aria-live="polite">
@@ -272,6 +317,16 @@ emit_step("workspace create", "completed")</textarea>
           </div>
           <img id="mobile-connection-qr" alt="QR code for the Agent Workflow Manager URL" hidden>
         </section>
+        <hr class="settings-divider">
+        <form id="external-target-settings">
+          <h3>External AWM targets</h3>
+          <p>Register stable IDs and server destinations. tokenEnv names a credential environment variable on this server; enter no credential values here.</p>
+          <label for="external-targets-json">Registrations (JSON array)</label>
+          <textarea id="external-targets-json" rows="6" spellcheck="false" placeholder='[{"id":"office","destination":"https://awm.example","tokenEnv":"OFFICE_AWM_TOKEN"}]'></textarea>
+          <p id="external-target-credentials"></p>
+          <button id="save-external-targets" type="submit" disabled>Save external targets</button>
+          <span id="external-target-message" role="status" aria-live="polite"></span>
+        </form>
         <hr class="settings-divider">
         <form id="notification-settings">
           <div class="settings-heading">

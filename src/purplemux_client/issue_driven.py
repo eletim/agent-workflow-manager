@@ -1334,7 +1334,12 @@ def _fixed_config_function(
     )
     prepare_integration = ""
     if config.make_integration_branch:
-        prepare_integration = f"""    integration = repository.prepare_feature_branch(
+        prepare_integration = f"""    github = GitHubRepository.open(
+        repository.expected_github_slug,
+        command_timeout_seconds=COMMAND_TIMEOUT,
+    )
+    warn_if_stale_integration_branch(config, repository, github)
+    integration = repository.prepare_feature_branch(
         {config.integration_branch!r},
         base={config.final_branch!r},
         expected_base_sha=context.base_sha,
@@ -1378,7 +1383,7 @@ def _fixed_config_function(
         context.execution_root,
         command_timeout_seconds=COMMAND_TIMEOUT,
     )
-{prepare_integration}    return Config(
+    config = Config(
         context.execution_root,
         repository.expected_github_slug,
         {config.integration_branch!r},
@@ -1387,7 +1392,9 @@ def _fixed_config_function(
         "git diff --check",
         WORKFLOW_POLICY_ISSUE,
         {config.one_shot_issue!r},
+        {config.make_integration_branch!r},
     )
+{prepare_integration}    return config
 
 
 """

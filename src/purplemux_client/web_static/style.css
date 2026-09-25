@@ -8,6 +8,7 @@
 * { box-sizing: border-box; }
 html, body { max-width: 100%; overflow-x: hidden; overflow-x: clip; }
 body { margin: 0; }
+body.directory-picker-open { overflow: hidden; }
 main { width: min(1100px, calc(100% - 40px)); min-width: 0; margin: 32px auto; }
 
 header, .controls, .header-actions, .guide-toolbar, .guide-actions,
@@ -179,6 +180,9 @@ textarea {
 #prompt-text { min-height: 220px; }
 #issue-driven-json { min-height: 260px; }
 #issue-driven-python { min-height: 330px; margin-top: 8px; }
+#review-json { min-height: 220px; }
+#review-python { min-height: 330px; margin-top: 8px; }
+#review-result-json { white-space: pre-wrap; overflow-wrap: anywhere; }
 .repository-config-heading {
   display: flex;
   align-items: end;
@@ -454,7 +458,13 @@ dialog {
 }
 dialog::backdrop { background: rgb(5 7 11 / 75%); }
 .directory-picker-dialog {
-  height: min(620px, calc(100% - 32px));
+  height: min(620px, calc(100dvh - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+}
+.directory-picker-dialog[open] {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 .directory-picker-toolbar, .directory-picker-navigation,
 .directory-picker-actions {
@@ -480,7 +490,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   display: grid;
   align-content: start;
   gap: 6px;
-  height: calc(100% - 174px);
+  min-height: 0;
   padding: 0 16px;
   overflow-y: auto;
 }
@@ -585,7 +595,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .run-history-actions { margin: 0; padding: 10px 12px 0; }
   .run-history-actions button { width: 100%; }
   .run-list { max-height: 32vh; margin: 0; padding: 10px 12px; overflow-y: auto; }
-  .mode-switch { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
+  .mode-switch { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; }
   .mode-switch button { min-width: 0; padding-inline: 6px; }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
   .editor-mode-bar #new-run { align-self: stretch; }
@@ -609,7 +619,6 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .guide-toolbar, .directory-picker-toolbar { align-items: flex-start; }
   .guide-actions { flex-wrap: wrap; justify-content: flex-end; }
   .directory-picker-navigation { align-items: stretch; flex-direction: column; }
-  .directory-picker-list { height: calc(100% - 220px); }
   .directory-picker-actions button { width: 100%; }
   .settings-heading { align-items: flex-start; }
   .mobile-connection { align-items: flex-start; flex-direction: column; }
@@ -626,3 +635,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 @media (hover: none), (pointer: coarse) {
   button, summary, a { -webkit-tap-highlight-color: rgb(188 170 255 / 20%); }
 }
+
+#run-family, .run-family { display: flex; flex-wrap: wrap; gap: 0.5rem; overflow-wrap: anywhere; }
+#run-family[hidden], .run-family[hidden] { display: none; }
+.run-family { grid-column: 1 / -1; font-size: 12px; }

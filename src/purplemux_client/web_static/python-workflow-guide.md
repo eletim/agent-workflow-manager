@@ -34,6 +34,42 @@ Runner-scoped correlation through named PurpleMux resources and
 `merge_final: false`, it generates no final-branch merge call. The displayed
 Python remains the sole execution and control-flow source of truth.
 
+## Review generation
+
+Review input is a small JSON declaration. `repositories` is a non-empty array
+of existing local Git repository roots, and `check` is a required non-empty
+natural-language instruction. Optional `start` and `finish` are non-empty
+natural-language instructions before and after the check. `agent` defaults to
+`codex` (`claude-code` is also supported), and `timeout` defaults to 3600
+seconds (range 1–86400). For example:
+
+```json
+{
+  "mode": "review",
+  "repositories": ["/path/to/project", "/path/to/related-project"],
+  "check": "Review error handling across these repositories",
+  "agent": "codex",
+  "timeout": 3600
+}
+```
+
+`POST /api/review/generate` with `{"json":"<the JSON declaration>"}`
+validates the input and returns `generatedCode`. Validate with
+`{"code":"<generatedCode>","args":[]}`. Submit through `POST /api/run` with
+`{"code":"<generatedCode>","args":[],"reviewJson":"<the original JSON declaration>"}`.
+Run regenerates the code from `reviewJson` and rejects a mismatch. Keep the
+original declaration in the request so Run history identifies it as Review and
+retains its settings. The generated Python owns the
+start, check, finish, deadline, and result handling. It asks the agent to
+inspect without changing the repositories and prints one JSON result with a
+`PASS`, `FAIL`, or `BLOCKED` verdict and a summary. Optional string arrays retain
+`findings`, `observed_facts`, `evidence`, `hypotheses`, and `observability_gaps`.
+An observation timeout or unavailable agent result produces `BLOCKED` with an
+observability gap. If start or check completion cannot be confirmed, the optional
+finish instruction is skipped. The JSON has no actions,
+conditions, loops, or other workflow control flow. Long reports are compacted
+to fit Run stdout; a `truncated` object records omitted text or repository paths.
+
 ## Architecture and responsibility
 
 ```text
@@ -157,7 +193,10 @@ a unique `awm-run/...` local branch. Recovery inspects logical and prior-run
 private refs, selects their single furthest descendant of the exact authoritative
 base, and fails closed if safe candidates diverge. A recovered commit can satisfy
 an unchanged agent turn; otherwise require the CodingAgent's new commit and clean
-worktree with `require_committed_result()`. Use `ensure_pushed()` to complete
+worktree with `require_committed_result(..., expected_agent="codex",
+expected_process="implementation")` (or the agent and process for that turn).
+`agent_commit_coauthor()` supplies the same normalized co-author identity to the
+prompt that this postcondition verifies. Use `ensure_pushed()` to complete
 delivery through the logical remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
 Workflow must then create or reuse and verify the exact Draft PR before starting
@@ -263,7 +302,9 @@ from purplemux_client import (
     emit_finding,
     emit_issue_driven_repositories,
     inspect_run_repository,
+    inspect_run_revision,
     prepare_run_repository,
+    prepare_run_revision,
     reconcile_inline_task_pr_body,
     register_run_resource,
     require_inline_task_pr_fingerprint,
@@ -325,9 +366,24 @@ PullRequestState(
     body,
 )
 MergeResult(pr, merge_commit_sha, reconciled=False)
-RepositoryPreparation(source_repository, remote, base_branch, base_ref, base_sha)
+RepositoryPreparation(
+    source_repository,
+    remote,
+    base_branch,
+    base_ref,
+    base_sha,
+    revision_kind="branch",
+    revision=None,
+)
 RepositoryExecutionContext(
-    source_repository, remote, base_branch, base_ref, base_sha, execution_root
+    source_repository,
+    remote,
+    base_branch,
+    base_ref,
+    base_sha,
+    execution_root,
+    revision_kind="branch",
+    revision=None,
 )
 ```
 
@@ -548,6 +604,8 @@ The supported Git inspection and assertion methods are:
 ```python
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
+repo.inspect_remote_branches(branches) -> dict[str, str | None]
+repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -555,11 +613,21 @@ repo.require_clean() -> None
 repo.require_current_branch(branch) -> BranchState
 repo.require_pushed(branch) -> BranchState
 repo.require_committed_result(
-    branch, *, previous_sha, allow_unchanged=False
+    branch, *, previous_sha, allow_unchanged=False,
+    expected_agent=None, expected_process=None
 ) -> BranchState
+repo.require_agent_commit_provenance(
+    previous_sha, current_sha, *, expected_agent, expected_process,
+    allow_unchanged=False
+) -> None
+agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
+
+`inspect_remote_branch_heads()` enumerates the remote directly and does not
+trust local tracking refs. Use it when a workflow must compare a configured
+development branch with the remote's current branch set.
 
 The inspection-aware Git operations that may mutate are:
 
@@ -590,6 +658,9 @@ The supported GitHub inspections and mutations are:
 
 ```python
 github.find_pr(*, head, base, state) -> PullRequestState | None
+github.compare_commits(*, base_sha, head_sha) -> Literal[
+    "ahead", "behind", "diverged", "identical"
+]
 github.require_pr(
     *, head, base, number=None, state="OPEN", expected_head_sha=None,
     expected_base_sha=None, draft=None
@@ -598,6 +669,9 @@ github.create_draft_pr(
     *, head, base, expected_head_sha, expected_base_sha, title, body,
     correlation_id
 ) -> PullRequestState
+github.create_issue_comment(
+    issue, *, body, correlation_id
+) -> str
 github.set_draft(
     pr, *, draft, expected_head, expected_head_sha, expected_base,
     expected_base_sha
@@ -612,14 +686,21 @@ github.merge_pr(
 ) -> MergeResult
 ```
 
-`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
+`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`.
+`compare_commits()` checks the relationship between two exact authoritative
+GitHub commit IDs without changing repository state. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
+`create_issue_comment()` appends one correlation-marked Issue comment and
+reconciles a lost mutation response without duplicating that comment.
 `update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
 concurrent body or review-state change. `merge_pr()` supports only an immediate
 merge commit and verifies
-its parents and the resulting base ref; it never queues, squashes, rebases, or
-enables auto-merge.
+its parents, the resulting base ref, and the `AWM-Automation` / `AWM-Process`
+trailers that identify the scripted merge. It never queues, squashes, rebases,
+or enables auto-merge, and it does not identify AWM as a co-author. CodingAgent
+commits separately carry a normalized co-author plus machine-readable
+`AWM-Agent` and `AWM-Process` trailers, which are verified before delivery.
 
 The repository execution helpers are:
 
@@ -631,12 +712,23 @@ prepare_run_repository(
     *, repo, base_branch, remote="origin", worktree_root=None,
     command_timeout_seconds=30.0
 ) -> RepositoryExecutionContext
+inspect_run_revision(
+    *, repo, revision, remote="origin", command_timeout_seconds=30.0
+) -> tuple[RepositoryPreparation, str]
+prepare_run_revision(
+    *, repo, revision, remote="origin", worktree_root=None,
+    command_timeout_seconds=30.0
+) -> RepositoryExecutionContext
 run_correlation(logical_name) -> str
 ```
 
 `inspect_run_repository()` is read-only. `prepare_run_repository()` is an
 inspection-aware mutation that creates and registers an isolated worktree, or
 reconciles the exact correlated worktree if the mutation outcome was uncertain.
+`inspect_run_revision()` and `prepare_run_revision()` also accept remote tags
+and full local commit SHAs. Branches use the existing repository preparation
+path. Local commits need no remote; tag and commit contexts have no base branch.
+A name shared by a remote branch and tag is rejected as ambiguous.
 `run_correlation()` is deterministic within one Runner run (and process-stable
 outside it); use it for logical resource names, never as a secret.
 
@@ -695,7 +787,8 @@ The following categories are normative:
 - **Inspection-aware, reconciliation-capable mutation:**
   `prepare_run_repository()`; workspace/tab creation and identity-checked
   deletion/close; `interrupt()`; every Git mutation listed above; and
-  `create_draft_pr()`, `set_draft()`, `update_pr_body()`, and `merge_pr()`. Each
+  `create_draft_pr()`, `create_issue_comment()`, `set_draft()`,
+  `update_pr_body()`, and `merge_pr()`. Each
   captures exact preconditions, dispatches at most once, and inspects an
   authoritative postcondition. It can return the confirmed desired result,
   report a proven rejection/conflict, or raise `MutationOutcomeUnknown` if
@@ -818,8 +911,11 @@ Workflow recovery is authored as a new run manually. Its ordinary Python code sh
 branches and commits, GitHub PR topology, and any relevant PurpleMux resources
 before reusing external work or making a new mutation. Keep mutation-once and
 `MutationOutcomeUnknown` protections: reconcile a possibly dispatched mutation
-from authoritative state and never retry it blindly. This recovery model does
-not add a graph, state machine, durable execution store, or automatic retry.
+from authoritative state and never retry it blindly. The generated Issue Driven
+workflow may use a dedicated recovery agent and retry its repository pass at most
+twice after a repair. Python checks fresh Git and PR state before each retry and
+stops if the recovery outcome or an inspection is uncertain. This recovery model
+does not add a graph, state machine, or durable execution store.
 
 Use these examples when reasoning about resumability, even if an external caller
 records its own phase label:
@@ -1270,3 +1366,80 @@ except BaseException as exc:
 Replace constants and prompts for the requested Issue, but keep orchestration,
 review separation, bounded attempts, and mutation handling explicit in plain
 Python. Resource destruction is the separate, explicit run Cleanup action.
+
+## Child Runs
+
+A running Python Workflow can start another Workflow on the same Runner and
+sequence it using ordinary Python:
+
+```python
+from purplemux_client import start_child_run, wait_child_run, get_child_run_result
+
+child_id = start_child_run('print("child work")')
+result = wait_child_run(child_id, timeout=60)
+assert result == get_child_run_result(child_id)
+if result.state != "success":
+    raise RuntimeError(f"Child {child_id} ended as {result.state}: {result.stderr}")
+```
+
+`start_child_run()` returns the local integer Run ID. The Runner persists both
+family references before executing child work, then uses its ordinary execution,
+Progress, Result, Stop, and history handling. `get_child_run_result()` returns
+`None` while running; the immutable `ChildRunResult` contains `run_id`, `state`,
+`exit_code`, `stdout`, and `stderr`. Failed and stopped children return results;
+the parent decides how to handle them. `wait_child_run()` raises `TimeoutError`
+when its optional timeout expires without stopping the child. Stop remains the
+Runner's existing per-Run action; stopping a parent does not cascade to children.
+
+Control uses a separate local authenticated endpoint, never progress events.
+Only the running parent may request its children's results. These helpers require
+a running Workflow and are unavailable during validation or Dry Run. An uncertain
+start request must be reconciled by inspecting Runner history before starting
+another child; it must not be retried automatically.
+
+Pass the same registered `target_id` to all three helpers to run an external child:
+
+```python
+child_id = start_child_run('print("remote child")', target_id="registered-target-id")
+result = wait_child_run(child_id, target_id="registered-target-id", timeout=300)
+assert result == get_child_run_result(child_id, target_id="registered-target-id")
+```
+
+The returned integer is the destination's Run ID. The receiving AWM persists the
+originating parent reference before execution; the caller persists the full child
+identity once received. Local and external children use the same final result
+fields and failure/stop semantics. External observation failures raise
+`ExternalRunError`, and uncertain launches raise `ExternalRunLaunchUnknown`;
+known family identities remain in history. A timeout does not stop the remote Run.
+Credentials are resolved on the calling server from its registered target settings.
+
+## External ordinary Runs
+
+`ExternalRunClient` launches ordinary Runs on external AWMs registered in Settings.
+The calling server resolves the registration and its environment credential;
+HTTPS or loopback HTTP, Host, Origin, and request-token protections still apply.
+
+```python
+from purplemux_client import ExternalRunClient
+
+external = ExternalRunClient(request_timeout=30)
+run_id = external.start_run("registered-target-id", 'print("remote work")')
+result = external.wait_run("registered-target-id", run_id, timeout=300)
+if result.state != "success":
+    raise RuntimeError(f"Remote Run {run_id} ended as {result.state}: {result.stderr}")
+```
+
+`start_run()` returns the destination's integer Run ID. Each client pins a target's
+destination on first use and explicitly rejects later destination changes, so
+colliding Run IDs on another AWM cannot substitute for the original results. `get_run_result()` returns
+None only when the destination confirms it is running. Terminal results use
+`ExternalRunResult` with `run_id`, `state`, `exit_code`, `stdout`, and `stderr`;
+output retains the destination Runner's limits and truncation notices. Failed
+and stopped Runs return their actual results. `wait_run()` raises TimeoutError
+when its deadline expires, without stopping the remote Run.
+
+Communication failures, unknown IDs, and malformed or unknown result responses
+raise `ExternalRunError`. An uncertain launch raises `ExternalRunLaunchUnknown`:
+the destination may already have started a Run. Inspect destination history
+before deciding whether to launch again. No launch is retried and no redirect is
+followed. Keep credentials on the calling server, outside browser code.

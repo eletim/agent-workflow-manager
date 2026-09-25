@@ -16,6 +16,7 @@ from purplemux_client import (
     GitRepository,
     PullRequestState,
     WorkerFailure,
+    WorkerInterrupted,
 )
 from purplemux_client.preflight import WorkflowValidator
 
@@ -174,6 +175,144 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
     assert '"Deliver the exact Issue topology"' in source
     assert "Deliver the exact approved Issue topology" not in source
+
+
+@pytest.mark.parametrize(
+    ("configured", "branches", "expected"),
+    [
+        (
+            "dev/v0.4.7",
+            {
+                "dev/v0.4.7": "a" * 40,
+                "dev/v0.4.8": "b" * 40,
+                "dev/v0.5.0": "c" * 40,
+                "release/v0.4.9": "d" * 40,
+            },
+            ("dev/v0.4.8",),
+        ),
+        (
+            "dev/v0.4.7",
+            {"dev/v0.4.8": "a" * 40, "dev/v0.4.9": "b" * 40},
+            ("dev/v0.4.9", "dev/v0.4.8"),
+        ),
+        ("dev/v0.4.8", {"dev/v0.4.7": "a" * 40}, ()),
+        ("dev/v1", {"dev/v1.0.1": "a" * 40}, ()),
+    ],
+)
+def test_newer_development_branches_are_limited_to_the_same_remote_patch_series(
+    configured: str, branches: dict[str, str], expected: tuple[str, ...]
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+
+    assert workflow["newer_development_branches"](configured, branches) == expected
+
+
+def test_stale_integration_branch_warning_uses_remote_state_without_rewriting(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v0.4.7", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_remote_branch_heads=lambda: {
+            "dev/v0.4.7": "a" * 40,
+            "dev/v0.4.8": "b" * 40,
+            "dev/v0.4.9": "c" * 40,
+        }
+    )
+    comparisons: list[tuple[str, str]] = []
+    github = SimpleNamespace(
+        compare_commits=lambda *, base_sha, head_sha: (
+            comparisons.append((base_sha, head_sha))
+            or ("ahead" if head_sha == "b" * 40 else "diverged")
+        )
+    )
+    findings: list[tuple[str, str, str]] = []
+    monkeypatch.setitem(
+        workflow["warn_if_stale_integration_branch"].__globals__,
+        "emit_finding",
+        lambda category, message, *, status: findings.append(
+            (category, message, status)
+        ),
+    )
+
+    workflow["warn_if_stale_integration_branch"](config, repo, github)
+
+    assert comparisons == [("a" * 40, "c" * 40), ("a" * 40, "b" * 40)]
+    assert len(findings) == 1
+    assert findings[0][0::2] == ("git", "warning")
+    assert "dev/v0.4.7" in findings[0][1]
+    assert "dev/v0.4.8" in findings[0][1]
+    assert "will not change it automatically" in findings[0][1]
+    assert capsys.readouterr().out == f"WARN: {findings[0][1]}\n"
+
+
+@pytest.mark.parametrize("comparison", ["identical", "behind", "diverged"])
+def test_newer_named_branch_without_forward_progress_does_not_warn(
+    comparison: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v0.4.7", "main", (), "true"
+    )
+    repo = SimpleNamespace(
+        inspect_remote_branch_heads=lambda: {
+            "dev/v0.4.7": "a" * 40,
+            "dev/v0.4.8": "b" * 40,
+        }
+    )
+    github = SimpleNamespace(compare_commits=lambda **_kwargs: comparison)
+    monkeypatch.setitem(
+        workflow["warn_if_stale_integration_branch"].__globals__,
+        "emit_finding",
+        lambda *args, **kwargs: pytest.fail("non-ahead branch emitted a warning"),
+    )
+
+    workflow["warn_if_stale_integration_branch"](config, repo, github)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_missing_integration_branch_warns_when_newer_branch_is_ahead_of_base(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"),
+        "acme/project",
+        "dev/v0.4.7",
+        "main",
+        (),
+        "true",
+        make_integration_branch=True,
+    )
+    repo = SimpleNamespace(
+        inspect_remote_branch_heads=lambda: {
+            "main": "a" * 40,
+            "dev/v0.4.8": "b" * 40,
+        }
+    )
+    comparisons: list[tuple[str, str]] = []
+    github = SimpleNamespace(
+        compare_commits=lambda *, base_sha, head_sha: (
+            comparisons.append((base_sha, head_sha)) or "ahead"
+        )
+    )
+    findings: list[str] = []
+    monkeypatch.setitem(
+        workflow["warn_if_stale_integration_branch"].__globals__,
+        "emit_finding",
+        lambda _category, message, *, status: findings.append(message),
+    )
+
+    workflow["warn_if_stale_integration_branch"](config, repo, github)
+
+    assert comparisons == [("a" * 40, "b" * 40)]
+    assert len(findings) == 1
+    assert "dev/v0.4.7 is absent" in findings[0]
+    assert "would be created from main" in findings[0]
+    assert capsys.readouterr().out == f"WARN: {findings[0]}\n"
 
 
 def test_outline_step_logs_terminal_progress_without_replacing_events(
@@ -576,7 +715,7 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 7
+    assert source.count("run_validated_turn(") == 8
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:
@@ -642,7 +781,14 @@ def test_review_audit_is_bounded_idempotent_and_records_fix_disposition() -> Non
             review_result("CHANGES_REQUESTED", (f"Fix behavior {round_number}",)),
         )
         records.append(record)
-        body = workflow["with_review_audit"](body, record)
+        body = workflow["with_review_audit"](
+            body,
+            record
+            if round_number == 35
+            else replace(
+                record, fix_disposition="fixed", fix_sha=f"head-{round_number + 1}"
+            ),
+        )
 
     recovered = workflow["review_audit_from_body"](body)
     assert len(recovered) == workflow["MAX_REVIEW_AUDIT_RECORDS"] == 16
@@ -734,7 +880,9 @@ def test_review_audit_byte_eviction_retains_latest_record_for_every_role(
                 f"head-{round_number}",
                 review_result("CHANGES_REQUESTED", findings),
             )
-            body = workflow["with_review_audit"](body, record)
+            body = workflow["with_review_audit"](
+                body, replace(record, fix_disposition="fixed", fix_sha="fixed-head")
+            )
 
     recovered = workflow["review_audit_from_body"](body)
     assert len(body.encode()) <= workflow["MAX_BASE_PR_BODY_BYTES"]
@@ -1783,10 +1931,20 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
         ) -> BranchState:
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["expected_process"] in {"implementation", "cleanup"}
 
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
@@ -1861,6 +2019,192 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
 
 
+@pytest.mark.parametrize(
+    ("primary_sha", "allow_unchanged", "expected_process"),
+    [
+        ("primary", True, "reviewer-fix"),
+        ("previous", False, "implementation"),
+    ],
+)
+def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_sha: str,
+    allow_unchanged: bool,
+    expected_process: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["require_agent_result"].__globals__
+    branch = "feature/process-boundaries"
+    previous_sha = "previous"
+    cleanup_sha = "cleanup"
+    provenance: list[tuple[str, str, dict[str, object]]] = []
+
+    class Repository:
+        def __init__(self) -> None:
+            self.local_sha = primary_sha
+            self.dirty = True
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                dirty=self.dirty,
+                current_branch=branch,
+                status=(" M pending.py",) if self.dirty else (),
+            )
+
+        def require_committed_result(
+            self, current: str, *, previous_sha: str, allow_unchanged: bool
+        ) -> BranchState:
+            assert (current, previous_sha, allow_unchanged) == (
+                branch,
+                "previous",
+                True,
+            )
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end, kwargs))
+
+    repository = Repository()
+
+    def clean(*args: object, **kwargs: object) -> str:
+        repository.local_sha = cleanup_sha
+        repository.dirty = False
+        return "cleaned"
+
+    monkeypatch.setitem(globals_, "run_turn", clean)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    assert workflow["require_agent_result"](
+        repository,
+        object(),
+        "tab",
+        branch,
+        previous_sha,
+        allow_unchanged=allow_unchanged,
+        expected_process=expected_process,
+    ) == (cleanup_sha, True)
+    assert provenance == [
+        (
+            previous_sha,
+            primary_sha,
+            {
+                "expected_agent": "codex",
+                "expected_process": expected_process,
+                "allow_unchanged": True,
+            },
+        ),
+        (
+            primary_sha,
+            cleanup_sha,
+            {"expected_agent": "codex", "expected_process": "cleanup"},
+        ),
+    ]
+
+
+def test_failed_mutating_turn_validates_commits_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    branch = "feature/failed-turn"
+    provenance: list[tuple[str, str, dict[str, object]]] = []
+
+    class Repository:
+        local_sha = "before"
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end, kwargs))
+
+    repository = Repository()
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, tab: str, timeout: int) -> None:
+            pass
+
+        def send_input(self, tab: str, prompt: str) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *args: object, **kwargs: object) -> None:
+            repository.local_sha = "failed-turn-commit"
+            raise WorkerFailure("turn failed")
+
+    globals_ = workflow["run_turn"].__globals__
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    with pytest.raises(WorkerFailure, match="turn failed"):
+        workflow["run_turn"](
+            Client(),
+            "tab",
+            "Implementation",
+            "prompt",
+            repository=repository,
+            branch=branch,
+            expected_process="implementation",
+        )
+    assert provenance == [
+        (
+            "before",
+            "failed-turn-commit",
+            {
+                "expected_agent": "codex",
+                "expected_process": "implementation",
+                "allow_unchanged": True,
+            },
+        )
+    ]
+
+
+def test_interrupted_turn_is_not_masked_by_provenance_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    branch = "feature/interrupted-turn"
+
+    class Repository:
+        def require_current_branch(self, current: str) -> BranchState:
+            return BranchState(current, "head", None, True)
+
+        def require_agent_commit_provenance(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            raise WorkerFailure("invalid provenance")
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, tab: str, timeout: int) -> None:
+            raise WorkerInterrupted("turn interrupted")
+
+    globals_ = workflow["run_turn"].__globals__
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    with pytest.raises(WorkerInterrupted, match="turn interrupted"):
+        workflow["run_turn"](
+            Client(),
+            "tab",
+            "Implementation",
+            "prompt",
+            repository=Repository(),
+            branch=branch,
+            expected_process="implementation",
+        )
+
+
 def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1889,12 +2233,22 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             return BranchState(branch, self.local_sha, None, True)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
         ) -> BranchState:
             events.append(f"commit:{self.local_sha}")
             assert branch == issue.branch
             assert self.local_sha != previous_sha or allow_unchanged
             return BranchState(branch, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["expected_process"] in {"implementation", "cleanup"}
 
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
@@ -3496,6 +3850,510 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
     )
 
 
+def test_whole_warning_retries_from_durable_audit_after_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = runpy.run_path(str(EXAMPLE))
+    config = first["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    marker = first["whole_continuation_audit"](
+        2, current.head_sha, "review_limit_reached"
+    )
+    current = replace(current, body=first["with_review_audit"](current.body, marker))
+    second = runpy.run_path(str(EXAMPLE))
+    globals_ = second["review_whole_version"].__globals__
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == current.head_sha
+            return current
+
+    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(
+        globals_, "create_agent", lambda *args, **kwargs: pytest.fail("review restarted")
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    pr, delivery = second["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, config.issues
+    )
+
+    assert pr == current
+    assert delivery.outcome == "continued_with_warning"
+    assert delivery.reviews == 2
+    assert "review limit 2 reached" in delivery.warnings[0]
+
+
+@pytest.mark.parametrize(
+    "changed_role",
+    (
+        "scenario_gate", "design_principles", "whole_version",
+        "version_readme", "whole_version_limit",
+    ),
+)
+def test_whole_limit_after_head_change_persists_retry_decision(
+    monkeypatch: pytest.MonkeyPatch, changed_role: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha="new-head",
+    )
+    previous = workflow["new_review_audit"](
+        changed_role, 2, "CHANGES_REQUESTED", "old-head",
+        review_result("CHANGES_REQUESTED", ("Correct the integration issue.",)),
+    )
+    current = replace(
+        current,
+        body=workflow["with_review_audit"](
+            current.body,
+            replace(previous, fix_disposition="reviewer_changed_head", fix_sha="new-head"),
+        ),
+    )
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            current = replace(current, body=body)
+            return current
+
+    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
+    monkeypatch.setitem(
+        globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
+    )
+    monkeypatch.setitem(globals_, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(
+        globals_, "require_agent_result",
+        lambda *args, **kwargs: (current.head_sha, False),
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    pr, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, config.issues
+    )
+    assert delivery.outcome == "continued_with_warning"
+    assert "already reached" in delivery.warnings[0]
+    marker = workflow["review_audit_from_body"](pr.body)[-1]
+    assert marker.role == "whole_version_continuation"
+    assert marker.fix_disposition == "review_limit_reached_after_head_change"
+
+    recovered = runpy.run_path(str(EXAMPLE))
+    recovered_globals = recovered["review_whole_version"].__globals__
+    monkeypatch.setitem(recovered_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(
+        recovered_globals, "create_agent",
+        lambda *args, **kwargs: pytest.fail("recovery restarted review"),
+    )
+    monkeypatch.setitem(recovered_globals, "emit_finding", lambda *args, **kwargs: None)
+    _, retry = recovered["review_whole_version"](
+        config, object(), Repository(), GitHub(), pr, config.issues
+    )
+    assert (
+        retry.outcome, retry.head_sha, retry.base_sha, retry.reviews, retry.warnings
+    ) == (
+        delivery.outcome, delivery.head_sha, delivery.base_sha,
+        delivery.reviews, delivery.warnings,
+    )
+
+
+def test_limit_head_change_marker_survives_recovery_transition() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    current = replace(
+        open_pr(head="dev/v1", base="main", draft=True), head_sha="new-head"
+    )
+
+    class GitHub:
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            current = replace(current, body=body)
+            return current
+
+    github = GitHub()
+    current = workflow["persist_whole_limit_head_change"](
+        github, current, round_number=2, reviewed_sha="old-head",
+        head="dev/v1", base="main",
+    )
+    assert workflow["review_audit_from_body"](current.body)[0].fix_disposition == (
+        "pending"
+    )
+    current = workflow["reconcile_review_audits_after_head_change"](
+        github, current, head="dev/v1", base="main"
+    )
+    recovered = workflow["review_audit_from_body"](current.body)[0]
+    assert recovered.role == "whole_version_limit"
+    assert recovered.round == 2
+    assert recovered.fix_disposition == "head_changed_before_disposition"
+    assert recovered.fix_sha == "new-head"
+
+
+def test_whole_retry_finishes_warning_after_dispositions_but_before_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    body = current.body
+    for role, verdict in (
+        ("design_principles", "APPROVED"),
+        ("whole_version", "CHANGES_REQUESTED"),
+        ("version_readme", "APPROVED"),
+    ):
+        result = review_result(
+            verdict, ("Correct the integration issue.",)
+            if verdict == "CHANGES_REQUESTED" else (),
+        )
+        record = workflow["new_review_audit"](
+            role, 2, verdict, current.head_sha, result
+        )
+        if verdict == "CHANGES_REQUESTED":
+            record = replace(record, fix_disposition="review_limit_reached")
+        body = workflow["with_review_audit"](body, record)
+    current = replace(current, body=body)
+
+    class Repository:
+        def require_pushed(self, branch: str) -> BranchState:
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return current
+
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            current = replace(current, body=body)
+            return current
+
+    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
+    monkeypatch.setitem(
+        globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
+    )
+    monkeypatch.setitem(globals_, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(
+        globals_, "require_agent_result",
+        lambda *args, **kwargs: (current.head_sha, False),
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    pr, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, config.issues
+    )
+    assert delivery.outcome == "continued_with_warning"
+    assert workflow["review_audit_from_body"](pr.body)[-1].role == (
+        "whole_version_continuation"
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_role",
+    ("scenario_gate", "design_principles", "whole_version", "version_readme"),
+)
+def test_review_audit_pruning_keeps_head_change_continuation_evidence(
+    monkeypatch: pytest.MonkeyPatch, changed_role: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    monkeypatch.setitem(
+        workflow["with_review_audit"].__globals__, "MAX_REVIEW_AUDIT_BYTES", 1_200
+    )
+    prior = workflow["new_review_audit"](
+        changed_role, 2, "CHANGES_REQUESTED", "old-head",
+        review_result("CHANGES_REQUESTED", ("Correct the integration issue.",)),
+    )
+    prior = replace(
+        prior, fix_disposition="reviewer_changed_head", fix_sha="new-head"
+    )
+    body = workflow["with_review_audit"]("Base PR.", prior)
+    for round_number in range(3, 22):
+        record = workflow["new_review_audit"](
+            changed_role, round_number, "APPROVED", f"head-{round_number}",
+            review_result(),
+        )
+        body = workflow["with_review_audit"](body, record)
+    assert prior in workflow["review_audit_from_body"](body)
+
+
+def test_review_audit_pruning_keeps_pending_fix_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["with_review_audit"].__globals__
+    monkeypatch.setitem(globals_, "MAX_REVIEW_AUDIT_RECORDS", 3)
+    pending = workflow["new_review_audit"](
+        "correctness", 1, "CHANGES_REQUESTED", "old-head",
+        review_result("CHANGES_REQUESTED", ("Correct the issue.",)),
+    )
+    body = workflow["with_review_audit"]("Child PR.", pending)
+    for round_number in range(2, 5):
+        approved = workflow["new_review_audit"](
+            "correctness", round_number, "APPROVED", f"head-{round_number}",
+            review_result(),
+        )
+        body = workflow["with_review_audit"](body, approved)
+    assert pending in workflow["review_audit_from_body"](body)
+
+    current = replace(open_pr(head="feature/issue-311", base="dev/v1", draft=True), body=body)
+
+    class GitHub:
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            return replace(current, body=body)
+
+    disposed = workflow["review_audit_disposition"](
+        GitHub(), current, pending.audit_id, "fixed",
+        head="feature/issue-311", base="dev/v1", fix_sha="head-4",
+    )
+    assert any(
+        record.audit_id == pending.audit_id and record.fix_disposition == "fixed"
+        for record in workflow["review_audit_from_body"](disposed.body)
+    )
+
+
+@pytest.mark.parametrize("resumed", (False, True))
+@pytest.mark.parametrize("lost_phase", ("scope/design", "correctness"))
+def test_missing_audit_after_fixes_restarts_review_and_completes_work_item(
+    monkeypatch: pytest.MonkeyPatch, resumed: bool, lost_phase: str,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](311, "feature/issue-311")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    current = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+    original_body = "Child PR."
+    prior = workflow["new_review_audit"](
+        "correctness", 1, "APPROVED", "prior-head", review_result()
+    )
+    if resumed:
+        original_body = workflow["with_review_audit"](original_body, prior)
+    current = replace(current, body=original_body)
+    review_heads: list[str] = []
+    turns: list[str] = []
+    persisted: list[tuple] = []
+    lost_audit_id: str | None = None
+    fix_delivered = False
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, current.base_sha, current.base_sha, False)
+
+        def require_clean(self) -> None:
+            assert current.head_sha == "fixed-head"
+
+        def require_pushed(self, branch: str) -> BranchState:
+            assert branch == issue.branch
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            nonlocal current, fix_delivered, lost_audit_id
+            assert branch == issue.branch
+            assert expected_local_sha == "fixed-head"
+            assert not fix_delivered
+            records = workflow["review_audit_from_body"](current.body)
+            lost_audit_id = records[-1].audit_id
+            assert records[-1].fix_disposition == "pending"
+            current = replace(current, head_sha="fixed-head", body=original_body)
+            fix_delivered = True
+            return BranchState(branch, "fixed-head", "fixed-head", True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == current.head_sha
+            assert kwargs["expected_base_sha"] == current.base_sha
+            assert kwargs["draft"] is True
+            return current
+
+        def update_pr_body(self, number: int, *, body: str, **kwargs: object):
+            nonlocal current
+            assert number == current.number
+            current = replace(current, body=body)
+            persisted.append(workflow["review_audit_from_body"](body))
+            return current
+
+        def set_draft(self, number: int, *, draft: bool, **kwargs: object):
+            nonlocal current
+            assert number == current.number
+            assert draft is False
+            current = replace(current, is_draft=False)
+            return current
+
+    def run_turn(*args: object, **kwargs: object) -> str:
+        name = str(args[2])
+        turns.append(name)
+        if name.endswith("implementation"):
+            return "implemented"
+        if name.endswith(f"{lost_phase} fixes"):
+            return "fixed"
+        if name.endswith("scope/design review"):
+            review_heads.append(current.head_sha)
+            if lost_phase == "scope/design" and len(review_heads) == 1:
+                return review_result("CHANGES_REQUESTED", ("Correct the scope.",))
+            return review_result()
+        if name.endswith("correctness review"):
+            if lost_phase == "correctness" and current.head_sha == "review-head":
+                return review_result("CHANGES_REQUESTED", ("Correct the behavior.",))
+            return review_result()
+        pytest.fail(f"unexpected agent turn: {name}")
+
+    agent_results_by_turn = [
+        ("review-head", True),
+        ("review-head", False),
+        ("fixed-head", True),
+        ("fixed-head", False),
+        ("fixed-head", False),
+    ]
+    if lost_phase == "correctness":
+        agent_results_by_turn.insert(2, ("review-head", False))
+    agent_results = iter(agent_results_by_turn)
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(globals_, "prepare_issue", lambda *args: (
+        current if resumed else None, "review-head", resumed
+    ))
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *args, **kwargs: current)
+    monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_, "require_agent_result", lambda *args, **kwargs: next(agent_results)
+    )
+    monkeypatch.setitem(globals_, "emit_issue_navigation", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_issue_result", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    ready = workflow["process_issue"](
+        issue, config, SimpleNamespace(workspace_id="workspace"), Repository(), GitHub()
+    )
+    records = workflow["review_audit_from_body"](ready.body)
+    assert fix_delivered
+    assert review_heads == ["review-head", "fixed-head"]
+    expected_turns = ["Issue #311 implementation", "Issue #311 scope/design review"]
+    if lost_phase == "correctness":
+        expected_turns.append("Issue #311 correctness review")
+    expected_turns.extend(
+        (
+            f"Issue #311 {lost_phase} fixes",
+            "Issue #311 scope/design review",
+            "Issue #311 correctness review",
+        )
+    )
+    assert turns == expected_turns
+    assert ready.is_draft is False
+    assert any(
+        lost_audit_id in {record.audit_id for record in update}
+        for update in persisted
+    )
+    assert lost_audit_id not in {record.audit_id for record in records}
+    assert any(
+        record.role == lost_phase.replace("/", "_")
+        and record.reviewed_sha == "fixed-head"
+        and record.verdict == "APPROVED"
+        for record in records
+    )
+    assert any(
+        record.role == "correctness"
+        and record.reviewed_sha == "fixed-head"
+        and record.verdict == "APPROVED"
+        for record in records
+    )
+    assert any(
+        record.role == "scope_design" and record.reviewed_sha == "fixed-head"
+        for update in persisted for record in update
+    )
+    if resumed:
+        assert prior in records
+
+
+def test_missing_audit_does_not_retry_with_dirty_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["review_issue_phase"].__globals__
+    issue = workflow["Issue"](311, "feature/issue-311")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    current = open_pr(head=issue.branch, base=config.integration_branch, draft=True)
+
+    class Repository:
+        def require_clean(self) -> None:
+            raise WorkerFailure("worktree is dirty")
+
+    monkeypatch.setitem(
+        globals_, "_review_issue_phase",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            workflow["MissingReviewAudit"]("record missing")
+        ),
+    )
+    with pytest.raises(WorkerFailure, match="worktree is dirty"):
+        workflow["review_issue_phase"](
+            issue, config, object(), Repository(), object(), "implementer",
+            "reviewer", current, phase="correctness", prompt="review", max_reviews=4,
+        )
+
+
+def test_missing_whole_review_audit_restarts_at_verified_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    current = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+    reviewed: list[str] = []
+
+    class Repository:
+        def require_clean(self) -> None:
+            pass
+
+        def require_pushed(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, current.head_sha, current.head_sha, True)
+
+    class GitHub:
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["draft"] is True
+            assert kwargs["expected_head_sha"] == current.head_sha
+            return current
+
+    def review(_config, _client, _repo, _github, pr, _work_items):
+        reviewed.append(pr.head_sha)
+        if len(reviewed) == 1:
+            raise workflow["MissingReviewAudit"]("record missing")
+        return pr, workflow["ReviewDelivery"]("approved", pr.head_sha, pr.base_sha, 1)
+
+    monkeypatch.setitem(globals_, "_review_whole_version", review)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    pr, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current, ()
+    )
+    assert pr == current
+    assert delivery.outcome == "approved"
+    assert reviewed == [current.head_sha, current.head_sha]
+
+
 def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3520,8 +4378,16 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
             return SimpleNamespace(dirty=False)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+            expected_agent: str | None = None,
+            expected_process: str | None = None,
         ) -> BranchState:
+            assert expected_agent == "codex"
+            assert expected_process == "cleanup"
             return BranchState(branch, draft.head_sha, draft.head_sha, True)
 
     class GitHub:
@@ -3608,10 +4474,20 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
         def require_committed_result(
-            self, branch: str, *, previous_sha: str, allow_unchanged: bool
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
         ) -> BranchState:
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["expected_process"] == "cleanup"
 
         def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")

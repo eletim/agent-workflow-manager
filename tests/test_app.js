@@ -29,6 +29,21 @@ class Element {
     this.checked = false;
     this.children = [];
     this.className = "";
+    this.classList = {
+      add: (...tokens) => {
+        const classes = new Set(this.className.split(/\s+/).filter(Boolean));
+        for (const token of tokens) classes.add(token);
+        this.className = [...classes].join(" ");
+      },
+      contains: (token) => this.className.split(/\s+/).includes(token),
+      remove: (...tokens) => {
+        const removed = new Set(tokens);
+        this.className = this.className
+          .split(/\s+/)
+          .filter((token) => token && !removed.has(token))
+          .join(" ");
+      },
+    };
     this.dataset = {};
     this.disabled = false;
     this.hidden = false;
@@ -87,7 +102,11 @@ class Element {
 
   showModal() { this.open = true; }
 
-  close() { this.open = false; }
+  close() {
+    this.open = false;
+    const event = {preventDefault() {}};
+    for (const listener of this.listeners.get("close") || []) listener(event);
+  }
 }
 
 function snapshot({
@@ -118,6 +137,9 @@ function snapshot({
   plannerSkips = [],
   purplemuxPort = 9123,
   issueDrivenJson = undefined,
+  environmentSetupJson = undefined,
+  reviewJson = undefined,
+  reviewResult = undefined,
   resumedFromRunId = null,
 }) {
   const result = {
@@ -157,6 +179,9 @@ function snapshot({
   if (mode !== undefined) result.mode = mode;
   if (prompt !== undefined) result.prompt = prompt;
   if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
+  if (environmentSetupJson !== undefined) result.environmentSetupJson = environmentSetupJson;
+  if (reviewJson !== undefined) result.reviewJson = reviewJson;
+  if (reviewResult !== undefined) result.reviewResult = reviewResult;
   return result;
 }
 
@@ -222,7 +247,12 @@ async function loadApp({
   confirmOverride = null,
 }) {
   const ids = [
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
+    "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "prompt-fields",
+    "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
+    "review-result-panel", "review-result-status", "review-result-json",
+    "environment-setup-fields", "environment-setup-json", "environment-setup-python",
+    "environment-setup-generate", "environment-setup-success", "environment-setup-error",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
     "repository-config-add", "repository-config-list", "repository-config-message",
@@ -231,7 +261,7 @@ async function loadApp({
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
     "active-context", "repository-navigation", "repository-slug", "repository-link",
-    "run-list", "delete-checked-runs",
+    "run-family", "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
@@ -259,6 +289,7 @@ async function loadApp({
     "save-settings", "test-notification",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
+  elements.body = new Element();
   elements.favicon = new Element();
   elements.favicon.setAttribute("href", "/favicon.svg");
   elements["validation-panel"].hidden = true;
@@ -269,7 +300,7 @@ async function loadApp({
   const calls = [];
   const eventSources = [];
   const document = {
-    body: new Element(),
+    body: elements.body,
     createElement() { return new Element(); },
     createTextNode(text) { return {textContent: text}; },
     execCommand() { return true; },
@@ -368,6 +399,7 @@ async function loadApp({
   return {
     calls,
     elements,
+    location: context.window.location,
     eventSource: eventSources[0],
     logDisplay: context.runnerLogDisplay,
   };
@@ -1213,6 +1245,28 @@ test("Issue Driven mode opens and copies its dedicated guide", async () => {
   assert.deepEqual(clipboard.writes, ["issue guide"]);
 });
 
+test("Review mode opens its dedicated guide", async () => {
+  const {elements, calls} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/review-guide.md") return response("review guide");
+      return undefined;
+    },
+  });
+
+  await elements["review-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Review Guide");
+  await elements["guide-open"].dispatch("click");
+  assert.equal(elements["guide-title"].textContent, "Review Guide");
+  assert.equal(elements["guide-raw"].href, "/review-guide.md");
+  assert.equal(elements["guide-content"].textContent, "review guide");
+  assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
+    ["/review-guide.md", "GET"],
+  ]);
+});
+
 test("stale guide failure cannot replace the active guide", async () => {
   const workflowGuide = deferred();
   const {elements} = await loadApp({
@@ -1500,6 +1554,7 @@ test("Prompt directory picker navigates and selects its resolved current path", 
   await elements["directory-picker-open"].dispatch("click");
   await waitFor(() => elements["directory-picker-list"].children.length === 1);
 
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
   assert.equal(elements["directory-picker-path"].textContent, "/typed/project");
   assert.equal(elements["directory-picker-list"].children[0].textContent, "📁 source");
   await elements["directory-picker-parent"].dispatch("click");
@@ -1514,10 +1569,60 @@ test("Prompt directory picker navigates and selects its resolved current path", 
   );
 
   await elements["directory-picker-select"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
   assert.equal(elements["prompt-cwd"].value, "/typed/project/source");
   assert.deepEqual(requestedPaths, [
     "/typed/project", "/typed", "/typed/project", "/typed/project/source",
   ]);
+});
+
+test("Prompt directory picker releases page scroll lock when dismissed", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") {
+        return response({path: "/work", parent: "/", directories: []});
+      }
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  await elements["directory-picker-open"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
+
+  await elements["directory-picker-close"].dispatch("click");
+  assert.equal(elements["directory-picker-dialog"].open, false);
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
+
+  await elements["directory-picker-open"].dispatch("click");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), true);
+  await elements["directory-picker-dialog"].dispatch("close");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
+});
+
+test("closing the directory picker invalidates its pending request", async () => {
+  const listing = deferred();
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/directories") return listing.promise;
+      return undefined;
+    },
+  });
+
+  await elements["prompt-mode"].dispatch("click");
+  await elements["directory-picker-open"].dispatch("click");
+  await elements["directory-picker-close"].dispatch("click");
+  listing.resolve(response({path: "/stale", parent: "/", directories: []}));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(elements["directory-picker-path"].textContent, "");
+  assert.equal(elements.body.classList.contains("directory-picker-open"), false);
 });
 
 test("Prompt directory picker reports invalid manual paths without replacing them", async () => {
@@ -3827,4 +3932,383 @@ test("completed Workflow runs expose explicit Cleanup and retain their history",
   assert.equal(runs.length, 1);
   assert.equal(elements.cleanup.disabled, true);
   assert.match(elements["resources-summary"].textContent, /cleaned/);
+});
+
+test("external targets load and save stable registrations without credential values", async () => {
+  const target = {id: "office", destination: "https://awm.example", tokenEnv: "OFFICE_TOKEN"};
+  const {elements, calls} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/settings/external-targets") {
+        if (options.method === "POST") {
+          assert.deepEqual(JSON.parse(options.body), {targets: [target]});
+        }
+        return response({targets: [{...target, credentialStatus: "configured"}]});
+      }
+      return undefined;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [target]);
+  assert.match(elements["external-target-credentials"].textContent, /office: credentials configured/);
+  await elements["external-target-settings"].dispatch("submit");
+  assert.ok(calls.some(([url, method]) => url === "/api/settings/external-targets" && method === "POST"));
+  assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+  elements["external-targets-json"].value = "invalid";
+  await elements["external-target-settings"].dispatch("submit");
+  assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 1);
+});
+
+test("obsolete external target responses cannot overwrite reopened Settings edits", async () => {
+  const first = deferred();
+  const second = deferred();
+  let reads = 0;
+  let saved;
+  const target = {id: "current", destination: "https://current.example", tokenEnv: "CURRENT_TOKEN"};
+  const edited = {...target, destination: "https://edited.example"};
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      if (options.method === "POST") {
+        saved = JSON.parse(options.body);
+        return response({targets: [{...edited, credentialStatus: "configured"}]});
+      }
+      return ++reads === 1 ? first.promise : second.promise;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  second.resolve(response({targets: [{...target, credentialStatus: "missing"}]}));
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  elements["external-targets-json"].value = JSON.stringify([edited]);
+  first.resolve(response({targets: [{...target, id: "stale", credentialStatus: "configured"}]}));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+  assert.equal(elements["external-target-credentials"].textContent, "current: credentials missing");
+  await elements["external-target-settings"].dispatch("submit");
+  assert.deepEqual(saved, {targets: [edited]});
+});
+
+test("obsolete external target failures cannot change current Settings state", async () => {
+  const first = deferred();
+  let reads = 0;
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      return ++reads === 1 ? first.promise : response({targets: []});
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  first.resolve(response({error: "obsolete failure"}, 500));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements["external-target-message"].textContent, "");
+  assert.equal(elements["save-external-targets"].disabled, false);
+});
+
+for (const obsoleteStatus of [200, 500]) {
+  test(`obsolete external target save (${obsoleteStatus}) preserves reopened edits and pending save`, async () => {
+    const oldSave = deferred();
+    const currentSave = deferred();
+    let saves = 0;
+    const target = {id: "office", destination: "https://office.example", tokenEnv: "OFFICE_TOKEN"};
+    const edited = {...target, destination: "https://edited.example"};
+    const {elements, calls} = await loadApp({
+      runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+      fetchOverride(url, options) {
+        if (url !== "/api/settings/external-targets") return undefined;
+        if (options.method === "POST") return ++saves === 1 ? oldSave.promise : currentSave.promise;
+        return response({targets: [{...target, credentialStatus: "missing"}]});
+      },
+    });
+    await elements["settings-open"].dispatch("click");
+    await waitFor(() => !elements["save-external-targets"].disabled);
+    const oldSubmission = elements["external-target-settings"].dispatch("submit");
+    await waitFor(() => saves === 1);
+    await elements["settings-close"].dispatch("click");
+    await elements["settings-open"].dispatch("click");
+    await waitFor(() => !elements["save-external-targets"].disabled);
+    elements["external-targets-json"].value = JSON.stringify([edited]);
+    const currentSubmission = elements["external-target-settings"].dispatch("submit");
+    await waitFor(() => saves === 2);
+    oldSave.resolve(response(obsoleteStatus === 200
+      ? {targets: [{...target, credentialStatus: "configured"}]}
+      : {error: "obsolete save failure"}, obsoleteStatus));
+    await oldSubmission;
+    assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+    assert.equal(elements["external-target-message"].textContent, "");
+    assert.equal(elements["external-target-credentials"].textContent, "office: credentials missing");
+    assert.equal(elements["save-external-targets"].disabled, true);
+    assert.equal(elements["save-external-targets"].dataset.pending, "true");
+    assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), "true");
+    await elements["external-target-settings"].dispatch("submit");
+    assert.equal(saves, 2);
+    assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 2);
+    currentSave.resolve(response({targets: [{...edited, credentialStatus: "configured"}]}));
+    await currentSubmission;
+    assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+    assert.equal(elements["save-external-targets"].disabled, false);
+    assert.equal(elements["save-external-targets"].dataset.pending, undefined);
+    assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), undefined);
+  });
+}
+
+
+test("persisted family links navigate both directions after reload", async () => {
+  const parent = "a".repeat(32) + "-1";
+  const child = "a".repeat(32) + "-2";
+  const childRef = {identity: child, runId: 2, scope: "local"};
+  const parentRef = {identity: parent, runId: 1, scope: "local"};
+  const runs = [
+    {runId: 1, identity: parent, state: "success", childRuns: [childRef]},
+    {runId: 2, identity: child, state: "success", parentRun: parentRef},
+  ];
+  const details = Object.fromEntries(runs.map(run => [run.runId, {
+    ...snapshot({runId: run.runId, state: "success", stdout: ""}), ...run,
+  }]));
+  const first = await loadApp({runs, details, locationHref: `http://127.0.0.1:8765/?run=${parent}`});
+  assert.equal(selectedRun(first.elements).dataset.runId, "1");
+  const childLink = first.elements["run-family"].children[0];
+  assert.equal(childLink.href, `/?run=${child}`);
+  assert.equal(first.elements["run-list"].children.filter(item => item.className === "run-family").length, 2);
+  const second = await loadApp({runs, details, locationHref: `http://127.0.0.1:8765${childLink.href}`});
+  assert.equal(selectedRun(second.elements).dataset.runId, "2");
+  assert.equal(second.elements["run-family"].children[0].href, `/?run=${parent}`);
+  const deleted = await loadApp({runs: [runs[0]], details, locationHref: `http://127.0.0.1:8765/?run=${child}`});
+  assert.equal(selectedRun(deleted.elements), undefined);
+  assert.match(deleted.elements.stderr.textContent, /no longer available/);
+});
+
+for (const relation of ["parentRun", "childRuns"]) {
+  test(`external ${relation} resolves exact identity and handles unavailable targets`, async () => {
+    const identity = "b".repeat(32) + "-7";
+    const ref = {identity, runId: 7, scope: "external"};
+    const family = {[relation]: relation === "parentRun" ? ref : [ref]};
+    const run = {...snapshot({runId: 1, state: "success", stdout: ""}), ...family};
+    let url = null;
+    const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+      if (path.startsWith("/api/run-navigation?")) return response({url});
+    }});
+    const link = app.elements["run-family"].children[0];
+    await link.dispatch("click");
+    assert.match(link.textContent, /target unavailable or history deleted/);
+    assert.equal(app.location.href, "http://127.0.0.1:8765/");
+    url = `https://registered.example/?run=${identity}`;
+    await link.dispatch("click");
+    assert.equal(app.location.href, url);
+    assert.ok(app.calls.some(([path]) => path === `/api/run-navigation?identity=${identity}`));
+  });
+}
+
+for (const responseOrder of [[0, 1], [1, 0]]) {
+  for (const obsoleteResult of ["destination", "unavailable", "error"]) {
+    test(`latest family click wins with response order ${responseOrder} and obsolete ${obsoleteResult}`, async () => {
+      const identities = ["b".repeat(32) + "-7", "c".repeat(32) + "-8"];
+      const pending = [deferred(), deferred()];
+      const run = {
+        ...snapshot({runId: 1, state: "success", stdout: ""}),
+        childRuns: identities.map((identity, index) => ({identity, runId: index + 7, scope: "external"})),
+      };
+      const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+        const index = identities.findIndex(identity => path === `/api/run-navigation?identity=${identity}`);
+        if (index >= 0) return pending[index].promise;
+      }});
+      // Detail and history share the same navigation intent.
+      const firstLink = app.elements["run-family"].children[0];
+      const historyFamily = app.elements["run-list"].children.find(item => item.className === "run-family");
+      const secondLink = historyFamily.children[1];
+      const originalLabel = firstLink.textContent;
+      const clicks = [firstLink.dispatch("click"), secondLink.dispatch("click")];
+      const destinations = identities.map(identity => `https://registered.example/?run=${identity}`);
+      for (const index of responseOrder) {
+        pending[index].resolve(index === 0 && obsoleteResult === "error"
+          ? response({error: "obsolete failure"}, 500)
+          : response({url: index === 0 && obsoleteResult === "unavailable" ? null : destinations[index]}));
+        await clicks[index];
+        assert.equal(app.location.href, index === 1 || responseOrder[0] === 1
+          ? destinations[1] : "http://127.0.0.1:8765/");
+        assert.equal(firstLink.textContent, originalLabel);
+      }
+    });
+  }
+}
+
+test("local family click invalidates pending external navigation", async () => {
+  const pending = deferred();
+  const run = {
+    ...snapshot({runId: 1, state: "success", stdout: ""}),
+    childRuns: [
+      {identity: "b".repeat(32) + "-7", runId: 7, scope: "external"},
+      {identity: "a".repeat(32) + "-2", runId: 2, scope: "local"},
+    ],
+  };
+  const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+    if (path.startsWith("/api/run-navigation?")) return pending.promise;
+  }});
+  const [external, local] = app.elements["run-family"].children;
+  const click = external.dispatch("click");
+  await local.dispatch("click");
+  pending.resolve(response({url: "https://obsolete.example/"}));
+  await click;
+  assert.equal(app.location.href, "http://127.0.0.1:8765/");
+  assert.equal(local.href, `/?run=${"a".repeat(32)}-2`);
+});
+
+test("Environment Setup generates, submits, and restores an ordinary Run", async () => {
+  const source = JSON.stringify({mode: "environment-setup", repository: "/repo", revision: "main", environment_agent: "codex", timeout: 120});
+  const generatedCode = "print('setup')";
+  const calls = [];
+  const running = snapshot({runId: 9, state: "running", stdout: "", mode: "environment-setup", code: generatedCode, environmentSetupJson: source});
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/environment-setup/generate") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({generatedCode, revisionValidation: "verified"});
+      }
+      if (["/api/validate", "/api/dry-run"].includes(url)) {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({validation: [], outline: ["Environment Setup"], dryRun: {status: "complete", findings: [], nextMutation: null}});
+      }
+      if (url === "/api/run") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response(running, 202);
+      }
+      return undefined;
+    },
+  });
+  await elements["environment-setup-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Environment Setup Guide");
+  elements["environment-setup-json"].value = source;
+  await elements["environment-setup-generate"].dispatch("click");
+  assert.equal(elements["environment-setup-python"].value, generatedCode);
+  assert.equal(elements["environment-setup-success"].hidden, false);
+  await elements.validate.dispatch("click");
+  await elements["dry-run"].dispatch("click");
+  await elements.run.dispatch("click");
+  assert.deepEqual(calls.at(-1), ["/api/run", {code: generatedCode, args: [], environmentSetupJson: source}]);
+  assert.match(elements["active-context"].textContent, /Environment Setup Run #9/);
+  assert.equal(elements["environment-setup-json"].value, source);
+  assert.equal(elements["environment-setup-json"].readOnly, true);
+  assert.equal(elements.stop.disabled, false);
+  assert.deepEqual(calls.filter(([url]) => url === "/api/validate" || url === "/api/dry-run").map(([url, body]) => [url, body]), [
+    ["/api/validate", {code: generatedCode, args: []}],
+    ["/api/dry-run", {code: generatedCode, args: []}],
+  ]);
+});
+
+test("Environment Setup generation errors clear stale generated Python", async () => {
+  const {elements} = await loadApp({runs: [], details: {}, validation: {body: {}, status: 200}, fetchOverride(url) {
+    if (url === "/api/environment-setup/generate") return response({error: "invalid revision"}, 422);
+    return undefined;
+  }});
+  await elements["environment-setup-mode"].dispatch("click");
+  elements["environment-setup-python"].value = "old code";
+  elements["environment-setup-json"].value = "{}";
+  await elements["environment-setup-json"].dispatch("input");
+  assert.equal(elements["environment-setup-python"].value, "");
+  await elements["environment-setup-generate"].dispatch("click");
+  assert.equal(elements["environment-setup-error"].textContent, "invalid revision");
+});
+
+test("Review generates read-only Python, starts a Run, and shows saved settings and result", async () => {
+  const source = JSON.stringify({mode: "review", repositories: ["/repo"], check: "Inspect it"});
+  const generatedCode = "print('review')";
+  const report = {verdict: "FAIL", summary: "One issue", findings: ["Missing check"], evidence: ["file.py:4"]};
+  const running = snapshot({runId: 9, state: "running", stdout: "", mode: "review", code: generatedCode, reviewJson: source});
+  const finished = snapshot({runId: 9, state: "success", stdout: "Diagnostic output only", mode: "review", code: generatedCode, reviewJson: source, reviewResult: report});
+  const calls = [];
+  const {elements} = await loadApp({
+    runs: [{runId: 9, state: "success", mode: "review"}],
+    details: {9: finished}, validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/review/generate") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({generatedCode});
+      }
+      if (url === "/api/run") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response(running, 202);
+      }
+      return undefined;
+    },
+  });
+  await elements["review-mode"].dispatch("click");
+  elements["review-json"].value = source;
+  await elements["review-generate"].dispatch("click");
+  assert.equal(elements["review-python"].value, generatedCode);
+  assert.equal(elements["review-success"].hidden, false);
+  await elements.run.dispatch("click");
+  assert.deepEqual(calls.at(-1), ["/api/run", {code: generatedCode, args: [], reviewJson: source}]);
+  assert.equal(elements["review-json"].value, source);
+  assert.equal(elements["review-json"].readOnly, true);
+  assert.match(elements["review-result-status"].textContent, /Verdict: FAIL — One issue/);
+  assert.match(elements["review-result-json"].textContent, /Missing check/);
+  assert.equal(elements.stdout.textContent, "Diagnostic output only");
+  assert.match(selectedRun(elements).textContent, /Review/);
+});
+
+test("Review panel ignores verdict text in stdout without a saved result", async () => {
+  const detail = snapshot({
+    runId: 1, state: "success", mode: "review", reviewJson: "{}",
+    stdout: JSON.stringify({verdict: "PASS", summary: "Only in stdout"}),
+    reviewResult: null,
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", mode: "review"}],
+    details: {1: detail},
+    validation: {body: {}, status: 200},
+  });
+  assert.equal(elements["review-result-status"].textContent,
+    "No structured Review result was saved. See stdout and stderr.");
+  assert.equal(elements["review-result-json"].textContent, "");
+});
+
+for (const verdict of ["PASS", "FAIL", "BLOCKED", null]) {
+  test(`reloaded Review history and detail show saved ${verdict ?? "missing"} result`, async () => {
+    const report = verdict === null ? null : {
+      verdict, summary: `Saved ${verdict} summary`, findings: [], evidence: [],
+    };
+    const detail = snapshot({
+      runId: 1, state: "success", mode: "review", reviewJson: "{}",
+      reviewResult: report,
+      stdout: "Verdict: PASS from stdout",
+    });
+    const {elements} = await loadApp({
+      runs: [{runId: 1, state: "success", mode: "review", reviewVerdict: verdict}],
+      details: {1: detail},
+      validation: {body: {}, status: 200},
+    });
+    assert.match(runItem(elements, 1).textContent,
+      new RegExp(`Review result: ${verdict ?? "none saved"}`));
+    if (verdict === null) {
+      assert.equal(elements["review-result-status"].textContent,
+        "No structured Review result was saved. See stdout and stderr.");
+      assert.equal(elements["review-result-json"].textContent, "");
+    } else {
+      assert.equal(elements["review-result-status"].textContent,
+        `Verdict: ${verdict} — Saved ${verdict} summary`);
+      assert.equal(JSON.parse(elements["review-result-json"].textContent).verdict, verdict);
+    }
+  });
+}
+
+test("Review generation errors clear stale code and remain visible", async () => {
+  const {elements} = await loadApp({runs: [], details: {}, validation: {body: {}, status: 200}, fetchOverride(url) {
+    if (url === "/api/review/generate") return response({error: "invalid Review JSON"}, 422);
+    return undefined;
+  }});
+  await elements["review-mode"].dispatch("click");
+  elements["review-python"].value = "old code";
+  elements["review-json"].value = "{}";
+  await elements["review-json"].dispatch("input");
+  assert.equal(elements["review-python"].value, "");
+  await elements["review-generate"].dispatch("click");
+  assert.equal(elements["review-error"].textContent, "invalid Review JSON");
 });

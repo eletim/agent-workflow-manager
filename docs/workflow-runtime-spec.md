@@ -67,11 +67,63 @@ This identity is only for creation and reconciliation. Run-owned resource
 inventory remains authoritative only after concrete workspace, tab, result
 directory, or worktree identities are returned and registered.
 
+## Child Run control contract
+
+A running Python Workflow can call `start_child_run(code, args=(), target_id=None)`,
+`get_child_run_result(run_id, target_id=None)`, and
+`wait_child_run(run_id, timeout=None, target_id=None)`. Python owns when to start,
+wait, branch, retry after authoritative inspection, or reject a final child result.
+The Runner does not schedule a graph or infer these decisions from progress.
+
+The Runner supplies `AGENT_WORKFLOW_MANAGER_CONTROL_URL` and
+`AGENT_WORKFLOW_MANAGER_CONTROL_TOKEN` to each Workflow process. This dedicated
+local HTTP control receiver accepts authenticated `start` and `result` requests
+with `X-AWM-Run-Token`; it is separate from the observational event receiver.
+Only an active, non-stopping parent may use its credential, and result access is
+limited to that parent's known children. The control credential is not an external
+AWM request token. External registrations and credential resolution belong to the
+calling server, not to workflow code or progress events.
+
+Starting creates an ordinary Run using the existing Runner lifecycle, output,
+Progress, Result, Stop, notifications, and history. Local family links are persisted
+before child execution. For external work the destination persists the supplied
+full parent identity before execution, and the source records a received child
+identity even if the remaining launch response is uncertain. An unavailable launch
+identity cannot be invented; inspect the destination history. Each instance retains
+its family links independently across restart. Numeric IDs alone do not establish
+cross-instance ownership; result observation checks the authorized full identity.
+
+A final `ChildRunResult` contains `run_id`, `state`, `exit_code`, `stdout`, and
+`stderr`. Failed and stopped children return final results too; they do not
+implicitly fail their parent. Only Python's own exit determines the parent outcome.
+Progress remains observational, including a child's completed step before a later
+failure. `None` means confirmed running, never an unknown result. A wait deadline
+raises `TimeoutError` without stopping the child. External communication or invalid
+results raise `ExternalRunError`; an uncertain launch raises
+`ExternalRunLaunchUnknown` and must not be blindly retried. Control transport
+failures also remain exceptions. There is no automatic child cancellation or
+restart/replay contract: inspect each ordinary Run and use its explicit Stop action.
+
+Registration setup and a runnable local/two-instance Python example are documented
+in the [README](../README.md) and [child Workflow](../examples/child-runs.py).
+
 ## Manual recovery contract
 
 Checkpoint and in-place Resume are not part of the Workflow contract. A failed
 or stopped Python process is not reconstructed or replayed. Its run record,
 output, findings, and owned resources remain inspectable until explicit Cleanup.
+
+While an Issue Driven workflow is still running, its plain Python code may handle
+a repository step failure with a bounded recovery attempt. It inspects current
+Git, GitHub, worktree, and work-item plan state, then starts a fresh recovery agent
+for that error. The agent returns a validated, size-limited report with a repair
+decision, retry-safety decision, summary, and post-repair evidence. Python
+re-inspects authoritative state before restarting the repository pass with a
+fresh plan. A verified repair emits runtime warning Findings containing the
+original error and the repair evidence; these remain visible even if the pass
+later succeeds. An unrepaired, unsafe, or uncertain outcome fails the run. The
+retry limit is finite, and an unknown mutation outcome is never retried. The
+Runner stores the Findings but does not interpret the report or schedule retries.
 
 For Issue Driven mode, the UI's Review & Resume action confirms the original
 immutable settings and starts a distinct run. Prompt and custom Python Workflow
@@ -79,8 +131,9 @@ recovery is authored as a new run manually. The new workflow uses normal Python 
 authoritative Git, GitHub, and PurpleMux state before deciding whether existing
 external work can be reused. Mutation helpers retain their mutation-once,
 postcondition reconciliation, and `MutationOutcomeUnknown` behavior; an unknown
-outcome is inspected and must never be blindly retried. This is not a durable
-workflow engine, graph, state machine, or automatic retry facility. Obsolete
+outcome is inspected and must never be blindly retried. The Issue Driven Python
+workflow can retry its repository pass after verified repair as described above;
+the Runner does not provide a general automatic retry facility. Obsolete
 checkpoint fields from older data or inherited environments are ignored and
 must never trigger replay.
 

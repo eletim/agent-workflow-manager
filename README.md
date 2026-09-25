@@ -4,6 +4,7 @@
 # Install and start the custom PurpleMux fork (keep this terminal running).
 git clone https://github.com/eletim/purplemux.git "$HOME/DevEnv/purplemux"
 cd "$HOME/DevEnv/purplemux"
+git switch dev/v0.5.0
 corepack enable
 pnpm install
 pnpm start
@@ -29,7 +30,10 @@ This setup intentionally uses the custom CLI from
 the upstream `npm install -g purplemux` package: it does not provide the CLI
 contract required by Agent Workflow Manager. No token needs to be copied into
 these commands; the custom CLI reads the runtime connection files created under
-`~/.purplemux/`.
+`~/.purplemux/`. Review requires the `ext-review` CLI and server API in the
+fork's `dev/v0.5.0` branch or newer. Check both with `purplemux help` and
+`purplemux api-guide` after starting the server; the Review Run checks the same
+contract before creating a workspace.
 
 # Agent Workflow Manager
 
@@ -67,9 +71,86 @@ record. Give each agent only the portion of human context and recorded decisions
 needed for its current role instead of accumulating every available artifact in
 every prompt.
 
+## Review mode
+
+Choose **Review** in the Runner to inspect local Git repositories or observe an
+external terminal. Enter a JSON declaration, select **Validate JSON & Generate**
+to inspect the generated Python, then use **Validate**, **Dry Run**, and **Run**.
+Progress, Stop, Result, and history use the ordinary Run surfaces. The Review
+result panel shows the structured verdict when one is available. Structured
+verdicts are saved with Run history and remain visible in history and detail
+after reload. The original JSON and generated Python are retained in history.
+
+The [Review Guide](src/purplemux_client/web_static/review-guide.md) gives the
+field schema, an example, the read-only browser and `ext-review` observation
+contract, and the meanings of `PASS`, `FAIL`, and `BLOCKED`.
+
+## Environment Setup inputs
+
+The UI offers an Environment Setup mode. Enter the declaration, select
+**Validate JSON & Generate** to inspect its Python, then use the usual
+Validate, Dry Run, and Run buttons. Run submits the generated Python and
+the original declaration to `/api/run`; Progress, Stop, Result, and history
+are the ordinary Run surfaces. History retains the declaration and generated
+Python.
+
+`POST /api/environment-setup/generate` accepts `{"json": "..."}` with an
+`environment-setup` declaration. Required fields are `mode`, `repository`
+(an existing local Git repository), `revision` (an existing `origin` branch or
+tag, or a full local commit SHA; a local commit needs no remote),
+`environment_agent` (`codex` or `claude-code`), and `timeout` (1–86400 seconds).
+Optional non-empty strings are `build`, `start`, and `ready_check`. The endpoint
+validates the inputs and returns the normalized configuration, a
+`revisionValidation` status, and generated plain Python Workflow. A remote tag
+whose object is not available locally is marked `provisional`; the Workflow
+verifies that it points to a commit after fetching it. The generated workflow
+prepares a detached worktree and asks the selected agent to prepare it. The
+workflow then runs each supplied build, start, and ready check command as given,
+in order, in managed PurpleMux terminals, even if the initial agent report is
+`BLOCKED`. Omitted commands are skipped. If no
+ready check is supplied, the agent provides a usability check command. Failed
+commands and their terminal logs go back to the agent for diagnosis and repair;
+the agent may make temporary setup changes, and the workflow retries the failed
+stage within the same timeout. If the start process exits while readiness fails,
+the workflow retries the start stage. The agent reports `BLOCKED` when readiness
+requires a permanent product fix. The start terminal
+remains available for inspection and control. The declared timeout applies to
+preparation, session creation, agent turns, and commands. The workflow records
+observed outcomes and accepts `READY` only when the commands and usability check
+succeed and the final service inspection does not report a readiness failure.
+On Linux, when a start terminal exits successfully, the workflow accepts a detached service
+only if the ready check names one local HTTP endpoint and a new listener on that
+port belongs to a process working inside the prepared worktree. It checks that
+same listener again before `READY`. Otherwise it treats the start as unverified
+and retains its output for diagnosis.
+Before returning `READY`, it verifies that the working path's HEAD still matches
+the resolved revision.
+An absent endpoint does not block readiness. Uncertain launches are not replayed
+unless the terminal result confirms the command failed. A busy agent is
+interrupted at timeout.
+The workflow returns one JSON result with `status` (`READY` or `BLOCKED`),
+`summary`, `resolved_revision` (the verified commit SHA when preparation
+succeeds), and `working_path` (the detached worktree when available). It also
+includes `connection` with workspace and agent tab IDs and an observed
+`endpoint` when available, `process` with the
+observed start process outcome, `checks`, `verification`, `attempts`, and
+execution and readiness summaries. A `BLOCKED` result includes
+`observed_facts` with the error and agent reports, so a later Python Workflow
+Run can inspect the available evidence and decide how to proceed.
+When the full result exceeds the Run output limit, histories are shortened to
+recent attempts with omission counts, then bulky logs are reduced as needed.
+These inputs describe the environment; they are not a steps language.
+API clients submit `generatedCode` to the existing Workflow validation and
+Dry Run endpoints, then submit `{"code": generatedCode, "args": [],
+"environmentSetupJson": originalJson}` to `/api/run`. A Run submission
+rejects a declaration whose generated code differs from `code`. The Run result
+is the JSON value on stdout described above; its Run state and exit code report
+workflow execution, while `status` in that JSON reports environment readiness.
+A stopped Run may end without a complete readiness JSON result.
+
 ## Issue Driven mode
 
-The UI offers `Prompt | Issue Driven | Python Workflow`. Issue Driven mode accepts
+The UI offers `Prompt | Environment Setup | Issue Driven | Review | Python Workflow`. Issue Driven mode accepts
 only a small JSON configuration, validates it separately from Python, and
 deterministically expands it into the canonical sequential plain-Python workflow.
 The generated Python is visible for inspection and is then passed unchanged to the
@@ -115,6 +196,13 @@ restored. Multi-repository recovery performs that inspection independently for
 each declared repository, so matching branch or PR names in another repository
 cannot supply its recovery state. Prompt and custom Python Workflow runs continue
 to use manual recovery.
+
+During an active Issue Driven run, a repository step failure can start a fresh
+recovery agent. After a verified repair, the workflow re-inspects persisted plan,
+Git, and PR state and retries the repository pass at most twice. An interrupted
+agent turn or uncertain mutation outcome stops the run. Each successful recovery
+records WARN findings for the original error and repair evidence; timeout and
+policy conflict warnings from earlier attempts remain in the final handoff.
 
 For one-shot delivery, replace the initial `issues` / `work_items` list with a
 single `one_shot_issue`. The generated workflow starts with an empty plan and its
@@ -170,6 +258,12 @@ original Issue as its work definition:
 }
 ```
 
+After every one-shot planning decision, the workflow appends a structured
+comment to the source Issue. Each comment records the current internal work-item
+decomposition, the planner's decomposition rationale, and the changes from the
+previous planning result. Replanning appends a new comment instead of replacing
+history; the workflow does not create child Issues or publish raw agent logs.
+
 The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`,
 `scope_max_reviews`, `turn_timeout`, the two agent fields, and `scenarios` are optional; every
 other field is required. When omitted, `scope_max_reviews` retains the existing
@@ -191,7 +285,13 @@ is reused only when it contains that exact starting commit and passes the normal
 safe recovery checks. While the two remote heads are identical, Base PR creation
 is deferred; it is created after the first Issue merge advances the integration
 branch. An existing Base PR is still recovered normally. The final PR still
-targets `final_branch`. During deferral, planner decisions—including empty
+targets `final_branch`. At startup, a warning asks the user to verify the intended
+base when a remote `dev/vX.Y.Z` branch with a higher patch version in the same
+major/minor series is ahead of the configured integration head, or ahead of the
+`final_branch` head from which a missing integration branch would be created.
+Newer names that are identical, behind, divergent, or in another series do not
+trigger the warning, and the workflow never changes the configured branch
+automatically. During deferral, planner decisions—including empty
 one-shot plans and dynamic items—use an AWM-owned remote Git note as authoritative
 recovery state without changing scheduling semantics. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design
@@ -261,6 +361,8 @@ turn_start_sha = feature.local_sha
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
+    expected_agent="codex",
+    expected_process="implementation",
 )
 # Push is also orchestration-owned gap absorption if the agent omitted it. This
 # only creates the exact remote branch or fast-forwards it; remote-ahead or
@@ -328,6 +430,13 @@ state cannot be resolved safely; an already-clean path does not invoke cleanup.
 If review or final checks introduce a commit, the Workflow pushes and rebinds the
 exact Draft PR, invalidates the prior approval, and repeats review and checks
 before making the PR Ready.
+
+CodingAgent prompts require every implementation, review-fix, cleanup, and
+recovery commit to retain the configured agent as a co-author and to include
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
+result check verifies that provenance before a branch can advance. Scripted
+merge commits instead record `AWM-Automation: agent-workflow-manager` and
+`AWM-Process: merge`; AWM is automation provenance, not a co-author.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,
@@ -479,7 +588,8 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI has two explicit modes. **Prompt** accepts an agent,
+The trusted local Runner UI has five explicit modes: **Prompt**, **Environment Setup**,
+**Issue Driven**, **Review**, and **Python Workflow**. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt
@@ -488,10 +598,10 @@ Workflow-owned resources and have no automatic or explicit Workflow cleanup path
 The generated Python remains an implementation detail rather than an editable or
 historical UI field.
 
-**Workflow** executes arbitrary Python with the current Python interpreter in a
-visible PurpleMux-managed Bash tab. PurpleMux terminal output is the detailed
-stdout/stderr inspection surface; AWM shows structured Progress, Findings,
-bounded failure diagnostics, the managed-shell exit code, and the
+**Python Workflow** executes arbitrary Python with the current Python interpreter in a
+visible PurpleMux-managed Bash tab. AWM saves bounded stdout and stderr in Run
+history and detail, alongside structured Progress, Findings, bounded failure
+diagnostics, the managed-shell exit code, and the
 idle/running/success/failed/stopped/validation_failed state. Validate remains a
 side-effect-free static check and Dry Run remains a pre-execution local
 inspection. Run performs preflight before creating the PurpleMux workspace and
@@ -508,6 +618,15 @@ and run-owned resources, but are never continued in place. Recovery starts a new
 run. Its ordinary Python logic must explicitly inspect and reuse authoritative
 Git, GitHub, or PurpleMux state where appropriate. The Runner does not expose a
 workflow checkpoint API or reconstruct terminated Python control flow.
+
+`PythonRunner.link_runs(parent_identity, child_identity)` records family links on
+ordinary Runs using full instance-qualified AWM identities. At least one Run must
+be local; local records are updated on both sides. Terminal history preserves these
+links across reload, including references to external AWMs and deleted Runs.
+Run detail and list snapshots expose `parentRun` and `childRuns`, each reference
+containing `identity`, `scope` (`local` or `external`), and `runId`. Numeric Run IDs
+alone do not identify a related Run across AWM instances. Existing history without
+family fields loads with empty links.
 
 Runs are independent and may execute concurrently. The UI lists every run and
 lets the operator select its state, output, progress, execution context, Stop,
@@ -832,3 +951,111 @@ second launch using its already-established project trust:
 AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
   uv run pytest tests/test_live_claude_trust.py
 ```
+
+External AWM targets can be registered in **Settings → External AWM targets** or
+through `GET` / `POST /api/settings/external-targets`. POST replaces the list and
+uses the existing trusted JSON request policy (`X-Python-Runner-Token`). Example:
+
+```json
+{"targets":[{"id":"office","destination":"https://awm.example","tokenEnv":"OFFICE_AWM_TOKEN"}]}
+```
+
+IDs are unique, stable names (1–64 letters, numbers, underscores, or hyphens).
+Destinations support HTTPS and loopback HTTP, including a deployment path prefix;
+URLs containing credentials, queries, or fragments are rejected. Registrations
+persist in `$XDG_CONFIG_HOME/agent-workflow-manager/external-targets.json`
+(default `~/.config/agent-workflow-manager/external-targets.json`), overridable with
+`AGENT_WORKFLOW_MANAGER_EXTERNAL_TARGETS_FILE`. Invalid files are reported rather
+than overwritten.
+
+Fetch the request token through `GET /api/token` on the trusted destination.
+Export its `token` value as the registered `tokenEnv` variable before starting
+the source AWM server. Only the variable name and credential status appear in
+settings; credential values are never stored in the registry or returned by its
+API. The destination generates a new token on every server start. After every
+destination restart, fetch the new token, export it again, and restart the source
+server so it inherits the updated environment. Server code can use
+`ExternalTargetSettings.connection(id)` to obtain the destination and private
+`X-Python-Runner-Token` header. Registration does not initiate a connection or
+launch an external Run.
+
+Server-to-server ordinary Runs use the same registered external targets as Settings.
+Credentials are resolved on the calling server from each registration's `tokenEnv`;
+keep them out of browser code. The destination must be HTTPS or loopback HTTP and
+must accept its configured Host and `X-Python-Runner-Token` credential. No Origin
+header is needed for server requests; existing Host, Origin, and token checks remain.
+
+```python
+from purplemux_client import ExternalRunClient
+
+client = ExternalRunClient(request_timeout=30)
+run_id = client.start_run("registered-target-id", 'print("hello")', args=[])
+result = client.wait_run("registered-target-id", run_id, timeout=300)
+print(result.state, result.exit_code, result.stdout, result.stderr)
+```
+
+Each client pins a target destination on first use. Changing that registration's
+destination makes subsequent requests fail explicitly; use the original
+destination to observe its Runs. Credentials can rotate at the same destination.
+The client accepts up to 24,065,536 response bytes, covering both default retained
+output streams even when JSON expands Unicode into surrogate pairs.
+
+The client launches once through `POST /api/run` with JSON `code` and optional
+string-array `args`; HTTP 202 returns a positive `runId`. Authenticated
+`GET /api/runs/{runId}/result` returns JSON `runId`, `state`, and `result`.
+For `running`, `result` is null. For terminal `success`, `failed`, or `stopped`,
+`result` contains `exitCode`, `stdout`, and `stderr` from the Runner snapshot
+(output retains the Runner's existing limits and truncation notices).
+`get_run_result()` returns None only for a confirmed running Run. Failed and
+stopped Runs return their actual terminal result; callers must inspect `state`.
+Unknown IDs return HTTP 404. Polling deadline expiry raises TimeoutError;
+communication failures and malformed or unknown results raise ExternalRunError.
+An uncertain launch raises ExternalRunLaunchUnknown: inspect destination Run
+history before deciding what to do, since a Run may already have started. The
+client never retries a launch or follows redirects, including credential redirects.
+
+From an **AWM Python Workflow**, use `start_child_run`, `get_child_run_result`,
+and `wait_child_run` to record parent/child relationships automatically. Omit
+`target_id` for the local AWM, or pass the same registered ID to all three calls
+for an external child. The standalone `ExternalRunClient` example above does not
+by itself attach a child to the currently running Workflow.
+
+[examples/child-runs.py](examples/child-runs.py) is a runnable Workflow for both
+cases. Paste its source into Python Workflow mode and start it with no arguments
+for a local child. For two local AWM instances, start the destination on a different
+port and use separate history files for the two instances. In the destination
+terminal:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE="$PWD/remote-run-history.json" make web ARGS="--port 8766"
+```
+In the source terminal, fetch and export the destination credential, then start
+the source on its own port:
+
+```bash
+export REMOTE_AWM_TOKEN="$(curl --fail --silent http://127.0.0.1:8766/api/token | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE="$PWD/source-run-history.json" make web ARGS="--port 8765"
+```
+
+Register `remote` in the source Settings with destination
+`http://127.0.0.1:8766` and `tokenEnv` set to `REMOTE_AWM_TOKEN`, then start the
+example on the source with arguments `["remote"]`. After every destination
+restart, repeat the token export and restart the source before using `remote`.
+The child receives `["AWM"]` and prints
+`hello AWM`; its final state, exit code, stdout, and stderr are printed by the parent.
+Running this file directly outside an AWM Workflow lacks the run-scoped control
+credentials and fails explicitly.
+
+A returned child ID is numeric and scoped to its AWM; persisted family references
+use the full instance-qualified identity. Both AWMs retain the external relationship
+in their own history. Family links in Run history let operators navigate locally
+or to a registered destination that still owns the exact identity.
+
+`get_child_run_result()` returns `None` only while the child is confirmed running.
+`wait_child_run()` returns a `ChildRunResult` for success, failure, or stop; Python
+must decide which outcomes satisfy the parent. The example requires `success`
+and exit code zero. A wait timeout does not stop the child. Communication failure,
+unavailable or mismatched identity, and unknown results raise errors instead of
+reporting success. An uncertain start may already have created a child: inspect
+source and destination histories before recovery, and never blindly retry it.
+See the [dedicated control contract](docs/workflow-runtime-spec.md#child-run-control-contract).

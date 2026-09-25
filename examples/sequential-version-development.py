@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import re
+import string
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,8 @@ from purplemux_client import (
     PurpleMuxRuntime,
     ShellCommandRequest,
     WorkerFailure,
+    WorkerInterrupted,
+    agent_commit_coauthor,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -60,8 +63,12 @@ MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
 MAX_PLANNER_ACTIONS = 100
+MAX_PLANNER_RATIONALE_BYTES = 2_000
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
+MAX_RECOVERY_STATE_BYTES = 32_000
+MAX_RECOVERY_REPORT_BYTES = 2_000
+MAX_REPOSITORY_RECOVERIES = 2
 IMPLEMENTER_AGENT = "codex"
 REVIEWER_AGENT = "codex"
 WORKFLOW_POLICY_ISSUE = None
@@ -84,6 +91,16 @@ REVIEWER_CHECKOUT_GUARD = (
     "gh pr checkout, git rebase, or git bisect. Inspect the diff with git diff, "
     "git show, or gh pr diff only."
 )
+DEVELOPMENT_BRANCH_VERSION = re.compile(
+    r"^(?P<series>.+/v)(?P<major>0|[1-9][0-9]*)\."
+    r"(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)$"
+)
+
+
+class MissingReviewAudit(WorkerFailure):
+    """A recorded review cannot be given its fix disposition."""
+
+
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
 POLICY_CONFLICT_PR_MARKER = "agent-workflow-manager:policy-conflict:"
 INLINE_TASK_FINGERPRINT_MARKER = "agent-workflow-manager:inline-task-sha256:"
@@ -214,6 +231,7 @@ class Config:
     check_command: str
     policy_issue: int | None = None
     one_shot_issue: int | None = None
+    make_integration_branch: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,6 +260,7 @@ class WorkItemPlan:
     finalized: bool = False
     persisted_source: str | None = None
     skipped: list[PlannerSkip] = field(default_factory=list)
+    active: Issue | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -346,6 +365,8 @@ class PlannerDecision:
     complete: bool
     policy_conflicts: tuple[str, ...] = ()
     skipped: tuple[PlannerSkip, ...] = ()
+    rationale: str | None = None
+    changes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -373,6 +394,7 @@ class RepositoryDelivery:
 
 
 ISSUE_HANDOFF_RESULTS: list[IssueHandoffResult] = []
+COMPLETED_ISSUE_PRS: dict[int | str, PullRequestState] = {}
 
 
 @dataclass(frozen=True)
@@ -445,6 +467,74 @@ def short_error(exc: BaseException) -> str:
     return str(exc).replace("\n", " ")[:500]
 
 
+def newer_development_branches(
+    integration_branch: str, remote_branches: dict[str, str]
+) -> tuple[str, ...]:
+    """Return newer-named remote branches in the configured patch series."""
+    configured = DEVELOPMENT_BRANCH_VERSION.fullmatch(integration_branch)
+    if configured is None:
+        return ()
+    series = configured["series"]
+    major = int(configured["major"])
+    minor = int(configured["minor"])
+    patch = int(configured["patch"])
+    candidates: list[tuple[int, str]] = []
+    for branch in remote_branches:
+        candidate = DEVELOPMENT_BRANCH_VERSION.fullmatch(branch)
+        if candidate is None:
+            continue
+        if (
+            candidate["series"] == series
+            and int(candidate["major"]) == major
+            and int(candidate["minor"]) == minor
+            and int(candidate["patch"]) > patch
+        ):
+            candidates.append((int(candidate["patch"]), branch))
+    return tuple(branch for _, branch in sorted(candidates, reverse=True))
+
+
+def warn_if_stale_integration_branch(
+    config: Config, repo: GitRepository, github: GitHubRepository
+) -> None:
+    """Warn when the remote contains a newer branch in the same patch series."""
+    if DEVELOPMENT_BRANCH_VERSION.fullmatch(config.integration_branch) is None:
+        return
+    remote_branches = repo.inspect_remote_branch_heads()
+    configured_sha = remote_branches.get(config.integration_branch)
+    if configured_sha is None:
+        if not config.make_integration_branch:
+            return
+        configured_sha = remote_branches.get(config.main_branch)
+        if configured_sha is None:
+            return
+    for newer in newer_development_branches(config.integration_branch, remote_branches):
+        newer_sha = remote_branches[newer]
+        if (
+            github.compare_commits(base_sha=configured_sha, head_sha=newer_sha)
+            != "ahead"
+        ):
+            continue
+        if config.integration_branch in remote_branches:
+            subject = (
+                f"configured integration branch {config.integration_branch} @ "
+                f"{configured_sha} may be stale"
+            )
+        else:
+            subject = (
+                f"configured integration branch {config.integration_branch} is "
+                f"absent and would be created from {config.main_branch} @ "
+                f"{configured_sha}"
+            )
+        warning = (
+            f"{subject}; authoritative remote branch {newer} @ {newer_sha} is "
+            "ahead in the same development series. Verify the intended base; "
+            "the workflow will not change it automatically."
+        )
+        print(f"WARN: {warning}", flush=True)
+        emit_finding("git", warning, status="warning")
+        return
+
+
 def inspect_pr(
     github: GitHubRepository, *, head: str, base: str
 ) -> PullRequestState | None:
@@ -494,7 +584,22 @@ def run_turn(
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
 ) -> str:
+    if (repository is None) != (branch is None) or (repository is None) != (
+        expected_process is None
+    ):
+        raise ValueError(
+            "repository, branch, and expected_process must be provided together"
+        )
+    before_sha: str | None = None
+    if repository is not None and branch is not None:
+        before = repository.require_current_branch(branch)
+        if before.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} does not exist")
+        before_sha = before.local_sha
     navigation = {"pr_number": pr.number, "pr_url": pr.url} if pr is not None else {}
     emit_step(
         name,
@@ -515,6 +620,25 @@ def run_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
+    def verify_turn_commits() -> None:
+        if (
+            repository is None
+            or branch is None
+            or expected_process is None
+            or before_sha is None
+        ):
+            return
+        after = repository.require_current_branch(branch)
+        if after.local_sha is None:
+            raise WorkerFailure(f"local branch {branch!r} disappeared")
+        repository.require_agent_commit_provenance(
+            before_sha,
+            after.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process=expected_process,
+            allow_unchanged=True,
+        )
+
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
         client.send_input(tab, prompt)
@@ -533,7 +657,14 @@ def run_turn(
             **navigation,
         )
         terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
+        try:
+            verify_turn_commits()
+        except BaseException as provenance_error:
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+                raise exc from provenance_error
+            raise
         raise
+    verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -597,13 +728,115 @@ def run_validated_turn(
     raise AssertionError("unreachable")
 
 
-def implementer_prompt(prompt: str) -> str:
+@dataclass(frozen=True)
+class RecoveryReport:
+    repaired: bool
+    retry_safe: bool
+    summary: str
+    evidence: str
+
+
+def parse_recovery_report(source: str) -> RecoveryReport:
+    """Accept only a bounded account with evidence for a safe retry."""
+    try:
+        source_bytes = source.encode("utf-8")
+    except UnicodeError as exc:
+        raise WorkerFailure("recovery report is not valid UTF-8") from exc
+    if len(source_bytes) > MAX_RECOVERY_REPORT_BYTES:
+        raise WorkerFailure("recovery report exceeds its size limit")
+    try:
+        value = json.loads(source)
+    except (UnicodeError, ValueError) as exc:
+        raise WorkerFailure("recovery report must be one JSON object") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "repaired",
+        "retry_safe",
+        "summary",
+        "evidence",
+    }:
+        raise WorkerFailure("recovery report has invalid fields")
+    if type(value["repaired"]) is not bool or type(value["retry_safe"]) is not bool:
+        raise WorkerFailure("recovery report decisions must be booleans")
+    for field_name in ("summary", "evidence"):
+        field_value = value[field_name]
+        if (
+            not isinstance(field_value, str)
+            or not field_value
+            or field_value != field_value.strip()
+            or any(
+                character in "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                for character in field_value
+            )
+            or "\0" in field_value
+        ):
+            raise WorkerFailure(f"recovery report {field_name} is invalid")
+        try:
+            field_bytes = field_value.encode("utf-8")
+        except UnicodeError as exc:
+            raise WorkerFailure(f"recovery report {field_name} is invalid UTF-8") from exc
+        if len(field_bytes) > 500:
+            raise WorkerFailure(f"recovery report {field_name} is too long")
+    if value["retry_safe"] and not value["repaired"]:
+        raise WorkerFailure("recovery cannot recommend retry without a repair")
+    return RecoveryReport(**value)
+
+
+def recover_error(
+    client: PurpleMuxCLIClient,
+    config: Config,
+    error: BaseException,
+    authoritative_state: str,
+) -> RecoveryReport:
+    """Start a dedicated recovery Agent for this error, never a resident agent."""
+    if not isinstance(authoritative_state, str) or not authoritative_state.strip():
+        raise WorkerFailure("recovery requires current authoritative state")
+    if len(authoritative_state.encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
+        raise WorkerFailure("recovery authoritative state exceeds its size limit")
+    agent = create_agent(
+        client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
+    )
+    try:
+        _, report = run_validated_turn(
+            client,
+            agent,
+            "Recovery assessment",
+            implementer_prompt(
+                "Investigate this workflow error using the current authoritative "
+                "state below. Make only a safe, necessary repair, then re-inspect "
+                "the affected state. If the outcome is uncertain, report retry_safe "
+                "as false. Do not reset, rebase, stash, force-push, merge a work-item "
+                "PR, create unrelated PRs, discard ambiguous work, or edit "
+                "agent-workflow-manager fingerprint markers. Return exactly one JSON "
+                "object with boolean repaired and retry_safe fields and concise "
+                "single-line summary and evidence strings (at most 500 UTF-8 bytes "
+                "each). Include evidence from the state after repair when "
+                "recommending retry. No other fields or prose.\n\n"
+                f"Error: {short_error(error)}\n\n"
+                f"Current authoritative state:\n{authoritative_state}",
+                process="recovery",
+            ),
+            parse_recovery_report,
+        )
+        return report
+    finally:
+        client.close_session(agent)
+
+
+def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
     """Add the shared change-boundary policy to an implementation turn."""
+    if process not in {"implementation", "reviewer-fix", "cleanup", "recovery"}:
+        raise ValueError(f"unsupported implementation process: {process!r}")
+    coauthor = agent_commit_coauthor(IMPLEMENTER_AGENT)
     return (
         f"{prompt.rstrip()}\n\n{IMPLEMENTATION_PRINCIPLE}\n\n"
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
-        "work-item plan."
+        "work-item plan.\n\n"
+        "Every commit you create must end with these exact Git trailers, preserving "
+        "any additional trailers the agent adds:\n"
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {IMPLEMENTER_AGENT}\n"
+        f"AWM-Process: {process}"
     )
 
 
@@ -634,6 +867,7 @@ _REVIEW_FIX_DISPOSITIONS = {
     "fixed",
     "no_change_after_re_evaluation",
     "review_limit_reached",
+    "review_limit_reached_after_head_change",
     "reviewer_changed_head",
     "head_changed_before_disposition",
 }
@@ -674,6 +908,9 @@ _RAW_REVIEW_OUTPUT = re.compile(
 )
 _OPAQUE_SECRET_LIKE_VALUE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_./+=-]{32,}")
 _PERSISTENCE_SAFE_REVIEW_TEXT = re.compile(r"^[^\x00-\x1f\x7f<>{}`=]+$")
+_PLANNER_LOW_LEVEL_TEXT = re.compile(
+    r"(?i)(?:^|[ \t])(?:user|assistant|system|developer|tool|stdout|stderr)\s*:"
+)
 
 
 def _safe_review_text(value: object, *, max_bytes: int) -> bool:
@@ -896,6 +1133,71 @@ def new_review_audit(
     )
 
 
+def whole_continuation_audit(
+    round_number: int, head_sha: str, disposition: str,
+) -> ReviewAuditRecord:
+    result = json.dumps({
+        "verdict": "CHANGES_REQUESTED",
+        "findings": ["Whole-version review continued with a warning."],
+        "policy_conflicts": [],
+    })
+    audit = new_review_audit(
+        "whole_version_continuation", round_number,
+        "CHANGES_REQUESTED", head_sha, result,
+    )
+    return ReviewAuditRecord(
+        audit.audit_id, audit.role, audit.round, audit.verdict,
+        audit.reviewed_sha, audit.findings, disposition,
+    )
+
+
+def whole_continuation_warning(disposition: str, limit: int) -> str:
+    if disposition == "review_limit_reached_after_head_change":
+        return (
+            f"Whole-version review limit {limit} was already reached "
+            "before the current head could complete review; keeping the Base PR "
+            "Draft and continuing without reviewer approval."
+        )
+    if disposition == "review_limit_reached":
+        return (
+            f"Whole-version review limit {limit} reached with "
+            "CHANGES_REQUESTED; keeping the Base PR Draft and continuing "
+            "without reviewer approval."
+        )
+    if disposition == "no_change_after_re_evaluation":
+        return (
+            "Whole-version reviewer requested changes, but the fixer "
+            "re-evaluated the findings and produced no code changes; "
+            "keeping the Base PR Draft and continuing without reviewer approval."
+        )
+    raise WorkerFailure("whole-version continuation disposition is invalid")
+
+
+def persist_whole_limit_head_change(
+    github: GitHubRepository,
+    pr: PullRequestState,
+    *,
+    round_number: int,
+    reviewed_sha: str,
+    head: str,
+    base: str,
+) -> PullRequestState:
+    """Keep the exhausted loop count when an individual role changed the head."""
+    result = json.dumps({
+        "verdict": "CHANGES_REQUESTED",
+        "findings": ["Review head changed after the whole-version review limit."],
+        "policy_conflicts": [],
+    })
+    return persist_review_audit(
+        github, pr,
+        new_review_audit(
+            "whole_version_limit", round_number,
+            "CHANGES_REQUESTED", reviewed_sha, result,
+        ),
+        head=head, base=base,
+    )
+
+
 def allocate_review_audit(
     body: str, role: str, verdict: str, reviewed_sha: str, result: str
 ) -> ReviewAuditRecord:
@@ -954,16 +1256,7 @@ def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
     records = [existing for existing in records if existing.audit_id != record.audit_id]
     records.append(record)
     while len(records) > MAX_REVIEW_AUDIT_RECORDS:
-        removable = next(
-            (
-                index
-                for index, existing in enumerate(records[:-1])
-                if any(
-                    later.role == existing.role for later in records[index + 1 :]
-                )
-            ),
-            None,
-        )
+        removable = _removable_review_audit_index(records)
         if removable is None:
             raise WorkerFailure(
                 "PR review audit cannot retain every role within its record bound"
@@ -1008,16 +1301,7 @@ def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
             and len(result.encode()) <= MAX_BASE_PR_BODY_BYTES
         ):
             return result
-        removable = next(
-            (
-                index
-                for index, existing in enumerate(records[:-1])
-                if any(
-                    later.role == existing.role for later in records[index + 1 :]
-                )
-            ),
-            None,
-        )
+        removable = _removable_review_audit_index(records)
         if removable is None:
             break
         records.pop(removable)
@@ -1025,6 +1309,31 @@ def with_review_audit(body: str, record: ReviewAuditRecord) -> str:
         "PR review audit cannot retain the latest record for every role within "
         "the shared PR-body byte budget"
     )
+
+
+def _removable_review_audit_index(records: list[ReviewAuditRecord]) -> int | None:
+    """Retain the last role result and the evidence for a changed-head continuation."""
+    protected = {max(i for i, entry in enumerate(records) if entry.role == role)
+                 for role in {entry.role for entry in records}}
+    protected.update(
+        i for i, entry in enumerate(records) if entry.fix_disposition == "pending"
+    )
+    whole_roles = {
+        "scenario_gate", "design_principles", "whole_version", "version_readme",
+        "whole_version_limit",
+    }
+    for dispositions in (
+        {"review_limit_reached"},
+        {"reviewer_changed_head", "head_changed_before_disposition"},
+    ):
+        candidates = [
+            i for i, entry in enumerate(records)
+            if entry.role in whole_roles
+            and entry.fix_disposition in dispositions
+        ]
+        if candidates:
+            protected.add(candidates[-1])
+    return next((i for i in range(len(records)) if i not in protected), None)
 
 
 def persist_review_audit(
@@ -1095,7 +1404,7 @@ def review_audit_dispositions(
         records = review_audit_from_body(body)
         matching = [record for record in records if record.audit_id == audit_id]
         if len(matching) != 1:
-            raise WorkerFailure("review audit record disappeared before fix disposition")
+            raise MissingReviewAudit("review audit record disappeared before fix disposition")
         record = matching[0]
         body = with_review_audit(
             body,
@@ -1266,6 +1575,7 @@ def record_issue_handoff_result(
         existing for existing in ISSUE_HANDOFF_RESULTS if existing.issue != issue
     ]
     ISSUE_HANDOFF_RESULTS.append(result)
+    COMPLETED_ISSUE_PRS[issue] = pr
 
 
 def human_handoff_prompt(
@@ -1830,9 +2140,12 @@ Do not push, modify PR state, merge, start a review, reset, stash, rebase,
 force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
-ignored, removed, or could not resolve."""),
+ignored, removed, or could not resolve.""", process="cleanup"),
         iteration=iteration,
         warning_scope=warning_scope,
+        repository=repo,
+        branch=branch,
+        expected_process="cleanup",
     )
     remaining = repo.inspect_worktree()
     if remaining.dirty:
@@ -1854,10 +2167,13 @@ def require_agent_result(
     previous_sha: str,
     *,
     allow_unchanged: bool,
+    expected_process: str,
     iteration: int | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
-    repo.require_current_branch(branch)
+    post_turn = repo.require_current_branch(branch)
+    if post_turn.local_sha is None:
+        raise WorkerFailure(f"local branch {branch!r} does not exist")
     require_clean_worktree(
         repo,
         client,
@@ -1867,9 +2183,26 @@ def require_agent_result(
         warning_scope=warning_scope,
     )
     result = repo.require_committed_result(
-        branch, previous_sha=previous_sha, allow_unchanged=allow_unchanged
+        branch,
+        previous_sha=previous_sha,
+        allow_unchanged=True,
     )
     assert result.local_sha is not None
+    cleanup_changed = result.local_sha != post_turn.local_sha
+    repo.require_agent_commit_provenance(
+        previous_sha,
+        post_turn.local_sha,
+        expected_agent=IMPLEMENTER_AGENT,
+        expected_process=expected_process,
+        allow_unchanged=allow_unchanged or cleanup_changed,
+    )
+    if cleanup_changed:
+        repo.require_agent_commit_provenance(
+            post_turn.local_sha,
+            result.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process="cleanup",
+        )
     emit_finding("git", f"{branch} is clean at {result.local_sha}")
     return result.local_sha, result.local_sha != previous_sha
 
@@ -2133,7 +2466,7 @@ def require_warning_delivery(
     return current
 
 
-def review_issue_phase(
+def _review_issue_phase(
     issue: Issue,
     config: Config,
     client: PurpleMuxCLIClient,
@@ -2252,6 +2585,7 @@ def review_issue_phase(
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2346,11 +2680,15 @@ def review_issue_phase(
                 policy_context(config, scope=f"fixes for {issue.label}")
                 + f"""Re-evaluate every {phase} review finding below. If warranted,
 fix, test, commit, and leave the worktree clean. If no change is warranted,
-leave it clean and explain why; do not create an empty commit.\n\n{result}"""
+leave it clean and explain why; do not create an empty commit.\n\n{result}""",
+                process="reviewer-fix",
             ),
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
+            repository=repo,
+            branch=issue.branch,
+            expected_process="reviewer-fix",
         )
         emit_policy_conflicts(
             fix_result,
@@ -2365,6 +2703,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
             issue.branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="reviewer-fix",
             iteration=review_number,
             warning_scope=issue.result_id,
         )
@@ -2430,6 +2769,65 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}"""
     raise WorkerFailure(f"{issue.label} {phase} review ended unexpectedly")
 
 
+def review_issue_phase(
+    issue: Issue,
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+    implementer: str,
+    reviewer: str,
+    pr: PullRequestState,
+    *,
+    phase: str,
+    prompt: str,
+    max_reviews: int,
+    review_offset: int = 0,
+    restart_scope_on_change: bool = False,
+) -> IssueReviewPhaseResult:
+    """Retry a lost audit only after verifying the current delivery topology."""
+    reviewed_head_sha = pr.head_sha
+    for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        try:
+            return _review_issue_phase(
+                issue, config, client, repo, github, implementer, reviewer, pr,
+                phase=phase, prompt=prompt, max_reviews=max_reviews,
+                review_offset=review_offset,
+                restart_scope_on_change=restart_scope_on_change,
+            )
+        except MissingReviewAudit:
+            if attempt == MAX_REPOSITORY_RECOVERIES:
+                raise
+            repo.require_clean()
+            pushed = repo.require_pushed(issue.branch)
+            if pushed.local_sha is None or pushed.remote_sha != pushed.local_sha:
+                raise WorkerFailure("review audit recovery requires a pushed head")
+            pr = github.require_pr(
+                number=pr.number,
+                head=issue.branch,
+                base=config.integration_branch,
+                state="OPEN",
+                expected_head_sha=pushed.local_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
+            )
+            if pr.auto_merge_enabled or pr.merge_queue_entry is not None:
+                raise WorkerFailure("review audit recovery requires a safe Draft PR")
+            require_inline_task_pr_fingerprint(pr, issue.task_fingerprint)
+            review_offset = 0
+            if restart_scope_on_change and pr.head_sha != reviewed_head_sha:
+                return IssueReviewPhaseResult(
+                    pr, "head_changed", pr.head_sha, pr.base_sha, review_offset
+                )
+            emit_finding(
+                "github",
+                f"{issue.label} {phase} audit is missing; reviewing current head "
+                f"{pr.head_sha} again",
+                status="warning",
+            )
+    raise WorkerFailure("review audit recovery retry limit exceeded")
+
+
 def process_issue(
     issue: Issue,
     config: Config,
@@ -2453,17 +2851,45 @@ def process_issue(
             warning_scope=issue.result_id,
         )
     prepared = prepare_issue(repo, github, issue, config)
+    previous_result = next(
+        (result for result in ISSUE_HANDOFF_RESULTS if result.issue == issue.result_id),
+        None,
+    )
+    previous_pr = COMPLETED_ISSUE_PRS.get(issue.result_id)
     if isinstance(prepared, PullRequestState):
         rehydrate_policy_conflicts(prepared.body, config, issue_number=issue.result_id)
-        print(f"Skipping already-merged {issue.label}", flush=True)
-        warnings = summary_warnings(issue.result_id)
+        if (
+            previous_result is not None
+            and previous_pr is not None
+            and previous_result.outcome != "skipped"
+            and (
+                previous_result.pr_number != prepared.number
+                or previous_pr.head_sha != prepared.head_sha
+            )
+        ):
+            raise WorkerFailure(f"completed {issue.label} PR changed during recovery")
+        completed_here = (
+            previous_result is not None
+            and previous_pr is not None
+            and previous_result.outcome != "skipped"
+            and previous_result.pr_number == prepared.number
+            and previous_pr.head_sha == prepared.head_sha
+        )
+        outcome = previous_result.outcome if completed_here else "skipped"
+        reviews = previous_result.reviews if completed_here else 0
+        warnings = (
+            tuple(dict.fromkeys((*previous_result.warnings, *summary_warnings(issue.result_id))))[:3]
+            if completed_here
+            else summary_warnings(issue.result_id)
+        )
+        print(f"Already merged {issue.label}", flush=True)
         record_issue_handoff_result(
-            issue.result_id, issue.label, prepared, "skipped", 0, warnings
+            issue.result_id, issue.label, prepared, outcome, reviews, warnings
         )
         emit_issue_result(
             issue.result_id,
-            "skipped",
-            0,
+            outcome,
+            reviews,
             prepared.number,
             prepared.url,
             warnings=warnings,
@@ -2471,6 +2897,99 @@ def process_issue(
         )
         return prepared
     existing_pr, start_sha, reused_existing_work = prepared
+    if (
+        not MERGE_TO_INTEGRATION
+        and previous_result is not None
+        and previous_pr is not None
+        and previous_result.outcome in ("approved", "continued_with_warning")
+        and not previous_pr.is_draft
+    ):
+        if (
+            existing_pr is None
+            or previous_result.pr_number != existing_pr.number
+        ):
+            raise WorkerFailure(f"reviewed {issue.label} PR changed during recovery")
+        pushed = repo.require_pushed(issue.branch)
+        if pushed.local_sha != previous_pr.head_sha:
+            raise WorkerFailure(f"reviewed {issue.label} head changed during recovery")
+        ready = github.require_pr(
+            number=existing_pr.number,
+            head=issue.branch,
+            base=config.integration_branch,
+            state="OPEN",
+            expected_head_sha=previous_pr.head_sha,
+            expected_base_sha=previous_pr.base_sha,
+            draft=False,
+        )
+        require_inline_task_pr_fingerprint(ready, issue.task_fingerprint)
+        audits = review_audit_from_body(ready.body)
+        for role, phase, limit in (
+            ("scope_design", "scope/design", MAX_SCOPE_REVIEWS),
+            ("correctness", "correctness", MAX_REVIEWS),
+        ):
+            role_audits = [
+                record for record in audits
+                if record.role == role and record.reviewed_sha == ready.head_sha
+            ]
+            reviewed_current_head = any(
+                (record.verdict == "APPROVED" and record.fix_disposition == "not_required")
+                or (
+                    previous_result.outcome == "continued_with_warning"
+                    and record.verdict == "CHANGES_REQUESTED"
+                    and record.fix_disposition in (
+                        "review_limit_reached",
+                        "no_change_after_re_evaluation",
+                    )
+                )
+                for record in role_audits
+            )
+            limit_warning = (
+                f"{issue.label} {phase} review limit {limit} was already "
+                "reached before the current head could complete this phase; continuing "
+                "without reviewer approval."
+            )
+            limit_before_current_head = (
+                previous_result.outcome == "continued_with_warning"
+                and limit_warning in previous_result.warnings
+                and any(
+                    record.role == role
+                    and record.round >= limit
+                    and record.reviewed_sha != ready.head_sha
+                    and record.fix_disposition != "pending"
+                    for record in audits
+                )
+                and any(
+                    record.fix_sha == ready.head_sha
+                    and record.fix_disposition in (
+                        "fixed",
+                        "reviewer_changed_head",
+                        "head_changed_before_disposition",
+                    )
+                    for record in audits
+                )
+            )
+            if not (reviewed_current_head or limit_before_current_head):
+                raise WorkerFailure(
+                    f"reviewed {issue.label} lacks persisted {role} review evidence"
+                )
+        record_issue_handoff_result(
+            issue.result_id,
+            issue.label,
+            ready,
+            previous_result.outcome,
+            previous_result.reviews,
+            previous_result.warnings,
+        )
+        emit_issue_result(
+            issue.result_id,
+            previous_result.outcome,
+            previous_result.reviews,
+            ready.number,
+            ready.url,
+            warnings=previous_result.warnings,
+            label=issue.label,
+        )
+        return ready
     if existing_pr is not None:
         existing_pr = return_to_draft_for_review(
             github,
@@ -2523,6 +3042,9 @@ def process_issue(
         implementation_prompt,
         pr=existing_pr,
         warning_scope=issue.result_id,
+        repository=repo,
+        branch=issue.branch,
+        expected_process="implementation",
     )
     emit_policy_conflicts(
         implementation_result,
@@ -2537,6 +3059,7 @@ def process_issue(
         issue.branch,
         start_sha,
         allow_unchanged=existing_pr is not None or reused_existing_work,
+        expected_process="implementation",
         warning_scope=issue.result_id,
     )
     integration = repo.inspect_branch(config.integration_branch)
@@ -2723,9 +3246,23 @@ decomposing the remaining work into short inline mini tasks. Each task must stat
 its purpose and any non-negotiable design decision, while leaving implementation
 detail to the implementer. Do not create GitHub Issues or implement the source
 Issue as one undivided work item. Numeric Issue additions are invalid in one-shot
-mode.
+mode. Do not include stdout or agent conversation logs in tasks or rationale.
+Tasks, rationale, and skip reasons that will be published must be concise
+single-line summaries, never copied stdout, stderr, or conversation transcripts.
 
 """
+    decision_keys = (
+        '"actions", "complete", "policy_conflicts", and\n"rationale"'
+        if config.one_shot_issue is not None
+        else '"actions", "complete", and\n"policy_conflicts"'
+    )
+    rationale_contract = (
+        f" rationale must be a concise single-line explanation of why the current "
+        f"decomposition is appropriate, at most {MAX_PLANNER_RATIONALE_BYTES} UTF-8 "
+        "bytes, without logs or secrets."
+        if config.one_shot_issue is not None
+        else ""
+    )
     return f"""Review the workflow-owned work-item plan before its next dispatch.
 You are the planning role only: do not edit files, implement work, or mutate Git
 or GitHub. Inspect repository and GitHub state read-only when useful. Preserve
@@ -2746,8 +3283,8 @@ Integration branch: {config.integration_branch}
 Processed work items: {json.dumps(processed, ensure_ascii=False)}
 Pending work items: {json.dumps(remaining, ensure_ascii=False)}
 
-Return exactly one JSON object with keys "actions", "complete", and
-"policy_conflicts". policy_conflicts must be an array containing at most
+Return exactly one JSON object with keys {decision_keys}.{rationale_contract}
+policy_conflicts must be an array containing at most
 {MAX_PLANNER_POLICY_CONFLICTS} concise strings of at most
 {MAX_POLICY_CONFLICT_DETAIL_CHARS} characters each, and must be empty when no
 conflict exists. Actions run in order and have one of these exact shapes:
@@ -2788,6 +3325,28 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
         task,
         fingerprint,
     )
+
+
+def planner_text_is_publishable(value: str) -> bool:
+    return (
+        value.splitlines() == [value]
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F for character in value
+        )
+        and "```" not in value
+        and _PLANNER_LOW_LEVEL_TEXT.search(value) is None
+        and _RAW_REVIEW_OUTPUT.search(value) is None
+        and _SENSITIVE_REVIEW_TEXT.search(value) is None
+        and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
+    )
+
+
+def require_publishable_planner_task(issue: Issue) -> None:
+    assert issue.task is not None
+    if not planner_text_is_publishable(issue.task):
+        raise WorkerFailure(
+            "one-shot planner task must not contain logs or secret-like values"
+        )
 
 
 def planner_key(value: object) -> int | str:
@@ -2838,6 +3397,8 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     except json.JSONDecodeError as exc:
         raise WorkerFailure(f"planner returned invalid JSON: {exc.msg}") from exc
     expected_fields = {"actions", "complete", "policy_conflicts"}
+    if plan.config.one_shot_issue is not None:
+        expected_fields.add("rationale")
     if not isinstance(decision, dict) or set(decision) != expected_fields:
         raise WorkerFailure(
             "planner decision must contain only actions, complete, and "
@@ -2846,6 +3407,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     actions = decision["actions"]
     complete = decision["complete"]
     policy_conflicts = decision["policy_conflicts"]
+    rationale = decision.get("rationale")
     if (
         not isinstance(actions, list)
         or len(actions) > MAX_PLANNER_ACTIONS
@@ -2854,6 +3416,11 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
     ):
         raise WorkerFailure("planner decision has invalid bounded values")
+    if plan.config.one_shot_issue is not None:
+        if not _safe_review_text(
+            rationale, max_bytes=MAX_PLANNER_RATIONALE_BYTES
+        ) or not planner_text_is_publishable(rationale):
+            raise WorkerFailure("planner rationale is invalid or unsafe")
     for conflict in policy_conflicts:
         conflict_has_surrogate = isinstance(conflict, str) and any(
             0xD800 <= ord(character) <= 0xDFFF for character in conflict
@@ -2875,6 +3442,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     candidate.position = plan.position
     candidate.skipped = list(plan.skipped)
     skipped_before = len(candidate.skipped)
+    changes: list[str] = []
     try:
         for action in actions:
             if not isinstance(action, dict) or not isinstance(
@@ -2883,16 +3451,18 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 raise WorkerFailure("planner action is invalid")
             kind = action["action"]
             if kind == "add" and set(action) == {"action", "item"}:
-                candidate.add(planner_added_issue(action["item"]))
+                added = planner_added_issue(action["item"])
+                candidate.add(added)
+                changes.append(f"Added {added.label}.")
             elif kind == "update" and set(action) == {"action", "key", "task"}:
                 key = planner_key(action["key"])
                 index = candidate._remaining_index(key)
                 current = candidate.items[index]
                 if current.task_id is None:
                     raise WorkerFailure("planner can update only an inline mini task")
-                candidate.update(
-                    key, planner_inline_issue(current.task_id, action["task"])
-                )
+                updated = planner_inline_issue(current.task_id, action["task"])
+                candidate.update(key, updated)
+                changes.append(f"Updated {current.label}.")
             elif kind == "skip" and set(action) == {"action", "key", "reason"}:
                 reason = action["reason"]
                 reason_has_surrogate = isinstance(reason, str) and any(
@@ -2907,11 +3477,27 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                     or reason_has_surrogate
                 ):
                     raise WorkerFailure("planner skip reason is invalid")
+                if (
+                    plan.config.one_shot_issue is not None
+                    and not planner_text_is_publishable(reason)
+                ):
+                    raise WorkerFailure(
+                        "one-shot planner skip reason must not contain logs or "
+                        "secret-like values"
+                    )
                 candidate.skip(planner_key(action["key"]), reason)
+                summary = reason if len(reason) <= 160 else f"{reason[:159]}…"
+                changes.append(
+                    f"Skipped {candidate.skipped[-1].issue.label}: {summary}"
+                )
             else:
                 raise WorkerFailure("planner action has an unsupported shape")
     except ValueError as exc:
         raise WorkerFailure(f"planner decision is invalid: {exc}") from exc
+
+    if plan.config.one_shot_issue is not None:
+        for issue in candidate.items:
+            require_publishable_planner_task(issue)
 
     if complete and candidate.remaining:
         raise WorkerFailure("planner cannot complete while work items remain")
@@ -2926,6 +3512,44 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
         complete,
         tuple(policy_conflicts),
         tuple(candidate.skipped[skipped_before:]),
+        rationale,
+        tuple(changes),
+    )
+
+
+def escape_planner_markdown(value: str) -> str:
+    """Render planner-controlled text without active Markdown or mentions."""
+    return "".join(
+        f"&#{ord(character)};" if character in string.punctuation else character
+        for character in value
+    )
+
+
+def one_shot_planning_comment(
+    plan: WorkItemPlan, decision: PlannerDecision
+) -> str:
+    if plan.config.one_shot_issue is None or decision.rationale is None:
+        raise ValueError("planning comments require a one-shot planner decision")
+    items = []
+    for index, issue in enumerate(plan.items):
+        status = "processed" if index < plan.position else "pending"
+        assert issue.task_id is not None and issue.task is not None
+        task = escape_planner_markdown(issue.task)
+        items.append(f"{index + 1}. `{issue.task_id}` ({status}) — {task}")
+    decomposition = "\n".join(items) if items else "No work items remain."
+    changes = (
+        "\n".join(f"- {escape_planner_markdown(change)}" for change in decision.changes)
+        if decision.changes
+        else "- No changes from the previous planning result."
+    )
+    return (
+        "## One-Shot Planning\n\n"
+        "### Work item decomposition\n\n"
+        f"{decomposition}\n\n"
+        "### Decomposition rationale\n\n"
+        f"{escape_planner_markdown(decision.rationale)}\n\n"
+        "### Changes from previous planning\n\n"
+        f"{changes}"
     )
 
 
@@ -3266,6 +3890,7 @@ def process_work_items(
     plan: WorkItemPlan,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
+        plan.active = recovered_issue
         inspect_dynamic_work_item_topology(
             recovered_issue, config, recover_missing_inline_identity=True
         )
@@ -3275,6 +3900,7 @@ def process_work_items(
                 issue, config, client, repo, github
             ),
         )
+        plan.active = None
     if plan.finalized:
         return plan.snapshot
     planner = create_agent(
@@ -3308,17 +3934,29 @@ def process_work_items(
                 skipped.reason,
                 label=skipped.issue.label,
             )
+        if config.one_shot_issue is not None:
+            comment = one_shot_planning_comment(plan, planner_decision)
+            github.create_issue_comment(
+                config.one_shot_issue,
+                body=comment,
+                correlation_id=run_correlation(
+                    "one-shot-planning-comment-"
+                    + hashlib.sha256(comment.encode()).hexdigest()[:16]
+                ),
+            )
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
+        plan.active = issue
         inspect_dynamic_work_item_topology(issue, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         run_outline_step(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
         )
+        plan.active = None
         if plan_pr is None:
             plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
     raise WorkerFailure(f"work-item planning exceeded {MAX_PLANNER_TURNS} turns")
@@ -3450,7 +4088,7 @@ def version_readme_review_prompt(
     )
 
 
-def review_whole_version(
+def _review_whole_version(
     config: Config,
     client: PurpleMuxCLIClient,
     repo: GitRepository,
@@ -3465,6 +4103,80 @@ def review_whole_version(
         head=config.integration_branch,
         base=config.main_branch,
     )
+    audits = review_audit_from_body(pr.body)
+    latest_continuation = next(
+        (record for record in reversed(audits)
+         if record.role == "whole_version_continuation"),
+        None,
+    )
+    continuation = (
+        latest_continuation
+        if latest_continuation is not None
+        and latest_continuation.reviewed_sha == pr.head_sha
+        and latest_continuation.fix_disposition in (
+            "review_limit_reached", "review_limit_reached_after_head_change",
+            "no_change_after_re_evaluation",
+        )
+        else None
+    )
+    if continuation is not None:
+        warning = whole_continuation_warning(
+            continuation.fix_disposition, continuation.round
+        )
+        pr = require_warning_delivery(
+            repo, github, pr, head=config.integration_branch,
+            base=config.main_branch, expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+        )
+        emit_finding("github", warning, status="warning")
+        return pr, ReviewDelivery(
+            "continued_with_warning", pr.head_sha, pr.base_sha,
+            continuation.round, (warning,),
+        )
+    whole_roles = {
+        "scenario_gate", "design_principles", "whole_version", "version_readme",
+        "whole_version_limit",
+    }
+    latest_changed_head = next(
+        (record for record in reversed(audits)
+         if record.role in whole_roles
+         and record.fix_disposition in (
+             "reviewer_changed_head", "head_changed_before_disposition"
+         )),
+        None,
+    )
+    prior_limit = (
+        latest_changed_head
+        if latest_changed_head is not None
+        and latest_changed_head.round >= MAX_REVIEWS
+        and latest_changed_head.fix_sha == pr.head_sha
+        else None
+    )
+    required_roles = {"design_principles", "whole_version", "version_readme"}
+    if SCENARIOS:
+        required_roles.add("scenario_gate")
+    latest_by_role = {
+        role: next(
+            (record for record in reversed(audits) if record.role == role), None
+        )
+        for role in required_roles
+    }
+    complete_current_head = all(
+        record is not None
+        and record.reviewed_sha == pr.head_sha
+        and record.fix_disposition != "pending"
+        for record in latest_by_role.values()
+    )
+    completed_warning = next(
+        (record for record in latest_by_role.values()
+         if record is not None
+         and record.fix_disposition in (
+             "review_limit_reached", "no_change_after_re_evaluation"
+         )),
+        None,
+    ) if complete_current_head else None
+    if completed_warning is not None:
+        prior_limit = None
     fixer = create_agent(
         client,
         config,
@@ -3500,7 +4212,10 @@ def review_whole_version(
         else None
     )
     delivery: ReviewDelivery | None = None
-    for review_number in range(1, MAX_REVIEWS + 1):
+    for review_number in (
+        () if prior_limit is not None or completed_warning is not None
+        else range(1, MAX_REVIEWS + 1)
+    ):
         result: str
         resumed_records = tuple(
             record
@@ -3555,6 +4270,7 @@ def review_whole_version(
                 config.integration_branch,
                 pr.head_sha,
                 allow_unchanged=True,
+                expected_process="cleanup",
                 iteration=review_number,
             )
             if scenario_reviewer_changed:
@@ -3588,6 +4304,12 @@ def review_whole_version(
                     base=config.main_branch,
                     fix_sha=scenario_sha,
                 )
+                if review_number == MAX_REVIEWS:
+                    pr = persist_whole_limit_head_change(
+                        github, pr, round_number=review_number,
+                        reviewed_sha=scenario_audit.reviewed_sha,
+                        head=config.integration_branch, base=config.main_branch,
+                    )
                 emit_finding(
                     "git",
                     "Scenario Gate review changed the integration branch; "
@@ -3642,6 +4364,7 @@ def review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if principles_reviewer_changed:
@@ -3675,6 +4398,12 @@ def review_whole_version(
                 base=config.main_branch,
                 fix_sha=principles_sha,
             )
+            if review_number == MAX_REVIEWS:
+                pr = persist_whole_limit_head_change(
+                    github, pr, round_number=review_number,
+                    reviewed_sha=principles_audit.reviewed_sha,
+                    head=config.integration_branch, base=config.main_branch,
+                )
             emit_finding(
                 "git",
                 "design-principles review changed the integration branch; "
@@ -3716,6 +4445,7 @@ def review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -3748,6 +4478,12 @@ def review_whole_version(
                 base=config.main_branch,
                 fix_sha=reviewed_sha,
             )
+            if review_number == MAX_REVIEWS:
+                pr = persist_whole_limit_head_change(
+                    github, pr, round_number=review_number,
+                    reviewed_sha=whole_audit.reviewed_sha,
+                    head=config.integration_branch, base=config.main_branch,
+                )
             emit_finding(
                 "git",
                 "whole-version review changed the integration branch; "
@@ -3793,6 +4529,7 @@ def review_whole_version(
             config.integration_branch,
             pr.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if reviewer_changed:
@@ -3826,6 +4563,12 @@ def review_whole_version(
                 base=config.main_branch,
                 fix_sha=reviewed_sha,
             )
+            if review_number == MAX_REVIEWS:
+                pr = persist_whole_limit_head_change(
+                    github, pr, round_number=review_number,
+                    reviewed_sha=version_audit.reviewed_sha,
+                    head=config.integration_branch, base=config.main_branch,
+                )
             emit_finding(
                 "git",
                 "version and README review changed the integration branch; "
@@ -3873,8 +4616,12 @@ def review_whole_version(
                         policy_context(config, scope="whole-version fixes")
                         + f"""Re-evaluate every finding. If warranted, fix, test, commit,
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
+                        process="reviewer-fix",
                     ),
                     iteration=review_number,
+                    repository=repo,
+                    branch=config.integration_branch,
+                    expected_process="reviewer-fix",
                 )
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
@@ -3884,6 +4631,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     config.integration_branch,
                     current.head_sha,
                     allow_unchanged=True,
+                    expected_process="reviewer-fix",
                     iteration=review_number,
                 )
                 if changed:
@@ -3934,6 +4682,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             config.integration_branch,
             current.head_sha,
             allow_unchanged=True,
+            expected_process="cleanup",
             iteration=review_number,
         )
         if checks_changed:
@@ -3975,6 +4724,15 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 expected_head_sha=current.head_sha,
                 expected_base_sha=current.base_sha,
             )
+            pr = persist_review_audit(
+                github, pr,
+                whole_continuation_audit(
+                    review_number, current.head_sha,
+                    "review_limit_reached" if review_number == MAX_REVIEWS
+                    else "no_change_after_re_evaluation",
+                ),
+                head=config.integration_branch, base=config.main_branch,
+            )
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", "Whole-version review")
             emit_finding("github", warning, status="warning")
@@ -3986,9 +4744,83 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 (warning,),
             )
         break
+    if prior_limit is not None or completed_warning is not None:
+        continuation_round = (
+            MAX_REVIEWS if prior_limit is not None else completed_warning.round
+        )
+        disposition = (
+            "review_limit_reached_after_head_change" if prior_limit is not None
+            else completed_warning.fix_disposition
+        )
+        warning = whole_continuation_warning(disposition, continuation_round)
+        run_final_checks(client, config)
+        checked_sha, changed = require_agent_result(
+            repo, client, fixer, config.integration_branch, pr.head_sha,
+            allow_unchanged=True, expected_process="cleanup",
+            iteration=continuation_round,
+        )
+        if changed or checked_sha != pr.head_sha:
+            raise WorkerFailure(
+                "final checks changed the integration branch at the review limit"
+            )
+        pr = require_warning_delivery(
+            repo, github, pr, head=config.integration_branch,
+            base=config.main_branch, expected_head_sha=pr.head_sha,
+            expected_base_sha=pr.base_sha,
+        )
+        pr = persist_review_audit(
+            github, pr,
+            whole_continuation_audit(
+                continuation_round, pr.head_sha, disposition,
+            ),
+            head=config.integration_branch, base=config.main_branch,
+        )
+        emit_finding("github", warning, status="warning")
+        delivery = ReviewDelivery(
+            "continued_with_warning", pr.head_sha, pr.base_sha,
+            continuation_round, (warning,),
+        )
     if delivery is None:
         raise WorkerFailure("whole-version review ended without a review outcome")
     return pr, delivery
+
+
+def review_whole_version(
+    config: Config,
+    client: PurpleMuxCLIClient,
+    repo: GitRepository,
+    github: GitHubRepository,
+    pr: PullRequestState,
+    work_items: tuple[Issue, ...],
+) -> tuple[PullRequestState, ReviewDelivery]:
+    """Repeat a whole review when its audit vanished after safe reinspection."""
+    for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        try:
+            return _review_whole_version(config, client, repo, github, pr, work_items)
+        except MissingReviewAudit:
+            if attempt == MAX_REPOSITORY_RECOVERIES:
+                raise
+            repo.require_clean()
+            pushed = repo.require_pushed(config.integration_branch)
+            if pushed.local_sha is None or pushed.remote_sha != pushed.local_sha:
+                raise WorkerFailure("review audit recovery requires a pushed head")
+            pr = github.require_pr(
+                number=pr.number,
+                head=config.integration_branch,
+                base=config.main_branch,
+                state="OPEN",
+                expected_head_sha=pushed.local_sha,
+                expected_base_sha=pr.base_sha,
+                draft=True,
+            )
+            if pr.auto_merge_enabled or pr.merge_queue_entry is not None:
+                raise WorkerFailure("review audit recovery requires a safe Draft PR")
+            emit_finding(
+                "github",
+                f"Whole-version audit is missing; reviewing current head {pr.head_sha} again",
+                status="warning",
+            )
+    raise WorkerFailure("review audit recovery retry limit exceeded")
 
 
 def integration_delivery(
@@ -4166,6 +4998,8 @@ def integration_delivery(
                     config.integration_branch,
                     previous_sha=pr.head_sha,
                     allow_unchanged=True,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="cleanup",
                 )
                 assert checked.local_sha is not None
                 checked_sha = checked.local_sha
@@ -4178,6 +5012,7 @@ def integration_delivery(
                     config.integration_branch,
                     pr.head_sha,
                     allow_unchanged=True,
+                    expected_process="cleanup",
                     iteration=check_number,
                 )
             if not checks_changed:
@@ -4276,6 +5111,213 @@ def report_repository_delivery(config: Config, ready: PullRequestState | None) -
         print(f"Policy Issue: {config.slug}#{config.policy_issue}", flush=True)
 
 
+def recovery_authoritative_state(
+    config: Config,
+    repo: GitRepository,
+    github: GitHubRepository,
+    plan: WorkItemPlan | None = None,
+) -> str:
+    """Inspect current Git and PR state after a workflow failure."""
+    state: dict[str, object] = {
+        "repository": str(config.repo),
+        "integration_branch": config.integration_branch,
+        "final_branch": config.main_branch,
+    }
+    if plan is not None:
+        try:
+            base_pr = github.find_pr(
+                head=config.integration_branch, base=config.main_branch, state="OPEN"
+            )
+            if base_pr is not None:
+                persisted = work_item_plan_from_body(base_pr.body, config)
+            else:
+                merged = github.find_pr(
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="MERGED",
+                )
+                if merged is not None:
+                    persisted = work_item_plan_from_body(merged.body, config)
+                else:
+                    final = repo.inspect_branch(config.main_branch)
+                    if final.remote_sha is None:
+                        raise WorkerFailure("final remote branch is missing")
+                    body = repo.inspect_remote_note(
+                        deferred_work_item_plan_ref(config), final.remote_sha
+                    )
+                    persisted = (
+                        WorkItemPlan(config)
+                        if body is None
+                        else work_item_plan_from_body(body, config)
+                    )
+            if serialized_work_item_plan(persisted) != serialized_work_item_plan(plan):
+                state["process_plan_differs_from_persisted"] = True
+            if plan.active is not None:
+                if plan.active not in persisted.items:
+                    raise WorkerFailure("active work item differs from persisted plan")
+                persisted.active = plan.active
+            plan = persisted
+        except Exception as exc:
+            state["work_item_plan_inspection_error"] = short_error(exc)
+            plan = None
+    if plan is None:
+        state["work_item_plan"] = {
+            "status": "unavailable before plan preparation completed",
+            "seed_count": len(config.issues),
+        }
+    else:
+        active = plan.active
+        next_item = plan.remaining[0] if plan.remaining else None
+        state["work_item_plan"] = {
+            "position": plan.position,
+            "total": len(plan.items),
+            "finalized": plan.finalized,
+            "active": (
+                None
+                if active is None
+                else {
+                    **planner_work_item_json(active),
+                    "branch": active.branch,
+                    "task_fingerprint": active.task_fingerprint,
+                }
+            ),
+            "next_item": (
+                None
+                if next_item is None
+                else {**planner_work_item_json(next_item), "branch": next_item.branch}
+            ),
+        }
+    try:
+        worktree = repo.inspect_worktree()
+        state["worktree"] = {
+            "current_branch": worktree.current_branch,
+            "dirty": worktree.dirty,
+            "status": [entry[:200] for entry in worktree.status[:20]],
+        }
+    except Exception as exc:
+        state["worktree_inspection_error"] = short_error(exc)
+    try:
+        state["remote_heads"] = repo.inspect_remote_branches(
+            (config.integration_branch, config.main_branch)
+        )
+    except Exception as exc:
+        state["remote_heads_inspection_error"] = short_error(exc)
+    if plan is not None and plan.active is not None:
+        active = plan.active
+        try:
+            branch = repo.inspect_branch(active.branch)
+            state["active_branch"] = {
+                "name": branch.name,
+                "local_sha": branch.local_sha,
+                "remote_sha": branch.remote_sha,
+                "current": branch.current,
+            }
+        except Exception as exc:
+            state["active_branch_inspection_error"] = short_error(exc)
+        active_prs = []
+        for status in ("OPEN", "MERGED", "CLOSED"):
+            try:
+                pr = github.find_pr(
+                    head=active.branch, base=config.integration_branch, state=status
+                )
+                if pr is not None:
+                    active_prs.append(
+                        {
+                            "number": pr.number,
+                            "state": pr.state,
+                            "draft": pr.is_draft,
+                            "head_sha": pr.head_sha,
+                            "base_sha": pr.base_sha,
+                            "merge_commit_sha": pr.merge_commit_sha,
+                        }
+                    )
+            except Exception as exc:
+                state[f"active_pr_{status.lower()}_inspection_error"] = short_error(exc)
+        state["active_prs"] = active_prs
+    try:
+        pr = github.find_pr(
+            head=config.integration_branch, base=config.main_branch, state="OPEN"
+        )
+        state["base_pr"] = (
+            None
+            if pr is None
+            else {
+                "number": pr.number,
+                "head_sha": pr.head_sha,
+                "base_sha": pr.base_sha,
+                "draft": pr.is_draft,
+            }
+        )
+    except Exception as exc:
+        state["base_pr_inspection_error"] = short_error(exc)
+    return json.dumps(state, ensure_ascii=True)
+
+
+def require_recovery_retry_state(source: str, expected_source: str | None = None) -> None:
+    """Require the topology needed to safely start a fresh repository pass."""
+    state = json.loads(source)
+    if any(key.endswith("_inspection_error") for key in state):
+        raise WorkerFailure("recovery outcome is uncertain: topology inspection failed")
+    worktree = state.get("worktree")
+    remote_heads = state.get("remote_heads")
+    if (
+        not isinstance(worktree, dict)
+        or worktree.get("dirty") is not False
+        or not isinstance(remote_heads, dict)
+        or not remote_heads.get(state["integration_branch"])
+        or not remote_heads.get(state["final_branch"])
+        or "base_pr" not in state
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: repository state is incomplete")
+    if state["work_item_plan"].get("active") is not None and (
+        "active_branch" not in state or "active_prs" not in state
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: active work item is incomplete")
+    active = state["work_item_plan"].get("active")
+    if active is not None:
+        branch = state["active_branch"]
+        prs = state["active_prs"]
+        if (
+            branch.get("name") != active["branch"]
+            or branch.get("current") != (worktree.get("current_branch") == active["branch"])
+            or not branch.get("local_sha")
+            or branch.get("remote_sha") != branch.get("local_sha")
+            or len(prs) > 1
+            or any(
+                not isinstance(pr.get("number"), int)
+                or pr.get("state") not in ("OPEN", "MERGED", "CLOSED")
+                or (pr.get("state") == "OPEN" and (
+                    pr.get("head_sha") != branch["remote_sha"]
+                    or pr.get("base_sha") != remote_heads[state["integration_branch"]]
+                ))
+                for pr in prs
+            )
+        ):
+            raise WorkerFailure("recovery outcome is uncertain: active branch or PR changed")
+    base_pr = state["base_pr"]
+    if base_pr is not None and (
+        base_pr.get("head_sha") != remote_heads[state["integration_branch"]]
+        or base_pr.get("base_sha") != remote_heads[state["final_branch"]]
+        or not isinstance(base_pr.get("number"), int)
+    ):
+        raise WorkerFailure("recovery outcome is uncertain: Base PR changed")
+    if expected_source is not None:
+        expected = json.loads(expected_source)
+        prior_prs = expected.get("active_prs")
+        if isinstance(prior_prs, list) and prior_prs:
+            prior_numbers = {pr.get("number") for pr in prior_prs}
+            current_prs = state.get("active_prs")
+            if not isinstance(current_prs, list) or any(
+                pr.get("number") not in prior_numbers for pr in current_prs
+            ):
+                raise WorkerFailure("recovery outcome is uncertain: active PR identity changed")
+        prior_base = expected.get("base_pr")
+        if prior_base is not None and base_pr is not None and (
+            prior_base.get("number") != base_pr.get("number")
+        ):
+            raise WorkerFailure("recovery outcome is uncertain: Base PR identity changed")
+
+
 def run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
@@ -4283,6 +5325,7 @@ def run_repository(
     POLICY_CONFLICT_WARNINGS.clear()
     AGENT_TURN_TIMEOUT_WARNINGS.clear()
     ISSUE_HANDOFF_RESULTS.clear()
+    COMPLETED_ISSUE_PRS.clear()
     emit_issue_driven_context(
         config.slug,
         config.integration_branch,
@@ -4295,18 +5338,72 @@ def run_repository(
         command_timeout_seconds=COMMAND_TIMEOUT,
     )
     github = GitHubRepository.open(config.slug, command_timeout_seconds=COMMAND_TIMEOUT)
+    if not config.make_integration_branch:
+        warn_if_stale_integration_branch(config, repo, github)
     client = create_runtime(config)
-    plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
-    work_items = run_outline_step(
-        "Work items",
-        lambda: process_work_items(config, client, repo, github, plan_pr, plan),
-    )
-    ready = integration_delivery(
-        config, work_items, client, repo, github, deferred_deliveries
-    )
-    if deferred_deliveries is None:
-        report_repository_delivery(config, ready)
-    return ready
+    for recovery_attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
+        plan: WorkItemPlan | None = None
+        delivery_count = len(deferred_deliveries) if deferred_deliveries is not None else 0
+        try:
+            plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
+            work_items = run_outline_step(
+                "Work items",
+                lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+            )
+            ready = integration_delivery(
+                config, work_items, client, repo, github, deferred_deliveries
+            )
+        except Exception as exc:
+            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)) or (
+                deferred_deliveries is not None
+                and len(deferred_deliveries) != delivery_count
+            ):
+                raise
+            if recovery_attempt == MAX_REPOSITORY_RECOVERIES:
+                raise WorkerFailure("repository recovery retry limit exceeded") from exc
+            recovery_worktree = repo.inspect_worktree()
+            recovery_branch = recovery_worktree.current_branch
+            if recovery_branch is None:
+                raise WorkerFailure("repository recovery requires a current branch") from exc
+            recovery_start = repo.inspect_branch(recovery_branch)
+            if recovery_start.local_sha is None:
+                raise WorkerFailure(
+                    "repository recovery requires a local branch commit"
+                ) from exc
+            state = recovery_authoritative_state(config, repo, github, plan)
+            report = recover_error(client, config, exc, state)
+            print(
+                f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
+                f"Evidence: {report.evidence}",
+                flush=True,
+            )
+            repo.require_committed_result(
+                recovery_branch,
+                previous_sha=recovery_start.local_sha,
+                allow_unchanged=True,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process="recovery",
+            )
+            if not report.repaired or not report.retry_safe:
+                raise
+            require_recovery_retry_state(
+                recovery_authoritative_state(config, repo, github, plan), state
+            )
+            emit_finding(
+                "runtime",
+                f"Recovered workflow error: {short_error(exc)}",
+                status="warning",
+            )
+            emit_finding(
+                "runtime",
+                f"Recovery repair: {report.summary} Evidence: {report.evidence}",
+                status="warning",
+            )
+            continue
+        if deferred_deliveries is None:
+            report_repository_delivery(config, ready)
+        return ready
+    raise AssertionError("unreachable")
 
 
 def main() -> None:

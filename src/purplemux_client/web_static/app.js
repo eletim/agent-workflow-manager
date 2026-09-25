@@ -2,9 +2,26 @@ const code = document.querySelector("#code");
 const runArguments = document.querySelector("#run-arguments");
 const promptModeButton = document.querySelector("#prompt-mode");
 const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
+const reviewModeButton = document.querySelector("#review-mode");
+const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
+const reviewFields = document.querySelector("#review-fields");
+const reviewJson = document.querySelector("#review-json");
+const reviewPython = document.querySelector("#review-python");
+const reviewGenerate = document.querySelector("#review-generate");
+const reviewSuccess = document.querySelector("#review-success");
+const reviewError = document.querySelector("#review-error");
+const reviewResultPanel = document.querySelector("#review-result-panel");
+const reviewResultStatus = document.querySelector("#review-result-status");
+const reviewResultJson = document.querySelector("#review-result-json");
+const environmentSetupFields = document.querySelector("#environment-setup-fields");
+const environmentSetupJson = document.querySelector("#environment-setup-json");
+const environmentSetupPython = document.querySelector("#environment-setup-python");
+const environmentSetupGenerate = document.querySelector("#environment-setup-generate");
+const environmentSetupSuccess = document.querySelector("#environment-setup-success");
+const environmentSetupError = document.querySelector("#environment-setup-error");
 const workflowFields = document.querySelector("#workflow-fields");
 const issueDrivenJson = document.querySelector("#issue-driven-json");
 const issueDrivenPython = document.querySelector("#issue-driven-python");
@@ -150,6 +167,8 @@ let promptDraft = {
   prompt: promptText.value,
 };
 let issueDrivenDraft = {json: issueDrivenJson.value, code: ""};
+let reviewDraft = {json: reviewJson.value, code: ""};
+let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
 // The last detail response accepted for the selected run. This is the only
@@ -157,12 +176,15 @@ let explicitNewRun = false;
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
+let familyNavigationRequestGeneration = 0;
 let checkedRunIds = [];
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
 let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
 let issueDrivenRequestGeneration = 0;
+let reviewRequestGeneration = 0;
+let environmentSetupRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
 let faviconRunning = false;
@@ -369,6 +391,10 @@ function applyFieldMode() {
   promptText.readOnly = !drafting;
   issueDrivenJson.readOnly = !drafting;
   issueDrivenGenerate.disabled = !drafting;
+  reviewJson.readOnly = !drafting;
+  reviewGenerate.disabled = !drafting;
+  environmentSetupJson.readOnly = !drafting;
+  environmentSetupGenerate.disabled = !drafting;
   repositoryConfigAdd.disabled = !drafting;
   directoryPickerOpen.disabled = !drafting;
   runButton.disabled = !drafting;
@@ -381,14 +407,20 @@ function applyFieldMode() {
 function applyModeVisibility() {
   const promptMode = currentMode === "prompt";
   const issueDrivenMode = currentMode === "issue-driven";
+  const reviewMode = currentMode === "review";
+  const environmentSetupMode = currentMode === "environment-setup";
   promptFields.hidden = !promptMode;
   issueDrivenFields.hidden = !issueDrivenMode;
-  workflowFields.hidden = promptMode || issueDrivenMode;
+  reviewFields.hidden = !reviewMode;
+  environmentSetupFields.hidden = !environmentSetupMode;
+  workflowFields.hidden = promptMode || issueDrivenMode || environmentSetupMode || reviewMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
-  guideOpen.textContent = issueDrivenMode ? "Issue Driven Guide" : "Workflow Guide";
+  guideOpen.textContent = reviewMode ? "Review Guide"
+    : issueDrivenMode ? "Issue Driven Guide"
+    : environmentSetupMode ? "Environment Setup Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
   dryRunPanel.hidden = promptMode || dryRunPanel.hidden;
   outlinePanel.hidden = promptMode || outlinePanel.hidden;
@@ -396,14 +428,18 @@ function applyModeVisibility() {
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
   issueDrivenModeButton.className = issueDrivenMode ? "selected" : "";
-  workflowModeButton.className = !promptMode && !issueDrivenMode ? "selected" : "";
+  reviewModeButton.className = reviewMode ? "selected" : "";
+  environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
+  workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
-  workflowModeButton.setAttribute("aria-pressed", String(!promptMode && !issueDrivenMode));
+  reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
+  environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
+  workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
 }
 
 function showDraftLabel() {
-  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", workflow: "Python Workflow"}[currentMode];
+  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", review: "Review", workflow: "Python Workflow"}[currentMode];
   activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
 }
 
@@ -418,8 +454,12 @@ function captureDraftIfEditing() {
         cwd: promptCwd.value,
         prompt: promptText.value,
       };
+    } else if (currentMode === "environment-setup") {
+      environmentSetupDraft = {json: environmentSetupJson.value, code: environmentSetupPython.value};
     } else if (currentMode === "issue-driven") {
       issueDrivenDraft = {json: issueDrivenJson.value, code: issueDrivenPython.value};
+    } else if (currentMode === "review") {
+      reviewDraft = {json: reviewJson.value, code: reviewPython.value};
     } else {
       draft = {args: runArguments.value, code: code.value};
     }
@@ -461,6 +501,7 @@ function inheritFolderIntoDraft(snapshot, mode) {
 }
 
 function renderCleanDraftState() {
+  renderRunFamily(document.querySelector("#run-family"), {});
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
   rawStdout = "";
@@ -496,6 +537,11 @@ function renderCleanDraftState() {
   validation.replaceChildren();
   issueDrivenSuccess.hidden = true;
   issueDrivenValidation.replaceChildren();
+  environmentSetupSuccess.hidden = true;
+  environmentSetupError.hidden = true;
+  reviewSuccess.hidden = true;
+  reviewError.hidden = true;
+  reviewResultPanel.hidden = true;
 }
 
 function runPresentation(run) {
@@ -512,11 +558,29 @@ function runPresentation(run) {
     || {label: run.state.replaceAll("_", " "), visualState: run.state};
 }
 
+function renderReviewResult(result) {
+  reviewResultPanel.hidden = result.mode !== "review" || result.runId == null;
+  if (reviewResultPanel.hidden) return;
+  const report = result.reviewResult;
+  if (report && typeof report === "object" && !Array.isArray(report)
+    && ["PASS", "FAIL", "BLOCKED"].includes(report.verdict)
+    && typeof report.summary === "string") {
+    reviewResultStatus.textContent = `Verdict: ${report.verdict} — ${report.summary}`;
+    reviewResultJson.textContent = JSON.stringify(report, null, 2);
+  } else {
+    reviewResultStatus.textContent = result.state === "running"
+      ? "Review in progress."
+      : "No structured Review result was saved. See stdout and stderr.";
+    reviewResultJson.textContent = "";
+  }
+}
+
 function renderRun(result) {
+  renderRunFamily(document.querySelector("#run-family"), result);
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
-  currentMode = ["prompt", "issue-driven"].includes(result.mode)
+  currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
     ? result.mode
     : "workflow";
   const running = result.state === "running";
@@ -554,6 +618,7 @@ function renderRun(result) {
   renderIntegrationPr(result.integrationPr || null);
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderIssueDrivenSummary(result.issueDrivenSummary || null);
+  renderReviewResult(result);
   renderRecovery(result);
   renderResources(result);
   renderDryRun(result);
@@ -566,9 +631,15 @@ function renderRun(result) {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
       promptText.value = result.prompt?.prompt || "";
+    } else if (currentMode === "environment-setup") {
+      environmentSetupJson.value = result.environmentSetupJson || "";
+      environmentSetupPython.value = result.code ?? "";
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = result.issueDrivenJson || "";
       issueDrivenPython.value = result.code ?? "";
+    } else if (currentMode === "review") {
+      reviewJson.value = result.reviewJson || "";
+      reviewPython.value = result.code ?? "";
     } else {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
@@ -576,6 +647,8 @@ function renderRun(result) {
     const modeLabel = {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
+      "environment-setup": "Environment Setup",
+      review: "Review",
       workflow: "Workflow",
     }[currentMode];
     const resumeLabel = result.resumedFromRunId == null
@@ -789,9 +862,15 @@ async function enterDraftMode(mode = currentMode) {
       promptAgent.value = promptDraft.agent;
       promptCwd.value = promptDraft.cwd;
       promptText.value = promptDraft.prompt;
+    } else if (currentMode === "environment-setup") {
+      environmentSetupJson.value = environmentSetupDraft.json;
+      environmentSetupPython.value = environmentSetupDraft.code;
     } else if (currentMode === "issue-driven") {
       issueDrivenJson.value = issueDrivenDraft.json;
       issueDrivenPython.value = issueDrivenDraft.code;
+    } else if (currentMode === "review") {
+      reviewJson.value = reviewDraft.json;
+      reviewPython.value = reviewDraft.code;
     } else {
       runArguments.value = draft.args;
       code.value = draft.code;
@@ -842,6 +921,38 @@ function renderRecovery(result) {
   }
 }
 
+function renderRunFamily(container, run) {
+  container.replaceChildren();
+  const references = [
+    ...(run.parentRun ? [["Parent", run.parentRun]] : []),
+    ...(run.childRuns || []).map(reference => ["Child", reference]),
+  ];
+  container.hidden = references.length === 0;
+  for (const [relation, reference] of references) {
+    const link = document.createElement(reference.scope === "external" ? "button" : "a");
+    link.type = "button";
+    link.textContent = `${relation}: ${reference.identity} (${reference.scope})`;
+    link.href = `/?run=${encodeURIComponent(reference.identity)}`;
+    link.addEventListener("click", async event => {
+      const requestGeneration = ++familyNavigationRequestGeneration;
+      if (reference.scope !== "external") return;
+      event.preventDefault();
+      const generation = activeRunGeneration;
+      try {
+        const {url} = await request(`/api/run-navigation?identity=${encodeURIComponent(reference.identity)}`);
+        if (generation !== activeRunGeneration || requestGeneration !== familyNavigationRequestGeneration) return;
+        if (url) window.location.href = url;
+        else link.textContent = `${relation}: ${reference.identity} — target unavailable or history deleted`;
+      } catch (error) {
+        if (generation === activeRunGeneration && requestGeneration === familyNavigationRequestGeneration) {
+          link.textContent = `${relation}: ${reference.identity} — target unavailable`;
+        }
+      }
+    });
+    container.append(link);
+  }
+}
+
 function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
@@ -862,6 +973,8 @@ function renderRunList(runs, cleanupOwnership = []) {
     const mode = {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
+      "environment-setup": "Environment Setup",
+      review: "Review",
       workflow: "Workflow",
     }[run.mode] || "Workflow";
     const executionRoot = run.mode === "prompt"
@@ -870,7 +983,13 @@ function renderRunList(runs, cleanupOwnership = []) {
     const resumed = run.resumedFromRunId == null
       ? ""
       : `  Resume of #${run.resumedFromRunId}`;
-    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
+    const reviewLabel = ["PASS", "FAIL", "BLOCKED"].includes(run.reviewVerdict)
+      ? run.reviewVerdict
+      : run.state === "running" ? "pending" : "none saved";
+    const reviewVerdict = run.mode === "review"
+      ? `  Review result: ${reviewLabel}`
+      : "";
+    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}${reviewVerdict}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -885,6 +1004,10 @@ function renderRunList(runs, cleanupOwnership = []) {
       await refresh();
     });
     runList.append(button);
+    const family = document.createElement("nav");
+    family.className = "run-family";
+    family.setAttribute("aria-label", `Run #${run.runId} family`);
+    renderRunFamily(family, run);
     if (["success", "failed", "stopped"].includes(run.state)) {
       const toggle = document.createElement("button");
       toggle.type = "button";
@@ -902,6 +1025,7 @@ function renderRunList(runs, cleanupOwnership = []) {
       });
       runList.append(toggle);
     }
+    if (!family.hidden) runList.append(family);
   }
   for (const ownership of [...cleanupOwnership].reverse()) {
     const description = document.createElement("div");
@@ -1332,6 +1456,20 @@ function renderRepository(repository) {
 }
 
 function selectedGuide() {
+  if (currentMode === "review") {
+    return {
+      key: "review",
+      path: "/review-guide.md",
+      title: "Review Guide",
+    };
+  }
+  if (currentMode === "environment-setup") {
+    return {
+      key: "environment-setup",
+      path: "/environment-setup-guide.md",
+      title: "Environment Setup Guide",
+    };
+  }
   if (currentMode === "issue-driven") {
     return {
       key: "issue-driven",
@@ -1496,19 +1634,32 @@ async function browseDirectory(path) {
   }
 }
 
+function invalidateDirectoryPickerRequests() {
+  directoryPickerRequestGeneration += 1;
+}
+
+function releaseDirectoryPickerScrollLock() {
+  document.body.classList.remove("directory-picker-open");
+}
+
 directoryPickerOpen.addEventListener("click", () => {
   if (activeRunId !== null) return;
   directoryPickerCurrentPath = null;
   directoryPickerParentPath = null;
   directoryPickerPath.textContent = "";
   directoryPickerList.replaceChildren();
+  document.body.classList.add("directory-picker-open");
   directoryPickerDialog.showModal();
   void browseDirectory(promptCwd.value || "~");
 });
 
 directoryPickerClose.addEventListener("click", () => {
-  directoryPickerRequestGeneration += 1;
   directoryPickerDialog.close();
+});
+
+directoryPickerDialog.addEventListener("close", () => {
+  invalidateDirectoryPickerRequests();
+  releaseDirectoryPickerScrollLock();
 });
 
 directoryPickerParent.addEventListener("click", () => {
@@ -1521,7 +1672,6 @@ directoryPickerSelect.addEventListener("click", () => {
   if (directoryPickerCurrentPath === null || activeRunId !== null) return;
   promptCwd.value = directoryPickerCurrentPath;
   promptDraft.cwd = directoryPickerCurrentPath;
-  directoryPickerRequestGeneration += 1;
   directoryPickerDialog.close();
   promptCwd.focus();
 });
@@ -1616,6 +1766,45 @@ async function scheduleEventRefresh() {
     eventRefreshActive = false;
   }
 }
+
+const externalTargetsForm = document.querySelector("#external-target-settings");
+const externalTargetsJson = document.querySelector("#external-targets-json");
+const externalTargetMessage = document.querySelector("#external-target-message");
+const saveExternalTargets = document.querySelector("#save-external-targets");
+let externalTargetsRequestGeneration = 0;
+
+function renderExternalTargets(settings) {
+  externalTargetsJson.value = JSON.stringify(settings.targets.map(({id, destination, tokenEnv}) => ({id, destination, tokenEnv})), null, 2);
+  document.querySelector("#external-target-credentials").textContent = settings.targets.map(target => `${target.id}: credentials ${target.credentialStatus}`).join("; ");
+}
+
+externalTargetsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (saveExternalTargets.disabled || saveExternalTargets.dataset.pending === "true") return;
+  const requestGeneration = externalTargetsRequestGeneration;
+  saveExternalTargets.dataset.pending = "true";
+  saveExternalTargets.setAttribute("aria-busy", "true");
+  saveExternalTargets.disabled = true;
+  try {
+    const settings = await request("/api/settings/external-targets", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({targets: JSON.parse(externalTargetsJson.value)}),
+    });
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    externalTargetMessage.textContent = "External targets saved.";
+  } catch (error) {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  } finally {
+    if (requestGeneration === externalTargetsRequestGeneration) {
+      delete saveExternalTargets.dataset.pending;
+      saveExternalTargets.removeAttribute("aria-busy");
+      saveExternalTargets.disabled = false;
+    }
+  }
+});
 
 function renderSettings(settings) {
   notificationsEnabled.checked = settings.enabled;
@@ -1726,18 +1915,128 @@ async function generateIssueDrivenCode() {
   }
 }
 
-async function workflowSubmissionPayload(includeIssueDrivenSettings = false) {
+async function workflowSubmissionPayload(includeSourceSettings = false) {
+  if (currentMode === "review") {
+    const source = reviewJson.value;
+    const payload = {code: await generateReviewCode(), args: []};
+    if (includeSourceSettings) payload.reviewJson = source;
+    return payload;
+  }
+  if (currentMode === "environment-setup") {
+    const source = environmentSetupJson.value;
+    const payload = {code: await generateEnvironmentSetupCode(), args: []};
+    if (includeSourceSettings) payload.environmentSetupJson = source;
+    return payload;
+  }
   if (currentMode === "issue-driven") {
     const source = issueDrivenJson.value;
     const payload = {
       code: await generateIssueDrivenCode(),
       args: [],
     };
-    if (includeIssueDrivenSettings) payload.issueDrivenJson = source;
+    if (includeSourceSettings) payload.issueDrivenJson = source;
     return payload;
   }
   return {code: code.value, ...executionContextPayload()};
 }
+
+async function generateReviewCode() {
+  const requestGeneration = ++reviewRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
+  const source = reviewJson.value;
+  try {
+    const result = await request("/api/review/generate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({json: source}),
+    });
+    if (requestGeneration === reviewRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "review"
+      && reviewJson.value === source) {
+      reviewPython.value = result.generatedCode;
+      reviewDraft = {json: source, code: result.generatedCode};
+      reviewSuccess.hidden = false;
+      reviewError.hidden = true;
+    }
+    return result.generatedCode;
+  } catch (error) {
+    if (requestGeneration === reviewRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "review"
+      && reviewJson.value === source) {
+      reviewSuccess.hidden = true;
+      reviewError.hidden = false;
+      reviewError.textContent = error.result?.error || String(error);
+    }
+    throw error;
+  }
+}
+
+reviewGenerate.addEventListener("click", async () => {
+  if (activeRunId !== null) return;
+  await withPendingButton(reviewGenerate, async () => {
+    try { await generateReviewCode(); }
+    catch (error) { if (!error.result?.error) stderr.textContent = String(error); }
+  }, applyFieldMode);
+});
+
+reviewJson.addEventListener("input", () => {
+  reviewRequestGeneration += 1;
+  reviewPython.value = "";
+  reviewDraft = {json: reviewJson.value, code: ""};
+  reviewSuccess.hidden = true;
+  reviewError.hidden = true;
+});
+
+async function generateEnvironmentSetupCode() {
+  const requestGeneration = ++environmentSetupRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
+  const source = environmentSetupJson.value;
+  try {
+    const result = await request("/api/environment-setup/generate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({json: source}),
+    });
+    if (requestGeneration === environmentSetupRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "environment-setup"
+      && environmentSetupJson.value === source) {
+      environmentSetupPython.value = result.generatedCode;
+      environmentSetupDraft = {json: source, code: result.generatedCode};
+      environmentSetupSuccess.hidden = false;
+      environmentSetupError.hidden = true;
+    }
+    return result.generatedCode;
+  } catch (error) {
+    if (requestGeneration === environmentSetupRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "environment-setup"
+      && environmentSetupJson.value === source) {
+      environmentSetupSuccess.hidden = true;
+      environmentSetupError.hidden = false;
+      environmentSetupError.textContent = error.result?.error || String(error);
+    }
+    throw error;
+  }
+}
+
+environmentSetupGenerate.addEventListener("click", async () => {
+  if (activeRunId !== null) return;
+  await withPendingButton(environmentSetupGenerate, async () => {
+    try { await generateEnvironmentSetupCode(); }
+    catch (error) { if (!error.result?.error) stderr.textContent = String(error); }
+  }, applyFieldMode);
+});
+
+environmentSetupJson.addEventListener("input", () => {
+  environmentSetupRequestGeneration += 1;
+  environmentSetupPython.value = "";
+  environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
+  environmentSetupSuccess.hidden = true;
+  environmentSetupError.hidden = true;
+});
 
 issueDrivenGenerate.addEventListener("click", async () => {
   if (activeRunId !== null) return;
@@ -1938,8 +2237,16 @@ workflowModeButton.addEventListener("click", async () => {
   await enterDraftMode("workflow");
 });
 
+environmentSetupModeButton.addEventListener("click", async () => {
+  await enterDraftMode("environment-setup");
+});
+
 issueDrivenModeButton.addEventListener("click", async () => {
   await enterDraftMode("issue-driven");
+});
+
+reviewModeButton.addEventListener("click", async () => {
+  await enterDraftMode("review");
 });
 
 validateButton.addEventListener("click", async () => {
@@ -2119,9 +2426,28 @@ checkedToggle.addEventListener("click", async () => {
 
 settingsOpen.addEventListener("click", () => {
   settingsDialog.showModal();
+  const requestGeneration = ++externalTargetsRequestGeneration;
+  delete saveExternalTargets.dataset.pending;
+  saveExternalTargets.removeAttribute("aria-busy");
+  saveExternalTargets.disabled = true;
+  externalTargetMessage.textContent = "Loading…";
+  request("/api/settings/external-targets").then(settings => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    saveExternalTargets.disabled = false;
+    externalTargetMessage.textContent = "";
+  }).catch(error => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  });
+});
+
+settingsDialog.addEventListener("close", () => {
+  if (!settingsDialog.open) ++externalTargetsRequestGeneration;
 });
 
 settingsClose.addEventListener("click", () => {
+  ++externalTargetsRequestGeneration;
   settingsDialog.close();
 });
 
