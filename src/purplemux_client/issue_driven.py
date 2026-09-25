@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -1510,20 +1511,7 @@ def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview
         else "and prepares delivery handoff."
     )
     return IssueDrivenRunPreview(
-        phases=(
-            "Work-item planning",
-            "Implementation",
-            "Scope / Design review",
-            "Correctness review",
-            "Review fixes",
-            "Recovery",
-            *(
-                ("Whole-version review", "Whole-version fixes")
-                if config.final_review
-                else ()
-            ),
-            "Final integration PR",
-        ),
+        phases=_workflow_preview_phases(config),
         agents=(
             IssueDrivenAgentPurpose(
                 role="Implementer",
@@ -1539,6 +1527,43 @@ def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview
                 purpose=reviewer_purpose,
             ),
         ),
+    )
+
+
+def _workflow_preview_phases(config: IssueDrivenConfig) -> tuple[str, ...]:
+    """Read preview phase metadata from the canonical generated workflow."""
+    assignment = next(
+        (
+            node
+            for node in ast.parse(_canonical_source()).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "WORKFLOW_PREVIEW_PHASES"
+                for target in node.targets
+            )
+        ),
+        None,
+    )
+    if assignment is None:
+        raise RuntimeError("canonical workflow preview metadata is missing")
+    value = ast.literal_eval(assignment.value)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not item[0]
+            or item[1] not in ("always", "final_review")
+            for item in value
+        )
+    ):
+        raise RuntimeError("canonical workflow preview metadata is invalid")
+    return tuple(
+        label
+        for label, availability in value
+        if availability == "always" or config.final_review
     )
 
 

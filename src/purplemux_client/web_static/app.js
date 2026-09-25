@@ -1281,14 +1281,19 @@ async function refreshReadiness() {
 }
 
 function renderOutline(labels, events, plannedPreview = null) {
-  const states = new Map(labels.map((label) => [label, "pending"]));
-  for (const event of events) {
-    if (!states.has(event.name)) continue;
-    states.set(event.name, {
-      started: "running",
-      completed: "completed",
-      failed: "failed",
-    }[event.status]);
+  const states = new Map(labels.map((label) => [
+    label,
+    plannedPreview ? "planned" : "pending",
+  ]));
+  if (!plannedPreview) {
+    for (const event of events) {
+      if (!states.has(event.name)) continue;
+      states.set(event.name, {
+        started: "running",
+        completed: "completed",
+        failed: "failed",
+      }[event.status]);
+    }
   }
 
   outline.replaceChildren();
@@ -1327,6 +1332,7 @@ function renderOutline(labels, events, plannedPreview = null) {
     marker.className = "outline-marker";
     marker.setAttribute("aria-hidden", "true");
     marker.textContent = {
+      planned: "○",
       pending: "○",
       running: "▶",
       completed: "✓",

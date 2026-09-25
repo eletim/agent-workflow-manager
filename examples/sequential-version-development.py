@@ -60,6 +60,17 @@ WORKFLOW_OUTLINE = [
     "Deliver the exact Issue topology",
     "Review and deliver the whole version",
 ]
+WORKFLOW_PREVIEW_PHASES = [
+    ("Work-item planning", "always"),
+    ("Implementation", "always"),
+    ("Scope / Design review", "always"),
+    ("Correctness review", "always"),
+    ("Review fixes", "always"),
+    ("Recovery", "always"),
+    ("Whole-version review", "final_review"),
+    ("Whole-version fixes", "final_review"),
+    ("Final integration PR", "always"),
+]
 MAX_REVIEWS = 4
 MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
@@ -245,6 +256,7 @@ class AgentTurnTimeoutWarning:
 
 AGENT_TURN_TIMEOUT_WARNINGS: list[AgentTurnTimeoutWarning] = []
 AGENT_TURN_IDS = count(1)
+DEFERRED_AGENT_TURN_TRACES: list[_AgentTurnExecution] = []
 
 
 @dataclass(frozen=True)
@@ -773,6 +785,9 @@ def _emit_completed_turn(
         )
     except Exception:
         pass
+    finally:
+        if execution in DEFERRED_AGENT_TURN_TRACES:
+            DEFERRED_AGENT_TURN_TRACES.remove(execution)
 
 
 def _deferred_turn_result(turn: str | _AgentTurnExecution) -> str:
@@ -791,6 +806,12 @@ def _complete_deferred_validated_turn(
 ) -> None:
     if executions:
         _emit_completed_turn(executions.pop(), transition_outcome)
+
+
+def _finalize_deferred_agent_turns(transition_outcome: str) -> None:
+    """Complete agent-success traces when later workflow checks fail."""
+    while DEFERRED_AGENT_TURN_TRACES:
+        _emit_completed_turn(DEFERRED_AGENT_TURN_TRACES[0], transition_outcome)
 
 
 def run_turn(
@@ -831,6 +852,7 @@ def run_turn(
         expected_process=expected_process,
     )
     if _defer_trace:
+        DEFERRED_AGENT_TURN_TRACES.append(execution)
         return execution
     _emit_completed_turn(execution, transition_outcome)
     return execution.result
@@ -5637,7 +5659,7 @@ def require_recovery_retry_state(source: str, expected_source: str | None = None
             raise WorkerFailure("recovery outcome is uncertain: Base PR identity changed")
 
 
-def run_repository(
+def _run_repository(
     config: Config,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
 ) -> PullRequestState | None:
@@ -5673,6 +5695,7 @@ def run_repository(
                 config, work_items, client, repo, github, deferred_deliveries
             )
         except Exception as exc:
+            _finalize_deferred_agent_turns("workflow_failed")
             if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)) or (
                 deferred_deliveries is not None
                 and len(deferred_deliveries) != delivery_count
@@ -5736,6 +5759,17 @@ def run_repository(
             report_repository_delivery(config, ready)
         return ready
     raise AssertionError("unreachable")
+
+
+def run_repository(
+    config: Config,
+    deferred_deliveries: list[RepositoryDelivery] | None = None,
+) -> PullRequestState | None:
+    """Run one repository and close every deferred trace on every exit path."""
+    try:
+        return _run_repository(config, deferred_deliveries)
+    finally:
+        _finalize_deferred_agent_turns("workflow_failed")
 
 
 def main() -> None:

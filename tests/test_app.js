@@ -1157,6 +1157,8 @@ test("Issue Driven mode generates Python before existing Static Validation", asy
   assert.equal(elements["issue-driven-success"].hidden, false);
   assert.equal(elements["outline-title"].textContent, "Planned run preview");
   assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.equal(elements.outline.children[0].className, "outline-item planned");
+  assert.equal(elements.outline.children[0].children[0].textContent, "○");
   assert.match(elements["workflow-story-state"].textContent, /^PLANNED/);
   assert.equal(elements["agent-turns"].hidden, true);
   assert.deepEqual(
@@ -2749,6 +2751,8 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
 
   assert.equal(elements["outline-title"].textContent, "Planned run preview");
   assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.equal(elements.outline.children[0].className, "outline-item planned");
+  assert.equal(elements.outline.children[0].children[0].textContent, "○");
   assert.deepEqual(
     elements["outline-agents"].children.map((item) => item.textContent),
     ["Implementer (codex)", "Implements and fixes.", "Reviewer (codex)", "Reviews each head."],

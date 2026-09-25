@@ -2571,10 +2571,26 @@ def test_generated_outline_keeps_dynamic_work_items_in_one_run_unit(
 
 @pytest.mark.parametrize("final_review", [True, False])
 def test_run_preview_covers_every_possible_agent_phase(final_review: bool) -> None:
-    preview = issue_driven_run_preview(
-        parse(payload(issues=[91], final_review=final_review))
+    config = parse(payload(issues=[91], final_review=final_review))
+    preview = issue_driven_run_preview(config)
+    generated = ast.parse(generate_issue_driven_workflow(config))
+    metadata = next(
+        node
+        for node in generated.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "WORKFLOW_PREVIEW_PHASES"
+            for target in node.targets
+        )
     )
+    declared_phases = ast.literal_eval(metadata.value)
 
+    assert preview.phases == tuple(
+        label
+        for label, availability in declared_phases
+        if availability == "always" or final_review
+    )
     assert preview.phases[:6] == (
         "Work-item planning",
         "Implementation",

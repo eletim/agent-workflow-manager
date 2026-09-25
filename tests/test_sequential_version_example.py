@@ -856,6 +856,56 @@ def test_validated_transition_can_wait_for_authoritative_branch_checks() -> None
     assert outcomes == ["head_changed"]
 
 
+def test_post_agent_workflow_failure_finalizes_deferred_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["run_repository"].__globals__
+    execution = workflow["_AgentTurnExecution"](
+        "agent completed before the PR check failed",
+        1,
+        "Issue #90 implementation",
+        "implementer",
+        1,
+        "implementation",
+        90,
+        "Issue #90",
+        "acme/project",
+        "a" * 40,
+    )
+    emitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fail_after_agent(*_args: object) -> None:
+        globals_["DEFERRED_AGENT_TURN_TRACES"].append(execution)
+        raise WorkerFailure("PR postcondition failed")
+
+    monkeypatch.setitem(globals_, "_run_repository", fail_after_agent)
+    monkeypatch.setitem(
+        globals_,
+        "emit_agent_turn",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    with pytest.raises(WorkerFailure, match="PR postcondition failed"):
+        workflow["run_repository"](object())
+
+    assert emitted == [
+        (
+            (1, "Issue #90 implementation", "implementer", 1, "completed"),
+            {
+                "result": "agent completed before the PR check failed",
+                "transition_outcome": "workflow_failed",
+                "repository": "acme/project",
+                "phase": "implementation",
+                "work_item_id": 90,
+                "work_item_label": "Issue #90",
+                "commit_sha": "a" * 40,
+            },
+        )
+    ]
+    assert globals_["DEFERRED_AGENT_TURN_TRACES"] == []
+
+
 def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     turns: list[str] = []
