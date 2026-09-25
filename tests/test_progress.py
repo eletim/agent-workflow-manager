@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from urllib import error
 
 import pytest
 
@@ -21,6 +22,8 @@ from purplemux_client import (
     register_run_resource,
 )
 from purplemux_client.progress import (
+    EVENT_TOKEN_ENV,
+    EVENT_URL_ENV,
     MAX_PROGRESS_EVENT_BYTES,
     PROGRESS_FD_ENV,
 )
@@ -98,6 +101,31 @@ def test_emit_agent_turn_chunks_preserve_the_exact_prompt(
         "status": "started",
         "prompt": prompt,
     }
+
+
+def test_emit_agent_turn_stops_after_one_fast_http_delivery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[float] = []
+
+    def unavailable(_request: object, *, timeout: float) -> None:
+        timeouts.append(timeout)
+        raise error.URLError("event endpoint unavailable")
+
+    monkeypatch.setenv(EVENT_URL_ENV, "http://127.0.0.1:1/events")
+    monkeypatch.setenv(EVENT_TOKEN_ENV, "token")
+    monkeypatch.setattr("purplemux_client.progress.request.urlopen", unavailable)
+
+    emit_agent_turn(
+        7,
+        "Review the current head",
+        "reviewer",
+        2,
+        "started",
+        prompt="large prompt\n" * 2_000,
+    )
+
+    assert timeouts == [0.05]
 
 
 def test_emit_run_pr_writes_structured_event(monkeypatch: pytest.MonkeyPatch) -> None:

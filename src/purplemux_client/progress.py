@@ -28,6 +28,7 @@ EVENT_URL_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_URL"
 EVENT_TOKEN_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_TOKEN"
 MAX_PROGRESS_EVENT_BYTES = 4096
 _AGENT_TURN_CHUNK_CHARS = 2_400
+_AGENT_TURN_HTTP_TIMEOUT_SECONDS = 0.05
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
 
@@ -140,7 +141,7 @@ def emit_agent_turn(
     )
     message_id = f"{turn_id}:{status}"
     for index, chunk in enumerate(chunks):
-        _write_event(
+        delivered = _write_event(
             {
                 "type": "agent_turn_trace_chunk",
                 "message_id": message_id,
@@ -149,7 +150,10 @@ def emit_agent_turn(
                 "data": chunk,
             },
             drop_oversized=True,
+            http_timeout=_AGENT_TURN_HTTP_TIMEOUT_SECONDS,
         )
+        if not delivered:
+            break
 
 
 def emit_run_pr(pr_number: int, pr_url: str) -> None:
@@ -624,7 +628,12 @@ def acknowledge_run_resource(
             raise RuntimeError("Runner rejected resource ownership evidence")
 
 
-def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -> None:
+def _write_event(
+    event: Mapping[str, object],
+    *,
+    drop_oversized: bool = False,
+    http_timeout: float = 5,
+) -> bool:
     event_url = os.environ.get(EVENT_URL_ENV)
     event_token = os.environ.get(EVENT_TOKEN_ENV)
     if event_url is not None and event_token is not None:
@@ -633,25 +642,32 @@ def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -
             if drop_oversized:
                 encoded = _truncate_event_error(event)
                 if encoded is None:
-                    return
+                    return False
                 event = json.loads(encoded)
             else:
                 raise ValueError("Runner event exceeds 4096 encoded bytes")
-        _post_event(event_url, event_token, event, required=False)
-        return
+        return bool(
+            _post_event(
+                event_url,
+                event_token,
+                event,
+                required=False,
+                timeout=http_timeout,
+            )
+        )
     fd_text = os.environ.get(PROGRESS_FD_ENV)
     if fd_text is None:
-        return
+        return False
     try:
         fd = int(fd_text)
     except ValueError:
-        return
+        return False
     encoded = _encode_event(event)
     if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
         if drop_oversized:
             encoded = _truncate_event_error(event)
             if encoded is None:
-                return
+                return False
         else:
             raise ValueError("Runner event exceeds 4096 encoded bytes")
     with _write_lock:
@@ -660,8 +676,9 @@ def _write_event(event: Mapping[str, object], *, drop_oversized: bool = False) -
             try:
                 written = os.write(fd, view)
             except OSError:
-                return
+                return False
             view = view[written:]
+    return True
 
 
 def _post_event(
@@ -670,6 +687,7 @@ def _post_event(
     event: Mapping[str, object],
     *,
     required: bool,
+    timeout: float = 5,
 ) -> object | None:
     encoded = _encode_event(event)
     if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
@@ -686,16 +704,16 @@ def _post_event(
         },
     )
     try:
-        with request.urlopen(submitted, timeout=5) as response:
+        with request.urlopen(submitted, timeout=timeout) as response:
             payload = response.read(MAX_PROGRESS_EVENT_BYTES + 1)
     except (error.URLError, OSError) as exc:
         if required:
             raise RuntimeError(
                 "Runner resource ownership event could not be delivered"
             ) from exc
-        return None
+        return False
     if not required:
-        return None
+        return True
     try:
         return json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
