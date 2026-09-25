@@ -4152,12 +4152,9 @@ class PythonRunner:
                 if transition.turn_id <= previous.turn_id:
                     return False
                 run.agent_turns[-1] = replace(previous, next_turn_id=transition.turn_id)
-            active_repository = self._active_issue_driven_repository(run)
-            repository = transition.repository or (
-                active_repository.context.repository
-                if active_repository is not None
-                else None
-            )
+            repository = transition.repository
+            if repository is None and len(run.issue_driven_repositories) == 1:
+                repository = run.issue_driven_repositories[0].context.repository
             run.agent_turns.append(
                 AgentTurnTrace(
                     transition.turn_id,

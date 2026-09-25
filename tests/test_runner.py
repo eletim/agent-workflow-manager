@@ -181,6 +181,42 @@ emit_agent_turn(1, "Legacy turn", "implementer", 1, "completed", result="legacy 
     assert snapshot.agent_turns[0].result == "legacy result"
 
 
+def test_legacy_agent_turn_infers_repository_only_for_single_repository_runs(
+    runner: PythonRunner,
+) -> None:
+    single_code = """\
+from purplemux_client import emit_agent_turn, emit_issue_driven_context
+emit_issue_driven_context("acme/only", "dev/v1", "main")
+emit_agent_turn(1, "Legacy turn", "reviewer", 1, "started", prompt="single")
+emit_agent_turn(1, "Legacy turn", "reviewer", 1, "completed", result="done")
+"""
+    single_id = runner.start(single_code, issue_driven_json='{"mode":"issue-driven"}')
+    single = wait_for(runner, lambda item: item.state == "success", run_id=single_id)
+    assert single.agent_turns[0].repository == "acme/only"
+
+    multi_code = """\
+from purplemux_client import (
+    emit_agent_turn, emit_issue_driven_context, emit_issue_driven_repositories,
+    emit_issue_driven_repository,
+)
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+emit_issue_driven_context("acme/api", "dev/api", "main")
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+emit_issue_driven_context("acme/web", "dev/web", "main")
+emit_agent_turn(1, "Delayed legacy API turn", "reviewer", 1, "started", prompt="multi")
+emit_agent_turn(1, "Delayed legacy API turn", "reviewer", 1, "completed", result="done")
+emit_issue_driven_repository(2, "completed")
+"""
+    multi_id = runner.start(multi_code, issue_driven_json='{"mode":"issue-driven"}')
+    multi = wait_for(runner, lambda item: item.state == "success", run_id=multi_id)
+    assert multi.agent_turns[0].repository is None
+
+
 def test_obsolete_recovery_metadata_is_ignored(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
