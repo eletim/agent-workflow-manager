@@ -206,6 +206,7 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
     snapshots = []
     for repository in repositories:
         digest = hashlib.sha256()
+        index_paths: set[Path] = set()
 
         def field(target: Any, value: bytes) -> None:
             target.update(len(value).to_bytes(8, "big"))
@@ -233,7 +234,9 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
         def fail_walk(error: OSError) -> None:
             raise error
 
-        def tree(root: Path, *, exclude_git: bool = False) -> None:
+        def tree(
+            root: Path, *, exclude_git: bool = False, git_admin: bool = False
+        ) -> None:
             for current, directories, files in os.walk(
                 root, followlinks=False, onerror=fail_walk
             ):
@@ -243,13 +246,31 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
                 directories.sort()
                 for name in sorted(directories + files):
                     path = Path(current) / name
+                    if (
+                        git_admin
+                        and name == "index"
+                        and (
+                            path.parent in (git_dir, common_dir)
+                            or path.parent.parent == common_dir / "worktrees"
+                        )
+                    ):
+                        index_paths.add(path)
+                        continue
+                    if (
+                        git_admin
+                        and name.startswith("sharedindex.")
+                        and (
+                            path.parent == root
+                            or path.parent.parent == common_dir / "worktrees"
+                        )
+                    ):
+                        continue
                     entry(path, path.relative_to(root))
 
         for args in (
             ("rev-parse", "HEAD"),
             ("symbolic-ref", "-q", "HEAD"),
             ("show-ref",),
-            ("ls-files", "--stage", "-z"),
             ("config", "--local", "--list", "--null", "--show-origin"),
             ("rev-parse", "--git-dir"),
             ("rev-parse", "--git-common-dir"),
@@ -264,7 +285,6 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
             field(digest, str(result.returncode).encode())
             field(digest, result.stdout)
             if result.returncode and args in (
-                ("ls-files", "--stage", "-z"),
                 ("config", "--local", "--list", "--null", "--show-origin"),
                 ("rev-parse", "--git-dir"),
                 ("rev-parse", "--git-common-dir"),
@@ -284,15 +304,39 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
         tree(Path(repository), exclude_git=True)
         for admin_dir in dict.fromkeys((git_dir, common_dir)):
             field(digest, os.fsencode(admin_dir))
-            tree(admin_dir)
+            tree(admin_dir, git_admin=True)
+        for index_path in sorted(index_paths):
+            field(digest, os.fsencode(index_path))
+            for args in (
+                ("ls-files", "-v", "--stage", "-z"),
+                ("ls-files", "--resolve-undo", "-z"),
+                ("diff", "--cached", "--raw", "-z", "--no-ext-diff"),
+            ):
+                result = subprocess.run(
+                    ["git", f"--git-dir={index_path.parent}", *args],
+                    env={**os.environ, "GIT_INDEX_FILE": str(index_path)},
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError(
+                        f"Could not inspect Git index {index_path}: "
+                        f"{result.stderr.decode(errors='replace')}"
+                    )
+                field(digest, b" ".join(part.encode() for part in args))
+                field(digest, result.stdout)
         snapshots.append(digest.hexdigest())
     return tuple(snapshots)
 
 
 class ReviewWriteMonitor:
-    """Record filesystem writes during a Review, including restored writes."""
+    """Record filesystem writes during a Review, except index refreshes."""
 
-    _WRITE_EVENTS = 0x002 | 0x004 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+    _WRITE_EVENTS = 0x002 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+    _EVENT = struct.Struct("iIII")
+    _CREATE = 0x100
+    _DELETE = 0x200
 
     def __init__(self, repositories: tuple[str, ...]) -> None:
         if sys.platform != "linux":
@@ -300,15 +344,23 @@ class ReviewWriteMonitor:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.inotify_init1.argtypes = [ctypes.c_int]
         libc.inotify_init1.restype = ctypes.c_int
-        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+        ]
         libc.inotify_add_watch.restype = ctypes.c_int
         self._libc = libc
         self._fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
         if self._fd < 0:
-            raise OSError(ctypes.get_errno(), "Could not start Review repository write monitor")
+            raise OSError(
+                ctypes.get_errno(), "Could not start Review repository write monitor"
+            )
         self._watched: dict[Path, int] = {}
+        self._paths: dict[int, Path] = {}
         self._owners: dict[int, set[str]] = {}
         self._repositories = repositories
+        self._git_dirs: set[Path] = set()
 
         def fail_walk(error: OSError) -> None:
             raise error
@@ -325,19 +377,24 @@ class ReviewWriteMonitor:
                         check=True,
                     )
                     roots.append((Path(repository) / result.stdout.strip()).resolve())
+                self._git_dirs.update(roots[1:])
                 for root in roots:
                     if not root.is_dir():
-                        raise RuntimeError(f"Could not watch Review repository path {root}")
+                        raise RuntimeError(
+                            f"Could not watch Review repository path {root}"
+                        )
                     for current, directories, files in os.walk(
                         root, followlinks=False, onerror=fail_walk
                     ):
                         directories[:] = [
-                            name for name in directories
+                            name
+                            for name in directories
                             if not (Path(current) / name).is_symlink()
                         ]
                         candidates = [Path(current)]
                         candidates.extend(
-                            Path(current) / name for name in files
+                            Path(current) / name
+                            for name in files
                             if not (Path(current) / name).is_symlink()
                         )
                         for candidate in candidates:
@@ -345,30 +402,100 @@ class ReviewWriteMonitor:
                             descriptor = self._watched.get(path)
                             if descriptor is None:
                                 descriptor = libc.inotify_add_watch(
-                                    self._fd, os.fsencode(path),
+                                    self._fd,
+                                    os.fsencode(path),
                                     self._WRITE_EVENTS | 0x02000000,  # IN_DONT_FOLLOW
                                 )
                                 if descriptor < 0:
                                     raise OSError(
-                                        ctypes.get_errno(), f"Could not watch Review repository path {path}"
+                                        ctypes.get_errno(),
+                                        f"Could not watch Review repository path {path}",
                                     )
                                 self._watched[path] = descriptor
+                                self._paths[descriptor] = path
                             self._owners.setdefault(descriptor, set()).add(repository)
         except BaseException:
             self.close()
             raise
 
     def assert_unchanged(self) -> None:
-        try:
-            events = os.read(self._fd, 65536)
-        except BlockingIOError as exc:
-            if exc.errno == errno.EAGAIN:
-                return
-            raise
-        if events:
-            descriptor = struct.unpack_from("i", events)[0]
-            changed = sorted(self._owners.get(descriptor, self._repositories))
-            raise RuntimeError("Review repository change detected during observation: " + json.dumps(changed))
+        pending_locks: set[tuple[int, bytes]] = set()
+        while True:
+            try:
+                events = os.read(self._fd, 65536)
+            except BlockingIOError as exc:
+                if exc.errno == errno.EAGAIN:
+                    break
+                raise
+            if not events:
+                raise RuntimeError(
+                    "Review repository write monitor closed unexpectedly"
+                )
+            offset = 0
+            while offset < len(events):
+                if len(events) - offset < self._EVENT.size:
+                    raise RuntimeError(
+                        "Review repository write monitor received a truncated event"
+                    )
+                descriptor, mask, _cookie, length = self._EVENT.unpack_from(
+                    events, offset
+                )
+                offset += self._EVENT.size
+                if length > len(events) - offset:
+                    raise RuntimeError(
+                        "Review repository write monitor received a truncated event"
+                    )
+                name = events[offset : offset + length].split(b"\0", 1)[0]
+                offset += length
+                parent = self._paths.get(descriptor)
+                event_path = parent / os.fsdecode(name) if parent and name else parent
+                if event_path is not None and (
+                    (
+                        event_path.name == "index"
+                        or event_path.name.startswith("sharedindex.")
+                    )
+                    and (
+                        event_path.parent in self._git_dirs
+                        or event_path.parent.parent.parent in self._git_dirs
+                        and event_path.parent.parent.name == "worktrees"
+                    )
+                ):
+                    # The final snapshot checks semantic index state. Git may
+                    # rewrite index storage just to refresh cached file metadata.
+                    continue
+                key = (descriptor, name)
+                git_lock = (
+                    parent is not None
+                    and name == b"index.lock"
+                    and (
+                        parent in self._git_dirs
+                        or (
+                            parent.parent.name == "worktrees"
+                            and parent.parent.parent in self._git_dirs
+                        )
+                    )
+                )
+                if git_lock and mask == self._CREATE and key not in pending_locks:
+                    pending_locks.add(key)
+                    continue
+                if git_lock and mask in (0x002, 0x008) and key in pending_locks:
+                    continue
+                if git_lock and mask == self._DELETE and key in pending_locks:
+                    pending_locks.remove(key)
+                    continue
+                if git_lock and mask == 0x040 and key in pending_locks:
+                    pending_locks.remove(key)
+                    continue
+                changed = sorted(self._owners.get(descriptor, self._repositories))
+                raise RuntimeError(
+                    "Review repository change detected during observation: "
+                    + json.dumps(changed)
+                )
+        if pending_locks:
+            raise RuntimeError(
+                "Review repository change detected during observation: "
+                + json.dumps(sorted(self._repositories))
+            )
 
     def close(self) -> None:
         if self._fd >= 0:
