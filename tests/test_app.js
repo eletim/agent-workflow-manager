@@ -222,6 +222,7 @@ async function loadApp({
   confirmOverride = null,
 }) {
   const ids = [
+    "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
     "code", "run-arguments", "prompt-mode", "issue-driven-mode", "workflow-mode", "prompt-fields",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
     "issue-driven-success", "issue-driven-validation",
@@ -231,7 +232,7 @@ async function loadApp({
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
     "active-context", "repository-navigation", "repository-slug", "repository-link",
-    "run-list", "delete-checked-runs",
+    "run-family", "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
     "integration-pr-panel", "integration-pr",
@@ -368,6 +369,7 @@ async function loadApp({
   return {
     calls,
     elements,
+    location: context.window.location,
     eventSource: eventSources[0],
     logDisplay: context.runnerLogDisplay,
   };
@@ -3827,4 +3829,230 @@ test("completed Workflow runs expose explicit Cleanup and retain their history",
   assert.equal(runs.length, 1);
   assert.equal(elements.cleanup.disabled, true);
   assert.match(elements["resources-summary"].textContent, /cleaned/);
+});
+
+test("external targets load and save stable registrations without credential values", async () => {
+  const target = {id: "office", destination: "https://awm.example", tokenEnv: "OFFICE_TOKEN"};
+  const {elements, calls} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url === "/api/settings/external-targets") {
+        if (options.method === "POST") {
+          assert.deepEqual(JSON.parse(options.body), {targets: [target]});
+        }
+        return response({targets: [{...target, credentialStatus: "configured"}]});
+      }
+      return undefined;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [target]);
+  assert.match(elements["external-target-credentials"].textContent, /office: credentials configured/);
+  await elements["external-target-settings"].dispatch("submit");
+  assert.ok(calls.some(([url, method]) => url === "/api/settings/external-targets" && method === "POST"));
+  assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+  elements["external-targets-json"].value = "invalid";
+  await elements["external-target-settings"].dispatch("submit");
+  assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 1);
+});
+
+test("obsolete external target responses cannot overwrite reopened Settings edits", async () => {
+  const first = deferred();
+  const second = deferred();
+  let reads = 0;
+  let saved;
+  const target = {id: "current", destination: "https://current.example", tokenEnv: "CURRENT_TOKEN"};
+  const edited = {...target, destination: "https://edited.example"};
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url, options) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      if (options.method === "POST") {
+        saved = JSON.parse(options.body);
+        return response({targets: [{...edited, credentialStatus: "configured"}]});
+      }
+      return ++reads === 1 ? first.promise : second.promise;
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  second.resolve(response({targets: [{...target, credentialStatus: "missing"}]}));
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  elements["external-targets-json"].value = JSON.stringify([edited]);
+  first.resolve(response({targets: [{...target, id: "stale", credentialStatus: "configured"}]}));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+  assert.equal(elements["external-target-credentials"].textContent, "current: credentials missing");
+  await elements["external-target-settings"].dispatch("submit");
+  assert.deepEqual(saved, {targets: [edited]});
+});
+
+test("obsolete external target failures cannot change current Settings state", async () => {
+  const first = deferred();
+  let reads = 0;
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url !== "/api/settings/external-targets") return undefined;
+      return ++reads === 1 ? first.promise : response({targets: []});
+    },
+  });
+  await elements["settings-open"].dispatch("click");
+  await elements["settings-close"].dispatch("click");
+  await elements["settings-open"].dispatch("click");
+  await waitFor(() => elements["external-targets-json"].value !== "");
+  first.resolve(response({error: "obsolete failure"}, 500));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements["external-target-message"].textContent, "");
+  assert.equal(elements["save-external-targets"].disabled, false);
+});
+
+for (const obsoleteStatus of [200, 500]) {
+  test(`obsolete external target save (${obsoleteStatus}) preserves reopened edits and pending save`, async () => {
+    const oldSave = deferred();
+    const currentSave = deferred();
+    let saves = 0;
+    const target = {id: "office", destination: "https://office.example", tokenEnv: "OFFICE_TOKEN"};
+    const edited = {...target, destination: "https://edited.example"};
+    const {elements, calls} = await loadApp({
+      runs: [], details: {}, validation: {status: 200, body: {validation: []}},
+      fetchOverride(url, options) {
+        if (url !== "/api/settings/external-targets") return undefined;
+        if (options.method === "POST") return ++saves === 1 ? oldSave.promise : currentSave.promise;
+        return response({targets: [{...target, credentialStatus: "missing"}]});
+      },
+    });
+    await elements["settings-open"].dispatch("click");
+    await waitFor(() => !elements["save-external-targets"].disabled);
+    const oldSubmission = elements["external-target-settings"].dispatch("submit");
+    await waitFor(() => saves === 1);
+    await elements["settings-close"].dispatch("click");
+    await elements["settings-open"].dispatch("click");
+    await waitFor(() => !elements["save-external-targets"].disabled);
+    elements["external-targets-json"].value = JSON.stringify([edited]);
+    const currentSubmission = elements["external-target-settings"].dispatch("submit");
+    await waitFor(() => saves === 2);
+    oldSave.resolve(response(obsoleteStatus === 200
+      ? {targets: [{...target, credentialStatus: "configured"}]}
+      : {error: "obsolete save failure"}, obsoleteStatus));
+    await oldSubmission;
+    assert.deepEqual(JSON.parse(elements["external-targets-json"].value), [edited]);
+    assert.equal(elements["external-target-message"].textContent, "");
+    assert.equal(elements["external-target-credentials"].textContent, "office: credentials missing");
+    assert.equal(elements["save-external-targets"].disabled, true);
+    assert.equal(elements["save-external-targets"].dataset.pending, "true");
+    assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), "true");
+    await elements["external-target-settings"].dispatch("submit");
+    assert.equal(saves, 2);
+    assert.equal(calls.filter(([url, method]) => url === "/api/settings/external-targets" && method === "POST").length, 2);
+    currentSave.resolve(response({targets: [{...edited, credentialStatus: "configured"}]}));
+    await currentSubmission;
+    assert.equal(elements["external-target-message"].textContent, "External targets saved.");
+    assert.equal(elements["save-external-targets"].disabled, false);
+    assert.equal(elements["save-external-targets"].dataset.pending, undefined);
+    assert.equal(elements["save-external-targets"].getAttribute("aria-busy"), undefined);
+  });
+}
+
+
+test("persisted family links navigate both directions after reload", async () => {
+  const parent = "a".repeat(32) + "-1";
+  const child = "a".repeat(32) + "-2";
+  const childRef = {identity: child, runId: 2, scope: "local"};
+  const parentRef = {identity: parent, runId: 1, scope: "local"};
+  const runs = [
+    {runId: 1, identity: parent, state: "success", childRuns: [childRef]},
+    {runId: 2, identity: child, state: "success", parentRun: parentRef},
+  ];
+  const details = Object.fromEntries(runs.map(run => [run.runId, {
+    ...snapshot({runId: run.runId, state: "success", stdout: ""}), ...run,
+  }]));
+  const first = await loadApp({runs, details, locationHref: `http://127.0.0.1:8765/?run=${parent}`});
+  assert.equal(selectedRun(first.elements).dataset.runId, "1");
+  const childLink = first.elements["run-family"].children[0];
+  assert.equal(childLink.href, `/?run=${child}`);
+  assert.equal(first.elements["run-list"].children.filter(item => item.className === "run-family").length, 2);
+  const second = await loadApp({runs, details, locationHref: `http://127.0.0.1:8765${childLink.href}`});
+  assert.equal(selectedRun(second.elements).dataset.runId, "2");
+  assert.equal(second.elements["run-family"].children[0].href, `/?run=${parent}`);
+  const deleted = await loadApp({runs: [runs[0]], details, locationHref: `http://127.0.0.1:8765/?run=${child}`});
+  assert.equal(selectedRun(deleted.elements), undefined);
+  assert.match(deleted.elements.stderr.textContent, /no longer available/);
+});
+
+for (const relation of ["parentRun", "childRuns"]) {
+  test(`external ${relation} resolves exact identity and handles unavailable targets`, async () => {
+    const identity = "b".repeat(32) + "-7";
+    const ref = {identity, runId: 7, scope: "external"};
+    const family = {[relation]: relation === "parentRun" ? ref : [ref]};
+    const run = {...snapshot({runId: 1, state: "success", stdout: ""}), ...family};
+    let url = null;
+    const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+      if (path.startsWith("/api/run-navigation?")) return response({url});
+    }});
+    const link = app.elements["run-family"].children[0];
+    await link.dispatch("click");
+    assert.match(link.textContent, /target unavailable or history deleted/);
+    assert.equal(app.location.href, "http://127.0.0.1:8765/");
+    url = `https://registered.example/?run=${identity}`;
+    await link.dispatch("click");
+    assert.equal(app.location.href, url);
+    assert.ok(app.calls.some(([path]) => path === `/api/run-navigation?identity=${identity}`));
+  });
+}
+
+for (const responseOrder of [[0, 1], [1, 0]]) {
+  for (const obsoleteResult of ["destination", "unavailable", "error"]) {
+    test(`latest family click wins with response order ${responseOrder} and obsolete ${obsoleteResult}`, async () => {
+      const identities = ["b".repeat(32) + "-7", "c".repeat(32) + "-8"];
+      const pending = [deferred(), deferred()];
+      const run = {
+        ...snapshot({runId: 1, state: "success", stdout: ""}),
+        childRuns: identities.map((identity, index) => ({identity, runId: index + 7, scope: "external"})),
+      };
+      const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+        const index = identities.findIndex(identity => path === `/api/run-navigation?identity=${identity}`);
+        if (index >= 0) return pending[index].promise;
+      }});
+      // Detail and history share the same navigation intent.
+      const firstLink = app.elements["run-family"].children[0];
+      const historyFamily = app.elements["run-list"].children.find(item => item.className === "run-family");
+      const secondLink = historyFamily.children[1];
+      const originalLabel = firstLink.textContent;
+      const clicks = [firstLink.dispatch("click"), secondLink.dispatch("click")];
+      const destinations = identities.map(identity => `https://registered.example/?run=${identity}`);
+      for (const index of responseOrder) {
+        pending[index].resolve(index === 0 && obsoleteResult === "error"
+          ? response({error: "obsolete failure"}, 500)
+          : response({url: index === 0 && obsoleteResult === "unavailable" ? null : destinations[index]}));
+        await clicks[index];
+        assert.equal(app.location.href, index === 1 || responseOrder[0] === 1
+          ? destinations[1] : "http://127.0.0.1:8765/");
+        assert.equal(firstLink.textContent, originalLabel);
+      }
+    });
+  }
+}
+
+test("local family click invalidates pending external navigation", async () => {
+  const pending = deferred();
+  const run = {
+    ...snapshot({runId: 1, state: "success", stdout: ""}),
+    childRuns: [
+      {identity: "b".repeat(32) + "-7", runId: 7, scope: "external"},
+      {identity: "a".repeat(32) + "-2", runId: 2, scope: "local"},
+    ],
+  };
+  const app = await loadApp({runs: [run], details: {1: run}, fetchOverride(path) {
+    if (path.startsWith("/api/run-navigation?")) return pending.promise;
+  }});
+  const [external, local] = app.elements["run-family"].children;
+  const click = external.dispatch("click");
+  await local.dispatch("click");
+  pending.resolve(response({url: "https://obsolete.example/"}));
+  await click;
+  assert.equal(app.location.href, "http://127.0.0.1:8765/");
+  assert.equal(local.href, `/?run=${"a".repeat(32)}-2`);
 });

@@ -509,6 +509,15 @@ run. Its ordinary Python logic must explicitly inspect and reuse authoritative
 Git, GitHub, or PurpleMux state where appropriate. The Runner does not expose a
 workflow checkpoint API or reconstruct terminated Python control flow.
 
+`PythonRunner.link_runs(parent_identity, child_identity)` records family links on
+ordinary Runs using full instance-qualified AWM identities. At least one Run must
+be local; local records are updated on both sides. Terminal history preserves these
+links across reload, including references to external AWMs and deleted Runs.
+Run detail and list snapshots expose `parentRun` and `childRuns`, each reference
+containing `identity`, `scope` (`local` or `external`), and `runId`. Numeric Run IDs
+alone do not identify a related Run across AWM instances. Existing history without
+family fields loads with empty links.
+
 Runs are independent and may execute concurrently. The UI lists every run and
 lets the operator select its state, output, progress, execution context, Stop,
 and explicit Cleanup action without changing another run. While run history is
@@ -832,3 +841,111 @@ second launch using its already-established project trust:
 AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
   uv run pytest tests/test_live_claude_trust.py
 ```
+
+External AWM targets can be registered in **Settings → External AWM targets** or
+through `GET` / `POST /api/settings/external-targets`. POST replaces the list and
+uses the existing trusted JSON request policy (`X-Python-Runner-Token`). Example:
+
+```json
+{"targets":[{"id":"office","destination":"https://awm.example","tokenEnv":"OFFICE_AWM_TOKEN"}]}
+```
+
+IDs are unique, stable names (1–64 letters, numbers, underscores, or hyphens).
+Destinations support HTTPS and loopback HTTP, including a deployment path prefix;
+URLs containing credentials, queries, or fragments are rejected. Registrations
+persist in `$XDG_CONFIG_HOME/agent-workflow-manager/external-targets.json`
+(default `~/.config/agent-workflow-manager/external-targets.json`), overridable with
+`AGENT_WORKFLOW_MANAGER_EXTERNAL_TARGETS_FILE`. Invalid files are reported rather
+than overwritten.
+
+Fetch the request token through `GET /api/token` on the trusted destination.
+Export its `token` value as the registered `tokenEnv` variable before starting
+the source AWM server. Only the variable name and credential status appear in
+settings; credential values are never stored in the registry or returned by its
+API. The destination generates a new token on every server start. After every
+destination restart, fetch the new token, export it again, and restart the source
+server so it inherits the updated environment. Server code can use
+`ExternalTargetSettings.connection(id)` to obtain the destination and private
+`X-Python-Runner-Token` header. Registration does not initiate a connection or
+launch an external Run.
+
+Server-to-server ordinary Runs use the same registered external targets as Settings.
+Credentials are resolved on the calling server from each registration's `tokenEnv`;
+keep them out of browser code. The destination must be HTTPS or loopback HTTP and
+must accept its configured Host and `X-Python-Runner-Token` credential. No Origin
+header is needed for server requests; existing Host, Origin, and token checks remain.
+
+```python
+from purplemux_client import ExternalRunClient
+
+client = ExternalRunClient(request_timeout=30)
+run_id = client.start_run("registered-target-id", 'print("hello")', args=[])
+result = client.wait_run("registered-target-id", run_id, timeout=300)
+print(result.state, result.exit_code, result.stdout, result.stderr)
+```
+
+Each client pins a target destination on first use. Changing that registration's
+destination makes subsequent requests fail explicitly; use the original
+destination to observe its Runs. Credentials can rotate at the same destination.
+The client accepts up to 24,065,536 response bytes, covering both default retained
+output streams even when JSON expands Unicode into surrogate pairs.
+
+The client launches once through `POST /api/run` with JSON `code` and optional
+string-array `args`; HTTP 202 returns a positive `runId`. Authenticated
+`GET /api/runs/{runId}/result` returns JSON `runId`, `state`, and `result`.
+For `running`, `result` is null. For terminal `success`, `failed`, or `stopped`,
+`result` contains `exitCode`, `stdout`, and `stderr` from the Runner snapshot
+(output retains the Runner's existing limits and truncation notices).
+`get_run_result()` returns None only for a confirmed running Run. Failed and
+stopped Runs return their actual terminal result; callers must inspect `state`.
+Unknown IDs return HTTP 404. Polling deadline expiry raises TimeoutError;
+communication failures and malformed or unknown results raise ExternalRunError.
+An uncertain launch raises ExternalRunLaunchUnknown: inspect destination Run
+history before deciding what to do, since a Run may already have started. The
+client never retries a launch or follows redirects, including credential redirects.
+
+From an **AWM Python Workflow**, use `start_child_run`, `get_child_run_result`,
+and `wait_child_run` to record parent/child relationships automatically. Omit
+`target_id` for the local AWM, or pass the same registered ID to all three calls
+for an external child. The standalone `ExternalRunClient` example above does not
+by itself attach a child to the currently running Workflow.
+
+[examples/child-runs.py](examples/child-runs.py) is a runnable Workflow for both
+cases. Paste its source into Python Workflow mode and start it with no arguments
+for a local child. For two local AWM instances, start the destination on a different
+port and use separate history files for the two instances. In the destination
+terminal:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE="$PWD/remote-run-history.json" make web ARGS="--port 8766"
+```
+In the source terminal, fetch and export the destination credential, then start
+the source on its own port:
+
+```bash
+export REMOTE_AWM_TOKEN="$(curl --fail --silent http://127.0.0.1:8766/api/token | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+AGENT_WORKFLOW_MANAGER_RUN_HISTORY_FILE="$PWD/source-run-history.json" make web ARGS="--port 8765"
+```
+
+Register `remote` in the source Settings with destination
+`http://127.0.0.1:8766` and `tokenEnv` set to `REMOTE_AWM_TOKEN`, then start the
+example on the source with arguments `["remote"]`. After every destination
+restart, repeat the token export and restart the source before using `remote`.
+The child receives `["AWM"]` and prints
+`hello AWM`; its final state, exit code, stdout, and stderr are printed by the parent.
+Running this file directly outside an AWM Workflow lacks the run-scoped control
+credentials and fails explicitly.
+
+A returned child ID is numeric and scoped to its AWM; persisted family references
+use the full instance-qualified identity. Both AWMs retain the external relationship
+in their own history. Family links in Run history let operators navigate locally
+or to a registered destination that still owns the exact identity.
+
+`get_child_run_result()` returns `None` only while the child is confirmed running.
+`wait_child_run()` returns a `ChildRunResult` for success, failure, or stop; Python
+must decide which outcomes satisfy the parent. The example requires `success`
+and exit code zero. A wait timeout does not stop the child. Communication failure,
+unavailable or mismatched identity, and unknown results raise errors instead of
+reporting success. An uncertain start may already have created a child: inspect
+source and destination histories before recovery, and never blindly retry it.
+See the [dedicated control contract](docs/workflow-runtime-spec.md#child-run-control-contract).

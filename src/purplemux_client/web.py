@@ -11,12 +11,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import qrcode
 from qrcode.image.svg import SvgPathImage
 
 from purplemux_client.errors import TerminalSessionError
+from purplemux_client.external_targets import ExternalTargetSettings
 from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     generate_issue_driven_workflow,
@@ -228,6 +229,7 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         readiness_service: AgentReadinessService | None = None,
         purplemux_port: int | None = None,
         purplemux_port_file: Path | None = None,
+        external_target_settings: ExternalTargetSettings | None = None,
     ) -> None:
         if purplemux_port is not None and purplemux_port_file is not None:
             raise ValueError("PurpleMux port and port file are mutually exclusive")
@@ -286,6 +288,14 @@ class RunnerHTTPServer(ThreadingHTTPServer):
         self.readiness_service = readiness_service or AgentReadinessService()
         self._settings_notifier = (
             notifier if runner is not None and notification_settings is None else None
+        )
+        self.external_target_settings = (
+            external_target_settings or ExternalTargetSettings()
+        )
+        from purplemux_client.external_runs import ExternalRunClient
+
+        self.runner._external_child_client = ExternalRunClient(
+            self.external_target_settings
         )
         self.request_token = secrets.token_urlsafe(32)
         self.allowed_hosts = {
@@ -410,6 +420,50 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted host"})
             return
         path = urlparse(self.path).path
+        result_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/result", path)
+        if result_match is not None:
+            if not self._is_trusted_request(require_json=False):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+                return
+            try:
+                snapshot = self.server.runner.snapshot(int(result_match.group(1)))
+            except RunNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "runId": snapshot.run_id,
+                    "identity": snapshot.identity,
+                    "state": snapshot.state,
+                    "result": None
+                    if snapshot.state == "running"
+                    else {
+                        "exitCode": snapshot.exit_code,
+                        "stdout": snapshot.stdout,
+                        "stderr": snapshot.stderr,
+                    },
+                },
+            )
+            return
+        if path == "/api/run-navigation":
+            if not self._is_trusted_request(require_json=False):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "untrusted request"})
+                return
+            identity = parse_qs(urlparse(self.path).query).get("identity", [""])[0]
+            try:
+                from purplemux_client.external_runs import ExternalRunClient
+
+                url = ExternalRunClient(
+                    self.server.external_target_settings
+                ).navigation_url(identity)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except SettingsError:
+                url = None
+            self._send_json(HTTPStatus.OK, {"url": url})
+            return
         if path == "/api/events":
             self._send_events()
             return
@@ -452,6 +506,14 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, settings.as_json())
+            return
+        if path == "/api/settings/external-targets":
+            try:
+                settings = self.server.external_target_settings.read()
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings)
             return
         if path == "/api/settings/mobile-connection":
             self._send_json(
@@ -549,6 +611,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
             "/api/readiness/probe",
             "/api/readiness/reconcile",
             "/api/settings/notifications",
+            "/api/settings/external-targets",
             "/api/settings/notifications/test",
         }
         checked_match = re.fullmatch(r"/api/runs/([1-9][0-9]*)/checked", path)
@@ -796,7 +859,11 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     code,
                     args=args,
                     issue_driven_json=issue_driven_json,
+                    parent_identity=payload.get("parentRun"),
                 )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             except InvalidExecutionContextError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -974,6 +1041,20 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             self._send_json(HTTPStatus.OK, snapshot.as_json())
+            return
+        if path == "/api/settings/external-targets":
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                settings = self.server.external_target_settings.update(payload)
+            except SettingsValidationError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except SettingsError as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, settings)
             return
         if path == "/api/settings/notifications":
             payload = self._read_json()

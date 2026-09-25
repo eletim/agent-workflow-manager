@@ -626,3 +626,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 @media (hover: none), (pointer: coarse) {
   button, summary, a { -webkit-tap-highlight-color: rgb(188 170 255 / 20%); }
 }
+
+#run-family, .run-family { display: flex; flex-wrap: wrap; gap: 0.5rem; overflow-wrap: anywhere; }
+#run-family[hidden], .run-family[hidden] { display: none; }
+.run-family { grid-column: 1 / -1; font-size: 12px; }

@@ -157,6 +157,7 @@ let explicitNewRun = false;
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
 let activeRunGeneration = 0;
+let familyNavigationRequestGeneration = 0;
 let checkedRunIds = [];
 let renderedRunIds = new Set();
 let refreshRequestGeneration = 0;
@@ -461,6 +462,7 @@ function inheritFolderIntoDraft(snapshot, mode) {
 }
 
 function renderCleanDraftState() {
+  renderRunFamily(document.querySelector("#run-family"), {});
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
   rawStdout = "";
@@ -513,6 +515,7 @@ function runPresentation(run) {
 }
 
 function renderRun(result) {
+  renderRunFamily(document.querySelector("#run-family"), result);
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
@@ -842,6 +845,38 @@ function renderRecovery(result) {
   }
 }
 
+function renderRunFamily(container, run) {
+  container.replaceChildren();
+  const references = [
+    ...(run.parentRun ? [["Parent", run.parentRun]] : []),
+    ...(run.childRuns || []).map(reference => ["Child", reference]),
+  ];
+  container.hidden = references.length === 0;
+  for (const [relation, reference] of references) {
+    const link = document.createElement(reference.scope === "external" ? "button" : "a");
+    link.type = "button";
+    link.textContent = `${relation}: ${reference.identity} (${reference.scope})`;
+    link.href = `/?run=${encodeURIComponent(reference.identity)}`;
+    link.addEventListener("click", async event => {
+      const requestGeneration = ++familyNavigationRequestGeneration;
+      if (reference.scope !== "external") return;
+      event.preventDefault();
+      const generation = activeRunGeneration;
+      try {
+        const {url} = await request(`/api/run-navigation?identity=${encodeURIComponent(reference.identity)}`);
+        if (generation !== activeRunGeneration || requestGeneration !== familyNavigationRequestGeneration) return;
+        if (url) window.location.href = url;
+        else link.textContent = `${relation}: ${reference.identity} — target unavailable or history deleted`;
+      } catch (error) {
+        if (generation === activeRunGeneration && requestGeneration === familyNavigationRequestGeneration) {
+          link.textContent = `${relation}: ${reference.identity} — target unavailable`;
+        }
+      }
+    });
+    container.append(link);
+  }
+}
+
 function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
   runsEmpty.hidden = runs.length > 0;
@@ -885,6 +920,10 @@ function renderRunList(runs, cleanupOwnership = []) {
       await refresh();
     });
     runList.append(button);
+    const family = document.createElement("nav");
+    family.className = "run-family";
+    family.setAttribute("aria-label", `Run #${run.runId} family`);
+    renderRunFamily(family, run);
     if (["success", "failed", "stopped"].includes(run.state)) {
       const toggle = document.createElement("button");
       toggle.type = "button";
@@ -902,6 +941,7 @@ function renderRunList(runs, cleanupOwnership = []) {
       });
       runList.append(toggle);
     }
+    if (!family.hidden) runList.append(family);
   }
   for (const ownership of [...cleanupOwnership].reverse()) {
     const description = document.createElement("div");
@@ -1617,6 +1657,45 @@ async function scheduleEventRefresh() {
   }
 }
 
+const externalTargetsForm = document.querySelector("#external-target-settings");
+const externalTargetsJson = document.querySelector("#external-targets-json");
+const externalTargetMessage = document.querySelector("#external-target-message");
+const saveExternalTargets = document.querySelector("#save-external-targets");
+let externalTargetsRequestGeneration = 0;
+
+function renderExternalTargets(settings) {
+  externalTargetsJson.value = JSON.stringify(settings.targets.map(({id, destination, tokenEnv}) => ({id, destination, tokenEnv})), null, 2);
+  document.querySelector("#external-target-credentials").textContent = settings.targets.map(target => `${target.id}: credentials ${target.credentialStatus}`).join("; ");
+}
+
+externalTargetsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (saveExternalTargets.disabled || saveExternalTargets.dataset.pending === "true") return;
+  const requestGeneration = externalTargetsRequestGeneration;
+  saveExternalTargets.dataset.pending = "true";
+  saveExternalTargets.setAttribute("aria-busy", "true");
+  saveExternalTargets.disabled = true;
+  try {
+    const settings = await request("/api/settings/external-targets", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({targets: JSON.parse(externalTargetsJson.value)}),
+    });
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    externalTargetMessage.textContent = "External targets saved.";
+  } catch (error) {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  } finally {
+    if (requestGeneration === externalTargetsRequestGeneration) {
+      delete saveExternalTargets.dataset.pending;
+      saveExternalTargets.removeAttribute("aria-busy");
+      saveExternalTargets.disabled = false;
+    }
+  }
+});
+
 function renderSettings(settings) {
   notificationsEnabled.checked = settings.enabled;
   notifySuccess.checked = settings.onSuccess;
@@ -2119,9 +2198,28 @@ checkedToggle.addEventListener("click", async () => {
 
 settingsOpen.addEventListener("click", () => {
   settingsDialog.showModal();
+  const requestGeneration = ++externalTargetsRequestGeneration;
+  delete saveExternalTargets.dataset.pending;
+  saveExternalTargets.removeAttribute("aria-busy");
+  saveExternalTargets.disabled = true;
+  externalTargetMessage.textContent = "Loading…";
+  request("/api/settings/external-targets").then(settings => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    renderExternalTargets(settings);
+    saveExternalTargets.disabled = false;
+    externalTargetMessage.textContent = "";
+  }).catch(error => {
+    if (requestGeneration !== externalTargetsRequestGeneration) return;
+    externalTargetMessage.textContent = String(error);
+  });
+});
+
+settingsDialog.addEventListener("close", () => {
+  if (!settingsDialog.open) ++externalTargetsRequestGeneration;
 });
 
 settingsClose.addEventListener("click", () => {
+  ++externalTargetsRequestGeneration;
   settingsDialog.close();
 });
 
