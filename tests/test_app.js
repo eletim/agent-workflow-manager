@@ -415,6 +415,7 @@ async function loadApp({
     location: context.window.location,
     eventSource: eventSources[0],
     logDisplay: context.runnerLogDisplay,
+    refresh: context.refresh,
   };
 }
 
@@ -2906,6 +2907,46 @@ test("SSE bursts coalesce to one active and one pending refresh", async () => {
     2,
   );
   assert.equal(elements.status.textContent, "✓ Success");
+});
+
+test("an older history response cannot regress known run identities", async () => {
+  const olderHistory = deferred();
+  const runs = [{runId: 1, state: "success", cwd: "/work/run-1"}];
+  let delayNextHistory = false;
+  let delayedHistory = false;
+  const {calls, elements, eventSource, refresh} = await loadApp({
+    runs,
+    details: {1: snapshot({runId: 1, state: "success", stdout: "saved"})},
+    validation: {status: 200, body: {validation: []}},
+    selectLatest: false,
+    fetchOverride(url) {
+      if (delayNextHistory && !delayedHistory && url === "/api/runs") {
+        delayedHistory = true;
+        return olderHistory.promise;
+      }
+      return undefined;
+    },
+  });
+
+  delayNextHistory = true;
+  eventSource.emit("runner-change");
+  await waitFor(() => delayedHistory);
+
+  // A newer reconciliation confirms Run #1 while the older request is still
+  // in flight. Its generation owns the known-history baseline.
+  await refresh();
+  olderHistory.resolve(response({runs: [], cleanupOwnership: []}));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const historyCalls = calls.filter(([url]) => url === "/api/runs").length;
+  eventSource.emit("runner-change");
+  await waitFor(() => (
+    calls.filter(([url]) => url === "/api/runs").length > historyCalls
+  ));
+
+  assert.equal(selectedRun(elements), undefined);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 });
 
 test("SSE refresh preserves the selected run while multiple runs change", async () => {

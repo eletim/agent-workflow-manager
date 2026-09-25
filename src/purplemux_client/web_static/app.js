@@ -179,6 +179,7 @@ let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
 let knownRunIds = null;
+let knownRunIdsGeneration = 0;
 // The last detail response accepted for the selected run. This is the only
 // source used when carrying a reusable folder into a new-run draft; list
 // summaries and rendered text are intentionally insufficient.
@@ -1733,10 +1734,12 @@ async function refresh() {
   try {
     const {runs, cleanupOwnership = []} = await request("/api/runs");
     if (selectionGeneration !== activeRunGeneration) return;
+    if (requestGeneration <= knownRunIdsGeneration) return;
     const newlyDiscoveredRuns = knownRunIds === null
       ? []
       : runs.filter((run) => !knownRunIds.has(run.runId));
     knownRunIds = new Set(runs.map((run) => run.runId));
+    knownRunIdsGeneration = requestGeneration;
     if (activeRunId === null && requestedRunIdentity !== null) {
       const linkedRun = runs.find((run) => run.identity === requestedRunIdentity);
       requestedRunIdentity = null;
