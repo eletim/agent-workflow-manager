@@ -81,6 +81,17 @@ this observation with Run history; it is not workflow recovery state and never
 participates in sequencing, retries, or any other decision made by the generated
 plain-Python Workflow.
 
+Before a run starts, the backend supplies a deterministic **Planned run preview**
+covering work-item planning, implementation, Scope / Design and Correctness
+reviews, review fixes, recovery, optional whole-version review and fixes, and the
+final integration PR. This is a capability preview, not a prediction: the
+generated workflow inspects Git and pull-request state as it runs, and those
+checks select the actual turns, retries, recovery work, warning continuations,
+and delivery path shown in Run detail. Planned phases therefore remain distinct
+from the ordered `agentTurns` and progress events that were actually observed.
+The exact prompt for an observed turn is retained without reconstruction but is
+disclosed only on demand by expanding that turn's prompt control in Run detail.
+
 ## Review mode
 
 Choose **Review** in the Runner to inspect local Git repositories or observe an

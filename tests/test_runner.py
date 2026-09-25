@@ -164,6 +164,53 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", repository="
         restored.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("turn_id", "1"),
+        ("purpose", 1),
+        ("prompt", 1),
+        ("role", 1),
+        ("attempt", "1"),
+        ("status", 1),
+        ("phase", 1),
+        ("work_item_id", []),
+        ("work_item_label", 1),
+        ("transition_outcome", 1),
+        ("commit_sha", 1),
+        ("result", 1),
+        ("error", 1),
+        ("previous_turn_id", True),
+        ("next_turn_id", True),
+        ("repository", 1),
+        ("started_at", 1),
+        ("completed_at", 1),
+    ],
+)
+def test_run_history_rejects_invalid_agent_turn_field_types(
+    tmp_path: Path, field: str, invalid: object
+) -> None:
+    history = tmp_path / "history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        code = """\
+from purplemux_client import emit_agent_turn
+emit_agent_turn(1, "Implement", "implementer", 1, "started", repository="acme/project", phase="implementation", work_item_id=90, work_item_label="Issue #90", commit_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", prompt="Do it")
+emit_agent_turn(1, "Implement", "implementer", 1, "completed", repository="acme/project", phase="implementation", work_item_id=90, work_item_label="Issue #90", transition_outcome="review", commit_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", result="done")
+"""
+        run_id = runner.start(code, issue_driven_json='{"mode":"issue-driven"}')
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+
+    saved = json.loads(history.read_text(encoding="utf-8"))
+    next(iter(saved["runs"].values()))["agentTurns"][0][field] = invalid
+    history.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(runner_module.RunHistoryError, match="unreadable"):
+        PythonRunner(managed_workflows=False, run_history_file=history)
+
+
 def test_legacy_agent_turn_without_repository_remains_accepted(
     runner: PythonRunner,
 ) -> None:
@@ -3964,7 +4011,17 @@ def test_issue_driven_generation_api_is_distinct_from_python_validation(
     assert generated["config"]["reviewer_agent"] == "codex"
     assert generated["runPreview"] == {
         "status": "planned",
-        "phases": ["Work items", "Whole-version review", "Final integration PR"],
+        "phases": [
+            "Work-item planning",
+            "Implementation",
+            "Scope / Design review",
+            "Correctness review",
+            "Review fixes",
+            "Recovery",
+            "Whole-version review",
+            "Whole-version fixes",
+            "Final integration PR",
+        ],
         "agents": [
             {
                 "role": "Implementer",

@@ -817,6 +817,45 @@ def test_validated_transition_traces_the_control_path_decision_once() -> None:
     )
 
 
+def test_validated_transition_can_wait_for_authoritative_branch_checks() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    result = review_result("CHANGES_REQUESTED", ("Fix the boundary check.",))
+    outcomes: list[str | None] = []
+    execution = workflow["_AgentTurnExecution"](
+        result,
+        1,
+        "Scope review",
+        "reviewer",
+        1,
+        "scope-review",
+        90,
+        "Issue #90",
+        "acme/project",
+    )
+    workflow["run_validated_turn"].__globals__["run_turn"] = lambda *_args, **_kwargs: (
+        execution
+    )
+    workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
+        lambda _execution, outcome: outcomes.append(outcome)
+    )
+    deferred: list[object] = []
+
+    assert workflow["run_validated_turn"](
+        object(),
+        "reviewer-tab",
+        "Scope review",
+        "Review this.",
+        workflow["decision"],
+        repository_identity="acme/project",
+        transition_outcome=lambda verdict: verdict.lower(),
+        _deferred_execution=deferred,
+    ) == (result, "CHANGES_REQUESTED")
+    assert outcomes == []
+
+    workflow["_complete_deferred_validated_turn"](deferred, "head_changed")
+    assert outcomes == ["head_changed"]
+
+
 def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     turns: list[str] = []

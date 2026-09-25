@@ -1510,7 +1510,20 @@ def issue_driven_run_preview(config: IssueDrivenConfig) -> IssueDrivenRunPreview
         else "and prepares delivery handoff."
     )
     return IssueDrivenRunPreview(
-        phases=issue_driven_workflow_outline(config),
+        phases=(
+            "Work-item planning",
+            "Implementation",
+            "Scope / Design review",
+            "Correctness review",
+            "Review fixes",
+            "Recovery",
+            *(
+                ("Whole-version review", "Whole-version fixes")
+                if config.final_review
+                else ()
+            ),
+            "Final integration PR",
+        ),
         agents=(
             IssueDrivenAgentPurpose(
                 role="Implementer",

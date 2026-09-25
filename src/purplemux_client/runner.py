@@ -1492,16 +1492,74 @@ class PythonRunner:
                 or isinstance(turn.attempt, bool)
                 or not isinstance(turn.attempt, int)
                 or turn.attempt < 1
+                or (
+                    turn.phase is not None
+                    and (not isinstance(turn.phase, str) or not turn.phase.strip())
+                )
+                or isinstance(turn.work_item_id, bool)
+                or (
+                    turn.work_item_id is not None
+                    and not isinstance(turn.work_item_id, (int, str))
+                )
+                or (isinstance(turn.work_item_id, int) and turn.work_item_id < 1)
+                or (
+                    isinstance(turn.work_item_id, str) and not turn.work_item_id.strip()
+                )
+                or (turn.work_item_id is None) != (turn.work_item_label is None)
+                or (
+                    turn.work_item_label is not None
+                    and (
+                        not isinstance(turn.work_item_label, str)
+                        or not turn.work_item_label.strip()
+                    )
+                )
+                or (
+                    turn.transition_outcome is not None
+                    and (
+                        turn.status != "completed"
+                        or not isinstance(turn.transition_outcome, str)
+                        or not turn.transition_outcome.strip()
+                    )
+                )
+                or (
+                    turn.previous_turn_id is not None
+                    and (
+                        isinstance(turn.previous_turn_id, bool)
+                        or not isinstance(turn.previous_turn_id, int)
+                        or turn.previous_turn_id < 1
+                    )
+                )
+                or (
+                    turn.next_turn_id is not None
+                    and (
+                        isinstance(turn.next_turn_id, bool)
+                        or not isinstance(turn.next_turn_id, int)
+                        or turn.next_turn_id < 1
+                    )
+                )
                 or turn.previous_turn_id != previous_id
                 or turn.next_turn_id != next_id
                 or (turn.status == "completed") != (turn.result is not None)
+                or (turn.result is not None and not isinstance(turn.result, str))
                 or (turn.status == "failed") != (turn.error is not None)
+                or (turn.error is not None and not isinstance(turn.error, str))
+                or (isinstance(turn.error, str) and not turn.error)
                 or (turn.status == "started" and turn.completed_at is not None)
                 or not isinstance(turn.started_at, str)
                 or (turn.status != "started" and not isinstance(turn.completed_at, str))
                 or (
+                    turn.repository is not None
+                    and (
+                        not isinstance(turn.repository, str)
+                        or not turn.repository.strip()
+                    )
+                )
+                or (
                     turn.commit_sha is not None
-                    and re.fullmatch(r"[0-9a-f]{40}", turn.commit_sha) is None
+                    and (
+                        not isinstance(turn.commit_sha, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", turn.commit_sha) is None
+                    )
                 )
             ):
                 raise ValueError

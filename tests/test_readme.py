@@ -49,6 +49,16 @@ def test_human_context_and_durable_decision_record_are_distinguished() -> None:
     assert "only the portion" in section
 
 
+def test_issue_driven_preview_and_observed_run_story_are_documented() -> None:
+    section = README.split("## Human context and durable decisions", maxsplit=1)[1]
+    section = section.split("## Review mode", maxsplit=1)[0]
+
+    assert "Planned run preview" in section
+    assert "capability preview, not a prediction" in section
+    assert "select the actual turns" in section
+    assert "disclosed only on demand" in section
+
+
 def test_git_delivery_example_verifies_agent_provenance() -> None:
     assert 'expected_agent="codex"' in README
     assert 'expected_process="implementation"' in README

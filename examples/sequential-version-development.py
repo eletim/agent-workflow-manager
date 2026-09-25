@@ -775,6 +775,24 @@ def _emit_completed_turn(
         pass
 
 
+def _deferred_turn_result(turn: str | _AgentTurnExecution) -> str:
+    return turn.result if isinstance(turn, _AgentTurnExecution) else turn
+
+
+def _complete_deferred_turn(
+    turn: str | _AgentTurnExecution, transition_outcome: str
+) -> None:
+    if isinstance(turn, _AgentTurnExecution):
+        _emit_completed_turn(turn, transition_outcome)
+
+
+def _complete_deferred_validated_turn(
+    executions: list[_AgentTurnExecution], transition_outcome: str
+) -> None:
+    if executions:
+        _emit_completed_turn(executions.pop(), transition_outcome)
+
+
 def run_turn(
     client: PurpleMuxCLIClient,
     tab: str,
@@ -837,6 +855,7 @@ def run_validated_turn(
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
+    _deferred_execution: list[_AgentTurnExecution] | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
     turn = run_turn(
@@ -900,7 +919,10 @@ def run_validated_turn(
             except Exception:
                 pass
         if isinstance(turn, _AgentTurnExecution):
-            _emit_completed_turn(turn, outcome)
+            if _deferred_execution is None:
+                _emit_completed_turn(turn, outcome)
+            else:
+                _deferred_execution.append(turn)
         return result, value
     raise AssertionError("unreachable")
 
@@ -963,6 +985,8 @@ def recover_error(
     config: Config,
     error: BaseException,
     authoritative_state: str,
+    *,
+    deferred_execution: list[_AgentTurnExecution] | None = None,
 ) -> RecoveryReport:
     """Start a dedicated recovery Agent for this error, never a resident agent."""
     if not isinstance(authoritative_state, str) or not authoritative_state.strip():
@@ -1012,9 +1036,7 @@ def recover_error(
             phase="recovery",
             work_item_id=work_item_id,
             work_item_label=work_item_label,
-            transition_outcome=lambda report: (
-                "retry_workflow" if report.retry_safe else "stop_workflow"
-            ),
+            _deferred_execution=deferred_execution,
         )
         return report
     finally:
@@ -2744,6 +2766,7 @@ def _review_issue_phase(
             and record.reviewed_sha == pr.head_sha
             and record.role == role
         )
+        review_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,
             reviewer,
@@ -2758,7 +2781,7 @@ def _review_issue_phase(
             phase=("scope-review" if phase == "scope/design" else "correctness-review"),
             work_item_id=issue.result_id,
             work_item_label=issue.label,
-            transition_outcome=lambda value: value.lower(),
+            _deferred_execution=review_execution,
         )
         emit_policy_conflicts(
             result,
@@ -2832,6 +2855,7 @@ def _review_issue_phase(
                 f"{phase} review changed {issue.branch}; outcome invalidated at "
                 f"{reviewed_sha}",
             )
+            _complete_deferred_validated_turn(review_execution, "head_changed")
             if restart_scope_on_change:
                 return IssueReviewPhaseResult(
                     pr, "head_changed", pr.head_sha, pr.base_sha, review_number
@@ -2847,6 +2871,7 @@ def _review_issue_phase(
                 head=issue.branch,
                 base=config.integration_branch,
             )
+            _complete_deferred_validated_turn(review_execution, "approved")
             return IssueReviewPhaseResult(
                 current, "approved", current.head_sha, current.base_sha, review_number
             )
@@ -2875,6 +2900,9 @@ def _review_issue_phase(
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
+            _complete_deferred_validated_turn(
+                review_execution, "continued_with_warning"
+            )
             return IssueReviewPhaseResult(
                 current,
                 "continued_with_warning",
@@ -2883,7 +2911,8 @@ def _review_issue_phase(
                 review_number,
                 (warning,),
             )
-        fix_result = run_turn(
+        _complete_deferred_validated_turn(review_execution, "changes_requested")
+        fix_turn = run_turn(
             client,
             implementer,
             f"{issue.label} {phase} fixes",
@@ -2905,8 +2934,9 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             phase="reviewer-fix",
             work_item_id=issue.result_id,
             work_item_label=issue.label,
-            transition_outcome="verify_fix",
+            _defer_trace=True,
         )
+        fix_result = _deferred_turn_result(fix_turn)
         emit_policy_conflicts(
             fix_result,
             config,
@@ -2950,6 +2980,7 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             print(f"WARN: {warning}", flush=True)
             terminal_progress("WARN CONTINUATION", f"{issue.label} {phase} review")
             emit_finding("git", warning, status="warning")
+            _complete_deferred_turn(fix_turn, "continued_with_warning")
             return IssueReviewPhaseResult(
                 current,
                 "continued_with_warning",
@@ -2978,6 +3009,9 @@ leave it clean and explain why; do not create an empty commit.\n\n{result}""",
             head=issue.branch,
             base=config.integration_branch,
             fix_sha=fixed_sha,
+        )
+        _complete_deferred_turn(
+            fix_turn, "restart_scope_review" if restart_scope_on_change else "re_review"
         )
         if restart_scope_on_change:
             return IssueReviewPhaseResult(
@@ -3252,7 +3286,7 @@ def process_issue(
     implementation_prompt, scope_prompt, correctness_prompt = issue_prompts(
         issue, config
     )
-    implementation_result = run_turn(
+    implementation_turn = run_turn(
         client,
         implementer,
         f"{issue.label} implementation",
@@ -3267,8 +3301,9 @@ def process_issue(
         phase="implementation",
         work_item_id=issue.result_id,
         work_item_label=issue.label,
-        transition_outcome="continue_to_scope_review",
+        _defer_trace=True,
     )
+    implementation_result = _deferred_turn_result(implementation_turn)
     emit_policy_conflicts(
         implementation_result,
         config,
@@ -3309,6 +3344,7 @@ def process_issue(
     pr = ensure_issue_pr_metadata(github, pr, issue, config)
     if pr.head_sha != implementation_sha:
         raise WorkerFailure("delivered PR head does not match committed result")
+    _complete_deferred_turn(implementation_turn, "continue_to_scope_review")
     emit_step(
         f"{issue.label}",
         "started",
@@ -4133,6 +4169,7 @@ def process_work_items(
         name="Work-item planner",
     )
     for planner_turn in range(1, MAX_PLANNER_TURNS + 1):
+        planning_execution: list[_AgentTurnExecution] = []
         _, planner_decision = run_validated_turn(
             client,
             planner,
@@ -4146,9 +4183,7 @@ def process_work_items(
             role="planner",
             iteration=planner_turn,
             phase="planning",
-            transition_outcome=lambda value: (
-                "planning_complete" if value.complete else "dispatch_work_item"
-            ),
+            _deferred_execution=planning_execution,
         )
         for conflict in planner_decision.policy_conflicts:
             record_policy_conflict(
@@ -4175,12 +4210,18 @@ def process_work_items(
             )
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
         if planner_decision.complete:
+            _complete_deferred_validated_turn(
+                planning_execution, "planning_complete"
+            )
             return plan.snapshot
         issue = plan.take_next()
         assert issue is not None
         plan.active = issue
         inspect_dynamic_work_item_topology(issue, config)
         plan_pr = persist_work_item_plan(plan, config, repo, github, plan_pr)
+        _complete_deferred_validated_turn(
+            planning_execution, "dispatch_work_item"
+        )
         run_outline_step(
             issue.label,
             lambda issue=issue: process_issue(issue, config, client, repo, github),
@@ -4466,6 +4507,7 @@ def _review_whole_version(
         whole_audit: ReviewAuditRecord | None = None
         changes_requested = bool(resumed_records)
         if scenario_reviewer is not None:
+            scenario_execution: list[_AgentTurnExecution] = []
             result, verdict = run_validated_turn(
                 client,
                 scenario_reviewer,
@@ -4482,7 +4524,7 @@ def _review_whole_version(
                 iteration=review_number,
                 pr=pr,
                 phase="whole-review",
-                transition_outcome=lambda value: value.lower(),
+                _deferred_execution=scenario_execution,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
             scenario_audit = allocate_review_audit(
@@ -4549,12 +4591,19 @@ def _review_whole_version(
                     "Scenario Gate review changed the integration branch; "
                     f"approval invalidated at {scenario_sha}",
                 )
+                _complete_deferred_validated_turn(
+                    scenario_execution, "head_changed"
+                )
                 continue
             review_results.append(result)
             changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
+            _complete_deferred_validated_turn(
+                scenario_execution, verdict.lower()
+            )
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
+        principles_execution: list[_AgentTurnExecution] = []
         principles_result, principles_verdict = run_validated_turn(
             client,
             design_principles_reviewer,
@@ -4571,7 +4620,7 @@ def _review_whole_version(
             iteration=review_number,
             pr=pr,
             phase="whole-review",
-            transition_outcome=lambda value: value.lower(),
+            _deferred_execution=principles_execution,
         )
         review_results.append(principles_result)
         changes_requested = (
@@ -4648,7 +4697,14 @@ def _review_whole_version(
                 "design-principles review changed the integration branch; "
                 f"approval invalidated at {principles_sha}",
             )
+            _complete_deferred_validated_turn(
+                principles_execution, "head_changed"
+            )
             continue
+        _complete_deferred_validated_turn(
+            principles_execution, principles_verdict.lower()
+        )
+        whole_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,
             reviewer,
@@ -4665,7 +4721,7 @@ def _review_whole_version(
             iteration=review_number,
             pr=pr,
             phase="whole-review",
-            transition_outcome=lambda value: value.lower(),
+            _deferred_execution=whole_execution,
         )
         review_results.append(result)
         changes_requested = changes_requested or verdict == "CHANGES_REQUESTED"
@@ -4733,7 +4789,10 @@ def _review_whole_version(
                 "whole-version review changed the integration branch; "
                 f"approval invalidated at {reviewed_sha}",
             )
+            _complete_deferred_validated_turn(whole_execution, "head_changed")
             continue
+        _complete_deferred_validated_turn(whole_execution, verdict.lower())
+        version_execution: list[_AgentTurnExecution] = []
         version_result, version_verdict = run_validated_turn(
             client,
             version_readme_reviewer,
@@ -4750,7 +4809,7 @@ def _review_whole_version(
             iteration=review_number,
             pr=pr,
             phase="whole-review",
-            transition_outcome=lambda value: value.lower(),
+            _deferred_execution=version_execution,
         )
         review_results.append(version_result)
         changes_requested = changes_requested or version_verdict == "CHANGES_REQUESTED"
@@ -4823,7 +4882,11 @@ def _review_whole_version(
                 "version and README review changed the integration branch; "
                 f"approval invalidated at {reviewed_sha}",
             )
+            _complete_deferred_validated_turn(version_execution, "head_changed")
             continue
+        _complete_deferred_validated_turn(
+            version_execution, version_verdict.lower()
+        )
         result = "\n\n".join(
             review_result
             for review_result in review_results
@@ -4857,7 +4920,7 @@ def _review_whole_version(
                     base=config.main_branch,
                 )
             else:
-                fix_result = run_turn(
+                fix_turn = run_turn(
                     client,
                     fixer,
                     "Whole-version fixes",
@@ -4874,8 +4937,9 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     branch=config.integration_branch,
                     expected_process="reviewer-fix",
                     phase="whole-fix",
-                    transition_outcome="verify_fix",
+                    _defer_trace=True,
                 )
+                fix_result = _deferred_turn_result(fix_turn)
                 emit_policy_conflicts(fix_result, config, scope="whole-version fixes")
                 fixed_sha, changed = require_agent_result(
                     repo,
@@ -4911,6 +4975,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                         base=config.main_branch,
                         fix_sha=fixed_sha,
                     )
+                    _complete_deferred_turn(fix_turn, "re_review")
                     continue
                 current = ensure_base_pr_policy_notes(github, current, config)
                 current = review_audit_dispositions(
@@ -4927,6 +4992,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                     "keeping the Base PR Draft and continuing without reviewer "
                     "approval."
                 )
+                _complete_deferred_turn(fix_turn, "continued_with_warning")
         run_final_checks(client, config)
         checked_sha, checks_changed = require_agent_result(
             repo,
@@ -5624,7 +5690,14 @@ def run_repository(
                     "repository recovery requires a local branch commit"
                 ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
-            report = recover_error(client, config, exc, state)
+            recovery_execution: list[_AgentTurnExecution] = []
+            report = recover_error(
+                client,
+                config,
+                exc,
+                state,
+                deferred_execution=recovery_execution,
+            )
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
@@ -5638,9 +5711,15 @@ def run_repository(
                 expected_process="recovery",
             )
             if not report.repaired or not report.retry_safe:
+                _complete_deferred_validated_turn(
+                    recovery_execution, "stop_workflow"
+                )
                 raise
             require_recovery_retry_state(
                 recovery_authoritative_state(config, repo, github, plan), state
+            )
+            _complete_deferred_validated_turn(
+                recovery_execution, "retry_workflow"
             )
             emit_finding(
                 "runtime",

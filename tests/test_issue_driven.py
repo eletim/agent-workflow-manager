@@ -29,6 +29,7 @@ from purplemux_client.issue_driven import (
     IssueDrivenValidationError,
     classify_issue_topology,
     generate_issue_driven_workflow,
+    issue_driven_run_preview,
     parse_issue_driven_json,
 )
 from purplemux_client.preflight import MAX_OUTLINE_ITEMS, WorkflowValidator
@@ -2568,6 +2569,25 @@ def test_generated_outline_keeps_dynamic_work_items_in_one_run_unit(
     assert "Implement and independently review" not in code
 
 
+@pytest.mark.parametrize("final_review", [True, False])
+def test_run_preview_covers_every_possible_agent_phase(final_review: bool) -> None:
+    preview = issue_driven_run_preview(
+        parse(payload(issues=[91], final_review=final_review))
+    )
+
+    assert preview.phases[:6] == (
+        "Work-item planning",
+        "Implementation",
+        "Scope / Design review",
+        "Correctness review",
+        "Review fixes",
+        "Recovery",
+    )
+    assert ("Whole-version review" in preview.phases) is final_review
+    assert ("Whole-version fixes" in preview.phases) is final_review
+    assert preview.phases[-1] == "Final integration PR"
+
+
 def test_generated_outline_step_reports_completed_skipped_issue_and_failures() -> None:
     code = generate_issue_driven_workflow(parse(payload(issues=[114])))
     module_name = "generated_issue_outline_workflow"
@@ -2724,9 +2744,16 @@ def test_generated_workflow_classifies_all_issue_driven_turn_phases() -> None:
         "recovery",
     ):
         assert f'"{phase}"' in source
-    assert 'transition_outcome="continue_to_scope_review"' in source
-    assert 'transition_outcome="verify_fix"' in source
-    assert '"retry_workflow" if report.retry_safe else "stop_workflow"' in source
+    assert (
+        '_complete_deferred_turn(implementation_turn, "continue_to_scope_review")'
+        in source
+    )
+    assert '_complete_deferred_turn(fix_turn, "re_review")' in source
+    assert 'transition_outcome="verify_fix"' not in source
+    assert (
+        '_complete_deferred_validated_turn(\n                recovery_execution, '
+        '"retry_workflow"'
+    ) in source
 
 
 def test_agent_turn_trace_failure_cannot_change_workflow_result() -> None:
@@ -2795,9 +2822,8 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     def run_validated(client, agent, name, prompt, validator, *, role, **kwargs):
         assert role == "recovery"
         assert kwargs["phase"] == "recovery"
-        assert kwargs["transition_outcome"](
-            workflow["RecoveryReport"](True, True, "ok", "evidence")
-        ) == "retry_workflow"
+        assert kwargs["_deferred_execution"] is None
+        assert "transition_outcome" not in kwargs
         prompts.append(prompt)
         return "", validator(
             json.dumps(
@@ -2902,7 +2928,7 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
     workflow["prepare_work_item_plan_pr"] = fail_plan
     received: list[tuple[object, object, object, str]] = []
 
-    def recover(client, config, error, state):
+    def recover(client, config, error, state, **_kwargs):
         received.append((client, config, error, state))
         return workflow["RecoveryReport"](
             False, False, "No repair was safe.", "State checked."
@@ -2964,7 +2990,7 @@ def test_repository_recovery_rejects_unrecoverable_report(
         raise WorkerFailure("plan failed")
 
     workflow["prepare_work_item_plan_pr"] = fail_plan
-    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
         repaired, retry_safe, "No safe continuation.", "Inspected state."
     )
     workflow["emit_finding"] = lambda *args, **kwargs: pytest.fail(
@@ -3031,7 +3057,7 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
         return None, plan
 
     workflow["prepare_work_item_plan_pr"] = prepare
-    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
         True, True, "Repaired plan.", "Inspected remote state."
     )
     workflow["process_work_items"] = lambda *args: ()
@@ -3099,7 +3125,7 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
         attempts.append(1),
         (_ for _ in ()).throw(WorkerFailure("plan failed")),
     )
-    workflow["recover_error"] = lambda *args: workflow["RecoveryReport"](
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
         True, True, "Repaired plan.", "Inspected remote state."
     )
     findings: list[tuple[str, str, str]] = []
@@ -3223,7 +3249,7 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
     workflow["prepare_work_item_plan_pr"] = fail
     recoveries: list[int] = []
 
-    def recover(*args):
+    def recover(*args, **kwargs):
         recoveries.append(1)
         return workflow["RecoveryReport"](
             True, True, "Repaired plan.", "Inspected remote state."
