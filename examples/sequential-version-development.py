@@ -962,8 +962,9 @@ def recover_error(
                 work_item_id = active["issue"]
                 work_item_label = f"Issue #{work_item_id}"
             elif isinstance(active.get("id"), str):
-                work_item_id = active["id"]
-                work_item_label = f"Mini task {work_item_id}"
+                task_id = active["id"]
+                work_item_id = f"mini-task:{task_id}"
+                work_item_label = f"Mini task {task_id}"
     except (AttributeError, TypeError, ValueError):
         pass
     agent = create_agent(

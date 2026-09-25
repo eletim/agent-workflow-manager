@@ -2816,6 +2816,33 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     assert closed == ["recovery-1", "recovery-2"]
 
 
+def test_recovery_traces_inline_work_item_context_with_result_id() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    trace_contexts: list[tuple[object, object]] = []
+    client = SimpleNamespace(close_session=lambda agent: None)
+    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
+
+    def run_validated(*args, **kwargs):
+        trace_contexts.append((kwargs["work_item_id"], kwargs["work_item_label"]))
+        return "", workflow["RecoveryReport"](True, True, "ok", "evidence")
+
+    workflow["run_validated_turn"] = run_validated
+    authoritative_state = json.dumps(
+        {"work_item_plan": {"active": {"id": "instrument-inline"}}}
+    )
+
+    workflow["recover_error"](
+        client, config, RuntimeError("first"), authoritative_state
+    )
+
+    assert trace_contexts == [
+        ("mini-task:instrument-inline", "Mini task instrument-inline")
+    ]
+
+
 def test_recovery_closes_agent_when_its_turn_fails() -> None:
     workflow = load_generated_workflow(issues=[90])
     config = workflow["Config"](
