@@ -426,9 +426,13 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
         driver.find_element(
             By.CSS_SELECTOR, f'[data-run-id="{recovered_run_id}"]'
         ).click()
-        recovery = wait.until(
-            lambda browser: browser.find_element(By.ID, "workflow-recovery-transition")
+        wait.until(
+            lambda browser: (
+                f"Run #{failed_run_id} (FAILED) → Run #{recovered_run_id}"
+                in browser.find_element(By.ID, "workflow-recovery-transition").text
+            )
         )
+        recovery = driver.find_element(By.ID, "workflow-recovery-transition")
         assert f"Run #{failed_run_id} (FAILED)" in recovery.text
         assert f"→ Run #{recovered_run_id}" in recovery.text
 
