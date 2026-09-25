@@ -294,3 +294,182 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         assert driver.find_element(By.ID, "stdout").is_displayed()
     finally:
         driver.quit()
+
+
+def test_issue_driven_story_survives_failure_recovery_and_browser_reload() -> None:
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if chrome is None:
+        pytest.skip("Chrome or Chromium is required for the HTTP browser smoke test")
+
+    exact_prompt = (
+        "Review the authoritative head exactly.\n"
+        "This sentinel comes only from the backend trace: 現実-🎯-actual."
+    )
+    workflow = f"""\
+from purplemux_client import (emit_agent_turn, emit_issue_driven_context, emit_issue_navigation)
+WORKFLOW_OUTLINE = ["Work items", "Final integration PR"]
+emit_issue_driven_context("acme/project", "dev/v1", "main")
+emit_issue_navigation("mini-task:ux", 40, "https://github.com/acme/project/pull/40", workspace_id="ws-story", implementation_tab_id="tab-implementation", scope_review_tab_id="tab-scope", correctness_review_tab_id="tab-correctness", label="Mini task ux")
+emit_agent_turn(1, "Review the implementation", "reviewer", 1, "started", repository="acme/project", phase="correctness-review", work_item_id="mini-task:ux", work_item_label="Mini task ux", commit_sha={"a" * 40!r}, prompt={exact_prompt!r})
+emit_agent_turn(1, "Review the implementation", "reviewer", 1, "completed", repository="acme/project", phase="correctness-review", work_item_id="mini-task:ux", work_item_label="Mini task ux", transition_outcome="changes_requested", commit_sha={"a" * 40!r}, result="CHANGES_REQUESTED")
+emit_agent_turn(2, "Fix the requested changes", "implementer", 1, "started", repository="acme/project", phase="fix", work_item_id="mini-task:ux", work_item_label="Mini task ux", commit_sha={"a" * 40!r}, prompt="Apply only the requested fix.")
+emit_agent_turn(2, "Fix the requested changes", "implementer", 1, "failed", repository="acme/project", phase="fix", work_item_id="mini-task:ux", work_item_label="Mini task ux", commit_sha={"a" * 40!r}, error="agent stopped before producing a result")
+raise RuntimeError("workflow failed after the authoritative turn failure")
+"""
+    preview = {
+        "status": "planned",
+        "phases": ["Work items", "Final integration PR"],
+        "agents": [
+            {
+                "role": "Reviewer",
+                "agent": "codex",
+                "purpose": "Reviews each implementation head.",
+            }
+        ],
+    }
+    issue_driven_json = '{"mode":"issue-driven","one_shot_issue":322}'
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    server = None
+    thread = None
+    driver = None
+    try:
+        failed_run_id = runner.start(
+            workflow,
+            issue_driven_json=issue_driven_json,
+            issue_driven_preview=preview,
+        )
+        deadline = time.monotonic() + 5
+        while (
+            runner.snapshot(failed_run_id).state == "running"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert runner.snapshot(failed_run_id).state == "failed"
+
+        recovered_run_id = runner.resume(failed_run_id)
+        deadline = time.monotonic() + 5
+        while (
+            runner.snapshot(recovered_run_id).state == "running"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert runner.snapshot(recovered_run_id).state == "failed"
+        authoritative_traces = {
+            run_id: runner.snapshot(run_id).as_json()["agentTurns"]
+            for run_id in (failed_run_id, recovered_run_id)
+        }
+
+        server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+
+        options = Options()
+        options.binary_location = chrome
+        for argument in (
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-proxy-server",
+        ):
+            options.add_argument(argument)
+        driver = webdriver.Chrome(options=options)
+        driver.get(url)
+        wait = WebDriverWait(driver, 5)
+
+        wait.until(
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-mode"
+            ).is_displayed()
+        )
+        assert driver.find_element(By.ID, "issue-driven-fields").is_displayed()
+        assert not driver.find_element(By.ID, "workflow-fields").is_displayed()
+        developer_views = driver.find_element(By.ID, "developer-views")
+        assert developer_views.get_attribute("open") is None
+        driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
+        driver.find_element(By.ID, "runtime-view").click()
+
+        failed_item = wait.until(
+            lambda browser: browser.find_element(
+                By.CSS_SELECTOR, f'[data-run-id="{failed_run_id}"]'
+            )
+        )
+        failed_item.click()
+        wait.until(
+            lambda browser: (
+                "ACTUAL" in browser.find_element(By.ID, "workflow-story-state").text
+            )
+        )
+        assert driver.find_element(By.ID, "outline-title").text == (
+            "Planned run preview"
+        )
+        assert (
+            "not actual execution"
+            in driver.find_element(By.ID, "outline-description").text
+        )
+        turns = driver.find_elements(By.CSS_SELECTOR, "#agent-turns > .agent-turn")
+        assert len(turns) == 2
+        assert "Changes Requested" in turns[0].text
+        assert "Correctness Review → Fix" in turns[0].text
+        assert "agent stopped before producing a result" in turns[1].text
+
+        prompt_details = turns[0].find_element(
+            By.CSS_SELECTOR, "details.agent-turn-prompt"
+        )
+        assert prompt_details.get_attribute("open") is None
+        assert prompt_details.find_element(By.TAG_NAME, "summary").text == (
+            "Show exact actual prompt"
+        )
+        prompt_details.find_element(By.TAG_NAME, "summary").click()
+        assert prompt_details.find_element(By.TAG_NAME, "pre").text == exact_prompt
+
+        driver.find_element(
+            By.CSS_SELECTOR, f'[data-run-id="{recovered_run_id}"]'
+        ).click()
+        recovery = wait.until(
+            lambda browser: browser.find_element(By.ID, "workflow-recovery-transition")
+        )
+        assert f"Run #{failed_run_id} (FAILED)" in recovery.text
+        assert f"→ Run #{recovered_run_id}" in recovery.text
+
+        driver.refresh()
+        wait.until(
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-mode"
+            ).is_displayed()
+        )
+        assert not driver.find_elements(By.CSS_SELECTOR, "#run-list .run-item.selected")
+        assert (
+            driver.find_element(By.ID, "developer-views").get_attribute("open") is None
+        )
+        driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
+        driver.find_element(By.ID, "runtime-view").click()
+        driver.find_element(
+            By.CSS_SELECTOR, f'[data-run-id="{recovered_run_id}"]'
+        ).click()
+        wait.until(
+            lambda browser: (
+                exact_prompt
+                in browser.find_element(By.ID, "agent-turns").get_attribute(
+                    "textContent"
+                )
+            )
+        )
+
+        assert [item.run_id for item in runner.snapshots()] == [
+            failed_run_id,
+            recovered_run_id,
+        ]
+        for run_id, trace in authoritative_traces.items():
+            snapshot = runner.snapshot(run_id)
+            assert snapshot.state == "failed"
+            assert snapshot.as_json()["agentTurns"] == trace
+    finally:
+        if driver is not None:
+            driver.quit()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join()
+        runner.close()
