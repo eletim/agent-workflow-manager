@@ -376,6 +376,12 @@ a { color: #bcaaff; }
 .outline-panel { margin-top: 14px; }
 .outline-panel h2 { margin: 0 0 10px; }
 .outline-description { margin: 0 0 10px; color: #9ba3b5; }
+.workflow-story-state {
+  margin: 0 0 10px;
+  color: #e8eaf0;
+  font-weight: 600;
+}
+.workflow-story-navigation { margin: 0 0 12px; overflow-wrap: anywhere; }
 .outline-list {
   display: grid;
   gap: 6px;
@@ -406,6 +412,47 @@ a { color: #bcaaff; }
 .outline-agents[hidden] { display: none; }
 .outline-agents dt { color: #e8eaf0; font-weight: 600; }
 .outline-agents dd { margin: 0; color: #9ba3b5; }
+.actual-story-title { margin: 18px 0 0; font-size: 15px; }
+.agent-turn-list {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.agent-turn {
+  padding: 10px 12px;
+  border: 1px solid #343a4a;
+  border-radius: 7px;
+  background: #191d27;
+}
+.agent-turn.current { border-color: #a57b1b; background: #29230f; }
+.agent-turn.failed { border-color: #7d4148; }
+.agent-turn-heading { font-weight: 650; overflow-wrap: anywhere; }
+.agent-turn-current {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #765c1f;
+  color: #ffe7a3;
+  font-size: 10px;
+}
+.agent-turn-purpose, .agent-turn-outcome, .agent-turn-navigation,
+.agent-turn-transition { margin: 6px 0 0; overflow-wrap: anywhere; }
+.agent-turn-purpose, .agent-turn-outcome { color: #c8d0df; }
+.agent-turn-navigation { font-size: 13px; }
+.agent-turn-transition { color: #9fc5ff; font-size: 13px; font-weight: 600; }
+.agent-turn-prompt, .agent-turn-result { margin-top: 8px; }
+.agent-turn-prompt summary, .agent-turn-result summary {
+  cursor: pointer;
+  color: #9fc5ff;
+  font-size: 13px;
+}
+.agent-turn-prompt pre, .agent-turn-result pre {
+  min-height: 0;
+  max-height: 280px;
+  margin-top: 7px;
+  font-size: 12px;
+}
 
 .integration-pr-panel, .issue-summary-panel, .progress-panel { margin-top: 14px; }
 .integration-pr-panel h2 { margin: 0 0 10px; }

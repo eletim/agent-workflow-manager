@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -93,10 +94,12 @@ def emit_agent_turn(
     attempt: int,
     status: Literal["started", "completed", "failed"],
     *,
+    repository: str | None = None,
     phase: str | None = None,
     work_item_id: int | str | None = None,
     work_item_label: str | None = None,
     transition_outcome: str | None = None,
+    commit_sha: str | None = None,
     prompt: str | None = None,
     result: str | None = None,
     error: str | None = None,
@@ -113,6 +116,10 @@ def emit_agent_turn(
         raise ValueError("agent turn purpose must be a non-empty string")
     if not isinstance(role, str) or not role.strip():
         raise ValueError("agent turn role must be a non-empty string")
+    if repository is not None and (
+        not isinstance(repository, str) or not repository.strip()
+    ):
+        raise ValueError("agent turn repository must be a non-empty string or None")
     if phase is not None and (not isinstance(phase, str) or not phase.strip()):
         raise ValueError("agent turn phase must be a non-empty string or None")
     if isinstance(work_item_id, bool) or (
@@ -151,6 +158,8 @@ def emit_agent_turn(
             raise ValueError("a failed agent turn cannot have a transition outcome")
     else:
         raise ValueError("agent turn status must be started, completed, or failed")
+    if commit_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        raise ValueError("agent turn commit_sha must be a full lowercase Git SHA")
 
     payload: dict[str, object] = {
         "turn_id": turn_id,
@@ -159,6 +168,8 @@ def emit_agent_turn(
         "attempt": attempt,
         "status": status,
     }
+    if repository is not None:
+        payload["repository"] = repository
     if phase is not None:
         payload["phase"] = phase
     if work_item_id is not None:
@@ -166,6 +177,8 @@ def emit_agent_turn(
         payload["work_item_label"] = work_item_label
     if transition_outcome is not None:
         payload["transition_outcome"] = transition_outcome
+    if commit_sha is not None:
+        payload["commit_sha"] = commit_sha
     if prompt is not None:
         payload["prompt"] = prompt
     if result is not None:

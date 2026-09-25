@@ -165,6 +165,7 @@ class AgentTurnTrace:
     work_item_id: int | str | None = None
     work_item_label: str | None = None
     transition_outcome: str | None = None
+    commit_sha: str | None = None
     result: str | None = None
     error: str | None = None
     previous_turn_id: int | None = None
@@ -189,10 +190,12 @@ class _AgentTurnTransition:
     role: str
     attempt: int
     status: AgentTurnStatus
+    repository: str | None
     phase: str | None = None
     work_item_id: int | str | None = None
     work_item_label: str | None = None
     transition_outcome: str | None = None
+    commit_sha: str | None = None
     prompt: str | None = None
     result: str | None = None
     error: str | None = None
@@ -503,6 +506,7 @@ def _agent_turn_json(turn: AgentTurnTrace) -> dict[str, object]:
         "workItemId": turn.work_item_id,
         "workItemLabel": turn.work_item_label,
         "transitionOutcome": turn.transition_outcome,
+        "commitSha": turn.commit_sha,
         "result": turn.result,
         "error": turn.error,
         "previousTurnId": turn.previous_turn_id,
@@ -511,6 +515,33 @@ def _agent_turn_json(turn: AgentTurnTrace) -> dict[str, object]:
         "startedAt": turn.started_at,
         "completedAt": turn.completed_at,
     }
+
+
+def _validated_issue_driven_preview(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"status", "phases", "agents"}:
+        raise ValueError("invalid Issue Driven run preview")
+    phases = value.get("phases")
+    agents = value.get("agents")
+    if (
+        value.get("status") != "planned"
+        or not isinstance(phases, list)
+        or not phases
+        or any(not isinstance(phase, str) or not phase for phase in phases)
+        or not isinstance(agents, list)
+        or not agents
+    ):
+        raise ValueError("invalid Issue Driven run preview")
+    copied_agents: list[dict[str, str]] = []
+    for agent in agents:
+        if not isinstance(agent, dict) or set(agent) != {"role", "agent", "purpose"}:
+            raise ValueError("invalid Issue Driven run preview")
+        if any(
+            not isinstance(agent.get(key), str) or not agent[key]
+            for key in ("role", "agent", "purpose")
+        ):
+            raise ValueError("invalid Issue Driven run preview")
+        copied_agents.append(cast(dict[str, str], dict(agent)))
+    return {"status": "planned", "phases": list(phases), "agents": copied_agents}
 
 
 @dataclass(frozen=True)
@@ -554,10 +585,12 @@ class RunnerSnapshot:
     issue_driven_repositories: tuple[IssueDrivenRepositorySummary, ...] = ()
     identity: str | None = None
     issue_driven_json: str | None = None
+    issue_driven_preview: dict[str, object] | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
     review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
+    resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
     agent_turns: tuple[AgentTurnTrace, ...] = ()
@@ -580,12 +613,16 @@ class RunnerSnapshot:
             else "workflow"
         )
         issue_driven_json = payload.pop("issue_driven_json")
+        issue_driven_preview = payload.pop("issue_driven_preview")
         environment_setup_json = payload.pop("environment_setup_json")
         review_json = payload.pop("review_json")
         review_result = payload.pop("review_result")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
+        resumed_from_state = payload.pop("resumed_from_state")
         if issue_driven_json is not None:
             payload["issueDrivenJson"] = issue_driven_json
+            if issue_driven_preview is not None:
+                payload["runPreview"] = issue_driven_preview
         if environment_setup_json is not None:
             payload["environmentSetupJson"] = environment_setup_json
         if review_json is not None:
@@ -593,6 +630,11 @@ class RunnerSnapshot:
             payload["reviewResult"] = review_result
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
+            payload["recoverySource"] = {
+                "runId": resumed_from_run_id,
+                "identity": f"{cast(str, self.identity).rsplit('-', 1)[0]}-{resumed_from_run_id}",
+                "state": resumed_from_state,
+            }
         if self.prompt is not None:
             payload["prompt"] = self.prompt.as_json()
             payload["repository"] = self.prompt.repository_json()
@@ -955,10 +997,12 @@ class _RunRecord:
     )
     issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
+    issue_driven_preview: dict[str, object] | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
     review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
+    resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
     agent_turns: list[AgentTurnTrace] = field(default_factory=list)
@@ -1202,10 +1246,12 @@ class PythonRunner:
             ],
             "checked": run.checked,
             "issueDrivenJson": run.issue_driven_json,
+            "issueDrivenPreview": run.issue_driven_preview,
             "environmentSetupJson": run.environment_setup_json,
             "reviewJson": run.review_json,
             "reviewResult": run.review_result,
             "resumedFromRunId": run.resumed_from_run_id,
+            "resumedFromState": run.resumed_from_state,
             "agentTurns": [asdict(turn) for turn in run.agent_turns],
         }
 
@@ -1302,10 +1348,12 @@ class PythonRunner:
         outline = value.get("outline")
         exit_code = value.get("exitCode")
         issue_driven_json = value.get("issueDrivenJson")
+        issue_driven_preview_value = value.get("issueDrivenPreview")
         environment_setup_json = value.get("environmentSetupJson")
         review_json = value.get("reviewJson")
         review_result = value.get("reviewResult")
         resumed_from_run_id = value.get("resumedFromRunId")
+        resumed_from_state = value.get("resumedFromState")
         if (
             isinstance(run_id, bool)
             or not isinstance(run_id, int)
@@ -1339,7 +1387,36 @@ class PythonRunner:
                     or resumed_from_run_id >= run_id
                 )
             )
+            or (
+                resumed_from_state is not None
+                and (
+                    resumed_from_run_id is None
+                    or resumed_from_state not in ("failed", "stopped")
+                )
+            )
         ):
+            raise ValueError
+        issue_driven_preview = (
+            _validated_issue_driven_preview(issue_driven_preview_value)
+            if issue_driven_preview_value is not None
+            else None
+        )
+        if issue_driven_preview is None and issue_driven_json is not None:
+            from purplemux_client.issue_driven import (
+                issue_driven_run_preview,
+                parse_issue_driven_json,
+            )
+
+            try:
+                issue_driven_preview = issue_driven_run_preview(
+                    parse_issue_driven_json(issue_driven_json)
+                ).as_json()
+            except (TypeError, ValueError):
+                # Early v1 histories did not validate or persist their preview.
+                # Keep otherwise readable legacy records available when their
+                # saved input no longer satisfies the current input schema.
+                pass
+        if issue_driven_preview is not None and issue_driven_json is None:
             raise ValueError
         if review_result is not None:
             from purplemux_client.review import validate_review_result
@@ -1422,6 +1499,10 @@ class PythonRunner:
                 or (turn.status == "started" and turn.completed_at is not None)
                 or not isinstance(turn.started_at, str)
                 or (turn.status != "started" and not isinstance(turn.completed_at, str))
+                or (
+                    turn.commit_sha is not None
+                    and re.fullmatch(r"[0-9a-f]{40}", turn.commit_sha) is None
+                )
             ):
                 raise ValueError
         if any(
@@ -1676,10 +1757,14 @@ class PythonRunner:
             issue_driven_repositories=issue_driven_repositories,
             checked=checked,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
             review_result=review_result,
             resumed_from_run_id=resumed_from_run_id,
+            resumed_from_state=cast(
+                Literal["failed", "stopped"] | None, resumed_from_state
+            ),
             parent_run=parent_run,
             child_runs=tuple(child_runs),
             agent_turns=agent_turns,
@@ -1785,6 +1870,16 @@ class PythonRunner:
                 and isinstance(run, dict)
                 and run.get("identity") == identity
             ]
+            restored_by_id = {run.run_id: run for run in restored}
+            for run in restored:
+                if (
+                    run.resumed_from_run_id is None
+                    or run.resumed_from_state is not None
+                ):
+                    continue
+                source = restored_by_id.get(run.resumed_from_run_id)
+                if source is not None and source.state in ("failed", "stopped"):
+                    run.resumed_from_state = source.state
             restored_ownership = [
                 self._cleanup_ownership_from_history(ownership)
                 for identity, ownership in cleanup_ownership.items()
@@ -2035,9 +2130,11 @@ class PythonRunner:
         args: Sequence[str] = (),
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
+        issue_driven_preview: Mapping[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
     ) -> int:
@@ -2046,6 +2143,13 @@ class PythonRunner:
             if parent_run_id is not None:
                 raise ValueError("provide only one parent reference")
         run_cwd, run_args, child_env = self._execution_context(args)
+        stored_preview = (
+            _validated_issue_driven_preview(dict(issue_driven_preview))
+            if issue_driven_preview is not None
+            else None
+        )
+        if stored_preview is not None and issue_driven_json is None:
+            raise ValueError("Issue Driven run preview requires issueDrivenJson")
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -2069,9 +2173,11 @@ class PythonRunner:
                     child_env=child_env,
                     prompt=prompt,
                     issue_driven_json=issue_driven_json,
+                    issue_driven_preview=stored_preview,
                     environment_setup_json=environment_setup_json,
                     review_json=review_json,
                     resumed_from_run_id=resumed_from_run_id,
+                    resumed_from_state=resumed_from_state,
                     parent_run_id=parent_run_id,
                     parent_identity=parent_identity,
                 )
@@ -2091,11 +2197,15 @@ class PythonRunner:
             code = source.code
             args = source.args
             issue_driven_json = source.issue_driven_json
+            issue_driven_preview = source.issue_driven_preview
+            resumed_from_state = source.state
         return self.start(
             code,
             args=args,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             resumed_from_run_id=run_id,
+            resumed_from_state=resumed_from_state,
         )
 
     def _start_validated(
@@ -2108,9 +2218,11 @@ class PythonRunner:
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
+        issue_driven_preview: dict[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
     ) -> int:
@@ -2129,9 +2241,11 @@ class PythonRunner:
                 run_args=run_args,
                 child_env=child_env,
                 issue_driven_json=issue_driven_json,
+                issue_driven_preview=issue_driven_preview,
                 environment_setup_json=environment_setup_json,
                 review_json=review_json,
                 resumed_from_run_id=resumed_from_run_id,
+                resumed_from_state=resumed_from_state,
                 parent_run_id=parent_run_id,
                 parent_identity=parent_identity,
             )
@@ -2153,9 +2267,11 @@ class PythonRunner:
             warning_findings=deque(maxlen=self._max_progress_events),
             prompt=prompt,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
             resumed_from_run_id=resumed_from_run_id,
+            resumed_from_state=resumed_from_state,
         )
         self._runs[run_id] = run
         try:
@@ -2336,9 +2452,11 @@ class PythonRunner:
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
         issue_driven_json: str | None = None,
+        issue_driven_preview: dict[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
     ) -> int:
@@ -2395,9 +2513,11 @@ class PythonRunner:
             agent_turn_trace_path=agent_turn_trace_path,
             event_token=event_token,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
             resumed_from_run_id=resumed_from_run_id,
+            resumed_from_state=resumed_from_state,
         )
         self._runs[run_id] = run
         correlation = self._run_identity(run_id)
@@ -2803,10 +2923,12 @@ class PythonRunner:
             ),
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
+            issue_driven_preview=run.issue_driven_preview,
             environment_setup_json=run.environment_setup_json,
             review_json=run.review_json,
             review_result=run.review_result if run.state == "success" else None,
             resumed_from_run_id=run.resumed_from_run_id,
+            resumed_from_state=run.resumed_from_state,
             parent_run=run.parent_run,
             child_runs=run.child_runs,
             agent_turns=tuple(run.agent_turns),
@@ -3924,10 +4046,12 @@ class PythonRunner:
         role = value.get("role")
         attempt = value.get("attempt")
         status = value.get("status")
+        repository = value.get("repository")
         phase = value.get("phase")
         work_item_id = value.get("work_item_id")
         work_item_label = value.get("work_item_label")
         transition_outcome = value.get("transition_outcome")
+        commit_sha = value.get("commit_sha")
         if (
             isinstance(turn_id, bool)
             or not isinstance(turn_id, int)
@@ -3940,6 +4064,10 @@ class PythonRunner:
             or not isinstance(attempt, int)
             or attempt < 1
             or status not in ("started", "completed", "failed")
+            or (
+                "repository" in value
+                and (not isinstance(repository, str) or not repository.strip())
+            )
             or (phase is not None and (not isinstance(phase, str) or not phase.strip()))
             or isinstance(work_item_id, bool)
             or (work_item_id is not None and not isinstance(work_item_id, (int, str)))
@@ -3960,15 +4088,32 @@ class PythonRunner:
                     or not transition_outcome.strip()
                 )
             )
+            or (
+                commit_sha is not None
+                and (
+                    not isinstance(commit_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None
+                )
+            )
         ):
             return None
-        expected_fields = {"turn_id", "purpose", "role", "attempt", "status"}
+        expected_fields = {
+            "turn_id",
+            "purpose",
+            "role",
+            "attempt",
+            "status",
+        }
+        if repository is not None:
+            expected_fields.add("repository")
         if phase is not None:
             expected_fields.add("phase")
         if work_item_id is not None:
             expected_fields.update(("work_item_id", "work_item_label"))
         if transition_outcome is not None:
             expected_fields.add("transition_outcome")
+        if commit_sha is not None:
+            expected_fields.add("commit_sha")
         content_field = {
             "started": "prompt",
             "completed": "result",
@@ -3985,10 +4130,12 @@ class PythonRunner:
             role,
             attempt,
             cast(AgentTurnStatus, status),
+            repository,
             phase=phase,
             work_item_id=work_item_id,
             work_item_label=work_item_label,
             transition_outcome=transition_outcome,
+            commit_sha=commit_sha,
             prompt=content if status == "started" else None,
             result=content if status == "completed" else None,
             error=content if status == "failed" else None,
@@ -4005,7 +4152,9 @@ class PythonRunner:
                 if transition.turn_id <= previous.turn_id:
                     return False
                 run.agent_turns[-1] = replace(previous, next_turn_id=transition.turn_id)
-            active_repository = self._active_issue_driven_repository(run)
+            repository = transition.repository
+            if repository is None and len(run.issue_driven_repositories) == 1:
+                repository = run.issue_driven_repositories[0].context.repository
             run.agent_turns.append(
                 AgentTurnTrace(
                     transition.turn_id,
@@ -4017,14 +4166,11 @@ class PythonRunner:
                     phase=transition.phase,
                     work_item_id=transition.work_item_id,
                     work_item_label=transition.work_item_label,
+                    commit_sha=transition.commit_sha,
                     previous_turn_id=(
                         previous.turn_id if previous is not None else None
                     ),
-                    repository=(
-                        active_repository.context.repository
-                        if active_repository is not None
-                        else None
-                    ),
+                    repository=repository,
                     started_at=self._accepted_at(),
                 )
             )
@@ -4048,6 +4194,10 @@ class PythonRunner:
             or current.phase != transition.phase
             or current.work_item_id != transition.work_item_id
             or current.work_item_label != transition.work_item_label
+            or (
+                transition.repository is not None
+                and current.repository != transition.repository
+            )
         ):
             return False
         run.agent_turns[index] = replace(
@@ -4056,6 +4206,7 @@ class PythonRunner:
             result=transition.result,
             error=transition.error,
             transition_outcome=transition.transition_outcome,
+            commit_sha=transition.commit_sha or current.commit_sha,
             completed_at=self._accepted_at(),
         )
         return True

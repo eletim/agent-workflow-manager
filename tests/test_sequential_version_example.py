@@ -375,7 +375,12 @@ def test_run_turn_retains_busy_timeout_warning_for_summary_and_handoff(
 
     assert (
         workflow["run_turn"](
-            Client(), "tab-1", "Issue #240 implementation", "work", warning_scope=240
+            Client(),
+            "tab-1",
+            "Issue #240 implementation",
+            "work",
+            repository_identity="acme/project",
+            warning_scope=240,
         )
         == "done"
     )
@@ -738,6 +743,7 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
             kwargs.get("phase"),
             kwargs.get("work_item_id"),
             kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
         )
 
     workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
@@ -746,7 +752,12 @@ def test_machine_output_recovery_corrects_in_the_same_session() -> None:
     )
 
     result, verdict = workflow["run_validated_turn"](
-        object(), "reviewer-tab", "Scope review", "Review this.", workflow["decision"]
+        object(),
+        "reviewer-tab",
+        "Scope review",
+        "Review this.",
+        workflow["decision"],
+        repository_identity="acme/project",
     )
 
     assert result == corrected
@@ -776,6 +787,7 @@ def test_validated_transition_traces_the_control_path_decision_once() -> None:
             kwargs.get("phase"),
             kwargs.get("work_item_id"),
             kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
         )
     )
     workflow["run_validated_turn"].__globals__["_emit_completed_turn"] = (
@@ -792,6 +804,7 @@ def test_validated_transition_traces_the_control_path_decision_once() -> None:
         "Correctness review",
         "Review this.",
         validate,
+        repository_identity="acme/project",
         transition_outcome=lambda verdict: verdict.lower(),
     ) == (result, "APPROVED")
     assert validation_calls == [result]
@@ -819,6 +832,7 @@ def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
             kwargs.get("phase"),
             kwargs.get("work_item_id"),
             kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
         )
 
     workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
@@ -830,6 +844,7 @@ def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
             "Scenario Gate",
             "Review this.",
             workflow["decision"],
+            repository_identity="acme/project",
         )
 
     assert turns == [
@@ -1746,6 +1761,8 @@ def test_clean_worktree_does_not_invoke_cleanup_turn(
     require_clean_worktree = workflow["require_clean_worktree"]
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def inspect_worktree(self) -> SimpleNamespace:
             return SimpleNamespace(dirty=False, current_branch="feature/issue-116")
 
@@ -1778,6 +1795,8 @@ def test_dirty_worktree_gets_focused_cleanup_and_is_rechecked(
     prompts: list[str] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def inspect_worktree(self) -> SimpleNamespace:
             return next(states)
 
@@ -1866,6 +1885,8 @@ def test_ambiguous_dirty_worktree_fails_with_remaining_paths(
     )
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def inspect_worktree(self) -> SimpleNamespace:
             return dirty
 
@@ -1987,6 +2008,8 @@ def test_reviewer_dirty_state_is_committed_delivered_and_re_reviewed(
     events: list[str] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = implementation_sha
             self.dirty = False
@@ -2111,6 +2134,8 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
     provenance: list[tuple[str, str, dict[str, object]]] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = primary_sha
             self.dirty = True
@@ -2222,6 +2247,7 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             "tab",
             "Implementation",
             "prompt",
+            repository_identity="acme/project",
             repository=repository,
             branch=branch,
             expected_process="implementation",
@@ -2270,6 +2296,7 @@ def test_interrupted_turn_is_not_masked_by_provenance_failure(
             "tab",
             "Implementation",
             "prompt",
+            repository_identity="acme/project",
             repository=Repository(),
             branch=branch,
             expected_process="implementation",
@@ -2293,6 +2320,8 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
     issue_results: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = start_sha
 
@@ -4520,6 +4549,8 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     events: list[str] = []
 
     class Repository:
+        expected_github_slug = "acme/project"
+
         def __init__(self) -> None:
             self.local_sha = initial_sha
             self.dirty = False

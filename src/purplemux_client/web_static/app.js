@@ -115,6 +115,11 @@ const outlineTitle = document.querySelector("#outline-title");
 const outlineDescription = document.querySelector("#outline-description");
 const outline = document.querySelector("#outline");
 const outlineAgents = document.querySelector("#outline-agents");
+const workflowStoryState = document.querySelector("#workflow-story-state");
+const workflowStoryNavigation = document.querySelector("#workflow-story-navigation");
+const workflowRecoveryTransition = document.querySelector("#workflow-recovery-transition");
+const actualStoryTitle = document.querySelector("#actual-story-title");
+const agentTurns = document.querySelector("#agent-turns");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
 const guideClose = document.querySelector("#guide-close");
@@ -632,7 +637,13 @@ function renderRun(result) {
   checkedToggle.disabled = activeRunId === null || !checkable;
   checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
   checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
-  renderOutline(result.outline || [], result.progress || []);
+  const runPreview = result.mode === "issue-driven" ? result.runPreview || null : null;
+  renderOutline(
+    runPreview?.phases || result.outline || [],
+    result.progress || [],
+    runPreview,
+  );
+  renderIssueDrivenStory(result);
   renderProgress(
     result.progress || [],
     result.warningTimeline || [],
@@ -1288,6 +1299,17 @@ function renderOutline(labels, events, plannedPreview = null) {
     : "";
   outlineAgents.replaceChildren();
   outlineAgents.hidden = !plannedPreview;
+  workflowStoryState.hidden = !plannedPreview;
+  workflowStoryState.textContent = plannedPreview
+    ? "PLANNED · This preview describes the expected workflow before any agent turn runs."
+    : "";
+  workflowStoryNavigation.hidden = true;
+  workflowStoryNavigation.replaceChildren();
+  workflowRecoveryTransition.hidden = true;
+  workflowRecoveryTransition.replaceChildren();
+  actualStoryTitle.hidden = true;
+  agentTurns.hidden = true;
+  agentTurns.replaceChildren();
   for (const agent of plannedPreview?.agents || []) {
     const term = document.createElement("dt");
     term.textContent = `${agent.role} (${agent.agent})`;
@@ -1315,6 +1337,209 @@ function renderOutline(labels, events, plannedPreview = null) {
     text.textContent = label;
     item.append(marker, text);
     outline.append(item);
+  }
+}
+
+function storyPhaseLabel(value) {
+  if (typeof value !== "string" || value === "") return "Agent turn";
+  return value
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function githubRepositoryUrl(repository) {
+  return typeof repository === "string"
+    && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)
+    ? `https://github.com/${repository}`
+    : null;
+}
+
+function appendStoryLink(container, label, url) {
+  if (container.children.length || container.textContent) {
+    container.append(document.createTextNode(" · "));
+  }
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = label;
+  container.append(link);
+}
+
+function issueStoryNavigation(summary, turn) {
+  if (!summary || turn.workItemId == null) return null;
+  const repositories = summary.repositories || [summary];
+  const repository = repositories.find((item) => (
+    turn.repository == null || item.repository === turn.repository
+  ));
+  if (!repository) return null;
+  return (repository.issues || []).find((item) => (
+    String(item.issue) === String(turn.workItemId)
+  )) || null;
+}
+
+function appendTurnNavigation(container, turn, summary) {
+  const navigation = issueStoryNavigation(summary, turn);
+  if (!navigation) return;
+  if (navigation.pr?.url) {
+    appendStoryLink(container, `PR #${navigation.pr.number}`, navigation.pr.url);
+  }
+  const phase = (turn.phase || "").toLowerCase();
+  const terminals = navigation.terminals || {};
+  const terminal = phase.includes("scope")
+    ? terminals.scopeReview
+    : (phase.includes("correctness") || phase === "whole-review")
+      ? terminals.correctnessReview
+      : terminals.implementation;
+  if (terminal) appendPurpleMuxLink(container, "PurpleMux terminal", terminal);
+}
+
+function renderIssueDrivenStory(result) {
+  if (result.mode !== "issue-driven" || result.runId == null) return;
+  outlinePanel.hidden = false;
+  workflowStoryState.hidden = false;
+  const turns = result.agentTurns || [];
+  const tailTurn = turns.at(-1);
+  const currentTurn = result.state === "running"
+    && tailTurn?.status === "started"
+    && tailTurn.completedAt == null
+    ? tailTurn
+    : null;
+  const presentation = runPresentation(result);
+  workflowStoryState.textContent = currentTurn
+    ? `ACTUAL · ${presentation.label} · Current turn: ${currentTurn.purpose}`
+    : `ACTUAL · ${presentation.label} · ${turns.length} actual agent turn${turns.length === 1 ? "" : "s"} recorded`;
+
+  const summary = result.issueDrivenSummary;
+  const repositories = summary?.repositories || (summary ? [summary] : []);
+  workflowStoryNavigation.replaceChildren();
+  for (const repository of repositories) {
+    const url = githubRepositoryUrl(repository.repository);
+    if (url) appendStoryLink(workflowStoryNavigation, repository.repository, url);
+  }
+  const baseSha = result.executionContext?.baseSha;
+  if (repositories.length === 1 && typeof baseSha === "string") {
+    const repositoryUrl = githubRepositoryUrl(repositories[0].repository);
+    if (repositoryUrl) {
+      appendStoryLink(
+        workflowStoryNavigation,
+        `Base commit ${baseSha.slice(0, 10)}`,
+        `${repositoryUrl}/commit/${baseSha}`,
+      );
+    }
+  }
+  workflowStoryNavigation.hidden = workflowStoryNavigation.children.length === 0;
+
+  workflowRecoveryTransition.replaceChildren();
+  const recoverySource = result.recoverySource;
+  if (recoverySource?.identity) {
+    workflowRecoveryTransition.append(document.createTextNode("Recovery: "));
+    const source = document.createElement("a");
+    source.href = `/?run=${encodeURIComponent(recoverySource.identity)}`;
+    const priorOutcome = recoverySource.state
+      ? recoverySource.state.toUpperCase()
+      : "OUTCOME UNAVAILABLE";
+    source.textContent = `Run #${recoverySource.runId} (${priorOutcome})`;
+    workflowRecoveryTransition.append(
+      source,
+      document.createTextNode(` → Run #${result.runId}`),
+    );
+    workflowRecoveryTransition.hidden = false;
+  } else {
+    workflowRecoveryTransition.hidden = true;
+  }
+
+  agentTurns.replaceChildren();
+  agentTurns.hidden = turns.length === 0;
+  actualStoryTitle.hidden = turns.length === 0;
+  const turnsById = new Map(turns.map((turn) => [turn.turnId, turn]));
+  for (const turn of turns) {
+    const item = document.createElement("li");
+    const isOpen = turn.status === "started" && turn.completedAt == null;
+    const isCurrent = turn === currentTurn;
+    item.className = `agent-turn ${isCurrent ? "current" : turn.status}`;
+
+    const heading = document.createElement("div");
+    heading.className = "agent-turn-heading";
+    const scope = turn.workItemLabel || (turn.workItemId == null ? "" : `Work item ${turn.workItemId}`);
+    heading.textContent = `Turn ${turn.turnId} · ${storyPhaseLabel(turn.phase)} · ${turn.role} · Attempt ${turn.attempt}${scope ? ` · ${scope}` : ""}`;
+    if (isCurrent) {
+      const current = document.createElement("span");
+      current.className = "agent-turn-current";
+      current.textContent = "CURRENT";
+      heading.append(document.createTextNode(" "), current);
+    }
+
+    const purpose = document.createElement("p");
+    purpose.className = "agent-turn-purpose";
+    purpose.textContent = `Purpose: ${turn.purpose}`;
+
+    const outcome = document.createElement("p");
+    outcome.className = "agent-turn-outcome";
+    if (turn.status === "failed") {
+      outcome.textContent = `Outcome: Failed${turn.error ? ` — ${turn.error}` : ""}`;
+    } else if (isCurrent) {
+      outcome.textContent = "Outcome: In progress";
+    } else if (isOpen) {
+      outcome.textContent = result.state === "failed" || result.state === "stopped"
+        ? `Outcome: Run ${result.state} before completion was recorded`
+        : "Outcome: Completion event missing";
+    } else {
+      const transition = turn.transitionOutcome
+        ? storyPhaseLabel(turn.transitionOutcome)
+        : "Completed";
+      outcome.textContent = `Outcome: ${transition}`;
+    }
+
+    const navigation = document.createElement("p");
+    navigation.className = "agent-turn-navigation";
+    const repositoryUrl = githubRepositoryUrl(turn.repository);
+    if (repositoryUrl) appendStoryLink(navigation, turn.repository, repositoryUrl);
+    if (repositoryUrl && turn.commitSha) {
+      appendStoryLink(
+        navigation,
+        `Commit ${turn.commitSha.slice(0, 10)}`,
+        `${repositoryUrl}/commit/${turn.commitSha}`,
+      );
+    }
+    appendTurnNavigation(navigation, turn, summary);
+
+    const promptDetails = document.createElement("details");
+    promptDetails.className = "agent-turn-prompt";
+    const promptSummary = document.createElement("summary");
+    promptSummary.textContent = "Show exact actual prompt";
+    const prompt = document.createElement("pre");
+    prompt.textContent = turn.prompt;
+    promptDetails.append(promptSummary, prompt);
+
+    item.append(heading, purpose, outcome);
+    if (navigation.children.length || navigation.textContent) item.append(navigation);
+    item.append(promptDetails);
+
+    if (turn.result != null) {
+      const resultDetails = document.createElement("details");
+      resultDetails.className = "agent-turn-result";
+      const resultSummary = document.createElement("summary");
+      resultSummary.textContent = "Show actual agent result";
+      const actualResult = document.createElement("pre");
+      actualResult.textContent = turn.result;
+      resultDetails.append(resultSummary, actualResult);
+      item.append(resultDetails);
+    }
+
+    const next = turnsById.get(turn.nextTurnId);
+    if (next) {
+      const transition = document.createElement("p");
+      transition.className = "agent-turn-transition";
+      const retry = turn.phase === next.phase && next.attempt > turn.attempt ? "Retry · " : "";
+      const outcomeLabel = turn.transitionOutcome
+        ? ` · ${storyPhaseLabel(turn.transitionOutcome)}`
+        : "";
+      transition.textContent = `Transition: ${retry}${storyPhaseLabel(turn.phase)} → ${storyPhaseLabel(next.phase)}${outcomeLabel}`;
+      item.append(transition);
+    }
+    agentTurns.append(item);
   }
 }
 

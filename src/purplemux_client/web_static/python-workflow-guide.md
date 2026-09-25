@@ -1011,6 +1011,7 @@ emit_agent_turn(
     attempt,                # positive int
     status,                 # "started", "completed", or "failed"
     *,
+    repository=None,       # repository identity; omitted by legacy workflows
     phase=None,             # generated workflow phase, when applicable
     work_item_id=None,      # authoritative Issue/mini-task identity
     work_item_label=None,   # supplied together with work_item_id

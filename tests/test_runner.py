@@ -22,6 +22,10 @@ import purplemux_client.runner as runner_module
 import purplemux_client.web as web_module
 from purplemux_client import WorkspaceState
 from purplemux_client.errors import MutationOutcomeUnknown
+from purplemux_client.issue_driven import (
+    issue_driven_run_preview,
+    parse_issue_driven_json,
+)
 from purplemux_client.notification_settings import NotificationSettings
 from purplemux_client.notifier import NotificationResult
 from purplemux_client.preflight import WorkflowValidator
@@ -99,10 +103,10 @@ def test_issue_driven_agent_turn_trace_is_linked_and_survives_history(
     result = "completed exactly\n" + "evidence\n" * 600
     code = f"""\
 from purplemux_client import emit_agent_turn
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", prompt={prompt!r})
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", result={result!r})
-emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", prompt="review prompt")
-emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent stopped")
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", repository="acme/project", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", commit_sha={"a" * 40!r}, prompt={prompt!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", repository="acme/project", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", commit_sha={"b" * 40!r}, result={result!r})
+emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", repository="acme/project", prompt="review prompt")
+emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", repository="acme/project", error="agent stopped")
 """
     try:
         run_id = runner.start(code, issue_driven_json='{"mode":"issue-driven"}')
@@ -120,11 +124,12 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "workItemId": "mini-task",
                 "workItemLabel": "Mini task mini-task",
                 "transitionOutcome": "continue_to_scope_review",
+                "commitSha": "b" * 40,
                 "result": result,
                 "error": None,
                 "previousTurnId": None,
                 "nextTurnId": 2,
-                "repository": None,
+                "repository": "acme/project",
                 "startedAt": trace[0]["startedAt"],
                 "completedAt": trace[0]["completedAt"],
             },
@@ -139,11 +144,12 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "workItemId": None,
                 "workItemLabel": None,
                 "transitionOutcome": None,
+                "commitSha": None,
                 "result": None,
                 "error": "agent stopped",
                 "previousTurnId": 1,
                 "nextTurnId": None,
-                "repository": None,
+                "repository": "acme/project",
                 "startedAt": trace[1]["startedAt"],
                 "completedAt": trace[1]["completedAt"],
             },
@@ -156,6 +162,59 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
         assert restored.snapshot(run_id).as_json()["agentTurns"] == trace
     finally:
         restored.close()
+
+
+def test_legacy_agent_turn_without_repository_remains_accepted(
+    runner: PythonRunner,
+) -> None:
+    code = """\
+from purplemux_client import emit_agent_turn
+emit_agent_turn(1, "Legacy turn", "implementer", 1, "started", prompt="legacy prompt")
+emit_agent_turn(1, "Legacy turn", "implementer", 1, "completed", result="legacy result")
+"""
+    run_id = runner.start(code, issue_driven_json='{"mode":"issue-driven"}')
+    snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+
+    assert len(snapshot.agent_turns) == 1
+    assert snapshot.agent_turns[0].status == "completed"
+    assert snapshot.agent_turns[0].repository is None
+    assert snapshot.agent_turns[0].result == "legacy result"
+
+
+def test_legacy_agent_turn_infers_repository_only_for_single_repository_runs(
+    runner: PythonRunner,
+) -> None:
+    single_code = """\
+from purplemux_client import emit_agent_turn, emit_issue_driven_context
+emit_issue_driven_context("acme/only", "dev/v1", "main")
+emit_agent_turn(1, "Legacy turn", "reviewer", 1, "started", prompt="single")
+emit_agent_turn(1, "Legacy turn", "reviewer", 1, "completed", result="done")
+"""
+    single_id = runner.start(single_code, issue_driven_json='{"mode":"issue-driven"}')
+    single = wait_for(runner, lambda item: item.state == "success", run_id=single_id)
+    assert single.agent_turns[0].repository == "acme/only"
+
+    multi_code = """\
+from purplemux_client import (
+    emit_agent_turn, emit_issue_driven_context, emit_issue_driven_repositories,
+    emit_issue_driven_repository,
+)
+emit_issue_driven_repositories((
+    ("acme/api", "dev/api", "main", None),
+    ("acme/web", "dev/web", "main", None),
+))
+emit_issue_driven_repository(1, "started")
+emit_issue_driven_context("acme/api", "dev/api", "main")
+emit_issue_driven_repository(1, "completed")
+emit_issue_driven_repository(2, "started")
+emit_issue_driven_context("acme/web", "dev/web", "main")
+emit_agent_turn(1, "Delayed legacy API turn", "reviewer", 1, "started", prompt="multi")
+emit_agent_turn(1, "Delayed legacy API turn", "reviewer", 1, "completed", result="done")
+emit_issue_driven_repository(2, "completed")
+"""
+    multi_id = runner.start(multi_code, issue_driven_json='{"mode":"issue-driven"}')
+    multi = wait_for(runner, lambda item: item.state == "success", run_id=multi_id)
+    assert multi.agent_turns[0].repository is None
 
 
 def test_obsolete_recovery_metadata_is_ignored(
@@ -583,12 +642,36 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         stop_timeout=0.5,
         run_history_file=history_file,
     )
-    source = '{"mode":"issue-driven","one_shot_issue":196}'
+    source = json.dumps(
+        {
+            "mode": "issue-driven",
+            "repository": "/work/project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "one_shot_issue": 196,
+            "max_reviews": 4,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
+    preview = {
+        "status": "planned",
+        "phases": ["Work items", "Final integration PR"],
+        "agents": [
+            {
+                "role": "Implementer",
+                "agent": "codex",
+                "purpose": "Implements changes.",
+            }
+        ],
+    }
     try:
         first_id = runner.start(
             "import sys; print(sys.argv[1]); raise SystemExit(7)",
             args=("same-argument",),
             issue_driven_json=source,
+            issue_driven_preview=preview,
         )
         wait_for(runner, lambda item: item.state == "failed", run_id=first_id)
 
@@ -601,11 +684,26 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         assert resumed.code == runner.snapshot(first_id).code
         assert resumed.args == ("same-argument",)
         assert resumed.issue_driven_json == source
+        assert resumed.issue_driven_preview == preview
         assert resumed.resumed_from_run_id == first_id
+        assert resumed.resumed_from_state == "failed"
         assert resumed.as_json()["mode"] == "issue-driven"
+        assert resumed.as_json()["runPreview"] == preview
+        assert resumed.as_json()["recoverySource"] == {
+            "runId": first_id,
+            "identity": runner.snapshot(first_id).identity,
+            "state": "failed",
+        }
         assert resumed.as_summary_json()["resumedFromRunId"] == first_id
     finally:
         runner.close()
+
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    for record in history["runs"].values():
+        record.pop("issueDrivenPreview", None)
+        record.pop("resumedFromState", None)
+    history_file.write_text(json.dumps(history), encoding="utf-8")
+    legacy_preview = issue_driven_run_preview(parse_issue_driven_json(source)).as_json()
 
     restored = PythonRunner(
         managed_workflows=False,
@@ -615,7 +713,50 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
     try:
         resumed = restored.snapshot(resumed_id)
         assert resumed.issue_driven_json == source
+        assert resumed.issue_driven_preview == legacy_preview
         assert resumed.resumed_from_run_id == first_id
+        assert resumed.resumed_from_state == "failed"
+        assert resumed.as_json()["recoverySource"]["state"] == "failed"
+    finally:
+        restored.close()
+
+
+def test_legacy_resume_keeps_source_identity_when_source_history_was_deleted(
+    tmp_path: Path,
+) -> None:
+    history_file = tmp_path / "run-history.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        source_id = runner.start(
+            "raise SystemExit(7)", issue_driven_json='{"mode":"issue-driven"}'
+        )
+        wait_for(runner, lambda item: item.state == "failed", run_id=source_id)
+        resumed_id = runner.resume(source_id)
+        wait_for(runner, lambda item: item.state == "failed", run_id=resumed_id)
+    finally:
+        runner.close()
+
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    source_identity = next(
+        identity
+        for identity, record in history["runs"].items()
+        if record["runId"] == source_id
+    )
+    del history["runs"][source_identity]
+    resumed_record = next(
+        record for record in history["runs"].values() if record["runId"] == resumed_id
+    )
+    resumed_record.pop("resumedFromState")
+    history_file.write_text(json.dumps(history), encoding="utf-8")
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history_file)
+    try:
+        recovery = restored.snapshot(resumed_id).as_json()["recoverySource"]
+        assert recovery == {
+            "runId": source_id,
+            "identity": source_identity,
+            "state": None,
+        }
     finally:
         restored.close()
 
