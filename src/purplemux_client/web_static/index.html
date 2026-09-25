@@ -38,6 +38,7 @@
           <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
           <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
           <button id="issue-driven-mode" type="button" aria-pressed="false">Issue Driven</button>
+          <button id="review-mode" type="button" aria-pressed="false">Review</button>
           <button id="workflow-mode" type="button" class="selected" aria-pressed="true">Python Workflow</button>
         </div>
         <div class="editor-mode-bar">
@@ -123,6 +124,24 @@
           <textarea id="environment-setup-python" spellcheck="false" readonly aria-label="Generated Environment Setup workflow"></textarea>
         </div>
 
+        <div id="review-fields" hidden>
+          <label for="review-json">Review JSON</label>
+          <textarea id="review-json" spellcheck="false">{
+  "mode": "review",
+  "repositories": ["~/DevEnv/project"],
+  "check": "Inspect the repository and report findings with evidence.",
+  "agent": "codex",
+  "timeout": 3600
+}</textarea>
+          <div class="generated-heading">
+            <label for="review-python">Generated Python (read-only)</label>
+            <button id="review-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="review-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <p id="review-error" class="repository-config-message" hidden></p>
+          <textarea id="review-python" spellcheck="false" readonly aria-label="Generated Review workflow"></textarea>
+        </div>
+
         <div id="workflow-fields">
           <label for="code">Python</label>
           <textarea id="code" spellcheck="false">from purplemux_client import emit_step
@@ -199,6 +218,12 @@ emit_step("workspace create", "completed")</textarea>
         <p id="issue-summary-base"></p>
         <p id="issue-summary-policy"></p>
         <p id="issue-summary-warnings"></p>
+      </section>
+
+      <section id="review-result-panel" class="panel" aria-live="polite" hidden>
+        <h2>Review result</h2>
+        <p id="review-result-status"></p>
+        <pre id="review-result-json"></pre>
       </section>
 
       <section class="panel progress-panel" aria-live="polite">

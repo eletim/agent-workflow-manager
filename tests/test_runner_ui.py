@@ -129,6 +129,14 @@ def test_issue_driven_repository_editor_is_available_in_new_run_ui() -> None:
     assert 'id="repository-config-message"' in html
 
 
+def test_review_editor_keeps_generated_python_read_only() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="review-mode"' in html
+    assert 'id="review-json"' in html
+    assert 'id="review-python" spellcheck="false" readonly' in html
+    assert 'id="review-result-panel"' in html
+
+
 def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     ancestors = _ancestors("run-list")
 
@@ -156,7 +164,7 @@ def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
 
     assert "@media (max-width: 760px)" in styles
     assert "overflow-x: clip" in styles
-    assert ".mode-switch" in styles and "repeat(4, minmax(0, 1fr))" in styles
+    assert ".mode-switch" in styles and "repeat(5, minmax(0, 1fr))" in styles
     assert ".controls" in styles and "repeat(2, minmax(0, 1fr))" in styles
     assert ".output-panel { min-width: 0; }" in styles
     assert 'id="issue-summary-panel"' in INDEX.read_text(encoding="utf-8")

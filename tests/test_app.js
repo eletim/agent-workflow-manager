@@ -119,6 +119,7 @@ function snapshot({
   purplemuxPort = 9123,
   issueDrivenJson = undefined,
   environmentSetupJson = undefined,
+  reviewJson = undefined,
   resumedFromRunId = null,
 }) {
   const result = {
@@ -159,6 +160,7 @@ function snapshot({
   if (prompt !== undefined) result.prompt = prompt;
   if (issueDrivenJson !== undefined) result.issueDrivenJson = issueDrivenJson;
   if (environmentSetupJson !== undefined) result.environmentSetupJson = environmentSetupJson;
+  if (reviewJson !== undefined) result.reviewJson = reviewJson;
   return result;
 }
 
@@ -225,7 +227,9 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "workflow-mode", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "prompt-fields",
+    "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
+    "review-result-panel", "review-result-status", "review-result-json",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
     "environment-setup-generate", "environment-setup-success", "environment-setup-error",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
@@ -1217,6 +1221,28 @@ test("Issue Driven mode opens and copies its dedicated guide", async () => {
 
   await elements["guide-copy"].dispatch("click");
   assert.deepEqual(clipboard.writes, ["issue guide"]);
+});
+
+test("Review mode opens its dedicated guide", async () => {
+  const {elements, calls} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/review-guide.md") return response("review guide");
+      return undefined;
+    },
+  });
+
+  await elements["review-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Review Guide");
+  await elements["guide-open"].dispatch("click");
+  assert.equal(elements["guide-title"].textContent, "Review Guide");
+  assert.equal(elements["guide-raw"].href, "/review-guide.md");
+  assert.equal(elements["guide-content"].textContent, "review guide");
+  assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
+    ["/review-guide.md", "GET"],
+  ]);
 });
 
 test("stale guide failure cannot replace the active guide", async () => {
@@ -4116,4 +4142,54 @@ test("Environment Setup generation errors clear stale generated Python", async (
   assert.equal(elements["environment-setup-python"].value, "");
   await elements["environment-setup-generate"].dispatch("click");
   assert.equal(elements["environment-setup-error"].textContent, "invalid revision");
+});
+
+test("Review generates read-only Python, starts a Run, and shows saved settings and result", async () => {
+  const source = JSON.stringify({mode: "review", repositories: ["/repo"], check: "Inspect it"});
+  const generatedCode = "print('review')";
+  const report = {verdict: "FAIL", summary: "One issue", findings: ["Missing check"], evidence: ["file.py:4"]};
+  const running = snapshot({runId: 9, state: "running", stdout: "", mode: "review", code: generatedCode, reviewJson: source});
+  const finished = snapshot({runId: 9, state: "success", stdout: JSON.stringify(report), mode: "review", code: generatedCode, reviewJson: source});
+  const calls = [];
+  const {elements} = await loadApp({
+    runs: [{runId: 9, state: "success", mode: "review"}],
+    details: {9: finished}, validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/review/generate") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response({generatedCode});
+      }
+      if (url === "/api/run") {
+        calls.push([url, JSON.parse(options.body)]);
+        return response(running, 202);
+      }
+      return undefined;
+    },
+  });
+  await elements["review-mode"].dispatch("click");
+  elements["review-json"].value = source;
+  await elements["review-generate"].dispatch("click");
+  assert.equal(elements["review-python"].value, generatedCode);
+  assert.equal(elements["review-success"].hidden, false);
+  await elements.run.dispatch("click");
+  assert.deepEqual(calls.at(-1), ["/api/run", {code: generatedCode, args: [], reviewJson: source}]);
+  assert.equal(elements["review-json"].value, source);
+  assert.equal(elements["review-json"].readOnly, true);
+  assert.match(elements["review-result-status"].textContent, /Verdict: FAIL — One issue/);
+  assert.match(elements["review-result-json"].textContent, /Missing check/);
+  assert.match(selectedRun(elements).textContent, /Review/);
+});
+
+test("Review generation errors clear stale code and remain visible", async () => {
+  const {elements} = await loadApp({runs: [], details: {}, validation: {body: {}, status: 200}, fetchOverride(url) {
+    if (url === "/api/review/generate") return response({error: "invalid Review JSON"}, 422);
+    return undefined;
+  }});
+  await elements["review-mode"].dispatch("click");
+  elements["review-python"].value = "old code";
+  elements["review-json"].value = "{}";
+  await elements["review-json"].dispatch("input");
+  assert.equal(elements["review-python"].value, "");
+  await elements["review-generate"].dispatch("click");
+  assert.equal(elements["review-error"].textContent, "invalid Review JSON");
 });

@@ -179,6 +179,9 @@ textarea {
 #prompt-text { min-height: 220px; }
 #issue-driven-json { min-height: 260px; }
 #issue-driven-python { min-height: 330px; margin-top: 8px; }
+#review-json { min-height: 220px; }
+#review-python { min-height: 330px; margin-top: 8px; }
+#review-result-json { white-space: pre-wrap; overflow-wrap: anywhere; }
 .repository-config-heading {
   display: flex;
   align-items: end;
@@ -585,7 +588,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .run-history-actions { margin: 0; padding: 10px 12px 0; }
   .run-history-actions button { width: 100%; }
   .run-list { max-height: 32vh; margin: 0; padding: 10px 12px; overflow-y: auto; }
-  .mode-switch { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; }
+  .mode-switch { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; }
   .mode-switch button { min-width: 0; padding-inline: 6px; }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
   .editor-mode-bar #new-run { align-self: stretch; }
