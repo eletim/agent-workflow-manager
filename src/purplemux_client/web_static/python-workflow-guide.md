@@ -193,7 +193,10 @@ a unique `awm-run/...` local branch. Recovery inspects logical and prior-run
 private refs, selects their single furthest descendant of the exact authoritative
 base, and fails closed if safe candidates diverge. A recovered commit can satisfy
 an unchanged agent turn; otherwise require the CodingAgent's new commit and clean
-worktree with `require_committed_result()`. Use `ensure_pushed()` to complete
+worktree with `require_committed_result(..., expected_agent="codex",
+expected_process="implementation")` (or the agent and process for that turn).
+`agent_commit_coauthor()` supplies the same normalized co-author identity to the
+prompt that this postcondition verifies. Use `ensure_pushed()` to complete
 delivery through the logical remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
 Workflow must then create or reuse and verify the exact Draft PR before starting
@@ -602,6 +605,7 @@ The supported Git inspection and assertion methods are:
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
+repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -609,11 +613,21 @@ repo.require_clean() -> None
 repo.require_current_branch(branch) -> BranchState
 repo.require_pushed(branch) -> BranchState
 repo.require_committed_result(
-    branch, *, previous_sha, allow_unchanged=False
+    branch, *, previous_sha, allow_unchanged=False,
+    expected_agent=None, expected_process=None
 ) -> BranchState
+repo.require_agent_commit_provenance(
+    previous_sha, current_sha, *, expected_agent, expected_process,
+    allow_unchanged=False
+) -> None
+agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
+
+`inspect_remote_branch_heads()` enumerates the remote directly and does not
+trust local tracking refs. Use it when a workflow must compare a configured
+development branch with the remote's current branch set.
 
 The inspection-aware Git operations that may mutate are:
 
@@ -644,6 +658,9 @@ The supported GitHub inspections and mutations are:
 
 ```python
 github.find_pr(*, head, base, state) -> PullRequestState | None
+github.compare_commits(*, base_sha, head_sha) -> Literal[
+    "ahead", "behind", "diverged", "identical"
+]
 github.require_pr(
     *, head, base, number=None, state="OPEN", expected_head_sha=None,
     expected_base_sha=None, draft=None
@@ -652,6 +669,9 @@ github.create_draft_pr(
     *, head, base, expected_head_sha, expected_base_sha, title, body,
     correlation_id
 ) -> PullRequestState
+github.create_issue_comment(
+    issue, *, body, correlation_id
+) -> str
 github.set_draft(
     pr, *, draft, expected_head, expected_head_sha, expected_base,
     expected_base_sha
@@ -666,14 +686,21 @@ github.merge_pr(
 ) -> MergeResult
 ```
 
-`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Open same-head PRs to
+`state` is exactly `"OPEN"`, `"MERGED"`, or `"CLOSED"`.
+`compare_commits()` checks the relationship between two exact authoritative
+GitHub commit IDs without changing repository state. Open same-head PRs to
 the wrong base, duplicate exact PRs, changing SHAs, auto-merge, and merge-queue
 state fail closed. `create_draft_pr()` embeds the required correlation marker.
+`create_issue_comment()` appends one correlation-marked Issue comment and
+reconciles a lost mutation response without duplicating that comment.
 `update_pr_body()` preserves the exact open Draft or Ready topology and rejects a
 concurrent body or review-state change. `merge_pr()` supports only an immediate
 merge commit and verifies
-its parents and the resulting base ref; it never queues, squashes, rebases, or
-enables auto-merge.
+its parents, the resulting base ref, and the `AWM-Automation` / `AWM-Process`
+trailers that identify the scripted merge. It never queues, squashes, rebases,
+or enables auto-merge, and it does not identify AWM as a co-author. CodingAgent
+commits separately carry a normalized co-author plus machine-readable
+`AWM-Agent` and `AWM-Process` trailers, which are verified before delivery.
 
 The repository execution helpers are:
 
@@ -760,7 +787,8 @@ The following categories are normative:
 - **Inspection-aware, reconciliation-capable mutation:**
   `prepare_run_repository()`; workspace/tab creation and identity-checked
   deletion/close; `interrupt()`; every Git mutation listed above; and
-  `create_draft_pr()`, `set_draft()`, `update_pr_body()`, and `merge_pr()`. Each
+  `create_draft_pr()`, `create_issue_comment()`, `set_draft()`,
+  `update_pr_body()`, and `merge_pr()`. Each
   captures exact preconditions, dispatches at most once, and inspects an
   authoritative postcondition. It can return the confirmed desired result,
   report a proven rejection/conflict, or raise `MutationOutcomeUnknown` if

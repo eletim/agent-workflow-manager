@@ -258,6 +258,12 @@ original Issue as its work definition:
 }
 ```
 
+After every one-shot planning decision, the workflow appends a structured
+comment to the source Issue. Each comment records the current internal work-item
+decomposition, the planner's decomposition rationale, and the changes from the
+previous planning result. Replanning appends a new comment instead of replacing
+history; the workflow does not create child Issues or publish raw agent logs.
+
 The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`,
 `scope_max_reviews`, `turn_timeout`, the two agent fields, and `scenarios` are optional; every
 other field is required. When omitted, `scope_max_reviews` retains the existing
@@ -279,7 +285,13 @@ is reused only when it contains that exact starting commit and passes the normal
 safe recovery checks. While the two remote heads are identical, Base PR creation
 is deferred; it is created after the first Issue merge advances the integration
 branch. An existing Base PR is still recovered normally. The final PR still
-targets `final_branch`. During deferral, planner decisions—including empty
+targets `final_branch`. At startup, a warning asks the user to verify the intended
+base when a remote `dev/vX.Y.Z` branch with a higher patch version in the same
+major/minor series is ahead of the configured integration head, or ahead of the
+`final_branch` head from which a missing integration branch would be created.
+Newer names that are identical, behind, divergent, or in another series do not
+trigger the warning, and the workflow never changes the configured branch
+automatically. During deferral, planner decisions—including empty
 one-shot plans and dynamic items—use an AWM-owned remote Git note as authoritative
 recovery state without changing scheduling semantics. When set,
 `policy_issue` is a positive Issue number that supplies version-wide design
@@ -349,6 +361,8 @@ turn_start_sha = feature.local_sha
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
+    expected_agent="codex",
+    expected_process="implementation",
 )
 # Push is also orchestration-owned gap absorption if the agent omitted it. This
 # only creates the exact remote branch or fast-forwards it; remote-ahead or
@@ -416,6 +430,13 @@ state cannot be resolved safely; an already-clean path does not invoke cleanup.
 If review or final checks introduce a commit, the Workflow pushes and rebinds the
 exact Draft PR, invalidates the prior approval, and repeats review and checks
 before making the PR Ready.
+
+CodingAgent prompts require every implementation, review-fix, cleanup, and
+recovery commit to retain the configured agent as a co-author and to include
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
+result check verifies that provenance before a branch can advance. Scripted
+merge commits instead record `AWM-Automation: agent-workflow-manager` and
+`AWM-Process: merge`; AWM is automation provenance, not a co-author.
 
 PR discovery exhausts a bounded sequence of authoritative GitHub API pages. An
 open PR for the requested head but a different base, multiple exact candidates,
