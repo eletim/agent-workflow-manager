@@ -873,6 +873,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             issue_driven_json = payload.get("issueDrivenJson")
+            issue_driven_preview = None
             if "issueDrivenJson" in payload:
                 if path != "/api/run" or not isinstance(issue_driven_json, str):
                     self._send_json(
@@ -883,9 +884,13 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
                 try:
+                    issue_driven_config = parse_issue_driven_json(issue_driven_json)
                     issue_driven_code = generate_issue_driven_workflow(
-                        parse_issue_driven_json(issue_driven_json)
+                        issue_driven_config
                     )
+                    issue_driven_preview = issue_driven_run_preview(
+                        issue_driven_config
+                    ).as_json()
                 except IssueDrivenValidationError as exc:
                     self._send_json(
                         HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)}
@@ -981,6 +986,7 @@ class RunnerRequestHandler(BaseHTTPRequestHandler):
                     code,
                     args=args,
                     issue_driven_json=issue_driven_json,
+                    issue_driven_preview=issue_driven_preview,
                     environment_setup_json=environment_setup_json,
                     review_json=review_json,
                     parent_identity=payload.get("parentRun"),

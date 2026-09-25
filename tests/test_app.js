@@ -141,6 +141,8 @@ function snapshot({
   reviewJson = undefined,
   reviewResult = undefined,
   resumedFromRunId = null,
+  recoverySource = null,
+  runPreview = null,
   agentTurns = [],
 }) {
   const result = {
@@ -176,6 +178,8 @@ function snapshot({
     issueDrivenSummary,
     purplemuxPort,
     resumedFromRunId,
+    recoverySource,
+    runPreview,
     agentTurns,
   };
   if (mode !== undefined) result.mode = mode;
@@ -276,7 +280,7 @@ async function loadApp({
     "resume-open", "resume-dialog", "resume-source", "resume-settings",
     "resume-cancel", "resume-confirm",
     "resources-summary", "execution-context-details", "resources", "validation-panel",
-    "validation-success", "validation", "outline-panel", "outline-title", "outline-description", "workflow-story-state", "workflow-story-navigation", "outline", "outline-agents", "agent-turns", "guide-dialog",
+    "validation-success", "validation", "outline-panel", "outline-title", "outline-description", "workflow-story-state", "workflow-story-navigation", "workflow-recovery-transition", "outline", "outline-agents", "actual-story-title", "agent-turns", "guide-dialog",
     "dry-run-panel", "dry-run-status", "dry-run-eligibility", "topology-findings",
     "next-mutation",
     "readiness-workspace", "readiness-provider", "run-readiness", "reconcile-readiness",
@@ -1692,6 +1696,11 @@ test("failed Issue Driven run previews immutable settings and resumes as a new r
     mode: "issue-driven",
     issueDrivenJson: source,
     resumedFromRunId: 4,
+    recoverySource: {
+      runId: 4,
+      identity: "a".repeat(32) + "-4",
+      state: "failed",
+    },
   });
   const runs = [{runId: 4, state: "failed", mode: "issue-driven"}];
   const details = {4: failed};
@@ -1727,6 +1736,14 @@ test("failed Issue Driven run previews immutable settings and resumes as a new r
   assert.match(elements["active-context"].textContent, /Issue Driven Run #5/);
   assert.match(elements["active-context"].textContent, /resumed from Run #4/);
   assert.match(runItem(elements, 5).textContent, /Resume of #4/);
+  const recoveryTransition = elements["workflow-recovery-transition"];
+  assert.equal(recoveryTransition.hidden, false);
+  assert.equal(recoveryTransition.children[1].textContent, "Run #4 (FAILED)");
+  assert.equal(
+    recoveryTransition.children[1].href,
+    `/?run=${"a".repeat(32)}-4`,
+  );
+  assert.equal(recoveryTransition.children[2].textContent, " → Run #5");
 });
 
 test("failed Prompt and custom Workflow runs do not offer Resume", async () => {
@@ -2658,6 +2675,7 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
       role: "reviewer", attempt: 1, status: "completed", phase: "correctness-review",
       workItemId: "mini-task:story", workItemLabel: "Mini task story",
       transitionOutcome: "changes_requested", result: "CHANGES_REQUESTED",
+      commitSha: "b".repeat(40),
       nextTurnId: 2, completedAt: "2026-09-25T01:00:00Z", repository: "acme/project",
     },
     {
@@ -2665,6 +2683,7 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
       role: "implementer", attempt: 1, status: "completed", phase: "fix",
       workItemId: "mini-task:story", workItemLabel: "Mini task story",
       transitionOutcome: "continue_to_correctness_review", result: "Fixed",
+      commitSha: "c".repeat(40),
       nextTurnId: 3, completedAt: "2026-09-25T01:01:00Z", repository: "acme/project",
     },
     {
@@ -2672,6 +2691,7 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
       role: "reviewer", attempt: 2, status: "started", phase: "correctness-review",
       workItemId: "mini-task:story", workItemLabel: "Mini task story",
       transitionOutcome: null, result: null, nextTurnId: null, completedAt: null,
+      commitSha: "c".repeat(40),
       repository: "acme/project",
     },
   ];
@@ -2684,6 +2704,14 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
     outline: ["Work items", "Final integration PR"],
     progress: [{name: "Work items", status: "started"}],
     issueDrivenSummary,
+    runPreview: {
+      status: "planned",
+      phases: ["Work items", "Final integration PR"],
+      agents: [
+        {role: "Implementer", agent: "codex", purpose: "Implements and fixes."},
+        {role: "Reviewer", agent: "codex", purpose: "Reviews each head."},
+      ],
+    },
     agentTurns,
     executionContext: {
       sourceRepository: "/work/project", executionRoot: "/managed/project",
@@ -2697,9 +2725,14 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
     locationHref: "http://127.0.0.1:8765/",
   });
 
-  assert.equal(elements["outline-title"].textContent, "Actual workflow story");
-  assert.match(elements["outline-description"].textContent, /^ACTUAL/);
-  assert.match(elements["workflow-story-state"].textContent, /Current turn: Re-review/);
+  assert.equal(elements["outline-title"].textContent, "Planned run preview");
+  assert.match(elements["outline-description"].textContent, /not actual execution/);
+  assert.deepEqual(
+    elements["outline-agents"].children.map((item) => item.textContent),
+    ["Implementer (codex)", "Implements and fixes.", "Reviewer (codex)", "Reviews each head."],
+  );
+  assert.match(elements["workflow-story-state"].textContent, /^ACTUAL.*Current turn: Re-review/);
+  assert.equal(elements["actual-story-title"].hidden, false);
   assert.equal(elements["agent-turns"].children.length, 3);
   assert.match(
     elements["agent-turns"].children[0].children.at(-1).textContent,
@@ -2722,10 +2755,15 @@ test("Issue Driven run presents authoritative agent turns as an actual workflow 
     `https://github.com/acme/project/commit/${"a".repeat(40)}`,
   );
   const turnNavigation = elements["agent-turns"].children[0].children[3];
-  assert.equal(turnNavigation.children[2].textContent, "PR #40");
-  assert.equal(turnNavigation.children[4].textContent, "PurpleMux terminal");
+  assert.equal(turnNavigation.children[2].textContent, "Commit bbbbbbbbbb");
   assert.equal(
-    turnNavigation.children[4].href,
+    turnNavigation.children[2].href,
+    `https://github.com/acme/project/commit/${"b".repeat(40)}`,
+  );
+  assert.equal(turnNavigation.children[4].textContent, "PR #40");
+  assert.equal(turnNavigation.children[6].textContent, "PurpleMux terminal");
+  assert.equal(
+    turnNavigation.children[6].href,
     "http://127.0.0.1:9123/?workspace=ws-run&tab=tab-correctness",
   );
 });

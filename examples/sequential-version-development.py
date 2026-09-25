@@ -588,6 +588,7 @@ class _AgentTurnExecution:
     phase: str | None
     work_item_id: int | str | None
     work_item_label: str | None
+    commit_sha: str | None = None
 
 
 def _execute_turn(
@@ -626,6 +627,9 @@ def _execute_turn(
     if work_item_id is not None:
         trace_context["work_item_id"] = work_item_id
         trace_context["work_item_label"] = work_item_label
+    initial_commit_sha = before_sha or (pr.head_sha if pr is not None else None)
+    if initial_commit_sha is not None:
+        trace_context["commit_sha"] = initial_commit_sha
     emit_step(
         name,
         "started",
@@ -645,14 +649,14 @@ def _execute_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
-    def verify_turn_commits() -> None:
+    def verify_turn_commits() -> str | None:
         if (
             repository is None
             or branch is None
             or expected_process is None
             or before_sha is None
         ):
-            return
+            return pr.head_sha if pr is not None else None
         after = repository.require_current_branch(branch)
         if after.local_sha is None:
             raise WorkerFailure(f"local branch {branch!r} disappeared")
@@ -663,6 +667,7 @@ def _execute_turn(
             expected_process=expected_process,
             allow_unchanged=True,
         )
+        return after.local_sha
 
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
@@ -717,7 +722,7 @@ def _execute_turn(
                 raise exc from provenance_error
             raise
         raise
-    verify_turn_commits()
+    commit_sha = verify_turn_commits()
     emit_step(
         name,
         "completed",
@@ -736,6 +741,7 @@ def _execute_turn(
         phase,
         work_item_id,
         work_item_label,
+        commit_sha,
     )
 
 
@@ -749,6 +755,8 @@ def _emit_completed_turn(
     if execution.work_item_id is not None:
         trace_context["work_item_id"] = execution.work_item_id
         trace_context["work_item_label"] = execution.work_item_label
+    if execution.commit_sha is not None:
+        trace_context["commit_sha"] = execution.commit_sha
     try:
         emit_agent_turn(
             execution.turn_id,
@@ -4455,6 +4463,7 @@ def _review_whole_version(
                 decision,
                 role="reviewer",
                 iteration=review_number,
+                pr=pr,
                 phase="whole-review",
                 transition_outcome=lambda value: value.lower(),
             )
@@ -4542,6 +4551,7 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            pr=pr,
             phase="whole-review",
             transition_outcome=lambda value: value.lower(),
         )
@@ -4634,6 +4644,7 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            pr=pr,
             phase="whole-review",
             transition_outcome=lambda value: value.lower(),
         )
@@ -4717,6 +4728,7 @@ def _review_whole_version(
             decision,
             role="reviewer",
             iteration=review_number,
+            pr=pr,
             phase="whole-review",
             transition_outcome=lambda value: value.lower(),
         )

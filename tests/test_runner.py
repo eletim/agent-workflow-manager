@@ -99,8 +99,8 @@ def test_issue_driven_agent_turn_trace_is_linked_and_survives_history(
     result = "completed exactly\n" + "evidence\n" * 600
     code = f"""\
 from purplemux_client import emit_agent_turn
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", prompt={prompt!r})
-emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", result={result!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "started", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", commit_sha={"a" * 40!r}, prompt={prompt!r})
+emit_agent_turn(1, "Implement the work item", "implementer", 1, "completed", phase="implementation", work_item_id="mini-task", work_item_label="Mini task mini-task", transition_outcome="continue_to_scope_review", commit_sha={"b" * 40!r}, result={result!r})
 emit_agent_turn(2, "Review the work item", "reviewer", 3, "started", prompt="review prompt")
 emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent stopped")
 """
@@ -120,6 +120,7 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "workItemId": "mini-task",
                 "workItemLabel": "Mini task mini-task",
                 "transitionOutcome": "continue_to_scope_review",
+                "commitSha": "b" * 40,
                 "result": result,
                 "error": None,
                 "previousTurnId": None,
@@ -139,6 +140,7 @@ emit_agent_turn(2, "Review the work item", "reviewer", 3, "failed", error="agent
                 "workItemId": None,
                 "workItemLabel": None,
                 "transitionOutcome": None,
+                "commitSha": None,
                 "result": None,
                 "error": "agent stopped",
                 "previousTurnId": 1,
@@ -584,11 +586,23 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         run_history_file=history_file,
     )
     source = '{"mode":"issue-driven","one_shot_issue":196}'
+    preview = {
+        "status": "planned",
+        "phases": ["Work items", "Final integration PR"],
+        "agents": [
+            {
+                "role": "Implementer",
+                "agent": "codex",
+                "purpose": "Implements changes.",
+            }
+        ],
+    }
     try:
         first_id = runner.start(
             "import sys; print(sys.argv[1]); raise SystemExit(7)",
             args=("same-argument",),
             issue_driven_json=source,
+            issue_driven_preview=preview,
         )
         wait_for(runner, lambda item: item.state == "failed", run_id=first_id)
 
@@ -601,8 +615,16 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         assert resumed.code == runner.snapshot(first_id).code
         assert resumed.args == ("same-argument",)
         assert resumed.issue_driven_json == source
+        assert resumed.issue_driven_preview == preview
         assert resumed.resumed_from_run_id == first_id
+        assert resumed.resumed_from_state == "failed"
         assert resumed.as_json()["mode"] == "issue-driven"
+        assert resumed.as_json()["runPreview"] == preview
+        assert resumed.as_json()["recoverySource"] == {
+            "runId": first_id,
+            "identity": runner.snapshot(first_id).identity,
+            "state": "failed",
+        }
         assert resumed.as_summary_json()["resumedFromRunId"] == first_id
     finally:
         runner.close()
@@ -615,7 +637,9 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
     try:
         resumed = restored.snapshot(resumed_id)
         assert resumed.issue_driven_json == source
+        assert resumed.issue_driven_preview == preview
         assert resumed.resumed_from_run_id == first_id
+        assert resumed.resumed_from_state == "failed"
     finally:
         restored.close()
 

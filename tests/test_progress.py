@@ -120,6 +120,7 @@ def test_emit_agent_turn_completed_carries_authoritative_transition_context(
             work_item_id="validate-change",
             work_item_label="Mini task validate-change",
             transition_outcome="changes_requested",
+            commit_sha="a" * 40,
             result="CHANGES_REQUESTED",
         )
     finally:
@@ -138,6 +139,7 @@ def test_emit_agent_turn_completed_carries_authoritative_transition_context(
         "work_item_id": "validate-change",
         "work_item_label": "Mini task validate-change",
         "transition_outcome": "changes_requested",
+        "commit_sha": "a" * 40,
         "result": "CHANGES_REQUESTED",
     }
 

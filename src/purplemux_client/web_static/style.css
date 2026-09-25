@@ -412,6 +412,7 @@ a { color: #bcaaff; }
 .outline-agents[hidden] { display: none; }
 .outline-agents dt { color: #e8eaf0; font-weight: 600; }
 .outline-agents dd { margin: 0; color: #9ba3b5; }
+.actual-story-title { margin: 18px 0 0; font-size: 15px; }
 .agent-turn-list {
   display: grid;
   gap: 10px;

@@ -117,6 +117,8 @@ const outline = document.querySelector("#outline");
 const outlineAgents = document.querySelector("#outline-agents");
 const workflowStoryState = document.querySelector("#workflow-story-state");
 const workflowStoryNavigation = document.querySelector("#workflow-story-navigation");
+const workflowRecoveryTransition = document.querySelector("#workflow-recovery-transition");
+const actualStoryTitle = document.querySelector("#actual-story-title");
 const agentTurns = document.querySelector("#agent-turns");
 const guideDialog = document.querySelector("#guide-dialog");
 const guideOpen = document.querySelector("#guide-open");
@@ -635,7 +637,12 @@ function renderRun(result) {
   checkedToggle.disabled = activeRunId === null || !checkable;
   checkedToggle.textContent = result.checked ? "Mark unchecked" : "Mark checked";
   checkedToggle.setAttribute("aria-pressed", String(Boolean(result.checked)));
-  renderOutline(result.outline || [], result.progress || []);
+  const runPreview = result.mode === "issue-driven" ? result.runPreview || null : null;
+  renderOutline(
+    runPreview?.phases || result.outline || [],
+    result.progress || [],
+    runPreview,
+  );
   renderIssueDrivenStory(result);
   renderProgress(
     result.progress || [],
@@ -1298,6 +1305,9 @@ function renderOutline(labels, events, plannedPreview = null) {
     : "";
   workflowStoryNavigation.hidden = true;
   workflowStoryNavigation.replaceChildren();
+  workflowRecoveryTransition.hidden = true;
+  workflowRecoveryTransition.replaceChildren();
+  actualStoryTitle.hidden = true;
   agentTurns.hidden = true;
   agentTurns.replaceChildren();
   for (const agent of plannedPreview?.agents || []) {
@@ -1388,19 +1398,13 @@ function appendTurnNavigation(container, turn, summary) {
 function renderIssueDrivenStory(result) {
   if (result.mode !== "issue-driven" || result.runId == null) return;
   outlinePanel.hidden = false;
-  outlineTitle.textContent = "Actual workflow story";
-  outlineDescription.hidden = false;
-  outlineDescription.textContent = "ACTUAL · Authoritative agent turns and observed workflow state for this run.";
   workflowStoryState.hidden = false;
   const turns = result.agentTurns || [];
   const currentTurn = turns.find((turn) => turn.status === "started" && turn.completedAt == null);
   const presentation = runPresentation(result);
-  const recovery = result.resumedFromRunId == null
-    ? ""
-    : `Recovery from Run #${result.resumedFromRunId} · `;
   workflowStoryState.textContent = currentTurn
-    ? `${presentation.label} · ${recovery}Current turn: ${currentTurn.purpose}`
-    : `${presentation.label} · ${recovery}${turns.length} actual agent turn${turns.length === 1 ? "" : "s"} recorded`;
+    ? `ACTUAL · ${presentation.label} · Current turn: ${currentTurn.purpose}`
+    : `ACTUAL · ${presentation.label} · ${turns.length} actual agent turn${turns.length === 1 ? "" : "s"} recorded`;
 
   const summary = result.issueDrivenSummary;
   const repositories = summary?.repositories || (summary ? [summary] : []);
@@ -1422,8 +1426,25 @@ function renderIssueDrivenStory(result) {
   }
   workflowStoryNavigation.hidden = workflowStoryNavigation.children.length === 0;
 
+  workflowRecoveryTransition.replaceChildren();
+  const recoverySource = result.recoverySource;
+  if (recoverySource?.identity && recoverySource.state) {
+    workflowRecoveryTransition.append(document.createTextNode("Recovery: "));
+    const source = document.createElement("a");
+    source.href = `/?run=${encodeURIComponent(recoverySource.identity)}`;
+    source.textContent = `Run #${recoverySource.runId} (${recoverySource.state.toUpperCase()})`;
+    workflowRecoveryTransition.append(
+      source,
+      document.createTextNode(` → Run #${result.runId}`),
+    );
+    workflowRecoveryTransition.hidden = false;
+  } else {
+    workflowRecoveryTransition.hidden = true;
+  }
+
   agentTurns.replaceChildren();
   agentTurns.hidden = turns.length === 0;
+  actualStoryTitle.hidden = turns.length === 0;
   const turnsById = new Map(turns.map((turn) => [turn.turnId, turn]));
   for (const turn of turns) {
     const item = document.createElement("li");
@@ -1462,6 +1483,13 @@ function renderIssueDrivenStory(result) {
     navigation.className = "agent-turn-navigation";
     const repositoryUrl = githubRepositoryUrl(turn.repository);
     if (repositoryUrl) appendStoryLink(navigation, turn.repository, repositoryUrl);
+    if (repositoryUrl && turn.commitSha) {
+      appendStoryLink(
+        navigation,
+        `Commit ${turn.commitSha.slice(0, 10)}`,
+        `${repositoryUrl}/commit/${turn.commitSha}`,
+      );
+    }
     appendTurnNavigation(navigation, turn, summary);
 
     const promptDetails = document.createElement("details");
