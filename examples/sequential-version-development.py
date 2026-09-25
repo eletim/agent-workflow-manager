@@ -578,7 +578,19 @@ def create_agent(
     )
 
 
-def run_turn(
+@dataclass(frozen=True)
+class _AgentTurnExecution:
+    result: str
+    turn_id: int
+    purpose: str
+    role: str
+    attempt: int
+    phase: str | None
+    work_item_id: int | str | None
+    work_item_label: str | None
+
+
+def _execute_turn(
     client: PurpleMuxCLIClient,
     tab: str,
     name: str,
@@ -588,14 +600,13 @@ def run_turn(
     phase: str | None = None,
     work_item_id: int | str | None = None,
     work_item_label: str | None = None,
-    transition_outcome: str | Callable[[str], str] = "completed",
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
     repository: GitRepository | None = None,
     branch: str | None = None,
     expected_process: str | None = None,
-) -> str:
+) -> _AgentTurnExecution:
     if (repository is None) != (branch is None) or (repository is None) != (
         expected_process is None
     ):
@@ -706,24 +717,6 @@ def run_turn(
                 raise exc from provenance_error
             raise
         raise
-    try:
-        outcome = (
-            transition_outcome(result)
-            if callable(transition_outcome)
-            else transition_outcome
-        )
-        emit_agent_turn(
-            turn_id,
-            name,
-            role,
-            turn_attempt,
-            "completed",
-            result=result,
-            transition_outcome=outcome,
-            **trace_context,
-        )
-    except Exception:
-        pass
     verify_turn_commits()
     emit_step(
         name,
@@ -734,7 +727,82 @@ def run_turn(
         **navigation,
     )
     terminal_progress("DONE", name, iteration=iteration)
-    return result
+    return _AgentTurnExecution(
+        result,
+        turn_id,
+        name,
+        role,
+        turn_attempt,
+        phase,
+        work_item_id,
+        work_item_label,
+    )
+
+
+def _emit_completed_turn(
+    execution: _AgentTurnExecution, transition_outcome: str | None
+) -> None:
+    """Observe the already-decided outcome without participating in control flow."""
+    trace_context = {}
+    if execution.phase is not None:
+        trace_context["phase"] = execution.phase
+    if execution.work_item_id is not None:
+        trace_context["work_item_id"] = execution.work_item_id
+        trace_context["work_item_label"] = execution.work_item_label
+    try:
+        emit_agent_turn(
+            execution.turn_id,
+            execution.purpose,
+            execution.role,
+            execution.attempt,
+            "completed",
+            result=execution.result,
+            transition_outcome=transition_outcome,
+            **trace_context,
+        )
+    except Exception:
+        pass
+
+
+def run_turn(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    name: str,
+    prompt: str,
+    *,
+    role: str = "agent",
+    phase: str | None = None,
+    work_item_id: int | str | None = None,
+    work_item_label: str | None = None,
+    transition_outcome: str | None = None,
+    iteration: int | None = None,
+    pr: PullRequestState | None = None,
+    warning_scope: int | str | None = None,
+    repository: GitRepository | None = None,
+    branch: str | None = None,
+    expected_process: str | None = None,
+    _defer_trace: bool = False,
+) -> str | _AgentTurnExecution:
+    execution = _execute_turn(
+        client,
+        tab,
+        name,
+        prompt,
+        role=role,
+        phase=phase,
+        work_item_id=work_item_id,
+        work_item_label=work_item_label,
+        iteration=iteration,
+        pr=pr,
+        warning_scope=warning_scope,
+        repository=repository,
+        branch=branch,
+        expected_process=expected_process,
+    )
+    if _defer_trace:
+        return execution
+    _emit_completed_turn(execution, transition_outcome)
+    return execution.result
 
 
 ValidatedOutput = TypeVar("ValidatedOutput")
@@ -757,19 +825,7 @@ def run_validated_turn(
     warning_scope: int | str | None = None,
 ) -> tuple[str, ValidatedOutput]:
     """Retry an invalid machine-readable response in the same agent session."""
-    validated: list[ValidatedOutput] = []
-
-    def classify(source: str) -> str:
-        try:
-            value = validator(source)
-        except WorkerFailure:
-            return "correct_output"
-        validated.append(value)
-        return (
-            transition_outcome(value) if transition_outcome is not None else "completed"
-        )
-
-    result = run_turn(
+    turn = run_turn(
         client,
         tab,
         name,
@@ -781,13 +837,20 @@ def run_validated_turn(
         phase=phase,
         work_item_id=work_item_id,
         work_item_label=work_item_label,
-        transition_outcome=classify,
+        _defer_trace=True,
     )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+        result = turn.result if isinstance(turn, _AgentTurnExecution) else turn
         try:
-            value = validated.pop(0) if validated else validator(result)
-            return result, value
+            value = validator(result)
         except WorkerFailure as exc:
+            if isinstance(turn, _AgentTurnExecution):
+                _emit_completed_turn(
+                    turn,
+                    "correct_output"
+                    if correction < MAX_MACHINE_OUTPUT_CORRECTIONS
+                    else "invalid_output",
+                )
             if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
                 raise WorkerFailure(
                     f"{name} returned invalid output after "
@@ -795,8 +858,7 @@ def run_validated_turn(
                     f"{short_error(exc)}"
                 ) from exc
             validation_error = short_error(exc)
-            validated.clear()
-            result = run_turn(
+            turn = run_turn(
                 client,
                 tab,
                 f"{name} output correction",
@@ -812,8 +874,18 @@ def run_validated_turn(
                 phase="output-correction",
                 work_item_id=work_item_id,
                 work_item_label=work_item_label,
-                transition_outcome=classify,
+                _defer_trace=True,
             )
+            continue
+        outcome: str | None = None
+        if transition_outcome is not None:
+            try:
+                outcome = transition_outcome(value)
+            except Exception:
+                pass
+        if isinstance(turn, _AgentTurnExecution):
+            _emit_completed_turn(turn, outcome)
+        return result, value
     raise AssertionError("unreachable")
 
 
