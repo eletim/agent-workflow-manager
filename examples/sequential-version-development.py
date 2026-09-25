@@ -16,6 +16,7 @@ import re
 import string
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import count
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -33,6 +34,7 @@ from purplemux_client import (
     WorkerFailure,
     WorkerInterrupted,
     agent_commit_coauthor,
+    emit_agent_turn,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -242,6 +244,7 @@ class AgentTurnTimeoutWarning:
 
 
 AGENT_TURN_TIMEOUT_WARNINGS: list[AgentTurnTimeoutWarning] = []
+AGENT_TURN_IDS = count(1)
 
 
 @dataclass(frozen=True)
@@ -581,6 +584,7 @@ def run_turn(
     name: str,
     prompt: str,
     *,
+    role: str = "agent",
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
@@ -641,12 +645,38 @@ def run_turn(
 
     try:
         client.wait_until_ready(tab, READY_TIMEOUT)
+        turn_id = next(AGENT_TURN_IDS)
+        turn_attempt = iteration or 1
+        try:
+            emit_agent_turn(
+                turn_id,
+                name,
+                role,
+                turn_attempt,
+                "started",
+                prompt=prompt,
+            )
+        except Exception:
+            # The trace is observation-only and must never control execution.
+            pass
         client.send_input(tab, prompt)
         client.wait_for_turn_completion(
             tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
         )
         result = client.read_result(tab)
     except BaseException as exc:
+        if "turn_id" in locals():
+            try:
+                emit_agent_turn(
+                    turn_id,
+                    name,
+                    role,
+                    turn_attempt,
+                    "failed",
+                    error=short_error(exc),
+                )
+            except Exception:
+                pass
         emit_step(
             name,
             "failed",
@@ -664,6 +694,17 @@ def run_turn(
                 raise exc from provenance_error
             raise
         raise
+    try:
+        emit_agent_turn(
+            turn_id,
+            name,
+            role,
+            turn_attempt,
+            "completed",
+            result=result,
+        )
+    except Exception:
+        pass
     verify_turn_commits()
     emit_step(
         name,
@@ -687,6 +728,7 @@ def run_validated_turn(
     prompt: str,
     validator: Callable[[str], ValidatedOutput],
     *,
+    role: str = "agent",
     iteration: int | None = None,
     pr: PullRequestState | None = None,
     warning_scope: int | str | None = None,
@@ -700,6 +742,7 @@ def run_validated_turn(
         iteration=iteration,
         pr=pr,
         warning_scope=warning_scope,
+        role=role,
     )
     for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
         try:
@@ -724,6 +767,7 @@ def run_validated_turn(
                 iteration=correction + 1,
                 pr=pr,
                 warning_scope=warning_scope,
+                role=role,
             )
     raise AssertionError("unreachable")
 
@@ -816,6 +860,7 @@ def recover_error(
                 process="recovery",
             ),
             parse_recovery_report,
+            role="recovery",
         )
         return report
     finally:
@@ -1760,6 +1805,7 @@ def update_base_pr_human_handoff(
             writer,
             "Base PR human handoff",
             human_handoff_prompt(config, work_items, pr, delivery, warnings),
+            role="reviewer",
             pr=pr,
         )
         handoff = validate_human_handoff(
@@ -1893,6 +1939,7 @@ def update_multi_repository_human_handoffs(
             writer,
             "Multi-repository human handoff",
             multi_repository_handoff_prompt(tuple(deliveries)),
+            role="reviewer",
             pr=writer_delivery.pr,
         )
         handoff = validate_human_handoff(
@@ -2141,6 +2188,7 @@ force, or discard uncertain work. If any dirty path is ambiguous, preserve it
 and clearly explain why it cannot be resolved safely. Finish with a clean
 worktree when safe and return a concise summary of exactly what you committed,
 ignored, removed, or could not resolve.""", process="cleanup"),
+        role="implementer",
         iteration=iteration,
         warning_scope=warning_scope,
         repository=repo,
@@ -2545,6 +2593,7 @@ def _review_issue_phase(
             f"{issue.label} {phase} review",
             f"{prompt}\nReview exact head {pr.head_sha} against base {pr.base_sha}.",
             decision,
+            role="reviewer",
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
@@ -2683,6 +2732,7 @@ fix, test, commit, and leave the worktree clean. If no change is warranted,
 leave it clean and explain why; do not create an empty commit.\n\n{result}""",
                 process="reviewer-fix",
             ),
+            role="implementer",
             iteration=review_number,
             pr=pr,
             warning_scope=issue.result_id,
@@ -3040,6 +3090,7 @@ def process_issue(
         implementer,
         f"{issue.label} implementation",
         implementation_prompt,
+        role="implementer",
         pr=existing_pr,
         warning_scope=issue.result_id,
         repository=repo,
@@ -3919,6 +3970,7 @@ def process_work_items(
             )
             + planner_prompt(plan, config),
             lambda source: apply_planner_decision(plan, source),
+            role="planner",
             iteration=planner_turn,
         )
         for conflict in planner_decision.policy_conflicts:
@@ -4248,6 +4300,7 @@ def _review_whole_version(
                 )
                 + scenario_gate_prompt(pr, config, work_items),
                 decision,
+                role="reviewer",
                 iteration=review_number,
             )
             emit_policy_conflicts(result, config, scope="the integrated version")
@@ -4332,6 +4385,7 @@ def _review_whole_version(
             )
             + design_principles_review_prompt(pr, config, work_items),
             decision,
+            role="reviewer",
             iteration=review_number,
         )
         review_results.append(principles_result)
@@ -4421,6 +4475,7 @@ def _review_whole_version(
             )
             + whole_version_review_prompt(pr, config, work_items),
             decision,
+            role="reviewer",
             iteration=review_number,
         )
         review_results.append(result)
@@ -4501,6 +4556,7 @@ def _review_whole_version(
             )
             + version_readme_review_prompt(pr, config, work_items),
             decision,
+            role="reviewer",
             iteration=review_number,
         )
         review_results.append(version_result)
@@ -4618,6 +4674,7 @@ def _review_whole_version(
 and leave the worktree clean. If not, leave it clean and explain why.\n\n{result}""",
                         process="reviewer-fix",
                     ),
+                    role="implementer",
                     iteration=review_number,
                     repository=repo,
                     branch=config.integration_branch,

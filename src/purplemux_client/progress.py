@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Mapping
+from queue import SimpleQueue
 from typing import Literal
 from urllib import error, request
 from urllib.parse import urlparse
@@ -25,9 +28,16 @@ PROGRESS_FD_ENV = "PURPLEMUX_RUNNER_PROGRESS_FD"
 RESOURCE_ACK_FD_ENV = "PURPLEMUX_RUNNER_RESOURCE_ACK_FD"
 EVENT_URL_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_URL"
 EVENT_TOKEN_ENV = "AGENT_WORKFLOW_MANAGER_EVENT_TOKEN"
+AGENT_TURN_TRACE_FILE_ENV = "AGENT_WORKFLOW_MANAGER_AGENT_TURN_TRACE_FILE"
 MAX_PROGRESS_EVENT_BYTES = 4096
+_AGENT_TURN_CHUNK_CHARS = 2_400
 _TRUNCATED_ERROR_SUFFIX = "\n[error truncated]"
 _write_lock = threading.Lock()
+_agent_turn_http_queue: SimpleQueue[tuple[str, str, tuple[dict[str, object], ...]]] = (
+    SimpleQueue()
+)
+_agent_turn_http_thread: threading.Thread | None = None
+_agent_turn_http_thread_lock = threading.Lock()
 
 
 def emit_step(
@@ -74,6 +84,177 @@ def emit_step(
         if value is not None:
             event[key] = value
     _write_event(event, drop_oversized=True)
+
+
+def emit_agent_turn(
+    turn_id: int,
+    purpose: str,
+    role: str,
+    attempt: int,
+    status: Literal["started", "completed", "failed"],
+    *,
+    prompt: str | None = None,
+    result: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Publish one observation-only Issue Driven agent-turn transition.
+
+    Large prompts and results are transported in independently bounded chunks.
+    Delivery is best-effort like every other progress event and therefore can
+    never become workflow control state.
+    """
+    _validate_positive_number("turn_id", turn_id)
+    _validate_positive_number("attempt", attempt)
+    if not isinstance(purpose, str) or not purpose.strip():
+        raise ValueError("agent turn purpose must be a non-empty string")
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("agent turn role must be a non-empty string")
+    if status == "started":
+        if not isinstance(prompt, str) or result is not None or error is not None:
+            raise ValueError("a started agent turn requires only its exact prompt")
+    elif status == "completed":
+        if not isinstance(result, str) or prompt is not None or error is not None:
+            raise ValueError("a completed agent turn requires only its result")
+    elif status == "failed":
+        if (
+            not isinstance(error, str)
+            or not error
+            or prompt is not None
+            or result is not None
+        ):
+            raise ValueError("a failed agent turn requires only its error")
+    else:
+        raise ValueError("agent turn status must be started, completed, or failed")
+
+    payload: dict[str, object] = {
+        "turn_id": turn_id,
+        "purpose": purpose,
+        "role": role,
+        "attempt": attempt,
+        "status": status,
+    }
+    if prompt is not None:
+        payload["prompt"] = prompt
+    if result is not None:
+        payload["result"] = result
+    if error is not None:
+        payload["error"] = error
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    ).decode("ascii")
+    chunks = tuple(
+        encoded[index : index + _AGENT_TURN_CHUNK_CHARS]
+        for index in range(0, len(encoded), _AGENT_TURN_CHUNK_CHARS)
+    )
+    message_id = f"{turn_id}:{status}"
+    events: tuple[dict[str, object], ...] = tuple(
+        {
+            "type": "agent_turn_trace_chunk",
+            "message_id": message_id,
+            "chunk_index": index,
+            "chunk_count": len(chunks),
+            "data": chunk,
+        }
+        for index, chunk in enumerate(chunks)
+    )
+    _append_agent_turn_spool(events)
+    event_url = os.environ.get(EVENT_URL_ENV)
+    event_token = os.environ.get(EVENT_TOKEN_ENV)
+    if event_url is not None and event_token is not None:
+        _enqueue_agent_turn_http(event_url, event_token, events)
+        return
+    for event in events:
+        _write_event(event, drop_oversized=True)
+
+
+def _enqueue_agent_turn_http(
+    event_url: str,
+    event_token: str,
+    events: tuple[dict[str, object], ...],
+) -> None:
+    """Queue ordered trace delivery without waiting at the agent send boundary."""
+    global _agent_turn_http_thread
+
+    _agent_turn_http_queue.put((event_url, event_token, events))
+    with _agent_turn_http_thread_lock:
+        if _agent_turn_http_thread is not None and _agent_turn_http_thread.is_alive():
+            return
+        _agent_turn_http_thread = threading.Thread(
+            target=_deliver_agent_turn_http,
+            name="agent-turn-trace-delivery",
+            # Observation must never keep authoritative workflow execution alive.
+            daemon=True,
+        )
+        _agent_turn_http_thread.start()
+
+
+def _deliver_agent_turn_http() -> None:
+    """Preserve transition order and retry ambiguous failures until shutdown."""
+    while True:
+        event_url, event_token, events = _agent_turn_http_queue.get()
+        for event in events:
+            retry_delay = 0.05
+            while True:
+                outcome = _post_agent_turn_event(event_url, event_token, event)
+                if outcome == "delivered":
+                    break
+                if outcome == "rejected":
+                    break
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 1.0)
+            if outcome == "rejected":
+                break
+
+
+def _append_agent_turn_spool(events: tuple[dict[str, object], ...]) -> None:
+    path = os.environ.get(AGENT_TURN_TRACE_FILE_ENV)
+    if path is None:
+        return
+    encoded = b"".join(_encode_event(event) for event in events)
+    try:
+        flags = os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            with _write_lock:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+
+
+def _post_agent_turn_event(
+    url: str,
+    token: str,
+    event: Mapping[str, object],
+) -> Literal["delivered", "retry", "rejected"]:
+    encoded = _encode_event(event)
+    if len(encoded) > MAX_PROGRESS_EVENT_BYTES:
+        return "rejected"
+    submitted = request.Request(
+        url,
+        data=encoded,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-AWM-Run-Token": token,
+        },
+    )
+    try:
+        with request.urlopen(submitted, timeout=5) as response:
+            response.read(MAX_PROGRESS_EVENT_BYTES + 1)
+    except error.HTTPError as exc:
+        return "retry" if 500 <= exc.code < 600 else "rejected"
+    except (error.URLError, OSError):
+        return "retry"
+    return "delivered"
 
 
 def emit_run_pr(pr_number: int, pr_url: str) -> None:
