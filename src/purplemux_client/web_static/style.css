@@ -29,7 +29,16 @@ h2, label { font-size: 14px; font-weight: 650; }
   background: #171b24;
   padding: 16px;
 }
-.runs-panel { margin-bottom: 14px; }
+.runtime-panel { margin-top: 14px; padding: 0; }
+.runtime-heading {
+  padding: 16px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 650;
+}
+.runtime-panel[open] .runtime-heading { border-bottom: 1px solid #303746; }
+.runtime-content { padding: 0 14px 14px; }
+.runs-panel { margin-top: 14px; }
 .runs-heading {
   display: flex;
   align-items: center;
@@ -159,16 +168,46 @@ textarea {
   gap: 12px;
   margin-bottom: 10px;
 }
-.mode-switch {
-  display: inline-flex;
-  gap: 4px;
-  margin-bottom: 14px;
-  padding: 3px;
+.execution-navigation { margin-bottom: 14px; }
+.issue-driven-entry {
+  display: grid;
+  width: 100%;
+  padding: 14px 16px;
+  text-align: left;
+  border-color: #8061e8;
+  background: #34295a;
+}
+.issue-driven-entry span { font-size: 16px; font-weight: 650; }
+.issue-driven-entry small { margin-top: 3px; color: #c9c0ec; }
+.issue-driven-entry.selected { background: #6846d7; }
+.developer-views {
+  margin-top: 8px;
+  padding: 0 10px;
   border: 1px solid #303746;
   border-radius: 8px;
-  background: #0c0f15;
+  background: #12161e;
 }
-.mode-switch button { border-color: transparent; background: transparent; }
+.developer-views summary {
+  padding: 10px 2px;
+  color: #aab0bf;
+  cursor: pointer;
+  font-size: 13px;
+}
+.mode-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 0 10px;
+}
+.mode-switch button, .mode-switch a {
+  padding: 8px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 13px;
+}
+.mode-switch a { color: #bcaaff; text-decoration: none; }
+.mode-switch a:hover { text-decoration: underline; }
 .mode-switch button.selected { border-color: #8061e8; background: #34295a; }
 .prompt-options {
   display: grid;
@@ -606,8 +645,8 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .run-history-actions { margin: 0; padding: 10px 12px 0; }
   .run-history-actions button { width: 100%; }
   .run-list { max-height: 32vh; margin: 0; padding: 10px 12px; overflow-y: auto; }
-  .mode-switch { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; }
-  .mode-switch button { min-width: 0; padding-inline: 6px; }
+  .mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+  .mode-switch button, .mode-switch a { min-width: 0; padding-inline: 6px; text-align: center; }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
   .editor-mode-bar #new-run { align-self: stretch; }
   .repository-navigation { align-items: flex-start; flex-direction: column; }

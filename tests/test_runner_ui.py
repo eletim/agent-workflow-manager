@@ -137,9 +137,34 @@ def test_review_editor_keeps_generated_python_read_only() -> None:
     assert 'id="review-result-panel"' in html
 
 
+def test_issue_driven_is_primary_and_developer_views_remain_linked() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+
+    assert 'id="issue-driven-mode" class="issue-driven-entry selected"' in html
+    assert '<div id="issue-driven-fields">' in html
+    assert '<div id="workflow-fields" hidden>' in html
+    assert '<details id="developer-views" class="developer-views">' in html
+    for label in (
+        "Prompt",
+        "Environment Setup",
+        "Review",
+        "Python Workflow",
+        "Runtime",
+        "Diagnostics",
+    ):
+        assert f">{label}<" in html
+    assert 'id="runtime-view" type="button">Runtime</button>' in html
+    assert '<details id="runtime-panel" class="panel runtime-panel" hidden>' in html
+    assert 'href="#diagnostics-panel">Diagnostics</a>' in html
+
+
 def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
     ancestors = _ancestors("run-list")
 
+    assert any(
+        tag == "details" and attributes.get("id") == "runtime-panel"
+        for tag, attributes in ancestors
+    )
     assert any(
         tag == "details"
         and attributes.get("id") == "runs-panel"
@@ -164,7 +189,7 @@ def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
 
     assert "@media (max-width: 760px)" in styles
     assert "overflow-x: clip" in styles
-    assert ".mode-switch" in styles and "repeat(5, minmax(0, 1fr))" in styles
+    assert ".mode-switch" in styles and "repeat(2, minmax(0, 1fr))" in styles
     assert ".controls" in styles and "repeat(2, minmax(0, 1fr))" in styles
     assert ".output-panel { min-width: 0; }" in styles
     assert 'id="issue-summary-panel"' in INDEX.read_text(encoding="utf-8")
