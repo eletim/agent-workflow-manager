@@ -77,8 +77,9 @@ Choose **Review** in the Runner to inspect local Git repositories or observe an
 external terminal. Enter a JSON declaration, select **Validate JSON & Generate**
 to inspect the generated Python, then use **Validate**, **Dry Run**, and **Run**.
 Progress, Stop, Result, and history use the ordinary Run surfaces. The Review
-result panel shows the structured verdict when one is available. The original
-JSON and generated Python are retained in history.
+result panel shows the structured verdict when one is available. Structured
+verdicts are saved with Run history and remain visible in history and detail
+after reload. The original JSON and generated Python are retained in history.
 
 The [Review Guide](src/purplemux_client/web_static/review-guide.md) gives the
 field schema, an example, the read-only browser and `ext-review` observation
@@ -570,9 +571,9 @@ The generated Python remains an implementation detail rather than an editable or
 historical UI field.
 
 **Python Workflow** executes arbitrary Python with the current Python interpreter in a
-visible PurpleMux-managed Bash tab. PurpleMux terminal output is the detailed
-stdout/stderr inspection surface; AWM shows structured Progress, Findings,
-bounded failure diagnostics, the managed-shell exit code, and the
+visible PurpleMux-managed Bash tab. AWM saves bounded stdout and stderr in Run
+history and detail, alongside structured Progress, Findings, bounded failure
+diagnostics, the managed-shell exit code, and the
 idle/running/success/failed/stopped/validation_failed state. Validate remains a
 side-effect-free static check and Dry Run remains a pre-execution local
 inspection. Run performs preflight before creating the PurpleMux workspace and

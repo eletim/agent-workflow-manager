@@ -201,6 +201,59 @@ def serialize_review_result(
     return payload
 
 
+def validate_review_result(value: object) -> dict[str, Any]:
+    """Validate the final, compacted Review value stored with a Run."""
+    if not isinstance(value, dict) or value.get("verdict") not in (
+        "PASS",
+        "FAIL",
+        "BLOCKED",
+    ):
+        raise ValueError("invalid Review verdict")
+    if not isinstance(value.get("summary"), str) or not value["summary"].strip():
+        raise ValueError("invalid Review summary")
+    repositories = value.get("repositories")
+    if not isinstance(repositories, list) or any(
+        not isinstance(item, str) for item in repositories
+    ):
+        raise ValueError("invalid Review repositories")
+    arrays = (
+        "findings",
+        "observed_facts",
+        "evidence",
+        "hypotheses",
+        "observability_gaps",
+    )
+    if any(
+        name in value
+        and (
+            not isinstance(value[name], list)
+            or any(not isinstance(item, str) for item in value[name])
+        )
+        for name in arrays
+    ):
+        raise ValueError("invalid Review details")
+    truncated = value.get("truncated", {})
+    if not isinstance(truncated, dict) or any(
+        not isinstance(key, str) or type(count) is not int or count < 1
+        for key, count in truncated.items()
+    ):
+        raise ValueError("invalid Review truncation")
+    if value.keys() - {"verdict", "summary", "repositories", "truncated", *arrays}:
+        raise ValueError("unknown Review result fields")
+    return value
+
+
+def publish_review_result(value: dict[str, Any]) -> None:
+    """Send the Review decision to its owning Run, independently of output."""
+    from purplemux_client.workflow import CONTROL_TOKEN_ENV, CONTROL_URL_ENV, _control
+
+    validate_review_result(value)
+    # Generated workflows can also be run directly as ordinary Python scripts.
+    if CONTROL_URL_ENV not in os.environ and CONTROL_TOKEN_ENV not in os.environ:
+        return
+    _control("review_result", result=value)
+
+
 def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ...]:
     """Fingerprint Git state and file contents, including ignored and untracked files."""
     snapshots = []
@@ -539,7 +592,7 @@ import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
 from purplemux_client.errors import MutationOutcomeUnknown, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
-from purplemux_client.review import ReviewWriteMonitor, require_ext_review_contract, serialize_review_result, snapshot_review_repositories
+from purplemux_client.review import ReviewWriteMonitor, publish_review_result, require_ext_review_contract, serialize_review_result, snapshot_review_repositories
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -676,6 +729,7 @@ try:
     client.close_session(tab)
     tab = None
     verify_repositories()
+    publish_review_result(json.loads(serialized_result))
     print(serialized_result)
 except BaseException as exc:
     failure = exc

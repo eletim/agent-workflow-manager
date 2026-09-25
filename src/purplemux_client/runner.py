@@ -29,6 +29,7 @@ from purplemux_client.client import (
     PurpleMuxCLIClient,
     PurpleMuxRuntime,
     ShellCommandRequest,
+    ShellResult,
     WorkspaceState,
 )
 from purplemux_client.correlation import RUN_IDENTITY_ENV
@@ -483,6 +484,7 @@ class RunnerSnapshot:
     issue_driven_json: str | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
+    review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
@@ -507,6 +509,7 @@ class RunnerSnapshot:
         issue_driven_json = payload.pop("issue_driven_json")
         environment_setup_json = payload.pop("environment_setup_json")
         review_json = payload.pop("review_json")
+        review_result = payload.pop("review_result")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
         if issue_driven_json is not None:
             payload["issueDrivenJson"] = issue_driven_json
@@ -514,6 +517,7 @@ class RunnerSnapshot:
             payload["environmentSetupJson"] = environment_setup_json
         if review_json is not None:
             payload["reviewJson"] = review_json
+            payload["reviewResult"] = review_result
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
         if self.prompt is not None:
@@ -763,6 +767,12 @@ class RunnerSnapshot:
             "checked": self.checked,
         }
         payload.update(self._family_json())
+        if self.review_json is not None:
+            payload["reviewVerdict"] = (
+                self.review_result["verdict"]
+                if self.state == "success" and self.review_result is not None
+                else None
+            )
         if self.resumed_from_run_id is not None:
             payload["resumedFromRunId"] = self.resumed_from_run_id
         if self.prompt is not None:
@@ -868,6 +878,7 @@ class _RunRecord:
     issue_driven_json: str | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
+    review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
@@ -1109,6 +1120,7 @@ class PythonRunner:
             "issueDrivenJson": run.issue_driven_json,
             "environmentSetupJson": run.environment_setup_json,
             "reviewJson": run.review_json,
+            "reviewResult": run.review_result,
             "resumedFromRunId": run.resumed_from_run_id,
         }
 
@@ -1207,6 +1219,7 @@ class PythonRunner:
         issue_driven_json = value.get("issueDrivenJson")
         environment_setup_json = value.get("environmentSetupJson")
         review_json = value.get("reviewJson")
+        review_result = value.get("reviewResult")
         resumed_from_run_id = value.get("resumedFromRunId")
         if (
             isinstance(run_id, bool)
@@ -1231,6 +1244,7 @@ class PythonRunner:
                 and not isinstance(environment_setup_json, str)
             )
             or (review_json is not None and not isinstance(review_json, str))
+            or (review_result is not None and review_json is None)
             or (
                 resumed_from_run_id is not None
                 and (
@@ -1242,6 +1256,10 @@ class PythonRunner:
             )
         ):
             raise ValueError
+        if review_result is not None:
+            from purplemux_client.review import validate_review_result
+
+            validate_review_result(review_result)
 
         parent_run = value.get("parentRun")
         child_runs = value.get("childRuns", [])
@@ -1542,6 +1560,7 @@ class PythonRunner:
             issue_driven_json=issue_driven_json,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
+            review_result=review_result,
             resumed_from_run_id=resumed_from_run_id,
             parent_run=parent_run,
             child_runs=tuple(child_runs),
@@ -2082,6 +2101,14 @@ class PythonRunner:
                 raise PermissionError("invalid running Workflow credential")
             parent_id = parent.run_id
             operation = payload.get("operation")
+            if operation == "review_result":
+                if parent.review_json is None or parent.review_result is not None:
+                    raise ValueError("Review result is unavailable for this Run")
+                from purplemux_client.review import validate_review_result
+
+                parent.review_result = validate_review_result(payload.get("result"))
+                self._mark_changed()
+                return {}
             target_id = payload.get("target_id")
             if target_id is not None and (
                 not isinstance(target_id, str) or not target_id
@@ -2290,6 +2317,7 @@ class PythonRunner:
                     cwd=str(run_cwd),
                     name=tab_name,
                     correlation_id=correlation,
+                    max_output_chars=self._max_output_chars,
                 ),
                 on_created=created,
             )
@@ -2647,6 +2675,7 @@ class PythonRunner:
             issue_driven_json=run.issue_driven_json,
             environment_setup_json=run.environment_setup_json,
             review_json=run.review_json,
+            review_result=run.review_result if run.state == "success" else None,
             resumed_from_run_id=run.resumed_from_run_id,
             parent_run=run.parent_run,
             child_runs=run.child_runs,
@@ -2879,7 +2908,7 @@ class PythonRunner:
                     managed_tab_id, self._stop_timeout
                 )
                 result = managed_client.read_shell_result(managed_tab_id)
-                self._finish_managed_workflow(run, result.exit_code)
+                self._finish_managed_workflow(run, result)
                 return True
             except Exception as exc:
                 lifecycle_error = exc
@@ -2900,7 +2929,9 @@ class PythonRunner:
                     self._record_managed_uncertainty(run, message)
                     raise RunStopUncertainError(message) from close_exc
                 self._finish_managed_workflow(
-                    run, 130, diagnostic=f"Workflow tab closed after: {exc}"
+                    run,
+                    ShellResult(130),
+                    diagnostic=f"Workflow tab closed after: {exc}",
                 )
             return True
         self._terminate_process_group(run)
@@ -3217,7 +3248,17 @@ class PythonRunner:
                     "managed shell result directory identity changed; refusing cleanup"
                 )
             entries = os.listdir(descriptor)
-            owned_entries = ("result.json", "result.json.pending")
+            owned_entries = (
+                "result.json",
+                "result.json.pending",
+                "result.json.stdout",
+                "result.json.stderr",
+                "result.json.stdout.pending",
+                "result.json.stderr.pending",
+                "result.json.command_done",
+                "result.json.stdout.pipe",
+                "result.json.stderr.pipe",
+            )
             if any(name not in owned_entries for name in entries):
                 raise OSError(
                     "managed shell result directory contains unexpected files"
@@ -3226,9 +3267,12 @@ class PythonRunner:
                 if entry not in entries:
                     continue
                 result_state = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
-                if not stat.S_ISREG(result_state.st_mode):
+                expected_file_type = (
+                    stat.S_ISFIFO if entry.endswith(".pipe") else stat.S_ISREG
+                )
+                if not expected_file_type(result_state.st_mode):
                     raise OSError(
-                        "managed shell result entry is not a regular file; "
+                        "managed shell result entry has an unexpected file type; "
                         "refusing cleanup"
                     )
                 os.unlink(entry, dir_fd=descriptor)
@@ -4298,6 +4342,8 @@ class PythonRunner:
                     if exit_code == 0
                     else "failed"
                 )
+                if run.state != "success":
+                    run.review_result = None
                 self._finish_active_repository(run)
                 attempt_state = run.state
                 run.attempts.append(
@@ -4349,9 +4395,7 @@ class PythonRunner:
                     if result.exit_code != 0
                     else None
                 )
-                self._finish_managed_workflow(
-                    run, result.exit_code, diagnostic=diagnostic
-                )
+                self._finish_managed_workflow(run, result, diagnostic=diagnostic)
                 return
         finally:
             with self._lock:
@@ -4365,11 +4409,20 @@ class PythonRunner:
             self._mark_changed()
 
     def _finish_managed_workflow(
-        self, run: _RunRecord, exit_code: int, *, diagnostic: str | None = None
+        self,
+        run: _RunRecord,
+        result: ShellResult,
+        *,
+        diagnostic: str | None = None,
     ) -> None:
+        exit_code = result.exit_code
         with self._lock:
             if run.state != "running":
                 return
+            if result.stdout:
+                self._append_output(run, "stdout", result.stdout, lock_held=True)
+            if result.stderr:
+                self._append_output(run, "stderr", result.stderr, lock_held=True)
             run.exit_code = exit_code
             run.state = (
                 "stopped"
@@ -4378,6 +4431,8 @@ class PythonRunner:
                 if exit_code == 0
                 else "failed"
             )
+            if run.state != "success":
+                run.review_result = None
             self._finish_active_repository(run)
             if diagnostic:
                 self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)

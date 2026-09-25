@@ -272,6 +272,102 @@ def test_review_run_binds_code_and_retains_source_in_history(
         restored.close()
 
 
+@pytest.mark.parametrize("verdict", ["PASS", "FAIL", "BLOCKED"])
+def test_review_result_is_durable_and_independent_of_output(
+    repositories: tuple[Path, Path], tmp_path: Path, verdict: str
+) -> None:
+    history = tmp_path / "runs.json"
+    source = declaration(repositories)
+    result = {
+        "verdict": verdict,
+        "summary": "Observed review decision",
+        "repositories": [str(path) for path in repositories],
+        "findings": ["Retained detail"],
+    }
+    code = (
+        "import json, sys\n"
+        "from purplemux_client.review import publish_review_result\n"
+        f"publish_review_result({result!r})\n"
+        "print('stdout is diagnostic, not the decision')\n"
+        "print('stderr is diagnostic too', file=sys.stderr)\n"
+    )
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=history, max_output_chars=16
+    )
+    try:
+        run_id = runner.start(code, review_json=source)
+        snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        assert snapshot.as_json()["reviewResult"] == result
+        assert snapshot.as_summary_json()["reviewVerdict"] == verdict
+        assert snapshot.stdout.endswith("the decision\n")
+        assert snapshot.stderr.endswith("diagnostic too\n")
+        assert json.dumps(result) not in snapshot.stdout + snapshot.stderr
+    finally:
+        runner.close()
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        restored_snapshot = restored.snapshot(run_id)
+        assert restored_snapshot.as_json()["reviewResult"] == result
+        assert restored_snapshot.as_summary_json()["reviewVerdict"] == verdict
+        assert restored_snapshot.stdout == snapshot.stdout
+        assert restored_snapshot.stderr == snapshot.stderr
+        assert (
+            json.loads(history.read_text())["runs"][snapshot.identity]["reviewResult"]
+            == result
+        )
+    finally:
+        restored.close()
+
+
+def test_review_result_requires_valid_report_and_successful_run(
+    repositories: tuple[Path, Path], tmp_path: Path
+) -> None:
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "runs.json"
+    )
+    source = declaration(repositories)
+    try:
+        output_only = runner.start(
+            'print("{\\"verdict\\": \\"PASS\\"}")', review_json=source
+        )
+        assert (
+            wait_for(
+                runner, lambda item: item.state == "success", run_id=output_only
+            ).as_json()["reviewResult"]
+            is None
+        )
+        assert runner.snapshot(output_only).as_summary_json()["reviewVerdict"] is None
+
+        invalid = runner.start(
+            "from purplemux_client.review import publish_review_result\n"
+            "publish_review_result({'verdict': 'PASS', 'summary': ''})\n",
+            review_json=source,
+        )
+        assert (
+            wait_for(
+                runner, lambda item: item.state == "failed", run_id=invalid
+            ).as_json()["reviewResult"]
+            is None
+        )
+
+        failed = runner.start(
+            "from purplemux_client.review import publish_review_result\n"
+            "publish_review_result({'verdict': 'BLOCKED', 'summary': 'Unavailable', 'repositories': []})\n"
+            "raise RuntimeError('after publish')\n",
+            review_json=source,
+        )
+        assert (
+            wait_for(
+                runner, lambda item: item.state == "failed", run_id=failed
+            ).as_json()["reviewResult"]
+            is None
+        )
+        assert runner.snapshot(failed).as_summary_json()["reviewVerdict"] is None
+    finally:
+        runner.close()
+
+
 @pytest.mark.parametrize("oversized", [False, True])
 @pytest.mark.parametrize("finish_unavailable", [False, True])
 @pytest.mark.parametrize("full_gaps", [False, True])
@@ -288,6 +384,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     messages: list[str] = []
     steps: list[tuple[str, str]] = []
     closed: list[str] = []
+    published: list[dict[str, object]] = []
 
     class Client:
         def create_session(self, request: object) -> str:
@@ -349,6 +446,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
         "require_ext_review_contract",
         lambda **_kwargs: "/usr/bin/purplemux",
     )
+    monkeypatch.setattr(review_module, "publish_review_result", published.append)
     monkeypatch.setattr(
         purplemux_client,
         "emit_step",
@@ -372,6 +470,7 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     retained = output.getvalue()
     assert len(retained) <= 1_000_000
     result = json.loads(retained)
+    assert published == [result]
     assert result["verdict"] == "FAIL"
     assert result["observed_facts"] == ["Request returned 500"]
     assert result["evidence"] == ["Browser response"]
@@ -404,7 +503,9 @@ def test_generated_review_sequences_optional_turns_and_reports_result(
     assert closed == ["agent-tab"]
 
 
-@pytest.mark.parametrize("unavailable", ["timeout", "busy timeout", "result unavailable"])
+@pytest.mark.parametrize(
+    "unavailable", ["timeout", "busy timeout", "result unavailable"]
+)
 def test_generated_review_unavailable_returns_blocked_and_skips_finish(
     repositories: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, unavailable: str
 ) -> None:
@@ -483,7 +584,10 @@ def test_generated_review_unavailable_returns_blocked_and_skips_finish(
     assert result["observability_gaps"] == (
         [expected]
         if unavailable == "result unavailable"
-        else ["Finish could not run because check completion was not confirmed", expected]
+        else [
+            "Finish could not run because check completion was not confirmed",
+            expected,
+        ]
     )
     assert len(messages) == (2 if unavailable == "result unavailable" else 1)
     if unavailable == "result unavailable":
@@ -572,7 +676,11 @@ def test_generated_review_start_unavailable_blocks_without_check_or_finish(
     assert "start observation" in result["summary"]
     assert result["observability_gaps"] == [
         "Start completion could not be confirmed: "
-        + ("start observation timed out" if unavailable == "timeout" else "start result unavailable")
+        + (
+            "start observation timed out"
+            if unavailable == "timeout"
+            else "start result unavailable"
+        )
     ]
     assert len(messages) == 1
     assert "Start observation" in messages[0]
@@ -622,7 +730,9 @@ def test_generated_review_agent_readiness_timeout_returns_blocked(
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
     monkeypatch.setattr(
-        review_module, "require_ext_review_contract", lambda **_kwargs: "/usr/bin/purplemux"
+        review_module,
+        "require_ext_review_contract",
+        lambda **_kwargs: "/usr/bin/purplemux",
     )
     monkeypatch.setattr(
         purplemux_client,
@@ -1234,8 +1344,7 @@ def test_review_monitor_handles_sharedindex_housekeeping(
         os.write(
             write_fd,
             b"".join(
-                struct.pack("iIII", descriptor, mask, 0, len(event_name))
-                + event_name
+                struct.pack("iIII", descriptor, mask, 0, len(event_name)) + event_name
                 for descriptor, mask, event_name in events
             ),
         )

@@ -1140,6 +1140,34 @@ def test_managed_shell_result_cleanup_removes_wrapper_owned_pending_sidecar(
     assert not directory.exists()
 
 
+def test_managed_shell_result_cleanup_removes_captured_output_and_pipes(
+    runner: PythonRunner,
+) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="awm-shell-"))
+    result = directory / "result.json"
+    result.write_text('{"exitCode":0}', encoding="utf-8")
+    for stream in ("stdout", "stderr"):
+        (directory / f"result.json.{stream}").write_text(stream, encoding="utf-8")
+        (directory / f"result.json.{stream}.pending").write_text(
+            stream, encoding="utf-8"
+        )
+        os.mkfifo(directory / f"result.json.{stream}.pipe")
+    (directory / "result.json.command_done").touch()
+    resource = RunResource(
+        "managed_shell_result",
+        str(directory),
+        {
+            "result_path": str(result),
+            "tab_id": "tab-1",
+            "directory_identity": _test_path_identity(directory),
+        },
+    )
+
+    runner._cleanup_resource(resource)
+
+    assert not directory.exists()
+
+
 def test_managed_shell_result_cleanup_rejects_non_regular_pending_sidecar(
     runner: PythonRunner,
 ) -> None:
@@ -1157,7 +1185,7 @@ def test_managed_shell_result_cleanup_rejects_non_regular_pending_sidecar(
         },
     )
 
-    with pytest.raises(OSError, match="not a regular file"):
+    with pytest.raises(OSError, match="unexpected file type"):
         runner._cleanup_resource(resource)
 
     assert pending.is_dir()
