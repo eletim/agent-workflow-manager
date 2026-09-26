@@ -1061,8 +1061,10 @@ def recover_error(
                 "Investigate this workflow error using the current authoritative "
                 "state below. Make only a safe, necessary repair, then re-inspect "
                 "the affected state. If the outcome is uncertain, report retry_safe "
-                "as false. Do not reset, rebase, stash, force-push, merge a work-item "
-                "PR, create unrelated PRs, discard ambiguous work, or edit "
+                "as false. Do not amend, reset, rebase, or otherwise rewrite commit "
+                "history to repair provenance. Leave every local and remote branch "
+                "ref unchanged. Do not stash, force-push, merge a work-item PR, "
+                "create unrelated PRs, discard ambiguous work, or edit "
                 "agent-workflow-manager fingerprint markers. Return exactly one JSON "
                 "object with boolean repaired and retry_safe fields and concise "
                 "single-line summary and evidence strings (at most 500 UTF-8 bytes "
@@ -5741,6 +5743,8 @@ def _run_repository(
                 raise WorkerFailure(
                     "repository recovery requires a local branch commit"
                 ) from exc
+            recovery_local_refs = repo.inspect_local_branch_heads()
+            recovery_remote_refs = repo.inspect_remote_branch_heads()
             state = recovery_authoritative_state(config, repo, github, plan)
             recovery_execution: list[_AgentTurnExecution] = []
             report = recover_error(
@@ -5755,6 +5759,16 @@ def _run_repository(
                 f"Evidence: {report.evidence}",
                 flush=True,
             )
+            if repo.inspect_local_branch_heads() != recovery_local_refs:
+                raise WorkerFailure(
+                    "recovery changed local branch history; refusing to rewrite "
+                    "repository provenance"
+                )
+            if repo.inspect_remote_branch_heads() != recovery_remote_refs:
+                raise WorkerFailure(
+                    "recovery changed remote branch history; refusing to rewrite "
+                    "published provenance"
+                )
             repo.require_committed_result(
                 recovery_branch,
                 previous_sha=recovery_start.local_sha,

@@ -288,6 +288,22 @@ def test_remote_branch_enumeration_uses_authoritative_remote_heads(
     assert "local-only" not in result
 
 
+def test_local_branch_head_inspection_includes_linked_worktrees(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base = git(work, "rev-parse", "HEAD")
+    branch = "feature/linked-head"
+    linked = tmp_path / "linked"
+    git(work, "worktree", "add", "-b", branch, str(linked), base)
+    git(linked, "commit", "--allow-empty", "-m", "linked work")
+
+    heads = open_repo(work, RecordingGitRunner()).inspect_local_branch_heads()
+
+    assert heads["main"] == base
+    assert heads[branch] == git(linked, "rev-parse", "HEAD")
+
+
 def test_remote_notes_persist_recovery_state_without_moving_branches(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:

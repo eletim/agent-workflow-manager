@@ -633,6 +633,10 @@ repo.inspect_remote_note(ref, object_sha) -> str | None
 `inspect_remote_branch_heads()` enumerates the remote directly and does not
 trust local tracking refs. Use it when a workflow must compare a configured
 development branch with the remote's current branch set.
+`inspect_local_branch_heads()` provides the corresponding authoritative local
+branch set across linked worktrees. Repository recovery snapshots both sets and
+requires them to remain exact: it never repairs provenance by amending,
+rebasing, resetting, or otherwise rewriting local or remote-visible history.
 
 The inspection-aware Git operations that may mutate are:
 
