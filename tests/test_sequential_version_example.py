@@ -179,6 +179,57 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+def test_existing_work_item_pr_adopts_its_verified_remote_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pull_request = open_pr(
+        head=issue.branch, base=config.integration_branch, draft=True
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    class Repository:
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(
+            self, branch: str, *, expected_remote_sha: str | None = None
+        ) -> BranchState:
+            calls.append((branch, expected_remote_sha))
+            sha = (
+                pull_request.base_sha
+                if branch == config.integration_branch
+                else pull_request.head_sha
+            )
+            return BranchState(branch, sha, sha, True)
+
+        def inspect_feature_preparation(self, *args: object, **kwargs: object):
+            return SimpleNamespace(base_is_ancestor=True)
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base) == (issue.branch, config.integration_branch)
+            return pull_request if state == "OPEN" else None
+
+    monkeypatch.setitem(
+        workflow["prepare_issue"].__globals__,
+        "emit_finding",
+        lambda *args, **kwargs: None,
+    )
+
+    prepared = workflow["prepare_issue"](Repository(), GitHub(), issue, config)
+
+    assert prepared == (pull_request, pull_request.head_sha, True)
+    assert calls == [
+        (config.integration_branch, None),
+        (issue.branch, pull_request.head_sha),
+    ]
+
+
 @pytest.mark.parametrize(
     ("configured", "branches", "expected"),
     [

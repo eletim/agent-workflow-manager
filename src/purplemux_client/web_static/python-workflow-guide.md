@@ -664,7 +664,7 @@ repo.normalize_agent_commit_provenance(
     allow_unchanged=False
 ) -> BranchState
 repo.ensure_pushed(branch, *, expected_local_sha) -> BranchState
-repo.synchronize_branch(branch) -> BranchState
+repo.synchronize_branch(branch, *, expected_remote_sha=None) -> BranchState
 repo.prepare_feature_branch(
     branch, *, base, expected_base_sha
 ) -> BranchState
@@ -680,8 +680,10 @@ repo.update_remote_note(
 ```
 
 They validate repository identity, cleanliness, exact SHAs, ancestry, and
-fast-forward-only topology. They may return without mutation when the desired
-state already exists. AWM-owned remote notes provide branch-neutral recovery
+fast-forward-only topology. Pass `expected_remote_sha` when synchronization must
+adopt a previously verified authoritative head, such as an existing work-item
+PR. They may return without mutation when the desired state already exists.
+AWM-owned remote notes provide branch-neutral recovery
 state with exact prior-body and remote-ref checks; note updates do not move a
 branch. These helpers never reset, force-push, or hide divergence.
 
