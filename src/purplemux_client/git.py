@@ -268,6 +268,22 @@ class GitRepository:
         self._validate_branch(branch)
         return self._inspect_branch(branch)
 
+    def has_path_at_commit(self, commit_sha: str, path: str) -> bool:
+        """Return whether a repository-relative path exists at an exact commit."""
+        self._validate_identity()
+        self._validate_sha(commit_sha)
+        if (
+            not path
+            or "\0" in path
+            or path.startswith("/")
+            or any(part in ("", ".", "..") for part in path.split("/"))
+        ):
+            raise ValueError("path must be a normalized repository-relative path")
+        completed = self._command(
+            ["ls-tree", "-z", "--full-tree", commit_sha, "--", path], {0}
+        )
+        return bool(completed.stdout)
+
     def inspect_remote_branches(self, branches: Sequence[str]) -> dict[str, str | None]:
         """Resolve several remote heads authoritatively without tracking refs."""
         self._validate_identity()

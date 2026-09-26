@@ -4551,6 +4551,11 @@ def design_principles_review_prompt(
     )
 
 
+def has_design_principles(repo: GitRepository, head_sha: str) -> bool:
+    """Check optional design guidance at the exact integration head."""
+    return repo.has_path_at_commit(head_sha, "docs/design-principles.md")
+
+
 def version_readme_review_prompt(
     pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
 ) -> str:
@@ -4635,29 +4640,34 @@ def _review_whole_version(
         and latest_changed_head.fix_sha == pr.head_sha
         else None
     )
-    required_roles = {"design_principles", "whole_version", "version_readme"}
-    if SCENARIOS:
-        required_roles.add("scenario_gate")
-    latest_by_role = {
-        role: next(
-            (record for record in reversed(audits) if record.role == role), None
+    completed_warning: ReviewAuditRecord | None = None
+    if prior_limit is None:
+        design_principles_present = has_design_principles(repo, pr.head_sha)
+        required_roles = {"whole_version", "version_readme"}
+        if design_principles_present:
+            required_roles.add("design_principles")
+        if SCENARIOS:
+            required_roles.add("scenario_gate")
+        latest_by_role = {
+            role: next(
+                (record for record in reversed(audits) if record.role == role), None
+            )
+            for role in required_roles
+        }
+        complete_current_head = all(
+            record is not None
+            and record.reviewed_sha == pr.head_sha
+            and record.fix_disposition != "pending"
+            for record in latest_by_role.values()
         )
-        for role in required_roles
-    }
-    complete_current_head = all(
-        record is not None
-        and record.reviewed_sha == pr.head_sha
-        and record.fix_disposition != "pending"
-        for record in latest_by_role.values()
-    )
-    completed_warning = next(
-        (record for record in latest_by_role.values()
-         if record is not None
-         and record.fix_disposition in (
-             "review_limit_reached", "no_change_after_re_evaluation"
-         )),
-        None,
-    ) if complete_current_head else None
+        completed_warning = next(
+            (record for record in latest_by_role.values()
+             if record is not None
+             and record.fix_disposition in (
+                 "review_limit_reached", "no_change_after_re_evaluation"
+             )),
+            None,
+        ) if complete_current_head else None
     if completed_warning is not None:
         prior_limit = None
     fixer = create_agent(
@@ -4673,12 +4683,7 @@ def _review_whole_version(
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
     )
-    design_principles_reviewer = create_agent(
-        client,
-        config,
-        agent_type=REVIEWER_AGENT,
-        name="Design Principles reviewer",
-    )
+    design_principles_reviewer: str | None = None
     version_readme_reviewer = create_agent(
         client,
         config,
@@ -4700,12 +4705,14 @@ def _review_whole_version(
         () if prior_limit is not None or completed_warning is not None
         else range(1, MAX_REVIEWS + 1)
     ):
+        design_principles_present = has_design_principles(repo, pr.head_sha)
         result: str
         resumed_records = tuple(
             record
             for record in review_audit_from_body(pr.body)
             if record.fix_disposition == "pending"
             and record.reviewed_sha == pr.head_sha
+            and (record.role != "design_principles" or design_principles_present)
         )
         review_results = [
             json.dumps(
@@ -4817,107 +4824,115 @@ def _review_whole_version(
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
-        principles_execution: list[_AgentTurnExecution] = []
-        principles_result, principles_verdict = run_validated_turn(
-            client,
-            design_principles_reviewer,
-            "Design Principles reviewer turn",
-            policy_context(
-                config,
-                scope="the design-principles conformance review",
-                structured_conflicts=True,
+        if design_principles_present:
+            if design_principles_reviewer is None:
+                design_principles_reviewer = create_agent(
+                    client,
+                    config,
+                    agent_type=REVIEWER_AGENT,
+                    name="Design Principles reviewer",
+                )
+            principles_execution: list[_AgentTurnExecution] = []
+            principles_result, principles_verdict = run_validated_turn(
+                client,
+                design_principles_reviewer,
+                "Design Principles reviewer turn",
+                policy_context(
+                    config,
+                    scope="the design-principles conformance review",
+                    structured_conflicts=True,
+                )
+                + design_principles_review_prompt(pr, config, work_items),
+                decision,
+                repository_identity=config.slug,
+                role="reviewer",
+                iteration=review_number,
+                pr=pr,
+                phase="whole-review",
+                _deferred_execution=principles_execution,
             )
-            + design_principles_review_prompt(pr, config, work_items),
-            decision,
-            repository_identity=config.slug,
-            role="reviewer",
-            iteration=review_number,
-            pr=pr,
-            phase="whole-review",
-            _deferred_execution=principles_execution,
-        )
-        review_results.append(principles_result)
-        changes_requested = (
-            changes_requested or principles_verdict == "CHANGES_REQUESTED"
-        )
-        emit_policy_conflicts(
-            principles_result, config, scope="the integrated version"
-        )
-        principles_audit = allocate_review_audit(
-            pr.body,
-            "design_principles",
-            principles_verdict,
-            pr.head_sha,
-            principles_result,
-        )
-        pr = persist_review_audit(
-            github,
-            pr,
-            principles_audit,
-            head=config.integration_branch,
-            base=config.main_branch,
-        )
-        if principles_verdict == "CHANGES_REQUESTED":
-            requested_change_audits.append(principles_audit.audit_id)
-        principles_sha, principles_reviewer_changed = require_agent_result(
-            repo,
-            client,
-            fixer,
-            config.integration_branch,
-            pr.head_sha,
-            allow_unchanged=True,
-            expected_process="cleanup",
-            iteration=review_number,
-        )
-        if principles_reviewer_changed:
-            pushed = repo.ensure_pushed(
-                config.integration_branch, expected_local_sha=principles_sha
+            review_results.append(principles_result)
+            changes_requested = (
+                changes_requested or principles_verdict == "CHANGES_REQUESTED"
             )
-            assert pushed.remote_sha is not None
-            pr = github.require_pr(
-                number=pr.number,
-                head=config.integration_branch,
-                base=config.main_branch,
-                state="OPEN",
-                expected_head_sha=pushed.remote_sha,
-                expected_base_sha=pr.base_sha,
-                draft=True,
+            emit_policy_conflicts(
+                principles_result, config, scope="the integrated version"
             )
-            pr = ensure_base_pr_policy_notes(github, pr, config)
-            pending_audits = tuple(
-                record.audit_id
-                for record in review_audit_from_body(pr.body)
-                if record.fix_disposition == "pending"
+            principles_audit = allocate_review_audit(
+                pr.body,
+                "design_principles",
+                principles_verdict,
+                pr.head_sha,
+                principles_result,
             )
-            pr = review_audit_dispositions(
+            pr = persist_review_audit(
                 github,
                 pr,
-                tuple(requested_change_audits)
-                + pending_audits
-                + (principles_audit.audit_id,),
-                "reviewer_changed_head",
+                principles_audit,
                 head=config.integration_branch,
                 base=config.main_branch,
-                fix_sha=principles_sha,
             )
-            if review_number == MAX_REVIEWS:
-                pr = persist_whole_limit_head_change(
-                    github, pr, round_number=review_number,
-                    reviewed_sha=principles_audit.reviewed_sha,
-                    head=config.integration_branch, base=config.main_branch,
+            if principles_verdict == "CHANGES_REQUESTED":
+                requested_change_audits.append(principles_audit.audit_id)
+            principles_sha, principles_reviewer_changed = require_agent_result(
+                repo,
+                client,
+                fixer,
+                config.integration_branch,
+                pr.head_sha,
+                allow_unchanged=True,
+                expected_process="cleanup",
+                iteration=review_number,
+            )
+            if principles_reviewer_changed:
+                pushed = repo.ensure_pushed(
+                    config.integration_branch, expected_local_sha=principles_sha
                 )
-            emit_finding(
-                "git",
-                "design-principles review changed the integration branch; "
-                f"approval invalidated at {principles_sha}",
-            )
+                assert pushed.remote_sha is not None
+                pr = github.require_pr(
+                    number=pr.number,
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="OPEN",
+                    expected_head_sha=pushed.remote_sha,
+                    expected_base_sha=pr.base_sha,
+                    draft=True,
+                )
+                pr = ensure_base_pr_policy_notes(github, pr, config)
+                pending_audits = tuple(
+                    record.audit_id
+                    for record in review_audit_from_body(pr.body)
+                    if record.fix_disposition == "pending"
+                )
+                pr = review_audit_dispositions(
+                    github,
+                    pr,
+                    tuple(requested_change_audits)
+                    + pending_audits
+                    + (principles_audit.audit_id,),
+                    "reviewer_changed_head",
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    fix_sha=principles_sha,
+                )
+                if review_number == MAX_REVIEWS:
+                    pr = persist_whole_limit_head_change(
+                        github, pr, round_number=review_number,
+                        reviewed_sha=principles_audit.reviewed_sha,
+                        head=config.integration_branch, base=config.main_branch,
+                    )
+                emit_finding(
+                    "git",
+                    "design-principles review changed the integration branch; "
+                    f"approval invalidated at {principles_sha}",
+                )
+                _complete_deferred_validated_turn(
+                    principles_execution, "head_changed"
+                )
+                continue
             _complete_deferred_validated_turn(
-                principles_execution, "head_changed"
+                principles_execution, principles_verdict.lower()
             )
-            continue
-        _complete_deferred_validated_turn(
-            principles_execution, principles_verdict.lower()
-        )
         whole_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,

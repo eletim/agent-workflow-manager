@@ -445,11 +445,14 @@ defaults to three when omitted; the recommended values are six for Scope Review
 and four for the Correctness and whole-version review limit. The higher
 recommended Scope limit reserves capacity for the required rechecks after
 Correctness fixes change the head. Whole Review first applies any configured
-Scenario Gate, then runs a dedicated Design Principles reviewer, the
+Scenario Gate, then runs a dedicated Design Principles reviewer when
+`docs/design-principles.md` exists at the exact integration head, followed by the
 integration/cross-Issue Whole-version reviewer, and the independent Version /
-README reviewer on every eligible head. The Design Principles turn reads
+README reviewer on every eligible head. When applicable, the Design Principles
+turn reads
 `docs/design-principles.md` from the exact integration head and reviews solely
-for conformance with that authoritative document. Findings from the independent
+for conformance with that authoritative document. Its absence is normal and does
+not request creation or restoration. Findings from the independent
 reviews are aggregated into one fix turn, and any changed head is reviewed again
 in the same order within the bounded whole-review loop.
 Each consequential review round is also recorded in a bounded managed section

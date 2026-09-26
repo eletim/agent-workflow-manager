@@ -107,6 +107,37 @@ class RecordingGitRunner:
         )
 
 
+class ObjectResolutionFailureGitRunner(RecordingGitRunner):
+    def __call__(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+        env: Mapping[str, str] | None = None,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        if command[1:4] == ["ls-tree", "-z", "--full-tree"]:
+            self.calls.append(command)
+            return subprocess.CompletedProcess(
+                command, 128, "", "fatal: unable to read tree object"
+            )
+        return super().__call__(
+            args,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+            env=env,
+            input=input,
+        )
+
+
 class RefRaceGitRunner(RecordingGitRunner):
     def __init__(self, branch: str, race: Callable[[], None]) -> None:
         super().__init__()
@@ -266,6 +297,39 @@ def repositories(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def open_repo(work: Path, runner: RecordingGitRunner) -> GitRepository:
     return GitRepository.open(work, expected_github_slug="acme/project", runner=runner)
+
+
+def test_has_path_at_commit_inspects_the_exact_tree(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    without_document = git(work, "rev-parse", "HEAD")
+    (work / "docs").mkdir()
+    (work / "docs" / "design-principles.md").write_text(
+        "# Design Principles\n", encoding="utf-8"
+    )
+    git(work, "add", "docs/design-principles.md")
+    git(work, "commit", "-m", "add design principles")
+    with_document = git(work, "rev-parse", "HEAD")
+
+    assert not repo.has_path_at_commit(
+        without_document, "docs/design-principles.md"
+    )
+    assert repo.has_path_at_commit(with_document, "docs/design-principles.md")
+    with pytest.raises(WorkerFailure, match="Git ls-tree.*failed"):
+        repo.has_path_at_commit("0" * 40, "docs/design-principles.md")
+
+
+def test_has_path_at_commit_fails_closed_on_object_resolution_error(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, ObjectResolutionFailureGitRunner())
+    commit_sha = git(work, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkerFailure, match="unable to read tree object"):
+        repo.has_path_at_commit(commit_sha, "docs/design-principles.md")
 
 
 def test_open_can_pin_identity_from_the_validated_github_origin(
