@@ -2576,7 +2576,9 @@ def prepare_issue(
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
     else:
-        feature = repo.synchronize_branch(issue.branch)
+        feature = repo.synchronize_branch(
+            issue.branch, expected_remote_sha=open_pr.head_sha
+        )
         reused_existing_work = True
         prepared = repo.inspect_feature_preparation(
             issue.branch,

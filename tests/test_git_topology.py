@@ -1276,6 +1276,46 @@ def test_recover_feature_rejects_unreconciled_prior_run_commit(
         )
 
 
+def test_synchronize_adopts_expected_remote_head_by_fast_forward_only(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    branch = "feature/remote-ahead"
+    git(work, "switch", "-c", branch)
+    git(work, "push", "-u", "origin", branch)
+    stale_sha = git(work, "rev-parse", "HEAD")
+    git(seed, "fetch", "origin", branch)
+    git(seed, "switch", "-c", branch, "--track", f"origin/{branch}")
+    git(seed, "commit", "--allow-empty", "-m", "authoritative implementation")
+    authoritative_sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "push", "origin", branch)
+    runner = RecordingGitRunner()
+    repo = open_repo(work, runner)
+
+    with pytest.raises(WorkerFailure, match="remote branch.*changed"):
+        repo.synchronize_branch(branch, expected_remote_sha="f" * 40)
+
+    assert git(work, "rev-parse", "HEAD") == stale_sha
+    synchronized = repo.synchronize_branch(
+        branch, expected_remote_sha=authoritative_sha
+    )
+
+    assert synchronized.current
+    assert synchronized.local_sha == authoritative_sha
+    assert synchronized.remote_sha == authoritative_sha
+    assert [
+        "git",
+        "merge",
+        "--ff-only",
+        f"refs/remotes/origin/{branch}",
+    ] in runner.calls
+    assert not any(
+        forbidden in call
+        for call in runner.calls
+        for forbidden in ("reset", "rebase", "push", "--force", "-f")
+    )
+
+
 def test_synchronize_fast_forwards_but_rejects_ahead_and_dirty(
     repositories: tuple[Path, Path, Path],
 ) -> None:

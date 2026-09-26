@@ -4411,7 +4411,7 @@ def test_interrupted_dispatched_item_is_reinspected_before_planning(
 
     repository = SimpleNamespace(
         require_clean=lambda: None,
-        synchronize_branch=lambda branch: BranchState(
+        synchronize_branch=lambda branch, **_kwargs: BranchState(
             branch, child_pr.head_sha, child_pr.head_sha, True
         ),
         inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
@@ -4512,7 +4512,7 @@ def test_ready_base_pr_recovery_is_validated_before_draft_mutation() -> None:
             return replace(ready, is_draft=True)
 
     repository = SimpleNamespace(
-        synchronize_branch=lambda branch: BranchState(
+        synchronize_branch=lambda branch, **_kwargs: BranchState(
             branch, ready.head_sha, ready.head_sha, True
         ),
         inspect_branch=lambda branch: BranchState(
@@ -4567,7 +4567,7 @@ def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:
 
     repository = SimpleNamespace(
         require_clean=lambda: None,
-        synchronize_branch=lambda branch: BranchState(
+        synchronize_branch=lambda branch, **_kwargs: BranchState(
             branch,
             open_dynamic.head_sha if branch == dynamic_issue.branch else "b" * 40,
             open_dynamic.head_sha if branch == dynamic_issue.branch else "b" * 40,

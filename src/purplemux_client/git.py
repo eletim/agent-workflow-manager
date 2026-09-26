@@ -1106,14 +1106,35 @@ class GitRepository:
         if not self._is_ancestor(commit_sha, state.local_sha):
             raise WorkerFailure(f"branch {branch!r} does not contain {commit_sha}")
 
-    def synchronize_branch(self, branch: str) -> BranchState:
+    def synchronize_branch(
+        self, branch: str, *, expected_remote_sha: str | None = None
+    ) -> BranchState:
         self._validate_identity()
         self._validate_branch(branch)
+        if expected_remote_sha is not None:
+            self._validate_sha(expected_remote_sha)
         self.require_clean()
         authoritative_sha = self._remote_sha(branch)
         if authoritative_sha is None:
             raise WorkerFailure(f"remote branch {branch!r} does not exist")
-        self._fetch_branch(branch, authoritative_sha)
+        if expected_remote_sha is not None and authoritative_sha != expected_remote_sha:
+            raise WorkerFailure(
+                f"remote branch {branch!r} changed: expected {expected_remote_sha}, "
+                f"found {authoritative_sha}"
+            )
+
+        def recheck_authoritative_ref() -> None:
+            self.require_clean()
+            actual = self._remote_sha(branch)
+            if actual != authoritative_sha:
+                raise WorkerFailure(
+                    f"remote branch {branch!r} changed during synchronization: "
+                    f"expected {authoritative_sha}, found {actual}"
+                )
+
+        self._fetch_branch(
+            branch, authoritative_sha, pre_dispatch=recheck_authoritative_ref
+        )
         state = self._inspect_branch_from_tracking(branch, authoritative_sha)
         checkout_branch = self._checkout_branch(branch)
         if state.local_sha is None:
@@ -1132,6 +1153,7 @@ class GitRepository:
                     branch, authoritative_sha
                 ),
                 desired=lambda: self._branch_matches(branch, authoritative_sha, True),
+                pre_dispatch=recheck_authoritative_ref,
             )
         else:
             if state.local_sha != authoritative_sha:
@@ -1155,6 +1177,7 @@ class GitRepository:
                         branch, authoritative_sha
                     ),
                     desired=lambda: self._branch_is_current(branch),
+                    pre_dispatch=recheck_authoritative_ref,
                 )
             if state.local_sha != authoritative_sha:
                 before = self._inspect_branch_from_tracking(branch, authoritative_sha)
@@ -1169,9 +1192,14 @@ class GitRepository:
                     desired=lambda: self._branch_matches(
                         branch, authoritative_sha, True
                     ),
+                    pre_dispatch=recheck_authoritative_ref,
                 )
         result = self.inspect_branch(branch)
-        if not result.current or result.local_sha != authoritative_sha:
+        if (
+            not result.current
+            or result.local_sha != authoritative_sha
+            or result.remote_sha != authoritative_sha
+        ):
             raise WorkerFailure(
                 f"branch {branch!r} synchronization postcondition failed"
             )
