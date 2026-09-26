@@ -894,6 +894,7 @@ class GitRepository:
         """Restore a clean branch after recovery rewrote its captured history."""
         self._validate_sha(original_sha)
         self._validate_sha(rejected_sha)
+        self.require_clean()
         state = self.require_current_branch(branch)
         if state.local_sha != rejected_sha:
             raise WorkerFailure(
@@ -924,6 +925,70 @@ class GitRepository:
         if restored.local_sha != original_sha:
             raise WorkerFailure("recovery rewrite restoration postcondition failed")
         return restored
+
+    def restore_rejected_recovery_refs(
+        self,
+        original: Mapping[str, LocalRefState],
+        recovered: Mapping[str, LocalRefState],
+        *,
+        active_ref: str,
+    ) -> None:
+        """CAS-restore non-active refs changed by a rejected recovery turn."""
+        if not active_ref.startswith("refs/heads/"):
+            raise ValueError("active_ref must name a local branch")
+        if self.inspect_local_refs() != dict(recovered):
+            raise WorkerFailure("local refs changed before recovery ref restoration")
+        changed = sorted(
+            ref
+            for ref in set(original) | set(recovered)
+            if ref != active_ref and original.get(ref) != recovered.get(ref)
+        )
+        expected = dict(recovered)
+        for ref in changed:
+            before = expected.get(ref)
+            desired_state = original.get(ref)
+
+            def require_expected_refs() -> None:
+                if self.inspect_local_refs() != expected:
+                    raise WorkerFailure(
+                        "local refs changed during recovery ref restoration"
+                    )
+
+            if desired_state is None:
+                assert before is not None
+                args = ["update-ref", "--no-deref", "-d", ref, before.object_sha]
+            elif desired_state.symbolic_target is None:
+                args = [
+                    "update-ref",
+                    "--no-deref",
+                    ref,
+                    desired_state.object_sha,
+                    "0" * 40 if before is None else before.object_sha,
+                ]
+            else:
+                # Older supported Git versions cannot update symbolic refs in an
+                # update-ref transaction. The complete snapshot recheck above is
+                # the CAS guard for this uncommon restoration path.
+                args = ["symbolic-ref", ref, desired_state.symbolic_target]
+
+            next_expected = dict(expected)
+            if desired_state is None:
+                next_expected.pop(ref, None)
+            else:
+                next_expected[ref] = desired_state
+            self._git_mutation(
+                args,
+                operation="restore ref changed by rejected recovery",
+                target=ref,
+                pre_state=before,
+                observe=lambda: self.inspect_local_refs().get(ref),
+                desired=lambda: self.inspect_local_refs().get(ref) == desired_state,
+                pre_dispatch=require_expected_refs,
+            )
+            expected = next_expected
+
+        if self.inspect_local_refs() != expected:
+            raise WorkerFailure("recovery ref restoration postcondition failed")
 
     def _normalize_agent_message(
         self,

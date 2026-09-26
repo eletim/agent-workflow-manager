@@ -910,6 +910,65 @@ def test_rejected_recovery_amend_restores_local_and_preserves_remote_refs(
     assert repo.inspect_worktree().dirty is False
 
 
+def test_rejected_recovery_restore_refuses_dirty_staged_and_unstaged_state(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    (work / "secondary.txt").write_text("base\n", encoding="utf-8")
+    git(work, "add", "secondary.txt")
+    git(work, "commit", "-m", "add secondary file")
+    original = git(work, "rev-parse", "HEAD")
+    git(work, "commit", "--amend", "--allow-empty", "-m", "rewritten recovery")
+    rejected = git(work, "rev-parse", "HEAD")
+    (work / "tracked.txt").write_text("staged recovery work\n", encoding="utf-8")
+    git(work, "add", "tracked.txt")
+    (work / "secondary.txt").write_text(
+        "unstaged recovery work\n", encoding="utf-8"
+    )
+    status_before = git(work, "status", "--short")
+    staged_before = git(work, "diff", "--cached")
+    unstaged_before = git(work, "diff")
+
+    with pytest.raises(WorkerFailure, match="worktree must be clean"):
+        repo.restore_rejected_recovery_branch(
+            "main", original_sha=original, rejected_sha=rejected
+        )
+
+    assert git(work, "rev-parse", "HEAD") == rejected
+    assert git(work, "status", "--short") == status_before
+    assert git(work, "diff", "--cached") == staged_before
+    assert git(work, "diff") == unstaged_before
+
+
+def test_rejected_recovery_restores_non_active_refs_before_amended_branch(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    original_sha = repo.synchronize_branch("main").local_sha or ""
+    original_refs = repo.inspect_local_refs()
+    remote_before = repo.inspect_remote_refs()
+    git(work, "commit", "--amend", "--allow-empty", "-m", "rewritten recovery")
+    rejected_sha = git(work, "rev-parse", "HEAD")
+    git(work, "tag", "recovery-created", rejected_sha)
+    recovered_refs = repo.inspect_local_refs()
+
+    repo.restore_rejected_recovery_refs(
+        original_refs,
+        recovered_refs,
+        active_ref="refs/heads/main",
+    )
+    repo.restore_rejected_recovery_branch(
+        "main", original_sha=original_sha, rejected_sha=rejected_sha
+    )
+
+    assert repo.inspect_local_refs() == original_refs
+    assert repo.inspect_remote_refs() == remote_before
+    assert git(work, "rev-parse", "HEAD") == original_sha
+    assert repo.inspect_worktree().dirty is False
+
+
 def test_normalize_refuses_commit_fast_forwarded_from_remote_side_branch(
     repositories: tuple[Path, Path, Path],
 ) -> None:

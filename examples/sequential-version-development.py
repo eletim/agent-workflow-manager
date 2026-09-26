@@ -5871,6 +5871,11 @@ def _run_repository(
             recovery_branch = recovery_worktree.current_branch
             if recovery_branch is None:
                 raise WorkerFailure("repository recovery requires a current branch") from exc
+            if recovery_worktree.dirty:
+                raise WorkerFailure(
+                    "repository recovery requires a clean worktree; refusing to "
+                    "risk pre-existing staged or unstaged changes"
+                ) from exc
             recovery_start = repo.inspect_branch(recovery_branch)
             if recovery_start.local_sha is None:
                 raise WorkerFailure(
@@ -5908,10 +5913,28 @@ def _run_repository(
                 recovered_other_refs = dict(recovered_local_refs)
                 original_other_refs.pop(recovery_branch_ref, None)
                 recovered_other_refs.pop(recovery_branch_ref, None)
+                restored_other_refs = recovered_other_refs != original_other_refs
+                if restored_other_refs:
+                    repo.restore_rejected_recovery_refs(
+                        recovery_local_refs,
+                        recovered_local_refs,
+                        active_ref=recovery_branch_ref,
+                    )
+                    recovered_local_refs = repo.inspect_local_refs()
+                    recovered_branch_state = recovered_local_refs.get(
+                        recovery_branch_ref
+                    )
+                    recovery_end = (
+                        None
+                        if recovered_branch_state is None
+                        else recovered_branch_state.object_sha
+                    )
+                    recovered_other_refs = dict(recovered_local_refs)
+                    recovered_other_refs.pop(recovery_branch_ref, None)
                 if recovered_other_refs != original_other_refs:
                     raise WorkerFailure(
-                        "recovery changed local refs outside the active branch; "
-                        "refusing to rewrite repository provenance"
+                        "recovery changed local refs outside the active branch and "
+                        "their restoration could not be proven"
                     )
                 if (
                     recovery_end is None
@@ -5950,6 +5973,11 @@ def _run_repository(
                 if checked_recovery.local_sha != recovery_end:
                     raise WorkerFailure(
                         "recovery branch inspection disagrees with local refs"
+                    )
+                if restored_other_refs:
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch; "
+                        "the original refs were restored"
                     )
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "

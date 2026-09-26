@@ -1371,6 +1371,20 @@ class PurpleMuxCLIClient:
     def _restricted_agent_command(worker: str, prompt: str) -> str:
         """Launch an agent with local Git but no remote ref capability."""
         encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        reference_hook = base64.b64encode(
+            b"""#!/bin/sh
+phase=$1
+[ "$phase" = prepared ] || exit 0
+zero=0000000000000000000000000000000000000000
+while read old new ref; do
+    [ "$ref" = HEAD ] || [ "$ref" = "$AWM_RECOVERY_PROTECTED_REF" ] || exit 1
+    [ "$old" != "$zero" ] || exit 1
+    [ "$new" != "$zero" ] || exit 1
+    git merge-base --is-ancestor "$old" "$new" || exit 1
+done
+"""
+        ).decode("ascii")
+        pre_push_hook = base64.b64encode(b"#!/bin/sh\nexit 1\n").decode("ascii")
         environment_options = [
             "env",
             "-u",
@@ -1390,9 +1404,10 @@ class PurpleMuxCLIClient:
             "GIT_TERMINAL_PROMPT=0",
             "GCM_INTERACTIVE=never",
             "GIT_SSH_COMMAND=false",
-            "GIT_CONFIG_COUNT=1",
+            "GIT_CONFIG_COUNT=2",
             "GIT_CONFIG_KEY_0=credential.helper",
             "GIT_CONFIG_VALUE_0=",
+            "GIT_CONFIG_KEY_1=core.hooksPath",
         ]
         if worker == "codex":
             command = [
@@ -1475,7 +1490,26 @@ class PurpleMuxCLIClient:
             ]
         else:
             raise WorkerFailure("restricted session worker must be codex or claude")
-        return f"printf %s {encoded} | base64 --decode | {shlex.join(command)}"
+        launch = shlex.join(command)
+        return (
+            "awm_recovery_hooks_root=$(git rev-parse --git-path hooks) && "
+            "mkdir -p -- \"$awm_recovery_hooks_root\" && "
+            "awm_recovery_hooks_root=$(cd \"$awm_recovery_hooks_root\" && pwd -P) && "
+            'awm_recovery_hooks=$(mktemp -d '
+            '"$awm_recovery_hooks_root/awm-recovery.XXXXXX") && '
+            "trap 'rm -r -- \"$awm_recovery_hooks\"' EXIT && "
+            "awm_recovery_ref=$(git symbolic-ref -q HEAD) && "
+            f"printf %s {reference_hook} | base64 --decode > "
+            '"$awm_recovery_hooks/reference-transaction" && '
+            f"printf %s {pre_push_hook} | base64 --decode > "
+            '"$awm_recovery_hooks/pre-push" && '
+            'chmod 500 "$awm_recovery_hooks/reference-transaction" '
+            '"$awm_recovery_hooks/pre-push" && '
+            f"printf %s {encoded} | base64 --decode | "
+            'AWM_RECOVERY_PROTECTED_REF="$awm_recovery_ref" '
+            'GIT_CONFIG_VALUE_1="$awm_recovery_hooks" '
+            f"{launch}"
+        )
 
     def _with_shell_diagnostic(
         self, session_id: str, result: ShellResult

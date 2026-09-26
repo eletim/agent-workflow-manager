@@ -3168,14 +3168,16 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
     ]
 
 
-def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() -> None:
+def test_repository_recovery_preserves_preexisting_staged_and_unstaged_changes() -> None:
     workflow = load_generated_workflow(issues=[90])
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
-            current_branch="dev/v1", dirty=True, status=(" M file",)
+            current_branch="dev/v1",
+            dirty=True,
+            status=("M  staged.txt", " M unstaged.txt"),
         ),
         inspect_branch=lambda branch: BranchState(
             branch, "b" * 40, "b" * 40, True
@@ -3202,17 +3204,22 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
         attempts.append(1),
         (_ for _ in ()).throw(WorkerFailure("plan failed")),
     )
-    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
-        True, True, "Repaired plan.", "Inspected remote state."
-    )
+    recovery_attempts: list[str] = []
+
+    def attempt_amend(*args: object, **kwargs: object):
+        recovery_attempts.append("git commit --amend")
+        pytest.fail("recovery must not start with staged or unstaged changes")
+
+    workflow["recover_error"] = attempt_amend
     findings: list[tuple[str, str, str]] = []
     workflow["emit_finding"] = lambda category, message, *, status: findings.append(
         (category, message, status)
     )
 
-    with pytest.raises(WorkerFailure, match="recovery outcome is uncertain"):
+    with pytest.raises(WorkerFailure, match="recovery requires a clean worktree"):
         workflow["run_repository"](config)
     assert len(attempts) == 1
+    assert recovery_attempts == []
     assert findings == []
 
 
@@ -3322,7 +3329,10 @@ def test_repository_recovery_rejects_changed_non_head_local_ref(
     if before is not None:
         original[changed_ref] = before
     changed = {**original, changed_ref: after}
-    local_refs = iter((original, changed))
+    local_refs = iter((original, changed, original))
+    restorations: list[
+        tuple[dict[str, LocalRefState], dict[str, LocalRefState], str]
+    ] = []
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
@@ -3330,8 +3340,11 @@ def test_repository_recovery_rejects_changed_non_head_local_ref(
         inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
         inspect_local_refs=lambda: next(local_refs),
         inspect_remote_refs=lambda: {"refs/heads/dev/v1": "a" * 40},
-        require_committed_result=lambda *args, **kwargs: pytest.fail(
-            "non-head ref mutation must fail before branch validation"
+        restore_rejected_recovery_refs=lambda original, recovered, *, active_ref: (
+            restorations.append((original, recovered, active_ref))
+        ),
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "a" * 40, "a" * 40, True
         ),
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3358,6 +3371,67 @@ def test_repository_recovery_rejects_changed_non_head_local_ref(
         WorkerFailure, match="recovery changed local refs outside the active branch"
     ):
         workflow["run_repository"](config)
+    assert restorations == [(original, changed, "refs/heads/dev/v1")]
+
+
+@pytest.mark.parametrize("recovery_raises", [False, True])
+def test_repository_recovery_restores_active_and_non_head_mutations(
+    recovery_raises: bool,
+) -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    original = {"refs/heads/dev/v1": LocalRefState("a" * 40, None)}
+    changed = {
+        "refs/heads/dev/v1": LocalRefState("b" * 40, None),
+        "refs/tags/recovery-test": LocalRefState("b" * 40, None),
+    }
+    active_only = {"refs/heads/dev/v1": LocalRefState("b" * 40, None)}
+    local_refs = iter((original, changed, active_only))
+    ref_restorations: list[str] = []
+    branch_restorations: list[tuple[str, str, str]] = []
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
+        inspect_local_refs=lambda: next(local_refs),
+        inspect_remote_refs=lambda: {"refs/heads/dev/v1": "a" * 40},
+        restore_rejected_recovery_refs=lambda *args, **kwargs: ref_restorations.append(
+            kwargs["active_ref"]
+        ),
+        require_committed_result=lambda *args, **kwargs: (_ for _ in ()).throw(
+            WorkerFailure("branch no longer descends from its pre-recovery head")
+        ),
+        restore_rejected_recovery_branch=lambda branch, original_sha, rejected_sha: (
+            branch_restorations.append((branch, original_sha, rejected_sha))
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: "inspected state"
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("provenance failed")
+    )
+
+    def recover(*args: object, **kwargs: object):
+        if recovery_raises:
+            raise WorkerFailure("recovery agent failed after changing refs")
+        return workflow["RecoveryReport"](
+            True, True, "Repaired provenance.", "Re-inspected refs."
+        )
+
+    workflow["recover_error"] = recover
+
+    with pytest.raises(WorkerFailure, match="recovery changed local branch history"):
+        workflow["run_repository"](config)
+    assert ref_restorations == ["refs/heads/dev/v1"]
+    assert branch_restorations == [("dev/v1", "a" * 40, "b" * 40)]
 
 
 def test_recovery_validates_adopted_remote_fast_forward_under_declared_process() -> None:

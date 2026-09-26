@@ -659,11 +659,15 @@ branch set across linked worktrees. Repository recovery instead snapshots all
 local `refs/*` and all authoritative remote refs, including tags and notes, and
 records both the object ID and symbolic target of each local ref. It then starts
 the recovery agent through the normal session and validated-turn APIs
-with the `local-git-only` restriction. That boundary denies remote Git ref
-mutation while allowing a necessary local commit or fast-forward. Codex retains
-native read-only remote search; Claude retains explicitly allowlisted local Git
-and non-ref GitHub operations. After the turn, the remote ref set and every
-unrelated local ref must remain exact. The active local branch must still
+with the `local-git-only` restriction. Recovery requires a clean worktree before
+launch so restoration cannot discard pre-existing staged or unstaged changes.
+The restricted session installs a temporary Git reference-transaction hook that
+allows only a fast-forward of the active branch, plus a pre-push hook that rejects
+pushes. Codex also loses Git/GitHub credentials and network access; Claude retains
+only explicitly allowlisted local Git and non-ref GitHub operations. After the turn,
+the remote ref set and every unrelated local ref must remain exact. Any detected
+non-active local ref mutation is CAS-restored, including when the recovery agent
+failed after making it. The active local branch must still
 descend from its pre-turn head; an exact advance to the snapshotted authoritative
 remote head keeps its existing provenance, while any other new commits require
 recovery provenance. Only when the pre-recovery local head is an ancestor of the
@@ -682,6 +686,9 @@ repo.normalize_agent_commit_provenance(
 repo.restore_rejected_recovery_branch(
     branch, *, original_sha, rejected_sha
 ) -> BranchState
+repo.restore_rejected_recovery_refs(
+    original, recovered, *, active_ref
+) -> None
 repo.ensure_pushed(branch, *, expected_local_sha) -> BranchState
 repo.synchronize_branch(branch, *, expected_remote_sha=None) -> BranchState
 repo.prepare_feature_branch(

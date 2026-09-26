@@ -356,8 +356,13 @@ authoritative remote refs (including tags), fetches missing referenced history, 
 refuses any commit already remote-visible; it also restores the original local head
 if a remote-ref race is detected. The API never rebases, force-pushes, deletes
 branches, stashes changes, or resolves conflicts. An internal recovery safeguard may
-hard-reset a clean pre-recovery worktree solely to restore its captured head after a
-recovery agent attempts a forbidden history rewrite.
+hard-reset only when both the captured pre-recovery worktree and the rejected result
+are clean, solely to restore its captured head after a recovery agent attempts a
+forbidden history rewrite. Recovery refuses to start over staged or unstaged changes.
+Restricted recovery sessions also install a temporary Git ref-transaction boundary:
+only a fast-forward of the active branch is accepted, pushes and unrelated ref updates
+are rejected, and any detected non-active local ref mutation is CAS-restored before
+the recovery failure is returned.
 
 ```python
 from purplemux_client import (
