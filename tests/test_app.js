@@ -923,6 +923,58 @@ test("failed run detail selection rolls back to the editable New Run context", a
   assert.match(elements.stderr.textContent, /detail unavailable/);
 });
 
+test("failed rapid selection rolls back past a pending Run to New Run", async () => {
+  const runADetail = deferred();
+  const runBDetail = deferred();
+  const {elements} = await loadApp({
+    runs: [
+      {runId: 1, state: "running", mode: "workflow", cwd: "/work/a"},
+      {runId: 2, state: "failed", mode: "workflow", cwd: "/work/b"},
+    ],
+    details: {
+      1: snapshot({runId: 1, state: "running", stdout: "A"}),
+      2: snapshot({runId: 2, state: "failed", stdout: "B"}),
+    },
+    validation: {status: 200, body: {validation: []}},
+    selectLatest: false,
+    fetchOverride(url) {
+      if (url === "/api/runs/1") return runADetail.promise;
+      if (url === "/api/runs/2") return runBDetail.promise;
+      return undefined;
+    },
+  });
+
+  await elements["workflow-mode"].dispatch("click");
+  elements.code.value = "print('committed draft')";
+  const selectA = runItem(elements, 1).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  const selectB = runItem(elements, 2).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(runItem(elements, 2).getAttribute("aria-current"), "true");
+  assert.match(elements["active-context"].textContent, /Loading Run #2/);
+
+  runBDetail.resolve(response({error: "B detail unavailable"}, 503));
+  await selectB;
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), "true");
+  assert.equal(runItem(elements, 1).getAttribute("aria-current"), undefined);
+  assert.equal(runItem(elements, 2).getAttribute("aria-current"), undefined);
+  assert.match(elements["active-context"].textContent, /New Python Workflow run/);
+  assert.equal(elements.code.value, "print('committed draft')");
+  assert.equal(elements.code.readOnly, false);
+  assert.equal(elements.run.disabled, false);
+  assert.match(elements.stderr.textContent, /B detail unavailable/);
+
+  runADetail.resolve(response(snapshot({runId: 1, state: "running", stdout: "A"})));
+  await selectA;
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), "true");
+  assert.equal(selectedRun(elements), undefined);
+  assert.equal(elements.code.value, "print('committed draft')");
+  assert.equal(elements.code.readOnly, false);
+});
+
 test("saved run history stays unselected across startup reconciliation", async () => {
   const latest = snapshot({
     runId: 2,

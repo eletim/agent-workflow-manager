@@ -190,6 +190,13 @@ let knownRunIdsGeneration = 0;
 // source used when carrying a reusable folder into a new-run draft; list
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
+// Pending history selections temporarily change `activeRunId` so New Run and
+// field editability cannot remain active under a Run selector. Keep the last
+// fully rendered context separately so a failed or superseded load never
+// rolls back to another pending selection.
+let committedRunId = null;
+let committedRunSnapshot = null;
+let committedExplicitNewRun = false;
 let activeRunGeneration = 0;
 let familyNavigationRequestGeneration = 0;
 let checkedRunIds = [];
@@ -499,6 +506,9 @@ function showDraftLabel() {
   activeContextPrimary.textContent = `${label} · Draft settings are isolated from existing Runs`;
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
+  committedRunId = null;
+  committedRunSnapshot = null;
+  committedExplicitNewRun = explicitNewRun;
   renderRunContextSelection();
 }
 
@@ -702,6 +712,9 @@ function renderRun(result) {
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
     activeRunSnapshot = result;
+    committedRunId = activeRunId;
+    committedRunSnapshot = result;
+    committedExplicitNewRun = explicitNewRun;
     if (currentMode === "prompt") {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
@@ -1083,9 +1096,6 @@ function renderRunList(runs, cleanupOwnership = []) {
     marker.setAttribute("aria-hidden", "true");
     button.prepend(marker);
     button.addEventListener("click", async () => {
-      const previousRunId = activeRunId;
-      const previousRunSnapshot = activeRunSnapshot;
-      const previousExplicitNewRun = explicitNewRun;
       captureDraftIfEditing();
       activeRunId = run.runId;
       activeRunSnapshot = null;
@@ -1110,13 +1120,13 @@ function renderRunList(runs, cleanupOwnership = []) {
         && selectionGeneration === activeRunGeneration
         && activeRunId === run.runId
       ) {
-        activeRunId = previousRunId;
-        activeRunSnapshot = previousRunSnapshot;
-        explicitNewRun = previousExplicitNewRun;
+        activeRunId = committedRunId;
+        activeRunSnapshot = committedRunSnapshot;
+        explicitNewRun = committedExplicitNewRun;
         activeRunGeneration += 1;
         const selectionError = stderr.textContent;
-        if (previousRunId !== null && previousRunSnapshot !== null) {
-          renderRun(previousRunSnapshot);
+        if (committedRunId !== null && committedRunSnapshot !== null) {
+          renderRun(committedRunSnapshot);
         } else {
           showDraftLabel();
           applyFieldMode();
