@@ -272,8 +272,6 @@ class GitRepository:
         """Return whether a repository-relative path exists at an exact commit."""
         self._validate_identity()
         self._validate_sha(commit_sha)
-        if not self._has_commit(commit_sha):
-            raise WorkerFailure(f"commit is not available locally: {commit_sha}")
         if (
             not path
             or "\0" in path
@@ -282,9 +280,9 @@ class GitRepository:
         ):
             raise ValueError("path must be a normalized repository-relative path")
         completed = self._command(
-            ["cat-file", "-e", f"{commit_sha}:{path}"], {0, 1, 128}
+            ["ls-tree", "-z", "--full-tree", commit_sha, "--", path], {0}
         )
-        return completed.returncode == 0
+        return bool(completed.stdout)
 
     def inspect_remote_branches(self, branches: Sequence[str]) -> dict[str, str | None]:
         """Resolve several remote heads authoritatively without tracking refs."""
