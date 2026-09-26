@@ -1022,6 +1022,141 @@ def parse_recovery_report(source: str) -> RecoveryReport:
     return RecoveryReport(**value)
 
 
+def recovery_agent_command(prompt: str) -> str:
+    """Build a one-shot recovery command with no Git metadata or push access."""
+    encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+    input_command = f"printf %s {encoded} | base64 --decode"
+    clean_environment = (
+        "env -u GH_TOKEN -u GITHUB_TOKEN -u GIT_ASKPASS -u SSH_ASKPASS "
+        "-u SSH_AUTH_SOCK -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT "
+        "-u GIT_DIR -u GIT_WORK_TREE -u GIT_SSH_COMMAND"
+    )
+    if IMPLEMENTER_AGENT == "codex":
+        agent_command = (
+            f"{clean_environment} codex --sandbox workspace-write "
+            "--ask-for-approval never "
+            "--config sandbox_workspace_write.network_access=false "
+            "--config sandbox_workspace_write.exclude_tmpdir_env_var=true "
+            "--config sandbox_workspace_write.exclude_slash_tmp=true "
+            "exec --ephemeral --ignore-user-config --ignore-rules "
+            "--color never --cd . -"
+        )
+    elif IMPLEMENTER_AGENT == "claude":
+        agent_command = (
+            f"{clean_environment} claude --print --no-session-persistence "
+            "--safe-mode --strict-mcp-config --restricted "
+            "--permission-mode dontAsk --permission-prompts none "
+            "--output-format text"
+        )
+    else:
+        raise WorkerFailure("recovery agent must be codex or claude")
+    return f"{input_command} | {agent_command}"
+
+
+def run_recovery_agent_turn(
+    client: PurpleMuxCLIClient,
+    config: Config,
+    name: str,
+    prompt: str,
+    *,
+    work_item_id: int | str | None,
+    work_item_label: str | None,
+    iteration: int,
+) -> _AgentTurnExecution:
+    """Run recovery in a fresh restricted process and record its exact result."""
+    turn_id = next(AGENT_TURN_IDS)
+    trace_context = {
+        "repository": config.slug,
+        "phase": "recovery",
+    }
+    if work_item_id is not None:
+        trace_context["work_item_id"] = work_item_id
+        trace_context["work_item_label"] = work_item_label
+    tab: str | None = None
+    try:
+        tab = client.start_shell(
+            ShellCommandRequest(
+                recovery_agent_command(prompt),
+                str(config.repo),
+                "Recovery agent",
+            )
+        )
+        emit_step(
+            name,
+            "started",
+            iteration=iteration,
+            workspace=client.workspace_id,
+            tab=tab,
+        )
+        terminal_progress("START", name, iteration=iteration)
+        try:
+            emit_agent_turn(
+                turn_id,
+                name,
+                "recovery",
+                iteration,
+                "started",
+                prompt=prompt,
+                **trace_context,
+            )
+        except Exception:
+            pass
+        client.wait_for_shell_completion(tab, timeout_seconds=TURN_TIMEOUT)
+        result = client.read_shell_result(tab)
+        if result.exit_code != 0:
+            raise WorkerFailure(result.failure_message(name))
+        output = result.stdout.strip()
+        if not output:
+            raise WorkerFailure("recovery agent returned an empty result")
+    except BaseException as exc:
+        try:
+            emit_agent_turn(
+                turn_id,
+                name,
+                "recovery",
+                iteration,
+                "failed",
+                error=short_error(exc),
+                **trace_context,
+            )
+        except Exception:
+            pass
+        emit_step(
+            name,
+            "failed",
+            iteration=iteration,
+            error=short_error(exc),
+            workspace=client.workspace_id,
+            tab=tab,
+        )
+        terminal_progress("FAILED", name, iteration=iteration, detail=short_error(exc))
+        raise
+    finally:
+        if tab is not None:
+            client.close_session(tab)
+    emit_step(
+        name,
+        "completed",
+        iteration=iteration,
+        workspace=client.workspace_id,
+        tab=tab,
+    )
+    terminal_progress("DONE", name, iteration=iteration)
+    execution = _AgentTurnExecution(
+        output,
+        turn_id,
+        name,
+        "recovery",
+        iteration,
+        "recovery",
+        work_item_id,
+        work_item_label,
+        config.slug,
+    )
+    DEFERRED_AGENT_TURN_TRACES.append(execution)
+    return execution
+
+
 def recover_error(
     client: PurpleMuxCLIClient,
     config: Config,
@@ -1049,42 +1184,65 @@ def recover_error(
                 work_item_label = f"Mini task {task_id}"
     except (AttributeError, TypeError, ValueError):
         pass
-    agent = create_agent(
-        client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
+    original_prompt = implementer_prompt(
+        "Investigate this workflow error using the current authoritative "
+        "state below. Make only a safe, necessary repair, then re-inspect "
+        "the affected state. If the outcome is uncertain, report retry_safe "
+        "as false. Do not amend, reset, rebase, or otherwise rewrite commit "
+        "history to repair provenance. Leave every local and remote branch "
+        "ref unchanged. Do not stash, force-push, merge a work-item PR, "
+        "create unrelated PRs, discard ambiguous work, or edit "
+        "agent-workflow-manager fingerprint markers. Return exactly one JSON "
+        "object with boolean repaired and retry_safe fields and concise "
+        "single-line summary and evidence strings (at most 500 UTF-8 bytes "
+        "each). Include evidence from the state after repair when "
+        "recommending retry. No other fields or prose.\n\n"
+        f"Error: {short_error(error)}\n\n"
+        f"Current authoritative state:\n{authoritative_state}",
+        process="recovery",
     )
-    try:
-        _, report = run_validated_turn(
+    prompt = original_prompt
+    for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+        execution = run_recovery_agent_turn(
             client,
-            agent,
+            config,
             "Recovery assessment",
-            implementer_prompt(
-                "Investigate this workflow error using the current authoritative "
-                "state below. Make only a safe, necessary repair, then re-inspect "
-                "the affected state. If the outcome is uncertain, report retry_safe "
-                "as false. Do not amend, reset, rebase, or otherwise rewrite commit "
-                "history to repair provenance. Leave every local and remote branch "
-                "ref unchanged. Do not stash, force-push, merge a work-item PR, "
-                "create unrelated PRs, discard ambiguous work, or edit "
-                "agent-workflow-manager fingerprint markers. Return exactly one JSON "
-                "object with boolean repaired and retry_safe fields and concise "
-                "single-line summary and evidence strings (at most 500 UTF-8 bytes "
-                "each). Include evidence from the state after repair when "
-                "recommending retry. No other fields or prose.\n\n"
-                f"Error: {short_error(error)}\n\n"
-                f"Current authoritative state:\n{authoritative_state}",
-                process="recovery",
-            ),
-            parse_recovery_report,
-            repository_identity=config.slug,
-            role="recovery",
-            phase="recovery",
+            prompt,
             work_item_id=work_item_id,
             work_item_label=work_item_label,
-            _deferred_execution=deferred_execution,
+            iteration=correction + 1,
         )
+        try:
+            report = parse_recovery_report(execution.result)
+        except WorkerFailure as exc:
+            _emit_completed_turn(
+                execution,
+                "correct_output"
+                if correction < MAX_MACHINE_OUTPUT_CORRECTIONS
+                else "invalid_output",
+            )
+            if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
+                raise WorkerFailure(
+                    "Recovery assessment returned invalid output after "
+                    f"{MAX_MACHINE_OUTPUT_CORRECTIONS} correction attempts: "
+                    f"{short_error(exc)}"
+                ) from exc
+            prior_bytes = execution.result.encode("utf-8")[:MAX_RECOVERY_REPORT_BYTES]
+            prior_result = prior_bytes.decode("utf-8", errors="replace")
+            prompt = (
+                "The previous response violated its machine-readable output "
+                f"contract: {short_error(exc)}\n\nReturn the complete corrected "
+                "response only. Do not repeat the underlying task or mutate any "
+                "state.\n\nOriginal request:\n"
+                f"{original_prompt}\n\nPrevious response (bounded):\n{prior_result}"
+            )
+            continue
+        if deferred_execution is None:
+            _emit_completed_turn(execution, None)
+        else:
+            deferred_execution.append(execution)
         return report
-    finally:
-        client.close_session(agent)
+    raise AssertionError("unreachable")
 
 
 def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
@@ -5748,14 +5906,13 @@ def _run_repository(
             state = recovery_authoritative_state(config, repo, github, plan)
             recovery_execution: list[_AgentTurnExecution] = []
             try:
-                with repo.protect_branch_history():
-                    report = recover_error(
-                        client,
-                        config,
-                        exc,
-                        state,
-                        deferred_execution=recovery_execution,
-                    )
+                report = recover_error(
+                    client,
+                    config,
+                    exc,
+                    state,
+                    deferred_execution=recovery_execution,
+                )
             finally:
                 recovered_local_refs = repo.inspect_local_branch_heads()
                 recovered_remote_refs = repo.inspect_remote_branch_heads()

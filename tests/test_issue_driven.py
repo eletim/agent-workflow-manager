@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import inspect
 import json
 import subprocess
 import sys
-from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -2541,7 +2541,6 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
             calls[text] = agent_type.id
 
     assert calls == {
-        "Recovery agent": "IMPLEMENTER_AGENT",
         " worktree cleanup": "IMPLEMENTER_AGENT",
         " implementer": "IMPLEMENTER_AGENT",
         " scope reviewer": "REVIEWER_AGENT",
@@ -2854,40 +2853,52 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    agents: list[tuple[str, str]] = []
-    prompts: list[str] = []
+    commands: list[str] = []
     closed: list[str] = []
-    client = SimpleNamespace(close_session=closed.append)
-    workflow["create_agent"] = lambda client, config, *, agent_type, name: (
-        agents.append((agent_type, name)) or f"recovery-{len(agents)}"
+    response = json.dumps(
+        {
+            "repaired": True,
+            "retry_safe": True,
+            "summary": "Restored the missing remote branch.",
+            "evidence": "Remote branch now points to the expected commit.",
+        }
     )
 
-    def run_validated(client, agent, name, prompt, validator, *, role, **kwargs):
-        assert role == "recovery"
-        assert kwargs["phase"] == "recovery"
-        assert kwargs["_deferred_execution"] is None
-        assert "transition_outcome" not in kwargs
-        prompts.append(prompt)
-        return "", validator(
-            json.dumps(
-                {
-                    "repaired": True,
-                    "retry_safe": True,
-                    "summary": "Restored the missing remote branch.",
-                    "evidence": "Remote branch now points to the expected commit.",
-                }
-            )
-        )
+    class Client:
+        workspace_id = "workspace-1"
 
-    workflow["run_validated_turn"] = run_validated
+        def start_shell(self, request):
+            commands.append(request.command)
+            return f"recovery-{len(commands)}"
+
+        def wait_for_shell_completion(self, *_args, **_kwargs):
+            return None
+
+        def read_shell_result(self, _tab):
+            return SimpleNamespace(exit_code=0, stdout=response)
+
+        def close_session(self, tab):
+            closed.append(tab)
+
     first = workflow["recover_error"](
-        client, config, RuntimeError("first"), "branch: absent"
+        Client(), config, RuntimeError("first"), "branch: absent"
     )
     second = workflow["recover_error"](
-        client, config, RuntimeError("second"), "branch: present"
+        Client(), config, RuntimeError("second"), "branch: present"
     )
 
-    assert agents == [("codex", "Recovery agent"), ("codex", "Recovery agent")]
+    prompts = [
+        base64.b64decode(
+            command.partition("printf %s ")[2].partition(" | ")[0]
+        )
+        .decode("utf-8")
+        for command in commands
+    ]
+
+    assert len(commands) == 2
+    assert all("--sandbox workspace-write" in command for command in commands)
+    assert all("sandbox_workspace_write.network_access=false" in command for command in commands)
+    assert all("-u GH_TOKEN -u GITHUB_TOKEN" in command for command in commands)
     assert first.retry_safe and second.repaired
     assert "first" in prompts[0] and "branch: absent" in prompts[0]
     assert "second" in prompts[1] and "branch: present" in prompts[1]
@@ -2902,14 +2913,19 @@ def test_recovery_traces_inline_work_item_context_with_result_id() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     trace_contexts: list[tuple[object, object]] = []
-    client = SimpleNamespace(close_session=lambda agent: None)
-    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
-
-    def run_validated(*args, **kwargs):
-        trace_contexts.append((kwargs["work_item_id"], kwargs["work_item_label"]))
-        return "", workflow["RecoveryReport"](True, True, "ok", "evidence")
-
-    workflow["run_validated_turn"] = run_validated
+    response = json.dumps(
+        {"repaired": True, "retry_safe": True, "summary": "ok", "evidence": "seen"}
+    )
+    client = SimpleNamespace(
+        workspace_id="workspace-1",
+        start_shell=lambda request: "recovery-only",
+        wait_for_shell_completion=lambda *args, **kwargs: None,
+        read_shell_result=lambda tab: SimpleNamespace(exit_code=0, stdout=response),
+        close_session=lambda agent: None,
+    )
+    workflow["emit_agent_turn"] = lambda *args, **kwargs: trace_contexts.append(
+        (kwargs.get("work_item_id"), kwargs.get("work_item_label"))
+    )
     authoritative_state = json.dumps(
         {"work_item_plan": {"active": {"id": "instrument-inline"}}}
     )
@@ -2918,9 +2934,10 @@ def test_recovery_traces_inline_work_item_context_with_result_id() -> None:
         client, config, RuntimeError("first"), authoritative_state
     )
 
-    assert trace_contexts == [
-        ("mini-task:instrument-inline", "Mini task instrument-inline")
-    ]
+    assert trace_contexts[0] == (
+        "mini-task:instrument-inline",
+        "Mini task instrument-inline",
+    )
 
 
 def test_recovery_closes_agent_when_its_turn_fails() -> None:
@@ -2929,15 +2946,51 @@ def test_recovery_closes_agent_when_its_turn_fails() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     closed: list[str] = []
-    client = SimpleNamespace(close_session=closed.append)
-    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
-    workflow["run_validated_turn"] = lambda *args, **kwargs: (_ for _ in ()).throw(
-        WorkerFailure("agent failed")
+    client = SimpleNamespace(
+        workspace_id="workspace-1",
+        start_shell=lambda request: "recovery-only",
+        wait_for_shell_completion=lambda *args, **kwargs: (_ for _ in ()).throw(
+            WorkerFailure("agent failed")
+        ),
+        close_session=closed.append,
     )
 
     with pytest.raises(WorkerFailure, match="agent failed"):
         workflow["recover_error"](client, config, RuntimeError("first"), "state")
     assert closed == ["recovery-only"]
+
+
+@pytest.mark.parametrize(
+    ("agent", "required"),
+    [
+        (
+            "codex",
+            (
+                "--sandbox workspace-write",
+                "network_access=false",
+                "exclude_tmpdir_env_var=true",
+                "exclude_slash_tmp=true",
+                "--ignore-user-config",
+            ),
+        ),
+        (
+            "claude",
+            ("--restricted", "--permission-prompts none", "--safe-mode"),
+        ),
+    ],
+)
+def test_recovery_agent_command_enforces_provider_session_boundary(
+    agent: str, required: tuple[str, ...]
+) -> None:
+    workflow = load_generated_workflow(issues=[90], implementer_agent=agent)
+
+    command = workflow["recovery_agent_command"]("inspect safely")
+
+    assert all(value in command for value in required)
+    assert "-u GH_TOKEN -u GITHUB_TOKEN" in command
+    assert "-u SSH_AUTH_SOCK" in command
+    if agent == "codex":
+        assert command.index("--ask-for-approval never") < command.index(" exec ")
 
 
 def test_repository_failure_starts_recovery_with_current_inspection() -> None:
@@ -2960,7 +3013,6 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         },
         inspect_local_branch_heads=lambda: {"feature/work": "b" * 40},
         inspect_remote_branch_heads=lambda: {"feature/work": "b" * 40},
-        protect_branch_history=nullcontext,
     )
     github = SimpleNamespace(find_pr=lambda **kwargs: None)
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3025,7 +3077,6 @@ def test_repository_recovery_rejects_unrecoverable_report(
         require_committed_result=require_recovery_commit,
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
-        protect_branch_history=nullcontext,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -3088,7 +3139,6 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
         },
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
-        protect_branch_history=nullcontext,
     )
     github = SimpleNamespace(find_pr=lambda **kwargs: None)
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3179,7 +3229,6 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
         },
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
-        protect_branch_history=nullcontext,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -3236,7 +3285,6 @@ def test_repository_recovery_rejects_changed_branch_history(
         inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
         inspect_local_branch_heads=inspect_local_branch_heads,
         inspect_remote_branch_heads=inspect_remote_branch_heads,
-        protect_branch_history=nullcontext,
         require_committed_result=lambda *args, **kwargs: pytest.fail(
             "changed history must fail before provenance validation"
         ),
@@ -3375,7 +3423,6 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
         ),
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
-        protect_branch_history=nullcontext,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
