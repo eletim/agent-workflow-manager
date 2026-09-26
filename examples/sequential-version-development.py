@@ -5824,6 +5824,9 @@ def _run_repository(
                     and authoritative_remote_head != recovery_start.local_sha
                 ):
                     try:
+                        repo.require_ancestor(
+                            recovery_start.local_sha, authoritative_remote_head
+                        )
                         repo.require_contains(
                             recovery_branch, authoritative_remote_head
                         )

@@ -642,6 +642,7 @@ repo.require_agent_commit_provenance(
 ) -> None
 agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
+repo.require_ancestor(ancestor_sha, descendant_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
 
@@ -658,10 +659,11 @@ and non-ref GitHub operations. After the turn, the remote ref set and every
 unrelated local ref must remain exact. The active local branch must still
 descend from its pre-turn head; an exact advance to the snapshotted authoritative
 remote head keeps its existing provenance, while any other new commits require
-recovery provenance. When that remote head is contained by the final local head,
-only commits after the remote head are attributed to recovery. Recovery therefore
-cannot repair provenance by amending, rebasing, resetting, force-pushing, or
-otherwise rewriting history.
+recovery provenance. Only when the pre-recovery local head is an ancestor of the
+remote head and that remote head is contained by the final local head are commits
+after the remote head attributed to recovery. Recovery therefore cannot repair
+provenance by amending, rebasing, resetting, force-pushing, or otherwise rewriting
+history.
 
 The inspection-aware Git operations that may mutate are:
 

@@ -3373,6 +3373,7 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     local_heads = iter(({"dev/v1": "a" * 40}, {"dev/v1": "c" * 40}))
+    ancestry_checks: list[tuple[str, str]] = []
     containment_checks: list[tuple[str, str]] = []
     provenance_checks: list[tuple[str, str, dict[str, object]]] = []
     repo = SimpleNamespace(
@@ -3386,6 +3387,9 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
         require_committed_result=lambda branch, **kwargs: BranchState(
             branch, "c" * 40, "b" * 40, True
+        ),
+        require_ancestor=lambda ancestor, descendant: ancestry_checks.append(
+            (ancestor, descendant)
         ),
         require_contains=lambda branch, commit: containment_checks.append(
             (branch, commit)
@@ -3411,10 +3415,71 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
     with pytest.raises(WorkerFailure, match="repair needed"):
         workflow["run_repository"](config)
 
+    assert ancestry_checks == [("a" * 40, "b" * 40)]
     assert containment_checks == [("dev/v1", "b" * 40)]
     assert provenance_checks == [
         (
             "b" * 40,
+            "c" * 40,
+            {"expected_agent": "codex", "expected_process": "recovery"},
+        )
+    ]
+
+
+def test_recovery_keeps_local_provenance_boundary_when_remote_was_behind() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    local_heads = iter(({"dev/v1": "a" * 40}, {"dev/v1": "c" * 40}))
+    ancestry_checks: list[tuple[str, str]] = []
+    provenance_checks: list[tuple[str, str, dict[str, object]]] = []
+
+    def require_ancestor(ancestor: str, descendant: str) -> None:
+        ancestry_checks.append((ancestor, descendant))
+        raise WorkerFailure("remote head is behind the pre-recovery local head")
+
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "a" * 40, "b" * 40, True
+        ),
+        inspect_local_branch_heads=lambda: next(local_heads),
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "c" * 40, "b" * 40, True
+        ),
+        require_ancestor=require_ancestor,
+        require_contains=lambda *args: pytest.fail(
+            "a remote-behind head cannot be treated as adopted"
+        ),
+        require_agent_commit_provenance=lambda start, end, **kwargs: (
+            provenance_checks.append((start, end, kwargs))
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: "inspected state"
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("repair needed")
+    )
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
+        False, False, "Committed repair.", "Range verified."
+    )
+
+    with pytest.raises(WorkerFailure, match="repair needed"):
+        workflow["run_repository"](config)
+
+    assert ancestry_checks == [("a" * 40, "b" * 40)]
+    assert provenance_checks == [
+        (
+            "a" * 40,
             "c" * 40,
             {"expected_agent": "codex", "expected_process": "recovery"},
         )

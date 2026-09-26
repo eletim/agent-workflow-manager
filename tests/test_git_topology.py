@@ -229,6 +229,23 @@ def test_open_can_pin_identity_from_the_validated_github_origin(
     assert runner.calls.count(["git", "remote", "get-url", "origin"]) >= 2
 
 
+def test_require_ancestor_checks_commit_topology(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    ancestor = git(work, "rev-parse", "HEAD")
+    (work / "descendant.txt").write_text("descendant\n", encoding="utf-8")
+    git(work, "add", "descendant.txt")
+    git(work, "commit", "-m", "descendant")
+    descendant = git(work, "rev-parse", "HEAD")
+    repo = open_repo(work, RecordingGitRunner())
+
+    repo.require_ancestor(ancestor, descendant)
+
+    with pytest.raises(WorkerFailure, match="is not an ancestor"):
+        repo.require_ancestor(descendant, ancestor)
+
+
 def test_safe_synchronize_prepare_and_read_only_require_pushed(
     repositories: tuple[Path, Path, Path],
 ) -> None:

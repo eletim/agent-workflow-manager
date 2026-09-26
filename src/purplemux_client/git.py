@@ -1106,6 +1106,14 @@ class GitRepository:
         if not self._is_ancestor(commit_sha, state.local_sha):
             raise WorkerFailure(f"branch {branch!r} does not contain {commit_sha}")
 
+    def require_ancestor(self, ancestor_sha: str, descendant_sha: str) -> None:
+        self._validate_sha(ancestor_sha)
+        self._validate_sha(descendant_sha)
+        if not self._is_ancestor(ancestor_sha, descendant_sha):
+            raise WorkerFailure(
+                f"commit {ancestor_sha} is not an ancestor of {descendant_sha}"
+            )
+
     def synchronize_branch(
         self, branch: str, *, expected_remote_sha: str | None = None
     ) -> BranchState:
