@@ -643,6 +643,7 @@ The supported Git inspection and assertion methods are:
 ```python
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
+repo.has_path_at_commit(commit_sha, path) -> bool
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_remote_refs() -> dict[str, str]

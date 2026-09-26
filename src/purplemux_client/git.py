@@ -822,7 +822,9 @@ class GitRepository:
             commit_process = expected_process
             if commit_process is None:
                 assert allowed_processes is not None
-                declared = self._agent_trailer_values(message)["awm-process"]
+                declared = self._raw_agent_provenance_values(
+                    message, commit_sha=commit_sha
+                )["awm-process"]
                 if len(declared) != 1 or declared[0] not in allowed_processes:
                     raise WorkerFailure(
                         f"commit {commit_sha} must have exactly one allowed "
@@ -1118,11 +1120,7 @@ class GitRepository:
         expected_process: str,
         coauthor: str,
     ) -> str:
-        values: dict[str, list[str]] = {
-            "awm-agent": [],
-            "awm-process": [],
-            "co-authored-by": [],
-        }
+        values = self._raw_agent_provenance_values(message, commit_sha=commit_sha)
         retained: list[str] = []
         lines = message.splitlines()
         index = 0
@@ -1130,10 +1128,6 @@ class GitRepository:
             line = lines[index]
             match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
             if match is None:
-                if _AGENT_PROVENANCE_PREFIX_RE.match(line):
-                    raise WorkerFailure(
-                        f"commit {commit_sha} has ambiguous malformed AWM provenance"
-                    )
                 retained.append(line)
                 index += 1
                 continue
@@ -1147,7 +1141,6 @@ class GitRepository:
             unfolded = " ".join(
                 [value, *(continuation.strip() for continuation in continuations)]
             ).strip()
-            values[key].append(unfolded)
             if key == "co-authored-by" and unfolded != coauthor:
                 if value == coauthor:
                     raise WorkerFailure(
@@ -1241,6 +1234,42 @@ class GitRepository:
             coauthor=coauthor,
         )
         return normalized
+
+    def _raw_agent_provenance_values(
+        self, message: str, *, commit_sha: str
+    ) -> dict[str, list[str]]:
+        """Read provenance lines strictly, including lines outside Git's trailer block."""
+        values: dict[str, list[str]] = {
+            "awm-agent": [],
+            "awm-process": [],
+            "co-authored-by": [],
+        }
+        lines = message.splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
+            if match is None:
+                if _AGENT_PROVENANCE_PREFIX_RE.match(line):
+                    raise WorkerFailure(
+                        f"commit {commit_sha} has ambiguous malformed AWM provenance"
+                    )
+                index += 1
+                continue
+            end = index + 1
+            continuations: list[str] = []
+            while end < len(lines) and lines[end].startswith((" ", "\t")):
+                continuations.append(lines[end])
+                end += 1
+            value = " ".join(
+                [
+                    match.group(2),
+                    *(continuation.strip() for continuation in continuations),
+                ]
+            ).strip()
+            values[match.group(1).lower()].append(value)
+            index = end
+        return values
 
     def _require_agent_message_provenance(
         self,

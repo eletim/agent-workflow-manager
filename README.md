@@ -419,10 +419,28 @@ feature = repo.ensure_pushed(
     "feature/issue-123",
     expected_local_sha=feature.local_sha,
 )
+pull_request = github.find_pr(
+    head="feature/issue-123",
+    base="dev/v1.2.3",
+    state="OPEN",
+)
+if pull_request is None:
+    pull_request = github.create_draft_pr(
+        head="feature/issue-123",
+        base="dev/v1.2.3",
+        expected_head_sha=feature.remote_sha,
+        expected_base_sha=context.base_sha,
+        title="Issue #123",
+        body="Implements Issue #123.",
+        correlation_id="issue-123-pr",
+    )
 pull_request = github.require_pr(
+    number=pull_request.number,
     head="feature/issue-123",
     base="dev/v1.2.3",
     expected_head_sha=feature.remote_sha,
+    expected_base_sha=context.base_sha,
+    draft=True,
 )
 ```
 
@@ -489,10 +507,11 @@ before making the PR Ready.
 
 CodingAgent prompts require every implementation, review-fix, cleanup, and
 recovery commit to retain the configured agent as a co-author and to include
-machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
-result check mechanically normalizes unambiguous provenance on unpublished
-commits, then verifies it before a branch can advance. Conflicting provenance
-and commits already visible on the remote fail closed. Scripted
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The post-turn and
+delivery gate mechanically normalizes unambiguous provenance on unpublished
+commits before the clean committed-result verification allows a branch to
+advance. Conflicting provenance and commits already visible on the remote fail
+closed. Scripted
 merge commits instead record `AWM-Automation: agent-workflow-manager` and
 `AWM-Process: merge`; AWM is automation provenance, not a co-author.
 

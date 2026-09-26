@@ -2763,12 +2763,11 @@ def ensure_issue_pr(
     issue: Issue,
     config: Config,
     *,
+    expected_local_sha: str,
     expected_base_sha: str,
     reconcile_plan_owned_inline_identity: bool = False,
 ) -> PullRequestState:
-    local = repo.require_current_branch(issue.branch)
-    assert local.local_sha is not None
-    feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
+    feature = repo.ensure_pushed(issue.branch, expected_local_sha=expected_local_sha)
     assert feature.remote_sha is not None
     reconciled_pr_number: int | None = None
     if reconcile_plan_owned_inline_identity and issue.task_fingerprint is not None:
@@ -3528,6 +3527,7 @@ def process_issue(
         github,
         issue,
         config,
+        expected_local_sha=implementation_sha,
         expected_base_sha=integration.remote_sha,
         reconcile_plan_owned_inline_identity=existing_pr is None,
     )

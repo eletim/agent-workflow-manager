@@ -2209,6 +2209,7 @@ def test_fresh_inline_delivery_creates_pr_with_plan_owned_identity() -> None:
         GitHub(),
         issue,
         config,
+        expected_local_sha=head_sha,
         expected_base_sha=base_sha,
         reconcile_plan_owned_inline_identity=True,
     )
@@ -2246,6 +2247,7 @@ def test_fresh_inline_delivery_propagates_foreign_fingerprint_rejection() -> Non
             ),
             issue,
             config,
+            expected_local_sha=head_sha,
             expected_base_sha="b" * 40,
             reconcile_plan_owned_inline_identity=True,
         )

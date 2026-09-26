@@ -841,6 +841,41 @@ def test_normalize_recovered_provenance_preserves_declared_processes(
         previous = commit_sha
 
 
+def test_normalize_recovered_provenance_finds_process_before_final_trailer_block(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/normalize-separated-declared-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "recovered cleanup\n\nAWM-Process: cleanup\n\nReviewed-by: Reviewer <reviewer@example.com>",
+    )
+    recovered = git(work, "rev-parse", "HEAD")
+
+    normalized = repo.normalize_agent_declared_commit_provenance(
+        branch,
+        base,
+        recovered,
+        expected_agent="codex",
+        allowed_processes=("implementation", "reviewer-fix", "cleanup"),
+    )
+
+    assert normalized.local_sha is not None
+    assert normalized.local_sha != recovered
+    repo.require_agent_commit_provenance(
+        base,
+        normalized.local_sha,
+        expected_agent="codex",
+        expected_process="cleanup",
+    )
+
+
 def test_normalize_declared_provenance_rejects_missing_process_boundary(
     repositories: tuple[Path, Path, Path],
 ) -> None:

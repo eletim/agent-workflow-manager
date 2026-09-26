@@ -3954,7 +3954,12 @@ def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> No
 
     github = GitHub()
     created = workflow["ensure_issue_pr"](
-        Repository(), github, issue, config, expected_base_sha=base_sha
+        Repository(),
+        github,
+        issue,
+        config,
+        expected_local_sha=head_sha,
+        expected_base_sha=base_sha,
     )
     assert created.body.startswith(f"{marker}\n\n")
 
@@ -3964,6 +3969,48 @@ def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> No
 
     assert updated.body == f"{marker}\n\nUpdated child PR description"
     assert bodies == [issue.pr_body, updated.body]
+
+
+def test_initial_delivery_rejects_branch_advanced_after_verification() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](116, "feature/issue-116")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    implementation_sha = "verified-implementation-head"
+    advanced_sha = "concurrent-local-head"
+    expected_heads: list[str] = []
+    published_heads: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            expected_heads.append(expected_local_sha)
+            assert branch == issue.branch
+            assert expected_local_sha == implementation_sha
+            if expected_local_sha != advanced_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed: expected {expected_local_sha}, "
+                    f"found {advanced_sha}"
+                )
+            published_heads.append(advanced_sha)
+            return BranchState(branch, advanced_sha, advanced_sha, True)
+
+    class GitHub:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"GitHub publication must not be attempted: {name}")
+
+    with pytest.raises(WorkerFailure, match="changed: expected"):
+        workflow["ensure_issue_pr"](
+            Repository(),
+            GitHub(),
+            issue,
+            config,
+            expected_local_sha=implementation_sha,
+            expected_base_sha="integration-head",
+        )
+
+    assert expected_heads == [implementation_sha]
+    assert published_heads == []
 
 
 @pytest.mark.parametrize(
