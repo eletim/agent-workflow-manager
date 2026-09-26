@@ -461,7 +461,9 @@ before making the PR Ready.
 CodingAgent prompts require every implementation, review-fix, cleanup, and
 recovery commit to retain the configured agent as a co-author and to include
 machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
-result check verifies that provenance before a branch can advance. Scripted
+result check mechanically normalizes unambiguous provenance on unpublished
+commits, then verifies it before a branch can advance. Conflicting provenance
+and commits already visible on the remote fail closed. Scripted
 merge commits instead record `AWM-Automation: agent-workflow-manager` and
 `AWM-Process: merge`; AWM is automation provenance, not a co-author.
 

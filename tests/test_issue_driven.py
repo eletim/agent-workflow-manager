@@ -2667,6 +2667,10 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     code = generate_issue_driven_workflow(parse(payload()))
 
     assert "require_committed_result(" in code
+    assert "normalize_agent_commit_provenance(" in code
+    assert code.index("normalize_agent_commit_provenance(") < code.index(
+        "repo.ensure_pushed("
+    )
     assert "repo.ensure_pushed(" in code
     assert "github.create_draft_pr(" in code
     assert "reviewer requested changes, but" in code

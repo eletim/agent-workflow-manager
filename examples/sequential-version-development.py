@@ -674,14 +674,23 @@ def _execute_turn(
         after = repository.require_current_branch(branch)
         if after.local_sha is None:
             raise WorkerFailure(f"local branch {branch!r} disappeared")
-        repository.require_agent_commit_provenance(
+        normalized = repository.normalize_agent_commit_provenance(
+            branch,
             before_sha,
             after.local_sha,
             expected_agent=IMPLEMENTER_AGENT,
             expected_process=expected_process,
             allow_unchanged=True,
         )
-        return after.local_sha
+        assert normalized.local_sha is not None
+        repository.require_agent_commit_provenance(
+            before_sha,
+            normalized.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process=expected_process,
+            allow_unchanged=True,
+        )
+        return normalized.local_sha
 
     result_observed = False
     try:

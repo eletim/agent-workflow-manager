@@ -196,7 +196,11 @@ an unchanged agent turn; otherwise require the CodingAgent's new commit and clea
 worktree with `require_committed_result(..., expected_agent="codex",
 expected_process="implementation")` (or the agent and process for that turn).
 `agent_commit_coauthor()` supplies the same normalized co-author identity to the
-prompt that this postcondition verifies. Use `ensure_pushed()` to complete
+prompt that this postcondition verifies. Before validation and delivery,
+`normalize_agent_commit_provenance()` makes unambiguous unpublished agent
+trailers contiguous and exact while preserving unrelated trailers. It fails
+closed for conflicting provenance or a remote-visible commit. Use
+`ensure_pushed()` to complete
 delivery through the logical remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
 Workflow must then create or reuse and verify the exact Draft PR before starting
@@ -633,6 +637,10 @@ development branch with the remote's current branch set.
 The inspection-aware Git operations that may mutate are:
 
 ```python
+repo.normalize_agent_commit_provenance(
+    branch, previous_sha, current_sha, *, expected_agent, expected_process,
+    allow_unchanged=False
+) -> BranchState
 repo.ensure_pushed(branch, *, expected_local_sha) -> BranchState
 repo.synchronize_branch(branch) -> BranchState
 repo.prepare_feature_branch(
