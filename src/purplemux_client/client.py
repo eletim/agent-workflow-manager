@@ -55,7 +55,7 @@ class CreateSessionRequest:
     name: str | None = None
     correlation_id: str | None = None
     deadline_check: Callable[[], float] | None = None
-    restriction: Literal["preserve-git-refs"] | None = None
+    restriction: Literal["local-git-only"] | None = None
 
 
 @dataclass(frozen=True)
@@ -681,7 +681,7 @@ class PurpleMuxCLIClient:
         """Create and launch a Codex or Claude session."""
         if request.deadline_check is not None:
             request.deadline_check()
-        if request.restriction not in (None, "preserve-git-refs"):
+        if request.restriction not in (None, "local-git-only"):
             raise ValueError("unsupported agent session restriction")
         panel_type = _PANEL_TYPES.get(request.worker.lower())
         if panel_type is None:
@@ -717,7 +717,7 @@ class PurpleMuxCLIClient:
         name = request.name or f"awm-{panel_type}-{correlation_id}"
         if request.name is not None and correlation_id not in name:
             name = f"{name} [awm:{correlation_id}]"
-        restricted = request.restriction == "preserve-git-refs"
+        restricted = request.restriction == "local-git-only"
         tab = self._create_correlated_tab(
             panel_type="terminal" if restricted else panel_type,
             provider=None
@@ -1359,7 +1359,7 @@ class PurpleMuxCLIClient:
 
     @staticmethod
     def _restricted_agent_command(worker: str, prompt: str) -> str:
-        """Launch an agent without a capability that can update Git refs."""
+        """Launch an agent with local Git but no remote ref capability."""
         encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         environment_options = [
             "env",
@@ -1424,6 +1424,16 @@ class PurpleMuxCLIClient:
                     "Glob",
                     "Grep",
                     "WebFetch",
+                    "Bash(git add *)",
+                    "Bash(git branch --show-current)",
+                    "Bash(git commit -m *)",
+                    "Bash(git diff *)",
+                    "Bash(git log *)",
+                    "Bash(git merge --ff-only *)",
+                    "Bash(git merge-base *)",
+                    "Bash(git rev-parse *)",
+                    "Bash(git show *)",
+                    "Bash(git status *)",
                     "Bash(gh pr view *)",
                     "Bash(gh pr edit *)",
                     "Bash(gh pr ready *)",

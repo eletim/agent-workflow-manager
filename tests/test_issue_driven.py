@@ -2893,8 +2893,8 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     )
 
     assert agents == [
-        ("codex", "Recovery agent", "preserve-git-refs"),
-        ("codex", "Recovery agent", "preserve-git-refs"),
+        ("codex", "Recovery agent", "local-git-only"),
+        ("codex", "Recovery agent", "local-git-only"),
     ]
     assert first.retry_safe and second.repaired
     assert "first" in prompts[0] and "branch: absent" in prompts[0]

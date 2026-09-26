@@ -165,7 +165,7 @@ def test_restricted_session_uses_common_turn_interface(
             worker="codex",
             cwd="/workspace/project",
             command="codex",
-            restriction="preserve-git-refs",
+            restriction="local-git-only",
         )
     )
     started: list[ShellCommandRequest] = []
@@ -243,6 +243,19 @@ def test_restricted_session_preserves_safe_remote_capabilities(
     else:
         assert "-u GH_TOKEN" not in command
         assert "-u GITHUB_TOKEN" not in command
+
+
+def test_restricted_claude_allows_only_bounded_local_git_mutations() -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command("claude", "repair locally")
+    arguments = shlex.split(command)
+    allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+
+    assert "Bash(git add *)" in allowed_tools
+    assert "Bash(git commit -m *)" in allowed_tools
+    assert "Bash(git merge --ff-only *)" in allowed_tools
+    assert not any("git push" in tool for tool in allowed_tools)
+    assert not any("git reset" in tool for tool in allowed_tools)
+    assert not any("git rebase" in tool for tool in allowed_tools)
 
 
 def test_restricted_claude_does_not_allow_pr_close_delete_branch() -> None:

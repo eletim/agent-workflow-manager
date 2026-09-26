@@ -564,11 +564,13 @@ project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrate
 unrelated state is preserved, and updates coordinate on Claude's state-file lock.
 Claude home-directory trust fails early because Claude does not persist it.
 Ordinary provider sessions do not change sandbox or approval policy. A session
-may explicitly request the `preserve-git-refs` restriction; that reusable
-profile runs turns in a managed terminal with provider-native restrictions on
-Git metadata writes and pushes. Codex recovery has no shell network or GitHub
-credentials and retains read-only remote inspection through native search;
-Claude recovery retains only an explicit allowlist of non-ref GitHub operations.
+may explicitly request the `local-git-only` restriction; that reusable profile
+runs turns in a managed terminal with local Git access but no remote Git ref
+mutation capability. Codex recovery has no shell network or GitHub credentials
+and retains read-only remote inspection through native search. Claude recovery
+has an explicit allowlist of local Git inspection, staging, commit, and
+fast-forward commands plus non-ref GitHub operations; push, reset, rebase, and
+unrestricted shell commands remain unavailable.
 AWM does not use a broad permission bypass, screen-text detection, or simulated
 trust-dialog keystrokes.
 
@@ -649,12 +651,15 @@ development branch with the remote's current branch set.
 `inspect_local_branch_heads()` provides the corresponding authoritative local
 branch set across linked worktrees. Repository recovery snapshots both sets and
 starts the recovery agent through the normal session and validated-turn APIs
-with the `preserve-git-refs` restriction. That boundary denies Git metadata
-writes and authenticated pushes. Codex retains native read-only remote search;
-Claude retains explicitly allowlisted non-ref GitHub operations. It then requires
-both ref sets to remain exact as defense in depth: recovery never repairs
-provenance by amending, rebasing, resetting, or otherwise rewriting local or
-remote-visible history.
+with the `local-git-only` restriction. That boundary denies remote Git ref
+mutation while allowing a necessary local commit or fast-forward. Codex retains
+native read-only remote search; Claude retains explicitly allowlisted local Git
+and non-ref GitHub operations. After the turn, the remote ref set and every
+unrelated local ref must remain exact. The active local branch must still
+descend from its pre-turn head; an exact advance to the snapshotted authoritative
+remote head keeps its existing provenance, while any other new commits require
+recovery provenance. Recovery therefore cannot repair provenance by amending,
+rebasing, resetting, force-pushing, or otherwise rewriting history.
 
 The inspection-aware Git operations that may mutate are:
 

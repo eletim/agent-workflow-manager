@@ -588,7 +588,7 @@ def create_agent(
     *,
     agent_type: str,
     name: str,
-    restriction: Literal["preserve-git-refs"] | None = None,
+    restriction: Literal["local-git-only"] | None = None,
 ) -> str:
     return client.create_session(
         CreateSessionRequest(
@@ -1065,7 +1065,7 @@ def recover_error(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Recovery agent",
-        restriction="preserve-git-refs",
+        restriction="local-git-only",
     )
     try:
         _, report = run_validated_turn(
