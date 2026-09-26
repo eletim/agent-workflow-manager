@@ -5,7 +5,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -85,6 +85,7 @@ class RecordingGitRunner:
         text: bool,
         timeout: float,
         check: bool,
+        env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         self.calls.append(command)
@@ -99,6 +100,7 @@ class RecordingGitRunner:
             text=text,
             timeout=timeout,
             check=check,
+            env=env,
         )
 
 
@@ -118,6 +120,7 @@ class RefRaceGitRunner(RecordingGitRunner):
         text: bool,
         timeout: float,
         check: bool,
+        env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         completed = super().__call__(
             args,
@@ -126,6 +129,7 @@ class RefRaceGitRunner(RecordingGitRunner):
             text=text,
             timeout=timeout,
             check=check,
+            env=env,
         )
         if not self.triggered and list(args[1:]) == [
             "rev-parse",
@@ -160,6 +164,7 @@ class UpdateRefRaceGitRunner(RecordingGitRunner):
         text: bool,
         timeout: float,
         check: bool,
+        env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         ref = f"refs/heads/{self.branch}"
@@ -173,6 +178,7 @@ class UpdateRefRaceGitRunner(RecordingGitRunner):
             text=text,
             timeout=timeout,
             check=check,
+            env=env,
         )
         if is_branch_update and not self.triggered and completed.returncode == 0:
             self.triggered = True

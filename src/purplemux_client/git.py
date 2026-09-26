@@ -6,7 +6,7 @@ import re
 import signal
 import subprocess
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -34,11 +34,6 @@ _AGENT_PROVENANCE_LINE_RE = re.compile(
 _AGENT_PROVENANCE_PREFIX_RE = re.compile(
     r"^(AWM-Agent|AWM-Process)(?:\s|:|=)", re.IGNORECASE
 )
-_TRAILER_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)[ \t]*:[ \t]*(.*?)[ \t]*$")
-_GIT_GENERATED_TRAILER_PREFIXES = (
-    "Signed-off-by: ",
-    "(cherry picked from commit ",
-)
 
 
 def agent_commit_coauthor(agent: str) -> str:
@@ -59,6 +54,7 @@ class GitCommandRunner(Protocol):
         text: bool,
         timeout: float,
         check: bool,
+        env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -821,36 +817,75 @@ class GitRepository:
                     f"commit {commit_sha} has ambiguous {key} provenance: {actual!r}"
                 )
 
-        patch_start = self._patch_divider_start(retained)
-        message_lines = retained[:patch_start]
-        patch_lines = retained[patch_start:]
-        preserved_trailers: list[str] = []
-        trailer_start = self._final_trailer_block_start(message_lines)
-        if patch_lines and trailer_start is not None:
-            # Pretty-format trailer atoms parse commit messages without divider
-            # semantics, so canonicalize pre-divider trailers into the final block.
-            block_body, preserved_trailers = self._partition_trailer_block(
-                message_lines[trailer_start:]
+        canonical_lines = (
+            f"Co-authored-by: {coauthor}",
+            f"AWM-Agent: {expected_agent}",
+            f"AWM-Process: {expected_process}",
+        )
+        if (
+            all(lines.count(line) == 1 for line in canonical_lines)
+            and values["awm-agent"] == [expected_agent]
+            and values["awm-process"] == [expected_process]
+            and values["co-authored-by"].count(coauthor) == 1
+        ):
+            parsed_values = self._agent_trailer_values(message)
+            if (
+                parsed_values["awm-agent"] == [expected_agent]
+                and parsed_values["awm-process"] == [expected_process]
+                and coauthor in parsed_values["co-authored-by"]
+            ):
+                return message
+
+        retained_message = "\n".join(retained) + "\n"
+        parsed_trailers = self._interpret_trailers(
+            retained_message, ["--parse"], in_place=False
+        ).splitlines()
+        trailer_tokens: dict[str, str] = {}
+        for trailer in parsed_trailers:
+            token, separator, _value = trailer.partition(":")
+            if not separator:
+                raise WorkerFailure(
+                    f"Git returned an invalid parsed trailer for commit {commit_sha}"
+                )
+            trailer_tokens.setdefault(token.lower(), token)
+
+        without_trailers = retained_message
+        if trailer_tokens:
+            removal_options = ["--trim-empty"]
+            for token in trailer_tokens.values():
+                removal_options.extend(
+                    [
+                        "--where=end",
+                        "--if-exists=replace",
+                        "--if-missing=doNothing",
+                        "--trailer",
+                        f"{token}:",
+                    ]
+                )
+            without_trailers = self._interpret_trailers(
+                retained_message, removal_options, in_place=True
             )
-            message_lines = [*message_lines[:trailer_start], *block_body]
-            message_lines.extend(patch_lines)
-            patch_lines = []
-        while message_lines and not message_lines[-1].strip():
-            message_lines.pop()
+
         trailers = [
-            *preserved_trailers,
+            *parsed_trailers,
             f"Co-authored-by: {coauthor}",
             f"AWM-Agent: {expected_agent}",
             f"AWM-Process: {expected_process}",
         ]
-        separator = (
-            "\n"
-            if self._final_trailer_block_start(message_lines) is not None
-            else "\n\n"
+        addition_options = ["--no-divider"]
+        for trailer in trailers:
+            addition_options.extend(
+                [
+                    "--where=end",
+                    "--if-exists=add",
+                    "--if-missing=add",
+                    "--trailer",
+                    trailer,
+                ]
+            )
+        normalized = self._interpret_trailers(
+            without_trailers, addition_options, in_place=True
         )
-        normalized = "\n".join(message_lines) + separator + "\n".join(trailers) + "\n"
-        if patch_lines:
-            normalized += "\n".join(patch_lines) + "\n"
         self._require_agent_message_provenance(
             normalized,
             commit_sha=commit_sha,
@@ -859,66 +894,6 @@ class GitRepository:
             coauthor=coauthor,
         )
         return normalized
-
-    @staticmethod
-    def _final_trailer_block_start(lines: Sequence[str]) -> int | None:
-        if not lines:
-            return None
-        end = len(lines)
-        while end and not lines[end - 1].strip():
-            end -= 1
-        start = end
-        while start and lines[start - 1].strip():
-            start -= 1
-        if start == 0 or end == start:
-            return None
-
-        trailer_lines = 0
-        non_trailer_lines = 0
-        recognized = False
-        current_is_trailer = False
-        for line in lines[start:end]:
-            match = _TRAILER_LINE_RE.fullmatch(line)
-            if match is not None:
-                trailer_lines += 1
-                current_is_trailer = True
-                recognized = recognized or line.startswith(
-                    _GIT_GENERATED_TRAILER_PREFIXES
-                )
-            elif line.startswith((" ", "\t")) and current_is_trailer:
-                continue
-            else:
-                non_trailer_lines += 1
-                current_is_trailer = False
-                recognized = recognized or line.startswith(
-                    _GIT_GENERATED_TRAILER_PREFIXES
-                )
-
-        if trailer_lines and not non_trailer_lines:
-            return start
-        if recognized and trailer_lines * 3 >= non_trailer_lines:
-            return start
-        return None
-
-    @staticmethod
-    def _patch_divider_start(lines: Sequence[str]) -> int:
-        for index, line in enumerate(lines):
-            if line == "---" or line.startswith("--- "):
-                return index
-        return len(lines)
-
-    @staticmethod
-    def _partition_trailer_block(lines: Sequence[str]) -> tuple[list[str], list[str]]:
-        body: list[str] = []
-        trailers: list[str] = []
-        destination = body
-        for line in lines:
-            if _TRAILER_LINE_RE.fullmatch(line) is not None:
-                destination = trailers
-            elif not line.startswith((" ", "\t")):
-                destination = body
-            destination.append(line)
-        return body, trailers
 
     def _require_agent_message_provenance(
         self,
@@ -929,23 +904,10 @@ class GitRepository:
         expected_process: str,
         coauthor: str,
     ) -> None:
-        lines = message.splitlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        start = self._final_trailer_block_start(lines)
-        trailer_values: dict[str, list[str]] = {}
-        if start is not None:
-            current_key: str | None = None
-            for line in lines[start:]:
-                match = _TRAILER_LINE_RE.fullmatch(line)
-                if match is not None:
-                    current_key = match.group(1).lower()
-                    trailer_values.setdefault(current_key, []).append(match.group(2))
-                elif current_key is not None and line.startswith((" ", "\t")):
-                    trailer_values[current_key][-1] += " " + line.strip()
-        agent = trailer_values.get("awm-agent", [])
-        process = trailer_values.get("awm-process", [])
-        coauthors = trailer_values.get("co-authored-by", [])
+        trailer_values = self._agent_trailer_values(message)
+        agent = trailer_values["awm-agent"]
+        process = trailer_values["awm-process"]
+        coauthors = trailer_values["co-authored-by"]
         if agent != [expected_agent]:
             raise WorkerFailure(
                 f"commit {commit_sha} must have exactly one "
@@ -960,6 +922,80 @@ class GitRepository:
             raise WorkerFailure(
                 f"commit {commit_sha} must attribute {coauthor} as a co-author"
             )
+
+    def _agent_trailer_values(self, message: str) -> dict[str, list[str]]:
+        trailer_values: dict[str, list[str]] = {
+            "awm-agent": [],
+            "awm-process": [],
+            "co-authored-by": [],
+        }
+        parsed = self._interpret_trailers(
+            message, ["--parse", "--no-divider"], in_place=False
+        )
+        for line in parsed.splitlines():
+            match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
+            if match is not None:
+                trailer_values[match.group(1).lower()].append(match.group(2))
+        return trailer_values
+
+    def _interpret_trailers(
+        self, message: str, options: Sequence[str], *, in_place: bool
+    ) -> str:
+        environment = dict(os.environ)
+        for key in tuple(environment):
+            if key in {
+                "GIT_COMMON_DIR",
+                "GIT_CONFIG",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+            } or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                environment.pop(key)
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "0",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            message_path = directory / "message"
+            message_path.write_text(message, encoding="utf-8", newline="")
+            args = [
+                "git",
+                "-c",
+                "trailer.separators=:",
+                "interpret-trailers",
+                *(["--in-place"] if in_place else []),
+                *options,
+                str(message_path),
+            ]
+            try:
+                completed = self._runner(
+                    args,
+                    cwd=directory,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.command_timeout_seconds,
+                    check=False,
+                    env=environment,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise WorkerFailure("Git trailer parsing timed out") from exc
+            except OSError as exc:
+                raise WorkerFailure(
+                    f"could not execute Git interpret-trailers: {exc}"
+                ) from exc
+            if completed.returncode != 0:
+                detail = (
+                    completed.stderr.strip() or completed.stdout.strip() or "no output"
+                )
+                raise WorkerFailure(f"Git interpret-trailers failed: {detail}")
+            if in_place:
+                return message_path.read_text(encoding="utf-8")
+            return completed.stdout
 
     def _write_commit_object(self, raw: str) -> str:
         with tempfile.NamedTemporaryFile(
