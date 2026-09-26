@@ -268,7 +268,7 @@ async function loadApp({
     "directory-picker-open", "directory-picker-dialog", "directory-picker-close",
     "directory-picker-parent", "directory-picker-path", "directory-picker-message",
     "directory-picker-list", "directory-picker-select",
-    "active-context", "repository-navigation", "repository-slug", "repository-link",
+    "active-context", "active-context-primary", "repository-navigation", "repository-slug", "repository-link",
     "run-family", "run-list", "delete-checked-runs",
     "runs-empty", "new-run", "run", "validate", "dry-run", "stop", "cleanup", "checked-toggle", "status", "stdout",
     "stderr", "output-copy", "exit-code", "progress", "progress-empty",
@@ -841,6 +841,47 @@ test("Issue Driven is the default draft and developer modes remain available", a
 
   assert.equal(elements["workflow-fields"].hidden, false);
   assert.equal(elements["developer-views"].open, true);
+});
+
+test("New Run and existing Runs are peer contexts with authoritative selected details", async () => {
+  const detail = snapshot({
+    runId: 7,
+    state: "failed",
+    stdout: "authoritative output",
+    mode: "issue-driven",
+    issueDrivenJson: '{"repository":"/authoritative/repository","issues":[7]}',
+    executionContext: {
+      sourceRepository: "/authoritative/repository",
+      executionRoot: "/managed/authoritative-7",
+    },
+  });
+  const {elements} = await loadApp({
+    runs: [{
+      runId: 7,
+      state: "success",
+      mode: "workflow",
+      cwd: "/stale/list-summary",
+    }],
+    details: {7: detail},
+    validation: {status: 200, body: {validation: []}},
+    selectLatest: false,
+  });
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), "true");
+  assert.match(elements["new-run"].textContent, /New Run\s+Issue Driven\s+Draft/);
+  assert.equal(runItem(elements, 7).getAttribute("aria-current"), undefined);
+  assert.equal(elements.status.textContent, "not started");
+  assert.match(elements["active-context-primary"].textContent, /Draft settings are isolated/);
+
+  await runItem(elements, 7).dispatch("click");
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), undefined);
+  assert.equal(runItem(elements, 7).getAttribute("aria-current"), "true");
+  assert.equal(elements.status.textContent, "✕ Failed");
+  assert.match(elements["active-context"].textContent, /Issue Driven Run #7/);
+  assert.match(elements["active-context-primary"].textContent, /\/authoritative\/repository/);
+  assert.equal(elements["active-context-primary"].textContent.includes("stale/list-summary"), false);
+  assert.equal(elements["issue-driven-json"].value, detail.issueDrivenJson);
 });
 
 test("saved run history stays unselected across startup reconciliation", async () => {

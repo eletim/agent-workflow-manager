@@ -46,6 +46,7 @@ const directoryPickerMessage = document.querySelector("#directory-picker-message
 const directoryPickerList = document.querySelector("#directory-picker-list");
 const directoryPickerSelect = document.querySelector("#directory-picker-select");
 const activeContext = document.querySelector("#active-context");
+const activeContextPrimary = document.querySelector("#active-context-primary");
 const repositoryNavigation = document.querySelector("#repository-navigation");
 const repositorySlug = document.querySelector("#repository-slug");
 const repositoryLink = document.querySelector("#repository-link");
@@ -458,9 +459,36 @@ function applyModeVisibility() {
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
 }
 
+function modeLabel(mode) {
+  return {
+    prompt: "Prompt",
+    "issue-driven": "Issue Driven",
+    "environment-setup": "Environment Setup",
+    review: "Review",
+    workflow: "Python Workflow",
+  }[mode] || "Python Workflow";
+}
+
+function renderNewRunContext() {
+  const selected = activeRunId === null;
+  newRunButton.className = `run-item run-context-new ${selected ? "selected" : ""}`.trim();
+  newRunButton.dataset.state = "draft";
+  newRunButton.textContent = `New Run  ${modeLabel(currentMode)}  Draft`;
+  const marker = document.createElement("span");
+  marker.className = "run-state-marker";
+  marker.setAttribute("aria-hidden", "true");
+  newRunButton.prepend(marker);
+  if (selected) newRunButton.setAttribute("aria-current", "true");
+  else newRunButton.removeAttribute("aria-current");
+}
+
 function showDraftLabel() {
-  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", review: "Review", workflow: "Python Workflow"}[currentMode];
+  const label = modeLabel(currentMode);
   activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
+  activeContextPrimary.textContent = `${label} · Draft settings are isolated from existing Runs`;
+  statusBadge.textContent = "not started";
+  statusBadge.className = "status idle";
+  renderNewRunContext();
 }
 
 // Snapshot the fields into the retained draft only when they currently *are*
@@ -679,17 +707,19 @@ function renderRun(result) {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
     }
-    const modeLabel = {
-      prompt: "Prompt",
-      "issue-driven": "Issue Driven",
-      "environment-setup": "Environment Setup",
-      review: "Review",
-      workflow: "Workflow",
-    }[currentMode];
+    const selectedModeLabel = modeLabel(currentMode);
     const resumeLabel = result.resumedFromRunId == null
       ? ""
       : ` — resumed from Run #${result.resumedFromRunId}`;
-    activeContext.textContent = `Viewing ${modeLabel} Run #${result.runId}${resumeLabel} (read-only)`;
+    activeContext.textContent = `Viewing ${selectedModeLabel} Run #${result.runId}${resumeLabel} (read-only)`;
+    const primaryLocation = currentMode === "prompt"
+      ? result.prompt?.cwd || result.cwd
+      : result.executionContext?.sourceRepository
+        || result.executionContext?.executionRoot
+        || result.cwd;
+    activeContextPrimary.textContent = primaryLocation
+      ? `${selectedModeLabel} · ${primaryLocation}`
+      : `${selectedModeLabel} · Saved backend snapshot`;
   } else if (activeRunId === null) {
     showDraftLabel();
   }
@@ -998,6 +1028,7 @@ function renderRunFamily(container, run) {
 
 function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
+  renderNewRunContext();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
   const checkedRuns = runs.filter((run) => run.checked);
@@ -1013,6 +1044,7 @@ function renderRunList(runs, cleanupOwnership = []) {
     const presentation = runPresentation(run);
     button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
+    if (run.runId === activeRunId) button.setAttribute("aria-current", "true");
     const mode = {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",

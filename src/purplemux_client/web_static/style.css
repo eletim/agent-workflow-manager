@@ -39,6 +39,12 @@ h2, label { font-size: 14px; font-weight: 650; }
 .runtime-panel[open] .runtime-heading { border-bottom: 1px solid #303746; }
 .runtime-content { padding: 0 14px 14px; }
 .runs-panel { margin-top: 14px; }
+.run-contexts {
+  margin: 0 0 14px;
+  border: 1px solid #303746;
+  border-radius: 8px;
+  background: #12161e;
+}
 .runs-heading {
   display: flex;
   align-items: center;
@@ -46,11 +52,14 @@ h2, label { font-size: 14px; font-weight: 650; }
   cursor: pointer;
   list-style: none;
 }
+.run-contexts > .runs-heading { padding: 10px 12px; }
+.run-contexts[open] > .runs-heading { border-bottom: 1px solid #303746; }
 .runs-heading::-webkit-details-marker { display: none; }
 .runs-title { font-size: 14px; font-weight: 650; }
 #runs-empty { color: #737d91; font-size: 13px; }
 .runs-toggle-hint { margin-left: auto; color: #9ba3b5; font-size: 12px; }
-.run-history-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.run-context-navigation { display: block; padding: 10px 12px 0; }
+.run-history-actions { display: flex; justify-content: flex-end; padding: 10px 12px; }
 .run-history-actions button { color: #ff9ca8; }
 .run-list {
   display: grid;
@@ -68,6 +77,11 @@ h2, label { font-size: 14px; font-weight: 650; }
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.run-context-new { width: 100%; text-align: left; }
+.run-context-new[data-state="draft"] .run-state-marker {
+  border-color: #bcaaff;
+  background: #bcaaff;
 }
 .run-check-toggle {
   grid-column: 2;
@@ -166,8 +180,15 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid #4a3b73;
+  border-radius: 8px;
+  background: #211a38;
 }
+.editor-mode-bar > div { min-width: 0; }
+.active-context { margin: 3px 0 0; font-weight: 650; }
+.active-context-primary { margin: 4px 0 0; color: #c9c0ec; font-size: 13px; overflow-wrap: anywhere; }
 .execution-navigation { margin-bottom: 14px; }
 .issue-driven-entry {
   display: grid;
@@ -689,13 +710,13 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .runs-panel { padding: 0; }
   .runs-heading { min-height: 48px; padding: 10px 12px; }
   .runs-panel[open] .runs-heading { border-bottom: 1px solid #303746; }
-  .run-history-actions { margin: 0; padding: 10px 12px 0; }
+  .run-history-actions { margin: 0; padding: 0 12px 10px; }
   .run-history-actions button { width: 100%; }
-  .run-list { max-height: 32vh; margin: 0; padding: 10px 12px; overflow-y: auto; }
+  .run-context-navigation { padding: 10px 12px; }
+  .run-list { max-height: 32vh; margin: 10px 0 0; padding: 0; overflow-y: auto; }
   .mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
   .mode-switch button, .mode-switch a { min-width: 0; padding-inline: 6px; text-align: center; }
   .editor-mode-bar { align-items: stretch; flex-direction: column; }
-  .editor-mode-bar #new-run { align-self: stretch; }
   .repository-navigation { align-items: flex-start; flex-direction: column; }
   .repository-config-heading { align-items: stretch; flex-direction: column; }
   .repository-config-grid { grid-template-columns: 1fr; }

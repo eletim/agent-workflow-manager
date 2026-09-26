@@ -17,11 +17,36 @@
         <div class="header-actions">
           <button id="guide-open">Workflow Guide</button>
           <button id="settings-open" type="button">Settings</button>
-          <span id="status" class="status idle">idle</span>
         </div>
       </header>
 
       <section class="panel editor-panel">
+        <details id="runs-panel" class="runs-panel run-contexts" open>
+          <summary class="runs-heading">
+            <span class="runs-title">Run contexts</span>
+            <span id="runs-empty">No existing runs yet.</span>
+            <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
+          </summary>
+          <nav class="run-context-navigation" aria-label="Run context">
+            <button id="new-run" class="run-item run-context-new selected" type="button" aria-current="true">
+              <span class="run-state-marker" aria-hidden="true"></span>
+              New Run  Issue Driven  Draft
+            </button>
+            <div id="run-list" class="run-list"></div>
+          </nav>
+          <div class="run-history-actions">
+            <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
+          </div>
+        </details>
+        <div class="editor-mode-bar" aria-live="polite">
+          <div>
+            <p class="eyebrow">Selected run context</p>
+            <p id="active-context" class="active-context"></p>
+            <p id="active-context-primary" class="active-context-primary"></p>
+          </div>
+          <span id="status" class="status idle">idle</span>
+          <nav id="run-family" aria-label="Run family" hidden></nav>
+        </div>
         <nav class="execution-navigation" aria-label="Workflow type">
           <button id="issue-driven-mode" class="issue-driven-entry selected" type="button" aria-pressed="true">
             <span>Issue Driven</span>
@@ -39,11 +64,6 @@
             </div>
           </details>
         </nav>
-        <div class="editor-mode-bar">
-          <p id="active-context" class="active-context"></p>
-          <nav id="run-family" aria-label="Run family" hidden></nav>
-          <button id="new-run" type="button">New run</button>
-        </div>
         <div id="repository-navigation" class="repository-navigation" hidden>
           <span>Repository: <strong id="repository-slug"></strong></span>
           <a id="repository-link" target="_blank" rel="noopener noreferrer">Open GitHub Repository</a>
@@ -182,18 +202,6 @@ emit_step("workspace create", "completed")</textarea>
       <details id="runtime-panel" class="panel runtime-panel" hidden>
         <summary class="runtime-heading">Runtime</summary>
         <div class="runtime-content">
-          <details id="runs-panel" class="panel runs-panel" open>
-            <summary class="runs-heading">
-              <span class="runs-title">Runs</span>
-              <span id="runs-empty">No runs yet.</span>
-              <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
-            </summary>
-            <div class="run-history-actions">
-              <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
-            </div>
-            <div id="run-list" class="run-list"></div>
-          </details>
-
       <section id="recovery-panel" class="panel recovery-panel" aria-live="polite" hidden>
         <h2>Recovery</h2>
         <p id="recovery-summary"></p>
