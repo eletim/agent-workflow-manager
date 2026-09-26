@@ -102,6 +102,9 @@ def keep_review_audit_in_memory(
         lambda _github, pr, **_kwargs: pr,
     )
     monkeypatch.setitem(
+        globals_, "has_design_principles", lambda _repo, _head_sha: True
+    )
+    monkeypatch.setitem(
         globals_,
         "new_review_audit",
         lambda role, round_number, verdict, reviewed_sha, _result: workflow[
@@ -1297,6 +1300,78 @@ def test_design_principles_review_prompt_has_an_independent_conformance_scope() 
     assert "Do not perform Scenario Gate" in prompt
     assert "general whole-version" in prompt
     assert "version, or README review" in prompt
+
+
+def test_whole_review_without_design_principles_keeps_other_review_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    keep_review_audit_in_memory(workflow, monkeypatch)
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha="integration-head-without-design-principles",
+    )
+    inspected_heads: list[str] = []
+    created_agents: list[str] = []
+    turns: list[str] = []
+    audit_roles: list[str] = []
+
+    class Repository:
+        pass
+
+    class GitHub:
+        def require_pr(self, **_kwargs: object) -> PullRequestState:
+            return current_pr
+
+    def has_design_principles(_repo: object, head_sha: str) -> bool:
+        inspected_heads.append(head_sha)
+        return False
+
+    def create_agent(*_args: object, **kwargs: object) -> str:
+        name = str(kwargs["name"])
+        created_agents.append(name)
+        return name
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        turns.append(str(args[2]))
+        return review_result("APPROVED")
+
+    def persist_audit(
+        _github: object, pr: PullRequestState, record: object, **_kwargs: object
+    ) -> PullRequestState:
+        audit_roles.append(str(record.role))  # type: ignore[attr-defined]
+        return pr
+
+    monkeypatch.setitem(
+        workflow_globals, "has_design_principles", has_design_principles
+    )
+    monkeypatch.setitem(workflow_globals, "create_agent", create_agent)
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(workflow_globals, "persist_review_audit", persist_audit)
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (current_pr.head_sha, False),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    _, delivery = workflow["review_whole_version"](
+        config, object(), Repository(), GitHub(), current_pr, config.issues
+    )
+
+    assert delivery.outcome == "approved"
+    assert set(inspected_heads) == {current_pr.head_sha}
+    assert "Design Principles reviewer" not in created_agents
+    assert turns == [
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ]
+    assert audit_roles == ["whole_version", "version_readme"]
 
 
 def test_version_readme_review_prompt_has_an_independent_documentation_scope() -> None:
@@ -5265,6 +5340,9 @@ def test_whole_retry_finishes_warning_after_dispositions_but_before_marker(
             return current
 
     monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(
+        globals_, "has_design_principles", lambda _repo, _head_sha: True
+    )
     monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
     monkeypatch.setitem(
         globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")

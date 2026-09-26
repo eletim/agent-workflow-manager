@@ -268,6 +268,28 @@ def open_repo(work: Path, runner: RecordingGitRunner) -> GitRepository:
     return GitRepository.open(work, expected_github_slug="acme/project", runner=runner)
 
 
+def test_has_path_at_commit_inspects_the_exact_tree(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    without_document = git(work, "rev-parse", "HEAD")
+    (work / "docs").mkdir()
+    (work / "docs" / "design-principles.md").write_text(
+        "# Design Principles\n", encoding="utf-8"
+    )
+    git(work, "add", "docs/design-principles.md")
+    git(work, "commit", "-m", "add design principles")
+    with_document = git(work, "rev-parse", "HEAD")
+
+    assert not repo.has_path_at_commit(
+        without_document, "docs/design-principles.md"
+    )
+    assert repo.has_path_at_commit(with_document, "docs/design-principles.md")
+    with pytest.raises(WorkerFailure, match="commit is not available locally"):
+        repo.has_path_at_commit("0" * 40, "docs/design-principles.md")
+
+
 def test_open_can_pin_identity_from_the_validated_github_origin(
     repositories: tuple[Path, Path, Path],
 ) -> None:

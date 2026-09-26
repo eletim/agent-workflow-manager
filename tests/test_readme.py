@@ -31,8 +31,10 @@ def test_issue_driven_overview_documents_optional_scenario_gate() -> None:
 
 def test_whole_review_documents_dedicated_design_principles_conformance() -> None:
     assert "dedicated Design Principles reviewer" in README
+    assert "exists at the exact integration head" in README
     assert "`docs/design-principles.md` from the exact integration head" in README
     assert "reviews solely\nfor conformance" in README
+    assert "does\nnot request creation or restoration" in README
     assert "bounded whole-review loop" in README
 
 
