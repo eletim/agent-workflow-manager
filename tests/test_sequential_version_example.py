@@ -180,7 +180,7 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
-def test_prepare_issue_normalizes_recovered_commit_before_unchanged_turn() -> None:
+def test_prepare_issue_preserves_recovered_processes_before_unchanged_turn() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     issue = workflow["Issue"](217, "feature/issue-217")
     config = workflow["Config"](
@@ -207,7 +207,7 @@ def test_prepare_issue_normalizes_recovered_commit_before_unchanged_turn() -> No
                 reused_existing_work=True,
             )
 
-        def normalize_agent_commit_provenance(
+        def normalize_agent_declared_commit_provenance(
             self, branch: str, start: str, end: str, **kwargs: object
         ) -> BranchState:
             events.append("normalize")
@@ -216,15 +216,23 @@ def test_prepare_issue_normalizes_recovered_commit_before_unchanged_turn() -> No
                 "base",
                 "raw-agent-commit",
             )
-            assert kwargs["expected_process"] == "implementation"
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
             return BranchState(branch, "normalized-agent-commit", None, True)
 
-        def require_agent_commit_provenance(
+        def require_agent_commit_declared_provenance(
             self, start: str, end: str, **kwargs: object
         ) -> None:
             events.append("verify")
             assert (start, end) == ("base", "normalized-agent-commit")
-            assert kwargs["expected_process"] == "implementation"
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
 
     class GitHub:
         def find_pr(self, **kwargs: object) -> None:

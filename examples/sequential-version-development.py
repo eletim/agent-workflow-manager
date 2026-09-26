@@ -2677,19 +2677,20 @@ def prepare_issue(
         published_ancestor = feature.remote_sha or integration.remote_sha
         if reused_existing_work and feature.local_sha != published_ancestor:
             assert feature.local_sha is not None
-            feature = repo.normalize_agent_commit_provenance(
+            allowed_processes = ("implementation", "reviewer-fix", "cleanup")
+            feature = repo.normalize_agent_declared_commit_provenance(
                 issue.branch,
                 published_ancestor,
                 feature.local_sha,
                 expected_agent=IMPLEMENTER_AGENT,
-                expected_process="implementation",
+                allowed_processes=allowed_processes,
             )
             assert feature.local_sha is not None
-            repo.require_agent_commit_provenance(
+            repo.require_agent_commit_declared_provenance(
                 published_ancestor,
                 feature.local_sha,
                 expected_agent=IMPLEMENTER_AGENT,
-                expected_process="implementation",
+                allowed_processes=allowed_processes,
             )
     else:
         feature = repo.synchronize_branch(

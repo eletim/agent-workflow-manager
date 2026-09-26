@@ -723,6 +723,80 @@ def test_normalize_unpublished_agent_provenance(
 
 
 @pytest.mark.parametrize(
+    "processes",
+    [("cleanup",), ("implementation", "cleanup")],
+    ids=("cleanup", "mixed-process"),
+)
+def test_normalize_recovered_provenance_preserves_declared_processes(
+    repositories: tuple[Path, Path, Path],
+    processes: tuple[str, ...],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/normalize-declared-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    for process in processes:
+        git(
+            work,
+            "commit",
+            "--allow-empty",
+            "-m",
+            process,
+            "-m",
+            f"AWM-Process: {process}",
+        )
+    recovered = git(work, "rev-parse", "HEAD")
+
+    normalized = repo.normalize_agent_declared_commit_provenance(
+        branch,
+        base,
+        recovered,
+        expected_agent="codex",
+        allowed_processes=("implementation", "reviewer-fix", "cleanup"),
+    )
+
+    assert normalized.local_sha is not None
+    assert normalized.local_sha != recovered
+    normalized_commits = git(
+        work, "rev-list", "--reverse", f"{base}..{normalized.local_sha}"
+    ).splitlines()
+    assert len(normalized_commits) == len(processes)
+    previous = base
+    for commit_sha, process in zip(normalized_commits, processes, strict=True):
+        repo.require_agent_commit_provenance(
+            previous,
+            commit_sha,
+            expected_agent="codex",
+            expected_process=process,
+        )
+        previous = commit_sha
+
+
+def test_normalize_declared_provenance_rejects_missing_process_boundary(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/missing-declared-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "undeclared cleanup")
+    cleanup = git(work, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkerFailure, match="exactly one allowed AWM-Process"):
+        repo.normalize_agent_declared_commit_provenance(
+            branch,
+            base,
+            cleanup,
+            expected_agent="codex",
+            allowed_processes=("implementation", "reviewer-fix", "cleanup"),
+        )
+
+    assert git(work, "rev-parse", "HEAD") == cleanup
+
+
+@pytest.mark.parametrize(
     ("message", "expected"),
     [
         (
