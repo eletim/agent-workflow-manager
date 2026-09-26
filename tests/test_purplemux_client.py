@@ -155,6 +155,427 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
+@pytest.mark.parametrize("restriction", ["local-git-only", "publication-disabled"])
+def test_restricted_session_uses_common_turn_interface(
+    monkeypatch: pytest.MonkeyPatch,
+    restriction: str,
+) -> None:
+    runner = FakeRunner([completed({"tabId": "tab-restricted"})])
+    cli = client(runner)
+    session = cli.create_session(
+        CreateSessionRequest(
+            worker="codex",
+            cwd="/workspace/project",
+            command="codex",
+            restriction=restriction,  # type: ignore[arg-type]
+        )
+    )
+    started: list[ShellCommandRequest] = []
+    waited: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        cli,
+        "_status",
+        lambda tab: {"panelType": "terminal", "alive": True},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_start_shell_run",
+        lambda tab, request, cwd: started.append(request),
+    )
+    monkeypatch.setattr(
+        cli,
+        "wait_for_shell_completion",
+        lambda tab, timeout: waited.append((tab, timeout)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "read_shell_result",
+        lambda tab: client_module.ShellResult(0, stdout="validated output\n"),
+    )
+
+    cli.wait_until_ready(session, 10)
+    cli.send_input(session, "inspect and repair")
+    cli.wait_for_turn_completion(session, 20)
+
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    assert create[-1] == "terminal"
+    assert len(started) == 1
+    assert "inspect and repair" not in started[0].command
+    assert waited == [(session, 20)]
+    assert cli.read_result(session) == "validated output"
+
+
+@pytest.mark.parametrize(
+    ("worker", "required"),
+    [
+        (
+            "codex",
+            (
+                "--sandbox workspace-write",
+                "network_access=false",
+                "exclude_tmpdir_env_var=true",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_TERMINAL_PROMPT=0",
+                "--search",
+            ),
+        ),
+        (
+            "claude",
+            (
+                "--restricted",
+                "--permission-prompts none",
+                "Bash(gh pr edit *)",
+                "Bash(gh issue edit *)",
+            ),
+        ),
+    ],
+)
+def test_restricted_session_preserves_safe_remote_capabilities(
+    worker: str, required: tuple[str, ...]
+) -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command(worker, "inspect safely")
+
+    assert all(value in command for value in required)
+    assert "GIT_SSH_COMMAND=false" in command
+    if worker == "codex":
+        assert "-u GH_TOKEN" in command
+        assert "-u GITHUB_TOKEN" in command
+        assert "GH_CONFIG_DIR=/dev/null" in command
+        assert command.index("--ask-for-approval never") < command.index(" exec ")
+    else:
+        assert "-u GH_TOKEN" not in command
+        assert "-u GITHUB_TOKEN" not in command
+
+
+def test_restricted_claude_allows_only_bounded_local_git_mutations() -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command("claude", "repair locally")
+    arguments = shlex.split(command)
+    allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+
+    assert "Bash(git add *)" in allowed_tools
+    assert "Bash(git commit -m *)" in allowed_tools
+    assert "Bash(git merge --ff-only *)" in allowed_tools
+    assert not any("git push" in tool for tool in allowed_tools)
+    assert not any("git reset" in tool for tool in allowed_tools)
+    assert not any("git rebase" in tool for tool in allowed_tools)
+
+
+def test_restricted_claude_does_not_allow_pr_close_delete_branch() -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command(
+        "claude", "Run gh pr close 123 --delete-branch"
+    )
+    arguments = shlex.split(command)
+    allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+
+    assert "Bash(gh pr close *)" not in allowed_tools
+    assert not any(tool.startswith("Bash(gh pr close") for tool in allowed_tools)
+    assert "Bash(gh pr edit *)" in allowed_tools
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        "gh api --method PATCH repos/acme/project/git/refs/heads/main",
+        "git push --force https://x-access-token:${GH_TOKEN}@github.com/acme/project.git",
+    ],
+)
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
+    attempt: str, worker: str, tmp_path: Path
+) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    fake_worker = tmp_path / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"${GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|\""
+        "\"${GH_CONFIG_DIR-unset}|$*\"\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(worker, attempt)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "GH_TOKEN": "push-capable-gh-token",
+            "GITHUB_TOKEN": "push-capable-github-token",
+        }
+    )
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert attempt not in command
+    assert "-u GH_TOKEN" in command
+    assert "-u GITHUB_TOKEN" in command
+    assert 'GH_CONFIG_DIR="$awm_delivery_hooks/gh"' in command
+    token, github_token, config_dir, arguments = result.stdout.strip().split("|", 3)
+    assert token == github_token == "unset"
+    assert config_dir.endswith("/gh")
+    if worker == "codex":
+        assert "sandbox_workspace_write.network_access=false" in arguments
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_agent_retains_development_tools(worker: str) -> None:
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        worker, "run the project tests, lint, formatter, and build"
+    )
+
+    assert "GIT_SSH_COMMAND=false" in command
+    assert "pre-push" in command
+    if worker == "codex":
+        assert "--sandbox workspace-write" in command
+        assert "--ask-for-approval never" in command
+    else:
+        arguments = shlex.split(command)
+        allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+        assert "Bash" in allowed_tools
+        assert not any(tool.startswith("Bash(") for tool in allowed_tools)
+
+
+def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        "claude", "run tests"
+    )
+    arguments = shlex.split(command)
+    settings = json.loads(arguments[arguments.index("--settings") + 1])
+
+    assert settings["sandbox"]["enabled"] is True
+    assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+    assert settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["network"]["allowedDomains"] == []
+    assert settings["sandbox"]["network"]["strictAllowlist"] is True
+    assert settings["sandbox"]["network"]["deniedDomains"] == [
+        "github.com",
+        "*.github.com",
+    ]
+    assert {entry["name"] for entry in settings["sandbox"]["credentials"]["envVars"]} == {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    }
+    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1" in command
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_allows_commits_in_nested_repository(
+    worker: str, tmp_path: Path
+) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    fake_worker = tmp_path / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        'nested=$(mktemp -d "${PWD%/*}/nested-repository.XXXXXX")\n'
+        "git -C \"$nested\" init -b main >/dev/null 2>&1\n"
+        "git -C \"$nested\" config user.name Test\n"
+        "git -C \"$nested\" config user.email test@example.com\n"
+        "git -C \"$nested\" commit --allow-empty -m nested >/dev/null 2>&1\n"
+        "printf '%s|%s\\n' \"$?\" \"$nested\"\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "run tests"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    commit_status, nested_path = result.stdout.strip().split("|", 1)
+    assert commit_status == "0"
+    assert subprocess.run(
+        ["git", "-C", nested_path, "log", "-1", "--format=%s"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "nested"
+
+
+def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_tags(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m advance >/dev/null 2>&1\n"
+        "advance=$?\n"
+        "git commit --amend --allow-empty -m rewrite >/dev/null 2>&1\n"
+        "amend=$?\n"
+        "git tag forbidden >/dev/null 2>&1\n"
+        "tag=$?\n"
+        "printf '%s %s %s\\n' \"$advance\" \"$amend\" \"$tag\"\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._restricted_agent_command("codex", "repair safely"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    advance_status, amend_status, tag_status = result.stdout.strip().split()
+    assert advance_status == "0"
+    assert amend_status != "0"
+    assert tag_status != "0"
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "merge-base", "--is-ancestor", base, "HEAD"],
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "tag", "--list", "forbidden"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_restricted_git_boundary_allows_fast_forward_merge(
+    provider: str, tmp_path: Path
+) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "switch", "-c", "authoritative"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "authoritative advance",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    authoritative = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "switch", "main"],
+        check=True,
+        capture_output=True,
+    )
+    fake_provider = tmp_path / provider
+    fake_provider.write_text(
+        "#!/bin/sh\n"
+        "git merge --ff-only authoritative >/dev/null 2>&1\n"
+        "printf '%s\\n' \"$?\"\n",
+        encoding="utf-8",
+    )
+    fake_provider.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._restricted_agent_command(provider, "adopt remote head"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "0"
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == authoritative
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "ORIG_HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+
+
 def test_session_deadline_only_limits_tab_create_command() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
     cli = client(runner, command_timeout_seconds=30)

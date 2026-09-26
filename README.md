@@ -349,8 +349,24 @@ by the UI or a second runtime.
 Plain Python workflows can enforce repository and pull-request structure through
 `GitRepository` and `GitHubRepository`. These validated handles recheck repository
 identity on every public operation, keep read-named methods mutation-free, and only
-permit branch creation/tracking/switching and fast-forward Git changes. They never
-reset, rebase, force-push, delete branches, stash changes, or resolve conflicts.
+permit branch creation/tracking/switching and fast-forward Git changes during ordinary
+topology operations. Provenance normalization is one narrow exception: it may rewrite
+only the linear, unpublished commit range created by the current agent turn. Before
+rewriting, it enumerates all
+authoritative remote refs (including tags), fetches missing referenced history, and
+refuses any commit already remote-visible; it also restores the original local head
+if a remote-ref race is detected. Ordinary operations never rebase, force-push, delete
+branches, stash changes, or resolve conflicts. A second tightly scoped exception is
+rejected-recovery rollback: it may hard-reset the active branch, restore deleted or
+changed non-active refs, and delete refs created without authorization, solely to
+reproduce the captured pre-recovery ref snapshot. Multi-ref rollback is atomic and
+refuses unsupported symbolic-ref restoration before mutation. The hard reset runs only
+when both the captured pre-recovery worktree and the rejected result are clean.
+Recovery refuses to start over staged or unstaged changes.
+Restricted recovery sessions also install a temporary Git ref-transaction boundary:
+only a fast-forward of the active branch is accepted, pushes and unrelated ref updates
+are rejected, and any detected non-active local ref mutation is CAS-restored before
+the recovery failure is returned.
 
 ```python
 from purplemux_client import (
@@ -376,28 +392,55 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told
-# to commit, push, create or update one exact Draft PR, and leave a clean
-# worktree. The Workflow independently verifies each delivery postcondition.
+# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told to
+# leave clean local commits. The Workflow owns normalization, verification,
+# publication, and exact Draft-PR management.
 turn_start_sha = feature.local_sha
 # ... run the CodingAgent ...
+feature = repo.require_current_branch("feature/issue-123")
+assert feature.local_sha is not None
+feature = repo.normalize_agent_commit_provenance(
+    "feature/issue-123",
+    turn_start_sha,
+    feature.local_sha,
+    expected_agent="codex",
+    expected_process="implementation",
+)
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
     expected_agent="codex",
     expected_process="implementation",
 )
-# Push is also orchestration-owned gap absorption if the agent omitted it. This
-# only creates the exact remote branch or fast-forwards it; remote-ahead or
-# diverged states fail closed.
+# Only after normalization and verification does orchestration publish the exact
+# commit. This only creates the remote branch or fast-forwards it; remote-ahead
+# or diverged states fail closed.
 feature = repo.ensure_pushed(
     "feature/issue-123",
     expected_local_sha=feature.local_sha,
 )
+pull_request = github.find_pr(
+    head="feature/issue-123",
+    base="dev/v1.2.3",
+    state="OPEN",
+)
+if pull_request is None:
+    pull_request = github.create_draft_pr(
+        head="feature/issue-123",
+        base="dev/v1.2.3",
+        expected_head_sha=feature.remote_sha,
+        expected_base_sha=context.base_sha,
+        title="Issue #123",
+        body="Implements Issue #123.",
+        correlation_id="issue-123-pr",
+    )
 pull_request = github.require_pr(
+    number=pull_request.number,
     head="feature/issue-123",
     base="dev/v1.2.3",
     expected_head_sha=feature.remote_sha,
+    expected_base_sha=context.base_sha,
+    draft=True,
 )
 ```
 
@@ -405,21 +448,29 @@ When a workflow does not already know the repository slug, omitting
 `expected_github_slug` derives and pins it from the validated GitHub origin. The
 origin is still rechecked on every topology operation.
 
-The Workflow similarly creates or reuses the exact Draft PR when the agent did
-not create one, then verifies its head, base, SHAs, and Draft state before
-review. Each Issue first receives a Scope / Design Review of whether its diff is
+The Workflow creates or reuses the exact Draft PR, then verifies its head, base,
+SHAs, and Draft state before review. Coding Agents never publish commits or
+manage PR state. Each Issue first receives a Scope / Design Review of whether
+its diff is
 necessary, sufficient, appropriately placed, and consistent with the shared
-minimal-change principle. Only then does a separately counted Correctness Review
-check implementation quality. Scope Review uses `scope_max_reviews`, which
+minimal-change principle. Directly out-of-scope incidental changes are judged by
+their necessity, proportionality, natural responsibility placement, and the
+sufficiency of the overall solution rather than rejected merely for being
+incidental; unrelated work and unnecessary refactors remain findings. Only then
+does a separately counted Correctness Review check implementation quality. Scope
+Review uses `scope_max_reviews`, which
 defaults to three when omitted; the recommended values are six for Scope Review
 and four for the Correctness and whole-version review limit. The higher
 recommended Scope limit reserves capacity for the required rechecks after
 Correctness fixes change the head. Whole Review first applies any configured
-Scenario Gate, then runs a dedicated Design Principles reviewer, the
+Scenario Gate, then runs a dedicated Design Principles reviewer when
+`docs/design-principles.md` exists at the exact integration head, followed by the
 integration/cross-Issue Whole-version reviewer, and the independent Version /
-README reviewer on every eligible head. The Design Principles turn reads
+README reviewer on every eligible head. When applicable, the Design Principles
+turn reads
 `docs/design-principles.md` from the exact integration head and reviews solely
-for conformance with that authoritative document. Findings from the independent
+for conformance with that authoritative document. Its absence is normal and does
+not request creation or restoration. Findings from the independent
 reviews are aggregated into one fix turn, and any changed head is reviewed again
 in the same order within the bounded whole-review loop.
 Each consequential review round is also recorded in a bounded managed section
@@ -456,8 +507,11 @@ before making the PR Ready.
 
 CodingAgent prompts require every implementation, review-fix, cleanup, and
 recovery commit to retain the configured agent as a co-author and to include
-machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
-result check verifies that provenance before a branch can advance. Scripted
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The post-turn and
+delivery gate mechanically normalizes unambiguous provenance on unpublished
+commits before the clean committed-result verification allows a branch to
+advance. Conflicting provenance and commits already visible on the remote fail
+closed. Scripted
 merge commits instead record `AWM-Automation: agent-workflow-manager` and
 `AWM-Process: merge`; AWM is automation provenance, not a co-author.
 
@@ -522,6 +576,12 @@ outside the Runner falls back to one process-stable random namespace. The public
 creation that still need an explicit value. Correlations identify creation and
 reconciliation; Cleanup ownership continues to use returned concrete workspace,
 tab, and filesystem identities.
+
+When repository recovery retries the same work item within one Run, the canonical
+workflow keeps the planner, implementer, and reviewer correlations stable. Before
+recreating those sessions, it closes every uniquely matched prior tab only after
+public status and result reads prove that tab completed. An ambiguous, unrelated,
+or still-running match is retained and stops the retry.
 
 Static Validation reports Dry Run eligibility separately. Eligible trusted
 workflows declare `WORKFLOW_DRY_RUN = 1`; Dry Run executes that same Python program
@@ -611,7 +671,14 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI opens in **Issue Driven** and keeps **Prompt**,
+The trusted local Runner UI presents **New Run** and every existing **Run** as peer
+top-level contexts. Selecting a Run puts its identity, status, and primary details
+at the top of the page and renders only that Run's authoritative persisted snapshot.
+Selecting New Run restores the independently retained editable draft, so browsing
+or refreshing an existing Run cannot overwrite draft inputs and draft edits cannot
+leak into historical Run detail.
+
+New Run opens in **Issue Driven** and keeps **Prompt**,
 **Environment Setup**, **Review**, and **Python Workflow** in its developer/detail
 navigation. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain

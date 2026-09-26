@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import importlib.machinery
 import json
 import os
 import shutil
@@ -29,7 +28,6 @@ DRY_RUN_VERSION = 1
 MAX_OUTLINE_ITEMS = 100
 MAX_OUTLINE_LABEL_CHARS = 200
 DEFAULT_CHECK_TIMEOUT = 30.0
-STDLIB_MODULE_ALIASES = frozenset({"os.path"})
 
 
 @dataclass(frozen=True)
@@ -1005,29 +1003,49 @@ class WorkflowValidator:
         return tuple(value)
 
     def _module_exists(self, name: str) -> bool:
-        if name in STDLIB_MODULE_ALIASES:
-            return True
         parts = name.split(".")
         if any(not part for part in parts):
             return False
-        root = parts[0]
-        if root in sys.builtin_module_names:
-            return len(parts) == 1
-        spec = importlib.machinery.PathFinder.find_spec(
-            root, list(self._module_search_path)
-        )
-        if spec is None:
-            return len(parts) == 1 and root in sys.stdlib_module_names
-        qualified = root
-        for part in parts[1:]:
-            locations = spec.submodule_search_locations
-            if locations is None:
+        original_path = sys.path[:]
+        try:
+            sys.path[:] = self._module_search_path
+            try:
+                loaded = sys.modules.get(name)
+                if getattr(loaded, "__spec__", None) is not None:
+                    return True
+                search_path: Sequence[str] | None = None
+                for index in range(len(parts)):
+                    fullname = ".".join(parts[: index + 1])
+                    loaded = sys.modules.get(fullname)
+                    spec = getattr(loaded, "__spec__", None)
+                    if spec is None:
+                        spec = self._find_spec_without_import(fullname, search_path)
+                    if spec is None:
+                        return False
+                    if index != len(parts) - 1:
+                        locations = spec.submodule_search_locations
+                        if locations is None:
+                            return False
+                        search_path = tuple(locations)
+                return True
+            except (AttributeError, ImportError, ValueError):
                 return False
-            qualified = f"{qualified}.{part}"
-            spec = importlib.machinery.PathFinder.find_spec(qualified, list(locations))
-            if spec is None:
-                return False
-        return True
+        finally:
+            sys.path[:] = original_path
+
+    @staticmethod
+    def _find_spec_without_import(
+        fullname: str, path: Sequence[str] | None
+    ) -> object | None:
+        """Ask runtime finders directly, without importing a dotted-name parent."""
+        for finder in sys.meta_path:
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, None)
+            if spec is not None:
+                return spec
+        return None
 
     @staticmethod
     def _workflow_module_search_path() -> tuple[str, ...]:

@@ -25,6 +25,7 @@ from purplemux_client import (
     CreateWorkspaceRequest,
     GitHubRepository,
     GitRepository,
+    LocalRefState,
     MergeResult,
     MutationOutcomeUnknown,
     PullRequestState,
@@ -583,10 +584,202 @@ def create_runtime(config: Config) -> PurpleMuxCLIClient:
 
 
 def create_agent(
-    client: PurpleMuxCLIClient, config: Config, *, agent_type: str, name: str
+    client: PurpleMuxCLIClient,
+    config: Config,
+    *,
+    agent_type: str,
+    name: str,
+    restriction: Literal["local-git-only", "publication-disabled"] | None = None,
 ) -> str:
+    correlation_id = run_correlation(name)
     return client.create_session(
-        CreateSessionRequest(agent_type, str(config.repo), agent_type, name=name)
+        CreateSessionRequest(
+            agent_type,
+            str(config.repo),
+            agent_type,
+            name=name,
+            correlation_id=correlation_id,
+            restriction=restriction,
+        )
+    )
+
+
+def correlated_agent_tab_name(name: str) -> str:
+    """Return the exact display identity used by an Agent tab in this run."""
+    return PurpleMuxCLIClient.correlated_session_name(name, run_correlation(name))
+
+
+def reconcile_completed_retry_tabs(
+    client: PurpleMuxCLIClient,
+    logical_tabs: tuple[
+        tuple[
+            str,
+            str,
+            Literal["local-git-only", "publication-disabled"] | None,
+        ],
+        ...,
+    ],
+    *,
+    context: str,
+) -> None:
+    """Close only exact, completed Agent tabs that would collide on retry."""
+    expected: list[tuple[str, str, str | None]] = []
+    for logical_name, agent_type, restriction in logical_tabs:
+        normalized = agent_type.lower()
+        if normalized in {"codex", "codex-cli"}:
+            panel_type, provider = "codex-cli", "codex"
+        elif normalized in {"claude", "claude-code"}:
+            panel_type, provider = "claude-code", "claude"
+        else:
+            raise WorkerFailure(f"unsupported retry Agent type {agent_type!r}")
+        if restriction is not None:
+            panel_type, provider = "terminal", None
+        expected.append(
+            (correlated_agent_tab_name(logical_name), panel_type, provider)
+        )
+
+    current = client.list_sessions()
+    completed = []
+    for name, panel_type, provider in expected:
+        matches = [tab for tab in current if tab.name == name]
+        if not matches:
+            continue
+        if len(matches) != 1:
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} is ambiguous; refusing cleanup"
+            )
+        tab = matches[0]
+        if tab.panel_type != panel_type or tab.provider != provider:
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} has an unrelated identity; "
+                "refusing cleanup"
+            )
+        status = client.read_status(tab.id)
+        if (
+            status.get("tabId") != tab.id
+            or status.get("workspaceId") != client.workspace_id
+            or status.get("panelType") != panel_type
+            or status.get("agentProviderId") != provider
+        ):
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} status identity is uncertain"
+            )
+        try:
+            if panel_type == "terminal":
+                # Restricted agents are terminal-backed. Their managed shell result
+                # is the authoritative completion record, including failed turns.
+                client.read_shell_result(tab.id)
+            else:
+                if status.get("cliState") not in {"idle", "ready-for-review"}:
+                    raise WorkerFailure("Agent tab is not ready")
+                # A ready-looking CLI state alone does not prove completion.
+                client.read_result(tab.id)
+        except WorkerFailure as exc:
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} is not completed; refusing cleanup"
+            ) from exc
+        completed.append(tab)
+
+    for tab in completed:
+        client.close_session(tab.id, expected_state=tab)
+    if completed:
+        emit_finding(
+            "runtime",
+            f"reconciled {len(completed)} completed {context} retry tab(s)",
+            status="warning",
+        )
+
+
+def reconcile_work_item_retry_tabs(client: PurpleMuxCLIClient, issue: Issue) -> None:
+    reconcile_completed_retry_tabs(
+        client,
+        (
+            (
+                f"{issue.label} implementer",
+                IMPLEMENTER_AGENT,
+                "publication-disabled",
+            ),
+            (f"{issue.label} scope reviewer", REVIEWER_AGENT, None),
+            (f"{issue.label} correctness reviewer", REVIEWER_AGENT, None),
+        ),
+        context=issue.label,
+    )
+
+
+def reconcile_planner_retry_tab(client: PurpleMuxCLIClient) -> None:
+    reconcile_completed_retry_tabs(
+        client,
+        (("Work-item planner", REVIEWER_AGENT, None),),
+        context="work-item planner",
+    )
+
+
+def reconcile_whole_version_retry_tabs(
+    client: PurpleMuxCLIClient,
+    *,
+    design_principles: bool,
+) -> None:
+    logical_tabs: list[
+        tuple[
+            str,
+            str,
+            Literal["local-git-only", "publication-disabled"] | None,
+        ]
+    ] = [
+        ("Whole-version fixer", IMPLEMENTER_AGENT, "publication-disabled"),
+        ("Whole-version reviewer", REVIEWER_AGENT, None),
+        ("Version / README reviewer", REVIEWER_AGENT, None),
+    ]
+    if SCENARIOS:
+        logical_tabs.append(("Scenario Gate reviewer", REVIEWER_AGENT, None))
+    if design_principles:
+        logical_tabs.append(("Design Principles reviewer", REVIEWER_AGENT, None))
+    reconcile_completed_retry_tabs(
+        client, tuple(logical_tabs), context="whole-version review"
+    )
+
+
+def reconcile_completed_shell_retry_tab(
+    client: PurpleMuxCLIClient, logical_name: str
+) -> None:
+    """Close one exact completed managed shell that will be recreated."""
+    name = PurpleMuxCLIClient.correlated_session_name(
+        logical_name, run_correlation(logical_name)
+    )
+    matches = [tab for tab in client.list_sessions() if tab.name == name]
+    if not matches:
+        return
+    if len(matches) != 1:
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} is ambiguous; refusing cleanup"
+        )
+    tab = matches[0]
+    if tab.panel_type != "terminal" or tab.provider is not None:
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} has an unrelated identity; "
+            "refusing cleanup"
+        )
+    status = client.read_status(tab.id)
+    if (
+        status.get("tabId") != tab.id
+        or status.get("workspaceId") != client.workspace_id
+        or status.get("panelType") != "terminal"
+        or status.get("agentProviderId") is not None
+    ):
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} status identity is uncertain"
+        )
+    try:
+        client.read_shell_result(tab.id)
+    except WorkerFailure as exc:
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} is not completed; refusing cleanup"
+        ) from exc
+    client.close_session(tab.id, expected_state=tab)
+    emit_finding(
+        "runtime",
+        f"reconciled 1 completed {logical_name} retry tab(s)",
+        status="warning",
     )
 
 
@@ -674,14 +867,23 @@ def _execute_turn(
         after = repository.require_current_branch(branch)
         if after.local_sha is None:
             raise WorkerFailure(f"local branch {branch!r} disappeared")
-        repository.require_agent_commit_provenance(
+        normalized = repository.normalize_agent_commit_provenance(
+            branch,
             before_sha,
             after.local_sha,
             expected_agent=IMPLEMENTER_AGENT,
             expected_process=expected_process,
             allow_unchanged=True,
         )
-        return after.local_sha
+        assert normalized.local_sha is not None
+        repository.require_agent_commit_provenance(
+            before_sha,
+            normalized.local_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            expected_process=expected_process,
+            allow_unchanged=True,
+        )
+        return normalized.local_sha
 
     result_observed = False
     try:
@@ -1041,7 +1243,11 @@ def recover_error(
     except (AttributeError, TypeError, ValueError):
         pass
     agent = create_agent(
-        client, config, agent_type=IMPLEMENTER_AGENT, name="Recovery agent"
+        client,
+        config,
+        agent_type=IMPLEMENTER_AGENT,
+        name="Recovery agent",
+        restriction="local-git-only",
     )
     try:
         _, report = run_validated_turn(
@@ -1052,8 +1258,13 @@ def recover_error(
                 "Investigate this workflow error using the current authoritative "
                 "state below. Make only a safe, necessary repair, then re-inspect "
                 "the affected state. If the outcome is uncertain, report retry_safe "
-                "as false. Do not reset, rebase, stash, force-push, merge a work-item "
-                "PR, create unrelated PRs, discard ambiguous work, or edit "
+                "as false. Do not amend, reset, rebase, or otherwise rewrite commit "
+                "history to repair provenance. Leave every remote branch ref and "
+                "every unrelated local branch ref unchanged. The current local "
+                "branch may only advance through recovery-created commits or an "
+                "exact fast-forward to its authoritative remote head. Do not stash, "
+                "force-push, merge a work-item PR, create unrelated PRs, discard "
+                "ambiguous work, or edit "
                 "agent-workflow-manager fingerprint markers. Return exactly one JSON "
                 "object with boolean repaired and retry_safe fields and concise "
                 "single-line summary and evidence strings (at most 500 UTF-8 bytes "
@@ -1086,6 +1297,10 @@ def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
         "work-item plan.\n\n"
+        "Your delivery responsibility ends with clean local commits. Do not push, "
+        "create or update a PR, or change PR state; AWM will normalize and verify "
+        "commit provenance before it publishes the exact commit and manages the "
+        "Draft PR.\n\n"
         "Every commit you create must end with these exact Git trailers, preserving "
         "any additional trailers the agent adds:\n"
         f"Co-authored-by: {coauthor}\n"
@@ -2477,25 +2692,27 @@ existing branch {issue.branch}, based on {config.integration_branch}. Read the
 work-item requirement below. Inspect existing Git and GitHub state before editing
 because this may be a new recovery run. Implement only the requested work item and run appropriate
 project tests and checks. Commit every intended source, test, and configuration
-change, leaving none uncommitted or untracked. Push the exact feature branch
-{issue.branch} after committing. Create or update exactly one Draft PR from
-{issue.branch} to {config.integration_branch}. Finish with a clean worktree.
+change, leaving none uncommitted or untracked. Leave publication to AWM, which
+will push the exact normalized commit on {issue.branch} and create or update
+exactly one Draft PR to {config.integration_branch}. Finish with a clean worktree.
 
 {issue.requirement}
 
 Never reset, rebase, stash, force-push, merge the work-item PR, target
 {config.main_branch}, create unrelated PRs, or discard ambiguous local work.
-Return a concise summary including the commit SHA and PR number or URL when
-available.""")
+Return a concise summary including the local commit SHA.""")
     scope_review = review_context + f"""Perform only the Scope / Design Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement} Inspect the PR diff. Decide whether the changed targets,
 amount of change, and responsibility placement are necessary and sufficient for
-the work item. Check for unrelated work or unnecessary refactors, failure to reuse
-appropriate existing implementation, unnatural mixing of responsibilities to
-minimize the diff, over-generalization of meaningfully distinct behavior, and
-unnecessary violations of the existing architecture or Source of Truth. If the
-Issue identifies a policy Issue, use that version-design context; the
+the work item. Do not reject a directly out-of-scope change solely because it is
+incidental; judge its necessity and proportionality, its natural responsibility
+placement, and its contribution to overall sufficiency. Check for unrelated work
+or unnecessary refactors, failure to reuse appropriate existing
+implementation, unnatural mixing of responsibilities to minimize the diff,
+over-generalization of meaningfully distinct behavior, and unnecessary
+violations of the existing architecture or Source of Truth. If the Issue
+identifies a policy Issue, use that version-design context; the
 implementation work item remains authoritative when they conflict, and report the
 conflict as a warning. Do not focus on detailed implementation bugs in this
 phase. Do not mutate files or PR state. {REVIEWER_CHECKOUT_GUARD}
@@ -2538,6 +2755,7 @@ def prepare_issue(
     repo.require_clean()
     integration = repo.synchronize_branch(config.integration_branch)
     assert integration.remote_sha is not None
+    allowed_processes = ("implementation", "reviewer-fix", "cleanup")
     if open_pr is None:
         recovery = repo.recover_feature_branch(
             issue.branch,
@@ -2546,8 +2764,34 @@ def prepare_issue(
         )
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
+        published_ancestor = feature.remote_sha or integration.remote_sha
+        if feature.remote_sha is not None:
+            repo.require_agent_commit_declared_provenance(
+                integration.remote_sha,
+                feature.remote_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
+        if reused_existing_work and feature.local_sha != published_ancestor:
+            assert feature.local_sha is not None
+            feature = repo.normalize_agent_declared_commit_provenance(
+                issue.branch,
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
+            assert feature.local_sha is not None
+            repo.require_agent_commit_declared_provenance(
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
     else:
-        feature = repo.synchronize_branch(issue.branch)
+        feature = repo.synchronize_branch(
+            issue.branch, expected_remote_sha=open_pr.head_sha
+        )
         reused_existing_work = True
         prepared = repo.inspect_feature_preparation(
             issue.branch,
@@ -2559,6 +2803,13 @@ def prepare_issue(
                 f"existing {issue.branch} does not contain authoritative base "
                 f"{integration.remote_sha}; reconcile it before starting a new run"
             )
+        assert feature.remote_sha is not None
+        repo.require_agent_commit_declared_provenance(
+            integration.remote_sha,
+            feature.remote_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            allowed_processes=allowed_processes,
+        )
     assert feature.local_sha is not None
     emit_finding(
         "git",
@@ -2601,12 +2852,11 @@ def ensure_issue_pr(
     issue: Issue,
     config: Config,
     *,
+    expected_local_sha: str,
     expected_base_sha: str,
     reconcile_plan_owned_inline_identity: bool = False,
 ) -> PullRequestState:
-    local = repo.require_current_branch(issue.branch)
-    assert local.local_sha is not None
-    feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
+    feature = repo.ensure_pushed(issue.branch, expected_local_sha=expected_local_sha)
     assert feature.remote_sha is not None
     reconciled_pr_number: int | None = None
     if reconcile_plan_owned_inline_identity and issue.task_fingerprint is not None:
@@ -3118,6 +3368,7 @@ def process_issue(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
+    retrying: bool = False,
 ) -> PullRequestState:
     terminal_progress("WORK ITEM", issue.label, detail=issue.branch)
     if repo.inspect_worktree().dirty:
@@ -3126,6 +3377,7 @@ def process_issue(
             config,
             agent_type=IMPLEMENTER_AGENT,
             name=f"{issue.label} worktree cleanup",
+            restriction="publication-disabled",
         )
         require_clean_worktree(
             repo,
@@ -3287,11 +3539,14 @@ def process_issue(
             pr_number=existing_pr.number,
             pr_url=existing_pr.url,
         )
+    if retrying:
+        reconcile_work_item_retry_tabs(client, issue)
     implementer = create_agent(
         client,
         config,
         agent_type=IMPLEMENTER_AGENT,
         name=f"{issue.label} implementer",
+        restriction="publication-disabled",
     )
     scope_reviewer = create_agent(
         client,
@@ -3361,6 +3616,7 @@ def process_issue(
         github,
         issue,
         config,
+        expected_local_sha=implementation_sha,
         expected_base_sha=integration.remote_sha,
         reconcile_plan_owned_inline_identity=existing_pr is None,
     )
@@ -3530,15 +3786,19 @@ def planner_prompt(plan: WorkItemPlan, config: Config) -> str:
     if config.one_shot_issue is not None:
         one_shot_context = f"""This is a one-shot run sourced from GitHub Issue
 #{config.one_shot_issue}. Before deciding, read it with `gh issue view
-{config.one_shot_issue} --repo {config.slug}` and read
-`docs/design-principles.md` from the current integration branch with `git show
-{config.integration_branch}:docs/design-principles.md`. Use that document as the
-canonical source when decomposing or refining work. Manage delivery by
-decomposing the remaining work into short inline mini tasks. Each task must state
-its purpose and any non-negotiable design decision, while leaving implementation
-detail to the implementer. Do not create GitHub Issues or implement the source
-Issue as one undivided work item. Numeric Issue additions are invalid in one-shot
-mode. Do not include stdout or agent conversation logs in tasks or rationale.
+{config.one_shot_issue} --repo {config.slug}`. Use only repository context that
+exists on the current integration branch. Read `docs/design-principles.md` only
+when it exists there with `if git cat-file -e
+{config.integration_branch}:docs/design-principles.md 2>/dev/null; then git show
+{config.integration_branch}:docs/design-principles.md; fi`. Use any output as
+optional repository-specific guidance. An empty result means the file is absent:
+continue from the source Issue and existing repository context; do not add a task
+to create or restore it. Manage delivery by decomposing the remaining work into
+short inline mini tasks. Each task must state its purpose and any
+non-negotiable design decision, while leaving implementation detail to the
+implementer. Do not create GitHub Issues or implement the source Issue as one
+undivided work item. Numeric Issue additions are invalid in one-shot mode. Do not
+include stdout or agent conversation logs in tasks or rationale.
 Tasks, rationale, and skip reasons that will be published must be concise
 single-line summaries, never copied stdout, stderr, or conversation transcripts.
 
@@ -4180,6 +4440,7 @@ def process_work_items(
     github: GitHubRepository,
     plan_pr: PullRequestState | None,
     plan: WorkItemPlan,
+    retrying: bool = False,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
         plan.active = recovered_issue
@@ -4188,13 +4449,17 @@ def process_work_items(
         )
         run_outline_step(
             recovered_issue.label,
-            lambda issue=recovered_issue: process_issue(
-                issue, config, client, repo, github
+            lambda issue=recovered_issue: (
+                process_issue(issue, config, client, repo, github, True)
+                if retrying
+                else process_issue(issue, config, client, repo, github)
             ),
         )
         plan.active = None
     if plan.finalized:
         return plan.snapshot
+    if retrying:
+        reconcile_planner_retry_tab(client)
     planner = create_agent(
         client,
         config,
@@ -4257,7 +4522,11 @@ def process_work_items(
         )
         run_outline_step(
             issue.label,
-            lambda issue=issue: process_issue(issue, config, client, repo, github),
+            lambda issue=issue: (
+                process_issue(issue, config, client, repo, github, True)
+                if retrying
+                else process_issue(issue, config, client, repo, github)
+            ),
         )
         plan.active = None
         if plan_pr is None:
@@ -4266,6 +4535,7 @@ def process_work_items(
 
 
 def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
+    reconcile_completed_shell_retry_tab(client, "Final checks")
     shell = client.start_shell(
         ShellCommandRequest(config.check_command, str(config.repo), "Final checks")
     )
@@ -4371,6 +4641,11 @@ def design_principles_review_prompt(
     )
 
 
+def has_design_principles(repo: GitRepository, head_sha: str) -> bool:
+    """Check optional design guidance at the exact integration head."""
+    return repo.has_path_at_commit(head_sha, "docs/design-principles.md")
+
+
 def version_readme_review_prompt(
     pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
 ) -> str:
@@ -4398,6 +4673,7 @@ def _review_whole_version(
     github: GitHubRepository,
     pr: PullRequestState,
     work_items: tuple[Issue, ...],
+    reconcile_tabs: bool = False,
 ) -> tuple[PullRequestState, ReviewDelivery]:
     """Review, fix, and check the whole version as one outline-level phase."""
     pr = reconcile_review_audits_after_head_change(
@@ -4455,36 +4731,46 @@ def _review_whole_version(
         and latest_changed_head.fix_sha == pr.head_sha
         else None
     )
-    required_roles = {"design_principles", "whole_version", "version_readme"}
-    if SCENARIOS:
-        required_roles.add("scenario_gate")
-    latest_by_role = {
-        role: next(
-            (record for record in reversed(audits) if record.role == role), None
+    completed_warning: ReviewAuditRecord | None = None
+    if prior_limit is None:
+        design_principles_present = has_design_principles(repo, pr.head_sha)
+        required_roles = {"whole_version", "version_readme"}
+        if design_principles_present:
+            required_roles.add("design_principles")
+        if SCENARIOS:
+            required_roles.add("scenario_gate")
+        latest_by_role = {
+            role: next(
+                (record for record in reversed(audits) if record.role == role), None
+            )
+            for role in required_roles
+        }
+        complete_current_head = all(
+            record is not None
+            and record.reviewed_sha == pr.head_sha
+            and record.fix_disposition != "pending"
+            for record in latest_by_role.values()
         )
-        for role in required_roles
-    }
-    complete_current_head = all(
-        record is not None
-        and record.reviewed_sha == pr.head_sha
-        and record.fix_disposition != "pending"
-        for record in latest_by_role.values()
-    )
-    completed_warning = next(
-        (record for record in latest_by_role.values()
-         if record is not None
-         and record.fix_disposition in (
-             "review_limit_reached", "no_change_after_re_evaluation"
-         )),
-        None,
-    ) if complete_current_head else None
+        completed_warning = next(
+            (record for record in latest_by_role.values()
+             if record is not None
+             and record.fix_disposition in (
+                 "review_limit_reached", "no_change_after_re_evaluation"
+             )),
+            None,
+        ) if complete_current_head else None
     if completed_warning is not None:
         prior_limit = None
+    if reconcile_tabs:
+        reconcile_whole_version_retry_tabs(
+            client, design_principles=has_design_principles(repo, pr.head_sha)
+        )
     fixer = create_agent(
         client,
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Whole-version fixer",
+        restriction="publication-disabled",
     )
     reviewer = create_agent(
         client,
@@ -4492,12 +4778,7 @@ def _review_whole_version(
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
     )
-    design_principles_reviewer = create_agent(
-        client,
-        config,
-        agent_type=REVIEWER_AGENT,
-        name="Design Principles reviewer",
-    )
+    design_principles_reviewer: str | None = None
     version_readme_reviewer = create_agent(
         client,
         config,
@@ -4519,12 +4800,14 @@ def _review_whole_version(
         () if prior_limit is not None or completed_warning is not None
         else range(1, MAX_REVIEWS + 1)
     ):
+        design_principles_present = has_design_principles(repo, pr.head_sha)
         result: str
         resumed_records = tuple(
             record
             for record in review_audit_from_body(pr.body)
             if record.fix_disposition == "pending"
             and record.reviewed_sha == pr.head_sha
+            and (record.role != "design_principles" or design_principles_present)
         )
         review_results = [
             json.dumps(
@@ -4636,107 +4919,115 @@ def _review_whole_version(
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
-        principles_execution: list[_AgentTurnExecution] = []
-        principles_result, principles_verdict = run_validated_turn(
-            client,
-            design_principles_reviewer,
-            "Design Principles reviewer turn",
-            policy_context(
-                config,
-                scope="the design-principles conformance review",
-                structured_conflicts=True,
+        if design_principles_present:
+            if design_principles_reviewer is None:
+                design_principles_reviewer = create_agent(
+                    client,
+                    config,
+                    agent_type=REVIEWER_AGENT,
+                    name="Design Principles reviewer",
+                )
+            principles_execution: list[_AgentTurnExecution] = []
+            principles_result, principles_verdict = run_validated_turn(
+                client,
+                design_principles_reviewer,
+                "Design Principles reviewer turn",
+                policy_context(
+                    config,
+                    scope="the design-principles conformance review",
+                    structured_conflicts=True,
+                )
+                + design_principles_review_prompt(pr, config, work_items),
+                decision,
+                repository_identity=config.slug,
+                role="reviewer",
+                iteration=review_number,
+                pr=pr,
+                phase="whole-review",
+                _deferred_execution=principles_execution,
             )
-            + design_principles_review_prompt(pr, config, work_items),
-            decision,
-            repository_identity=config.slug,
-            role="reviewer",
-            iteration=review_number,
-            pr=pr,
-            phase="whole-review",
-            _deferred_execution=principles_execution,
-        )
-        review_results.append(principles_result)
-        changes_requested = (
-            changes_requested or principles_verdict == "CHANGES_REQUESTED"
-        )
-        emit_policy_conflicts(
-            principles_result, config, scope="the integrated version"
-        )
-        principles_audit = allocate_review_audit(
-            pr.body,
-            "design_principles",
-            principles_verdict,
-            pr.head_sha,
-            principles_result,
-        )
-        pr = persist_review_audit(
-            github,
-            pr,
-            principles_audit,
-            head=config.integration_branch,
-            base=config.main_branch,
-        )
-        if principles_verdict == "CHANGES_REQUESTED":
-            requested_change_audits.append(principles_audit.audit_id)
-        principles_sha, principles_reviewer_changed = require_agent_result(
-            repo,
-            client,
-            fixer,
-            config.integration_branch,
-            pr.head_sha,
-            allow_unchanged=True,
-            expected_process="cleanup",
-            iteration=review_number,
-        )
-        if principles_reviewer_changed:
-            pushed = repo.ensure_pushed(
-                config.integration_branch, expected_local_sha=principles_sha
+            review_results.append(principles_result)
+            changes_requested = (
+                changes_requested or principles_verdict == "CHANGES_REQUESTED"
             )
-            assert pushed.remote_sha is not None
-            pr = github.require_pr(
-                number=pr.number,
-                head=config.integration_branch,
-                base=config.main_branch,
-                state="OPEN",
-                expected_head_sha=pushed.remote_sha,
-                expected_base_sha=pr.base_sha,
-                draft=True,
+            emit_policy_conflicts(
+                principles_result, config, scope="the integrated version"
             )
-            pr = ensure_base_pr_policy_notes(github, pr, config)
-            pending_audits = tuple(
-                record.audit_id
-                for record in review_audit_from_body(pr.body)
-                if record.fix_disposition == "pending"
+            principles_audit = allocate_review_audit(
+                pr.body,
+                "design_principles",
+                principles_verdict,
+                pr.head_sha,
+                principles_result,
             )
-            pr = review_audit_dispositions(
+            pr = persist_review_audit(
                 github,
                 pr,
-                tuple(requested_change_audits)
-                + pending_audits
-                + (principles_audit.audit_id,),
-                "reviewer_changed_head",
+                principles_audit,
                 head=config.integration_branch,
                 base=config.main_branch,
-                fix_sha=principles_sha,
             )
-            if review_number == MAX_REVIEWS:
-                pr = persist_whole_limit_head_change(
-                    github, pr, round_number=review_number,
-                    reviewed_sha=principles_audit.reviewed_sha,
-                    head=config.integration_branch, base=config.main_branch,
+            if principles_verdict == "CHANGES_REQUESTED":
+                requested_change_audits.append(principles_audit.audit_id)
+            principles_sha, principles_reviewer_changed = require_agent_result(
+                repo,
+                client,
+                fixer,
+                config.integration_branch,
+                pr.head_sha,
+                allow_unchanged=True,
+                expected_process="cleanup",
+                iteration=review_number,
+            )
+            if principles_reviewer_changed:
+                pushed = repo.ensure_pushed(
+                    config.integration_branch, expected_local_sha=principles_sha
                 )
-            emit_finding(
-                "git",
-                "design-principles review changed the integration branch; "
-                f"approval invalidated at {principles_sha}",
-            )
+                assert pushed.remote_sha is not None
+                pr = github.require_pr(
+                    number=pr.number,
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="OPEN",
+                    expected_head_sha=pushed.remote_sha,
+                    expected_base_sha=pr.base_sha,
+                    draft=True,
+                )
+                pr = ensure_base_pr_policy_notes(github, pr, config)
+                pending_audits = tuple(
+                    record.audit_id
+                    for record in review_audit_from_body(pr.body)
+                    if record.fix_disposition == "pending"
+                )
+                pr = review_audit_dispositions(
+                    github,
+                    pr,
+                    tuple(requested_change_audits)
+                    + pending_audits
+                    + (principles_audit.audit_id,),
+                    "reviewer_changed_head",
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    fix_sha=principles_sha,
+                )
+                if review_number == MAX_REVIEWS:
+                    pr = persist_whole_limit_head_change(
+                        github, pr, round_number=review_number,
+                        reviewed_sha=principles_audit.reviewed_sha,
+                        head=config.integration_branch, base=config.main_branch,
+                    )
+                emit_finding(
+                    "git",
+                    "design-principles review changed the integration branch; "
+                    f"approval invalidated at {principles_sha}",
+                )
+                _complete_deferred_validated_turn(
+                    principles_execution, "head_changed"
+                )
+                continue
             _complete_deferred_validated_turn(
-                principles_execution, "head_changed"
+                principles_execution, principles_verdict.lower()
             )
-            continue
-        _complete_deferred_validated_turn(
-            principles_execution, principles_verdict.lower()
-        )
         whole_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,
@@ -5144,11 +5435,15 @@ def review_whole_version(
     github: GitHubRepository,
     pr: PullRequestState,
     work_items: tuple[Issue, ...],
+    retrying: bool = False,
 ) -> tuple[PullRequestState, ReviewDelivery]:
     """Repeat a whole review when its audit vanished after safe reinspection."""
     for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
         try:
-            return _review_whole_version(config, client, repo, github, pr, work_items)
+            return _review_whole_version(
+                config, client, repo, github, pr, work_items,
+                retrying or attempt > 0,
+            )
         except MissingReviewAudit:
             if attempt == MAX_REPOSITORY_RECOVERIES:
                 raise
@@ -5182,6 +5477,7 @@ def integration_delivery(
     repo: GitRepository,
     github: GitHubRepository,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
+    retrying: bool = False,
 ) -> PullRequestState | None:
     terminal_progress(
         "PREPARE",
@@ -5329,7 +5625,7 @@ def integration_delivery(
         pr, delivery = run_outline_step(
             "Whole-version review",
             lambda: review_whole_version(
-                config, client, repo, github, pr, work_items
+                config, client, repo, github, pr, work_items, retrying
             ),
         )
         pr = ensure_base_pr_policy_notes(github, pr, config)
@@ -5339,11 +5635,22 @@ def integration_delivery(
             run_final_checks(client, config)
             state = repo.inspect_worktree()
             if state.dirty and cleanup is None:
+                if retrying:
+                    reconcile_completed_retry_tabs(
+                        client,
+                        ((
+                            "Whole-version cleanup",
+                            IMPLEMENTER_AGENT,
+                            "publication-disabled",
+                        ),),
+                        context="whole-version cleanup",
+                    )
                 cleanup = create_agent(
                     client,
                     config,
                     agent_type=IMPLEMENTER_AGENT,
                     name="Whole-version cleanup",
+                    restriction="publication-disabled",
                 )
             if cleanup is None:
                 checked = repo.require_committed_result(
@@ -5700,10 +6007,19 @@ def _run_repository(
             plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
             work_items = run_outline_step(
                 "Work items",
-                lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+                lambda: process_work_items(
+                    config,
+                    client,
+                    repo,
+                    github,
+                    plan_pr,
+                    plan,
+                    recovery_attempt > 0,
+                ),
             )
             ready = integration_delivery(
-                config, work_items, client, repo, github, deferred_deliveries
+                config, work_items, client, repo, github, deferred_deliveries,
+                recovery_attempt > 0,
             )
         except Exception as exc:
             if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
@@ -5720,32 +6036,164 @@ def _run_repository(
             recovery_branch = recovery_worktree.current_branch
             if recovery_branch is None:
                 raise WorkerFailure("repository recovery requires a current branch") from exc
+            if recovery_worktree.dirty:
+                raise WorkerFailure(
+                    "repository recovery requires a clean worktree; refusing to "
+                    "risk pre-existing staged or unstaged changes"
+                ) from exc
             recovery_start = repo.inspect_branch(recovery_branch)
             if recovery_start.local_sha is None:
                 raise WorkerFailure(
                     "repository recovery requires a local branch commit"
                 ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
+            recovery_local_refs = repo.inspect_local_refs()
+            recovery_remote_refs = repo.inspect_remote_refs()
             recovery_execution: list[_AgentTurnExecution] = []
-            report = recover_error(
-                client,
-                config,
-                exc,
-                state,
-                deferred_execution=recovery_execution,
-            )
+            try:
+                report = recover_error(
+                    client,
+                    config,
+                    exc,
+                    state,
+                    deferred_execution=recovery_execution,
+                )
+            finally:
+                recovered_local_refs = repo.inspect_local_refs()
+                recovered_remote_refs = repo.inspect_remote_refs()
+                if recovered_remote_refs != recovery_remote_refs:
+                    raise WorkerFailure(
+                        "recovery changed remote refs; refusing to rewrite "
+                        "published provenance"
+                    )
+                recovery_branch_ref = f"refs/heads/{recovery_branch}"
+                recovered_branch_state = recovered_local_refs.get(recovery_branch_ref)
+                recovery_branch_start = recovery_local_refs.get(recovery_branch_ref)
+                recovery_end = (
+                    None
+                    if recovered_branch_state is None
+                    else recovered_branch_state.object_sha
+                )
+                original_other_refs = dict(recovery_local_refs)
+                recovered_other_refs = dict(recovered_local_refs)
+                original_other_refs.pop(recovery_branch_ref, None)
+                recovered_other_refs.pop(recovery_branch_ref, None)
+                restored_other_refs = recovered_other_refs != original_other_refs
+                if restored_other_refs:
+                    repo.restore_rejected_recovery_refs(
+                        recovery_local_refs,
+                        recovered_local_refs,
+                        active_ref=recovery_branch_ref,
+                    )
+                    recovered_local_refs = repo.inspect_local_refs()
+                    recovered_branch_state = recovered_local_refs.get(
+                        recovery_branch_ref
+                    )
+                    recovery_end = (
+                        None
+                        if recovered_branch_state is None
+                        else recovered_branch_state.object_sha
+                    )
+                    recovered_other_refs = dict(recovered_local_refs)
+                    recovered_other_refs.pop(recovery_branch_ref, None)
+                if recovered_other_refs != original_other_refs:
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch and "
+                        "their restoration could not be proven"
+                    )
+                if (
+                    recovery_end is None
+                    or recovery_branch_start is None
+                ):
+                    raise WorkerFailure(
+                        "recovery removed the active local branch; refusing to "
+                        "rewrite repository provenance"
+                    )
+                try:
+                    checked_recovery = repo.require_committed_result(
+                        recovery_branch,
+                        previous_sha=recovery_start.local_sha,
+                        allow_unchanged=True,
+                    )
+                except WorkerFailure as validation_error:
+                    if recovery_end != recovery_start.local_sha:
+                        repo.restore_rejected_recovery_branch(
+                            recovery_branch,
+                            original_sha=recovery_start.local_sha,
+                            rejected_sha=recovery_end,
+                        )
+                    raise WorkerFailure(
+                        "recovery changed local branch history; the original branch "
+                        "and worktree were restored"
+                    ) from validation_error
+                expected_local_refs = dict(recovery_local_refs)
+                expected_local_refs[recovery_branch_ref] = LocalRefState(
+                    recovery_end, recovery_branch_start.symbolic_target
+                )
+                if recovered_local_refs != expected_local_refs:
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch; "
+                        "refusing to rewrite repository provenance"
+                    )
+                if checked_recovery.local_sha != recovery_end:
+                    raise WorkerFailure(
+                        "recovery branch inspection disagrees with local refs"
+                    )
+                if restored_other_refs:
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch; "
+                        "the original refs were restored"
+                    )
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
                 flush=True,
             )
-            repo.require_committed_result(
-                recovery_branch,
-                previous_sha=recovery_start.local_sha,
-                allow_unchanged=True,
-                expected_agent=IMPLEMENTER_AGENT,
-                expected_process="recovery",
+            assert recovery_end is not None
+            authoritative_remote_head = recovery_remote_refs.get(
+                f"refs/heads/{recovery_branch}"
             )
+            provenance_start = recovery_start.local_sha
+            if (
+                authoritative_remote_head is not None
+                and authoritative_remote_head != recovery_start.local_sha
+            ):
+                try:
+                    repo.require_ancestor(
+                        recovery_start.local_sha, authoritative_remote_head
+                    )
+                    repo.require_contains(recovery_branch, authoritative_remote_head)
+                except WorkerFailure:
+                    pass
+                else:
+                    repo.require_agent_commit_declared_provenance(
+                        recovery_start.local_sha,
+                        authoritative_remote_head,
+                        expected_agent=IMPLEMENTER_AGENT,
+                        allowed_processes=(
+                            "implementation",
+                            "reviewer-fix",
+                            "cleanup",
+                            "recovery",
+                        ),
+                    )
+                    provenance_start = authoritative_remote_head
+            if recovery_end != provenance_start:
+                normalized_recovery = repo.normalize_agent_commit_provenance(
+                    recovery_branch,
+                    provenance_start,
+                    recovery_end,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="recovery",
+                )
+                assert normalized_recovery.local_sha is not None
+                recovery_end = normalized_recovery.local_sha
+                repo.require_agent_commit_provenance(
+                    provenance_start,
+                    recovery_end,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="recovery",
+                )
             if not report.repaired or not report.retry_safe:
                 _complete_deferred_validated_turn(
                     recovery_execution, "stop_workflow"

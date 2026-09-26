@@ -89,8 +89,40 @@ def test_guide_keeps_agent_context_role_minimal_and_decisions_durable() -> None:
 
 def test_guide_documents_agent_provenance_verification() -> None:
     guide = GUIDE.read_text(encoding="utf-8")
+    normalized = " ".join(guide.split())
 
     assert 'expected_agent="codex",\nexpected_process="implementation")' in guide
     assert "`agent_commit_coauthor()` supplies the same normalized co-author" in guide
     assert "expected_agent=None" in guide
     assert "expected_process=None" in guide
+    assert "preserves each commit's" in normalized
+    assert "declared implementation, reviewer-fix, or cleanup process" in normalized
+    assert "atomically advances every matching logical and run-private recovery ref" in normalized
+    assert "Already-published recovered ranges are verified" in normalized
+    assert "gates every existing open Draft or Ready PR" in normalized
+
+
+def test_guide_documents_bounded_local_git_recovery() -> None:
+    guide = " ".join(GUIDE.read_text(encoding="utf-8").split())
+
+    assert "`local-git-only` restriction" in guide
+    assert "no remote Git ref mutation capability" in guide
+    assert "every unrelated local ref must remain exact" in guide
+    assert "all authoritative remote refs, including tags and notes" in guide
+    assert "both the object ID and symbolic target of each local ref" in guide
+    assert "exact advance to the snapshotted authoritative remote head" in guide
+    assert "any other new commits require recovery provenance" in guide
+    assert "pre-recovery local head is an ancestor of the remote head" in guide
+    assert "commits after the remote head attributed to recovery" in guide
+    assert "both ref sets to remain exact" not in guide
+
+
+def test_guide_separates_development_and_recovery_capabilities() -> None:
+    guide = " ".join(GUIDE.read_text(encoding="utf-8").split())
+
+    assert "Normal commit-producing sessions use the `publication-disabled`" in guide
+    assert "project-specific test, build, lint, and formatting commands" in guide
+    assert "strict OS sandbox with no network domains" in guide
+    assert "ignores separate temporary or nested repositories" in guide
+    assert "Recovery uses the separate, tighter `local-git-only` restriction" in guide
+    assert "Recovery-only `local-git-only` restriction" in guide

@@ -5,13 +5,14 @@ import os
 import re
 import signal
 import subprocess
-from collections.abc import Callable, Sequence
+import tempfile
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from purplemux_client.client import WorkerFailure
+from purplemux_client.client import MutationOutcomeUnknown, WorkerFailure
 from purplemux_client.operations import (
     AuthoritativeMutationRejection,
     MutationResolution,
@@ -26,6 +27,13 @@ _AGENT_COMMIT_COAUTHORS = {
     "codex": "Codex <noreply@openai.com>",
     "claude": "Claude <noreply@anthropic.com>",
 }
+_AGENT_PROVENANCE_LINE_RE = re.compile(
+    r"^(AWM-Agent|AWM-Process|Co-authored-by):[ \t]*(.*?)[ \t]*$",
+    re.IGNORECASE,
+)
+_AGENT_PROVENANCE_PREFIX_RE = re.compile(
+    r"^(AWM-Agent|AWM-Process)(?:\s|:|=)", re.IGNORECASE
+)
 
 
 def agent_commit_coauthor(agent: str) -> str:
@@ -46,6 +54,8 @@ class GitCommandRunner(Protocol):
         text: bool,
         timeout: float,
         check: bool,
+        env: Mapping[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -63,6 +73,12 @@ class BranchState:
     local_sha: str | None
     remote_sha: str | None
     current: bool
+
+
+@dataclass(frozen=True)
+class LocalRefState:
+    object_sha: str
+    symbolic_target: str | None
 
 
 @dataclass(frozen=True)
@@ -252,6 +268,22 @@ class GitRepository:
         self._validate_branch(branch)
         return self._inspect_branch(branch)
 
+    def has_path_at_commit(self, commit_sha: str, path: str) -> bool:
+        """Return whether a repository-relative path exists at an exact commit."""
+        self._validate_identity()
+        self._validate_sha(commit_sha)
+        if (
+            not path
+            or "\0" in path
+            or path.startswith("/")
+            or any(part in ("", ".", "..") for part in path.split("/"))
+        ):
+            raise ValueError("path must be a normalized repository-relative path")
+        completed = self._command(
+            ["ls-tree", "-z", "--full-tree", commit_sha, "--", path], {0}
+        )
+        return bool(completed.stdout)
+
     def inspect_remote_branches(self, branches: Sequence[str]) -> dict[str, str | None]:
         """Resolve several remote heads authoritatively without tracking refs."""
         self._validate_identity()
@@ -304,6 +336,76 @@ class GitRepository:
             if not branch or branch in result:
                 raise WorkerFailure("ambiguous ls-remote branch enumeration result")
             result[branch] = fields[0]
+        return result
+
+    def inspect_remote_refs(self) -> dict[str, str]:
+        """Enumerate authoritative remote refs without using local tracking refs."""
+        self._validate_identity()
+        completed = self._command(
+            ["ls-remote", "--refs", self.remote],
+            {0},
+        )
+        result: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or not fields[1].startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(fields[0])
+            ):
+                raise WorkerFailure("unexpected remote ref enumeration result")
+            ref = fields[1]
+            if ref in result:
+                raise WorkerFailure("ambiguous remote ref enumeration result")
+            result[ref] = fields[0]
+        return result
+
+    def inspect_local_branch_heads(self) -> dict[str, str]:
+        """Enumerate authoritative local branch heads across every worktree."""
+        self._validate_identity()
+        output = self._read(
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]
+        )
+        prefix = "refs/heads/"
+        result: dict[str, str] = {}
+        for line in output.splitlines():
+            ref, separator, sha = line.partition(" ")
+            if (
+                not separator
+                or not ref.startswith(prefix)
+                or not _OBJECT_ID_RE.fullmatch(sha)
+            ):
+                raise WorkerFailure("unexpected local branch enumeration result")
+            branch = ref.removeprefix(prefix)
+            if not branch or branch in result:
+                raise WorkerFailure("ambiguous local branch enumeration result")
+            result[branch] = sha
+        return result
+
+    def inspect_local_refs(self) -> dict[str, LocalRefState]:
+        """Enumerate refs stored in the local repository."""
+        self._validate_identity()
+        output = self._read(
+            [
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)%00%(symref)",
+                "refs",
+            ]
+        )
+        result: dict[str, LocalRefState] = {}
+        for line in output.splitlines():
+            fields = line.split("\0")
+            if (
+                len(fields) != 3
+                or not fields[0].startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(fields[1])
+                or (fields[2] and not fields[2].startswith("refs/"))
+            ):
+                raise WorkerFailure("unexpected local ref enumeration result")
+            ref, sha, symbolic_target = fields
+            if ref in result:
+                raise WorkerFailure("ambiguous local ref enumeration result")
+            result[ref] = LocalRefState(sha, symbolic_target or None)
         return result
 
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
@@ -523,44 +625,774 @@ class GitRepository:
             ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
         )
         for commit_sha in commits.splitlines():
-            agent = self._read(
-                [
-                    "show",
-                    "-s",
-                    "--format=%(trailers:key=AWM-Agent,valueonly)",
-                    commit_sha,
-                ]
-            ).splitlines()
-            process = self._read(
-                [
-                    "show",
-                    "-s",
-                    "--format=%(trailers:key=AWM-Process,valueonly)",
-                    commit_sha,
-                ]
-            ).splitlines()
-            coauthors = self._read(
-                [
-                    "show",
-                    "-s",
-                    "--format=%(trailers:key=Co-authored-by,valueonly)",
-                    commit_sha,
-                ]
-            ).splitlines()
-            if agent != [expected_agent]:
+            raw = self._command(["cat-file", "commit", commit_sha], {0}).stdout
+            _headers, separator, message = raw.partition("\n\n")
+            if not separator:
+                raise WorkerFailure(f"commit {commit_sha} has no message boundary")
+            self._require_agent_message_provenance(
+                message,
+                commit_sha=commit_sha,
+                expected_agent=expected_agent,
+                expected_process=expected_process,
+                coauthor=coauthor,
+            )
+
+    def require_agent_commit_declared_provenance(
+        self,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        allowed_processes: Collection[str],
+    ) -> None:
+        """Verify a range while preserving each commit's declared process."""
+        self._validate_sha(previous_sha)
+        self._validate_sha(current_sha)
+        coauthor = agent_commit_coauthor(expected_agent)
+        allowed = frozenset(allowed_processes)
+        supported = {"implementation", "reviewer-fix", "cleanup", "recovery"}
+        if not allowed or not allowed <= supported:
+            raise ValueError("allowed_processes must contain supported agent processes")
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._has_commit(current_sha):
+            raise WorkerFailure(f"current commit {current_sha} is not available")
+        if not self._is_ancestor(previous_sha, current_sha):
+            raise WorkerFailure(
+                f"commit {current_sha} does not descend from pre-turn commit "
+                f"{previous_sha}"
+            )
+        commits = self._read(
+            ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
+        )
+        for commit_sha in commits.splitlines():
+            raw = self._command(["cat-file", "commit", commit_sha], {0}).stdout
+            _headers, separator, message = raw.partition("\n\n")
+            if not separator:
+                raise WorkerFailure(f"commit {commit_sha} has no message boundary")
+            processes = self._agent_trailer_values(message)["awm-process"]
+            if len(processes) != 1 or processes[0] not in allowed:
                 raise WorkerFailure(
-                    f"commit {commit_sha} must have exactly one "
-                    f"AWM-Agent trailer naming {expected_agent}"
+                    f"commit {commit_sha} must have exactly one allowed "
+                    "AWM-Process trailer"
                 )
-            if process != [expected_process]:
+            self._require_agent_message_provenance(
+                message,
+                commit_sha=commit_sha,
+                expected_agent=expected_agent,
+                expected_process=processes[0],
+                coauthor=coauthor,
+            )
+
+    def normalize_agent_commit_provenance(
+        self,
+        branch: str,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        expected_process: str,
+        allow_unchanged: bool = False,
+    ) -> BranchState:
+        """Normalize unambiguous provenance on an unpublished agent commit range."""
+        return self._normalize_agent_commit_provenance(
+            branch,
+            previous_sha,
+            current_sha,
+            expected_agent=expected_agent,
+            expected_process=expected_process,
+            allowed_processes=None,
+            allow_unchanged=allow_unchanged,
+        )
+
+    def normalize_agent_declared_commit_provenance(
+        self,
+        branch: str,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        allowed_processes: Collection[str],
+        allow_unchanged: bool = False,
+    ) -> BranchState:
+        """Normalize an unpublished range while preserving declared processes."""
+        allowed = frozenset(allowed_processes)
+        supported = {"implementation", "reviewer-fix", "cleanup", "recovery"}
+        if not allowed or not allowed <= supported:
+            raise ValueError("allowed_processes must contain supported agent processes")
+        return self._normalize_agent_commit_provenance(
+            branch,
+            previous_sha,
+            current_sha,
+            expected_agent=expected_agent,
+            expected_process=None,
+            allowed_processes=allowed,
+            allow_unchanged=allow_unchanged,
+        )
+
+    def _normalize_agent_commit_provenance(
+        self,
+        branch: str,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        expected_process: str | None,
+        allowed_processes: frozenset[str] | None,
+        allow_unchanged: bool,
+    ) -> BranchState:
+        self._validate_sha(previous_sha)
+        self._validate_sha(current_sha)
+        coauthor = agent_commit_coauthor(expected_agent)
+        if expected_process is not None and expected_process not in {
+            "implementation",
+            "reviewer-fix",
+            "cleanup",
+            "recovery",
+        }:
+            raise ValueError("expected_process is not a supported agent process")
+        if (expected_process is None) == (allowed_processes is None):
+            raise ValueError(
+                "exactly one of expected_process or allowed_processes is required"
+            )
+
+        def require_normalized(start_sha: str, end_sha: str) -> None:
+            if expected_process is not None:
+                self.require_agent_commit_provenance(
+                    start_sha,
+                    end_sha,
+                    expected_agent=expected_agent,
+                    expected_process=expected_process,
+                )
+                return
+            assert allowed_processes is not None
+            self.require_agent_commit_declared_provenance(
+                start_sha,
+                end_sha,
+                expected_agent=expected_agent,
+                allowed_processes=allowed_processes,
+            )
+
+        worktree_before = self.inspect_worktree()
+        state = self.require_current_branch(branch)
+        if state.local_sha != current_sha:
+            raise WorkerFailure(
+                f"local {branch!r} changed: expected {current_sha}, "
+                f"found {state.local_sha}"
+            )
+        if current_sha == previous_sha:
+            if allow_unchanged:
+                return state
+            raise WorkerFailure("agent turn produced no new commit")
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._is_ancestor(previous_sha, current_sha):
+            raise WorkerFailure(
+                f"commit {current_sha} does not descend from pre-turn commit "
+                f"{previous_sha}"
+            )
+        commits = self._read(
+            [
+                "rev-list",
+                "--reverse",
+                "--first-parent",
+                f"{previous_sha}..{current_sha}",
+            ]
+        ).splitlines()
+        commit_data: list[tuple[str, list[str], str, str]] = []
+        needs_normalization = False
+        expected_parent = previous_sha
+        for commit_sha in commits:
+            raw = self._command(["cat-file", "commit", commit_sha], {0}).stdout
+            headers, separator, message = raw.partition("\n\n")
+            if not separator:
+                raise WorkerFailure(f"commit {commit_sha} has no message boundary")
+            header_lines = headers.splitlines()
+            parents = [
+                line.removeprefix("parent ")
+                for line in header_lines
+                if line.startswith("parent ")
+            ]
+            if parents != [expected_parent]:
                 raise WorkerFailure(
-                    f"commit {commit_sha} must have exactly one AWM-Process "
-                    f"trailer naming {expected_process}"
+                    "refusing to normalize agent provenance across a nonlinear "
+                    f"or merge commit range at {commit_sha}"
                 )
-            if coauthor not in coauthors:
+            expected_parent = commit_sha
+            commit_process = expected_process
+            if commit_process is None:
+                assert allowed_processes is not None
+                declared = self._raw_agent_provenance_values(
+                    message, commit_sha=commit_sha
+                )["awm-process"]
+                if len(declared) != 1 or declared[0] not in allowed_processes:
+                    raise WorkerFailure(
+                        f"commit {commit_sha} must have exactly one allowed "
+                        "AWM-Process trailer before provenance normalization"
+                    )
+                commit_process = declared[0]
+            normalized = self._normalize_agent_message(
+                message,
+                commit_sha=commit_sha,
+                expected_agent=expected_agent,
+                expected_process=commit_process,
+                coauthor=coauthor,
+            )
+            commit_data.append((commit_sha, header_lines, message, normalized))
+            needs_normalization = needs_normalization or normalized != message
+
+        remote_refs_before = self.inspect_remote_refs()
+        remote_before = remote_refs_before.get(f"refs/heads/{branch}")
+        if remote_before != state.remote_sha:
+            raise WorkerFailure(
+                f"remote {branch!r} changed before provenance normalization"
+            )
+        self._fetch_missing_remote_refs(remote_refs_before)
+        published = [
+            remote_ref
+            for remote_ref, remote_sha in remote_refs_before.items()
+            if self._has_commit(remote_sha)
+            if any(self._is_ancestor(commit_sha, remote_sha) for commit_sha in commits)
+        ]
+        if published:
+            raise WorkerFailure(
+                "refusing agent provenance because the commit range "
+                "is already reachable from remote ref(s): "
+                + ", ".join(repr(remote_ref) for remote_ref in published)
+            )
+        if remote_before is not None:
+            if not self._is_ancestor(remote_before, previous_sha):
                 raise WorkerFailure(
-                    f"commit {commit_sha} must attribute {coauthor} as a co-author"
+                    "refusing to normalize agent provenance because the remote "
+                    f"{branch!r} does not precede the agent commit range"
                 )
+
+        if not needs_normalization:
+            require_normalized(previous_sha, current_sha)
+            return state
+
+        rewritten: dict[str, str] = {}
+        for commit_sha, header_lines, message, normalized in commit_data:
+            rewritten_headers = [
+                f"parent {rewritten.get(line.removeprefix('parent '), line.removeprefix('parent '))}"
+                if line.startswith("parent ")
+                else line
+                for line in header_lines
+            ]
+            parent_changed = rewritten_headers != header_lines
+            if normalized == message and not parent_changed:
+                rewritten[commit_sha] = commit_sha
+                continue
+            if any(
+                line.startswith(("gpgsig ", "gpgsig-sha256 ", "mergetag "))
+                for line in header_lines
+            ):
+                raise WorkerFailure(
+                    f"commit {commit_sha} has signed commit metadata that cannot "
+                    "be preserved while normalizing provenance"
+                )
+            rewritten_raw = "\n".join(rewritten_headers) + "\n\n" + normalized
+            rewritten[commit_sha] = self._write_commit_object(rewritten_raw)
+
+        normalized_sha = rewritten[current_sha]
+        require_normalized(previous_sha, normalized_sha)
+        checkout_branch = self._checkout_branch(branch)
+        checkout_ref = f"refs/heads/{checkout_branch}"
+        feature_refs_before = self._feature_recovery_refs(branch)
+        source_refs = tuple(
+            sorted(
+                ref for ref, object_sha in feature_refs_before.items()
+                if rewritten.get(object_sha, object_sha) != object_sha
+            )
+        )
+        if checkout_ref not in source_refs:
+            raise WorkerFailure(
+                f"active recovery ref {checkout_ref!r} changed before provenance "
+                "normalization"
+            )
+        feature_refs_normalized = {
+            ref: rewritten.get(object_sha, object_sha)
+            for ref, object_sha in feature_refs_before.items()
+        }
+
+        def ref_transaction(
+            before: Mapping[str, str], after: Mapping[str, str]
+        ) -> str:
+            commands = ["start"]
+            commands.extend(
+                f"update {ref} {after[ref]} {before[ref]}" for ref in source_refs
+            )
+            commands.extend(("prepare", "commit"))
+            return "\n".join(commands) + "\n"
+
+        def require_unchanged_preconditions() -> None:
+            current_worktree = self.inspect_worktree()
+            if current_worktree.status != worktree_before.status:
+                raise WorkerFailure("worktree changed before provenance normalization")
+            current = self.require_current_branch(branch)
+            if current.local_sha != current_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed before provenance normalization: "
+                    f"expected {current_sha}, found {current.local_sha}"
+                )
+            actual_remote_refs = self.inspect_remote_refs()
+            if actual_remote_refs != remote_refs_before:
+                raise WorkerFailure(
+                    "remote refs changed before provenance normalization"
+                )
+            if self._feature_recovery_refs(branch) != feature_refs_before:
+                raise WorkerFailure(
+                    "feature recovery refs changed before provenance normalization"
+                )
+
+        self._git_mutation(
+            ["update-ref", "--stdin"],
+            operation="normalize agent commit provenance",
+            target=branch,
+            pre_state=feature_refs_before,
+            observe=lambda: self._feature_recovery_refs(branch),
+            desired=lambda: (
+                self._feature_recovery_refs(branch) == feature_refs_normalized
+            ),
+            pre_dispatch=require_unchanged_preconditions,
+            input_text=ref_transaction(feature_refs_before, feature_refs_normalized),
+        )
+        remote_refs_after = self.inspect_remote_refs()
+        result = self.require_current_branch(branch)
+        if (
+            remote_refs_after != remote_refs_before
+            or result.remote_sha != remote_before
+        ):
+            try:
+                self._git_mutation(
+                    ["update-ref", "--stdin"],
+                    operation="restore agent commit before remote race",
+                    target=branch,
+                    pre_state=feature_refs_normalized,
+                    observe=lambda: self._feature_recovery_refs(branch),
+                    desired=lambda: (
+                        self._feature_recovery_refs(branch) == feature_refs_before
+                    ),
+                    input_text=ref_transaction(
+                        feature_refs_normalized, feature_refs_before
+                    ),
+                )
+            except WorkerFailure as exc:
+                raise MutationOutcomeUnknown(
+                    "remote branches changed during agent provenance normalization and "
+                    "restoration of the original local commit could not be proven"
+                ) from exc
+            raise WorkerFailure(
+                "remote refs changed during provenance normalization; "
+                "the original local commit was restored"
+            )
+        if result.local_sha != normalized_sha:
+            raise WorkerFailure(
+                f"agent provenance normalization postcondition failed for {branch!r}"
+            )
+        if self.inspect_worktree().status != worktree_before.status:
+            raise WorkerFailure("worktree changed during provenance normalization")
+        require_normalized(previous_sha, normalized_sha)
+        return result
+
+    def restore_rejected_recovery_branch(
+        self,
+        branch: str,
+        *,
+        original_sha: str,
+        rejected_sha: str,
+    ) -> BranchState:
+        """Restore a clean branch after recovery rewrote its captured history."""
+        self._validate_sha(original_sha)
+        self._validate_sha(rejected_sha)
+        self.require_clean()
+        state = self.require_current_branch(branch)
+        if state.local_sha != rejected_sha:
+            raise WorkerFailure(
+                f"local {branch!r} changed before recovery restoration"
+            )
+        remote_refs_before = self.inspect_remote_refs()
+
+        def require_unchanged_preconditions() -> None:
+            current = self.require_current_branch(branch)
+            if current.local_sha != rejected_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed before recovery restoration"
+                )
+            self._require_remote_refs(remote_refs_before)
+
+        self._git_mutation(
+            ["reset", "--hard", original_sha],
+            operation="restore branch after rejected recovery rewrite",
+            target=branch,
+            pre_state=rejected_sha,
+            observe=lambda: self._checkout_sha(branch),
+            desired=lambda: self._branch_matches(branch, original_sha, True),
+            pre_dispatch=require_unchanged_preconditions,
+        )
+        self._require_remote_refs(remote_refs_before)
+        self.require_clean()
+        restored = self.require_current_branch(branch)
+        if restored.local_sha != original_sha:
+            raise WorkerFailure("recovery rewrite restoration postcondition failed")
+        return restored
+
+    def restore_rejected_recovery_refs(
+        self,
+        original: Mapping[str, LocalRefState],
+        recovered: Mapping[str, LocalRefState],
+        *,
+        active_ref: str,
+    ) -> None:
+        """CAS-restore non-active refs changed by a rejected recovery turn."""
+        if not active_ref.startswith("refs/heads/"):
+            raise ValueError("active_ref must name a local branch")
+        if self.inspect_local_refs() != dict(recovered):
+            raise WorkerFailure("local refs changed before recovery ref restoration")
+        changed = sorted(
+            ref
+            for ref in set(original) | set(recovered)
+            if ref != active_ref and original.get(ref) != recovered.get(ref)
+        )
+        unsupported = [
+            ref
+            for ref in changed
+            if (
+                original.get(ref) is not None
+                and original[ref].symbolic_target is not None
+            )
+            or (
+                recovered.get(ref) is not None
+                and recovered[ref].symbolic_target is not None
+            )
+        ]
+        if unsupported:
+            raise WorkerFailure(
+                "cannot atomically restore changed symbolic recovery refs: "
+                + ", ".join(unsupported)
+            )
+        if not changed:
+            return
+
+        commands = ["start"]
+        for ref in changed:
+            before = recovered.get(ref)
+            desired_state = original.get(ref)
+            if desired_state is None:
+                assert before is not None
+                commands.append(f"delete {ref} {before.object_sha}")
+            else:
+                commands.append(
+                    f"update {ref} {desired_state.object_sha} "
+                    f"{'0' * 40 if before is None else before.object_sha}"
+                )
+        commands.extend(("prepare", "commit"))
+        desired_refs = dict(recovered)
+        for ref in changed:
+            if ref in original:
+                desired_refs[ref] = original[ref]
+            else:
+                desired_refs.pop(ref, None)
+
+        def require_recovered_refs() -> None:
+            if self.inspect_local_refs() != dict(recovered):
+                raise WorkerFailure(
+                    "local refs changed before atomic recovery ref restoration"
+                )
+
+        self._git_mutation(
+            ["update-ref", "--no-deref", "--stdin"],
+            operation="atomically restore refs changed by rejected recovery",
+            target=f"{len(changed)} local ref(s)",
+            pre_state=dict(recovered),
+            observe=self.inspect_local_refs,
+            desired=lambda: self.inspect_local_refs() == desired_refs,
+            pre_dispatch=require_recovered_refs,
+            input_text="\n".join(commands) + "\n",
+        )
+
+    def _normalize_agent_message(
+        self,
+        message: str,
+        *,
+        commit_sha: str,
+        expected_agent: str,
+        expected_process: str,
+        coauthor: str,
+    ) -> str:
+        values = self._raw_agent_provenance_values(message, commit_sha=commit_sha)
+        retained: list[str] = []
+        lines = message.splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
+            if match is None:
+                retained.append(line)
+                index += 1
+                continue
+            key = match.group(1).lower()
+            value = match.group(2)
+            end = index + 1
+            continuations: list[str] = []
+            while end < len(lines) and lines[end].startswith((" ", "\t")):
+                continuations.append(lines[end])
+                end += 1
+            unfolded = " ".join(
+                [value, *(continuation.strip() for continuation in continuations)]
+            ).strip()
+            if key == "co-authored-by" and unfolded != coauthor:
+                if value == coauthor:
+                    raise WorkerFailure(
+                        f"commit {commit_sha} has ambiguous co-authored-by provenance"
+                    )
+                retained.extend(lines[index:end])
+            index = end
+
+        for key, expected in (
+            ("awm-agent", expected_agent),
+            ("awm-process", expected_process),
+        ):
+            actual = values[key]
+            if any(value != expected for value in actual):
+                raise WorkerFailure(
+                    f"commit {commit_sha} has ambiguous {key} provenance: {actual!r}"
+                )
+
+        canonical_lines = (
+            f"Co-authored-by: {coauthor}",
+            f"AWM-Agent: {expected_agent}",
+            f"AWM-Process: {expected_process}",
+        )
+        if (
+            all(lines.count(line) == 1 for line in canonical_lines)
+            and values["awm-agent"] == [expected_agent]
+            and values["awm-process"] == [expected_process]
+            and values["co-authored-by"].count(coauthor) == 1
+        ):
+            parsed_values = self._agent_trailer_values(message)
+            if (
+                parsed_values["awm-agent"] == [expected_agent]
+                and parsed_values["awm-process"] == [expected_process]
+                and coauthor in parsed_values["co-authored-by"]
+            ):
+                return message
+
+        retained_message = "\n".join(retained) + "\n"
+        parsed_trailers = self._interpret_trailers(
+            retained_message, ["--parse"], in_place=False
+        ).splitlines()
+        trailer_tokens: list[str] = []
+        for trailer in parsed_trailers:
+            token, separator, _value = trailer.partition(":")
+            if not separator:
+                raise WorkerFailure(
+                    f"Git returned an invalid parsed trailer for commit {commit_sha}"
+                )
+            trailer_tokens.append(token)
+
+        without_trailers = retained_message
+        for token in trailer_tokens:
+            without_trailers = self._interpret_trailers(
+                without_trailers,
+                [
+                    "--trim-empty",
+                    "--where=end",
+                    "--if-exists=replace",
+                    "--if-missing=doNothing",
+                    "--trailer",
+                    f"{token}:",
+                ],
+                in_place=True,
+            )
+
+        trailers = [
+            *parsed_trailers,
+            f"Co-authored-by: {coauthor}",
+            f"AWM-Agent: {expected_agent}",
+            f"AWM-Process: {expected_process}",
+        ]
+        addition_options = ["--no-divider"]
+        for trailer in trailers:
+            addition_options.extend(
+                [
+                    "--where=end",
+                    "--if-exists=add",
+                    "--if-missing=add",
+                    "--trailer",
+                    trailer,
+                ]
+            )
+        normalized = self._interpret_trailers(
+            without_trailers, addition_options, in_place=True
+        )
+        self._require_agent_message_provenance(
+            normalized,
+            commit_sha=commit_sha,
+            expected_agent=expected_agent,
+            expected_process=expected_process,
+            coauthor=coauthor,
+        )
+        return normalized
+
+    def _raw_agent_provenance_values(
+        self, message: str, *, commit_sha: str
+    ) -> dict[str, list[str]]:
+        """Read provenance lines strictly, including lines outside Git's trailer block."""
+        values: dict[str, list[str]] = {
+            "awm-agent": [],
+            "awm-process": [],
+            "co-authored-by": [],
+        }
+        lines = message.splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
+            if match is None:
+                if _AGENT_PROVENANCE_PREFIX_RE.match(line):
+                    raise WorkerFailure(
+                        f"commit {commit_sha} has ambiguous malformed AWM provenance"
+                    )
+                index += 1
+                continue
+            end = index + 1
+            continuations: list[str] = []
+            while end < len(lines) and lines[end].startswith((" ", "\t")):
+                continuations.append(lines[end])
+                end += 1
+            value = " ".join(
+                [
+                    match.group(2),
+                    *(continuation.strip() for continuation in continuations),
+                ]
+            ).strip()
+            values[match.group(1).lower()].append(value)
+            index = end
+        return values
+
+    def _require_agent_message_provenance(
+        self,
+        message: str,
+        *,
+        commit_sha: str,
+        expected_agent: str,
+        expected_process: str,
+        coauthor: str,
+    ) -> None:
+        trailer_values = self._agent_trailer_values(message)
+        agent = trailer_values["awm-agent"]
+        process = trailer_values["awm-process"]
+        coauthors = trailer_values["co-authored-by"]
+        if agent != [expected_agent]:
+            raise WorkerFailure(
+                f"commit {commit_sha} must have exactly one "
+                f"AWM-Agent trailer naming {expected_agent}"
+            )
+        if process != [expected_process]:
+            raise WorkerFailure(
+                f"commit {commit_sha} must have exactly one AWM-Process "
+                f"trailer naming {expected_process}"
+            )
+        if coauthor not in coauthors:
+            raise WorkerFailure(
+                f"commit {commit_sha} must attribute {coauthor} as a co-author"
+            )
+
+    def _agent_trailer_values(self, message: str) -> dict[str, list[str]]:
+        trailer_values: dict[str, list[str]] = {
+            "awm-agent": [],
+            "awm-process": [],
+            "co-authored-by": [],
+        }
+        parsed = self._interpret_trailers(
+            message, ["--parse", "--no-divider"], in_place=False
+        )
+        for line in parsed.splitlines():
+            match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
+            if match is not None:
+                trailer_values[match.group(1).lower()].append(match.group(2))
+        return trailer_values
+
+    def _interpret_trailers(
+        self, message: str, options: Sequence[str], *, in_place: bool
+    ) -> str:
+        environment = dict(os.environ)
+        for key in tuple(environment):
+            if key in {
+                "GIT_COMMON_DIR",
+                "GIT_CONFIG",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+            } or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                environment.pop(key)
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "0",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            message_path = directory / "message"
+            message_path.write_text(message, encoding="utf-8", newline="")
+            args = [
+                "git",
+                "-c",
+                "trailer.separators=:",
+                "interpret-trailers",
+                *(["--in-place"] if in_place else []),
+                *options,
+                str(message_path),
+            ]
+            try:
+                completed = self._runner(
+                    args,
+                    cwd=directory,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.command_timeout_seconds,
+                    check=False,
+                    env=environment,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise WorkerFailure("Git trailer parsing timed out") from exc
+            except OSError as exc:
+                raise WorkerFailure(
+                    f"could not execute Git interpret-trailers: {exc}"
+                ) from exc
+            if completed.returncode != 0:
+                detail = (
+                    completed.stderr.strip() or completed.stdout.strip() or "no output"
+                )
+                raise WorkerFailure(f"Git interpret-trailers failed: {detail}")
+            if in_place:
+                return message_path.read_text(encoding="utf-8")
+            return completed.stdout
+
+    def _write_commit_object(self, raw: str) -> str:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", delete=False
+        ) as commit_file:
+            commit_file.write(raw)
+            commit_path = Path(commit_file.name)
+        try:
+            expected_sha = self._read(["hash-object", "-t", "commit", str(commit_path)])
+            self._validate_sha(expected_sha)
+            self._git_mutation(
+                ["hash-object", "-t", "commit", "-w", str(commit_path)],
+                operation="write normalized commit object",
+                target=expected_sha,
+                pre_state=self._has_commit(expected_sha),
+                observe=lambda: self._has_commit(expected_sha),
+                desired=lambda: self._has_commit(expected_sha),
+            )
+            return expected_sha
+        finally:
+            commit_path.unlink(missing_ok=True)
 
     def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
         """Push a clean exact local branch only when its remote is absent or behind."""
@@ -630,14 +1462,43 @@ class GitRepository:
         if not self._is_ancestor(commit_sha, state.local_sha):
             raise WorkerFailure(f"branch {branch!r} does not contain {commit_sha}")
 
-    def synchronize_branch(self, branch: str) -> BranchState:
+    def require_ancestor(self, ancestor_sha: str, descendant_sha: str) -> None:
+        self._validate_sha(ancestor_sha)
+        self._validate_sha(descendant_sha)
+        if not self._is_ancestor(ancestor_sha, descendant_sha):
+            raise WorkerFailure(
+                f"commit {ancestor_sha} is not an ancestor of {descendant_sha}"
+            )
+
+    def synchronize_branch(
+        self, branch: str, *, expected_remote_sha: str | None = None
+    ) -> BranchState:
         self._validate_identity()
         self._validate_branch(branch)
+        if expected_remote_sha is not None:
+            self._validate_sha(expected_remote_sha)
         self.require_clean()
         authoritative_sha = self._remote_sha(branch)
         if authoritative_sha is None:
             raise WorkerFailure(f"remote branch {branch!r} does not exist")
-        self._fetch_branch(branch, authoritative_sha)
+        if expected_remote_sha is not None and authoritative_sha != expected_remote_sha:
+            raise WorkerFailure(
+                f"remote branch {branch!r} changed: expected {expected_remote_sha}, "
+                f"found {authoritative_sha}"
+            )
+
+        def recheck_authoritative_ref() -> None:
+            self.require_clean()
+            actual = self._remote_sha(branch)
+            if actual != authoritative_sha:
+                raise WorkerFailure(
+                    f"remote branch {branch!r} changed during synchronization: "
+                    f"expected {authoritative_sha}, found {actual}"
+                )
+
+        self._fetch_branch(
+            branch, authoritative_sha, pre_dispatch=recheck_authoritative_ref
+        )
         state = self._inspect_branch_from_tracking(branch, authoritative_sha)
         checkout_branch = self._checkout_branch(branch)
         if state.local_sha is None:
@@ -656,6 +1517,7 @@ class GitRepository:
                     branch, authoritative_sha
                 ),
                 desired=lambda: self._branch_matches(branch, authoritative_sha, True),
+                pre_dispatch=recheck_authoritative_ref,
             )
         else:
             if state.local_sha != authoritative_sha:
@@ -679,6 +1541,7 @@ class GitRepository:
                         branch, authoritative_sha
                     ),
                     desired=lambda: self._branch_is_current(branch),
+                    pre_dispatch=recheck_authoritative_ref,
                 )
             if state.local_sha != authoritative_sha:
                 before = self._inspect_branch_from_tracking(branch, authoritative_sha)
@@ -693,9 +1556,14 @@ class GitRepository:
                     desired=lambda: self._branch_matches(
                         branch, authoritative_sha, True
                     ),
+                    pre_dispatch=recheck_authoritative_ref,
                 )
         result = self.inspect_branch(branch)
-        if not result.current or result.local_sha != authoritative_sha:
+        if (
+            not result.current
+            or result.local_sha != authoritative_sha
+            or result.remote_sha != authoritative_sha
+        ):
             raise WorkerFailure(
                 f"branch {branch!r} synchronization postcondition failed"
             )
@@ -1190,7 +2058,13 @@ class GitRepository:
         return completed.returncode == 0
 
     def _has_commit(self, sha: str) -> bool:
-        completed = self._command(["cat-file", "-e", f"{sha}^{{commit}}"], {0, 128})
+        completed = self._command(
+            ["cat-file", "-e", f"{sha}^{{commit}}"], {0, 1, 128}
+        )
+        return completed.returncode == 0
+
+    def _has_object(self, sha: str) -> bool:
+        completed = self._command(["cat-file", "-e", sha], {0, 1, 128})
         return completed.returncode == 0
 
     def _tracking_ref(self, branch: str) -> str:
@@ -1218,6 +2092,69 @@ class GitRepository:
             desired=lambda: self._tracking_sha(branch) == authoritative_sha,
             pre_dispatch=pre_dispatch,
         )
+
+    def _fetch_missing_remote_branch_heads(self, authoritative: dict[str, str]) -> None:
+        missing = {
+            branch: sha
+            for branch, sha in authoritative.items()
+            if not self._has_commit(sha)
+        }
+        if not missing:
+            return
+        before = {branch: self._tracking_sha(branch) for branch in missing}
+
+        def desired() -> bool:
+            return all(
+                self._tracking_sha(branch) == sha for branch, sha in missing.items()
+            )
+
+        self._git_mutation(
+            [
+                "fetch",
+                "--no-tags",
+                self.remote,
+                *(
+                    f"refs/heads/{branch}:{self._tracking_ref(branch)}"
+                    for branch in missing
+                ),
+            ],
+            operation="fetch remote branch heads for provenance inspection",
+            target=self.remote,
+            pre_state=before,
+            observe=lambda: {branch: self._tracking_sha(branch) for branch in missing},
+            desired=desired,
+            pre_dispatch=lambda: self._require_remote_branch_heads(authoritative),
+        )
+
+    def _fetch_missing_remote_refs(self, authoritative: dict[str, str]) -> None:
+        missing = {
+            ref: sha for ref, sha in authoritative.items() if not self._has_object(sha)
+        }
+        if not missing:
+            return
+
+        def desired() -> bool:
+            return all(self._has_object(sha) for sha in missing.values())
+
+        self._git_mutation(
+            ["fetch", "--no-tags", self.remote, *missing],
+            operation="fetch remote refs for provenance inspection",
+            target=self.remote,
+            pre_state=tuple(sorted(missing.items())),
+            observe=lambda: tuple(
+                sorted((ref, self._has_object(sha)) for ref, sha in missing.items())
+            ),
+            desired=desired,
+            pre_dispatch=lambda: self._require_remote_refs(authoritative),
+        )
+
+    def _require_remote_branch_heads(self, expected: dict[str, str]) -> None:
+        if self.inspect_remote_branch_heads() != expected:
+            raise WorkerFailure("remote branches changed during provenance inspection")
+
+    def _require_remote_refs(self, expected: dict[str, str]) -> None:
+        if self.inspect_remote_refs() != expected:
+            raise WorkerFailure("remote refs changed during provenance inspection")
 
     def _require_feature_preparation_refs(
         self,
@@ -1255,14 +2192,20 @@ class GitRepository:
         observe: Callable[[], object],
         desired: Callable[[], bool],
         pre_dispatch: Callable[[], None] | None = None,
+        input_text: str | None = None,
     ) -> None:
         def dispatch() -> None:
             if pre_dispatch is not None:
                 pre_dispatch()
             try:
                 if self._owns_process_group:
-                    completed = self._run_mutation_process_group(args)
+                    completed = self._run_mutation_process_group(
+                        args, input_text=input_text
+                    )
                 else:
+                    runner_kwargs: dict[str, Any] = {}
+                    if input_text is not None:
+                        runner_kwargs["input"] = input_text
                     completed = self._runner(
                         ["git", *args],
                         cwd=self.root,
@@ -1270,6 +2213,7 @@ class GitRepository:
                         text=True,
                         timeout=self.command_timeout_seconds,
                         check=False,
+                        **runner_kwargs,
                     )
             except _QuiescentMutationTimeout as exc:
                 raise AuthoritativeMutationRejection(
@@ -1339,10 +2283,13 @@ class GitRepository:
         )
 
     def _run_mutation_process_group(
-        self, args: Sequence[str]
+        self, args: Sequence[str], *, input_text: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         return _run_git_mutation_process_group(
-            args, cwd=self.root, timeout=self.command_timeout_seconds
+            args,
+            cwd=self.root,
+            timeout=self.command_timeout_seconds,
+            input_text=input_text,
         )
 
     @staticmethod
@@ -1464,7 +2411,11 @@ def _raise_mutation_signal(signum: int, _frame: object) -> None:
 
 
 def _run_git_mutation_process_group(
-    args: Sequence[str], *, cwd: Path, timeout: float
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a mutating Git command and quiesce its whole process group on failure."""
     command = ["git", *args]
@@ -1474,6 +2425,7 @@ def _run_git_mutation_process_group(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1481,7 +2433,7 @@ def _run_git_mutation_process_group(
         )
         try:
             GitRepository._restore_signal_mask(previous_mask)
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             GitRepository._quiesce_process_group(process, exc)
             raise _QuiescentMutationTimeout(command, timeout) from exc

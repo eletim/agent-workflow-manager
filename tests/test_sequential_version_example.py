@@ -17,6 +17,7 @@ from purplemux_client import (
     GitRepository,
     MutationOutcomeUnknown,
     PullRequestState,
+    TabState,
     WorkerFailure,
     WorkerInterrupted,
 )
@@ -101,6 +102,9 @@ def keep_review_audit_in_memory(
         lambda _github, pr, **_kwargs: pr,
     )
     monkeypatch.setitem(
+        globals_, "has_design_principles", lambda _repo, _head_sha: True
+    )
+    monkeypatch.setitem(
         globals_,
         "new_review_audit",
         lambda role, round_number, verdict, reviewed_sha, _result: workflow[
@@ -177,6 +181,815 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
     assert '"Deliver the exact Issue topology"' in source
     assert "Deliver the exact approved Issue topology" not in source
+
+
+def test_prepare_issue_preserves_recovered_processes_before_unchanged_turn() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](217, "feature/issue-217")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    events: list[str] = []
+
+    class Repository:
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, "base", "base", True)
+
+        def recover_feature_branch(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs == {
+                "base": config.integration_branch,
+                "expected_base_sha": "base",
+            }
+            return SimpleNamespace(
+                branch=BranchState(branch, "raw-agent-commit", None, True),
+                reused_existing_work=True,
+            )
+
+        def normalize_agent_declared_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            events.append("normalize")
+            assert (branch, start, end) == (
+                issue.branch,
+                "base",
+                "raw-agent-commit",
+            )
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            return BranchState(branch, "normalized-agent-commit", None, True)
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify")
+            assert (start, end) == ("base", "normalized-agent-commit")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            assert kwargs["state"] in {"OPEN", "MERGED"}
+            return None
+
+    prepared = workflow["prepare_issue"](Repository(), GitHub(), issue, config)
+
+    assert prepared == (None, "normalized-agent-commit", True)
+    assert events == ["normalize", "verify"]
+
+
+def test_pushed_recovery_without_pr_fails_provenance_before_unchanged_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](218, "feature/issue-218")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, "base", "base", True)
+
+        def recover_feature_branch(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs["expected_base_sha"] == "base"
+            return SimpleNamespace(
+                branch=BranchState(branch, "pushed", "pushed", True),
+                reused_existing_work=True,
+            )
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify-published")
+            assert (start, end) == ("base", "pushed")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            raise WorkerFailure("published commit has invalid agent provenance")
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            assert kwargs["state"] in {"OPEN", "MERGED"}
+            return None
+
+        def create_draft_pr(self, **_kwargs: object) -> None:
+            events.append("draft")
+            raise AssertionError("Draft PR mutation must not be reached")
+
+    monkeypatch.setitem(
+        globals_,
+        "create_agent",
+        lambda *_args, **_kwargs: events.append("agent") or "agent",
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent provenance"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            GitHub(),
+        )
+
+    assert events == ["verify-published"]
+
+
+@pytest.mark.parametrize("draft", [True, False], ids=("draft", "ready"))
+def test_existing_pr_fails_provenance_before_mutation_or_agent_start(
+    draft: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](219, "feature/issue-219")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    existing = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=draft),
+        head_sha="published-head",
+        base_sha="base",
+    )
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(
+            self, branch: str, **kwargs: object
+        ) -> BranchState:
+            if branch == config.integration_branch:
+                assert kwargs == {}
+                return BranchState(branch, "base", "base", True)
+            assert branch == issue.branch
+            assert kwargs == {"expected_remote_sha": "published-head"}
+            return BranchState(branch, "published-head", "published-head", True)
+
+        def inspect_feature_preparation(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs["expected_base_sha"] == "base"
+            return SimpleNamespace(base_is_ancestor=True)
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify-published")
+            assert (start, end) == ("base", "published-head")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            raise WorkerFailure("published PR head has invalid agent provenance")
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> PullRequestState | None:
+            if kwargs["state"] == "OPEN":
+                return existing
+            assert kwargs["state"] == "MERGED"
+            return None
+
+        def set_draft(self, *_args: object, **_kwargs: object) -> None:
+            events.append("redraft")
+            raise AssertionError("PR mutation must not be reached")
+
+    monkeypatch.setitem(
+        globals_,
+        "create_agent",
+        lambda *_args, **_kwargs: events.append("agent") or "agent",
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent provenance"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            GitHub(),
+        )
+
+    assert events == ["verify-published"]
+
+
+def test_same_run_retry_reconciles_all_completed_work_item_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-retry-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-retry-tabs",
+        "retry-tabs",
+        "Retry completed tabs.",
+        hashlib.sha256(b"Retry completed tabs.").hexdigest(),
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    logical_names = (
+        f"{issue.label} implementer",
+        f"{issue.label} scope reviewer",
+        f"{issue.label} correctness reviewer",
+    )
+    names = tuple(workflow["correlated_agent_tab_name"](name) for name in logical_names)
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs = {
+                f"old-{index}": TabState(
+                f"old-{index}",
+                self.workspace_id,
+                name,
+                "terminal" if index == 1 else "codex-cli",
+                None if index == 1 else "codex",
+                True,
+                None if index == 1 else "ready-for-review",
+                )
+                for index, name in enumerate(names, 1)
+            }
+            self.closed: list[str] = []
+            self.created: list[object] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert tab_id in self.tabs
+            return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            assert self.tabs[tab_id].panel_type == "terminal"
+            return SimpleNamespace(exit_code=0, stdout="completed")
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+        def create_session(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            correlation_id = request.correlation_id  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{correlation_id}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"new-{len(self.created) + 1}"
+            self.tabs[tab_id] = TabState(
+                tab_id,
+                self.workspace_id,
+                name,
+                "terminal" if request.restriction is not None else "codex-cli",
+                None if request.restriction is not None else "codex",
+                True,
+                None if request.restriction is not None else "idle",
+            )
+            self.created.append(request)
+            return tab_id
+
+    client = Client()
+    workflow["reconcile_work_item_retry_tabs"](client, issue)
+    recreated = tuple(
+        workflow["create_agent"](client, config, agent_type="codex", name=logical_name)
+        for logical_name in logical_names
+    )
+
+    assert client.closed == ["old-1", "old-2", "old-3"]
+    assert recreated == ("new-1", "new-2", "new-3")
+    assert tuple(tab.name for tab in client.tabs.values()) == names
+    assert tuple(request.correlation_id for request in client.created) == tuple(
+        workflow["run_correlation"](name) for name in logical_names
+    )
+
+
+def test_whole_version_retry_reconciles_all_completed_agent_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "whole-retry-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    logical_names = (
+        "Whole-version fixer",
+        "Whole-version reviewer",
+        "Version / README reviewer",
+        "Design Principles reviewer",
+    )
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs = {
+                f"old-{index}": TabState(
+                    f"old-{index}",
+                    self.workspace_id,
+                    workflow["correlated_agent_tab_name"](name),
+                    "terminal" if index == 1 else "codex-cli",
+                    None if index == 1 else "codex",
+                    True,
+                    None if index == 1 else "ready-for-review",
+                )
+                for index, name in enumerate(logical_names, 1)
+            }
+            self.closed: list[str] = []
+            self.created: list[object] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            return SimpleNamespace(exit_code=0, stdout="completed")
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+        def create_session(self, request: object) -> str:
+            name = f"{request.name} [awm:{request.correlation_id}]"  # type: ignore[attr-defined]
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"new-{len(self.created) + 1}"
+            self.created.append(request)
+            return tab_id
+
+    client = Client()
+    workflow["reconcile_whole_version_retry_tabs"](
+        client, design_principles=True
+    )
+    recreated = tuple(
+        workflow["create_agent"](
+            client,
+            config,
+            agent_type="codex",
+            name=name,
+            restriction="publication-disabled" if index == 0 else None,
+        )
+        for index, name in enumerate(logical_names)
+    )
+
+    assert client.closed == ["old-1", "old-2", "old-3", "old-4"]
+    assert recreated == ("new-1", "new-2", "new-3", "new-4")
+
+
+def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-recovery-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["_run_repository"].__globals__
+    issue = workflow["Issue"](334, "feature/issue-334")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    feature_sha = "feature-head"
+    integration_sha = "integration-head"
+    draft = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=feature_sha,
+        base_sha=integration_sha,
+    )
+    ready = replace(draft, is_draft=False)
+    mutations: list[tuple[str, str, str, str | None]] = []
+    work_item_logical_names = (
+        f"{issue.label} implementer",
+        f"{issue.label} scope reviewer",
+        f"{issue.label} correctness reviewer",
+    )
+    work_item_names = tuple(
+        workflow["correlated_agent_tab_name"](name) for name in work_item_logical_names
+    )
+    work_item_correlations = tuple(
+        workflow["run_correlation"](name) for name in work_item_logical_names
+    )
+    planner_name = workflow["correlated_agent_tab_name"]("Work-item planner")
+    planner_correlation = workflow["run_correlation"]("Work-item planner")
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs: dict[str, TabState] = {}
+            self.next_id = 1
+
+        def create_session(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            correlation_id = request.correlation_id  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{correlation_id}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"tab-{self.next_id}"
+            self.next_id += 1
+            self.tabs[tab_id] = TabState(
+                tab_id,
+                self.workspace_id,
+                name,
+                "terminal" if request.restriction is not None else "codex-cli",
+                None if request.restriction is not None else "codex",
+                True,
+                None if request.restriction is not None else "busy",
+            )
+            mutations.append(("create", tab_id, name, correlation_id))
+            return tab_id
+
+        def complete(self, tab_id: str) -> None:
+            if self.tabs[tab_id].panel_type != "terminal":
+                self.tabs[tab_id] = replace(
+                    self.tabs[tab_id], cli_state="ready-for-review"
+                )
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert self.tabs[tab_id].cli_state == "ready-for-review"
+            return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            assert self.tabs[tab_id].panel_type == "terminal"
+            return SimpleNamespace(exit_code=0, stdout="completed")
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            tab = self.tabs.pop(tab_id)
+            mutations.append(("close", tab_id, tab.name, None))
+
+    client = Client()
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            sha = (
+                integration_sha if branch == config.integration_branch else feature_sha
+            )
+            return BranchState(branch, sha, sha, branch == issue.branch)
+
+        def inspect_local_refs(self) -> dict[str, object]:
+            return {
+                f"refs/heads/{issue.branch}": workflow["LocalRefState"](
+                    feature_sha, None
+                )
+            }
+
+        def inspect_remote_refs(self) -> dict[str, str]:
+            return {f"refs/heads/{issue.branch}": feature_sha}
+
+        def require_committed_result(
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+        ) -> BranchState:
+            assert (branch, previous_sha, allow_unchanged) == (
+                issue.branch,
+                feature_sha,
+                True,
+            )
+            return BranchState(branch, feature_sha, feature_sha, True)
+
+    repository = Repository()
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.ready_attempts = 0
+
+        def set_draft(self, number: int, **_kwargs: object) -> PullRequestState:
+            assert number == draft.number
+            assert len(client.tabs) == 4
+            assert all(
+                tab.panel_type == "terminal"
+                or tab.cli_state == "ready-for-review"
+                for tab in client.tabs.values()
+            )
+            self.ready_attempts += 1
+            if self.ready_attempts == 1:
+                raise WorkerFailure("recoverable repository failure")
+            return ready
+
+    github = GitHub()
+
+    plan_attempts = 0
+
+    def prepared_plan(*_args: object) -> tuple[None, object]:
+        nonlocal plan_attempts
+        plan = workflow["WorkItemPlan"](config)
+        plan.position = plan_attempts
+        plan_attempts += 1
+        return None, plan
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        client.complete(str(args[1]))
+        return "implemented"
+
+    def review_phase(*args: object, **kwargs: object) -> object:
+        client.complete(str(args[6]))
+        return workflow["IssueReviewPhaseResult"](
+            draft,
+            "approved",
+            feature_sha,
+            integration_sha,
+            1,
+        )
+
+    planner_turns = 0
+
+    def run_validated_turn(*args: object, **_kwargs: object) -> tuple[str, object]:
+        nonlocal planner_turns
+        planner_turns += 1
+        source = json.dumps(
+            {
+                "actions": [],
+                "complete": planner_turns == 2,
+                "policy_conflicts": [],
+            }
+        )
+        client.complete(str(args[1]))
+        validator = args[4]
+        return source, validator(source)  # type: ignore[operator]
+
+    monkeypatch.setitem(
+        globals_,
+        "GitRepository",
+        SimpleNamespace(open=lambda *_args, **_kwargs: repository),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "GitHubRepository",
+        SimpleNamespace(open=lambda *_args, **_kwargs: github),
+    )
+    monkeypatch.setitem(globals_, "create_runtime", lambda _config: client)
+    monkeypatch.setitem(globals_, "prepare_work_item_plan_pr", prepared_plan)
+    monkeypatch.setitem(globals_, "persist_work_item_plan", lambda _plan, *_args: None)
+    monkeypatch.setitem(
+        globals_, "inspect_dynamic_work_item_topology", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setitem(
+        globals_, "prepare_issue", lambda *_args: (None, feature_sha, False)
+    )
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(globals_, "run_validated_turn", run_validated_turn)
+    monkeypatch.setitem(
+        globals_,
+        "require_agent_result",
+        lambda *_args, **_kwargs: (feature_sha, False),
+    )
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *_args, **_kwargs: draft)
+    monkeypatch.setitem(
+        globals_, "ensure_issue_pr_metadata", lambda *_args, **_kwargs: draft
+    )
+    monkeypatch.setitem(globals_, "review_issue_phase", review_phase)
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(
+        globals_,
+        "recovery_authoritative_state",
+        lambda *_args: '{"stable":true}',
+    )
+    monkeypatch.setitem(
+        globals_,
+        "recover_error",
+        lambda *_args, **_kwargs: workflow["RecoveryReport"](
+            True, True, "repaired", "verified"
+        ),
+    )
+    monkeypatch.setitem(globals_, "require_recovery_retry_state", lambda *_args: None)
+    monkeypatch.setitem(
+        globals_, "integration_delivery", lambda *_args, **_kwargs: ready
+    )
+    monkeypatch.setitem(globals_, "report_repository_delivery", lambda *_args: None)
+    monkeypatch.setitem(
+        globals_, "emit_issue_driven_context", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *_args, **_kwargs: None)
+
+    result = workflow["_run_repository"](config)
+
+    assert result == ready
+    assert github.ready_attempts == 2
+    assert [mutation[:2] for mutation in mutations] == [
+        ("create", "tab-1"),  # Initial planner.
+        ("create", "tab-2"),
+        ("create", "tab-3"),
+        ("create", "tab-4"),
+        ("close", "tab-2"),
+        ("close", "tab-3"),
+        ("close", "tab-4"),
+        ("create", "tab-5"),
+        ("create", "tab-6"),
+        ("create", "tab-7"),
+        ("close", "tab-1"),
+        ("create", "tab-8"),  # Retry planner.
+    ]
+    assert tuple(mutation[2] for mutation in mutations[1:4]) == work_item_names
+    assert tuple(mutation[2] for mutation in mutations[7:10]) == work_item_names
+    assert tuple(mutation[3] for mutation in mutations[1:4]) == work_item_correlations
+    assert tuple(mutation[3] for mutation in mutations[7:10]) == work_item_correlations
+    assert mutations[0][2:] == (planner_name, planner_correlation)
+    assert mutations[-1][2:] == (planner_name, planner_correlation)
+
+
+@pytest.mark.parametrize(
+    "unsafe", ("ambiguous", "unrelated", "busy", "later-busy")
+)
+def test_retry_tab_reconciliation_never_closes_uncertain_tabs(
+    monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-unsafe-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](334, "feature/issue-334")
+    implementer_name = workflow["correlated_agent_tab_name"](
+        f"{issue.label} implementer"
+    )
+    tab = TabState(
+        "tab-1",
+        "workspace",
+        implementer_name,
+        "codex-cli" if unsafe == "unrelated" else "terminal",
+        "codex" if unsafe == "unrelated" else None,
+        True,
+        None,
+    )
+    later = TabState(
+        "tab-scope",
+        "workspace",
+        workflow["correlated_agent_tab_name"](f"{issue.label} scope reviewer"),
+        "codex-cli",
+        "codex",
+        True,
+        "busy",
+    )
+
+    class Client:
+        workspace_id = "workspace"
+        closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            if unsafe == "ambiguous":
+                return (tab, replace(tab, id="tab-2"))
+            if unsafe == "later-busy":
+                return (tab, later)
+            return (tab,)
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            selected = later if tab_id == later.id else tab
+            return {
+                "tabId": tab_id,
+                "workspaceId": self.workspace_id,
+                "panelType": selected.panel_type,
+                "agentProviderId": selected.provider,
+                "cliState": selected.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            if unsafe == "busy" and tab_id == tab.id:
+                raise WorkerFailure("result is not ready")
+            return SimpleNamespace(exit_code=0, stdout="completed")
+
+        def close_session(self, tab_id: str, **_kwargs: object) -> None:
+            self.closed.append(tab_id)
+
+    client = Client()
+    with pytest.raises(WorkerFailure, match="refusing cleanup"):
+        workflow["reconcile_work_item_retry_tabs"](client, issue)
+
+    assert client.closed == []
+
+
+def test_existing_work_item_pr_adopts_its_verified_remote_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](90, "feature/issue-90")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    pull_request = open_pr(
+        head=issue.branch, base=config.integration_branch, draft=True
+    )
+    calls: list[tuple[str, str | None]] = []
+    provenance: list[tuple[str, str]] = []
+
+    class Repository:
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(
+            self, branch: str, *, expected_remote_sha: str | None = None
+        ) -> BranchState:
+            calls.append((branch, expected_remote_sha))
+            sha = (
+                pull_request.base_sha
+                if branch == config.integration_branch
+                else pull_request.head_sha
+            )
+            return BranchState(branch, sha, sha, True)
+
+        def inspect_feature_preparation(self, *args: object, **kwargs: object):
+            return SimpleNamespace(base_is_ancestor=True)
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end))
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+
+    class GitHub:
+        def find_pr(self, *, head: str, base: str, state: str):
+            assert (head, base) == (issue.branch, config.integration_branch)
+            return pull_request if state == "OPEN" else None
+
+    monkeypatch.setitem(
+        workflow["prepare_issue"].__globals__,
+        "emit_finding",
+        lambda *args, **kwargs: None,
+    )
+
+    prepared = workflow["prepare_issue"](Repository(), GitHub(), issue, config)
+
+    assert prepared == (pull_request, pull_request.head_sha, True)
+    assert calls == [
+        (config.integration_branch, None),
+        (issue.branch, pull_request.head_sha),
+    ]
+    assert provenance == [(pull_request.base_sha, pull_request.head_sha)]
 
 
 @pytest.mark.parametrize(
@@ -591,6 +1404,154 @@ def test_design_principles_review_prompt_has_an_independent_conformance_scope() 
     assert "Do not perform Scenario Gate" in prompt
     assert "general whole-version" in prompt
     assert "version, or README review" in prompt
+
+
+def test_one_shot_without_design_principles_plans_and_completes_whole_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    exact_design_check = workflow["has_design_principles"]
+    keep_review_audit_in_memory(workflow, monkeypatch)
+    workflow_globals = workflow["review_whole_version"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+    current_pr = replace(
+        open_pr(head=config.integration_branch, base=config.main_branch, draft=True),
+        head_sha="integration-head-without-design-principles",
+    )
+    decisions = iter(
+        (
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "add",
+                            "item": {
+                                "id": "focused-change",
+                                "task": "Implement the required public behavior.",
+                            },
+                        }
+                    ],
+                    "complete": False,
+                    "policy_conflicts": [],
+                    "rationale": "This task isolates the required behavior.",
+                }
+            ),
+            json.dumps(
+                {
+                    "actions": [],
+                    "complete": True,
+                    "policy_conflicts": [],
+                    "rationale": "The planned work is complete.",
+                }
+            ),
+        )
+    )
+    inspected_heads: list[str] = []
+    created_agents: list[str] = []
+    planning_prompts: list[str] = []
+    review_turns: list[str] = []
+    review_prompts: list[str] = []
+    audit_roles: list[str] = []
+    processed: list[object] = []
+    comments: list[str] = []
+
+    class Repository:
+        def has_path_at_commit(self, head_sha: str, path: str) -> bool:
+            assert path == "docs/design-principles.md"
+            inspected_heads.append(head_sha)
+            return False
+
+    class GitHub:
+        def create_issue_comment(self, _issue: int, **kwargs: object) -> None:
+            comments.append(str(kwargs["body"]))
+
+        def require_pr(self, **_kwargs: object) -> PullRequestState:
+            return current_pr
+
+    def create_agent(*_args: object, **kwargs: object) -> str:
+        name = str(kwargs["name"])
+        created_agents.append(name)
+        return name
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        name = str(args[2])
+        prompt = str(args[3])
+        if name == "Work-item planning":
+            planning_prompts.append(prompt)
+            return next(decisions)
+        review_turns.append(name)
+        review_prompts.append(prompt)
+        return review_result("APPROVED")
+
+    def persist_audit(
+        _github: object, pr: PullRequestState, record: object, **_kwargs: object
+    ) -> PullRequestState:
+        audit_roles.append(str(record.role))  # type: ignore[attr-defined]
+        return pr
+
+    monkeypatch.setitem(workflow_globals, "has_design_principles", exact_design_check)
+    monkeypatch.setitem(workflow_globals, "create_agent", create_agent)
+    monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(workflow_globals, "persist_review_audit", persist_audit)
+    monkeypatch.setitem(
+        workflow_globals, "process_issue", lambda issue, *_args: processed.append(issue)
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "inspect_dynamic_work_item_topology",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setitem(
+        workflow_globals, "run_outline_step", lambda _name, action: action()
+    )
+    monkeypatch.setitem(
+        workflow_globals, "persist_work_item_plan", lambda _plan, *_args: _args[-1]
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_agent_result",
+        lambda *args, **kwargs: (current_pr.head_sha, False),
+    )
+    monkeypatch.setitem(workflow_globals, "run_final_checks", lambda *args: None)
+    monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
+
+    repository = Repository()
+    github = GitHub()
+    work_items = workflow["process_work_items"](
+        config,
+        object(),
+        repository,
+        github,
+        current_pr,
+        workflow["WorkItemPlan"](config),
+    )
+    _, delivery = workflow["review_whole_version"](
+        config, object(), repository, github, current_pr, work_items
+    )
+
+    assert [item.key for item in processed] == ["focused-change"]
+    assert [item.key for item in work_items] == ["focused-change"]
+    assert len(planning_prompts) == 2
+    assert all(
+        "An empty result means the file is absent" in prompt
+        for prompt in planning_prompts
+    )
+    assert all(
+        "do not add a task\nto create or restore it" in prompt
+        for prompt in planning_prompts
+    )
+    assert all("docs/design-principles.md" not in prompt for prompt in review_prompts)
+    assert len(comments) == 2
+    assert delivery.outcome == "approved"
+    assert set(inspected_heads) == {current_pr.head_sha}
+    assert "Design Principles reviewer" not in created_agents
+    assert review_turns == [
+        "Whole-version reviewer turn",
+        "Version / README reviewer turn",
+    ]
+    assert audit_roles == ["whole_version", "version_readme"]
 
 
 def test_version_readme_review_prompt_has_an_independent_documentation_scope() -> None:
@@ -1356,6 +2317,31 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
     assert "minimum required for this Issue" in principle
     assert "mixing responsibilities unnaturally" in principle
     assert "over-generalizing distinct behavior" in principle
+
+
+def test_scope_review_judges_necessary_incidental_changes_in_context() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](149, "feature/issue-149")
+    config = workflow["Config"](
+        Path("/tmp/project"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue,),
+        "git diff --check",
+    )
+
+    _, scope_review, _ = workflow["issue_prompts"](issue, config)
+    normalized_scope_review = " ".join(scope_review.split())
+
+    assert (
+        "Do not reject a directly out-of-scope change solely because it is incidental"
+        in normalized_scope_review
+    )
+    assert "necessity and proportionality" in normalized_scope_review
+    assert "natural responsibility placement" in normalized_scope_review
+    assert "contribution to overall sufficiency" in normalized_scope_review
+    assert "unrelated work or unnecessary refactors" in normalized_scope_review
 
 
 def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> None:
@@ -2301,11 +3287,122 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
     ]
 
 
+def test_new_commit_with_residual_dirty_files_normalizes_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    run_turn = workflow["run_turn"]
+    globals_ = run_turn.__globals__
+    branch = "feature/dirty-agent-result"
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+        local_sha = "before"
+        dirty = False
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                dirty=self.dirty,
+                current_branch=branch,
+                status=("?? generated.log",) if self.dirty else (),
+            )
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **_kwargs: object
+        ) -> BranchState:
+            assert (current, start, end) == (branch, "before", "primary")
+            assert self.dirty
+            events.append("normalize-primary")
+            self.local_sha = "normalized-primary"
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_committed_result(
+            self, current: str, *, previous_sha: str, allow_unchanged: bool
+        ) -> BranchState:
+            assert (current, previous_sha, allow_unchanged) == (
+                branch,
+                "before",
+                True,
+            )
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append(f"verify:{start}:{end}:{kwargs['expected_process']}")
+
+    repository = Repository()
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = "primary"
+            repository.dirty = True
+
+        def read_result(self, *_args: object) -> str:
+            return "implemented"
+
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_agent_turn", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    assert run_turn(
+        Client(),
+        "tab",
+        "Implementation",
+        "prompt",
+        repository_identity="acme/project",
+        repository=repository,
+        branch=branch,
+        expected_process="implementation",
+    ) == "implemented"
+
+    def clean(*_args: object, **_kwargs: object) -> str:
+        assert repository.dirty
+        events.append("cleanup")
+        repository.dirty = False
+        repository.local_sha = "cleanup"
+        return "cleaned"
+
+    monkeypatch.setitem(globals_, "run_turn", clean)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    assert workflow["require_agent_result"](
+        repository,
+        object(),
+        "tab",
+        branch,
+        "before",
+        allow_unchanged=False,
+        expected_process="implementation",
+    ) == ("cleanup", True)
+    assert events == [
+        "normalize-primary",
+        "verify:before:normalized-primary:implementation",
+        "cleanup",
+        "verify:before:normalized-primary:implementation",
+        "verify:normalized-primary:cleanup:cleanup",
+    ]
+
+
 def test_failed_mutating_turn_validates_commits_before_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     branch = "feature/failed-turn"
+    normalizations: list[tuple[str, str, str, dict[str, object]]] = []
     provenance: list[tuple[str, str, dict[str, object]]] = []
 
     class Repository:
@@ -2314,6 +3411,12 @@ def test_failed_mutating_turn_validates_commits_before_retry(
         def require_current_branch(self, current: str) -> BranchState:
             assert current == branch
             return BranchState(current, self.local_sha, None, True)
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            normalizations.append((current, start, end, kwargs))
+            return BranchState(current, end, None, True)
 
         def require_agent_commit_provenance(
             self, start: str, end: str, **kwargs: object
@@ -2350,6 +3453,18 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             branch=branch,
             expected_process="implementation",
         )
+    assert normalizations == [
+        (
+            branch,
+            "before",
+            "failed-turn-commit",
+            {
+                "expected_agent": "codex",
+                "expected_process": "implementation",
+                "allow_unchanged": True,
+            },
+        )
+    ]
     assert provenance == [
         (
             "before",
@@ -2374,6 +3489,12 @@ def test_post_result_provenance_failure_closes_started_agent_trace(
         def require_current_branch(self, current: str) -> BranchState:
             assert current == branch
             return BranchState(current, "agent-head", None, True)
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **_kwargs: object
+        ) -> BranchState:
+            assert (current, start, end) == (branch, "agent-head", "agent-head")
+            return BranchState(current, end, None, True)
 
         def require_agent_commit_provenance(
             self, start: str, end: str, **_kwargs: object
@@ -2473,6 +3594,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
         Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
     )
     start_sha = "start-head"
+    raw_implementation_sha = "raw-implementation-head"
     implementation_sha = "implementation-head"
     base_sha = "integration-head"
     events: list[str] = []
@@ -2503,11 +3625,26 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             assert self.local_sha != previous_sha or allow_unchanged
             return BranchState(branch, self.local_sha, None, True)
 
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (branch, start, end) == (
+                issue.branch,
+                start_sha,
+                raw_implementation_sha,
+            )
+            assert kwargs["expected_process"] == "implementation"
+            events.append("normalize:implementation")
+            self.local_sha = implementation_sha
+            return BranchState(branch, self.local_sha, None, True)
+
         def require_agent_commit_provenance(
             self, start: str, end: str, **kwargs: object
         ) -> None:
             assert kwargs["expected_agent"] == "codex"
             assert kwargs["expected_process"] in {"implementation", "cleanup"}
+            if kwargs["expected_process"] == "implementation":
+                events.append("verify:implementation")
 
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
@@ -2558,11 +3695,27 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             events.append("ready")
             return replace(draft, is_draft=False)
 
-    def run_turn(*args: object, **kwargs: object) -> str:
+    real_run_turn = workflow["run_turn"]
+
+    class ImplementationClient:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = raw_implementation_sha
+
+        def read_result(self, *_args: object) -> str:
+            return "implemented and committed"
+
+    def run_turn(*args: object, **kwargs: object):
         name = str(args[2])
         if name.endswith("implementation"):
-            repository.local_sha = implementation_sha
-            return "implemented and committed"
+            return real_run_turn(ImplementationClient(), *args[1:], **kwargs)
         if name.endswith("review"):
             return "APPROVED"
         raise AssertionError(f"unexpected turn {name}")
@@ -2576,6 +3729,12 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "emit_agent_turn", lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(
+        workflow_globals, "terminal_progress", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(
         workflow_globals,
@@ -2587,11 +3746,14 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
         issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
     )
 
+    normalize_index = events.index("normalize:implementation")
+    provenance_index = events.index("verify:implementation")
     commit_index = events.index(f"commit:{implementation_sha}")
     push_index = events.index(f"push:{implementation_sha}")
     draft_index = events.index(f"draft:{implementation_sha}")
     verify_index = events.index(f"require_pr:{implementation_sha}")
-    assert commit_index < push_index < draft_index < verify_index
+    assert normalize_index < provenance_index < commit_index < push_index
+    assert push_index < draft_index < verify_index
     assert events[-1] == "ready"
     assert issue_results[0][1]["workspace_id"] == "ws-test"
     assert issue_results[0][1]["implementation_tab_id"] == (
@@ -2896,7 +4058,12 @@ def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> No
 
     github = GitHub()
     created = workflow["ensure_issue_pr"](
-        Repository(), github, issue, config, expected_base_sha=base_sha
+        Repository(),
+        github,
+        issue,
+        config,
+        expected_local_sha=head_sha,
+        expected_base_sha=base_sha,
     )
     assert created.body.startswith(f"{marker}\n\n")
 
@@ -2906,6 +4073,48 @@ def test_one_shot_child_pr_creation_and_body_update_preserve_fingerprint() -> No
 
     assert updated.body == f"{marker}\n\nUpdated child PR description"
     assert bodies == [issue.pr_body, updated.body]
+
+
+def test_initial_delivery_rejects_branch_advanced_after_verification() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](116, "feature/issue-116")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    implementation_sha = "verified-implementation-head"
+    advanced_sha = "concurrent-local-head"
+    expected_heads: list[str] = []
+    published_heads: list[str] = []
+
+    class Repository:
+        def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
+            expected_heads.append(expected_local_sha)
+            assert branch == issue.branch
+            assert expected_local_sha == implementation_sha
+            if expected_local_sha != advanced_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed: expected {expected_local_sha}, "
+                    f"found {advanced_sha}"
+                )
+            published_heads.append(advanced_sha)
+            return BranchState(branch, advanced_sha, advanced_sha, True)
+
+    class GitHub:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"GitHub publication must not be attempted: {name}")
+
+    with pytest.raises(WorkerFailure, match="changed: expected"):
+        workflow["ensure_issue_pr"](
+            Repository(),
+            GitHub(),
+            issue,
+            config,
+            expected_local_sha=implementation_sha,
+            expected_base_sha="integration-head",
+        )
+
+    assert expected_heads == [implementation_sha]
+    assert published_heads == []
 
 
 @pytest.mark.parametrize(
@@ -3028,6 +4237,7 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     )
     base_sha = "integration-head"
     initial_sha = "implementation-head"
+    raw_fixed_sha = "raw-fixed-head"
     fixed_sha = "fixed-head"
     current_pr = replace(
         open_pr(head=issue.branch, base=config.integration_branch, draft=True),
@@ -3038,8 +4248,33 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     findings: list[tuple[str, str, str]] = []
 
     class Repository:
+        local_sha = initial_sha
+
         def inspect_worktree(self) -> SimpleNamespace:
             return SimpleNamespace(dirty=False)
+
+        def require_current_branch(self, branch: str) -> BranchState:
+            assert branch == issue.branch
+            return BranchState(branch, self.local_sha, None, True)
+
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (branch, start, end) == (
+                issue.branch,
+                initial_sha,
+                raw_fixed_sha,
+            )
+            assert kwargs["expected_process"] == "reviewer-fix"
+            events.append("normalize:reviewer-fix")
+            self.local_sha = fixed_sha
+            return BranchState(branch, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_process"] == "reviewer-fix"
+            events.append("verify:reviewer-fix")
 
         def inspect_branch(self, branch: str) -> BranchState:
             return BranchState(branch, base_sha, base_sha, False)
@@ -3072,9 +4307,29 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         )
     )
 
-    def run_turn(*args: object, **kwargs: object) -> str:
+    repository = Repository()
+    real_run_turn = workflow["run_turn"]
+
+    class FixClient:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = raw_fixed_sha
+
+        def read_result(self, *_args: object) -> str:
+            return "fixed"
+
+    def run_turn(*args: object, **kwargs: object):
         name = str(args[2])
         events.append(name)
+        if name.endswith("fixes"):
+            return real_run_turn(FixClient(), *args[1:], **kwargs)
         if "scope/design review" in name:
             return "CHANGES_REQUESTED\nstill needs work"
         if "correctness review" in name:
@@ -3090,6 +4345,12 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "emit_agent_turn", lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(
+        workflow_globals, "terminal_progress", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(
         workflow_globals,
         "require_agent_result",
@@ -3110,13 +4371,15 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     )
 
     result = workflow["process_issue"](
-        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+        issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
     )
 
     assert result.is_draft is False
     assert events.count("Issue #134 scope/design review") == 2
     assert events.count("Issue #134 scope/design fixes") == 1
     assert events.count("Issue #134 correctness review") == 1
+    assert events.index("normalize:reviewer-fix") < events.index("verify:reviewer-fix")
+    assert events.index("verify:reviewer-fix") < events.index(f"push:{fixed_sha}")
     assert "require_pushed" in events
     assert events[-1] == f"ready:{fixed_sha}"
     assert any(
@@ -4304,6 +5567,9 @@ def test_whole_retry_finishes_warning_after_dispositions_but_before_marker(
             return current
 
     monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(
+        globals_, "has_design_principles", lambda _repo, _head_sha: True
+    )
     monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
     monkeypatch.setitem(
         globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
@@ -4597,7 +5863,7 @@ def test_missing_whole_review_audit_restarts_at_verified_head(
             assert kwargs["expected_head_sha"] == current.head_sha
             return current
 
-    def review(_config, _client, _repo, _github, pr, _work_items):
+    def review(_config, _client, _repo, _github, pr, _work_items, *_args):
         reviewed.append(pr.head_sha)
         if len(reviewed) == 1:
             raise workflow["MissingReviewAudit"]("record missing")
@@ -4688,6 +5954,111 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
     assert events == ["final checks", f"ready:{draft.head_sha}"]
 
 
+def test_integration_delivery_retry_reconciles_completed_final_check_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "final-check-retry")
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["integration_delivery"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    draft = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs: dict[str, TabState] = {}
+            self.results: dict[str, object] = {}
+            self.started = 0
+            self.closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+            }
+
+        def start_shell(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{workflow['run_correlation'](logical_name)}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            self.started += 1
+            tab_id = f"check-{self.started}"
+            self.tabs[tab_id] = TabState(
+                tab_id, self.workspace_id, name, "terminal", None, True, None
+            )
+            exit_code = 1 if self.started == 1 else 0
+            self.results[tab_id] = SimpleNamespace(
+                exit_code=exit_code,
+                failure_message=lambda _step: "checks failed",
+            )
+            return tab_id
+
+        def wait_for_shell_completion(self, tab_id: str, _timeout: float) -> None:
+            assert tab_id in self.results
+
+        def read_shell_result(self, tab_id: str) -> object:
+            return self.results[tab_id]
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.base_sha, draft.base_sha, False)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def require_committed_result(self, *args: object, **kwargs: object) -> BranchState:
+            return BranchState(
+                config.integration_branch, draft.head_sha, draft.head_sha, True
+            )
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return draft if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return draft
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            return replace(draft, is_draft=False)
+
+    client = Client()
+    monkeypatch.setitem(globals_, "FINAL_REVIEW", False)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    with pytest.raises(WorkerFailure, match="checks failed"):
+        workflow["integration_delivery"](
+            config, config.issues, client, Repository(), GitHub()
+        )
+    delivered = workflow["integration_delivery"](
+        config, config.issues, client, Repository(), GitHub()
+    )
+
+    assert delivered is not None and delivered.is_draft is False
+    assert client.closed == ["check-1"]
+    assert client.started == 2
+
+
 def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4698,6 +6069,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     initial_sha = "integration-head"
+    raw_cleanup_sha = "raw-check-cleanup-head"
     cleanup_sha = "check-cleanup-head"
     base_sha = "main-head"
     current_pr = replace(
@@ -4744,11 +6116,26 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (branch, start, end) == (
+                config.integration_branch,
+                initial_sha,
+                raw_cleanup_sha,
+            )
+            assert kwargs["expected_process"] == "cleanup"
+            events.append("normalize:cleanup")
+            self.local_sha = cleanup_sha
+            return BranchState(branch, self.local_sha, self.local_sha, True)
+
         def require_agent_commit_provenance(
             self, start: str, end: str, **kwargs: object
         ) -> None:
             assert kwargs["expected_agent"] == "codex"
             assert kwargs["expected_process"] == "cleanup"
+            if (start, end) == (initial_sha, cleanup_sha):
+                events.append("verify:cleanup")
 
         def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")
@@ -4782,7 +6169,25 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     check_count = 0
     outline_events: list[tuple[str, str]] = []
 
-    def run_turn(*args: object, **kwargs: object) -> str:
+    real_run_turn = workflow["run_turn"]
+
+    class CleanupClient:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.dirty = False
+            repository.local_sha = raw_cleanup_sha
+
+        def read_result(self, *_args: object) -> str:
+            return "committed final-check artifacts"
+
+    def run_turn(*args: object, **kwargs: object):
         nonlocal review_count
         name = str(args[2])
         events.append(name)
@@ -4795,9 +6200,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             return "APPROVED"
         if name == "Clean worktree":
             assert repository.dirty
-            repository.dirty = False
-            repository.local_sha = cleanup_sha
-            return "committed final-check artifacts"
+            return real_run_turn(CleanupClient(), *args[1:], **kwargs)
         raise AssertionError(f"unexpected turn {name}")
 
     def final_checks(*args: object) -> None:
@@ -4811,6 +6214,12 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "emit_agent_turn", lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(
+        workflow_globals, "terminal_progress", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(workflow_globals, "run_final_checks", final_checks)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
     monkeypatch.setitem(
@@ -4828,12 +6237,18 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     assert check_count == 2
     assert outline_events == [
         ("Whole-version review", "started"),
+        ("Clean worktree", "started"),
+        ("Clean worktree", "completed"),
         ("Whole-version review", "completed"),
         ("Final integration PR", "started"),
         ("Final integration PR", "completed"),
     ]
     assert f"push:{cleanup_sha}" in events
-    assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
+    assert events.index("normalize:cleanup") < events.index("verify:cleanup")
+    assert events.index("verify:cleanup") < events.index(f"push:{cleanup_sha}")
+    assert events.index(f"push:{cleanup_sha}") < events.index(
+        f"require_pr:{cleanup_sha}"
+    )
 
 
 def test_whole_version_outline_fails_when_final_checks_fail(
