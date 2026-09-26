@@ -137,6 +137,49 @@ class RefRaceGitRunner(RecordingGitRunner):
         return completed
 
 
+class UpdateRefRaceGitRunner(RecordingGitRunner):
+    def __init__(
+        self,
+        branch: str,
+        race: Callable[[], None],
+        *,
+        reject_restore: bool = False,
+    ) -> None:
+        super().__init__()
+        self.branch = branch
+        self.race = race
+        self.reject_restore = reject_restore
+        self.triggered = False
+
+    def __call__(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        ref = f"refs/heads/{self.branch}"
+        is_branch_update = command[1:3] == ["update-ref", ref]
+        if is_branch_update and self.triggered and self.reject_restore:
+            return subprocess.CompletedProcess(command, 1, "", "restore rejected")
+        completed = super().__call__(
+            args,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+        )
+        if is_branch_update and not self.triggered and completed.returncode == 0:
+            self.triggered = True
+            self.race()
+        return completed
+
+
 def git(cwd: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
@@ -689,6 +732,160 @@ def test_normalize_rewrites_each_commit_in_an_unpublished_range(
         expected_agent="codex",
         expected_process="implementation",
     )
+
+
+def test_normalize_preserves_residual_dirty_files_for_focused_cleanup(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/dirty-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "agent result")
+    original = git(work, "rev-parse", "HEAD")
+    generated = work / "generated.log"
+    generated.write_text("residual output\n", encoding="utf-8")
+    status_before = repo.inspect_worktree().status
+
+    result = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        original,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert result.local_sha is not None
+    assert result.local_sha != original
+    assert repo.inspect_worktree().status == status_before
+    assert generated.read_text(encoding="utf-8") == "residual output\n"
+    repo.require_agent_commit_provenance(
+        base,
+        result.local_sha,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+
+@pytest.mark.parametrize("publish_side", [False, True])
+def test_normalize_refuses_merged_side_history(
+    repositories: tuple[Path, Path, Path], publish_side: bool
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/merge-provenance"
+    side_branch = "feature/provenance-side"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "switch", "-c", side_branch, base)
+    git(work, "commit", "--allow-empty", "-m", "side history")
+    side_sha = git(work, "rev-parse", "HEAD")
+    if publish_side:
+        git(work, "push", "origin", side_branch)
+    git(work, "switch", branch)
+    git(work, "merge", "--no-ff", side_branch, "-m", "merge side history")
+    merge_sha = git(work, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkerFailure, match="nonlinear or merge"):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            merge_sha,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert git(work, "rev-parse", "HEAD") == merge_sha
+    assert "AWM-Agent" not in git(work, "show", "-s", "--format=%B", side_sha)
+    expected_remote = side_sha if publish_side else None
+    assert repo.inspect_branch(side_branch).remote_sha == expected_remote
+
+
+def test_normalize_ignores_hostile_trailer_configuration(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/config-independent-provenance"
+    marker = work / "hostile-trailer-command-ran"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "config", "trailer.Co-authored-by.ifexists", "replace")
+    git(work, "config", "trailer.AWM-Agent.cmd", f"touch {marker}")
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        "Co-authored-by: Human <human@example.com>",
+    )
+    original = git(work, "rev-parse", "HEAD")
+
+    result = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        original,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert result.local_sha is not None
+    message = git(work, "show", "-s", "--format=%B", result.local_sha)
+    assert not marker.exists()
+    assert message.count("Co-authored-by: Human <human@example.com>") == 1
+    assert message.count("Co-authored-by: Codex <noreply@openai.com>") == 1
+    assert message.count("AWM-Agent: codex") == 1
+    assert message.count("AWM-Process: implementation") == 1
+    repo.require_agent_commit_provenance(
+        base,
+        result.local_sha,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+
+@pytest.mark.parametrize("reject_restore", [False, True])
+def test_normalize_reconciles_remote_race_after_local_ref_update(
+    repositories: tuple[Path, Path, Path], reject_restore: bool
+) -> None:
+    _remote, _seed, work = repositories
+    setup = open_repo(work, RecordingGitRunner())
+    base = setup.synchronize_branch("main").local_sha or ""
+    branch = "feature/provenance-remote-race"
+    setup.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "agent result")
+    original = git(work, "rev-parse", "HEAD")
+
+    def publish_original() -> None:
+        git(work, "push", "origin", f"{original}:refs/heads/{branch}")
+
+    runner = UpdateRefRaceGitRunner(
+        branch, publish_original, reject_restore=reject_restore
+    )
+    repo = open_repo(work, runner)
+    expected_error = MutationOutcomeUnknown if reject_restore else WorkerFailure
+    expected_message = (
+        "restoration.*could not be proven" if reject_restore else "restored"
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            original,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert runner.triggered
+    assert repo.inspect_branch(branch).remote_sha == original
+    if reject_restore:
+        assert git(work, "rev-parse", "HEAD") != original
+    else:
+        assert git(work, "rev-parse", "HEAD") == original
 
 
 def test_committed_result_requires_agent_and_process_together(

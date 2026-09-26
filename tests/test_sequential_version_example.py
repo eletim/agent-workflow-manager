@@ -2326,6 +2326,116 @@ def test_agent_result_preserves_primary_and_cleanup_turn_boundaries(
     ]
 
 
+def test_new_commit_with_residual_dirty_files_normalizes_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    run_turn = workflow["run_turn"]
+    globals_ = run_turn.__globals__
+    branch = "feature/dirty-agent-result"
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+        local_sha = "before"
+        dirty = False
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                dirty=self.dirty,
+                current_branch=branch,
+                status=("?? generated.log",) if self.dirty else (),
+            )
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **_kwargs: object
+        ) -> BranchState:
+            assert (current, start, end) == (branch, "before", "primary")
+            assert self.dirty
+            events.append("normalize-primary")
+            self.local_sha = "normalized-primary"
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_committed_result(
+            self, current: str, *, previous_sha: str, allow_unchanged: bool
+        ) -> BranchState:
+            assert (current, previous_sha, allow_unchanged) == (
+                branch,
+                "before",
+                True,
+            )
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append(f"verify:{start}:{end}:{kwargs['expected_process']}")
+
+    repository = Repository()
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = "primary"
+            repository.dirty = True
+
+        def read_result(self, *_args: object) -> str:
+            return "implemented"
+
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_agent_turn", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    assert run_turn(
+        Client(),
+        "tab",
+        "Implementation",
+        "prompt",
+        repository_identity="acme/project",
+        repository=repository,
+        branch=branch,
+        expected_process="implementation",
+    ) == "implemented"
+
+    def clean(*_args: object, **_kwargs: object) -> str:
+        assert repository.dirty
+        events.append("cleanup")
+        repository.dirty = False
+        repository.local_sha = "cleanup"
+        return "cleaned"
+
+    monkeypatch.setitem(globals_, "run_turn", clean)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    assert workflow["require_agent_result"](
+        repository,
+        object(),
+        "tab",
+        branch,
+        "before",
+        allow_unchanged=False,
+        expected_process="implementation",
+    ) == ("cleanup", True)
+    assert events == [
+        "normalize-primary",
+        "verify:before:normalized-primary:implementation",
+        "cleanup",
+        "verify:before:normalized-primary:implementation",
+        "verify:normalized-primary:cleanup:cleanup",
+    ]
+
+
 def test_failed_mutating_turn_validates_commits_before_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
