@@ -28,8 +28,9 @@ The JSON is never interpreted as runtime control flow, and it has no generic
 actions, conditions, loops, graph edges, or executable nesting.
 
 The generated workflow uses the canonical commit-and-clean CodingAgent
-postcondition, fills safe push/Draft-PR gaps before independent review, and uses
-Runner-scoped correlation through named PurpleMux resources and
+postcondition, then unconditionally owns provenance normalization, exact push,
+and Draft-PR management before independent review. It uses Runner-scoped
+correlation through named PurpleMux resources and
 `run_correlation()`. It does not generate UUIDs or correlation tokens. With
 `merge_final: false`, it generates no final-branch merge call. The displayed
 Python remains the sole execution and control-flow source of truth.
@@ -201,12 +202,13 @@ prompt that this postcondition verifies. Before validation and delivery,
 `normalize_agent_commit_provenance()` makes unambiguous unpublished agent
 trailers contiguous and exact while preserving unrelated trailers. It fails
 closed for conflicting provenance or a remote-visible commit. Use
-`ensure_pushed()` to complete
-delivery through the logical remote branch name. It creates an absent branch or
+`ensure_pushed()` to publish the exact normalized commit through the logical
+remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
 Workflow must then create or reuse and verify the exact Draft PR before starting
-review. Push and PR creation may be agent conveniences, but are not CodingAgent
-hard postconditions.
+review. Coding Agents never push or manage PR state. Reusing an exact pre-existing
+Draft PR is recovery compatibility for an interrupted or older run, not delegated
+publication ownership.
 
 The workflow process itself runs in a PurpleMux Bash tab from a stable
 Runner-controlled directory;
