@@ -46,6 +46,7 @@ const directoryPickerMessage = document.querySelector("#directory-picker-message
 const directoryPickerList = document.querySelector("#directory-picker-list");
 const directoryPickerSelect = document.querySelector("#directory-picker-select");
 const activeContext = document.querySelector("#active-context");
+const activeContextPrimary = document.querySelector("#active-context-primary");
 const repositoryNavigation = document.querySelector("#repository-navigation");
 const repositorySlug = document.querySelector("#repository-slug");
 const repositoryLink = document.querySelector("#repository-link");
@@ -189,6 +190,13 @@ let knownRunIdsGeneration = 0;
 // source used when carrying a reusable folder into a new-run draft; list
 // summaries and rendered text are intentionally insufficient.
 let activeRunSnapshot = null;
+// Pending history selections temporarily change `activeRunId` so New Run and
+// field editability cannot remain active under a Run selector. Keep the last
+// fully rendered context separately so a failed or superseded load never
+// rolls back to another pending selection.
+let committedRunId = null;
+let committedRunSnapshot = null;
+let committedExplicitNewRun = false;
 let activeRunGeneration = 0;
 let familyNavigationRequestGeneration = 0;
 let checkedRunIds = [];
@@ -458,9 +466,50 @@ function applyModeVisibility() {
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
 }
 
+function modeLabel(mode) {
+  return {
+    prompt: "Prompt",
+    "issue-driven": "Issue Driven",
+    "environment-setup": "Environment Setup",
+    review: "Review",
+    workflow: "Python Workflow",
+  }[mode] || "Python Workflow";
+}
+
+function renderRunContextSelection() {
+  const newRunSelected = activeRunId === null;
+  newRunButton.className = `run-item run-context-new ${newRunSelected ? "selected" : ""}`.trim();
+  newRunButton.dataset.state = "draft";
+  newRunButton.textContent = `New Run  ${modeLabel(currentMode)}  Draft`;
+  const marker = document.createElement("span");
+  marker.className = "run-state-marker";
+  marker.setAttribute("aria-hidden", "true");
+  newRunButton.prepend(marker);
+  if (newRunSelected) newRunButton.setAttribute("aria-current", "true");
+  else newRunButton.removeAttribute("aria-current");
+  for (const item of runList.children) {
+    if (item.dataset.runId == null) continue;
+    const selected = Number(item.dataset.runId) === activeRunId;
+    if (selected) {
+      item.classList.add("selected");
+      item.setAttribute("aria-current", "true");
+    } else {
+      item.classList.remove("selected");
+      item.removeAttribute("aria-current");
+    }
+  }
+}
+
 function showDraftLabel() {
-  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", review: "Review", workflow: "Python Workflow"}[currentMode];
+  const label = modeLabel(currentMode);
   activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
+  activeContextPrimary.textContent = `${label} · Draft settings are isolated from existing Runs`;
+  statusBadge.textContent = "not started";
+  statusBadge.className = "status idle";
+  committedRunId = null;
+  committedRunSnapshot = null;
+  committedExplicitNewRun = explicitNewRun;
+  renderRunContextSelection();
 }
 
 // Snapshot the fields into the retained draft only when they currently *are*
@@ -612,6 +661,7 @@ function renderRun(result) {
       ? result.mode
       : "workflow";
   }
+  renderRunContextSelection();
   const running = result.state === "running";
   const presentation = runPresentation(result);
   statusBadge.textContent = presentation.label;
@@ -662,6 +712,9 @@ function renderRun(result) {
   // populate the fields, never a stale response or another run's data.
   if (result.runId != null && result.runId === activeRunId) {
     activeRunSnapshot = result;
+    committedRunId = activeRunId;
+    committedRunSnapshot = result;
+    committedExplicitNewRun = explicitNewRun;
     if (currentMode === "prompt") {
       promptAgent.value = result.prompt?.agent || "codex";
       promptCwd.value = result.prompt?.cwd || result.cwd || "";
@@ -679,17 +732,19 @@ function renderRun(result) {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
     }
-    const modeLabel = {
-      prompt: "Prompt",
-      "issue-driven": "Issue Driven",
-      "environment-setup": "Environment Setup",
-      review: "Review",
-      workflow: "Workflow",
-    }[currentMode];
+    const selectedModeLabel = modeLabel(currentMode);
     const resumeLabel = result.resumedFromRunId == null
       ? ""
       : ` — resumed from Run #${result.resumedFromRunId}`;
-    activeContext.textContent = `Viewing ${modeLabel} Run #${result.runId}${resumeLabel} (read-only)`;
+    activeContext.textContent = `Viewing ${selectedModeLabel} Run #${result.runId}${resumeLabel} (read-only)`;
+    const primaryLocation = currentMode === "prompt"
+      ? result.prompt?.cwd || result.cwd
+      : result.executionContext?.sourceRepository
+        || result.executionContext?.executionRoot
+        || result.cwd;
+    activeContextPrimary.textContent = primaryLocation
+      ? `${selectedModeLabel} · ${primaryLocation}`
+      : `${selectedModeLabel} · Saved backend snapshot`;
   } else if (activeRunId === null) {
     showDraftLabel();
   }
@@ -998,6 +1053,7 @@ function renderRunFamily(container, run) {
 
 function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
+  renderRunContextSelection();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
   const checkedRuns = runs.filter((run) => run.checked);
@@ -1013,6 +1069,7 @@ function renderRunList(runs, cleanupOwnership = []) {
     const presentation = runPresentation(run);
     button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
+    if (run.runId === activeRunId) button.setAttribute("aria-current", "true");
     const mode = {
       prompt: "Prompt",
       "issue-driven": "Issue Driven",
@@ -1042,9 +1099,40 @@ function renderRunList(runs, cleanupOwnership = []) {
       captureDraftIfEditing();
       activeRunId = run.runId;
       activeRunSnapshot = null;
-      activeRunGeneration += 1;
       explicitNewRun = false;
-      await refresh();
+      const selectionGeneration = ++activeRunGeneration;
+      const pendingPresentation = runPresentation(run);
+      activeContext.textContent = `Loading Run #${run.runId}…`;
+      activeContextPrimary.textContent = `${modeLabel(run.mode)} · Loading authoritative snapshot`;
+      statusBadge.textContent = pendingPresentation.label;
+      statusBadge.className = `status ${pendingPresentation.visualState}`;
+      renderRunContextSelection();
+      applyFieldMode();
+      try {
+        await refresh();
+      } catch (error) {
+        if (selectionGeneration === activeRunGeneration) {
+          stderr.textContent = String(error);
+        }
+      }
+      if (
+        activeRunSnapshot === null
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === run.runId
+      ) {
+        activeRunId = committedRunId;
+        activeRunSnapshot = committedRunSnapshot;
+        explicitNewRun = committedExplicitNewRun;
+        activeRunGeneration += 1;
+        const selectionError = stderr.textContent;
+        if (committedRunId !== null && committedRunSnapshot !== null) {
+          renderRun(committedRunSnapshot);
+        } else {
+          showDraftLabel();
+          applyFieldMode();
+        }
+        stderr.textContent = selectionError;
+      }
     });
     runList.append(button);
     const family = document.createElement("nav");

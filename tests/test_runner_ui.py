@@ -172,10 +172,10 @@ def test_issue_driven_story_is_primary_while_runtime_detail_stays_collapsed() ->
     )
 
 
-def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
+def test_run_contexts_are_primary_and_collapsible_without_a_duplicate_view() -> None:
     ancestors = _ancestors("run-list")
 
-    assert any(
+    assert not any(
         tag == "details" and attributes.get("id") == "runtime-panel"
         for tag, attributes in ancestors
     )
@@ -185,6 +185,15 @@ def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
         and "open" in attributes
         for tag, attributes in ancestors
     )
+    assert any(
+        tag == "section" and "editor-panel" in (attributes.get("class") or "")
+        for tag, attributes in ancestors
+    )
+    html = INDEX.read_text(encoding="utf-8")
+    assert html.index('id="runs-panel"') < html.index('id="issue-driven-mode"')
+    assert 'aria-label="Run context"' in html
+    assert 'id="new-run" class="run-item run-context-new selected"' in html
+    assert 'id="active-context-primary"' in html
     assert "runs-toggle-hint" in INDEX.read_text(encoding="utf-8")
 
 
