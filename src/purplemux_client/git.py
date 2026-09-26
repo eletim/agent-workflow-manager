@@ -315,6 +315,28 @@ class GitRepository:
             result[branch] = fields[0]
         return result
 
+    def inspect_remote_refs(self) -> dict[str, str]:
+        """Enumerate authoritative remote refs without using local tracking refs."""
+        self._validate_identity()
+        completed = self._command(
+            ["ls-remote", "--refs", self.remote],
+            {0},
+        )
+        result: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or not fields[1].startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(fields[0])
+            ):
+                raise WorkerFailure("unexpected remote ref enumeration result")
+            ref = fields[1]
+            if ref in result:
+                raise WorkerFailure("ambiguous remote ref enumeration result")
+            result[ref] = fields[0]
+        return result
+
     def inspect_local_branch_heads(self) -> dict[str, str]:
         """Enumerate authoritative local branch heads across every worktree."""
         self._validate_identity()
@@ -335,6 +357,26 @@ class GitRepository:
             if not branch or branch in result:
                 raise WorkerFailure("ambiguous local branch enumeration result")
             result[branch] = sha
+        return result
+
+    def inspect_local_refs(self) -> dict[str, str]:
+        """Enumerate refs stored in the local repository."""
+        self._validate_identity()
+        output = self._read(
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs"]
+        )
+        result: dict[str, str] = {}
+        for line in output.splitlines():
+            ref, separator, sha = line.partition(" ")
+            if (
+                not separator
+                or not ref.startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(sha)
+            ):
+                raise WorkerFailure("unexpected local ref enumeration result")
+            if ref in result:
+                raise WorkerFailure("ambiguous local ref enumeration result")
+            result[ref] = sha
         return result
 
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:

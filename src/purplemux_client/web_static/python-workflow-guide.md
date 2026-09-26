@@ -626,6 +626,8 @@ repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_remote_branch_heads() -> dict[str, str]
+repo.inspect_remote_refs() -> dict[str, str]
+repo.inspect_local_refs() -> dict[str, str]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -650,7 +652,8 @@ repo.inspect_remote_note(ref, object_sha) -> str | None
 trust local tracking refs. Use it when a workflow must compare a configured
 development branch with the remote's current branch set.
 `inspect_local_branch_heads()` provides the corresponding authoritative local
-branch set across linked worktrees. Repository recovery snapshots both sets and
+branch set across linked worktrees. Repository recovery instead snapshots all
+local `refs/*` and all authoritative remote refs, including tags and notes, and
 starts the recovery agent through the normal session and validated-turn APIs
 with the `local-git-only` restriction. That boundary denies remote Git ref
 mutation while allowing a necessary local commit or fast-forward. Codex retains

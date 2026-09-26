@@ -5763,9 +5763,9 @@ def _run_repository(
                 raise WorkerFailure(
                     "repository recovery requires a local branch commit"
                 ) from exc
-            recovery_local_refs = repo.inspect_local_branch_heads()
-            recovery_remote_refs = repo.inspect_remote_branch_heads()
             state = recovery_authoritative_state(config, repo, github, plan)
+            recovery_local_refs = repo.inspect_local_refs()
+            recovery_remote_refs = repo.inspect_remote_refs()
             recovery_execution: list[_AgentTurnExecution] = []
             try:
                 report = recover_error(
@@ -5776,21 +5776,22 @@ def _run_repository(
                     deferred_execution=recovery_execution,
                 )
             finally:
-                recovered_local_refs = repo.inspect_local_branch_heads()
-                recovered_remote_refs = repo.inspect_remote_branch_heads()
+                recovered_local_refs = repo.inspect_local_refs()
+                recovered_remote_refs = repo.inspect_remote_refs()
                 if recovered_remote_refs != recovery_remote_refs:
                     raise WorkerFailure(
-                        "recovery changed remote branch history; refusing to rewrite "
+                        "recovery changed remote refs; refusing to rewrite "
                         "published provenance"
                     )
-                recovery_end = recovered_local_refs.get(recovery_branch)
+                recovery_branch_ref = f"refs/heads/{recovery_branch}"
+                recovery_end = recovered_local_refs.get(recovery_branch_ref)
                 expected_local_refs = dict(recovery_local_refs)
                 if recovery_end is not None:
-                    expected_local_refs[recovery_branch] = recovery_end
+                    expected_local_refs[recovery_branch_ref] = recovery_end
                 if recovery_end is None or recovered_local_refs != expected_local_refs:
                     raise WorkerFailure(
-                        "recovery changed local branch history outside the active "
-                        "branch; refusing to rewrite repository provenance"
+                        "recovery changed local refs outside the active branch; "
+                        "refusing to rewrite repository provenance"
                     )
                 try:
                     checked_recovery = repo.require_committed_result(
@@ -5813,7 +5814,9 @@ def _run_repository(
                 flush=True,
             )
             assert recovery_end is not None
-            authoritative_remote_head = recovery_remote_refs.get(recovery_branch)
+            authoritative_remote_head = recovery_remote_refs.get(
+                f"refs/heads/{recovery_branch}"
+            )
             if (
                 recovery_end != recovery_start.local_sha
                 and recovery_end != authoritative_remote_head

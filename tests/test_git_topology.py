@@ -305,6 +305,20 @@ def test_remote_branch_enumeration_uses_authoritative_remote_heads(
     assert "local-only" not in result
 
 
+def test_remote_ref_enumeration_includes_non_branch_refs(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    head = git(seed, "rev-parse", "HEAD")
+    git(seed, "tag", "release-test")
+    git(seed, "push", "origin", "refs/tags/release-test")
+
+    refs = open_repo(work, RecordingGitRunner()).inspect_remote_refs()
+
+    assert refs["refs/heads/main"] == head
+    assert refs["refs/tags/release-test"] == head
+
+
 def test_local_branch_head_inspection_includes_linked_worktrees(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:
@@ -319,6 +333,23 @@ def test_local_branch_head_inspection_includes_linked_worktrees(
 
     assert heads["main"] == base
     assert heads[branch] == git(linked, "rev-parse", "HEAD")
+
+
+def test_local_ref_enumeration_includes_stash_and_non_head_refs(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    head = git(work, "rev-parse", "HEAD")
+    git(work, "tag", "local-test")
+    (work / "tracked.txt").write_text("stashed\n", encoding="utf-8")
+    git(work, "stash", "push", "-m", "recovery guard test")
+
+    refs = open_repo(work, RecordingGitRunner()).inspect_local_refs()
+
+    assert refs["refs/heads/main"] == head
+    assert refs["refs/remotes/origin/main"] == head
+    assert refs["refs/tags/local-test"] == head
+    assert "refs/stash" in refs
 
 
 def test_remote_notes_persist_recovery_state_without_moving_branches(
