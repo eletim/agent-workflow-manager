@@ -884,6 +884,45 @@ test("New Run and existing Runs are peer contexts with authoritative selected de
   assert.equal(elements["issue-driven-json"].value, detail.issueDrivenJson);
 });
 
+test("failed run detail selection rolls back to the editable New Run context", async () => {
+  const failedDetail = deferred();
+  let failDetail = false;
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "success", mode: "workflow", cwd: "/work/one"}],
+    details: {1: snapshot({runId: 1, state: "success", stdout: "one"})},
+    validation: {status: 200, body: {validation: []}},
+    selectLatest: false,
+    fetchOverride(url) {
+      if (failDetail && url === "/api/runs/1") {
+        return failedDetail.promise;
+      }
+      return undefined;
+    },
+  });
+
+  await elements["workflow-mode"].dispatch("click");
+  elements.code.value = "print('draft remains isolated')";
+  failDetail = true;
+  const selection = runItem(elements, 1).dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), undefined);
+  assert.equal(runItem(elements, 1).getAttribute("aria-current"), "true");
+  assert.match(elements["active-context"].textContent, /Loading Run #1/);
+  assert.equal(elements.code.readOnly, true);
+
+  failedDetail.resolve(response({error: "detail unavailable"}, 503));
+  await selection;
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), "true");
+  assert.equal(runItem(elements, 1).getAttribute("aria-current"), undefined);
+  assert.match(elements["active-context"].textContent, /New Python Workflow run/);
+  assert.equal(elements.code.value, "print('draft remains isolated')");
+  assert.equal(elements.code.readOnly, false);
+  assert.equal(elements.run.disabled, false);
+  assert.match(elements.stderr.textContent, /detail unavailable/);
+});
+
 test("saved run history stays unselected across startup reconciliation", async () => {
   const latest = snapshot({
     runId: 2,
@@ -4192,6 +4231,43 @@ test("Run submission after returning to New run uses the draft, not a viewed run
   await runItem(elements, 1).dispatch("click");
   assert.equal(elements.stdout.textContent, "A");
   assert.equal(elements.code.value, "print('A')");
+});
+
+test("successful Run selection survives a failed follow-up history refresh", async () => {
+  const submitted = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "started",
+    code: "print('submitted')",
+  });
+  let failHistory = false;
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+    fetchOverride(url) {
+      if (url === "/api/run") {
+        failHistory = true;
+        return response(submitted);
+      }
+      if (url === "/api/runs" && failHistory) {
+        return response({error: "history unavailable"}, 503);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["workflow-mode"].dispatch("click");
+  elements.code.value = "print('submitted')";
+  await elements.run.dispatch("click");
+
+  assert.equal(elements["new-run"].getAttribute("aria-current"), undefined);
+  assert.equal(elements["new-run"].classList.contains("selected"), false);
+  assert.match(elements["active-context"].textContent, /Python Workflow Run #1/);
+  assert.equal(elements.status.textContent, "● Running");
+  assert.equal(elements.code.value, "print('submitted')");
+  assert.equal(elements.code.readOnly, true);
+  assert.equal(elements.run.disabled, true);
 });
 
 test("a delayed run-detail response cannot overwrite fields belonging to a newer selection", async () => {

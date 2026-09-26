@@ -469,17 +469,28 @@ function modeLabel(mode) {
   }[mode] || "Python Workflow";
 }
 
-function renderNewRunContext() {
-  const selected = activeRunId === null;
-  newRunButton.className = `run-item run-context-new ${selected ? "selected" : ""}`.trim();
+function renderRunContextSelection() {
+  const newRunSelected = activeRunId === null;
+  newRunButton.className = `run-item run-context-new ${newRunSelected ? "selected" : ""}`.trim();
   newRunButton.dataset.state = "draft";
   newRunButton.textContent = `New Run  ${modeLabel(currentMode)}  Draft`;
   const marker = document.createElement("span");
   marker.className = "run-state-marker";
   marker.setAttribute("aria-hidden", "true");
   newRunButton.prepend(marker);
-  if (selected) newRunButton.setAttribute("aria-current", "true");
+  if (newRunSelected) newRunButton.setAttribute("aria-current", "true");
   else newRunButton.removeAttribute("aria-current");
+  for (const item of runList.children) {
+    if (item.dataset.runId == null) continue;
+    const selected = Number(item.dataset.runId) === activeRunId;
+    if (selected) {
+      item.classList.add("selected");
+      item.setAttribute("aria-current", "true");
+    } else {
+      item.classList.remove("selected");
+      item.removeAttribute("aria-current");
+    }
+  }
 }
 
 function showDraftLabel() {
@@ -488,7 +499,7 @@ function showDraftLabel() {
   activeContextPrimary.textContent = `${label} · Draft settings are isolated from existing Runs`;
   statusBadge.textContent = "not started";
   statusBadge.className = "status idle";
-  renderNewRunContext();
+  renderRunContextSelection();
 }
 
 // Snapshot the fields into the retained draft only when they currently *are*
@@ -640,6 +651,7 @@ function renderRun(result) {
       ? result.mode
       : "workflow";
   }
+  renderRunContextSelection();
   const running = result.state === "running";
   const presentation = runPresentation(result);
   statusBadge.textContent = presentation.label;
@@ -1028,7 +1040,7 @@ function renderRunFamily(container, run) {
 
 function renderRunList(runs, cleanupOwnership = []) {
   runList.replaceChildren();
-  renderNewRunContext();
+  renderRunContextSelection();
   runsEmpty.hidden = runs.length > 0;
   renderedRunIds = new Set(runs.map((run) => run.runId));
   const checkedRuns = runs.filter((run) => run.checked);
@@ -1071,12 +1083,46 @@ function renderRunList(runs, cleanupOwnership = []) {
     marker.setAttribute("aria-hidden", "true");
     button.prepend(marker);
     button.addEventListener("click", async () => {
+      const previousRunId = activeRunId;
+      const previousRunSnapshot = activeRunSnapshot;
+      const previousExplicitNewRun = explicitNewRun;
       captureDraftIfEditing();
       activeRunId = run.runId;
       activeRunSnapshot = null;
-      activeRunGeneration += 1;
       explicitNewRun = false;
-      await refresh();
+      const selectionGeneration = ++activeRunGeneration;
+      const pendingPresentation = runPresentation(run);
+      activeContext.textContent = `Loading Run #${run.runId}…`;
+      activeContextPrimary.textContent = `${modeLabel(run.mode)} · Loading authoritative snapshot`;
+      statusBadge.textContent = pendingPresentation.label;
+      statusBadge.className = `status ${pendingPresentation.visualState}`;
+      renderRunContextSelection();
+      applyFieldMode();
+      try {
+        await refresh();
+      } catch (error) {
+        if (selectionGeneration === activeRunGeneration) {
+          stderr.textContent = String(error);
+        }
+      }
+      if (
+        activeRunSnapshot === null
+        && selectionGeneration === activeRunGeneration
+        && activeRunId === run.runId
+      ) {
+        activeRunId = previousRunId;
+        activeRunSnapshot = previousRunSnapshot;
+        explicitNewRun = previousExplicitNewRun;
+        activeRunGeneration += 1;
+        const selectionError = stderr.textContent;
+        if (previousRunId !== null && previousRunSnapshot !== null) {
+          renderRun(previousRunSnapshot);
+        } else {
+          showDraftLabel();
+          applyFieldMode();
+        }
+        stderr.textContent = selectionError;
+      }
     });
     runList.append(button);
     const family = document.createElement("nav");
