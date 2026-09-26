@@ -17,6 +17,7 @@ from purplemux_client import (
     BranchState,
     GitHubRepository,
     GitRepository,
+    LocalRefState,
     MutationOutcomeUnknown,
     PullRequestState,
     WorkerFailure,
@@ -2967,7 +2968,9 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
-        inspect_local_refs=lambda: {"refs/heads/feature/work": "b" * 40},
+        inspect_local_refs=lambda: {
+            "refs/heads/feature/work": LocalRefState("b" * 40, None)
+        },
         inspect_remote_refs=lambda: {"refs/heads/feature/work": "b" * 40},
     )
     github = SimpleNamespace(find_pr=lambda **kwargs: None)
@@ -3031,7 +3034,9 @@ def test_repository_recovery_rejects_unrecoverable_report(
             branch, "b" * 40, "b" * 40, True
         ),
         require_committed_result=require_recovery_commit,
-        inspect_local_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
+        inspect_local_refs=lambda: {
+            "refs/heads/dev/v1": LocalRefState("b" * 40, None)
+        },
         inspect_remote_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3091,7 +3096,9 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
-        inspect_local_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
+        inspect_local_refs=lambda: {
+            "refs/heads/dev/v1": LocalRefState("b" * 40, None)
+        },
         inspect_remote_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
     )
     github = SimpleNamespace(find_pr=lambda **kwargs: None)
@@ -3179,7 +3186,9 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
         inspect_remote_branches=lambda branches: {
             branch: "a" * 40 for branch in branches
         },
-        inspect_local_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
+        inspect_local_refs=lambda: {
+            "refs/heads/dev/v1": LocalRefState("b" * 40, None)
+        },
         inspect_remote_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3216,18 +3225,22 @@ def test_repository_recovery_rejects_changed_branch_or_remote_ref(
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    original = {"refs/heads/dev/v1": "a" * 40}
-    rewritten_local = {"refs/heads/dev/v1": "b" * 40}
-    rewritten_remote = {**original, "refs/tags/recovery-test": "b" * 40}
+    original = {"refs/heads/dev/v1": LocalRefState("a" * 40, None)}
+    rewritten_local = {"refs/heads/dev/v1": LocalRefState("b" * 40, None)}
+    original_remote = {"refs/heads/dev/v1": "a" * 40}
+    rewritten_remote = {**original_remote, "refs/tags/recovery-test": "b" * 40}
     local_refs = iter(
         (original, rewritten_local if changed == "local" else original)
     )
     remote_refs = iter(
-        (original, rewritten_remote if changed == "remote" else original)
+        (
+            original_remote,
+            rewritten_remote if changed == "remote" else original_remote,
+        )
     )
     inspections: list[str] = []
 
-    def inspect_local_refs() -> dict[str, str]:
+    def inspect_local_refs() -> dict[str, LocalRefState]:
         inspections.append("local")
         return next(local_refs)
 
@@ -3276,16 +3289,32 @@ def test_repository_recovery_rejects_changed_branch_or_remote_ref(
 
 
 @pytest.mark.parametrize("recovery_raises", [False, True])
-@pytest.mark.parametrize("changed_ref", ["refs/stash", "refs/tags/recovery-test"])
+@pytest.mark.parametrize(
+    ("changed_ref", "before", "after"),
+    [
+        ("refs/stash", None, LocalRefState("b" * 40, None)),
+        ("refs/tags/recovery-test", None, LocalRefState("b" * 40, None)),
+        (
+            "refs/remotes/origin/alias",
+            LocalRefState("a" * 40, None),
+            LocalRefState("a" * 40, "refs/heads/dev/v1"),
+        ),
+    ],
+)
 def test_repository_recovery_rejects_changed_non_head_local_ref(
-    changed_ref: str, recovery_raises: bool
+    changed_ref: str,
+    before: LocalRefState | None,
+    after: LocalRefState,
+    recovery_raises: bool,
 ) -> None:
     workflow = load_generated_workflow(issues=[90])
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    original = {"refs/heads/dev/v1": "a" * 40}
-    changed = {**original, changed_ref: "b" * 40}
+    original = {"refs/heads/dev/v1": LocalRefState("a" * 40, None)}
+    if before is not None:
+        original[changed_ref] = before
+    changed = {**original, changed_ref: after}
     local_refs = iter((original, changed))
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
@@ -3330,7 +3359,10 @@ def test_recovery_accepts_zero_commit_remote_fast_forward_without_provenance() -
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     local_heads = iter(
-        ({"refs/heads/dev/v1": "a" * 40}, {"refs/heads/dev/v1": "b" * 40})
+        (
+            {"refs/heads/dev/v1": LocalRefState("a" * 40, None)},
+            {"refs/heads/dev/v1": LocalRefState("b" * 40, None)},
+        )
     )
     committed_checks: list[tuple[str, dict[str, object]]] = []
 
@@ -3383,7 +3415,10 @@ def test_repository_recovery_requires_provenance_for_created_commits() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     local_heads = iter(
-        ({"refs/heads/dev/v1": "a" * 40}, {"refs/heads/dev/v1": "c" * 40})
+        (
+            {"refs/heads/dev/v1": LocalRefState("a" * 40, None)},
+            {"refs/heads/dev/v1": LocalRefState("c" * 40, None)},
+        )
     )
     provenance_checks: list[tuple[str, str, dict[str, object]]] = []
     repo = SimpleNamespace(
@@ -3434,7 +3469,10 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     local_heads = iter(
-        ({"refs/heads/dev/v1": "a" * 40}, {"refs/heads/dev/v1": "c" * 40})
+        (
+            {"refs/heads/dev/v1": LocalRefState("a" * 40, None)},
+            {"refs/heads/dev/v1": LocalRefState("c" * 40, None)},
+        )
     )
     ancestry_checks: list[tuple[str, str]] = []
     containment_checks: list[tuple[str, str]] = []
@@ -3495,7 +3533,10 @@ def test_recovery_keeps_local_provenance_boundary_when_remote_was_behind() -> No
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     local_heads = iter(
-        ({"refs/heads/dev/v1": "a" * 40}, {"refs/heads/dev/v1": "c" * 40})
+        (
+            {"refs/heads/dev/v1": LocalRefState("a" * 40, None)},
+            {"refs/heads/dev/v1": LocalRefState("c" * 40, None)},
+        )
     )
     ancestry_checks: list[tuple[str, str]] = []
     provenance_checks: list[tuple[str, str, dict[str, object]]] = []
@@ -3657,7 +3698,9 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
         require_committed_result=lambda branch, **kwargs: BranchState(
             branch, "b" * 40, "b" * 40, True
         ),
-        inspect_local_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
+        inspect_local_refs=lambda: {
+            "refs/heads/dev/v1": LocalRefState("b" * 40, None)
+        },
         inspect_remote_refs=lambda: {"refs/heads/dev/v1": "b" * 40},
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)

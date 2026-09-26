@@ -103,6 +103,7 @@ def test_guide_documents_bounded_local_git_recovery() -> None:
     assert "no remote Git ref mutation capability" in guide
     assert "every unrelated local ref must remain exact" in guide
     assert "all authoritative remote refs, including tags and notes" in guide
+    assert "both the object ID and symbolic target of each local ref" in guide
     assert "exact advance to the snapshotted authoritative remote head" in guide
     assert "any other new commits require recovery provenance" in guide
     assert "pre-recovery local head is an ancestor of the remote head" in guide

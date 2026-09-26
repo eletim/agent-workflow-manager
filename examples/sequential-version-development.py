@@ -25,6 +25,7 @@ from purplemux_client import (
     CreateWorkspaceRequest,
     GitHubRepository,
     GitRepository,
+    LocalRefState,
     MergeResult,
     MutationOutcomeUnknown,
     PullRequestState,
@@ -5784,11 +5785,23 @@ def _run_repository(
                         "published provenance"
                     )
                 recovery_branch_ref = f"refs/heads/{recovery_branch}"
-                recovery_end = recovered_local_refs.get(recovery_branch_ref)
+                recovered_branch_state = recovered_local_refs.get(recovery_branch_ref)
+                recovery_branch_start = recovery_local_refs.get(recovery_branch_ref)
+                recovery_end = (
+                    None
+                    if recovered_branch_state is None
+                    else recovered_branch_state.object_sha
+                )
                 expected_local_refs = dict(recovery_local_refs)
-                if recovery_end is not None:
-                    expected_local_refs[recovery_branch_ref] = recovery_end
-                if recovery_end is None or recovered_local_refs != expected_local_refs:
+                if recovery_end is not None and recovery_branch_start is not None:
+                    expected_local_refs[recovery_branch_ref] = LocalRefState(
+                        recovery_end, recovery_branch_start.symbolic_target
+                    )
+                if (
+                    recovery_end is None
+                    or recovery_branch_start is None
+                    or recovered_local_refs != expected_local_refs
+                ):
                     raise WorkerFailure(
                         "recovery changed local refs outside the active branch; "
                         "refusing to rewrite repository provenance"

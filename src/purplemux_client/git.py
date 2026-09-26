@@ -75,6 +75,12 @@ class BranchState:
 
 
 @dataclass(frozen=True)
+class LocalRefState:
+    object_sha: str
+    symbolic_target: str | None
+
+
+@dataclass(frozen=True)
 class FeaturePreparationState:
     branch: BranchState
     base: BranchState
@@ -359,24 +365,30 @@ class GitRepository:
             result[branch] = sha
         return result
 
-    def inspect_local_refs(self) -> dict[str, str]:
+    def inspect_local_refs(self) -> dict[str, LocalRefState]:
         """Enumerate refs stored in the local repository."""
         self._validate_identity()
         output = self._read(
-            ["for-each-ref", "--format=%(refname) %(objectname)", "refs"]
+            [
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)%00%(symref)",
+                "refs",
+            ]
         )
-        result: dict[str, str] = {}
+        result: dict[str, LocalRefState] = {}
         for line in output.splitlines():
-            ref, separator, sha = line.partition(" ")
+            fields = line.split("\0")
             if (
-                not separator
-                or not ref.startswith("refs/")
-                or not _OBJECT_ID_RE.fullmatch(sha)
+                len(fields) != 3
+                or not fields[0].startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(fields[1])
+                or (fields[2] and not fields[2].startswith("refs/"))
             ):
                 raise WorkerFailure("unexpected local ref enumeration result")
+            ref, sha, symbolic_target = fields
             if ref in result:
                 raise WorkerFailure("ambiguous local ref enumeration result")
-            result[ref] = sha
+            result[ref] = LocalRefState(sha, symbolic_target or None)
         return result
 
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:

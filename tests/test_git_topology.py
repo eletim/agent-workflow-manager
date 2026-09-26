@@ -12,6 +12,7 @@ import pytest
 
 from purplemux_client import (
     GitRepository,
+    LocalRefState,
     MutationOutcomeUnknown,
     WorkerFailure,
     agent_commit_coauthor,
@@ -346,10 +347,29 @@ def test_local_ref_enumeration_includes_stash_and_non_head_refs(
 
     refs = open_repo(work, RecordingGitRunner()).inspect_local_refs()
 
-    assert refs["refs/heads/main"] == head
-    assert refs["refs/remotes/origin/main"] == head
-    assert refs["refs/tags/local-test"] == head
+    assert refs["refs/heads/main"] == LocalRefState(head, None)
+    assert refs["refs/remotes/origin/main"] == LocalRefState(head, None)
+    assert refs["refs/tags/local-test"] == LocalRefState(head, None)
     assert "refs/stash" in refs
+
+
+def test_local_ref_enumeration_distinguishes_same_oid_symbolic_ref(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    head = git(work, "rev-parse", "HEAD")
+    ref = "refs/remotes/origin/recovery-alias"
+    git(work, "update-ref", ref, head)
+    repo = open_repo(work, RecordingGitRunner())
+    direct = repo.inspect_local_refs()[ref]
+
+    git(work, "symbolic-ref", ref, "refs/heads/main")
+    symbolic = repo.inspect_local_refs()[ref]
+
+    assert direct == LocalRefState(head, None)
+    assert symbolic == LocalRefState(head, "refs/heads/main")
+    assert direct.object_sha == symbolic.object_sha
+    assert direct != symbolic
 
 
 def test_remote_notes_persist_recovery_state_without_moving_branches(

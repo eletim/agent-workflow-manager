@@ -627,7 +627,7 @@ repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_remote_refs() -> dict[str, str]
-repo.inspect_local_refs() -> dict[str, str]
+repo.inspect_local_refs() -> dict[str, LocalRefState]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -654,7 +654,8 @@ development branch with the remote's current branch set.
 `inspect_local_branch_heads()` provides the corresponding authoritative local
 branch set across linked worktrees. Repository recovery instead snapshots all
 local `refs/*` and all authoritative remote refs, including tags and notes, and
-starts the recovery agent through the normal session and validated-turn APIs
+records both the object ID and symbolic target of each local ref. It then starts
+the recovery agent through the normal session and validated-turn APIs
 with the `local-git-only` restriction. That boundary denies remote Git ref
 mutation while allowing a necessary local commit or fast-forward. Codex retains
 native read-only remote search; Claude retains explicitly allowlisted local Git
