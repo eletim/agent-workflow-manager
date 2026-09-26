@@ -155,6 +155,158 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
+def test_restricted_session_uses_common_turn_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeRunner([completed({"tabId": "tab-restricted"})])
+    cli = client(runner)
+    session = cli.create_session(
+        CreateSessionRequest(
+            worker="codex",
+            cwd="/workspace/project",
+            command="codex",
+            restriction="preserve-git-refs",
+        )
+    )
+    started: list[ShellCommandRequest] = []
+    waited: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        cli,
+        "_status",
+        lambda tab: {"panelType": "terminal", "alive": True},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_start_shell_run",
+        lambda tab, request, cwd: started.append(request),
+    )
+    monkeypatch.setattr(
+        cli,
+        "wait_for_shell_completion",
+        lambda tab, timeout: waited.append((tab, timeout)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "read_shell_result",
+        lambda tab: client_module.ShellResult(0, stdout="validated output\n"),
+    )
+
+    cli.wait_until_ready(session, 10)
+    cli.send_input(session, "inspect and repair")
+    cli.wait_for_turn_completion(session, 20)
+
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    assert create[-1] == "terminal"
+    assert len(started) == 1
+    assert "inspect and repair" not in started[0].command
+    assert waited == [(session, 20)]
+    assert cli.read_result(session) == "validated output"
+
+
+@pytest.mark.parametrize(
+    ("worker", "required"),
+    [
+        (
+            "codex",
+            (
+                "--sandbox workspace-write",
+                "network_access=false",
+                "exclude_tmpdir_env_var=true",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_TERMINAL_PROMPT=0",
+                "--search",
+            ),
+        ),
+        (
+            "claude",
+            (
+                "--restricted",
+                "--permission-prompts none",
+                "Bash(gh pr edit *)",
+                "Bash(gh issue edit *)",
+            ),
+        ),
+    ],
+)
+def test_restricted_session_preserves_safe_remote_capabilities(
+    worker: str, required: tuple[str, ...]
+) -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command(worker, "inspect safely")
+
+    assert all(value in command for value in required)
+    assert "GIT_SSH_COMMAND=false" in command
+    if worker == "codex":
+        assert "-u GH_TOKEN" in command
+        assert "-u GITHUB_TOKEN" in command
+        assert "GH_CONFIG_DIR=/dev/null" in command
+        assert command.index("--ask-for-approval never") < command.index(" exec ")
+    else:
+        assert "-u GH_TOKEN" not in command
+        assert "-u GITHUB_TOKEN" not in command
+
+
+def test_restricted_claude_does_not_allow_pr_close_delete_branch() -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command(
+        "claude", "Run gh pr close 123 --delete-branch"
+    )
+    arguments = shlex.split(command)
+    allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+
+    assert "Bash(gh pr close *)" not in allowed_tools
+    assert not any(tool.startswith("Bash(gh pr close") for tool in allowed_tools)
+    assert "Bash(gh pr edit *)" in allowed_tools
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        "gh api --method PATCH repos/acme/project/git/refs/heads/main",
+        "git push --force https://x-access-token:${GH_TOKEN}@github.com/acme/project.git",
+    ],
+)
+def test_restricted_codex_denies_authenticated_ref_update_capabilities(
+    attempt: str, tmp_path: Path
+) -> None:
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"${GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|\""
+        "\"${GH_CONFIG_DIR-unset}|$*\"\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    command = PurpleMuxCLIClient._restricted_agent_command("codex", attempt)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "GH_TOKEN": "push-capable-gh-token",
+            "GITHUB_TOKEN": "push-capable-github-token",
+        }
+    )
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert attempt not in command
+    assert "sandbox_workspace_write.network_access=false" in command
+    assert "-u GH_TOKEN" in command
+    assert "-u GITHUB_TOKEN" in command
+    assert "GH_CONFIG_DIR=/dev/null" in command
+    token, github_token, config_dir, arguments = result.stdout.strip().split("|", 3)
+    assert token == github_token == "unset"
+    assert config_dir == "/dev/null"
+    assert "sandbox_workspace_write.network_access=false" in arguments
+
+
 def test_session_deadline_only_limits_tab_create_command() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
     cli = client(runner, command_timeout_seconds=30)

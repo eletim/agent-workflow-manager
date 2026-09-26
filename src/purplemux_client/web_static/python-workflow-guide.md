@@ -330,7 +330,15 @@ The request and returned-state shapes used by workflow code are:
 
 ```python
 CreateWorkspaceRequest(cwd, name, correlation_id=None)
-CreateSessionRequest(worker, cwd, command, metadata={}, name=None, correlation_id=None)
+CreateSessionRequest(
+    worker,
+    cwd,
+    command,
+    metadata={},
+    name=None,
+    correlation_id=None,
+    restriction=None,
+)
 ShellCommandRequest(command, cwd, name, correlation_id=None)
 
 WorkspaceState(
@@ -555,8 +563,13 @@ project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrate
 `.config.json`, legacy `.claude.json`, and custom-OAuth state precedence;
 unrelated state is preserved, and updates coordinate on Claude's state-file lock.
 Claude home-directory trust fails early because Claude does not persist it.
-Neither provider integration changes sandbox or approval policy, and AWM does
-not use a broad permission bypass, screen-text detection, or simulated
+Ordinary provider sessions do not change sandbox or approval policy. A session
+may explicitly request the `preserve-git-refs` restriction; that reusable
+profile runs turns in a managed terminal with provider-native restrictions on
+Git metadata writes and pushes. Codex recovery has no shell network or GitHub
+credentials and retains read-only remote inspection through native search;
+Claude recovery retains only an explicit allowlist of non-ref GitHub operations.
+AWM does not use a broad permission bypass, screen-text detection, or simulated
 trust-dialog keystrokes.
 
 Relevant errors all derive from `TerminalSessionError`:
@@ -633,6 +646,15 @@ repo.inspect_remote_note(ref, object_sha) -> str | None
 `inspect_remote_branch_heads()` enumerates the remote directly and does not
 trust local tracking refs. Use it when a workflow must compare a configured
 development branch with the remote's current branch set.
+`inspect_local_branch_heads()` provides the corresponding authoritative local
+branch set across linked worktrees. Repository recovery snapshots both sets and
+starts the recovery agent through the normal session and validated-turn APIs
+with the `preserve-git-refs` restriction. That boundary denies Git metadata
+writes and authenticated pushes. Codex retains native read-only remote search;
+Claude retains explicitly allowlisted non-ref GitHub operations. It then requires
+both ref sets to remain exact as defense in depth: recovery never repairs
+provenance by amending, rebasing, resetting, or otherwise rewriting local or
+remote-visible history.
 
 The inspection-aware Git operations that may mutate are:
 

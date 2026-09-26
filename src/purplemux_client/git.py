@@ -315,6 +315,28 @@ class GitRepository:
             result[branch] = fields[0]
         return result
 
+    def inspect_local_branch_heads(self) -> dict[str, str]:
+        """Enumerate authoritative local branch heads across every worktree."""
+        self._validate_identity()
+        output = self._read(
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]
+        )
+        prefix = "refs/heads/"
+        result: dict[str, str] = {}
+        for line in output.splitlines():
+            ref, separator, sha = line.partition(" ")
+            if (
+                not separator
+                or not ref.startswith(prefix)
+                or not _OBJECT_ID_RE.fullmatch(sha)
+            ):
+                raise WorkerFailure("unexpected local branch enumeration result")
+            branch = ref.removeprefix(prefix)
+            if not branch or branch in result:
+                raise WorkerFailure("ambiguous local branch enumeration result")
+            result[branch] = sha
+        return result
+
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
         """Read a note from an AWM-owned remote ref without changing branch heads."""
         self._validate_identity()
