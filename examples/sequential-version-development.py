@@ -589,7 +589,7 @@ def create_agent(
     *,
     agent_type: str,
     name: str,
-    restriction: Literal["local-git-only"] | None = None,
+    restriction: Literal["local-git-only", "publication-disabled"] | None = None,
 ) -> str:
     correlation_id = run_correlation(name)
     return client.create_session(
@@ -3257,7 +3257,7 @@ def process_issue(
             config,
             agent_type=IMPLEMENTER_AGENT,
             name=f"{issue.label} worktree cleanup",
-            restriction="local-git-only",
+            restriction="publication-disabled",
         )
         require_clean_worktree(
             repo,
@@ -3426,7 +3426,7 @@ def process_issue(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name=f"{issue.label} implementer",
-        restriction="local-git-only",
+        restriction="publication-disabled",
     )
     scope_reviewer = create_agent(
         client,
@@ -4633,7 +4633,7 @@ def _review_whole_version(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Whole-version fixer",
-        restriction="local-git-only",
+        restriction="publication-disabled",
     )
     reviewer = create_agent(
         client,
@@ -5493,7 +5493,7 @@ def integration_delivery(
                     config,
                     agent_type=IMPLEMENTER_AGENT,
                     name="Whole-version cleanup",
-                    restriction="local-git-only",
+                    restriction="publication-disabled",
                 )
             if cleanup is None:
                 checked = repo.require_committed_result(

@@ -55,7 +55,7 @@ class CreateSessionRequest:
     name: str | None = None
     correlation_id: str | None = None
     deadline_check: Callable[[], float] | None = None
-    restriction: Literal["local-git-only"] | None = None
+    restriction: Literal["local-git-only", "publication-disabled"] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +165,7 @@ class _ShellRun:
 class _RestrictedSession:
     worker: str
     cwd: str
+    restriction: Literal["local-git-only", "publication-disabled"]
     initial_prompt: str | None = None
 
 
@@ -691,7 +692,11 @@ class PurpleMuxCLIClient:
         """Create and launch a Codex or Claude session."""
         if request.deadline_check is not None:
             request.deadline_check()
-        if request.restriction not in (None, "local-git-only"):
+        if request.restriction not in (
+            None,
+            "local-git-only",
+            "publication-disabled",
+        ):
             raise ValueError("unsupported agent session restriction")
         panel_type = _PANEL_TYPES.get(request.worker.lower())
         if panel_type is None:
@@ -727,7 +732,7 @@ class PurpleMuxCLIClient:
         name = request.name or f"awm-{panel_type}-{correlation_id}"
         if request.name is not None:
             name = self.correlated_session_name(name, correlation_id)
-        restricted = request.restriction == "local-git-only"
+        restricted = request.restriction is not None
         tab = self._create_correlated_tab(
             panel_type="terminal" if restricted else panel_type,
             provider=None
@@ -743,6 +748,7 @@ class PurpleMuxCLIClient:
             self._restricted_sessions[tab.id] = _RestrictedSession(
                 "codex" if panel_type == "codex-cli" else "claude",
                 launch_directory,
+                request.restriction,
             )
         return tab.id
 
@@ -1131,7 +1137,13 @@ class PurpleMuxCLIClient:
             self._start_shell_run(
                 session_id,
                 ShellCommandRequest(
-                    self._restricted_agent_command(restricted.worker, prompt),
+                    (
+                        self._restricted_agent_command(restricted.worker, prompt)
+                        if restricted.restriction == "local-git-only"
+                        else self._publication_disabled_agent_command(
+                            restricted.worker, prompt
+                        )
+                    ),
                     restricted.cwd,
                     "Restricted agent turn",
                 ),
@@ -1369,7 +1381,7 @@ class PurpleMuxCLIClient:
 
     @staticmethod
     def _restricted_agent_command(worker: str, prompt: str) -> str:
-        """Launch an agent with local Git but no publication capability."""
+        """Launch a Recovery agent with tightly bounded local Git capability."""
         encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         reference_hook = base64.b64encode(
             b"""#!/bin/sh
@@ -1383,6 +1395,155 @@ while read old new ref; do
         continue
     fi
     [ "$ref" = HEAD ] || [ "$ref" = "$AWM_RECOVERY_PROTECTED_REF" ] || exit 1
+    [ "$old" != "$zero" ] || exit 1
+    [ "$new" != "$zero" ] || exit 1
+    git merge-base --is-ancestor "$old" "$new" || exit 1
+done
+"""
+        ).decode("ascii")
+        pre_push_hook = base64.b64encode(b"#!/bin/sh\nexit 1\n").decode("ascii")
+        environment_options = [
+            "env",
+            "-u",
+            "GIT_ASKPASS",
+            "-u",
+            "SSH_ASKPASS",
+            "-u",
+            "SSH_AUTH_SOCK",
+            "-u",
+            "GIT_DIR",
+            "-u",
+            "GIT_WORK_TREE",
+        ]
+        git_environment = [
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_TERMINAL_PROMPT=0",
+            "GCM_INTERACTIVE=never",
+            "GIT_SSH_COMMAND=false",
+            "GIT_CONFIG_COUNT=2",
+            "GIT_CONFIG_KEY_0=credential.helper",
+            "GIT_CONFIG_VALUE_0=",
+            "GIT_CONFIG_KEY_1=core.hooksPath",
+        ]
+        if worker == "codex":
+            command = [
+                *environment_options,
+                "-u",
+                "GH_TOKEN",
+                "-u",
+                "GITHUB_TOKEN",
+                *git_environment,
+                "GH_CONFIG_DIR=/dev/null",
+                "codex",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "--search",
+                "--config",
+                "sandbox_workspace_write.network_access=false",
+                "--config",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                "--config",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "exec",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--color",
+                "never",
+                "--cd",
+                ".",
+                "-",
+            ]
+        elif worker == "claude":
+            safe_tools = ",".join(
+                (
+                    "Read",
+                    "Edit",
+                    "Write",
+                    "Glob",
+                    "Grep",
+                    "WebFetch",
+                    "Bash(git add *)",
+                    "Bash(git branch --show-current)",
+                    "Bash(git commit -m *)",
+                    "Bash(git diff *)",
+                    "Bash(git log *)",
+                    "Bash(git merge --ff-only *)",
+                    "Bash(git merge-base *)",
+                    "Bash(git rev-parse *)",
+                    "Bash(git show *)",
+                    "Bash(git status *)",
+                    "Bash(gh pr view *)",
+                    "Bash(gh pr edit *)",
+                    "Bash(gh pr ready *)",
+                    "Bash(gh pr reopen *)",
+                    "Bash(gh issue view *)",
+                    "Bash(gh issue edit *)",
+                    "Bash(gh issue close *)",
+                    "Bash(gh issue reopen *)",
+                    "Bash(gh issue comment *)",
+                )
+            )
+            command = [
+                *environment_options,
+                *git_environment,
+                "claude",
+                "--print",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--restricted",
+                "--allowed-tools",
+                safe_tools,
+                "--permission-mode",
+                "dontAsk",
+                "--permission-prompts",
+                "none",
+                "--output-format",
+                "text",
+            ]
+        else:
+            raise WorkerFailure("restricted session worker must be codex or claude")
+        launch = shlex.join(command)
+        return (
+            "awm_recovery_hooks_root=$(git rev-parse --git-path hooks) && "
+            "mkdir -p -- \"$awm_recovery_hooks_root\" && "
+            "awm_recovery_hooks_root=$(cd \"$awm_recovery_hooks_root\" && pwd -P) && "
+            'awm_recovery_hooks=$(mktemp -d '
+            '"$awm_recovery_hooks_root/awm-recovery.XXXXXX") && '
+            "trap 'rm -r -- \"$awm_recovery_hooks\"' EXIT && "
+            "awm_recovery_ref=$(git symbolic-ref -q HEAD) && "
+            f"printf %s {reference_hook} | base64 --decode > "
+            '"$awm_recovery_hooks/reference-transaction" && '
+            f"printf %s {pre_push_hook} | base64 --decode > "
+            '"$awm_recovery_hooks/pre-push" && '
+            'chmod 500 "$awm_recovery_hooks/reference-transaction" '
+            '"$awm_recovery_hooks/pre-push" && '
+            f"printf %s {encoded} | base64 --decode | "
+            'AWM_RECOVERY_PROTECTED_REF="$awm_recovery_ref" '
+            'GIT_CONFIG_VALUE_1="$awm_recovery_hooks" '
+            f"{launch}"
+        )
+
+    @staticmethod
+    def _publication_disabled_agent_command(worker: str, prompt: str) -> str:
+        """Launch a development agent with local commits but no publication."""
+        encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        reference_hook = base64.b64encode(
+            b"""#!/bin/sh
+phase=$1
+[ "$phase" = prepared ] || exit 0
+zero=0000000000000000000000000000000000000000
+while read old new ref; do
+    if [ "$ref" = ORIG_HEAD ]; then
+        protected=$(git rev-parse "$AWM_DELIVERY_PROTECTED_REF") || exit 1
+        [ "$new" = "$protected" ] || exit 1
+        continue
+    fi
+    [ "$ref" = HEAD ] || [ "$ref" = "$AWM_DELIVERY_PROTECTED_REF" ] || exit 1
     [ "$old" != "$zero" ] || exit 1
     [ "$new" != "$zero" ] || exit 1
     git merge-base --is-ancestor "$old" "$new" || exit 1
@@ -1453,18 +1614,7 @@ done
                     "Glob",
                     "Grep",
                     "WebFetch",
-                    "Bash(git add *)",
-                    "Bash(git branch --show-current)",
-                    "Bash(git commit -m *)",
-                    "Bash(git diff *)",
-                    "Bash(git log *)",
-                    "Bash(git merge --ff-only *)",
-                    "Bash(git merge-base *)",
-                    "Bash(git rev-parse *)",
-                    "Bash(git show *)",
-                    "Bash(git status *)",
-                    "Bash(gh pr view *)",
-                    "Bash(gh issue view *)",
+                    "Bash",
                 )
             )
             command = [
@@ -1486,27 +1636,29 @@ done
                 "text",
             ]
         else:
-            raise WorkerFailure("restricted session worker must be codex or claude")
+            raise WorkerFailure(
+                "publication-disabled session worker must be codex or claude"
+            )
         launch = shlex.join(command)
         return (
-            "awm_recovery_hooks_root=$(git rev-parse --git-path hooks) && "
-            "mkdir -p -- \"$awm_recovery_hooks_root\" && "
-            "awm_recovery_hooks_root=$(cd \"$awm_recovery_hooks_root\" && pwd -P) && "
-            'awm_recovery_hooks=$(mktemp -d '
-            '"$awm_recovery_hooks_root/awm-recovery.XXXXXX") && '
-            'mkdir -p -- "$awm_recovery_hooks/gh" && '
-            "trap 'rm -r -- \"$awm_recovery_hooks\"' EXIT && "
-            "awm_recovery_ref=$(git symbolic-ref -q HEAD) && "
+            "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
+            "mkdir -p -- \"$awm_delivery_hooks_root\" && "
+            "awm_delivery_hooks_root=$(cd \"$awm_delivery_hooks_root\" && pwd -P) && "
+            'awm_delivery_hooks=$(mktemp -d '
+            '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
+            'mkdir -p -- "$awm_delivery_hooks/gh" && '
+            "trap 'rm -r -- \"$awm_delivery_hooks\"' EXIT && "
+            "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
             f"printf %s {reference_hook} | base64 --decode > "
-            '"$awm_recovery_hooks/reference-transaction" && '
+            '"$awm_delivery_hooks/reference-transaction" && '
             f"printf %s {pre_push_hook} | base64 --decode > "
-            '"$awm_recovery_hooks/pre-push" && '
-            'chmod 500 "$awm_recovery_hooks/reference-transaction" '
-            '"$awm_recovery_hooks/pre-push" && '
+            '"$awm_delivery_hooks/pre-push" && '
+            'chmod 500 "$awm_delivery_hooks/reference-transaction" '
+            '"$awm_delivery_hooks/pre-push" && '
             f"printf %s {encoded} | base64 --decode | "
-            'AWM_RECOVERY_PROTECTED_REF="$awm_recovery_ref" '
-            'GH_CONFIG_DIR="$awm_recovery_hooks/gh" '
-            'GIT_CONFIG_VALUE_1="$awm_recovery_hooks" '
+            'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
+            'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
+            'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
             f"{launch}"
         )
 

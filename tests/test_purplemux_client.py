@@ -155,8 +155,10 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
+@pytest.mark.parametrize("restriction", ["local-git-only", "publication-disabled"])
 def test_restricted_session_uses_common_turn_interface(
     monkeypatch: pytest.MonkeyPatch,
+    restriction: str,
 ) -> None:
     runner = FakeRunner([completed({"tabId": "tab-restricted"})])
     cli = client(runner)
@@ -165,7 +167,7 @@ def test_restricted_session_uses_common_turn_interface(
             worker="codex",
             cwd="/workspace/project",
             command="codex",
-            restriction="local-git-only",
+            restriction=restriction,  # type: ignore[arg-type]
         )
     )
     started: list[ShellCommandRequest] = []
@@ -222,8 +224,8 @@ def test_restricted_session_uses_common_turn_interface(
             (
                 "--restricted",
                 "--permission-prompts none",
-                "Bash(gh pr view *)",
-                "Bash(gh issue view *)",
+                "Bash(gh pr edit *)",
+                "Bash(gh issue edit *)",
             ),
         ),
     ],
@@ -238,11 +240,11 @@ def test_restricted_session_preserves_safe_remote_capabilities(
     if worker == "codex":
         assert "-u GH_TOKEN" in command
         assert "-u GITHUB_TOKEN" in command
-        assert 'GH_CONFIG_DIR="$awm_recovery_hooks/gh"' in command
+        assert "GH_CONFIG_DIR=/dev/null" in command
         assert command.index("--ask-for-approval never") < command.index(" exec ")
     else:
-        assert "-u GH_TOKEN" in command
-        assert "-u GITHUB_TOKEN" in command
+        assert "-u GH_TOKEN" not in command
+        assert "-u GITHUB_TOKEN" not in command
 
 
 def test_restricted_claude_allows_only_bounded_local_git_mutations() -> None:
@@ -258,7 +260,7 @@ def test_restricted_claude_allows_only_bounded_local_git_mutations() -> None:
     assert not any("git rebase" in tool for tool in allowed_tools)
 
 
-def test_restricted_claude_does_not_allow_github_mutations() -> None:
+def test_restricted_claude_does_not_allow_pr_close_delete_branch() -> None:
     command = PurpleMuxCLIClient._restricted_agent_command(
         "claude", "Run gh pr close 123 --delete-branch"
     )
@@ -267,10 +269,7 @@ def test_restricted_claude_does_not_allow_github_mutations() -> None:
 
     assert "Bash(gh pr close *)" not in allowed_tools
     assert not any(tool.startswith("Bash(gh pr close") for tool in allowed_tools)
-    assert "Bash(gh pr edit *)" not in allowed_tools
-    assert "Bash(gh issue edit *)" not in allowed_tools
-    assert "Bash(gh pr view *)" in allowed_tools
-    assert "Bash(gh issue view *)" in allowed_tools
+    assert "Bash(gh pr edit *)" in allowed_tools
 
 
 @pytest.mark.parametrize(
@@ -281,7 +280,7 @@ def test_restricted_claude_does_not_allow_github_mutations() -> None:
     ],
 )
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_restricted_agent_denies_authenticated_ref_update_capabilities(
+def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
     attempt: str, worker: str, tmp_path: Path
 ) -> None:
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
@@ -293,7 +292,7 @@ def test_restricted_agent_denies_authenticated_ref_update_capabilities(
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
-    command = PurpleMuxCLIClient._restricted_agent_command(worker, attempt)
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(worker, attempt)
     environment = os.environ.copy()
     environment.update(
         {
@@ -317,12 +316,30 @@ def test_restricted_agent_denies_authenticated_ref_update_capabilities(
     assert attempt not in command
     assert "-u GH_TOKEN" in command
     assert "-u GITHUB_TOKEN" in command
-    assert 'GH_CONFIG_DIR="$awm_recovery_hooks/gh"' in command
+    assert 'GH_CONFIG_DIR="$awm_delivery_hooks/gh"' in command
     token, github_token, config_dir, arguments = result.stdout.strip().split("|", 3)
     assert token == github_token == "unset"
     assert config_dir.endswith("/gh")
     if worker == "codex":
         assert "sandbox_workspace_write.network_access=false" in arguments
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_agent_retains_development_tools(worker: str) -> None:
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        worker, "run the project tests, lint, formatter, and build"
+    )
+
+    assert "GIT_SSH_COMMAND=false" in command
+    assert "pre-push" in command
+    if worker == "codex":
+        assert "--sandbox workspace-write" in command
+        assert "--ask-for-approval never" in command
+    else:
+        arguments = shlex.split(command)
+        allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+        assert "Bash" in allowed_tools
+        assert not any(tool.startswith("Bash(") for tool in allowed_tools)
 
 
 def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_tags(

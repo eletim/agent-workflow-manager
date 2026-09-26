@@ -566,14 +566,16 @@ project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrate
 `.config.json`, legacy `.claude.json`, and custom-OAuth state precedence;
 unrelated state is preserved, and updates coordinate on Claude's state-file lock.
 Claude home-directory trust fails early because Claude does not persist it.
-Ordinary provider sessions do not change sandbox or approval policy. A session
-may explicitly request the `local-git-only` restriction; that reusable profile
-runs turns in a managed terminal with local Git access but no remote Git ref
-mutation capability. Codex recovery has no shell network or GitHub credentials
-and retains read-only remote inspection through native search. Claude recovery
-has an explicit allowlist of local Git inspection, staging, commit, and
-fast-forward commands plus non-ref GitHub operations; push, reset, rebase, and
-unrestricted shell commands remain unavailable.
+Ordinary provider sessions do not change sandbox or approval policy. Normal
+commit-producing sessions use the `publication-disabled` restriction. It retains
+the provider's repository development tools, including project-specific test,
+build, lint, and formatting commands, while removing authenticated publication
+credentials, rejecting Git pushes, and preventing PR management. Recovery uses
+the separate, tighter `local-git-only` restriction. Codex recovery has no shell
+network or GitHub credentials and retains read-only remote inspection through
+native search. Claude recovery has an explicit allowlist of local Git inspection,
+staging, commit, and fast-forward commands plus non-ref GitHub operations; push,
+reset, rebase, and unrestricted shell commands remain unavailable.
 AWM does not use a broad permission bypass, screen-text detection, or simulated
 trust-dialog keystrokes.
 
@@ -661,8 +663,10 @@ development branch with the remote's current branch set.
 branch set across linked worktrees. Repository recovery instead snapshots all
 local `refs/*` and all authoritative remote refs, including tags and notes, and
 records both the object ID and symbolic target of each local ref. It then starts
-the recovery agent through the normal session and validated-turn APIs
-with the `local-git-only` restriction. Recovery requires a clean worktree before
+the recovery agent through the normal session and validated-turn APIs with the
+Recovery-only `local-git-only` restriction, never the broader
+`publication-disabled` development profile. That boundary has no remote Git ref
+mutation capability. Recovery requires a clean worktree before
 launch so restoration cannot discard pre-existing staged or unstaged changes.
 The restricted session installs a temporary Git reference-transaction hook that
 allows only a fast-forward of the active branch, plus a pre-push hook that rejects

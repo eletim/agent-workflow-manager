@@ -109,3 +109,12 @@ def test_guide_documents_bounded_local_git_recovery() -> None:
     assert "pre-recovery local head is an ancestor of the remote head" in guide
     assert "commits after the remote head attributed to recovery" in guide
     assert "both ref sets to remain exact" not in guide
+
+
+def test_guide_separates_development_and_recovery_capabilities() -> None:
+    guide = " ".join(GUIDE.read_text(encoding="utf-8").split())
+
+    assert "Normal commit-producing sessions use the `publication-disabled`" in guide
+    assert "project-specific test, build, lint, and formatting commands" in guide
+    assert "Recovery uses the separate, tighter `local-git-only` restriction" in guide
+    assert "Recovery-only `local-git-only` restriction" in guide

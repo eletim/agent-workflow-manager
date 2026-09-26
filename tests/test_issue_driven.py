@@ -2595,12 +2595,12 @@ def test_generated_workflow_restricts_every_coding_session_from_publication() ->
             else None
         )
 
+    assert restrictions["Recovery agent"] == "local-git-only"
     assert {
         label
         for label, restriction in restrictions.items()
-        if restriction == "local-git-only"
+        if restriction == "publication-disabled"
     } == {
-        "Recovery agent",
         " worktree cleanup",
         " implementer",
         "Whole-version fixer",
@@ -2735,7 +2735,8 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "push the exact normalized commit" in code
     assert "Your delivery responsibility ends with clean local commits" in code
     assert "Do not push, create or update a PR, or change PR state" in prompt
-    assert code.count('restriction="local-git-only"') == 5
+    assert code.count('restriction="local-git-only"') == 1
+    assert code.count('restriction="publication-disabled"') == 4
     assert (
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers"
         in code
