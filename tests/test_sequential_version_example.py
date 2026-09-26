@@ -2331,6 +2331,7 @@ def test_failed_mutating_turn_validates_commits_before_retry(
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     branch = "feature/failed-turn"
+    normalizations: list[tuple[str, str, str, dict[str, object]]] = []
     provenance: list[tuple[str, str, dict[str, object]]] = []
 
     class Repository:
@@ -2339,6 +2340,12 @@ def test_failed_mutating_turn_validates_commits_before_retry(
         def require_current_branch(self, current: str) -> BranchState:
             assert current == branch
             return BranchState(current, self.local_sha, None, True)
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            normalizations.append((current, start, end, kwargs))
+            return BranchState(current, end, None, True)
 
         def require_agent_commit_provenance(
             self, start: str, end: str, **kwargs: object
@@ -2375,6 +2382,18 @@ def test_failed_mutating_turn_validates_commits_before_retry(
             branch=branch,
             expected_process="implementation",
         )
+    assert normalizations == [
+        (
+            branch,
+            "before",
+            "failed-turn-commit",
+            {
+                "expected_agent": "codex",
+                "expected_process": "implementation",
+                "allow_unchanged": True,
+            },
+        )
+    ]
     assert provenance == [
         (
             "before",
@@ -2399,6 +2418,12 @@ def test_post_result_provenance_failure_closes_started_agent_trace(
         def require_current_branch(self, current: str) -> BranchState:
             assert current == branch
             return BranchState(current, "agent-head", None, True)
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **_kwargs: object
+        ) -> BranchState:
+            assert (current, start, end) == (branch, "agent-head", "agent-head")
+            return BranchState(current, end, None, True)
 
         def require_agent_commit_provenance(
             self, start: str, end: str, **_kwargs: object

@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,13 @@ _AGENT_COMMIT_COAUTHORS = {
     "codex": "Codex <noreply@openai.com>",
     "claude": "Claude <noreply@anthropic.com>",
 }
+_AGENT_PROVENANCE_LINE_RE = re.compile(
+    r"^(AWM-Agent|AWM-Process|Co-authored-by):[ \t]*(.*?)[ \t]*$",
+    re.IGNORECASE,
+)
+_AGENT_PROVENANCE_PREFIX_RE = re.compile(
+    r"^(AWM-Agent|AWM-Process)(?:\s|:|=)", re.IGNORECASE
+)
 
 
 def agent_commit_coauthor(agent: str) -> str:
@@ -561,6 +569,244 @@ class GitRepository:
                 raise WorkerFailure(
                     f"commit {commit_sha} must attribute {coauthor} as a co-author"
                 )
+
+    def normalize_agent_commit_provenance(
+        self,
+        branch: str,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        expected_process: str,
+        allow_unchanged: bool = False,
+    ) -> BranchState:
+        """Normalize unambiguous provenance on an unpublished agent commit range."""
+        self._validate_sha(previous_sha)
+        self._validate_sha(current_sha)
+        coauthor = agent_commit_coauthor(expected_agent)
+        if expected_process not in {
+            "implementation",
+            "reviewer-fix",
+            "cleanup",
+            "recovery",
+        }:
+            raise ValueError("expected_process is not a supported agent process")
+        self.require_clean()
+        state = self.require_current_branch(branch)
+        if state.local_sha != current_sha:
+            raise WorkerFailure(
+                f"local {branch!r} changed: expected {current_sha}, "
+                f"found {state.local_sha}"
+            )
+        if current_sha == previous_sha:
+            if allow_unchanged:
+                return state
+            raise WorkerFailure("agent turn produced no new commit")
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._is_ancestor(previous_sha, current_sha):
+            raise WorkerFailure(
+                f"commit {current_sha} does not descend from pre-turn commit "
+                f"{previous_sha}"
+            )
+        commits = self._read(
+            ["rev-list", "--reverse", "--topo-order", f"{previous_sha}..{current_sha}"]
+        ).splitlines()
+        commit_data: list[tuple[str, list[str], str, str]] = []
+        needs_normalization = False
+        for commit_sha in commits:
+            raw = self._command(["cat-file", "commit", commit_sha], {0}).stdout
+            headers, separator, message = raw.partition("\n\n")
+            if not separator:
+                raise WorkerFailure(f"commit {commit_sha} has no message boundary")
+            header_lines = headers.splitlines()
+            normalized = self._normalize_agent_message(
+                message,
+                commit_sha=commit_sha,
+                expected_agent=expected_agent,
+                expected_process=expected_process,
+                coauthor=coauthor,
+            )
+            commit_data.append((commit_sha, header_lines, message, normalized))
+            needs_normalization = needs_normalization or normalized != message
+
+        if not needs_normalization:
+            self.require_agent_commit_provenance(
+                previous_sha,
+                current_sha,
+                expected_agent=expected_agent,
+                expected_process=expected_process,
+            )
+            return state
+
+        remote_before = state.remote_sha
+        if remote_before is not None:
+            if not self._has_commit(remote_before):
+                self._fetch_branch(branch, remote_before)
+            if not self._is_ancestor(remote_before, previous_sha):
+                raise WorkerFailure(
+                    "refusing to normalize agent provenance because the remote "
+                    f"{branch!r} does not precede the agent commit range"
+                )
+
+        rewritten: dict[str, str] = {}
+        for commit_sha, header_lines, message, normalized in commit_data:
+            rewritten_headers = [
+                f"parent {rewritten.get(line.removeprefix('parent '), line.removeprefix('parent '))}"
+                if line.startswith("parent ")
+                else line
+                for line in header_lines
+            ]
+            parent_changed = rewritten_headers != header_lines
+            if normalized == message and not parent_changed:
+                rewritten[commit_sha] = commit_sha
+                continue
+            if any(
+                line.startswith(("gpgsig ", "gpgsig-sha256 ", "mergetag "))
+                for line in header_lines
+            ):
+                raise WorkerFailure(
+                    f"commit {commit_sha} has signed commit metadata that cannot "
+                    "be preserved while normalizing provenance"
+                )
+            rewritten_raw = "\n".join(rewritten_headers) + "\n\n" + normalized
+            rewritten[commit_sha] = self._write_commit_object(rewritten_raw)
+
+        normalized_sha = rewritten[current_sha]
+        checkout_branch = self._checkout_branch(branch)
+
+        def require_unchanged_preconditions() -> None:
+            self.require_clean()
+            current = self.require_current_branch(branch)
+            if current.local_sha != current_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed before provenance normalization: "
+                    f"expected {current_sha}, found {current.local_sha}"
+                )
+            actual_remote = self._remote_sha(branch)
+            if actual_remote != remote_before:
+                raise WorkerFailure(
+                    f"remote {branch!r} changed before provenance normalization: "
+                    f"expected {remote_before}, found {actual_remote}"
+                )
+
+        self._git_mutation(
+            [
+                "update-ref",
+                f"refs/heads/{checkout_branch}",
+                normalized_sha,
+                current_sha,
+            ],
+            operation="normalize agent commit provenance",
+            target=branch,
+            pre_state=current_sha,
+            observe=lambda: self._checkout_sha(branch),
+            desired=lambda: self._branch_matches(branch, normalized_sha, True),
+            pre_dispatch=require_unchanged_preconditions,
+        )
+        result = self.require_current_branch(branch)
+        if result.local_sha != normalized_sha or result.remote_sha != remote_before:
+            raise WorkerFailure(
+                f"agent provenance normalization postcondition failed for {branch!r}"
+            )
+        self.require_clean()
+        self.require_agent_commit_provenance(
+            previous_sha,
+            normalized_sha,
+            expected_agent=expected_agent,
+            expected_process=expected_process,
+        )
+        return result
+
+    def _normalize_agent_message(
+        self,
+        message: str,
+        *,
+        commit_sha: str,
+        expected_agent: str,
+        expected_process: str,
+        coauthor: str,
+    ) -> str:
+        values: dict[str, list[str]] = {
+            "awm-agent": [],
+            "awm-process": [],
+            "co-authored-by": [],
+        }
+        retained: list[str] = []
+        for line in message.splitlines():
+            match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
+            if match is None:
+                if _AGENT_PROVENANCE_PREFIX_RE.match(line):
+                    raise WorkerFailure(
+                        f"commit {commit_sha} has ambiguous malformed AWM provenance"
+                    )
+                retained.append(line)
+                continue
+            key = match.group(1).lower()
+            value = match.group(2)
+            values[key].append(value)
+            if key == "co-authored-by" and value != coauthor:
+                retained.append(line)
+
+        for key, expected in (
+            ("awm-agent", expected_agent),
+            ("awm-process", expected_process),
+        ):
+            actual = values[key]
+            if any(value != expected for value in actual):
+                raise WorkerFailure(
+                    f"commit {commit_sha} has ambiguous {key} provenance: {actual!r}"
+                )
+
+        base_message = "\n".join(retained).rstrip() + "\n"
+        trailers = (
+            f"Co-authored-by: {coauthor}",
+            f"AWM-Agent: {expected_agent}",
+            f"AWM-Process: {expected_process}",
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", delete=False
+        ) as message_file:
+            message_file.write(base_message)
+            message_path = Path(message_file.name)
+        try:
+            self._command(
+                [
+                    "interpret-trailers",
+                    "--in-place",
+                    *(
+                        argument
+                        for trailer in trailers
+                        for argument in ("--trailer", trailer)
+                    ),
+                    str(message_path),
+                ],
+                {0},
+            )
+            return message_path.read_text(encoding="utf-8")
+        finally:
+            message_path.unlink(missing_ok=True)
+
+    def _write_commit_object(self, raw: str) -> str:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", delete=False
+        ) as commit_file:
+            commit_file.write(raw)
+            commit_path = Path(commit_file.name)
+        try:
+            expected_sha = self._read(["hash-object", "-t", "commit", str(commit_path)])
+            self._validate_sha(expected_sha)
+            self._git_mutation(
+                ["hash-object", "-t", "commit", "-w", str(commit_path)],
+                operation="write normalized commit object",
+                target=expected_sha,
+                pre_state=self._has_commit(expected_sha),
+                observe=lambda: self._has_commit(expected_sha),
+                desired=lambda: self._has_commit(expected_sha),
+            )
+            return expected_sha
+        finally:
+            commit_path.unlink(missing_ok=True)
 
     def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
         """Push a clean exact local branch only when its remote is absent or behind."""

@@ -458,6 +458,239 @@ def test_agent_provenance_verifies_exact_turn_ranges(
     )
 
 
+@pytest.mark.parametrize(
+    "trailers",
+    [
+        (
+            "Co-authored-by: Codex <noreply@openai.com>\n\n"
+            "AWM-Agent: codex\n\nAWM-Process: implementation"
+        ),
+        (
+            "Co-authored-by: Codex <noreply@openai.com>\n"
+            "AWM-Agent: codex\nAWM-Agent: codex\n"
+            "AWM-Process: implementation\nAWM-Process: implementation"
+        ),
+        "Co-authored-by: Codex <noreply@openai.com>",
+    ],
+    ids=("malformed-spacing", "duplicates", "missing-awm"),
+)
+def test_normalize_unpublished_agent_provenance(
+    repositories: tuple[Path, Path, Path], trailers: str
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/normalize-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        f"Reviewed-by: Reviewer <reviewer@example.com>\n{trailers}",
+    )
+    original = git(work, "rev-parse", "HEAD")
+
+    normalized = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        original,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert normalized.local_sha is not None
+    assert normalized.local_sha != original
+    expected = {
+        "Reviewed-by": ["Reviewer <reviewer@example.com>"],
+        "Co-authored-by": ["Codex <noreply@openai.com>"],
+        "AWM-Agent": ["codex"],
+        "AWM-Process": ["implementation"],
+    }
+    for key, values in expected.items():
+        assert (
+            git(
+                work,
+                "show",
+                "-s",
+                f"--format=%(trailers:key={key},valueonly)",
+                normalized.local_sha,
+            ).splitlines()
+            == values
+        )
+    repo.require_agent_commit_provenance(
+        base,
+        normalized.local_sha,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+
+def test_normalize_provenance_preserves_unrelated_coauthors_and_precedes_push(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/normalize-before-push"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        "Co-authored-by: Human <human@example.com>",
+    )
+    original = git(work, "rev-parse", "HEAD")
+
+    normalized = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        original,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+    assert normalized.local_sha is not None
+    pushed = repo.ensure_pushed(branch, expected_local_sha=normalized.local_sha)
+
+    assert pushed.remote_sha == normalized.local_sha
+    assert git(
+        work,
+        "show",
+        "-s",
+        "--format=%(trailers:key=Co-authored-by,valueonly)",
+        normalized.local_sha,
+    ).splitlines() == [
+        "Human <human@example.com>",
+        "Codex <noreply@openai.com>",
+    ]
+
+
+def test_normalize_provenance_refuses_ambiguous_values_without_moving_head(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/ambiguous-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        "AWM-Agent: codex\nAWM-Agent: claude\nAWM-Process: implementation",
+    )
+    original = git(work, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkerFailure, match="ambiguous awm-agent provenance"):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            original,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert git(work, "rev-parse", "HEAD") == original
+    assert repo.inspect_branch(branch).remote_sha is None
+
+
+def test_normalize_provenance_refuses_remote_visible_commit(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/pushed-malformed-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "agent result")
+    pushed_sha = git(work, "rev-parse", "HEAD")
+    git(work, "push", "origin", branch)
+
+    with pytest.raises(WorkerFailure, match="remote.*does not precede"):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            pushed_sha,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert git(work, "rev-parse", "HEAD") == pushed_sha
+    assert repo.inspect_branch(branch).remote_sha == pushed_sha
+
+
+def test_normalize_valid_remote_visible_provenance_is_a_noop(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/pushed-valid-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\nAWM-Process: implementation",
+    )
+    pushed_sha = git(work, "rev-parse", "HEAD")
+    git(work, "push", "origin", branch)
+
+    result = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        pushed_sha,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert result.local_sha == pushed_sha
+    assert result.remote_sha == pushed_sha
+
+
+def test_normalize_rewrites_each_commit_in_an_unpublished_range(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/multiple-provenance-commits"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "first result")
+    git(work, "commit", "--allow-empty", "-m", "second result")
+    original = git(work, "rev-parse", "HEAD")
+
+    result = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        original,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert result.local_sha is not None
+    assert result.local_sha != original
+    assert len(git(work, "rev-list", f"{base}..{result.local_sha}").splitlines()) == 2
+    repo.require_agent_commit_provenance(
+        base,
+        result.local_sha,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+
 def test_committed_result_requires_agent_and_process_together(
     repositories: tuple[Path, Path, Path],
 ) -> None:
