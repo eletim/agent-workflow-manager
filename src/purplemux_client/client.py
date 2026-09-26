@@ -1359,9 +1359,9 @@ class PurpleMuxCLIClient:
 
     @staticmethod
     def _restricted_agent_command(worker: str, prompt: str) -> str:
-        """Launch an agent whose process cannot perform ordinary Git pushes."""
+        """Launch an agent without a capability that can update Git refs."""
         encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
-        environment = [
+        environment_options = [
             "env",
             "-u",
             "GIT_ASKPASS",
@@ -1373,6 +1373,8 @@ class PurpleMuxCLIClient:
             "GIT_DIR",
             "-u",
             "GIT_WORK_TREE",
+        ]
+        git_environment = [
             "GIT_CONFIG_GLOBAL=/dev/null",
             "GIT_CONFIG_SYSTEM=/dev/null",
             "GIT_TERMINAL_PROMPT=0",
@@ -1384,14 +1386,21 @@ class PurpleMuxCLIClient:
         ]
         if worker == "codex":
             command = [
-                *environment,
+                *environment_options,
+                "-u",
+                "GH_TOKEN",
+                "-u",
+                "GITHUB_TOKEN",
+                *git_environment,
+                "GH_CONFIG_DIR=/dev/null",
                 "codex",
                 "--sandbox",
                 "workspace-write",
                 "--ask-for-approval",
                 "never",
+                "--search",
                 "--config",
-                "sandbox_workspace_write.network_access=true",
+                "sandbox_workspace_write.network_access=false",
                 "--config",
                 "sandbox_workspace_write.exclude_tmpdir_env_var=true",
                 "--config",
@@ -1428,7 +1437,8 @@ class PurpleMuxCLIClient:
                 )
             )
             command = [
-                *environment,
+                *environment_options,
+                *git_environment,
                 "claude",
                 "--print",
                 "--no-session-persistence",

@@ -210,10 +210,11 @@ def test_restricted_session_uses_common_turn_interface(
             "codex",
             (
                 "--sandbox workspace-write",
-                "network_access=true",
+                "network_access=false",
                 "exclude_tmpdir_env_var=true",
                 "GIT_CONFIG_GLOBAL=/dev/null",
                 "GIT_TERMINAL_PROMPT=0",
+                "--search",
             ),
         ),
         (
@@ -233,11 +234,65 @@ def test_restricted_session_preserves_safe_remote_capabilities(
     command = PurpleMuxCLIClient._restricted_agent_command(worker, "inspect safely")
 
     assert all(value in command for value in required)
-    assert "-u GH_TOKEN" not in command
-    assert "-u GITHUB_TOKEN" not in command
     assert "GIT_SSH_COMMAND=false" in command
     if worker == "codex":
+        assert "-u GH_TOKEN" in command
+        assert "-u GITHUB_TOKEN" in command
+        assert "GH_CONFIG_DIR=/dev/null" in command
         assert command.index("--ask-for-approval never") < command.index(" exec ")
+    else:
+        assert "-u GH_TOKEN" not in command
+        assert "-u GITHUB_TOKEN" not in command
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        "gh api --method PATCH repos/acme/project/git/refs/heads/main",
+        "git push --force https://x-access-token:${GH_TOKEN}@github.com/acme/project.git",
+    ],
+)
+def test_restricted_codex_denies_authenticated_ref_update_capabilities(
+    attempt: str, tmp_path: Path
+) -> None:
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"${GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|\""
+        "\"${GH_CONFIG_DIR-unset}|$*\"\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    command = PurpleMuxCLIClient._restricted_agent_command("codex", attempt)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "GH_TOKEN": "push-capable-gh-token",
+            "GITHUB_TOKEN": "push-capable-github-token",
+        }
+    )
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert attempt not in command
+    assert "sandbox_workspace_write.network_access=false" in command
+    assert "-u GH_TOKEN" in command
+    assert "-u GITHUB_TOKEN" in command
+    assert "GH_CONFIG_DIR=/dev/null" in command
+    token, github_token, config_dir, arguments = result.stdout.strip().split("|", 3)
+    assert token == github_token == "unset"
+    assert config_dir == "/dev/null"
+    assert "sandbox_workspace_write.network_access=false" in arguments
 
 
 def test_session_deadline_only_limits_tab_create_command() -> None:
