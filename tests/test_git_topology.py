@@ -600,8 +600,31 @@ def test_normalize_unpublished_agent_provenance(
             "---\ndiff --git a/file b/file",
             {"Reviewed-by": ["Reviewer <reviewer@example.com>"]},
         ),
+        (
+            "agent result\n\n"
+            "Reviewed-by: First Reviewer <first@example.com>\n"
+            "Reviewed-by: Second Reviewer <second@example.com>\n"
+            "Co-authored-by: First Human <first-human@example.com>\n"
+            "Co-authored-by: Second Human <second-human@example.com>",
+            {
+                "Reviewed-by": [
+                    "First Reviewer <first@example.com>",
+                    "Second Reviewer <second@example.com>",
+                ],
+                "Co-authored-by": [
+                    "First Human <first-human@example.com>",
+                    "Second Human <second-human@example.com>",
+                    "Codex <noreply@openai.com>",
+                ],
+            },
+        ),
     ],
-    ids=("whitespace-separator", "mixed-block", "patch-divider"),
+    ids=(
+        "whitespace-separator",
+        "mixed-block",
+        "patch-divider",
+        "repeated-unrelated-keys",
+    ),
 )
 def test_normalize_preserves_git_trailer_blocks(
     repositories: tuple[Path, Path, Path],

@@ -840,30 +840,28 @@ class GitRepository:
         parsed_trailers = self._interpret_trailers(
             retained_message, ["--parse"], in_place=False
         ).splitlines()
-        trailer_tokens: dict[str, str] = {}
+        trailer_tokens: list[str] = []
         for trailer in parsed_trailers:
             token, separator, _value = trailer.partition(":")
             if not separator:
                 raise WorkerFailure(
                     f"Git returned an invalid parsed trailer for commit {commit_sha}"
                 )
-            trailer_tokens.setdefault(token.lower(), token)
+            trailer_tokens.append(token)
 
         without_trailers = retained_message
-        if trailer_tokens:
-            removal_options = ["--trim-empty"]
-            for token in trailer_tokens.values():
-                removal_options.extend(
-                    [
-                        "--where=end",
-                        "--if-exists=replace",
-                        "--if-missing=doNothing",
-                        "--trailer",
-                        f"{token}:",
-                    ]
-                )
+        for token in trailer_tokens:
             without_trailers = self._interpret_trailers(
-                retained_message, removal_options, in_place=True
+                without_trailers,
+                [
+                    "--trim-empty",
+                    "--where=end",
+                    "--if-exists=replace",
+                    "--if-missing=doNothing",
+                    "--trailer",
+                    f"{token}:",
+                ],
+                in_place=True,
             )
 
         trailers = [
