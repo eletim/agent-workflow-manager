@@ -409,8 +409,12 @@ The Workflow similarly creates or reuses the exact Draft PR when the agent did
 not create one, then verifies its head, base, SHAs, and Draft state before
 review. Each Issue first receives a Scope / Design Review of whether its diff is
 necessary, sufficient, appropriately placed, and consistent with the shared
-minimal-change principle. Only then does a separately counted Correctness Review
-check implementation quality. Scope Review uses `scope_max_reviews`, which
+minimal-change principle. Directly out-of-scope incidental changes are judged by
+their necessity, proportionality, natural responsibility placement, and the
+sufficiency of the overall solution rather than rejected merely for being
+incidental; unrelated work and unnecessary refactors remain findings. Only then
+does a separately counted Correctness Review check implementation quality. Scope
+Review uses `scope_max_reviews`, which
 defaults to three when omitted; the recommended values are six for Scope Review
 and four for the Correctness and whole-version review limit. The higher
 recommended Scope limit reserves capacity for the required rechecks after
