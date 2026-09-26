@@ -12,6 +12,7 @@ import pytest
 
 from purplemux_client import (
     GitRepository,
+    LocalRefState,
     MutationOutcomeUnknown,
     WorkerFailure,
     agent_commit_coauthor,
@@ -229,6 +230,23 @@ def test_open_can_pin_identity_from_the_validated_github_origin(
     assert runner.calls.count(["git", "remote", "get-url", "origin"]) >= 2
 
 
+def test_require_ancestor_checks_commit_topology(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    ancestor = git(work, "rev-parse", "HEAD")
+    (work / "descendant.txt").write_text("descendant\n", encoding="utf-8")
+    git(work, "add", "descendant.txt")
+    git(work, "commit", "-m", "descendant")
+    descendant = git(work, "rev-parse", "HEAD")
+    repo = open_repo(work, RecordingGitRunner())
+
+    repo.require_ancestor(ancestor, descendant)
+
+    with pytest.raises(WorkerFailure, match="is not an ancestor"):
+        repo.require_ancestor(descendant, ancestor)
+
+
 def test_safe_synchronize_prepare_and_read_only_require_pushed(
     repositories: tuple[Path, Path, Path],
 ) -> None:
@@ -288,6 +306,20 @@ def test_remote_branch_enumeration_uses_authoritative_remote_heads(
     assert "local-only" not in result
 
 
+def test_remote_ref_enumeration_includes_non_branch_refs(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    head = git(seed, "rev-parse", "HEAD")
+    git(seed, "tag", "release-test")
+    git(seed, "push", "origin", "refs/tags/release-test")
+
+    refs = open_repo(work, RecordingGitRunner()).inspect_remote_refs()
+
+    assert refs["refs/heads/main"] == head
+    assert refs["refs/tags/release-test"] == head
+
+
 def test_local_branch_head_inspection_includes_linked_worktrees(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:
@@ -302,6 +334,42 @@ def test_local_branch_head_inspection_includes_linked_worktrees(
 
     assert heads["main"] == base
     assert heads[branch] == git(linked, "rev-parse", "HEAD")
+
+
+def test_local_ref_enumeration_includes_stash_and_non_head_refs(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    head = git(work, "rev-parse", "HEAD")
+    git(work, "tag", "local-test")
+    (work / "tracked.txt").write_text("stashed\n", encoding="utf-8")
+    git(work, "stash", "push", "-m", "recovery guard test")
+
+    refs = open_repo(work, RecordingGitRunner()).inspect_local_refs()
+
+    assert refs["refs/heads/main"] == LocalRefState(head, None)
+    assert refs["refs/remotes/origin/main"] == LocalRefState(head, None)
+    assert refs["refs/tags/local-test"] == LocalRefState(head, None)
+    assert "refs/stash" in refs
+
+
+def test_local_ref_enumeration_distinguishes_same_oid_symbolic_ref(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    head = git(work, "rev-parse", "HEAD")
+    ref = "refs/remotes/origin/recovery-alias"
+    git(work, "update-ref", ref, head)
+    repo = open_repo(work, RecordingGitRunner())
+    direct = repo.inspect_local_refs()[ref]
+
+    git(work, "symbolic-ref", ref, "refs/heads/main")
+    symbolic = repo.inspect_local_refs()[ref]
+
+    assert direct == LocalRefState(head, None)
+    assert symbolic == LocalRefState(head, "refs/heads/main")
+    assert direct.object_sha == symbolic.object_sha
+    assert direct != symbolic
 
 
 def test_remote_notes_persist_recovery_state_without_moving_branches(

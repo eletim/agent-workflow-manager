@@ -36,6 +36,7 @@ from purplemux_client.git import (
     FeaturePreparationState,
     FeatureRecoveryState,
     GitRepository,
+    LocalRefState,
     WorktreeState,
     agent_commit_coauthor,
 )
@@ -92,6 +93,7 @@ __all__ = [
     "FeatureRecoveryState",
     "GitHubRepository",
     "GitRepository",
+    "LocalRefState",
     "IncompletePullRequestEnumeration",
     "IssueDrivenConfig",
     "IssueDrivenFinding",

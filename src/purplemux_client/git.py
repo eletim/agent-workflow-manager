@@ -75,6 +75,12 @@ class BranchState:
 
 
 @dataclass(frozen=True)
+class LocalRefState:
+    object_sha: str
+    symbolic_target: str | None
+
+
+@dataclass(frozen=True)
 class FeaturePreparationState:
     branch: BranchState
     base: BranchState
@@ -315,6 +321,28 @@ class GitRepository:
             result[branch] = fields[0]
         return result
 
+    def inspect_remote_refs(self) -> dict[str, str]:
+        """Enumerate authoritative remote refs without using local tracking refs."""
+        self._validate_identity()
+        completed = self._command(
+            ["ls-remote", "--refs", self.remote],
+            {0},
+        )
+        result: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or not fields[1].startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(fields[0])
+            ):
+                raise WorkerFailure("unexpected remote ref enumeration result")
+            ref = fields[1]
+            if ref in result:
+                raise WorkerFailure("ambiguous remote ref enumeration result")
+            result[ref] = fields[0]
+        return result
+
     def inspect_local_branch_heads(self) -> dict[str, str]:
         """Enumerate authoritative local branch heads across every worktree."""
         self._validate_identity()
@@ -335,6 +363,32 @@ class GitRepository:
             if not branch or branch in result:
                 raise WorkerFailure("ambiguous local branch enumeration result")
             result[branch] = sha
+        return result
+
+    def inspect_local_refs(self) -> dict[str, LocalRefState]:
+        """Enumerate refs stored in the local repository."""
+        self._validate_identity()
+        output = self._read(
+            [
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)%00%(symref)",
+                "refs",
+            ]
+        )
+        result: dict[str, LocalRefState] = {}
+        for line in output.splitlines():
+            fields = line.split("\0")
+            if (
+                len(fields) != 3
+                or not fields[0].startswith("refs/")
+                or not _OBJECT_ID_RE.fullmatch(fields[1])
+                or (fields[2] and not fields[2].startswith("refs/"))
+            ):
+                raise WorkerFailure("unexpected local ref enumeration result")
+            ref, sha, symbolic_target = fields
+            if ref in result:
+                raise WorkerFailure("ambiguous local ref enumeration result")
+            result[ref] = LocalRefState(sha, symbolic_target or None)
         return result
 
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
@@ -1105,6 +1159,14 @@ class GitRepository:
             raise WorkerFailure(f"local branch {branch!r} does not exist")
         if not self._is_ancestor(commit_sha, state.local_sha):
             raise WorkerFailure(f"branch {branch!r} does not contain {commit_sha}")
+
+    def require_ancestor(self, ancestor_sha: str, descendant_sha: str) -> None:
+        self._validate_sha(ancestor_sha)
+        self._validate_sha(descendant_sha)
+        if not self._is_ancestor(ancestor_sha, descendant_sha):
+            raise WorkerFailure(
+                f"commit {ancestor_sha} is not an ancestor of {descendant_sha}"
+            )
 
     def synchronize_branch(
         self, branch: str, *, expected_remote_sha: str | None = None

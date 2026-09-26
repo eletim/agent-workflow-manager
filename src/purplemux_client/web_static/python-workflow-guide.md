@@ -564,11 +564,13 @@ project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrate
 unrelated state is preserved, and updates coordinate on Claude's state-file lock.
 Claude home-directory trust fails early because Claude does not persist it.
 Ordinary provider sessions do not change sandbox or approval policy. A session
-may explicitly request the `preserve-git-refs` restriction; that reusable
-profile runs turns in a managed terminal with provider-native restrictions on
-Git metadata writes and pushes. Codex recovery has no shell network or GitHub
-credentials and retains read-only remote inspection through native search;
-Claude recovery retains only an explicit allowlist of non-ref GitHub operations.
+may explicitly request the `local-git-only` restriction; that reusable profile
+runs turns in a managed terminal with local Git access but no remote Git ref
+mutation capability. Codex recovery has no shell network or GitHub credentials
+and retains read-only remote inspection through native search. Claude recovery
+has an explicit allowlist of local Git inspection, staging, commit, and
+fast-forward commands plus non-ref GitHub operations; push, reset, rebase, and
+unrestricted shell commands remain unavailable.
 AWM does not use a broad permission bypass, screen-text detection, or simulated
 trust-dialog keystrokes.
 
@@ -624,6 +626,8 @@ repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_remote_branch_heads() -> dict[str, str]
+repo.inspect_remote_refs() -> dict[str, str]
+repo.inspect_local_refs() -> dict[str, LocalRefState]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -640,6 +644,7 @@ repo.require_agent_commit_provenance(
 ) -> None
 agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
+repo.require_ancestor(ancestor_sha, descendant_sha) -> None
 repo.inspect_remote_note(ref, object_sha) -> str | None
 ```
 
@@ -647,14 +652,22 @@ repo.inspect_remote_note(ref, object_sha) -> str | None
 trust local tracking refs. Use it when a workflow must compare a configured
 development branch with the remote's current branch set.
 `inspect_local_branch_heads()` provides the corresponding authoritative local
-branch set across linked worktrees. Repository recovery snapshots both sets and
-starts the recovery agent through the normal session and validated-turn APIs
-with the `preserve-git-refs` restriction. That boundary denies Git metadata
-writes and authenticated pushes. Codex retains native read-only remote search;
-Claude retains explicitly allowlisted non-ref GitHub operations. It then requires
-both ref sets to remain exact as defense in depth: recovery never repairs
-provenance by amending, rebasing, resetting, or otherwise rewriting local or
-remote-visible history.
+branch set across linked worktrees. Repository recovery instead snapshots all
+local `refs/*` and all authoritative remote refs, including tags and notes, and
+records both the object ID and symbolic target of each local ref. It then starts
+the recovery agent through the normal session and validated-turn APIs
+with the `local-git-only` restriction. That boundary denies remote Git ref
+mutation while allowing a necessary local commit or fast-forward. Codex retains
+native read-only remote search; Claude retains explicitly allowlisted local Git
+and non-ref GitHub operations. After the turn, the remote ref set and every
+unrelated local ref must remain exact. The active local branch must still
+descend from its pre-turn head; an exact advance to the snapshotted authoritative
+remote head keeps its existing provenance, while any other new commits require
+recovery provenance. Only when the pre-recovery local head is an ancestor of the
+remote head and that remote head is contained by the final local head are commits
+after the remote head attributed to recovery. Recovery therefore cannot repair
+provenance by amending, rebasing, resetting, force-pushing, or otherwise rewriting
+history.
 
 The inspection-aware Git operations that may mutate are:
 

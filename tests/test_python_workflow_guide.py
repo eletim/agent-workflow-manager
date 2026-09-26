@@ -94,3 +94,18 @@ def test_guide_documents_agent_provenance_verification() -> None:
     assert "`agent_commit_coauthor()` supplies the same normalized co-author" in guide
     assert "expected_agent=None" in guide
     assert "expected_process=None" in guide
+
+
+def test_guide_documents_bounded_local_git_recovery() -> None:
+    guide = " ".join(GUIDE.read_text(encoding="utf-8").split())
+
+    assert "`local-git-only` restriction" in guide
+    assert "no remote Git ref mutation capability" in guide
+    assert "every unrelated local ref must remain exact" in guide
+    assert "all authoritative remote refs, including tags and notes" in guide
+    assert "both the object ID and symbolic target of each local ref" in guide
+    assert "exact advance to the snapshotted authoritative remote head" in guide
+    assert "any other new commits require recovery provenance" in guide
+    assert "pre-recovery local head is an ancestor of the remote head" in guide
+    assert "commits after the remote head attributed to recovery" in guide
+    assert "both ref sets to remain exact" not in guide

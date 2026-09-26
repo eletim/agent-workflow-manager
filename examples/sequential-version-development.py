@@ -25,6 +25,7 @@ from purplemux_client import (
     CreateWorkspaceRequest,
     GitHubRepository,
     GitRepository,
+    LocalRefState,
     MergeResult,
     MutationOutcomeUnknown,
     PullRequestState,
@@ -588,7 +589,7 @@ def create_agent(
     *,
     agent_type: str,
     name: str,
-    restriction: Literal["preserve-git-refs"] | None = None,
+    restriction: Literal["local-git-only"] | None = None,
 ) -> str:
     return client.create_session(
         CreateSessionRequest(
@@ -1065,7 +1066,7 @@ def recover_error(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Recovery agent",
-        restriction="preserve-git-refs",
+        restriction="local-git-only",
     )
     try:
         _, report = run_validated_turn(
@@ -1077,9 +1078,12 @@ def recover_error(
                 "state below. Make only a safe, necessary repair, then re-inspect "
                 "the affected state. If the outcome is uncertain, report retry_safe "
                 "as false. Do not amend, reset, rebase, or otherwise rewrite commit "
-                "history to repair provenance. Leave every local and remote branch "
-                "ref unchanged. Do not stash, force-push, merge a work-item PR, "
-                "create unrelated PRs, discard ambiguous work, or edit "
+                "history to repair provenance. Leave every remote branch ref and "
+                "every unrelated local branch ref unchanged. The current local "
+                "branch may only advance through recovery-created commits or an "
+                "exact fast-forward to its authoritative remote head. Do not stash, "
+                "force-push, merge a work-item PR, create unrelated PRs, discard "
+                "ambiguous work, or edit "
                 "agent-workflow-manager fingerprint markers. Return exactly one JSON "
                 "object with boolean repaired and retry_safe fields and concise "
                 "single-line summary and evidence strings (at most 500 UTF-8 bytes "
@@ -5760,9 +5764,9 @@ def _run_repository(
                 raise WorkerFailure(
                     "repository recovery requires a local branch commit"
                 ) from exc
-            recovery_local_refs = repo.inspect_local_branch_heads()
-            recovery_remote_refs = repo.inspect_remote_branch_heads()
             state = recovery_authoritative_state(config, repo, github, plan)
+            recovery_local_refs = repo.inspect_local_refs()
+            recovery_remote_refs = repo.inspect_remote_refs()
             recovery_execution: list[_AgentTurnExecution] = []
             try:
                 report = recover_error(
@@ -5773,30 +5777,85 @@ def _run_repository(
                     deferred_execution=recovery_execution,
                 )
             finally:
-                recovered_local_refs = repo.inspect_local_branch_heads()
-                recovered_remote_refs = repo.inspect_remote_branch_heads()
-                if recovered_local_refs != recovery_local_refs:
+                recovered_local_refs = repo.inspect_local_refs()
+                recovered_remote_refs = repo.inspect_remote_refs()
+                if recovered_remote_refs != recovery_remote_refs:
+                    raise WorkerFailure(
+                        "recovery changed remote refs; refusing to rewrite "
+                        "published provenance"
+                    )
+                recovery_branch_ref = f"refs/heads/{recovery_branch}"
+                recovered_branch_state = recovered_local_refs.get(recovery_branch_ref)
+                recovery_branch_start = recovery_local_refs.get(recovery_branch_ref)
+                recovery_end = (
+                    None
+                    if recovered_branch_state is None
+                    else recovered_branch_state.object_sha
+                )
+                expected_local_refs = dict(recovery_local_refs)
+                if recovery_end is not None and recovery_branch_start is not None:
+                    expected_local_refs[recovery_branch_ref] = LocalRefState(
+                        recovery_end, recovery_branch_start.symbolic_target
+                    )
+                if (
+                    recovery_end is None
+                    or recovery_branch_start is None
+                    or recovered_local_refs != expected_local_refs
+                ):
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch; "
+                        "refusing to rewrite repository provenance"
+                    )
+                try:
+                    checked_recovery = repo.require_committed_result(
+                        recovery_branch,
+                        previous_sha=recovery_start.local_sha,
+                        allow_unchanged=True,
+                    )
+                except WorkerFailure as validation_error:
                     raise WorkerFailure(
                         "recovery changed local branch history; refusing to rewrite "
                         "repository provenance"
-                    )
-                if recovered_remote_refs != recovery_remote_refs:
+                    ) from validation_error
+                if checked_recovery.local_sha != recovery_end:
                     raise WorkerFailure(
-                        "recovery changed remote branch history; refusing to rewrite "
-                        "published provenance"
+                        "recovery branch inspection disagrees with local refs"
                     )
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
                 flush=True,
             )
-            repo.require_committed_result(
-                recovery_branch,
-                previous_sha=recovery_start.local_sha,
-                allow_unchanged=True,
-                expected_agent=IMPLEMENTER_AGENT,
-                expected_process="recovery",
+            assert recovery_end is not None
+            authoritative_remote_head = recovery_remote_refs.get(
+                f"refs/heads/{recovery_branch}"
             )
+            if (
+                recovery_end != recovery_start.local_sha
+                and recovery_end != authoritative_remote_head
+            ):
+                provenance_start = recovery_start.local_sha
+                if (
+                    authoritative_remote_head is not None
+                    and authoritative_remote_head != recovery_start.local_sha
+                ):
+                    try:
+                        repo.require_ancestor(
+                            recovery_start.local_sha, authoritative_remote_head
+                        )
+                        repo.require_contains(
+                            recovery_branch, authoritative_remote_head
+                        )
+                    except WorkerFailure:
+                        pass
+                    else:
+                        provenance_start = authoritative_remote_head
+                repo.require_agent_commit_provenance(
+                    provenance_start,
+                    recovery_end,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="recovery",
+                )
             if not report.repaired or not report.retry_safe:
                 _complete_deferred_validated_turn(
                     recovery_execution, "stop_workflow"
