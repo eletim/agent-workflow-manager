@@ -1358,6 +1358,31 @@ def test_shared_implementation_principle_is_only_added_to_implementer_prompt() -
     assert "over-generalizing distinct behavior" in principle
 
 
+def test_scope_review_judges_necessary_incidental_changes_in_context() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](149, "feature/issue-149")
+    config = workflow["Config"](
+        Path("/tmp/project"),
+        "acme/project",
+        "dev/v1",
+        "main",
+        (issue,),
+        "git diff --check",
+    )
+
+    _, scope_review, _ = workflow["issue_prompts"](issue, config)
+    normalized_scope_review = " ".join(scope_review.split())
+
+    assert (
+        "Do not reject a directly out-of-scope change solely because it is incidental"
+        in normalized_scope_review
+    )
+    assert "necessity and proportionality" in normalized_scope_review
+    assert "natural responsibility placement" in normalized_scope_review
+    assert "contribution to overall sufficiency" in normalized_scope_review
+    assert "unrelated work or unnecessary refactors" in normalized_scope_review
+
+
 def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> None:
     source = EXAMPLE.read_text(encoding="utf-8")
 

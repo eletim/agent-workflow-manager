@@ -2491,11 +2491,14 @@ available.""")
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement} Inspect the PR diff. Decide whether the changed targets,
 amount of change, and responsibility placement are necessary and sufficient for
-the work item. Check for unrelated work or unnecessary refactors, failure to reuse
-appropriate existing implementation, unnatural mixing of responsibilities to
-minimize the diff, over-generalization of meaningfully distinct behavior, and
-unnecessary violations of the existing architecture or Source of Truth. If the
-Issue identifies a policy Issue, use that version-design context; the
+the work item. Do not reject a directly out-of-scope change solely because it is
+incidental; judge its necessity and proportionality, its natural responsibility
+placement, and its contribution to overall sufficiency. Check for unrelated work
+or unnecessary refactors, failure to reuse appropriate existing
+implementation, unnatural mixing of responsibilities to minimize the diff,
+over-generalization of meaningfully distinct behavior, and unnecessary
+violations of the existing architecture or Source of Truth. If the Issue
+identifies a policy Issue, use that version-design context; the
 implementation work item remains authoritative when they conflict, and report the
 conflict as a warning. Do not focus on detailed implementation bugs in this
 phase. Do not mutate files or PR state. {REVIEWER_CHECKOUT_GUARD}
