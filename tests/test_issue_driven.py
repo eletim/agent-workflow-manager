@@ -1113,8 +1113,12 @@ def test_generated_one_shot_workflow_bootstraps_the_manager_from_source_issue() 
     assert '        (),\n        "git diff --check",' in parse_args
     assert "        WORKFLOW_POLICY_ISSUE,\n        169," in parse_args
     assert "gh issue view\n{config.one_shot_issue} --repo {config.slug}" in code
-    assert "git show\n{config.integration_branch}:docs/design-principles.md" in code
-    assert "canonical source when decomposing or refining" in code
+    assert (
+        "if git cat-file -e\n{config.integration_branch}:docs/design-principles.md"
+        " 2>/dev/null; then git show" in code
+    )
+    assert "optional repository-specific guidance" in code
+    assert "do not add a task\nto create or restore it" in code
     assert "short inline mini tasks" in code
     assert "Do not create GitHub Issues" in code
     assert "rationale must be a concise single-line explanation" in code
@@ -1238,10 +1242,14 @@ def test_one_shot_manager_dispatches_mini_task_through_existing_issue_flow() -> 
     assert "No changes from the previous planning result" in comments[1]
     assert all("gh issue view\n169 --repo acme/project" in prompt for prompt in prompts)
     assert all(
-        "git show\ndev/v1:docs/design-principles.md" in prompt for prompt in prompts
+        "if git cat-file -e\ndev/v1:docs/design-principles.md 2>/dev/null; then git show"
+        in prompt
+        for prompt in prompts
     )
+    assert all("dev/v1:docs/design-principles.md; fi" in prompt for prompt in prompts)
+    assert all("optional repository-specific guidance" in prompt for prompt in prompts)
     assert all(
-        "canonical source when decomposing or refining" in prompt for prompt in prompts
+        "do not add a task\nto create or restore it" in prompt for prompt in prompts
     )
 
 
@@ -1259,6 +1267,20 @@ def test_seeded_planner_does_not_receive_one_shot_design_principles_context() ->
     prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
 
     assert "docs/design-principles.md" not in prompt
+
+
+def test_one_shot_planner_allows_missing_design_principles() -> None:
+    workflow = load_generated_workflow(one_shot_issue=169)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true", None, 169
+    )
+
+    prompt = workflow["planner_prompt"](workflow["WorkItemPlan"](config), config)
+
+    assert "Use only repository context that\nexists" in prompt
+    assert "An empty result means the file is absent" in prompt
+    assert "continue from the source Issue" in prompt
+    assert "do not add a task\nto create or restore it" in prompt
 
 
 def test_one_shot_plan_rejects_numeric_planner_additions() -> None:
