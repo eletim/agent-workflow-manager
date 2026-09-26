@@ -234,6 +234,24 @@ def test_nested_existing_module_is_accepted(tmp_path: Path) -> None:
     assert result.valid
 
 
+def test_python_3_14_collections_abc_runtime_alias_is_accepted(
+    tmp_path: Path,
+) -> None:
+    result = WorkflowValidator(cwd=tmp_path).validate(
+        "from collections.abc import Callable"
+    )
+
+    assert result.valid
+
+
+def test_missing_child_of_runtime_aliased_package_is_rejected(tmp_path: Path) -> None:
+    result = WorkflowValidator(cwd=tmp_path).validate("import collections.unavailable")
+
+    assert not result.valid
+    assert result.issues[0].kind == "import"
+    assert "collections.unavailable" in result.issues[0].message
+
+
 def test_manager_cwd_only_module_is_not_visible_to_workflow_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

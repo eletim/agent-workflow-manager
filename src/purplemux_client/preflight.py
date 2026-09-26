@@ -29,7 +29,7 @@ DRY_RUN_VERSION = 1
 MAX_OUTLINE_ITEMS = 100
 MAX_OUTLINE_LABEL_CHARS = 200
 DEFAULT_CHECK_TIMEOUT = 30.0
-STDLIB_MODULE_ALIASES = frozenset({"os.path"})
+STDLIB_MODULE_ALIASES = frozenset({"collections.abc", "os.path"})
 
 
 @dataclass(frozen=True)
