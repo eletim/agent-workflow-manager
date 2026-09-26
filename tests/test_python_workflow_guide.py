@@ -116,5 +116,7 @@ def test_guide_separates_development_and_recovery_capabilities() -> None:
 
     assert "Normal commit-producing sessions use the `publication-disabled`" in guide
     assert "project-specific test, build, lint, and formatting commands" in guide
+    assert "strict OS sandbox with no network domains" in guide
+    assert "ignores separate temporary or nested repositories" in guide
     assert "Recovery uses the separate, tighter `local-git-only` restriction" in guide
     assert "Recovery-only `local-git-only` restriction" in guide

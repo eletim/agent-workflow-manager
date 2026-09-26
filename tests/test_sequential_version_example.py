@@ -180,6 +180,63 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+def test_prepare_issue_normalizes_recovered_commit_before_unchanged_turn() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](217, "feature/issue-217")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    events: list[str] = []
+
+    class Repository:
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, "base", "base", True)
+
+        def recover_feature_branch(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs == {
+                "base": config.integration_branch,
+                "expected_base_sha": "base",
+            }
+            return SimpleNamespace(
+                branch=BranchState(branch, "raw-agent-commit", None, True),
+                reused_existing_work=True,
+            )
+
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            events.append("normalize")
+            assert (branch, start, end) == (
+                issue.branch,
+                "base",
+                "raw-agent-commit",
+            )
+            assert kwargs["expected_process"] == "implementation"
+            return BranchState(branch, "normalized-agent-commit", None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify")
+            assert (start, end) == ("base", "normalized-agent-commit")
+            assert kwargs["expected_process"] == "implementation"
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            assert kwargs["state"] in {"OPEN", "MERGED"}
+            return None
+
+    prepared = workflow["prepare_issue"](Repository(), GitHub(), issue, config)
+
+    assert prepared == (None, "normalized-agent-commit", True)
+    assert events == ["normalize", "verify"]
+
+
 def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

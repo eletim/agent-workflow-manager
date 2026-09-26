@@ -201,7 +201,9 @@ expected_process="implementation")` (or the agent and process for that turn).
 prompt that this postcondition verifies. Before validation and delivery,
 `normalize_agent_commit_provenance()` makes unambiguous unpublished agent
 trailers contiguous and exact while preserving unrelated trailers. It fails
-closed for conflicting provenance or a remote-visible commit. Use
+closed for conflicting provenance or a remote-visible commit. A recovered local
+commit range is normalized and verified from its authoritative published ancestor
+before an unchanged resumed turn may deliver it. Use
 `ensure_pushed()` to publish the exact normalized commit through the logical
 remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
@@ -570,7 +572,11 @@ Ordinary provider sessions do not change sandbox or approval policy. Normal
 commit-producing sessions use the `publication-disabled` restriction. It retains
 the provider's repository development tools, including project-specific test,
 build, lint, and formatting commands, while removing authenticated publication
-credentials, rejecting Git pushes, and preventing PR management. Recovery uses
+credentials, rejecting Git pushes, and preventing PR management. Claude Bash
+commands run in its strict OS sandbox with no network domains, no unsandboxed
+fallback, and denied GitHub/SSH credential sources. The protected-checkout ref
+hook ignores separate temporary or nested repositories so project test fixtures
+can create and commit to them normally. Recovery uses
 the separate, tighter `local-git-only` restriction. Codex recovery has no shell
 network or GitHub credentials and retains read-only remote inspection through
 native search. Claude recovery has an explicit allowlist of local Git inspection,

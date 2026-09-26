@@ -1536,6 +1536,8 @@ done
             b"""#!/bin/sh
 phase=$1
 [ "$phase" = prepared ] || exit 0
+root=$(git rev-parse --show-toplevel) || exit 1
+[ "$root" = "$AWM_DELIVERY_PROTECTED_ROOT" ] || exit 0
 zero=0000000000000000000000000000000000000000
 while read old new ref; do
     if [ "$ref" = ORIG_HEAD ]; then
@@ -1606,6 +1608,32 @@ done
                 "-",
             ]
         elif worker == "claude":
+            sandbox_settings = json.dumps(
+                {
+                    "sandbox": {
+                        "enabled": True,
+                        "allowUnsandboxedCommands": False,
+                        "failIfUnavailable": True,
+                        "network": {
+                            "allowedDomains": [],
+                            "deniedDomains": ["github.com", "*.github.com"],
+                            "strictAllowlist": True,
+                        },
+                        "credentials": {
+                            "envVars": [
+                                {"name": "GH_TOKEN", "mode": "deny"},
+                                {"name": "GITHUB_TOKEN", "mode": "deny"},
+                            ],
+                            "files": [
+                                {"path": "~/.config/gh", "mode": "deny"},
+                                {"path": "~/.git-credentials", "mode": "deny"},
+                                {"path": "~/.ssh", "mode": "deny"},
+                            ],
+                        },
+                    }
+                },
+                separators=(",", ":"),
+            )
             safe_tools = ",".join(
                 (
                     "Read",
@@ -1626,6 +1654,8 @@ done
                 "--safe-mode",
                 "--strict-mcp-config",
                 "--restricted",
+                "--settings",
+                sandbox_settings,
                 "--allowed-tools",
                 safe_tools,
                 "--permission-mode",
@@ -1657,6 +1687,8 @@ done
             '"$awm_delivery_hooks/pre-push" && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
+            'AWM_DELIVERY_PROTECTED_ROOT="$(pwd -P)" '
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
             'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
             f"{launch}"

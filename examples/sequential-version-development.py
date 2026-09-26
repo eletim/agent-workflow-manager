@@ -2674,6 +2674,23 @@ def prepare_issue(
         )
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
+        published_ancestor = feature.remote_sha or integration.remote_sha
+        if reused_existing_work and feature.local_sha != published_ancestor:
+            assert feature.local_sha is not None
+            feature = repo.normalize_agent_commit_provenance(
+                issue.branch,
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process="implementation",
+            )
+            assert feature.local_sha is not None
+            repo.require_agent_commit_provenance(
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process="implementation",
+            )
     else:
         feature = repo.synchronize_branch(
             issue.branch, expected_remote_sha=open_pr.head_sha
