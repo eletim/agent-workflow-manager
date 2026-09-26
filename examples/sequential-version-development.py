@@ -609,15 +609,13 @@ def correlated_agent_tab_name(name: str) -> str:
     return PurpleMuxCLIClient.correlated_session_name(name, run_correlation(name))
 
 
-def reconcile_work_item_retry_tabs(
-    client: PurpleMuxCLIClient, issue: Issue
+def reconcile_completed_retry_tabs(
+    client: PurpleMuxCLIClient,
+    logical_tabs: tuple[tuple[str, str], ...],
+    *,
+    context: str,
 ) -> None:
     """Close only exact, completed Agent tabs that would collide on retry."""
-    logical_tabs = (
-        (f"{issue.label} implementer", IMPLEMENTER_AGENT),
-        (f"{issue.label} scope reviewer", REVIEWER_AGENT),
-        (f"{issue.label} correctness reviewer", REVIEWER_AGENT),
-    )
     expected: list[tuple[str, str, str]] = []
     for logical_name, agent_type in logical_tabs:
         normalized = agent_type.lower()
@@ -671,9 +669,29 @@ def reconcile_work_item_retry_tabs(
     if completed:
         emit_finding(
             "runtime",
-            f"reconciled {len(completed)} completed {issue.label} retry tab(s)",
+            f"reconciled {len(completed)} completed {context} retry tab(s)",
             status="warning",
         )
+
+
+def reconcile_work_item_retry_tabs(client: PurpleMuxCLIClient, issue: Issue) -> None:
+    reconcile_completed_retry_tabs(
+        client,
+        (
+            (f"{issue.label} implementer", IMPLEMENTER_AGENT),
+            (f"{issue.label} scope reviewer", REVIEWER_AGENT),
+            (f"{issue.label} correctness reviewer", REVIEWER_AGENT),
+        ),
+        context=issue.label,
+    )
+
+
+def reconcile_planner_retry_tab(client: PurpleMuxCLIClient) -> None:
+    reconcile_completed_retry_tabs(
+        client,
+        (("Work-item planner", REVIEWER_AGENT),),
+        context="work-item planner",
+    )
 
 
 @dataclass(frozen=True)
@@ -4314,6 +4332,8 @@ def process_work_items(
         plan.active = None
     if plan.finalized:
         return plan.snapshot
+    if retrying:
+        reconcile_planner_retry_tab(client)
     planner = create_agent(
         client,
         config,

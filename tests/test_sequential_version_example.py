@@ -278,7 +278,7 @@ def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     )
 
 
-def test_repository_recovery_recreates_all_completed_work_item_tabs(
+def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-recovery-tabs")
@@ -297,17 +297,19 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
     )
     ready = replace(draft, is_draft=False)
     mutations: list[tuple[str, str, str, str | None]] = []
-    logical_names = (
+    work_item_logical_names = (
         f"{issue.label} implementer",
         f"{issue.label} scope reviewer",
         f"{issue.label} correctness reviewer",
     )
-    expected_names = tuple(
-        workflow["correlated_agent_tab_name"](name) for name in logical_names
+    work_item_names = tuple(
+        workflow["correlated_agent_tab_name"](name) for name in work_item_logical_names
     )
-    expected_correlations = tuple(
-        workflow["run_correlation"](name) for name in logical_names
+    work_item_correlations = tuple(
+        workflow["run_correlation"](name) for name in work_item_logical_names
     )
+    planner_name = workflow["correlated_agent_tab_name"]("Work-item planner")
+    planner_correlation = workflow["run_correlation"]("Work-item planner")
 
     class Client:
         workspace_id = "workspace"
@@ -406,7 +408,7 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
 
         def set_draft(self, number: int, **_kwargs: object) -> PullRequestState:
             assert number == draft.number
-            assert len(client.tabs) == 3
+            assert len(client.tabs) == 4
             assert all(
                 tab.cli_state == "ready-for-review" for tab in client.tabs.values()
             )
@@ -417,10 +419,13 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
 
     github = GitHub()
 
+    plan_attempts = 0
+
     def prepared_plan(*_args: object) -> tuple[None, object]:
+        nonlocal plan_attempts
         plan = workflow["WorkItemPlan"](config)
-        plan.position = 1
-        plan.finalized = True
+        plan.position = plan_attempts
+        plan_attempts += 1
         return None, plan
 
     def run_turn(*args: object, **_kwargs: object) -> str:
@@ -437,6 +442,22 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
             1,
         )
 
+    planner_turns = 0
+
+    def run_validated_turn(*args: object, **_kwargs: object) -> tuple[str, object]:
+        nonlocal planner_turns
+        planner_turns += 1
+        source = json.dumps(
+            {
+                "actions": [],
+                "complete": planner_turns == 2,
+                "policy_conflicts": [],
+            }
+        )
+        client.complete(str(args[1]))
+        validator = args[4]
+        return source, validator(source)  # type: ignore[operator]
+
     monkeypatch.setitem(
         globals_,
         "GitRepository",
@@ -449,6 +470,7 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
     )
     monkeypatch.setitem(globals_, "create_runtime", lambda _config: client)
     monkeypatch.setitem(globals_, "prepare_work_item_plan_pr", prepared_plan)
+    monkeypatch.setitem(globals_, "persist_work_item_plan", lambda _plan, *_args: None)
     monkeypatch.setitem(
         globals_, "inspect_dynamic_work_item_topology", lambda *_args, **_kwargs: None
     )
@@ -456,6 +478,7 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
         globals_, "prepare_issue", lambda *_args: (None, feature_sha, False)
     )
     monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(globals_, "run_validated_turn", run_validated_turn)
     monkeypatch.setitem(
         globals_,
         "require_agent_result",
@@ -494,20 +517,25 @@ def test_repository_recovery_recreates_all_completed_work_item_tabs(
     assert result == ready
     assert github.ready_attempts == 2
     assert [mutation[:2] for mutation in mutations] == [
-        ("create", "tab-1"),
+        ("create", "tab-1"),  # Initial planner.
         ("create", "tab-2"),
         ("create", "tab-3"),
-        ("close", "tab-1"),
+        ("create", "tab-4"),
         ("close", "tab-2"),
         ("close", "tab-3"),
-        ("create", "tab-4"),
+        ("close", "tab-4"),
         ("create", "tab-5"),
         ("create", "tab-6"),
+        ("create", "tab-7"),
+        ("close", "tab-1"),
+        ("create", "tab-8"),  # Retry planner.
     ]
-    assert tuple(mutation[2] for mutation in mutations[:3]) == expected_names
-    assert tuple(mutation[2] for mutation in mutations[6:]) == expected_names
-    assert tuple(mutation[3] for mutation in mutations[:3]) == expected_correlations
-    assert tuple(mutation[3] for mutation in mutations[6:]) == expected_correlations
+    assert tuple(mutation[2] for mutation in mutations[1:4]) == work_item_names
+    assert tuple(mutation[2] for mutation in mutations[7:10]) == work_item_names
+    assert tuple(mutation[3] for mutation in mutations[1:4]) == work_item_correlations
+    assert tuple(mutation[3] for mutation in mutations[7:10]) == work_item_correlations
+    assert mutations[0][2:] == (planner_name, planner_correlation)
+    assert mutations[-1][2:] == (planner_name, planner_correlation)
 
 
 @pytest.mark.parametrize(

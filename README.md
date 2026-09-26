@@ -530,10 +530,10 @@ reconciliation; Cleanup ownership continues to use returned concrete workspace,
 tab, and filesystem identities.
 
 When repository recovery retries the same work item within one Run, the canonical
-workflow keeps those correlations stable. Before recreating the implementer and
-reviewer sessions, it closes every uniquely matched prior tab only after public
-status and result reads prove that tab completed. An ambiguous, unrelated, or
-still-running match is retained and stops the retry.
+workflow keeps the planner, implementer, and reviewer correlations stable. Before
+recreating those sessions, it closes every uniquely matched prior tab only after
+public status and result reads prove that tab completed. An ambiguous, unrelated,
+or still-running match is retained and stops the retry.
 
 Static Validation reports Dry Run eligibility separately. Eligible trusted
 workflows declare `WORKFLOW_DRY_RUN = 1`; Dry Run executes that same Python program
