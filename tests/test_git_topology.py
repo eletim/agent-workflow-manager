@@ -1148,8 +1148,10 @@ def test_normalize_refuses_conflicting_folded_provenance(
     assert repo.inspect_branch(branch).remote_sha is None
 
 
-def test_normalize_valid_remote_visible_provenance_is_a_noop(
+@pytest.mark.parametrize("process", ["implementation", "reviewer-fix", "cleanup"])
+def test_normalize_rejects_valid_remote_visible_provenance(
     repositories: tuple[Path, Path, Path],
+    process: str,
 ) -> None:
     _remote, _seed, work = repositories
     repo = open_repo(work, RecordingGitRunner())
@@ -1164,21 +1166,22 @@ def test_normalize_valid_remote_visible_provenance_is_a_noop(
         "agent result",
         "-m",
         "Co-authored-by: Codex <noreply@openai.com>\n"
-        "AWM-Agent: codex\nAWM-Process: implementation",
+        f"AWM-Agent: codex\nAWM-Process: {process}",
     )
     pushed_sha = git(work, "rev-parse", "HEAD")
     git(work, "push", "origin", branch)
 
-    result = repo.normalize_agent_commit_provenance(
-        branch,
-        base,
-        pushed_sha,
-        expected_agent="codex",
-        expected_process="implementation",
-    )
+    with pytest.raises(WorkerFailure, match="already reachable from remote"):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            pushed_sha,
+            expected_agent="codex",
+            expected_process=process,
+        )
 
-    assert result.local_sha == pushed_sha
-    assert result.remote_sha == pushed_sha
+    assert git(work, "rev-parse", "HEAD") == pushed_sha
+    assert repo.inspect_branch(branch).remote_sha == pushed_sha
 
 
 def test_normalize_rewrites_each_commit_in_an_unpublished_range(

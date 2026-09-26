@@ -3257,6 +3257,7 @@ def process_issue(
             config,
             agent_type=IMPLEMENTER_AGENT,
             name=f"{issue.label} worktree cleanup",
+            restriction="local-git-only",
         )
         require_clean_worktree(
             repo,
@@ -3425,6 +3426,7 @@ def process_issue(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name=f"{issue.label} implementer",
+        restriction="local-git-only",
     )
     scope_reviewer = create_agent(
         client,
@@ -4631,6 +4633,7 @@ def _review_whole_version(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Whole-version fixer",
+        restriction="local-git-only",
     )
     reviewer = create_agent(
         client,
@@ -5490,6 +5493,7 @@ def integration_delivery(
                     config,
                     agent_type=IMPLEMENTER_AGENT,
                     name="Whole-version cleanup",
+                    restriction="local-git-only",
                 )
             if cleanup is None:
                 checked = repo.require_committed_result(

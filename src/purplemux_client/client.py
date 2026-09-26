@@ -45,7 +45,7 @@ class CreateSessionRequest:
     selects the provider; `cwd`, `command`, and `metadata` describe caller intent and
     are retained for generated-workflow APIs. A supplied `name` is also the logical
     resource name used for automatic run-scoped correlation. `restriction` selects
-    an explicit reusable capability boundary for exceptional agent turns.
+    an explicit reusable capability boundary for commit-producing agent turns.
     """
 
     worker: str
@@ -1369,7 +1369,7 @@ class PurpleMuxCLIClient:
 
     @staticmethod
     def _restricted_agent_command(worker: str, prompt: str) -> str:
-        """Launch an agent with local Git but no remote ref capability."""
+        """Launch an agent with local Git but no publication capability."""
         encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         reference_hook = base64.b64encode(
             b"""#!/bin/sh
@@ -1392,6 +1392,10 @@ done
         pre_push_hook = base64.b64encode(b"#!/bin/sh\nexit 1\n").decode("ascii")
         environment_options = [
             "env",
+            "-u",
+            "GH_TOKEN",
+            "-u",
+            "GITHUB_TOKEN",
             "-u",
             "GIT_ASKPASS",
             "-u",
@@ -1417,12 +1421,7 @@ done
         if worker == "codex":
             command = [
                 *environment_options,
-                "-u",
-                "GH_TOKEN",
-                "-u",
-                "GITHUB_TOKEN",
                 *git_environment,
-                "GH_CONFIG_DIR=/dev/null",
                 "codex",
                 "--sandbox",
                 "workspace-write",
@@ -1465,14 +1464,7 @@ done
                     "Bash(git show *)",
                     "Bash(git status *)",
                     "Bash(gh pr view *)",
-                    "Bash(gh pr edit *)",
-                    "Bash(gh pr ready *)",
-                    "Bash(gh pr reopen *)",
                     "Bash(gh issue view *)",
-                    "Bash(gh issue edit *)",
-                    "Bash(gh issue close *)",
-                    "Bash(gh issue reopen *)",
-                    "Bash(gh issue comment *)",
                 )
             )
             command = [
@@ -1502,6 +1494,7 @@ done
             "awm_recovery_hooks_root=$(cd \"$awm_recovery_hooks_root\" && pwd -P) && "
             'awm_recovery_hooks=$(mktemp -d '
             '"$awm_recovery_hooks_root/awm-recovery.XXXXXX") && '
+            'mkdir -p -- "$awm_recovery_hooks/gh" && '
             "trap 'rm -r -- \"$awm_recovery_hooks\"' EXIT && "
             "awm_recovery_ref=$(git symbolic-ref -q HEAD) && "
             f"printf %s {reference_hook} | base64 --decode > "
@@ -1512,6 +1505,7 @@ done
             '"$awm_recovery_hooks/pre-push" && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_RECOVERY_PROTECTED_REF="$awm_recovery_ref" '
+            'GH_CONFIG_DIR="$awm_recovery_hooks/gh" '
             'GIT_CONFIG_VALUE_1="$awm_recovery_hooks" '
             f"{launch}"
         )

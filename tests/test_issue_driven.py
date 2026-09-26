@@ -2570,6 +2570,44 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
     }
 
 
+def test_generated_workflow_restricts_every_coding_session_from_publication() -> None:
+    tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
+    restrictions: dict[str, str | None] = {}
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != "create_agent":
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        name = keywords["name"]
+        if isinstance(name, ast.Constant):
+            label = str(name.value)
+        elif isinstance(name, ast.JoinedStr):
+            label = "".join(
+                str(value.value)
+                for value in name.values
+                if isinstance(value, ast.Constant)
+            )
+        else:
+            continue
+        restriction = keywords.get("restriction")
+        restrictions[label] = (
+            str(restriction.value)
+            if isinstance(restriction, ast.Constant)
+            else None
+        )
+
+    assert {
+        label
+        for label, restriction in restrictions.items()
+        if restriction == "local-git-only"
+    } == {
+        "Recovery agent",
+        " worktree cleanup",
+        " implementer",
+        "Whole-version fixer",
+        "Whole-version cleanup",
+    }
+
+
 @pytest.mark.parametrize(
     ("final_review", "expected"),
     [
@@ -2697,7 +2735,7 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "push the exact normalized commit" in code
     assert "Your delivery responsibility ends with clean local commits" in code
     assert "Do not push, create or update a PR, or change PR state" in prompt
-    assert code.count('restriction="local-git-only"') == 1
+    assert code.count('restriction="local-git-only"') == 5
     assert (
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers"
         in code

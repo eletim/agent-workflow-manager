@@ -745,15 +745,6 @@ class GitRepository:
             commit_data.append((commit_sha, header_lines, message, normalized))
             needs_normalization = needs_normalization or normalized != message
 
-        if not needs_normalization:
-            self.require_agent_commit_provenance(
-                previous_sha,
-                current_sha,
-                expected_agent=expected_agent,
-                expected_process=expected_process,
-            )
-            return state
-
         remote_refs_before = self.inspect_remote_refs()
         remote_before = remote_refs_before.get(f"refs/heads/{branch}")
         if remote_before != state.remote_sha:
@@ -769,7 +760,7 @@ class GitRepository:
         ]
         if published:
             raise WorkerFailure(
-                "refusing to normalize agent provenance because the commit range "
+                "refusing agent provenance because the commit range "
                 "is already reachable from remote ref(s): "
                 + ", ".join(repr(remote_ref) for remote_ref in published)
             )
@@ -779,6 +770,15 @@ class GitRepository:
                     "refusing to normalize agent provenance because the remote "
                     f"{branch!r} does not precede the agent commit range"
                 )
+
+        if not needs_normalization:
+            self.require_agent_commit_provenance(
+                previous_sha,
+                current_sha,
+                expected_agent=expected_agent,
+                expected_process=expected_process,
+            )
+            return state
 
         rewritten: dict[str, str] = {}
         for commit_sha, header_lines, message, normalized in commit_data:
