@@ -392,9 +392,9 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told
-# to commit, push, create or update one exact Draft PR, and leave a clean
-# worktree. The Workflow independently verifies each delivery postcondition.
+# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told to
+# leave clean local commits. The Workflow owns normalization, verification,
+# publication, and exact Draft-PR management.
 turn_start_sha = feature.local_sha
 # ... run the CodingAgent ...
 feature = repo.require_current_branch("feature/issue-123")
@@ -412,9 +412,9 @@ feature = repo.require_committed_result(
     expected_agent="codex",
     expected_process="implementation",
 )
-# Push is also orchestration-owned gap absorption if the agent omitted it. This
-# only creates the exact remote branch or fast-forwards it; remote-ahead or
-# diverged states fail closed.
+# Only after normalization and verification does orchestration publish the exact
+# commit. This only creates the remote branch or fast-forwards it; remote-ahead
+# or diverged states fail closed.
 feature = repo.ensure_pushed(
     "feature/issue-123",
     expected_local_sha=feature.local_sha,
@@ -430,9 +430,10 @@ When a workflow does not already know the repository slug, omitting
 `expected_github_slug` derives and pins it from the validated GitHub origin. The
 origin is still rechecked on every topology operation.
 
-The Workflow similarly creates or reuses the exact Draft PR when the agent did
-not create one, then verifies its head, base, SHAs, and Draft state before
-review. Each Issue first receives a Scope / Design Review of whether its diff is
+The Workflow creates or reuses the exact Draft PR, then verifies its head, base,
+SHAs, and Draft state before review. Coding Agents never publish commits or
+manage PR state. Each Issue first receives a Scope / Design Review of whether
+its diff is
 necessary, sufficient, appropriately placed, and consistent with the shared
 minimal-change principle. Directly out-of-scope incidental changes are judged by
 their necessity, proportionality, natural responsibility placement, and the

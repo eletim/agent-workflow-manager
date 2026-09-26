@@ -155,8 +155,10 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
+@pytest.mark.parametrize("restriction", ["local-git-only", "publication-disabled"])
 def test_restricted_session_uses_common_turn_interface(
     monkeypatch: pytest.MonkeyPatch,
+    restriction: str,
 ) -> None:
     runner = FakeRunner([completed({"tabId": "tab-restricted"})])
     cli = client(runner)
@@ -165,7 +167,7 @@ def test_restricted_session_uses_common_turn_interface(
             worker="codex",
             cwd="/workspace/project",
             command="codex",
-            restriction="local-git-only",
+            restriction=restriction,  # type: ignore[arg-type]
         )
     )
     started: list[ShellCommandRequest] = []
@@ -277,19 +279,20 @@ def test_restricted_claude_does_not_allow_pr_close_delete_branch() -> None:
         "git push --force https://x-access-token:${GH_TOKEN}@github.com/acme/project.git",
     ],
 )
-def test_restricted_codex_denies_authenticated_ref_update_capabilities(
-    attempt: str, tmp_path: Path
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
+    attempt: str, worker: str, tmp_path: Path
 ) -> None:
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
-    fake_codex = tmp_path / "codex"
-    fake_codex.write_text(
+    fake_worker = tmp_path / worker
+    fake_worker.write_text(
         "#!/bin/sh\n"
         "printf '%s\\n' \"${GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|\""
         "\"${GH_CONFIG_DIR-unset}|$*\"\n",
         encoding="utf-8",
     )
-    fake_codex.chmod(0o755)
-    command = PurpleMuxCLIClient._restricted_agent_command("codex", attempt)
+    fake_worker.chmod(0o755)
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(worker, attempt)
     environment = os.environ.copy()
     environment.update(
         {
@@ -311,14 +314,110 @@ def test_restricted_codex_denies_authenticated_ref_update_capabilities(
 
     assert result.returncode == 0
     assert attempt not in command
-    assert "sandbox_workspace_write.network_access=false" in command
     assert "-u GH_TOKEN" in command
     assert "-u GITHUB_TOKEN" in command
-    assert "GH_CONFIG_DIR=/dev/null" in command
+    assert 'GH_CONFIG_DIR="$awm_delivery_hooks/gh"' in command
     token, github_token, config_dir, arguments = result.stdout.strip().split("|", 3)
     assert token == github_token == "unset"
-    assert config_dir == "/dev/null"
-    assert "sandbox_workspace_write.network_access=false" in arguments
+    assert config_dir.endswith("/gh")
+    if worker == "codex":
+        assert "sandbox_workspace_write.network_access=false" in arguments
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_agent_retains_development_tools(worker: str) -> None:
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        worker, "run the project tests, lint, formatter, and build"
+    )
+
+    assert "GIT_SSH_COMMAND=false" in command
+    assert "pre-push" in command
+    if worker == "codex":
+        assert "--sandbox workspace-write" in command
+        assert "--ask-for-approval never" in command
+    else:
+        arguments = shlex.split(command)
+        allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+        assert "Bash" in allowed_tools
+        assert not any(tool.startswith("Bash(") for tool in allowed_tools)
+
+
+def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        "claude", "run tests"
+    )
+    arguments = shlex.split(command)
+    settings = json.loads(arguments[arguments.index("--settings") + 1])
+
+    assert settings["sandbox"]["enabled"] is True
+    assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+    assert settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["network"]["allowedDomains"] == []
+    assert settings["sandbox"]["network"]["strictAllowlist"] is True
+    assert settings["sandbox"]["network"]["deniedDomains"] == [
+        "github.com",
+        "*.github.com",
+    ]
+    assert {entry["name"] for entry in settings["sandbox"]["credentials"]["envVars"]} == {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    }
+    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1" in command
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_allows_commits_in_nested_repository(
+    worker: str, tmp_path: Path
+) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    fake_worker = tmp_path / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        'nested=$(mktemp -d "${PWD%/*}/nested-repository.XXXXXX")\n'
+        "git -C \"$nested\" init -b main >/dev/null 2>&1\n"
+        "git -C \"$nested\" config user.name Test\n"
+        "git -C \"$nested\" config user.email test@example.com\n"
+        "git -C \"$nested\" commit --allow-empty -m nested >/dev/null 2>&1\n"
+        "printf '%s|%s\\n' \"$?\" \"$nested\"\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "run tests"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    commit_status, nested_path = result.stdout.strip().split("|", 1)
+    assert commit_status == "0"
+    assert subprocess.run(
+        ["git", "-C", nested_path, "log", "-1", "--format=%s"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "nested"
 
 
 def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_tags(

@@ -679,16 +679,84 @@ class GitRepository:
         allow_unchanged: bool = False,
     ) -> BranchState:
         """Normalize unambiguous provenance on an unpublished agent commit range."""
+        return self._normalize_agent_commit_provenance(
+            branch,
+            previous_sha,
+            current_sha,
+            expected_agent=expected_agent,
+            expected_process=expected_process,
+            allowed_processes=None,
+            allow_unchanged=allow_unchanged,
+        )
+
+    def normalize_agent_declared_commit_provenance(
+        self,
+        branch: str,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        allowed_processes: Collection[str],
+        allow_unchanged: bool = False,
+    ) -> BranchState:
+        """Normalize an unpublished range while preserving declared processes."""
+        allowed = frozenset(allowed_processes)
+        supported = {"implementation", "reviewer-fix", "cleanup", "recovery"}
+        if not allowed or not allowed <= supported:
+            raise ValueError("allowed_processes must contain supported agent processes")
+        return self._normalize_agent_commit_provenance(
+            branch,
+            previous_sha,
+            current_sha,
+            expected_agent=expected_agent,
+            expected_process=None,
+            allowed_processes=allowed,
+            allow_unchanged=allow_unchanged,
+        )
+
+    def _normalize_agent_commit_provenance(
+        self,
+        branch: str,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        expected_process: str | None,
+        allowed_processes: frozenset[str] | None,
+        allow_unchanged: bool,
+    ) -> BranchState:
         self._validate_sha(previous_sha)
         self._validate_sha(current_sha)
         coauthor = agent_commit_coauthor(expected_agent)
-        if expected_process not in {
+        if expected_process is not None and expected_process not in {
             "implementation",
             "reviewer-fix",
             "cleanup",
             "recovery",
         }:
             raise ValueError("expected_process is not a supported agent process")
+        if (expected_process is None) == (allowed_processes is None):
+            raise ValueError(
+                "exactly one of expected_process or allowed_processes is required"
+            )
+
+        def require_normalized(start_sha: str, end_sha: str) -> None:
+            if expected_process is not None:
+                self.require_agent_commit_provenance(
+                    start_sha,
+                    end_sha,
+                    expected_agent=expected_agent,
+                    expected_process=expected_process,
+                )
+                return
+            assert allowed_processes is not None
+            self.require_agent_commit_declared_provenance(
+                start_sha,
+                end_sha,
+                expected_agent=expected_agent,
+                allowed_processes=allowed_processes,
+            )
+
         worktree_before = self.inspect_worktree()
         state = self.require_current_branch(branch)
         if state.local_sha != current_sha:
@@ -735,24 +803,25 @@ class GitRepository:
                     f"or merge commit range at {commit_sha}"
                 )
             expected_parent = commit_sha
+            commit_process = expected_process
+            if commit_process is None:
+                assert allowed_processes is not None
+                declared = self._agent_trailer_values(message)["awm-process"]
+                if len(declared) != 1 or declared[0] not in allowed_processes:
+                    raise WorkerFailure(
+                        f"commit {commit_sha} must have exactly one allowed "
+                        "AWM-Process trailer before provenance normalization"
+                    )
+                commit_process = declared[0]
             normalized = self._normalize_agent_message(
                 message,
                 commit_sha=commit_sha,
                 expected_agent=expected_agent,
-                expected_process=expected_process,
+                expected_process=commit_process,
                 coauthor=coauthor,
             )
             commit_data.append((commit_sha, header_lines, message, normalized))
             needs_normalization = needs_normalization or normalized != message
-
-        if not needs_normalization:
-            self.require_agent_commit_provenance(
-                previous_sha,
-                current_sha,
-                expected_agent=expected_agent,
-                expected_process=expected_process,
-            )
-            return state
 
         remote_refs_before = self.inspect_remote_refs()
         remote_before = remote_refs_before.get(f"refs/heads/{branch}")
@@ -769,7 +838,7 @@ class GitRepository:
         ]
         if published:
             raise WorkerFailure(
-                "refusing to normalize agent provenance because the commit range "
+                "refusing agent provenance because the commit range "
                 "is already reachable from remote ref(s): "
                 + ", ".join(repr(remote_ref) for remote_ref in published)
             )
@@ -779,6 +848,10 @@ class GitRepository:
                     "refusing to normalize agent provenance because the remote "
                     f"{branch!r} does not precede the agent commit range"
                 )
+
+        if not needs_normalization:
+            require_normalized(previous_sha, current_sha)
+            return state
 
         rewritten: dict[str, str] = {}
         for commit_sha, header_lines, message, normalized in commit_data:
@@ -804,13 +877,35 @@ class GitRepository:
             rewritten[commit_sha] = self._write_commit_object(rewritten_raw)
 
         normalized_sha = rewritten[current_sha]
-        self.require_agent_commit_provenance(
-            previous_sha,
-            normalized_sha,
-            expected_agent=expected_agent,
-            expected_process=expected_process,
-        )
+        require_normalized(previous_sha, normalized_sha)
         checkout_branch = self._checkout_branch(branch)
+        checkout_ref = f"refs/heads/{checkout_branch}"
+        feature_refs_before = self._feature_recovery_refs(branch)
+        source_refs = tuple(
+            sorted(
+                ref for ref, object_sha in feature_refs_before.items()
+                if rewritten.get(object_sha, object_sha) != object_sha
+            )
+        )
+        if checkout_ref not in source_refs:
+            raise WorkerFailure(
+                f"active recovery ref {checkout_ref!r} changed before provenance "
+                "normalization"
+            )
+        feature_refs_normalized = {
+            ref: rewritten.get(object_sha, object_sha)
+            for ref, object_sha in feature_refs_before.items()
+        }
+
+        def ref_transaction(
+            before: Mapping[str, str], after: Mapping[str, str]
+        ) -> str:
+            commands = ["start"]
+            commands.extend(
+                f"update {ref} {after[ref]} {before[ref]}" for ref in source_refs
+            )
+            commands.extend(("prepare", "commit"))
+            return "\n".join(commands) + "\n"
 
         def require_unchanged_preconditions() -> None:
             current_worktree = self.inspect_worktree()
@@ -827,20 +922,22 @@ class GitRepository:
                 raise WorkerFailure(
                     "remote refs changed before provenance normalization"
                 )
+            if self._feature_recovery_refs(branch) != feature_refs_before:
+                raise WorkerFailure(
+                    "feature recovery refs changed before provenance normalization"
+                )
 
         self._git_mutation(
-            [
-                "update-ref",
-                f"refs/heads/{checkout_branch}",
-                normalized_sha,
-                current_sha,
-            ],
+            ["update-ref", "--stdin"],
             operation="normalize agent commit provenance",
             target=branch,
-            pre_state=current_sha,
-            observe=lambda: self._checkout_sha(branch),
-            desired=lambda: self._branch_matches(branch, normalized_sha, True),
+            pre_state=feature_refs_before,
+            observe=lambda: self._feature_recovery_refs(branch),
+            desired=lambda: (
+                self._feature_recovery_refs(branch) == feature_refs_normalized
+            ),
             pre_dispatch=require_unchanged_preconditions,
+            input_text=ref_transaction(feature_refs_before, feature_refs_normalized),
         )
         remote_refs_after = self.inspect_remote_refs()
         result = self.require_current_branch(branch)
@@ -850,17 +947,17 @@ class GitRepository:
         ):
             try:
                 self._git_mutation(
-                    [
-                        "update-ref",
-                        f"refs/heads/{checkout_branch}",
-                        current_sha,
-                        normalized_sha,
-                    ],
+                    ["update-ref", "--stdin"],
                     operation="restore agent commit before remote race",
                     target=branch,
-                    pre_state=normalized_sha,
-                    observe=lambda: self._checkout_sha(branch),
-                    desired=lambda: self._branch_matches(branch, current_sha, True),
+                    pre_state=feature_refs_normalized,
+                    observe=lambda: self._feature_recovery_refs(branch),
+                    desired=lambda: (
+                        self._feature_recovery_refs(branch) == feature_refs_before
+                    ),
+                    input_text=ref_transaction(
+                        feature_refs_normalized, feature_refs_before
+                    ),
                 )
             except WorkerFailure as exc:
                 raise MutationOutcomeUnknown(
@@ -877,12 +974,7 @@ class GitRepository:
             )
         if self.inspect_worktree().status != worktree_before.status:
             raise WorkerFailure("worktree changed during provenance normalization")
-        self.require_agent_commit_provenance(
-            previous_sha,
-            normalized_sha,
-            expected_agent=expected_agent,
-            expected_process=expected_process,
-        )
+        require_normalized(previous_sha, normalized_sha)
         return result
 
     def restore_rejected_recovery_branch(

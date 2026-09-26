@@ -589,7 +589,7 @@ def create_agent(
     *,
     agent_type: str,
     name: str,
-    restriction: Literal["local-git-only"] | None = None,
+    restriction: Literal["local-git-only", "publication-disabled"] | None = None,
 ) -> str:
     correlation_id = run_correlation(name)
     return client.create_session(
@@ -1208,6 +1208,10 @@ def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
         "work-item plan.\n\n"
+        "Your delivery responsibility ends with clean local commits. Do not push, "
+        "create or update a PR, or change PR state; AWM will normalize and verify "
+        "commit provenance before it publishes the exact commit and manages the "
+        "Draft PR.\n\n"
         "Every commit you create must end with these exact Git trailers, preserving "
         "any additional trailers the agent adds:\n"
         f"Co-authored-by: {coauthor}\n"
@@ -2599,16 +2603,15 @@ existing branch {issue.branch}, based on {config.integration_branch}. Read the
 work-item requirement below. Inspect existing Git and GitHub state before editing
 because this may be a new recovery run. Implement only the requested work item and run appropriate
 project tests and checks. Commit every intended source, test, and configuration
-change, leaving none uncommitted or untracked. Push the exact feature branch
-{issue.branch} after committing. Create or update exactly one Draft PR from
-{issue.branch} to {config.integration_branch}. Finish with a clean worktree.
+change, leaving none uncommitted or untracked. Leave publication to AWM, which
+will push the exact normalized commit on {issue.branch} and create or update
+exactly one Draft PR to {config.integration_branch}. Finish with a clean worktree.
 
 {issue.requirement}
 
 Never reset, rebase, stash, force-push, merge the work-item PR, target
 {config.main_branch}, create unrelated PRs, or discard ambiguous local work.
-Return a concise summary including the commit SHA and PR number or URL when
-available.""")
+Return a concise summary including the local commit SHA.""")
     scope_review = review_context + f"""Perform only the Scope / Design Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement} Inspect the PR diff. Decide whether the changed targets,
@@ -2663,6 +2666,7 @@ def prepare_issue(
     repo.require_clean()
     integration = repo.synchronize_branch(config.integration_branch)
     assert integration.remote_sha is not None
+    allowed_processes = ("implementation", "reviewer-fix", "cleanup")
     if open_pr is None:
         recovery = repo.recover_feature_branch(
             issue.branch,
@@ -2671,6 +2675,30 @@ def prepare_issue(
         )
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
+        published_ancestor = feature.remote_sha or integration.remote_sha
+        if feature.remote_sha is not None:
+            repo.require_agent_commit_declared_provenance(
+                integration.remote_sha,
+                feature.remote_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
+        if reused_existing_work and feature.local_sha != published_ancestor:
+            assert feature.local_sha is not None
+            feature = repo.normalize_agent_declared_commit_provenance(
+                issue.branch,
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
+            assert feature.local_sha is not None
+            repo.require_agent_commit_declared_provenance(
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
     else:
         feature = repo.synchronize_branch(
             issue.branch, expected_remote_sha=open_pr.head_sha
@@ -2686,6 +2714,13 @@ def prepare_issue(
                 f"existing {issue.branch} does not contain authoritative base "
                 f"{integration.remote_sha}; reconcile it before starting a new run"
             )
+        assert feature.remote_sha is not None
+        repo.require_agent_commit_declared_provenance(
+            integration.remote_sha,
+            feature.remote_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            allowed_processes=allowed_processes,
+        )
     assert feature.local_sha is not None
     emit_finding(
         "git",
@@ -3254,6 +3289,7 @@ def process_issue(
             config,
             agent_type=IMPLEMENTER_AGENT,
             name=f"{issue.label} worktree cleanup",
+            restriction="publication-disabled",
         )
         require_clean_worktree(
             repo,
@@ -3422,6 +3458,7 @@ def process_issue(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name=f"{issue.label} implementer",
+        restriction="publication-disabled",
     )
     scope_reviewer = create_agent(
         client,
@@ -4628,6 +4665,7 @@ def _review_whole_version(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Whole-version fixer",
+        restriction="publication-disabled",
     )
     reviewer = create_agent(
         client,
@@ -5487,6 +5525,7 @@ def integration_delivery(
                     config,
                     agent_type=IMPLEMENTER_AGENT,
                     name="Whole-version cleanup",
+                    restriction="publication-disabled",
                 )
             if cleanup is None:
                 checked = repo.require_committed_result(

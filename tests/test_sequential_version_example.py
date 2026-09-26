@@ -180,6 +180,224 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "Deliver the exact approved Issue topology" not in source
 
 
+def test_prepare_issue_preserves_recovered_processes_before_unchanged_turn() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](217, "feature/issue-217")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    events: list[str] = []
+
+    class Repository:
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, "base", "base", True)
+
+        def recover_feature_branch(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs == {
+                "base": config.integration_branch,
+                "expected_base_sha": "base",
+            }
+            return SimpleNamespace(
+                branch=BranchState(branch, "raw-agent-commit", None, True),
+                reused_existing_work=True,
+            )
+
+        def normalize_agent_declared_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            events.append("normalize")
+            assert (branch, start, end) == (
+                issue.branch,
+                "base",
+                "raw-agent-commit",
+            )
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            return BranchState(branch, "normalized-agent-commit", None, True)
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify")
+            assert (start, end) == ("base", "normalized-agent-commit")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            assert kwargs["state"] in {"OPEN", "MERGED"}
+            return None
+
+    prepared = workflow["prepare_issue"](Repository(), GitHub(), issue, config)
+
+    assert prepared == (None, "normalized-agent-commit", True)
+    assert events == ["normalize", "verify"]
+
+
+def test_pushed_recovery_without_pr_fails_provenance_before_unchanged_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](218, "feature/issue-218")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, "base", "base", True)
+
+        def recover_feature_branch(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs["expected_base_sha"] == "base"
+            return SimpleNamespace(
+                branch=BranchState(branch, "pushed", "pushed", True),
+                reused_existing_work=True,
+            )
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify-published")
+            assert (start, end) == ("base", "pushed")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            raise WorkerFailure("published commit has invalid agent provenance")
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            assert kwargs["state"] in {"OPEN", "MERGED"}
+            return None
+
+        def create_draft_pr(self, **_kwargs: object) -> None:
+            events.append("draft")
+            raise AssertionError("Draft PR mutation must not be reached")
+
+    monkeypatch.setitem(
+        globals_,
+        "create_agent",
+        lambda *_args, **_kwargs: events.append("agent") or "agent",
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent provenance"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            GitHub(),
+        )
+
+    assert events == ["verify-published"]
+
+
+@pytest.mark.parametrize("draft", [True, False], ids=("draft", "ready"))
+def test_existing_pr_fails_provenance_before_mutation_or_agent_start(
+    draft: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](219, "feature/issue-219")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    existing = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=draft),
+        head_sha="published-head",
+        base_sha="base",
+    )
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(
+            self, branch: str, **kwargs: object
+        ) -> BranchState:
+            if branch == config.integration_branch:
+                assert kwargs == {}
+                return BranchState(branch, "base", "base", True)
+            assert branch == issue.branch
+            assert kwargs == {"expected_remote_sha": "published-head"}
+            return BranchState(branch, "published-head", "published-head", True)
+
+        def inspect_feature_preparation(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs["expected_base_sha"] == "base"
+            return SimpleNamespace(base_is_ancestor=True)
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify-published")
+            assert (start, end) == ("base", "published-head")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            raise WorkerFailure("published PR head has invalid agent provenance")
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> PullRequestState | None:
+            if kwargs["state"] == "OPEN":
+                return existing
+            assert kwargs["state"] == "MERGED"
+            return None
+
+        def set_draft(self, *_args: object, **_kwargs: object) -> None:
+            events.append("redraft")
+            raise AssertionError("PR mutation must not be reached")
+
+    monkeypatch.setitem(
+        globals_,
+        "create_agent",
+        lambda *_args, **_kwargs: events.append("agent") or "agent",
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent provenance"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            GitHub(),
+        )
+
+    assert events == ["verify-published"]
+
+
 def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -615,6 +833,7 @@ def test_existing_work_item_pr_adopts_its_verified_remote_head(
         head=issue.branch, base=config.integration_branch, draft=True
     )
     calls: list[tuple[str, str | None]] = []
+    provenance: list[tuple[str, str]] = []
 
     class Repository:
         def require_clean(self) -> None:
@@ -634,6 +853,17 @@ def test_existing_work_item_pr_adopts_its_verified_remote_head(
         def inspect_feature_preparation(self, *args: object, **kwargs: object):
             return SimpleNamespace(base_is_ancestor=True)
 
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end))
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+
     class GitHub:
         def find_pr(self, *, head: str, base: str, state: str):
             assert (head, base) == (issue.branch, config.integration_branch)
@@ -652,6 +882,7 @@ def test_existing_work_item_pr_adopts_its_verified_remote_head(
         (config.integration_branch, None),
         (issue.branch, pull_request.head_sha),
     ]
+    assert provenance == [(pull_request.base_sha, pull_request.head_sha)]
 
 
 @pytest.mark.parametrize(
@@ -3108,6 +3339,7 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
         Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
     )
     start_sha = "start-head"
+    raw_implementation_sha = "raw-implementation-head"
     implementation_sha = "implementation-head"
     base_sha = "integration-head"
     events: list[str] = []
@@ -3138,11 +3370,26 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             assert self.local_sha != previous_sha or allow_unchanged
             return BranchState(branch, self.local_sha, None, True)
 
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (branch, start, end) == (
+                issue.branch,
+                start_sha,
+                raw_implementation_sha,
+            )
+            assert kwargs["expected_process"] == "implementation"
+            events.append("normalize:implementation")
+            self.local_sha = implementation_sha
+            return BranchState(branch, self.local_sha, None, True)
+
         def require_agent_commit_provenance(
             self, start: str, end: str, **kwargs: object
         ) -> None:
             assert kwargs["expected_agent"] == "codex"
             assert kwargs["expected_process"] in {"implementation", "cleanup"}
+            if kwargs["expected_process"] == "implementation":
+                events.append("verify:implementation")
 
         def inspect_branch(self, branch: str) -> BranchState:
             assert branch == config.integration_branch
@@ -3193,11 +3440,27 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
             events.append("ready")
             return replace(draft, is_draft=False)
 
-    def run_turn(*args: object, **kwargs: object) -> str:
+    real_run_turn = workflow["run_turn"]
+
+    class ImplementationClient:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = raw_implementation_sha
+
+        def read_result(self, *_args: object) -> str:
+            return "implemented and committed"
+
+    def run_turn(*args: object, **kwargs: object):
         name = str(args[2])
         if name.endswith("implementation"):
-            repository.local_sha = implementation_sha
-            return "implemented and committed"
+            return real_run_turn(ImplementationClient(), *args[1:], **kwargs)
         if name.endswith("review"):
             return "APPROVED"
         raise AssertionError(f"unexpected turn {name}")
@@ -3211,6 +3474,12 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "emit_agent_turn", lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(
+        workflow_globals, "terminal_progress", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(workflow_globals, "MERGE_TO_INTEGRATION", False)
     monkeypatch.setitem(
         workflow_globals,
@@ -3222,11 +3491,14 @@ def test_normal_issue_path_commits_pushes_and_creates_exact_draft_pr(
         issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
     )
 
+    normalize_index = events.index("normalize:implementation")
+    provenance_index = events.index("verify:implementation")
     commit_index = events.index(f"commit:{implementation_sha}")
     push_index = events.index(f"push:{implementation_sha}")
     draft_index = events.index(f"draft:{implementation_sha}")
     verify_index = events.index(f"require_pr:{implementation_sha}")
-    assert commit_index < push_index < draft_index < verify_index
+    assert normalize_index < provenance_index < commit_index < push_index
+    assert push_index < draft_index < verify_index
     assert events[-1] == "ready"
     assert issue_results[0][1]["workspace_id"] == "ws-test"
     assert issue_results[0][1]["implementation_tab_id"] == (
@@ -3663,6 +3935,7 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     )
     base_sha = "integration-head"
     initial_sha = "implementation-head"
+    raw_fixed_sha = "raw-fixed-head"
     fixed_sha = "fixed-head"
     current_pr = replace(
         open_pr(head=issue.branch, base=config.integration_branch, draft=True),
@@ -3673,8 +3946,33 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     findings: list[tuple[str, str, str]] = []
 
     class Repository:
+        local_sha = initial_sha
+
         def inspect_worktree(self) -> SimpleNamespace:
             return SimpleNamespace(dirty=False)
+
+        def require_current_branch(self, branch: str) -> BranchState:
+            assert branch == issue.branch
+            return BranchState(branch, self.local_sha, None, True)
+
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (branch, start, end) == (
+                issue.branch,
+                initial_sha,
+                raw_fixed_sha,
+            )
+            assert kwargs["expected_process"] == "reviewer-fix"
+            events.append("normalize:reviewer-fix")
+            self.local_sha = fixed_sha
+            return BranchState(branch, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert kwargs["expected_process"] == "reviewer-fix"
+            events.append("verify:reviewer-fix")
 
         def inspect_branch(self, branch: str) -> BranchState:
             return BranchState(branch, base_sha, base_sha, False)
@@ -3707,9 +4005,29 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         )
     )
 
-    def run_turn(*args: object, **kwargs: object) -> str:
+    repository = Repository()
+    real_run_turn = workflow["run_turn"]
+
+    class FixClient:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = raw_fixed_sha
+
+        def read_result(self, *_args: object) -> str:
+            return "fixed"
+
+    def run_turn(*args: object, **kwargs: object):
         name = str(args[2])
         events.append(name)
+        if name.endswith("fixes"):
+            return real_run_turn(FixClient(), *args[1:], **kwargs)
         if "scope/design review" in name:
             return "CHANGES_REQUESTED\nstill needs work"
         if "correctness review" in name:
@@ -3725,6 +4043,12 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "emit_agent_turn", lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(
+        workflow_globals, "terminal_progress", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(
         workflow_globals,
         "require_agent_result",
@@ -3745,13 +4069,15 @@ def test_issue_review_limit_warns_without_starting_an_extra_fix(
     )
 
     result = workflow["process_issue"](
-        issue, config, SimpleNamespace(workspace_id="ws-test"), Repository(), GitHub()
+        issue, config, SimpleNamespace(workspace_id="ws-test"), repository, GitHub()
     )
 
     assert result.is_draft is False
     assert events.count("Issue #134 scope/design review") == 2
     assert events.count("Issue #134 scope/design fixes") == 1
     assert events.count("Issue #134 correctness review") == 1
+    assert events.index("normalize:reviewer-fix") < events.index("verify:reviewer-fix")
+    assert events.index("verify:reviewer-fix") < events.index(f"push:{fixed_sha}")
     assert "require_pushed" in events
     assert events[-1] == f"ready:{fixed_sha}"
     assert any(
@@ -5333,6 +5659,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     initial_sha = "integration-head"
+    raw_cleanup_sha = "raw-check-cleanup-head"
     cleanup_sha = "check-cleanup-head"
     base_sha = "main-head"
     current_pr = replace(
@@ -5379,11 +5706,26 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             assert not self.dirty
             return BranchState(branch, self.local_sha, self.local_sha, True)
 
+        def normalize_agent_commit_provenance(
+            self, branch: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (branch, start, end) == (
+                config.integration_branch,
+                initial_sha,
+                raw_cleanup_sha,
+            )
+            assert kwargs["expected_process"] == "cleanup"
+            events.append("normalize:cleanup")
+            self.local_sha = cleanup_sha
+            return BranchState(branch, self.local_sha, self.local_sha, True)
+
         def require_agent_commit_provenance(
             self, start: str, end: str, **kwargs: object
         ) -> None:
             assert kwargs["expected_agent"] == "codex"
             assert kwargs["expected_process"] == "cleanup"
+            if (start, end) == (initial_sha, cleanup_sha):
+                events.append("verify:cleanup")
 
         def ensure_pushed(self, branch: str, *, expected_local_sha: str) -> BranchState:
             events.append(f"push:{expected_local_sha}")
@@ -5417,7 +5759,25 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     check_count = 0
     outline_events: list[tuple[str, str]] = []
 
-    def run_turn(*args: object, **kwargs: object) -> str:
+    real_run_turn = workflow["run_turn"]
+
+    class CleanupClient:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.dirty = False
+            repository.local_sha = raw_cleanup_sha
+
+        def read_result(self, *_args: object) -> str:
+            return "committed final-check artifacts"
+
+    def run_turn(*args: object, **kwargs: object):
         nonlocal review_count
         name = str(args[2])
         events.append(name)
@@ -5430,9 +5790,7 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
             return "APPROVED"
         if name == "Clean worktree":
             assert repository.dirty
-            repository.dirty = False
-            repository.local_sha = cleanup_sha
-            return "committed final-check artifacts"
+            return real_run_turn(CleanupClient(), *args[1:], **kwargs)
         raise AssertionError(f"unexpected turn {name}")
 
     def final_checks(*args: object) -> None:
@@ -5446,6 +5804,12 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
     monkeypatch.setitem(workflow_globals, "run_turn", run_turn)
+    monkeypatch.setitem(
+        workflow_globals, "emit_agent_turn", lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(
+        workflow_globals, "terminal_progress", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(workflow_globals, "run_final_checks", final_checks)
     monkeypatch.setitem(workflow_globals, "emit_finding", lambda *args, **kwargs: None)
     monkeypatch.setitem(
@@ -5463,12 +5827,18 @@ def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
     assert check_count == 2
     assert outline_events == [
         ("Whole-version review", "started"),
+        ("Clean worktree", "started"),
+        ("Clean worktree", "completed"),
         ("Whole-version review", "completed"),
         ("Final integration PR", "started"),
         ("Final integration PR", "completed"),
     ]
     assert f"push:{cleanup_sha}" in events
-    assert events.index("Clean worktree") < events.index(f"ready:{cleanup_sha}")
+    assert events.index("normalize:cleanup") < events.index("verify:cleanup")
+    assert events.index("verify:cleanup") < events.index(f"push:{cleanup_sha}")
+    assert events.index(f"push:{cleanup_sha}") < events.index(
+        f"require_pr:{cleanup_sha}"
+    )
 
 
 def test_whole_version_outline_fails_when_final_checks_fail(
