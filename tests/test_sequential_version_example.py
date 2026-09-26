@@ -278,6 +278,238 @@ def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     )
 
 
+def test_repository_recovery_recreates_all_completed_work_item_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-recovery-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["_run_repository"].__globals__
+    issue = workflow["Issue"](334, "feature/issue-334")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    feature_sha = "feature-head"
+    integration_sha = "integration-head"
+    draft = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=feature_sha,
+        base_sha=integration_sha,
+    )
+    ready = replace(draft, is_draft=False)
+    mutations: list[tuple[str, str, str, str | None]] = []
+    logical_names = (
+        f"{issue.label} implementer",
+        f"{issue.label} scope reviewer",
+        f"{issue.label} correctness reviewer",
+    )
+    expected_names = tuple(
+        workflow["correlated_agent_tab_name"](name) for name in logical_names
+    )
+    expected_correlations = tuple(
+        workflow["run_correlation"](name) for name in logical_names
+    )
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs: dict[str, TabState] = {}
+            self.next_id = 1
+
+        def create_session(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            correlation_id = request.correlation_id  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{correlation_id}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"tab-{self.next_id}"
+            self.next_id += 1
+            self.tabs[tab_id] = TabState(
+                tab_id,
+                self.workspace_id,
+                name,
+                "codex-cli",
+                "codex",
+                True,
+                "busy",
+            )
+            mutations.append(("create", tab_id, name, correlation_id))
+            return tab_id
+
+        def complete(self, tab_id: str) -> None:
+            self.tabs[tab_id] = replace(self.tabs[tab_id], cli_state="ready-for-review")
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert self.tabs[tab_id].cli_state == "ready-for-review"
+            return "completed"
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            tab = self.tabs.pop(tab_id)
+            mutations.append(("close", tab_id, tab.name, None))
+
+    client = Client()
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            sha = (
+                integration_sha if branch == config.integration_branch else feature_sha
+            )
+            return BranchState(branch, sha, sha, branch == issue.branch)
+
+        def inspect_local_refs(self) -> dict[str, object]:
+            return {
+                f"refs/heads/{issue.branch}": workflow["LocalRefState"](
+                    feature_sha, None
+                )
+            }
+
+        def inspect_remote_refs(self) -> dict[str, str]:
+            return {f"refs/heads/{issue.branch}": feature_sha}
+
+        def require_committed_result(
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+        ) -> BranchState:
+            assert (branch, previous_sha, allow_unchanged) == (
+                issue.branch,
+                feature_sha,
+                True,
+            )
+            return BranchState(branch, feature_sha, feature_sha, True)
+
+    repository = Repository()
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.ready_attempts = 0
+
+        def set_draft(self, number: int, **_kwargs: object) -> PullRequestState:
+            assert number == draft.number
+            assert len(client.tabs) == 3
+            assert all(
+                tab.cli_state == "ready-for-review" for tab in client.tabs.values()
+            )
+            self.ready_attempts += 1
+            if self.ready_attempts == 1:
+                raise WorkerFailure("recoverable repository failure")
+            return ready
+
+    github = GitHub()
+
+    def prepared_plan(*_args: object) -> tuple[None, object]:
+        plan = workflow["WorkItemPlan"](config)
+        plan.position = 1
+        plan.finalized = True
+        return None, plan
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        client.complete(str(args[1]))
+        return "implemented"
+
+    def review_phase(*args: object, **kwargs: object) -> object:
+        client.complete(str(args[6]))
+        return workflow["IssueReviewPhaseResult"](
+            draft,
+            "approved",
+            feature_sha,
+            integration_sha,
+            1,
+        )
+
+    monkeypatch.setitem(
+        globals_,
+        "GitRepository",
+        SimpleNamespace(open=lambda *_args, **_kwargs: repository),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "GitHubRepository",
+        SimpleNamespace(open=lambda *_args, **_kwargs: github),
+    )
+    monkeypatch.setitem(globals_, "create_runtime", lambda _config: client)
+    monkeypatch.setitem(globals_, "prepare_work_item_plan_pr", prepared_plan)
+    monkeypatch.setitem(
+        globals_, "inspect_dynamic_work_item_topology", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setitem(
+        globals_, "prepare_issue", lambda *_args: (None, feature_sha, False)
+    )
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(
+        globals_,
+        "require_agent_result",
+        lambda *_args, **_kwargs: (feature_sha, False),
+    )
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *_args, **_kwargs: draft)
+    monkeypatch.setitem(
+        globals_, "ensure_issue_pr_metadata", lambda *_args, **_kwargs: draft
+    )
+    monkeypatch.setitem(globals_, "review_issue_phase", review_phase)
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(
+        globals_,
+        "recovery_authoritative_state",
+        lambda *_args: '{"stable":true}',
+    )
+    monkeypatch.setitem(
+        globals_,
+        "recover_error",
+        lambda *_args, **_kwargs: workflow["RecoveryReport"](
+            True, True, "repaired", "verified"
+        ),
+    )
+    monkeypatch.setitem(globals_, "require_recovery_retry_state", lambda *_args: None)
+    monkeypatch.setitem(
+        globals_, "integration_delivery", lambda *_args, **_kwargs: ready
+    )
+    monkeypatch.setitem(globals_, "report_repository_delivery", lambda *_args: None)
+    monkeypatch.setitem(
+        globals_, "emit_issue_driven_context", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *_args, **_kwargs: None)
+
+    result = workflow["_run_repository"](config)
+
+    assert result == ready
+    assert github.ready_attempts == 2
+    assert [mutation[:2] for mutation in mutations] == [
+        ("create", "tab-1"),
+        ("create", "tab-2"),
+        ("create", "tab-3"),
+        ("close", "tab-1"),
+        ("close", "tab-2"),
+        ("close", "tab-3"),
+        ("create", "tab-4"),
+        ("create", "tab-5"),
+        ("create", "tab-6"),
+    ]
+    assert tuple(mutation[2] for mutation in mutations[:3]) == expected_names
+    assert tuple(mutation[2] for mutation in mutations[6:]) == expected_names
+    assert tuple(mutation[3] for mutation in mutations[:3]) == expected_correlations
+    assert tuple(mutation[3] for mutation in mutations[6:]) == expected_correlations
+
+
 @pytest.mark.parametrize(
     "unsafe", ("ambiguous", "unrelated", "busy", "later-busy")
 )
