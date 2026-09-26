@@ -34,7 +34,11 @@ _AGENT_PROVENANCE_LINE_RE = re.compile(
 _AGENT_PROVENANCE_PREFIX_RE = re.compile(
     r"^(AWM-Agent|AWM-Process)(?:\s|:|=)", re.IGNORECASE
 )
-_TRAILER_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*):[ \t]*(.*?)[ \t]*$")
+_TRAILER_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)[ \t]*:[ \t]*(.*?)[ \t]*$")
+_GIT_GENERATED_TRAILER_PREFIXES = (
+    "Signed-off-by: ",
+    "(cherry picked from commit ",
+)
 
 
 def agent_commit_coauthor(agent: str) -> str:
@@ -817,17 +821,36 @@ class GitRepository:
                     f"commit {commit_sha} has ambiguous {key} provenance: {actual!r}"
                 )
 
-        while retained and not retained[-1]:
-            retained.pop()
+        patch_start = self._patch_divider_start(retained)
+        message_lines = retained[:patch_start]
+        patch_lines = retained[patch_start:]
+        preserved_trailers: list[str] = []
+        trailer_start = self._final_trailer_block_start(message_lines)
+        if patch_lines and trailer_start is not None:
+            # Pretty-format trailer atoms parse commit messages without divider
+            # semantics, so canonicalize pre-divider trailers into the final block.
+            block_body, preserved_trailers = self._partition_trailer_block(
+                message_lines[trailer_start:]
+            )
+            message_lines = [*message_lines[:trailer_start], *block_body]
+            message_lines.extend(patch_lines)
+            patch_lines = []
+        while message_lines and not message_lines[-1].strip():
+            message_lines.pop()
         trailers = [
+            *preserved_trailers,
             f"Co-authored-by: {coauthor}",
             f"AWM-Agent: {expected_agent}",
             f"AWM-Process: {expected_process}",
         ]
         separator = (
-            "\n" if self._final_trailer_block_start(retained) is not None else "\n\n"
+            "\n"
+            if self._final_trailer_block_start(message_lines) is not None
+            else "\n\n"
         )
-        normalized = "\n".join(retained) + separator + "\n".join(trailers) + "\n"
+        normalized = "\n".join(message_lines) + separator + "\n".join(trailers) + "\n"
+        if patch_lines:
+            normalized += "\n".join(patch_lines) + "\n"
         self._require_agent_message_provenance(
             normalized,
             commit_sha=commit_sha,
@@ -841,19 +864,61 @@ class GitRepository:
     def _final_trailer_block_start(lines: Sequence[str]) -> int | None:
         if not lines:
             return None
-        start = len(lines) - 1
-        while start > 0 and lines[start - 1]:
+        end = len(lines)
+        while end and not lines[end - 1].strip():
+            end -= 1
+        start = end
+        while start and lines[start - 1].strip():
             start -= 1
-        if start == 0:
+        if start == 0 or end == start:
             return None
-        saw_trailer = False
-        for line in lines[start:]:
+
+        trailer_lines = 0
+        non_trailer_lines = 0
+        recognized = False
+        current_is_trailer = False
+        for line in lines[start:end]:
             match = _TRAILER_LINE_RE.fullmatch(line)
             if match is not None:
-                saw_trailer = True
-            elif not saw_trailer or not line.startswith((" ", "\t")):
-                return None
-        return start if saw_trailer else None
+                trailer_lines += 1
+                current_is_trailer = True
+                recognized = recognized or line.startswith(
+                    _GIT_GENERATED_TRAILER_PREFIXES
+                )
+            elif line.startswith((" ", "\t")) and current_is_trailer:
+                continue
+            else:
+                non_trailer_lines += 1
+                current_is_trailer = False
+                recognized = recognized or line.startswith(
+                    _GIT_GENERATED_TRAILER_PREFIXES
+                )
+
+        if trailer_lines and not non_trailer_lines:
+            return start
+        if recognized and trailer_lines * 3 >= non_trailer_lines:
+            return start
+        return None
+
+    @staticmethod
+    def _patch_divider_start(lines: Sequence[str]) -> int:
+        for index, line in enumerate(lines):
+            if line == "---" or line.startswith("--- "):
+                return index
+        return len(lines)
+
+    @staticmethod
+    def _partition_trailer_block(lines: Sequence[str]) -> tuple[list[str], list[str]]:
+        body: list[str] = []
+        trailers: list[str] = []
+        destination = body
+        for line in lines:
+            if _TRAILER_LINE_RE.fullmatch(line) is not None:
+                destination = trailers
+            elif not line.startswith((" ", "\t")):
+                destination = body
+            destination.append(line)
+        return body, trailers
 
     def _require_agent_message_provenance(
         self,
@@ -865,7 +930,7 @@ class GitRepository:
         coauthor: str,
     ) -> None:
         lines = message.splitlines()
-        while lines and not lines[-1]:
+        while lines and not lines[-1].strip():
             lines.pop()
         start = self._final_trailer_block_start(lines)
         trailer_values: dict[str, list[str]] = {}

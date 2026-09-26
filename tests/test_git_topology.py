@@ -572,6 +572,70 @@ def test_normalize_unpublished_agent_provenance(
     )
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "agent result\n   \nReviewed-by: Reviewer <reviewer@example.com>",
+            {"Reviewed-by": ["Reviewer <reviewer@example.com>"]},
+        ),
+        (
+            "agent result\n\nrelease note 1\nrelease note 2\nrelease note 3\n"
+            "release note 4\nrelease note 5\nrelease note 6\n"
+            "Reviewed-by: Reviewer <reviewer@example.com>\n"
+            "Signed-off-by: Developer <developer@example.com>",
+            {
+                "Reviewed-by": ["Reviewer <reviewer@example.com>"],
+                "Signed-off-by": ["Developer <developer@example.com>"],
+            },
+        ),
+        (
+            "agent result\n\nReviewed-by: Reviewer <reviewer@example.com>\n"
+            "---\ndiff --git a/file b/file",
+            {"Reviewed-by": ["Reviewer <reviewer@example.com>"]},
+        ),
+    ],
+    ids=("whitespace-separator", "mixed-block", "patch-divider"),
+)
+def test_normalize_preserves_git_trailer_blocks(
+    repositories: tuple[Path, Path, Path],
+    message: str,
+    expected: dict[str, list[str]],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/git-trailer-block"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", message)
+    original = git(work, "rev-parse", "HEAD")
+
+    normalized = repo.normalize_agent_commit_provenance(
+        branch,
+        base,
+        original,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert normalized.local_sha is not None
+    for key, values in expected.items():
+        assert (
+            git(
+                work,
+                "show",
+                "-s",
+                f"--format=%(trailers:key={key},valueonly)",
+                normalized.local_sha,
+            ).splitlines()
+            == values
+        )
+    if "---\n" in message:
+        assert "---\ndiff --git a/file b/file" in git(
+            work, "show", "-s", "--format=%B", normalized.local_sha
+        )
+
+
 def test_normalize_provenance_preserves_unrelated_coauthors_and_precedes_push(
     repositories: tuple[Path, Path, Path],
 ) -> None:
