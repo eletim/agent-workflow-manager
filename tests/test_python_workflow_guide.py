@@ -104,4 +104,5 @@ def test_guide_documents_bounded_local_git_recovery() -> None:
     assert "every unrelated local ref must remain exact" in guide
     assert "exact advance to the snapshotted authoritative remote head" in guide
     assert "any other new commits require recovery provenance" in guide
+    assert "only commits after the remote head are attributed to recovery" in guide
     assert "both ref sets to remain exact" not in guide

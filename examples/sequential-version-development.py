@@ -5818,8 +5818,21 @@ def _run_repository(
                 recovery_end != recovery_start.local_sha
                 and recovery_end != authoritative_remote_head
             ):
+                provenance_start = recovery_start.local_sha
+                if (
+                    authoritative_remote_head is not None
+                    and authoritative_remote_head != recovery_start.local_sha
+                ):
+                    try:
+                        repo.require_contains(
+                            recovery_branch, authoritative_remote_head
+                        )
+                    except WorkerFailure:
+                        pass
+                    else:
+                        provenance_start = authoritative_remote_head
                 repo.require_agent_commit_provenance(
-                    recovery_start.local_sha,
+                    provenance_start,
                     recovery_end,
                     expected_agent=IMPLEMENTER_AGENT,
                     expected_process="recovery",

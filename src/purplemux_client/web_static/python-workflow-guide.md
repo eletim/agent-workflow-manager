@@ -658,8 +658,10 @@ and non-ref GitHub operations. After the turn, the remote ref set and every
 unrelated local ref must remain exact. The active local branch must still
 descend from its pre-turn head; an exact advance to the snapshotted authoritative
 remote head keeps its existing provenance, while any other new commits require
-recovery provenance. Recovery therefore cannot repair provenance by amending,
-rebasing, resetting, force-pushing, or otherwise rewriting history.
+recovery provenance. When that remote head is contained by the final local head,
+only commits after the remote head are attributed to recovery. Recovery therefore
+cannot repair provenance by amending, rebasing, resetting, force-pushing, or
+otherwise rewriting history.
 
 The inspection-aware Git operations that may mutate are:
 

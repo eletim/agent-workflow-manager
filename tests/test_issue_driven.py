@@ -3367,6 +3367,60 @@ def test_repository_recovery_requires_provenance_for_created_commits() -> None:
     ]
 
 
+def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    local_heads = iter(({"dev/v1": "a" * 40}, {"dev/v1": "c" * 40}))
+    containment_checks: list[tuple[str, str]] = []
+    provenance_checks: list[tuple[str, str, dict[str, object]]] = []
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "a" * 40, "b" * 40, True
+        ),
+        inspect_local_branch_heads=lambda: next(local_heads),
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "c" * 40, "b" * 40, True
+        ),
+        require_contains=lambda branch, commit: containment_checks.append(
+            (branch, commit)
+        ),
+        require_agent_commit_provenance=lambda start, end, **kwargs: (
+            provenance_checks.append((start, end, kwargs))
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: "inspected state"
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("repair needed")
+    )
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
+        False, False, "Adopted remote and committed repair.", "Range verified."
+    )
+
+    with pytest.raises(WorkerFailure, match="repair needed"):
+        workflow["run_repository"](config)
+
+    assert containment_checks == [("dev/v1", "b" * 40)]
+    assert provenance_checks == [
+        (
+            "b" * 40,
+            "c" * 40,
+            {"expected_agent": "codex", "expected_process": "recovery"},
+        )
+    ]
+
+
 def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
     workflow = load_generated_workflow(issues=[90])
     config = workflow["Config"](
