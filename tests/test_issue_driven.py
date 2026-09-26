@@ -3239,6 +3239,7 @@ def test_repository_recovery_rejects_changed_branch_or_remote_ref(
         )
     )
     inspections: list[str] = []
+    restorations: list[tuple[str, str, str]] = []
 
     def inspect_local_refs() -> dict[str, LocalRefState]:
         inspections.append("local")
@@ -3257,6 +3258,9 @@ def test_repository_recovery_rejects_changed_branch_or_remote_ref(
         inspect_remote_refs=inspect_remote_refs,
         require_committed_result=lambda *args, **kwargs: (_ for _ in ()).throw(
             WorkerFailure("branch no longer descends from its pre-recovery head")
+        ),
+        restore_rejected_recovery_branch=lambda branch, original_sha, rejected_sha: (
+            restorations.append((branch, original_sha, rejected_sha))
         ),
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3286,6 +3290,9 @@ def test_repository_recovery_rejects_changed_branch_or_remote_ref(
     with pytest.raises(WorkerFailure, match=expected):
         workflow["run_repository"](config)
     assert inspections == ["local", "remote", "local", "remote"]
+    assert restorations == (
+        [("dev/v1", "a" * 40, "b" * 40)] if changed == "local" else []
+    )
 
 
 @pytest.mark.parametrize("recovery_raises", [False, True])
@@ -3353,7 +3360,7 @@ def test_repository_recovery_rejects_changed_non_head_local_ref(
         workflow["run_repository"](config)
 
 
-def test_recovery_accepts_zero_commit_remote_fast_forward_without_provenance() -> None:
+def test_recovery_validates_adopted_remote_fast_forward_under_declared_process() -> None:
     workflow = load_generated_workflow(issues=[90])
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -3365,6 +3372,7 @@ def test_recovery_accepts_zero_commit_remote_fast_forward_without_provenance() -
         )
     )
     committed_checks: list[tuple[str, dict[str, object]]] = []
+    declared_checks: list[tuple[str, str, dict[str, object]]] = []
 
     def require_fast_forward(branch: str, **kwargs: object) -> BranchState:
         committed_checks.append((branch, kwargs))
@@ -3382,6 +3390,11 @@ def test_recovery_accepts_zero_commit_remote_fast_forward_without_provenance() -
         require_committed_result=require_fast_forward,
         require_agent_commit_provenance=lambda *args, **kwargs: pytest.fail(
             "an adopted remote head has no recovery-created commits"
+        ),
+        require_ancestor=lambda ancestor, descendant: None,
+        require_contains=lambda branch, commit: None,
+        require_agent_commit_declared_provenance=lambda start, end, **kwargs: (
+            declared_checks.append((start, end, kwargs))
         ),
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3407,6 +3420,21 @@ def test_recovery_accepts_zero_commit_remote_fast_forward_without_provenance() -
             {"previous_sha": "a" * 40, "allow_unchanged": True},
         )
     ]
+    assert declared_checks == [
+        (
+            "a" * 40,
+            "b" * 40,
+            {
+                "expected_agent": "codex",
+                "allowed_processes": (
+                    "implementation",
+                    "reviewer-fix",
+                    "cleanup",
+                    "recovery",
+                ),
+            },
+        )
+    ]
 
 
 def test_repository_recovery_requires_provenance_for_created_commits() -> None:
@@ -3421,6 +3449,7 @@ def test_repository_recovery_requires_provenance_for_created_commits() -> None:
         )
     )
     provenance_checks: list[tuple[str, str, dict[str, object]]] = []
+    normalization_checks: list[tuple[str, str, str, dict[str, object]]] = []
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
@@ -3436,6 +3465,10 @@ def test_repository_recovery_requires_provenance_for_created_commits() -> None:
         require_agent_commit_provenance=lambda start, end, **kwargs: (
             provenance_checks.append((start, end, kwargs))
         ),
+        normalize_agent_commit_provenance=lambda branch, start, end, **kwargs: (
+            normalization_checks.append((branch, start, end, kwargs)),
+            BranchState(branch, "d" * 40, "a" * 40, True),
+        )[1],
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -3457,6 +3490,14 @@ def test_repository_recovery_requires_provenance_for_created_commits() -> None:
     assert provenance_checks == [
         (
             "a" * 40,
+            "d" * 40,
+            {"expected_agent": "codex", "expected_process": "recovery"},
+        )
+    ]
+    assert normalization_checks == [
+        (
+            "dev/v1",
+            "a" * 40,
             "c" * 40,
             {"expected_agent": "codex", "expected_process": "recovery"},
         )
@@ -3477,6 +3518,7 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
     ancestry_checks: list[tuple[str, str]] = []
     containment_checks: list[tuple[str, str]] = []
     provenance_checks: list[tuple[str, str, dict[str, object]]] = []
+    declared_checks: list[tuple[str, str, dict[str, object]]] = []
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
@@ -3498,6 +3540,12 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
         require_agent_commit_provenance=lambda start, end, **kwargs: (
             provenance_checks.append((start, end, kwargs))
         ),
+        require_agent_commit_declared_provenance=lambda start, end, **kwargs: (
+            declared_checks.append((start, end, kwargs))
+        ),
+        normalize_agent_commit_provenance=lambda branch, start, end, **kwargs: (
+            BranchState(branch, end, "b" * 40, True)
+        ),
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -3518,6 +3566,21 @@ def test_recovery_checks_only_commits_after_adopted_remote_head() -> None:
 
     assert ancestry_checks == [("a" * 40, "b" * 40)]
     assert containment_checks == [("dev/v1", "b" * 40)]
+    assert declared_checks == [
+        (
+            "a" * 40,
+            "b" * 40,
+            {
+                "expected_agent": "codex",
+                "allowed_processes": (
+                    "implementation",
+                    "reviewer-fix",
+                    "cleanup",
+                    "recovery",
+                ),
+            },
+        )
+    ]
     assert provenance_checks == [
         (
             "b" * 40,
@@ -3563,6 +3626,9 @@ def test_recovery_keeps_local_provenance_boundary_when_remote_was_behind() -> No
         ),
         require_agent_commit_provenance=lambda start, end, **kwargs: (
             provenance_checks.append((start, end, kwargs))
+        ),
+        normalize_agent_commit_provenance=lambda branch, start, end, **kwargs: (
+            BranchState(branch, end, "b" * 40, True)
         ),
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)

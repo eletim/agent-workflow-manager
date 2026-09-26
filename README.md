@@ -349,8 +349,15 @@ by the UI or a second runtime.
 Plain Python workflows can enforce repository and pull-request structure through
 `GitRepository` and `GitHubRepository`. These validated handles recheck repository
 identity on every public operation, keep read-named methods mutation-free, and only
-permit branch creation/tracking/switching and fast-forward Git changes. They never
-reset, rebase, force-push, delete branches, stash changes, or resolve conflicts.
+permit branch creation/tracking/switching and fast-forward Git changes. The narrow
+exception is provenance normalization: it may rewrite only the linear, unpublished
+commit range created by the current agent turn. Before rewriting, it enumerates all
+authoritative remote refs (including tags), fetches missing referenced history, and
+refuses any commit already remote-visible; it also restores the original local head
+if a remote-ref race is detected. The API never rebases, force-pushes, deletes
+branches, stashes changes, or resolves conflicts. An internal recovery safeguard may
+hard-reset a clean pre-recovery worktree solely to restore its captured head after a
+recovery agent attempts a forbidden history rewrite.
 
 ```python
 from purplemux_client import (
@@ -381,6 +388,15 @@ feature = repo.prepare_feature_branch(
 # worktree. The Workflow independently verifies each delivery postcondition.
 turn_start_sha = feature.local_sha
 # ... run the CodingAgent ...
+feature = repo.require_current_branch("feature/issue-123")
+assert feature.local_sha is not None
+feature = repo.normalize_agent_commit_provenance(
+    "feature/issue-123",
+    turn_start_sha,
+    feature.local_sha,
+    expected_agent="codex",
+    expected_process="implementation",
+)
 feature = repo.require_committed_result(
     "feature/issue-123",
     previous_sha=turn_start_sha,
@@ -623,7 +639,14 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI opens in **Issue Driven** and keeps **Prompt**,
+The trusted local Runner UI presents **New Run** and every existing **Run** as peer
+top-level contexts. Selecting a Run puts its identity, status, and primary details
+at the top of the page and renders only that Run's authoritative persisted snapshot.
+Selecting New Run restores the independently retained editable draft, so browsing
+or refreshing an existing Run cannot overwrite draft inputs and draft edits cannot
+leak into historical Run detail.
+
+New Run opens in **Issue Driven** and keeps **Prompt**,
 **Environment Setup**, **Review**, and **Python Workflow** in its developer/detail
 navigation. Prompt accepts an agent,
 an existing working directory, and one prompt. It generates a single-step plain

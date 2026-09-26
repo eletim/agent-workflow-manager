@@ -60,5 +60,15 @@ def test_issue_driven_preview_and_observed_run_story_are_documented() -> None:
 
 
 def test_git_delivery_example_verifies_agent_provenance() -> None:
+    assert "feature = repo.normalize_agent_commit_provenance(" in README
+    assert "authoritative remote refs (including tags)" in README
     assert 'expected_agent="codex"' in README
     assert 'expected_process="implementation"' in README
+
+
+def test_runner_ui_documents_peer_draft_and_authoritative_run_contexts() -> None:
+    section = README.split("## Local Python Runner UI", maxsplit=1)[1]
+
+    assert "**New Run** and every existing **Run** as peer" in section
+    assert "authoritative persisted snapshot" in section
+    assert "independently retained editable draft" in section

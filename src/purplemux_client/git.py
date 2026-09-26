@@ -6,7 +6,7 @@ import re
 import signal
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -620,6 +620,53 @@ class GitRepository:
                 coauthor=coauthor,
             )
 
+    def require_agent_commit_declared_provenance(
+        self,
+        previous_sha: str,
+        current_sha: str,
+        *,
+        expected_agent: str,
+        allowed_processes: Collection[str],
+    ) -> None:
+        """Verify a range while preserving each commit's declared process."""
+        self._validate_sha(previous_sha)
+        self._validate_sha(current_sha)
+        coauthor = agent_commit_coauthor(expected_agent)
+        allowed = frozenset(allowed_processes)
+        supported = {"implementation", "reviewer-fix", "cleanup", "recovery"}
+        if not allowed or not allowed <= supported:
+            raise ValueError("allowed_processes must contain supported agent processes")
+        if not self._has_commit(previous_sha):
+            raise WorkerFailure(f"previous commit {previous_sha} is not available")
+        if not self._has_commit(current_sha):
+            raise WorkerFailure(f"current commit {current_sha} is not available")
+        if not self._is_ancestor(previous_sha, current_sha):
+            raise WorkerFailure(
+                f"commit {current_sha} does not descend from pre-turn commit "
+                f"{previous_sha}"
+            )
+        commits = self._read(
+            ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
+        )
+        for commit_sha in commits.splitlines():
+            raw = self._command(["cat-file", "commit", commit_sha], {0}).stdout
+            _headers, separator, message = raw.partition("\n\n")
+            if not separator:
+                raise WorkerFailure(f"commit {commit_sha} has no message boundary")
+            processes = self._agent_trailer_values(message)["awm-process"]
+            if len(processes) != 1 or processes[0] not in allowed:
+                raise WorkerFailure(
+                    f"commit {commit_sha} must have exactly one allowed "
+                    "AWM-Process trailer"
+                )
+            self._require_agent_message_provenance(
+                message,
+                commit_sha=commit_sha,
+                expected_agent=expected_agent,
+                expected_process=processes[0],
+                coauthor=coauthor,
+            )
+
     def normalize_agent_commit_provenance(
         self,
         branch: str,
@@ -706,23 +753,24 @@ class GitRepository:
             )
             return state
 
-        remote_heads_before = self.inspect_remote_branch_heads()
-        remote_before = remote_heads_before.get(branch)
+        remote_refs_before = self.inspect_remote_refs()
+        remote_before = remote_refs_before.get(f"refs/heads/{branch}")
         if remote_before != state.remote_sha:
             raise WorkerFailure(
                 f"remote {branch!r} changed before provenance normalization"
             )
-        self._fetch_missing_remote_branch_heads(remote_heads_before)
+        self._fetch_missing_remote_refs(remote_refs_before)
         published = [
-            remote_branch
-            for remote_branch, remote_sha in remote_heads_before.items()
+            remote_ref
+            for remote_ref, remote_sha in remote_refs_before.items()
+            if self._has_commit(remote_sha)
             if any(self._is_ancestor(commit_sha, remote_sha) for commit_sha in commits)
         ]
         if published:
             raise WorkerFailure(
                 "refusing to normalize agent provenance because the commit range "
-                "is already reachable from remote branch(es): "
-                + ", ".join(repr(remote_branch) for remote_branch in published)
+                "is already reachable from remote ref(s): "
+                + ", ".join(repr(remote_ref) for remote_ref in published)
             )
         if remote_before is not None:
             if not self._is_ancestor(remote_before, previous_sha):
@@ -773,10 +821,10 @@ class GitRepository:
                     f"local {branch!r} changed before provenance normalization: "
                     f"expected {current_sha}, found {current.local_sha}"
                 )
-            actual_remote_heads = self.inspect_remote_branch_heads()
-            if actual_remote_heads != remote_heads_before:
+            actual_remote_refs = self.inspect_remote_refs()
+            if actual_remote_refs != remote_refs_before:
                 raise WorkerFailure(
-                    "remote branches changed before provenance normalization"
+                    "remote refs changed before provenance normalization"
                 )
 
         self._git_mutation(
@@ -793,10 +841,10 @@ class GitRepository:
             desired=lambda: self._branch_matches(branch, normalized_sha, True),
             pre_dispatch=require_unchanged_preconditions,
         )
-        remote_heads_after = self.inspect_remote_branch_heads()
+        remote_refs_after = self.inspect_remote_refs()
         result = self.require_current_branch(branch)
         if (
-            remote_heads_after != remote_heads_before
+            remote_refs_after != remote_refs_before
             or result.remote_sha != remote_before
         ):
             try:
@@ -819,7 +867,7 @@ class GitRepository:
                     "restoration of the original local commit could not be proven"
                 ) from exc
             raise WorkerFailure(
-                "remote branches changed during provenance normalization; "
+                "remote refs changed during provenance normalization; "
                 "the original local commit was restored"
             )
         if result.local_sha != normalized_sha:
@@ -835,6 +883,47 @@ class GitRepository:
             expected_process=expected_process,
         )
         return result
+
+    def restore_rejected_recovery_branch(
+        self,
+        branch: str,
+        *,
+        original_sha: str,
+        rejected_sha: str,
+    ) -> BranchState:
+        """Restore a clean branch after recovery rewrote its captured history."""
+        self._validate_sha(original_sha)
+        self._validate_sha(rejected_sha)
+        state = self.require_current_branch(branch)
+        if state.local_sha != rejected_sha:
+            raise WorkerFailure(
+                f"local {branch!r} changed before recovery restoration"
+            )
+        remote_refs_before = self.inspect_remote_refs()
+
+        def require_unchanged_preconditions() -> None:
+            current = self.require_current_branch(branch)
+            if current.local_sha != rejected_sha:
+                raise WorkerFailure(
+                    f"local {branch!r} changed before recovery restoration"
+                )
+            self._require_remote_refs(remote_refs_before)
+
+        self._git_mutation(
+            ["reset", "--hard", original_sha],
+            operation="restore branch after rejected recovery rewrite",
+            target=branch,
+            pre_state=rejected_sha,
+            observe=lambda: self._checkout_sha(branch),
+            desired=lambda: self._branch_matches(branch, original_sha, True),
+            pre_dispatch=require_unchanged_preconditions,
+        )
+        self._require_remote_refs(remote_refs_before)
+        self.require_clean()
+        restored = self.require_current_branch(branch)
+        if restored.local_sha != original_sha:
+            raise WorkerFailure("recovery rewrite restoration postcondition failed")
+        return restored
 
     def _normalize_agent_message(
         self,
@@ -1756,7 +1845,13 @@ class GitRepository:
         return completed.returncode == 0
 
     def _has_commit(self, sha: str) -> bool:
-        completed = self._command(["cat-file", "-e", f"{sha}^{{commit}}"], {0, 128})
+        completed = self._command(
+            ["cat-file", "-e", f"{sha}^{{commit}}"], {0, 1, 128}
+        )
+        return completed.returncode == 0
+
+    def _has_object(self, sha: str) -> bool:
+        completed = self._command(["cat-file", "-e", sha], {0, 1, 128})
         return completed.returncode == 0
 
     def _tracking_ref(self, branch: str) -> str:
@@ -1818,9 +1913,35 @@ class GitRepository:
             pre_dispatch=lambda: self._require_remote_branch_heads(authoritative),
         )
 
+    def _fetch_missing_remote_refs(self, authoritative: dict[str, str]) -> None:
+        missing = {
+            ref: sha for ref, sha in authoritative.items() if not self._has_object(sha)
+        }
+        if not missing:
+            return
+
+        def desired() -> bool:
+            return all(self._has_object(sha) for sha in missing.values())
+
+        self._git_mutation(
+            ["fetch", "--no-tags", self.remote, *missing],
+            operation="fetch remote refs for provenance inspection",
+            target=self.remote,
+            pre_state=tuple(sorted(missing.items())),
+            observe=lambda: tuple(
+                sorted((ref, self._has_object(sha)) for ref, sha in missing.items())
+            ),
+            desired=desired,
+            pre_dispatch=lambda: self._require_remote_refs(authoritative),
+        )
+
     def _require_remote_branch_heads(self, expected: dict[str, str]) -> None:
         if self.inspect_remote_branch_heads() != expected:
             raise WorkerFailure("remote branches changed during provenance inspection")
+
+    def _require_remote_refs(self, expected: dict[str, str]) -> None:
+        if self.inspect_remote_refs() != expected:
+            raise WorkerFailure("remote refs changed during provenance inspection")
 
     def _require_feature_preparation_refs(
         self,

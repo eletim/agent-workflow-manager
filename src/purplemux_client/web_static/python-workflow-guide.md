@@ -642,6 +642,9 @@ repo.require_agent_commit_provenance(
     previous_sha, current_sha, *, expected_agent, expected_process,
     allow_unchanged=False
 ) -> None
+repo.require_agent_commit_declared_provenance(
+    previous_sha, current_sha, *, expected_agent, allowed_processes
+) -> None
 agent_commit_coauthor(agent) -> str
 repo.require_contains(branch, commit_sha) -> None
 repo.require_ancestor(ancestor_sha, descendant_sha) -> None
@@ -675,6 +678,9 @@ The inspection-aware Git operations that may mutate are:
 repo.normalize_agent_commit_provenance(
     branch, previous_sha, current_sha, *, expected_agent, expected_process,
     allow_unchanged=False
+) -> BranchState
+repo.restore_rejected_recovery_branch(
+    branch, *, original_sha, rejected_sha
 ) -> BranchState
 repo.ensure_pushed(branch, *, expected_local_sha) -> BranchState
 repo.synchronize_branch(branch, *, expected_remote_sha=None) -> BranchState

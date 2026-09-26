@@ -5904,19 +5904,22 @@ def _run_repository(
                     if recovered_branch_state is None
                     else recovered_branch_state.object_sha
                 )
-                expected_local_refs = dict(recovery_local_refs)
-                if recovery_end is not None and recovery_branch_start is not None:
-                    expected_local_refs[recovery_branch_ref] = LocalRefState(
-                        recovery_end, recovery_branch_start.symbolic_target
+                original_other_refs = dict(recovery_local_refs)
+                recovered_other_refs = dict(recovered_local_refs)
+                original_other_refs.pop(recovery_branch_ref, None)
+                recovered_other_refs.pop(recovery_branch_ref, None)
+                if recovered_other_refs != original_other_refs:
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch; "
+                        "refusing to rewrite repository provenance"
                     )
                 if (
                     recovery_end is None
                     or recovery_branch_start is None
-                    or recovered_local_refs != expected_local_refs
                 ):
                     raise WorkerFailure(
-                        "recovery changed local refs outside the active branch; "
-                        "refusing to rewrite repository provenance"
+                        "recovery removed the active local branch; refusing to "
+                        "rewrite repository provenance"
                     )
                 try:
                     checked_recovery = repo.require_committed_result(
@@ -5925,10 +5928,25 @@ def _run_repository(
                         allow_unchanged=True,
                     )
                 except WorkerFailure as validation_error:
+                    if recovery_end != recovery_start.local_sha:
+                        repo.restore_rejected_recovery_branch(
+                            recovery_branch,
+                            original_sha=recovery_start.local_sha,
+                            rejected_sha=recovery_end,
+                        )
                     raise WorkerFailure(
-                        "recovery changed local branch history; refusing to rewrite "
-                        "repository provenance"
+                        "recovery changed local branch history; the original branch "
+                        "and worktree were restored"
                     ) from validation_error
+                expected_local_refs = dict(recovery_local_refs)
+                expected_local_refs[recovery_branch_ref] = LocalRefState(
+                    recovery_end, recovery_branch_start.symbolic_target
+                )
+                if recovered_local_refs != expected_local_refs:
+                    raise WorkerFailure(
+                        "recovery changed local refs outside the active branch; "
+                        "refusing to rewrite repository provenance"
+                    )
                 if checked_recovery.local_sha != recovery_end:
                     raise WorkerFailure(
                         "recovery branch inspection disagrees with local refs"
@@ -5942,26 +5960,41 @@ def _run_repository(
             authoritative_remote_head = recovery_remote_refs.get(
                 f"refs/heads/{recovery_branch}"
             )
+            provenance_start = recovery_start.local_sha
             if (
-                recovery_end != recovery_start.local_sha
-                and recovery_end != authoritative_remote_head
+                authoritative_remote_head is not None
+                and authoritative_remote_head != recovery_start.local_sha
             ):
-                provenance_start = recovery_start.local_sha
-                if (
-                    authoritative_remote_head is not None
-                    and authoritative_remote_head != recovery_start.local_sha
-                ):
-                    try:
-                        repo.require_ancestor(
-                            recovery_start.local_sha, authoritative_remote_head
-                        )
-                        repo.require_contains(
-                            recovery_branch, authoritative_remote_head
-                        )
-                    except WorkerFailure:
-                        pass
-                    else:
-                        provenance_start = authoritative_remote_head
+                try:
+                    repo.require_ancestor(
+                        recovery_start.local_sha, authoritative_remote_head
+                    )
+                    repo.require_contains(recovery_branch, authoritative_remote_head)
+                except WorkerFailure:
+                    pass
+                else:
+                    repo.require_agent_commit_declared_provenance(
+                        recovery_start.local_sha,
+                        authoritative_remote_head,
+                        expected_agent=IMPLEMENTER_AGENT,
+                        allowed_processes=(
+                            "implementation",
+                            "reviewer-fix",
+                            "cleanup",
+                            "recovery",
+                        ),
+                    )
+                    provenance_start = authoritative_remote_head
+            if recovery_end != provenance_start:
+                normalized_recovery = repo.normalize_agent_commit_provenance(
+                    recovery_branch,
+                    provenance_start,
+                    recovery_end,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="recovery",
+                )
+                assert normalized_recovery.local_sha is not None
+                recovery_end = normalized_recovery.local_sha
                 repo.require_agent_commit_provenance(
                     provenance_start,
                     recovery_end,

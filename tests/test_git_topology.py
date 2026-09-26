@@ -589,6 +589,20 @@ def test_agent_provenance_verifies_exact_turn_ranges(
         expected_agent="codex",
         expected_process="cleanup",
     )
+    repo.require_agent_commit_declared_provenance(
+        base,
+        cleanup,
+        expected_agent="codex",
+        allowed_processes=("implementation", "reviewer-fix", "cleanup"),
+    )
+
+    with pytest.raises(WorkerFailure, match="allowed AWM-Process"):
+        repo.require_agent_commit_declared_provenance(
+            base,
+            cleanup,
+            expected_agent="codex",
+            allowed_processes=("implementation", "reviewer-fix"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -848,6 +862,54 @@ def test_normalize_provenance_refuses_remote_visible_commit(
     assert repo.inspect_branch(branch).remote_sha == pushed_sha
 
 
+def test_normalize_provenance_refuses_commit_visible_from_remote_tag(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/tagged-malformed-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "agent result")
+    tagged_sha = git(work, "rev-parse", "HEAD")
+    git(work, "tag", "published-agent-result", tagged_sha)
+    git(work, "push", "origin", "refs/tags/published-agent-result")
+    git(work, "tag", "-d", "published-agent-result")
+
+    with pytest.raises(WorkerFailure, match="refs/tags/published-agent-result"):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            tagged_sha,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert git(work, "rev-parse", "HEAD") == tagged_sha
+    assert repo.inspect_branch(branch).remote_sha is None
+
+
+def test_rejected_recovery_amend_restores_local_and_preserves_remote_refs(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    original = repo.synchronize_branch("main").local_sha or ""
+    remote_before = repo.inspect_remote_refs()
+    git(work, "commit", "--amend", "--allow-empty", "-m", "rewritten recovery")
+    rejected = git(work, "rev-parse", "HEAD")
+    assert rejected != original
+
+    restored = repo.restore_rejected_recovery_branch(
+        "main", original_sha=original, rejected_sha=rejected
+    )
+
+    assert restored.local_sha == original
+    assert git(work, "rev-parse", "HEAD") == original
+    assert repo.inspect_remote_refs() == remote_before
+    assert repo.inspect_worktree().dirty is False
+
+
 def test_normalize_refuses_commit_fast_forwarded_from_remote_side_branch(
     repositories: tuple[Path, Path, Path],
 ) -> None:
@@ -869,7 +931,7 @@ def test_normalize_refuses_commit_fast_forwarded_from_remote_side_branch(
     remote_side_sha = git(seed, "rev-parse", "HEAD")
     git(seed, "push", "origin", side_branch)
 
-    with pytest.raises(WorkerFailure, match=repr(side_branch)):
+    with pytest.raises(WorkerFailure, match=f"refs/heads/{side_branch}"):
         repo.normalize_agent_commit_provenance(
             branch,
             base,
