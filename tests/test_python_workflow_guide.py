@@ -99,6 +99,7 @@ def test_guide_documents_agent_provenance_verification() -> None:
     assert "declared implementation, reviewer-fix, or cleanup process" in normalized
     assert "atomically advances every matching logical and run-private recovery ref" in normalized
     assert "Already-published recovered ranges are verified" in normalized
+    assert "gates every existing open Draft or Ready PR" in normalized
 
 
 def test_guide_documents_bounded_local_git_recovery() -> None:

@@ -4933,6 +4933,7 @@ def test_interrupted_dispatched_item_is_reinspected_before_planning(
         inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
             base_is_ancestor=True
         ),
+        require_agent_commit_declared_provenance=lambda *args, **kwargs: None,
     )
     github = GitHub()
 
@@ -5092,6 +5093,7 @@ def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:
         inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
             base_is_ancestor=True
         ),
+        require_agent_commit_declared_provenance=lambda *args, **kwargs: None,
     )
 
     github = GitHub()

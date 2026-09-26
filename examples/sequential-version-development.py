@@ -2666,6 +2666,7 @@ def prepare_issue(
     repo.require_clean()
     integration = repo.synchronize_branch(config.integration_branch)
     assert integration.remote_sha is not None
+    allowed_processes = ("implementation", "reviewer-fix", "cleanup")
     if open_pr is None:
         recovery = repo.recover_feature_branch(
             issue.branch,
@@ -2674,7 +2675,6 @@ def prepare_issue(
         )
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
-        allowed_processes = ("implementation", "reviewer-fix", "cleanup")
         published_ancestor = feature.remote_sha or integration.remote_sha
         if feature.remote_sha is not None:
             repo.require_agent_commit_declared_provenance(
@@ -2714,6 +2714,13 @@ def prepare_issue(
                 f"existing {issue.branch} does not contain authoritative base "
                 f"{integration.remote_sha}; reconcile it before starting a new run"
             )
+        assert feature.remote_sha is not None
+        repo.require_agent_commit_declared_provenance(
+            integration.remote_sha,
+            feature.remote_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            allowed_processes=allowed_processes,
+        )
     assert feature.local_sha is not None
     emit_finding(
         "git",

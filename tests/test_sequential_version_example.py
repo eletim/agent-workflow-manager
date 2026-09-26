@@ -316,6 +316,88 @@ def test_pushed_recovery_without_pr_fails_provenance_before_unchanged_turn(
     assert events == ["verify-published"]
 
 
+@pytest.mark.parametrize("draft", [True, False], ids=("draft", "ready"))
+def test_existing_pr_fails_provenance_before_mutation_or_agent_start(
+    draft: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](219, "feature/issue-219")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    existing = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=draft),
+        head_sha="published-head",
+        base_sha="base",
+    )
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(
+            self, branch: str, **kwargs: object
+        ) -> BranchState:
+            if branch == config.integration_branch:
+                assert kwargs == {}
+                return BranchState(branch, "base", "base", True)
+            assert branch == issue.branch
+            assert kwargs == {"expected_remote_sha": "published-head"}
+            return BranchState(branch, "published-head", "published-head", True)
+
+        def inspect_feature_preparation(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs["expected_base_sha"] == "base"
+            return SimpleNamespace(base_is_ancestor=True)
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify-published")
+            assert (start, end) == ("base", "published-head")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            raise WorkerFailure("published PR head has invalid agent provenance")
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> PullRequestState | None:
+            if kwargs["state"] == "OPEN":
+                return existing
+            assert kwargs["state"] == "MERGED"
+            return None
+
+        def set_draft(self, *_args: object, **_kwargs: object) -> None:
+            events.append("redraft")
+            raise AssertionError("PR mutation must not be reached")
+
+    monkeypatch.setitem(
+        globals_,
+        "create_agent",
+        lambda *_args, **_kwargs: events.append("agent") or "agent",
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent provenance"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            GitHub(),
+        )
+
+    assert events == ["verify-published"]
+
+
 def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -751,6 +833,7 @@ def test_existing_work_item_pr_adopts_its_verified_remote_head(
         head=issue.branch, base=config.integration_branch, draft=True
     )
     calls: list[tuple[str, str | None]] = []
+    provenance: list[tuple[str, str]] = []
 
     class Repository:
         def require_clean(self) -> None:
@@ -770,6 +853,17 @@ def test_existing_work_item_pr_adopts_its_verified_remote_head(
         def inspect_feature_preparation(self, *args: object, **kwargs: object):
             return SimpleNamespace(base_is_ancestor=True)
 
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            provenance.append((start, end))
+            assert kwargs["expected_agent"] == "codex"
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+
     class GitHub:
         def find_pr(self, *, head: str, base: str, state: str):
             assert (head, base) == (issue.branch, config.integration_branch)
@@ -788,6 +882,7 @@ def test_existing_work_item_pr_adopts_its_verified_remote_head(
         (config.integration_branch, None),
         (issue.branch, pull_request.head_sha),
     ]
+    assert provenance == [(pull_request.base_sha, pull_request.head_sha)]
 
 
 @pytest.mark.parametrize(

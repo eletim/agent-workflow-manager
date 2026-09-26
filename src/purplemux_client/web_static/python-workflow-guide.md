@@ -209,7 +209,9 @@ implementation, reviewer-fix, or cleanup process and fails closed when that
 declaration is missing or ambiguous. It atomically advances every matching
 logical and run-private recovery ref, so an interruption cannot leave raw and
 normalized sibling histories. Already-published recovered ranges are verified
-from the authoritative integration head before an unchanged turn or PR mutation. Use
+from the authoritative integration head before an unchanged turn or PR mutation.
+The same verification gates every existing open Draft or Ready PR before
+orchestration may mutate, review, or terminally reuse it. Use
 `ensure_pushed()` to publish the exact normalized commit through the logical
 remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
