@@ -245,6 +245,18 @@ def test_restricted_session_preserves_safe_remote_capabilities(
         assert "-u GITHUB_TOKEN" not in command
 
 
+def test_restricted_claude_does_not_allow_pr_close_delete_branch() -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command(
+        "claude", "Run gh pr close 123 --delete-branch"
+    )
+    arguments = shlex.split(command)
+    allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
+
+    assert "Bash(gh pr close *)" not in allowed_tools
+    assert not any(tool.startswith("Bash(gh pr close") for tool in allowed_tools)
+    assert "Bash(gh pr edit *)" in allowed_tools
+
+
 @pytest.mark.parametrize(
     "attempt",
     [

@@ -1427,7 +1427,6 @@ class PurpleMuxCLIClient:
                     "Bash(gh pr view *)",
                     "Bash(gh pr edit *)",
                     "Bash(gh pr ready *)",
-                    "Bash(gh pr close *)",
                     "Bash(gh pr reopen *)",
                     "Bash(gh issue view *)",
                     "Bash(gh issue edit *)",
