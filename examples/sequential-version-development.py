@@ -1208,6 +1208,10 @@ def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
         "work-item plan.\n\n"
+        "Your delivery responsibility ends with clean local commits. Do not push, "
+        "create or update a PR, or change PR state; AWM will normalize and verify "
+        "commit provenance before it publishes the exact commit and manages the "
+        "Draft PR.\n\n"
         "Every commit you create must end with these exact Git trailers, preserving "
         "any additional trailers the agent adds:\n"
         f"Co-authored-by: {coauthor}\n"
@@ -2599,16 +2603,15 @@ existing branch {issue.branch}, based on {config.integration_branch}. Read the
 work-item requirement below. Inspect existing Git and GitHub state before editing
 because this may be a new recovery run. Implement only the requested work item and run appropriate
 project tests and checks. Commit every intended source, test, and configuration
-change, leaving none uncommitted or untracked. Push the exact feature branch
-{issue.branch} after committing. Create or update exactly one Draft PR from
-{issue.branch} to {config.integration_branch}. Finish with a clean worktree.
+change, leaving none uncommitted or untracked. Leave publication to AWM, which
+will push the exact normalized commit on {issue.branch} and create or update
+exactly one Draft PR to {config.integration_branch}. Finish with a clean worktree.
 
 {issue.requirement}
 
 Never reset, rebase, stash, force-push, merge the work-item PR, target
 {config.main_branch}, create unrelated PRs, or discard ambiguous local work.
-Return a concise summary including the commit SHA and PR number or URL when
-available.""")
+Return a concise summary including the local commit SHA.""")
     scope_review = review_context + f"""Perform only the Scope / Design Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement} Inspect the PR diff. Decide whether the changed targets,

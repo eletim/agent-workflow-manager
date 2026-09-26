@@ -166,9 +166,10 @@ On Resume, the workflow calls `recover_issue_driven_work_item_topology` only for
 an inline item whose dispatch identity was restored from the persisted plan.
 After all topology checks succeed, the helper may restore a missing or malformed
 fingerprint on the exact open Draft PR. After a fresh implementation, the
-workflow uses the same plan-owned identity and guarded reconciliation to adopt a
-Draft PR created by the CodingAgent, or creates the PR with the marker itself if
-none exists. Subsequent PR metadata updates use
+workflow normalizes and verifies the CodingAgent's clean local commits before it
+publishes the exact head and creates or reuses the Draft PR with the marker.
+Coding Agents never publish commits or manage PR state. Subsequent PR metadata
+updates use
 `reconcile_inline_task_pr_body()` and `require_inline_task_pr_fingerprint()` as
 the same strict reconciliation and validation boundary. CodingAgent prompts
 prohibit marker changes: only AWM creates or repairs the fingerprint marker. If
@@ -1223,13 +1224,13 @@ Do not:
 - run observable/parallel Bash work as an invisible local subprocess;
 - invent a checkpoint, graph, state-machine, or durable-execution abstraction.
 
-## Complete example: implement, review, fix, and ready a PR
+## Complete example: implement, review, and fix with orchestrated delivery
 
 This lower-level example focuses on agent turn orchestration. Production
 repository workflows should combine it with the commit/clean and delivery gates
 above; the canonical `examples/sequential-version-development.py` shows safe
-push and exact Draft-PR gap absorption. All owned resources remain available
-until explicit Cleanup.
+provenance normalization, exact publication, and Draft-PR management. All owned
+resources remain available until explicit Cleanup.
 
 ```python
 from __future__ import annotations
@@ -1254,6 +1255,8 @@ context = prepare_run_repository(
 )
 REPO = context.execution_root
 ISSUE_URL = "https://github.com/OWNER/REPO/issues/123"
+# Orchestration reads the Issue before starting the restricted CodingAgent.
+ISSUE_REQUIREMENT = "The exact authoritative Issue body fetched by AWM."
 BASE_BRANCH = "dev/v0.1.0"
 FEATURE_BRANCH = "feature/issue-123"
 MAX_REVIEWS = 5
@@ -1385,15 +1388,20 @@ try:
         client,
         implementer,
         "implementation",
-        f"""Implement {ISSUE_URL}. Treat the Issue body as Source of Truth.
-Work in the prepared checkout based on {BASE_BRANCH}; publish its HEAD to the
-logical branch {FEATURE_BRANCH} and create no other branch yourself.
+        f"""Implement this authoritative requirement: {ISSUE_REQUIREMENT}
+Work in the prepared checkout based on {BASE_BRANCH}; advance the local logical
+branch {FEATURE_BRANCH} only through clean commits.
 Run required format/lint/typecheck/tests and git diff --check.
-Commit, push with `git push origin HEAD:refs/heads/{FEATURE_BRANCH}`, and create a
-Draft PR targeting {BASE_BRANCH}.
-Do not merge main or {BASE_BRANCH}. Do not start a review yourself.
+Commit locally. Do not push or create, update, or ready a PR.
+Do not merge main or {BASE_BRANCH}. Do not start a review yourself. AWM will
+normalize and verify provenance before publishing the exact commit and managing
+the Draft PR.
 Return a concise implementation and verification summary.""",
     )
+
+    # Before review, orchestration applies the commit/clean gates shown above,
+    # normalizes and verifies provenance, pushes the exact resulting SHA, and
+    # creates or reuses the exact Draft PR.
 
     approved = False
     for review_number in range(1, MAX_REVIEWS + 1):
@@ -1420,8 +1428,8 @@ Otherwise return CHANGES_REQUESTED on the first non-empty line, followed by spec
             "fix",
             f"""Fix only the actionable review findings below for {ISSUE_URL}.
 Keep branch {FEATURE_BRANCH}; do not create another branch or merge anything.
-Run required checks, commit, and push with
-`git push origin HEAD:refs/heads/{FEATURE_BRANCH}` to the existing Draft PR.
+Run required checks and commit locally. Do not push or modify PR state; AWM
+normalizes and verifies provenance before publishing the exact commit.
 Do not start a review yourself.
 
 REVIEW FINDINGS:
@@ -1429,17 +1437,15 @@ REVIEW FINDINGS:
             iteration=review_number,
         )
 
+        # Before re-review, orchestration repeats the commit/clean, provenance,
+        # exact-push, and Draft-PR topology gates.
+
     if not approved:
         raise WorkerFailure("workflow ended without approval")
 
-    run_turn(
-        client,
-        implementer,
-        "pr ready",
-        f"""Run final required checks for {FEATURE_BRANCH}, confirm it is pushed,
-and convert its existing Draft PR targeting {BASE_BRANCH} to Ready for review.
-Do not merge the PR and do not start another review. Return the PR URL and final status.""",
-    )
+    # Orchestration runs final checks, revalidates the exact pushed topology,
+    # and changes the verified Draft PR to Ready without delegating PR state to
+    # the CodingAgent.
     workflow_succeeded = True
 except BaseException as exc:
     emit_step(

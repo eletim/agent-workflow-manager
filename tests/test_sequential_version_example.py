@@ -2911,6 +2911,108 @@ def test_new_commit_with_residual_dirty_files_normalizes_before_cleanup(
     ]
 
 
+@pytest.mark.parametrize("process", ["implementation", "reviewer-fix", "cleanup"])
+def test_agent_commit_normalization_precedes_awm_publication(
+    monkeypatch: pytest.MonkeyPatch, process: str
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    run_turn = workflow["run_turn"]
+    globals_ = run_turn.__globals__
+    branch = "feature/local-delivery"
+    events: list[str] = []
+
+    class Repository:
+        local_sha = "before"
+
+        def require_current_branch(self, current: str) -> BranchState:
+            assert current == branch
+            return BranchState(current, self.local_sha, None, True)
+
+        def normalize_agent_commit_provenance(
+            self, current: str, start: str, end: str, **kwargs: object
+        ) -> BranchState:
+            assert (current, start, end) == (branch, "before", "agent-commit")
+            assert kwargs["expected_process"] == process
+            events.append("normalize")
+            self.local_sha = "normalized-commit"
+            return BranchState(current, self.local_sha, None, True)
+
+        def require_agent_commit_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            assert (start, end) == ("before", "normalized-commit")
+            assert kwargs["expected_process"] == process
+            events.append("verify")
+
+        def ensure_pushed(
+            self, current: str, *, expected_local_sha: str
+        ) -> BranchState:
+            assert (current, expected_local_sha) == (branch, "normalized-commit")
+            events.append("push")
+            return BranchState(current, expected_local_sha, expected_local_sha, True)
+
+    repository = Repository()
+
+    class Client:
+        workspace_id = "ws-test"
+
+        def wait_until_ready(self, *_args: object) -> None:
+            pass
+
+        def send_input(self, *_args: object) -> None:
+            pass
+
+        def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
+            repository.local_sha = "agent-commit"
+
+        def read_result(self, *_args: object) -> str:
+            return "committed locally"
+
+    monkeypatch.setitem(globals_, "emit_step", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_agent_turn", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+    monkeypatch.setitem(globals_, "terminal_progress", lambda *args, **kwargs: None)
+
+    run_turn(
+        Client(),
+        "tab",
+        process,
+        "prompt",
+        repository_identity="acme/project",
+        repository=repository,
+        branch=branch,
+        expected_process=process,
+    )
+
+    issue = workflow["Issue"](123, branch)
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+
+    class GitHub:
+        def find_pr(self, **_kwargs: object) -> None:
+            return None
+
+        def create_draft_pr(self, **kwargs: object) -> PullRequestState:
+            assert kwargs["expected_head_sha"] == "normalized-commit"
+            events.append("create-pr")
+            return open_pr(head=branch, base=config.integration_branch, draft=True)
+
+        def require_pr(self, **_kwargs: object) -> PullRequestState:
+            events.append("verify-pr")
+            return open_pr(head=branch, base=config.integration_branch, draft=True)
+
+    workflow["ensure_issue_pr"](
+        repository,
+        GitHub(),
+        issue,
+        config,
+        expected_base_sha="base",
+    )
+
+    assert events[:4] == ["normalize", "verify", "push", "create-pr"]
+
+
 def test_failed_mutating_turn_validates_commits_before_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
