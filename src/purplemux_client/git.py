@@ -630,10 +630,25 @@ class GitRepository:
             )
             return state
 
-        remote_before = state.remote_sha
+        remote_heads_before = self.inspect_remote_branch_heads()
+        remote_before = remote_heads_before.get(branch)
+        if remote_before != state.remote_sha:
+            raise WorkerFailure(
+                f"remote {branch!r} changed before provenance normalization"
+            )
+        self._fetch_missing_remote_branch_heads(remote_heads_before)
+        published = [
+            remote_branch
+            for remote_branch, remote_sha in remote_heads_before.items()
+            if any(self._is_ancestor(commit_sha, remote_sha) for commit_sha in commits)
+        ]
+        if published:
+            raise WorkerFailure(
+                "refusing to normalize agent provenance because the commit range "
+                "is already reachable from remote branch(es): "
+                + ", ".join(repr(remote_branch) for remote_branch in published)
+            )
         if remote_before is not None:
-            if not self._has_commit(remote_before):
-                self._fetch_branch(branch, remote_before)
             if not self._is_ancestor(remote_before, previous_sha):
                 raise WorkerFailure(
                     "refusing to normalize agent provenance because the remote "
@@ -682,11 +697,10 @@ class GitRepository:
                     f"local {branch!r} changed before provenance normalization: "
                     f"expected {current_sha}, found {current.local_sha}"
                 )
-            actual_remote = self._remote_sha(branch)
-            if actual_remote != remote_before:
+            actual_remote_heads = self.inspect_remote_branch_heads()
+            if actual_remote_heads != remote_heads_before:
                 raise WorkerFailure(
-                    f"remote {branch!r} changed before provenance normalization: "
-                    f"expected {remote_before}, found {actual_remote}"
+                    "remote branches changed before provenance normalization"
                 )
 
         self._git_mutation(
@@ -703,9 +717,12 @@ class GitRepository:
             desired=lambda: self._branch_matches(branch, normalized_sha, True),
             pre_dispatch=require_unchanged_preconditions,
         )
-        remote_after = self._remote_sha(branch)
+        remote_heads_after = self.inspect_remote_branch_heads()
         result = self.require_current_branch(branch)
-        if remote_after != remote_before or result.remote_sha != remote_before:
+        if (
+            remote_heads_after != remote_heads_before
+            or result.remote_sha != remote_before
+        ):
             try:
                 self._git_mutation(
                     [
@@ -722,11 +739,11 @@ class GitRepository:
                 )
             except WorkerFailure as exc:
                 raise MutationOutcomeUnknown(
-                    "remote changed during agent provenance normalization and "
+                    "remote branches changed during agent provenance normalization and "
                     "restoration of the original local commit could not be proven"
                 ) from exc
             raise WorkerFailure(
-                f"remote {branch!r} changed during provenance normalization; "
+                "remote branches changed during provenance normalization; "
                 "the original local commit was restored"
             )
         if result.local_sha != normalized_sha:
@@ -758,7 +775,10 @@ class GitRepository:
             "co-authored-by": [],
         }
         retained: list[str] = []
-        for line in message.splitlines():
+        lines = message.splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
             match = _AGENT_PROVENANCE_LINE_RE.fullmatch(line)
             if match is None:
                 if _AGENT_PROVENANCE_PREFIX_RE.match(line):
@@ -766,12 +786,26 @@ class GitRepository:
                         f"commit {commit_sha} has ambiguous malformed AWM provenance"
                     )
                 retained.append(line)
+                index += 1
                 continue
             key = match.group(1).lower()
             value = match.group(2)
-            values[key].append(value)
-            if key == "co-authored-by" and value != coauthor:
-                retained.append(line)
+            end = index + 1
+            continuations: list[str] = []
+            while end < len(lines) and lines[end].startswith((" ", "\t")):
+                continuations.append(lines[end])
+                end += 1
+            unfolded = " ".join(
+                [value, *(continuation.strip() for continuation in continuations)]
+            ).strip()
+            values[key].append(unfolded)
+            if key == "co-authored-by" and unfolded != coauthor:
+                if value == coauthor:
+                    raise WorkerFailure(
+                        f"commit {commit_sha} has ambiguous co-authored-by provenance"
+                    )
+                retained.extend(lines[index:end])
+            index = end
 
         for key, expected in (
             ("awm-agent", expected_agent),
@@ -836,12 +870,14 @@ class GitRepository:
         start = self._final_trailer_block_start(lines)
         trailer_values: dict[str, list[str]] = {}
         if start is not None:
+            current_key: str | None = None
             for line in lines[start:]:
                 match = _TRAILER_LINE_RE.fullmatch(line)
                 if match is not None:
-                    trailer_values.setdefault(match.group(1).lower(), []).append(
-                        match.group(2)
-                    )
+                    current_key = match.group(1).lower()
+                    trailer_values.setdefault(current_key, []).append(match.group(2))
+                elif current_key is not None and line.startswith((" ", "\t")):
+                    trailer_values[current_key][-1] += " " + line.strip()
         agent = trailer_values.get("awm-agent", [])
         process = trailer_values.get("awm-process", [])
         coauthors = trailer_values.get("co-authored-by", [])
@@ -1537,6 +1573,43 @@ class GitRepository:
             desired=lambda: self._tracking_sha(branch) == authoritative_sha,
             pre_dispatch=pre_dispatch,
         )
+
+    def _fetch_missing_remote_branch_heads(self, authoritative: dict[str, str]) -> None:
+        missing = {
+            branch: sha
+            for branch, sha in authoritative.items()
+            if not self._has_commit(sha)
+        }
+        if not missing:
+            return
+        before = {branch: self._tracking_sha(branch) for branch in missing}
+
+        def desired() -> bool:
+            return all(
+                self._tracking_sha(branch) == sha for branch, sha in missing.items()
+            )
+
+        self._git_mutation(
+            [
+                "fetch",
+                "--no-tags",
+                self.remote,
+                *(
+                    f"refs/heads/{branch}:{self._tracking_ref(branch)}"
+                    for branch in missing
+                ),
+            ],
+            operation="fetch remote branch heads for provenance inspection",
+            target=self.remote,
+            pre_state=before,
+            observe=lambda: {branch: self._tracking_sha(branch) for branch in missing},
+            desired=desired,
+            pre_dispatch=lambda: self._require_remote_branch_heads(authoritative),
+        )
+
+    def _require_remote_branch_heads(self, expected: dict[str, str]) -> None:
+        if self.inspect_remote_branch_heads() != expected:
+            raise WorkerFailure("remote branches changed during provenance inspection")
 
     def _require_feature_preparation_refs(
         self,

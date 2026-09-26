@@ -514,8 +514,9 @@ def test_agent_provenance_verifies_exact_turn_ranges(
             "AWM-Process: implementation\nAWM-Process: implementation"
         ),
         "Co-authored-by: Codex <noreply@openai.com>",
+        "Co-authored-by: Codex\n <noreply@openai.com>",
     ],
-    ids=("malformed-spacing", "duplicates", "missing-awm"),
+    ids=("malformed-spacing", "duplicates", "missing-awm", "folded-coauthor"),
 )
 def test_normalize_unpublished_agent_provenance(
     repositories: tuple[Path, Path, Path], trailers: str
@@ -657,7 +658,7 @@ def test_normalize_provenance_refuses_remote_visible_commit(
     pushed_sha = git(work, "rev-parse", "HEAD")
     git(work, "push", "origin", branch)
 
-    with pytest.raises(WorkerFailure, match="remote.*does not precede"):
+    with pytest.raises(WorkerFailure, match="already reachable from remote"):
         repo.normalize_agent_commit_provenance(
             branch,
             base,
@@ -668,6 +669,84 @@ def test_normalize_provenance_refuses_remote_visible_commit(
 
     assert git(work, "rev-parse", "HEAD") == pushed_sha
     assert repo.inspect_branch(branch).remote_sha == pushed_sha
+
+
+def test_normalize_refuses_commit_fast_forwarded_from_remote_side_branch(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/remote-side-provenance"
+    side_branch = "feature/published-agent-result"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "switch", "-c", side_branch, base)
+    git(work, "commit", "--allow-empty", "-m", "published malformed result")
+    published_sha = git(work, "rev-parse", "HEAD")
+    git(work, "push", "origin", side_branch)
+    git(work, "switch", branch)
+    git(work, "merge", "--ff-only", side_branch)
+    git(seed, "fetch", "origin", f"{side_branch}:{side_branch}")
+    git(seed, "switch", side_branch)
+    git(seed, "commit", "--allow-empty", "-m", "advance published side branch")
+    remote_side_sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "push", "origin", side_branch)
+
+    with pytest.raises(WorkerFailure, match=repr(side_branch)):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            published_sha,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert git(work, "rev-parse", "HEAD") == published_sha
+    assert repo.inspect_branch(branch).remote_sha is None
+    assert repo.inspect_branch(side_branch).remote_sha == remote_side_sha
+
+
+@pytest.mark.parametrize(
+    ("trailers", "error"),
+    [
+        (
+            "AWM-Agent: codex\n claude\nAWM-Process: implementation",
+            "ambiguous awm-agent provenance",
+        ),
+        (
+            "AWM-Agent: codex\nAWM-Process: implementation\n cleanup",
+            "ambiguous awm-process provenance",
+        ),
+        (
+            "Co-authored-by: Codex <noreply@openai.com>\n malicious\n"
+            "AWM-Agent: codex\nAWM-Process: implementation",
+            "ambiguous co-authored-by provenance",
+        ),
+    ],
+    ids=("folded-agent", "folded-process", "folded-configured-coauthor"),
+)
+def test_normalize_refuses_conflicting_folded_provenance(
+    repositories: tuple[Path, Path, Path], trailers: str, error: str
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/folded-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(work, "commit", "--allow-empty", "-m", "agent result", "-m", trailers)
+    original = git(work, "rev-parse", "HEAD")
+
+    with pytest.raises(WorkerFailure, match=error):
+        repo.normalize_agent_commit_provenance(
+            branch,
+            base,
+            original,
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+    assert git(work, "rev-parse", "HEAD") == original
+    assert repo.inspect_branch(branch).remote_sha is None
 
 
 def test_normalize_valid_remote_visible_provenance_is_a_noop(
