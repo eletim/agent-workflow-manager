@@ -155,6 +155,91 @@ def test_create_response_parsing_and_codex_panel_type() -> None:
     assert create[create.index("-n") + 1].startswith("awm-codex-cli-")
 
 
+def test_restricted_session_uses_common_turn_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeRunner([completed({"tabId": "tab-restricted"})])
+    cli = client(runner)
+    session = cli.create_session(
+        CreateSessionRequest(
+            worker="codex",
+            cwd="/workspace/project",
+            command="codex",
+            restriction="preserve-git-refs",
+        )
+    )
+    started: list[ShellCommandRequest] = []
+    waited: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        cli,
+        "_status",
+        lambda tab: {"panelType": "terminal", "alive": True},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_start_shell_run",
+        lambda tab, request, cwd: started.append(request),
+    )
+    monkeypatch.setattr(
+        cli,
+        "wait_for_shell_completion",
+        lambda tab, timeout: waited.append((tab, timeout)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "read_shell_result",
+        lambda tab: client_module.ShellResult(0, stdout="validated output\n"),
+    )
+
+    cli.wait_until_ready(session, 10)
+    cli.send_input(session, "inspect and repair")
+    cli.wait_for_turn_completion(session, 20)
+
+    create = next(call for call in runner.calls if call[1:3] == ["tab", "create"])
+    assert create[-1] == "terminal"
+    assert len(started) == 1
+    assert "inspect and repair" not in started[0].command
+    assert waited == [(session, 20)]
+    assert cli.read_result(session) == "validated output"
+
+
+@pytest.mark.parametrize(
+    ("worker", "required"),
+    [
+        (
+            "codex",
+            (
+                "--sandbox workspace-write",
+                "network_access=true",
+                "exclude_tmpdir_env_var=true",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_TERMINAL_PROMPT=0",
+            ),
+        ),
+        (
+            "claude",
+            (
+                "--restricted",
+                "--permission-prompts none",
+                "Bash(gh pr edit *)",
+                "Bash(gh issue edit *)",
+            ),
+        ),
+    ],
+)
+def test_restricted_session_preserves_safe_remote_capabilities(
+    worker: str, required: tuple[str, ...]
+) -> None:
+    command = PurpleMuxCLIClient._restricted_agent_command(worker, "inspect safely")
+
+    assert all(value in command for value in required)
+    assert "-u GH_TOKEN" not in command
+    assert "-u GITHUB_TOKEN" not in command
+    assert "GIT_SSH_COMMAND=false" in command
+    if worker == "codex":
+        assert command.index("--ask-for-approval never") < command.index(" exec ")
+
+
 def test_session_deadline_only_limits_tab_create_command() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
     cli = client(runner, command_timeout_seconds=30)

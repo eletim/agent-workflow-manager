@@ -722,7 +722,7 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 7
+    assert source.count("run_validated_turn(") == 8
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import base64
 import hashlib
 import inspect
 import json
@@ -2480,7 +2479,10 @@ def test_generated_workflow_selects_role_specific_agents(
 
     assert f"IMPLEMENTER_AGENT = {implementer!r}" in code
     assert f"REVIEWER_AGENT = {reviewer!r}" in code
-    assert "CreateSessionRequest(agent_type, str(config.repo), agent_type" in code
+    assert "CreateSessionRequest(" in code
+    assert "agent_type," in code
+    assert "str(config.repo)," in code
+    assert "restriction=restriction," in code
 
 
 @pytest.mark.parametrize(
@@ -2541,6 +2543,7 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
             calls[text] = agent_type.id
 
     assert calls == {
+        "Recovery agent": "IMPLEMENTER_AGENT",
         " worktree cleanup": "IMPLEMENTER_AGENT",
         " implementer": "IMPLEMENTER_AGENT",
         " scope reviewer": "REVIEWER_AGENT",
@@ -2853,52 +2856,46 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
-    commands: list[str] = []
+    agents: list[tuple[str, str, object]] = []
+    prompts: list[str] = []
     closed: list[str] = []
-    response = json.dumps(
-        {
-            "repaired": True,
-            "retry_safe": True,
-            "summary": "Restored the missing remote branch.",
-            "evidence": "Remote branch now points to the expected commit.",
-        }
+    client = SimpleNamespace(close_session=closed.append)
+    workflow["create_agent"] = lambda client, config, **kwargs: (
+        agents.append(
+            (kwargs["agent_type"], kwargs["name"], kwargs.get("restriction"))
+        )
+        or f"recovery-{len(agents)}"
     )
 
-    class Client:
-        workspace_id = "workspace-1"
+    def run_validated(client, agent, name, prompt, validator, *, role, **kwargs):
+        assert role == "recovery"
+        assert kwargs["phase"] == "recovery"
+        assert kwargs["_deferred_execution"] is None
+        assert "transition_outcome" not in kwargs
+        prompts.append(prompt)
+        return "", validator(
+            json.dumps(
+                {
+                    "repaired": True,
+                    "retry_safe": True,
+                    "summary": "Restored the missing remote branch.",
+                    "evidence": "Remote branch now points to the expected commit.",
+                }
+            )
+        )
 
-        def start_shell(self, request):
-            commands.append(request.command)
-            return f"recovery-{len(commands)}"
-
-        def wait_for_shell_completion(self, *_args, **_kwargs):
-            return None
-
-        def read_shell_result(self, _tab):
-            return SimpleNamespace(exit_code=0, stdout=response)
-
-        def close_session(self, tab):
-            closed.append(tab)
-
+    workflow["run_validated_turn"] = run_validated
     first = workflow["recover_error"](
-        Client(), config, RuntimeError("first"), "branch: absent"
+        client, config, RuntimeError("first"), "branch: absent"
     )
     second = workflow["recover_error"](
-        Client(), config, RuntimeError("second"), "branch: present"
+        client, config, RuntimeError("second"), "branch: present"
     )
 
-    prompts = [
-        base64.b64decode(
-            command.partition("printf %s ")[2].partition(" | ")[0]
-        )
-        .decode("utf-8")
-        for command in commands
+    assert agents == [
+        ("codex", "Recovery agent", "preserve-git-refs"),
+        ("codex", "Recovery agent", "preserve-git-refs"),
     ]
-
-    assert len(commands) == 2
-    assert all("--sandbox workspace-write" in command for command in commands)
-    assert all("sandbox_workspace_write.network_access=false" in command for command in commands)
-    assert all("-u GH_TOKEN -u GITHUB_TOKEN" in command for command in commands)
     assert first.retry_safe and second.repaired
     assert "first" in prompts[0] and "branch: absent" in prompts[0]
     assert "second" in prompts[1] and "branch: present" in prompts[1]
@@ -2913,19 +2910,14 @@ def test_recovery_traces_inline_work_item_context_with_result_id() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     trace_contexts: list[tuple[object, object]] = []
-    response = json.dumps(
-        {"repaired": True, "retry_safe": True, "summary": "ok", "evidence": "seen"}
-    )
-    client = SimpleNamespace(
-        workspace_id="workspace-1",
-        start_shell=lambda request: "recovery-only",
-        wait_for_shell_completion=lambda *args, **kwargs: None,
-        read_shell_result=lambda tab: SimpleNamespace(exit_code=0, stdout=response),
-        close_session=lambda agent: None,
-    )
-    workflow["emit_agent_turn"] = lambda *args, **kwargs: trace_contexts.append(
-        (kwargs.get("work_item_id"), kwargs.get("work_item_label"))
-    )
+    client = SimpleNamespace(close_session=lambda agent: None)
+    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
+
+    def run_validated(*args, **kwargs):
+        trace_contexts.append((kwargs["work_item_id"], kwargs["work_item_label"]))
+        return "", workflow["RecoveryReport"](True, True, "ok", "evidence")
+
+    workflow["run_validated_turn"] = run_validated
     authoritative_state = json.dumps(
         {"work_item_plan": {"active": {"id": "instrument-inline"}}}
     )
@@ -2934,10 +2926,9 @@ def test_recovery_traces_inline_work_item_context_with_result_id() -> None:
         client, config, RuntimeError("first"), authoritative_state
     )
 
-    assert trace_contexts[0] == (
-        "mini-task:instrument-inline",
-        "Mini task instrument-inline",
-    )
+    assert trace_contexts == [
+        ("mini-task:instrument-inline", "Mini task instrument-inline")
+    ]
 
 
 def test_recovery_closes_agent_when_its_turn_fails() -> None:
@@ -2946,51 +2937,15 @@ def test_recovery_closes_agent_when_its_turn_fails() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     closed: list[str] = []
-    client = SimpleNamespace(
-        workspace_id="workspace-1",
-        start_shell=lambda request: "recovery-only",
-        wait_for_shell_completion=lambda *args, **kwargs: (_ for _ in ()).throw(
-            WorkerFailure("agent failed")
-        ),
-        close_session=closed.append,
+    client = SimpleNamespace(close_session=closed.append)
+    workflow["create_agent"] = lambda *args, **kwargs: "recovery-only"
+    workflow["run_validated_turn"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        WorkerFailure("agent failed")
     )
 
     with pytest.raises(WorkerFailure, match="agent failed"):
         workflow["recover_error"](client, config, RuntimeError("first"), "state")
     assert closed == ["recovery-only"]
-
-
-@pytest.mark.parametrize(
-    ("agent", "required"),
-    [
-        (
-            "codex",
-            (
-                "--sandbox workspace-write",
-                "network_access=false",
-                "exclude_tmpdir_env_var=true",
-                "exclude_slash_tmp=true",
-                "--ignore-user-config",
-            ),
-        ),
-        (
-            "claude",
-            ("--restricted", "--permission-prompts none", "--safe-mode"),
-        ),
-    ],
-)
-def test_recovery_agent_command_enforces_provider_session_boundary(
-    agent: str, required: tuple[str, ...]
-) -> None:
-    workflow = load_generated_workflow(issues=[90], implementer_agent=agent)
-
-    command = workflow["recovery_agent_command"]("inspect safely")
-
-    assert all(value in command for value in required)
-    assert "-u GH_TOKEN -u GITHUB_TOKEN" in command
-    assert "-u SSH_AUTH_SOCK" in command
-    if agent == "codex":
-        assert command.index("--ask-for-approval never") < command.index(" exec ")
 
 
 def test_repository_failure_starts_recovery_with_current_inspection() -> None:
