@@ -3201,8 +3201,11 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
     assert findings == []
 
 
+@pytest.mark.parametrize("recovery_raises", [False, True])
 @pytest.mark.parametrize("changed", ["local", "remote"])
-def test_repository_recovery_rejects_changed_branch_history(changed: str) -> None:
+def test_repository_recovery_rejects_changed_branch_history(
+    changed: str, recovery_raises: bool
+) -> None:
     workflow = load_generated_workflow(issues=[90])
     config = workflow["Config"](
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
@@ -3211,13 +3214,23 @@ def test_repository_recovery_rejects_changed_branch_history(changed: str) -> Non
     rewritten = {"dev/v1": "b" * 40}
     local_refs = iter((original, rewritten if changed == "local" else original))
     remote_refs = iter((original, rewritten if changed == "remote" else original))
+    inspections: list[str] = []
+
+    def inspect_local_branch_heads() -> dict[str, str]:
+        inspections.append("local")
+        return next(local_refs)
+
+    def inspect_remote_branch_heads() -> dict[str, str]:
+        inspections.append("remote")
+        return next(remote_refs)
+
     repo = SimpleNamespace(
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
         inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
-        inspect_local_branch_heads=lambda: next(local_refs),
-        inspect_remote_branch_heads=lambda: next(remote_refs),
+        inspect_local_branch_heads=inspect_local_branch_heads,
+        inspect_remote_branch_heads=inspect_remote_branch_heads,
         require_committed_result=lambda *args, **kwargs: pytest.fail(
             "changed history must fail before provenance validation"
         ),
@@ -3232,14 +3245,20 @@ def test_repository_recovery_rejects_changed_branch_history(changed: str) -> Non
     workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
         WorkerFailure("provenance failed")
     )
-    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
-        True, True, "Repaired provenance.", "Re-inspected branch refs."
-    )
+    def recover(*args: object, **kwargs: object):
+        if recovery_raises:
+            raise WorkerFailure("recovery agent failed after rewriting history")
+        return workflow["RecoveryReport"](
+            True, True, "Repaired provenance.", "Re-inspected branch refs."
+        )
+
+    workflow["recover_error"] = recover
 
     with pytest.raises(
         WorkerFailure, match=f"recovery changed {changed} branch history"
     ):
         workflow["run_repository"](config)
+    assert inspections == ["local", "remote", "local", "remote"]
 
 
 def test_repository_does_not_retry_unknown_mutation_outcome() -> None:

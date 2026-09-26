@@ -5747,28 +5747,32 @@ def _run_repository(
             recovery_remote_refs = repo.inspect_remote_branch_heads()
             state = recovery_authoritative_state(config, repo, github, plan)
             recovery_execution: list[_AgentTurnExecution] = []
-            report = recover_error(
-                client,
-                config,
-                exc,
-                state,
-                deferred_execution=recovery_execution,
-            )
+            try:
+                report = recover_error(
+                    client,
+                    config,
+                    exc,
+                    state,
+                    deferred_execution=recovery_execution,
+                )
+            finally:
+                recovered_local_refs = repo.inspect_local_branch_heads()
+                recovered_remote_refs = repo.inspect_remote_branch_heads()
+                if recovered_local_refs != recovery_local_refs:
+                    raise WorkerFailure(
+                        "recovery changed local branch history; refusing to rewrite "
+                        "repository provenance"
+                    )
+                if recovered_remote_refs != recovery_remote_refs:
+                    raise WorkerFailure(
+                        "recovery changed remote branch history; refusing to rewrite "
+                        "published provenance"
+                    )
             print(
                 f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
                 f"Evidence: {report.evidence}",
                 flush=True,
             )
-            if repo.inspect_local_branch_heads() != recovery_local_refs:
-                raise WorkerFailure(
-                    "recovery changed local branch history; refusing to rewrite "
-                    "repository provenance"
-                )
-            if repo.inspect_remote_branch_heads() != recovery_remote_refs:
-                raise WorkerFailure(
-                    "recovery changed remote branch history; refusing to rewrite "
-                    "published provenance"
-                )
             repo.require_committed_result(
                 recovery_branch,
                 previous_sha=recovery_start.local_sha,
