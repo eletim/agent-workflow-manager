@@ -244,6 +244,60 @@ def test_python_3_14_collections_abc_runtime_alias_is_accepted(
     assert result.valid
 
 
+def test_registered_meta_path_module_is_accepted_without_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finder = tmp_path / "finder"
+    finder.mkdir()
+    (finder / "sitecustomize.py").write_text(
+        """import importlib.util
+import sys
+
+class Loader:
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        return None
+
+class Finder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname not in {"finder_package", "finder_package.available"}:
+            return None
+        return importlib.util.spec_from_loader(
+            fullname, Loader(), is_package=fullname == "finder_package"
+        )
+
+sys.meta_path.insert(0, Finder())
+""",
+        encoding="utf-8",
+    )
+    current_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(finder)
+    if current_pythonpath:
+        pythonpath += os.pathsep + current_pythonpath
+    monkeypatch.setenv("PYTHONPATH", pythonpath)
+    runtime = subprocess.run(
+        [sys.executable, "-c", "import finder_package.available"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    available = WorkflowValidator(cwd=tmp_path).validate(
+        "import finder_package.available"
+    )
+    missing = WorkflowValidator(cwd=tmp_path).validate(
+        "import finder_package.missing"
+    )
+
+    assert runtime.returncode == 0, runtime.stderr
+    assert available.valid
+    assert not missing.valid
+    assert missing.issues[0].kind == "import"
+    assert "finder_package.missing" in missing.issues[0].message
+
+
 def test_missing_child_of_runtime_aliased_package_is_rejected(tmp_path: Path) -> None:
     result = WorkflowValidator(cwd=tmp_path).validate("import collections.unavailable")
 

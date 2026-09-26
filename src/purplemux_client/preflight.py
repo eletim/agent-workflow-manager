@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -29,7 +29,6 @@ DRY_RUN_VERSION = 1
 MAX_OUTLINE_ITEMS = 100
 MAX_OUTLINE_LABEL_CHARS = 200
 DEFAULT_CHECK_TIMEOUT = 30.0
-STDLIB_MODULE_ALIASES = frozenset({"collections.abc", "os.path"})
 
 
 @dataclass(frozen=True)
@@ -1005,29 +1004,18 @@ class WorkflowValidator:
         return tuple(value)
 
     def _module_exists(self, name: str) -> bool:
-        if name in STDLIB_MODULE_ALIASES:
-            return True
         parts = name.split(".")
         if any(not part for part in parts):
             return False
-        root = parts[0]
-        if root in sys.builtin_module_names:
-            return len(parts) == 1
-        spec = importlib.machinery.PathFinder.find_spec(
-            root, list(self._module_search_path)
-        )
-        if spec is None:
-            return len(parts) == 1 and root in sys.stdlib_module_names
-        qualified = root
-        for part in parts[1:]:
-            locations = spec.submodule_search_locations
-            if locations is None:
+        original_path = sys.path[:]
+        try:
+            sys.path[:] = self._module_search_path
+            try:
+                return importlib.util.find_spec(name) is not None
+            except (AttributeError, ImportError, ValueError):
                 return False
-            qualified = f"{qualified}.{part}"
-            spec = importlib.machinery.PathFinder.find_spec(qualified, list(locations))
-            if spec is None:
-                return False
-        return True
+        finally:
+            sys.path[:] = original_path
 
     @staticmethod
     def _workflow_module_search_path() -> tuple[str, ...]:
