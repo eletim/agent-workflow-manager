@@ -17,6 +17,7 @@ from purplemux_client import (
     GitRepository,
     MutationOutcomeUnknown,
     PullRequestState,
+    TabState,
     WorkerFailure,
     WorkerInterrupted,
 )
@@ -177,6 +178,169 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
     assert '"Deliver the exact Issue topology"' in source
     assert "Deliver the exact approved Issue topology" not in source
+
+
+def test_same_run_retry_reconciles_all_completed_work_item_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-retry-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-retry-tabs",
+        "retry-tabs",
+        "Retry completed tabs.",
+        hashlib.sha256(b"Retry completed tabs.").hexdigest(),
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    logical_names = (
+        f"{issue.label} implementer",
+        f"{issue.label} scope reviewer",
+        f"{issue.label} correctness reviewer",
+    )
+    names = tuple(workflow["correlated_agent_tab_name"](name) for name in logical_names)
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs = {
+                f"old-{index}": TabState(
+                    f"old-{index}",
+                    self.workspace_id,
+                    name,
+                    "codex-cli",
+                    "codex",
+                    True,
+                    "ready-for-review",
+                )
+                for index, name in enumerate(names, 1)
+            }
+            self.closed: list[str] = []
+            self.created: list[object] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert tab_id in self.tabs
+            return "completed"
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+        def create_session(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            correlation_id = request.correlation_id  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{correlation_id}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"new-{len(self.created) + 1}"
+            self.tabs[tab_id] = TabState(
+                tab_id,
+                self.workspace_id,
+                name,
+                "codex-cli",
+                "codex",
+                True,
+                "idle",
+            )
+            self.created.append(request)
+            return tab_id
+
+    client = Client()
+    workflow["reconcile_work_item_retry_tabs"](client, issue)
+    recreated = tuple(
+        workflow["create_agent"](client, config, agent_type="codex", name=logical_name)
+        for logical_name in logical_names
+    )
+
+    assert client.closed == ["old-1", "old-2", "old-3"]
+    assert recreated == ("new-1", "new-2", "new-3")
+    assert tuple(tab.name for tab in client.tabs.values()) == names
+    assert tuple(request.correlation_id for request in client.created) == tuple(
+        workflow["run_correlation"](name) for name in logical_names
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe", ("ambiguous", "unrelated", "busy", "later-busy")
+)
+def test_retry_tab_reconciliation_never_closes_uncertain_tabs(
+    monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-unsafe-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](334, "feature/issue-334")
+    implementer_name = workflow["correlated_agent_tab_name"](
+        f"{issue.label} implementer"
+    )
+    tab = TabState(
+        "tab-1",
+        "workspace",
+        implementer_name,
+        "terminal" if unsafe == "unrelated" else "codex-cli",
+        None if unsafe == "unrelated" else "codex",
+        True,
+        "busy" if unsafe == "busy" else "ready-for-review",
+    )
+    later = TabState(
+        "tab-scope",
+        "workspace",
+        workflow["correlated_agent_tab_name"](f"{issue.label} scope reviewer"),
+        "codex-cli",
+        "codex",
+        True,
+        "busy",
+    )
+
+    class Client:
+        workspace_id = "workspace"
+        closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            if unsafe == "ambiguous":
+                return (tab, replace(tab, id="tab-2"))
+            if unsafe == "later-busy":
+                return (tab, later)
+            return (tab,)
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            selected = later if tab_id == later.id else tab
+            return {
+                "tabId": tab_id,
+                "workspaceId": self.workspace_id,
+                "panelType": selected.panel_type,
+                "agentProviderId": selected.provider,
+                "cliState": selected.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            return "completed"
+
+        def close_session(self, tab_id: str, **_kwargs: object) -> None:
+            self.closed.append(tab_id)
+
+    client = Client()
+    with pytest.raises(WorkerFailure, match="refusing cleanup"):
+        workflow["reconcile_work_item_retry_tabs"](client, issue)
+
+    assert client.closed == []
 
 
 def test_existing_work_item_pr_adopts_its_verified_remote_head(
