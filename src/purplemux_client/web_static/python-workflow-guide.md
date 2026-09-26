@@ -206,7 +206,10 @@ commit range is normalized and verified from its authoritative published ancesto
 before an unchanged resumed turn may deliver it.
 `normalize_agent_declared_commit_provenance()` preserves each commit's declared
 implementation, reviewer-fix, or cleanup process and fails closed when that
-declaration is missing or ambiguous. Use
+declaration is missing or ambiguous. It atomically advances every matching
+logical and run-private recovery ref, so an interruption cannot leave raw and
+normalized sibling histories. Already-published recovered ranges are verified
+from the authoritative integration head before an unchanged turn or PR mutation. Use
 `ensure_pushed()` to publish the exact normalized commit through the logical
 remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The

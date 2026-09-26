@@ -2674,10 +2674,17 @@ def prepare_issue(
         )
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
+        allowed_processes = ("implementation", "reviewer-fix", "cleanup")
         published_ancestor = feature.remote_sha or integration.remote_sha
+        if feature.remote_sha is not None:
+            repo.require_agent_commit_declared_provenance(
+                integration.remote_sha,
+                feature.remote_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
         if reused_existing_work and feature.local_sha != published_ancestor:
             assert feature.local_sha is not None
-            allowed_processes = ("implementation", "reviewer-fix", "cleanup")
             feature = repo.normalize_agent_declared_commit_provenance(
                 issue.branch,
                 published_ancestor,

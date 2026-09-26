@@ -879,6 +879,33 @@ class GitRepository:
         normalized_sha = rewritten[current_sha]
         require_normalized(previous_sha, normalized_sha)
         checkout_branch = self._checkout_branch(branch)
+        checkout_ref = f"refs/heads/{checkout_branch}"
+        feature_refs_before = self._feature_recovery_refs(branch)
+        source_refs = tuple(
+            sorted(
+                ref for ref, object_sha in feature_refs_before.items()
+                if rewritten.get(object_sha, object_sha) != object_sha
+            )
+        )
+        if checkout_ref not in source_refs:
+            raise WorkerFailure(
+                f"active recovery ref {checkout_ref!r} changed before provenance "
+                "normalization"
+            )
+        feature_refs_normalized = {
+            ref: rewritten.get(object_sha, object_sha)
+            for ref, object_sha in feature_refs_before.items()
+        }
+
+        def ref_transaction(
+            before: Mapping[str, str], after: Mapping[str, str]
+        ) -> str:
+            commands = ["start"]
+            commands.extend(
+                f"update {ref} {after[ref]} {before[ref]}" for ref in source_refs
+            )
+            commands.extend(("prepare", "commit"))
+            return "\n".join(commands) + "\n"
 
         def require_unchanged_preconditions() -> None:
             current_worktree = self.inspect_worktree()
@@ -895,20 +922,22 @@ class GitRepository:
                 raise WorkerFailure(
                     "remote refs changed before provenance normalization"
                 )
+            if self._feature_recovery_refs(branch) != feature_refs_before:
+                raise WorkerFailure(
+                    "feature recovery refs changed before provenance normalization"
+                )
 
         self._git_mutation(
-            [
-                "update-ref",
-                f"refs/heads/{checkout_branch}",
-                normalized_sha,
-                current_sha,
-            ],
+            ["update-ref", "--stdin"],
             operation="normalize agent commit provenance",
             target=branch,
-            pre_state=current_sha,
-            observe=lambda: self._checkout_sha(branch),
-            desired=lambda: self._branch_matches(branch, normalized_sha, True),
+            pre_state=feature_refs_before,
+            observe=lambda: self._feature_recovery_refs(branch),
+            desired=lambda: (
+                self._feature_recovery_refs(branch) == feature_refs_normalized
+            ),
             pre_dispatch=require_unchanged_preconditions,
+            input_text=ref_transaction(feature_refs_before, feature_refs_normalized),
         )
         remote_refs_after = self.inspect_remote_refs()
         result = self.require_current_branch(branch)
@@ -918,17 +947,17 @@ class GitRepository:
         ):
             try:
                 self._git_mutation(
-                    [
-                        "update-ref",
-                        f"refs/heads/{checkout_branch}",
-                        current_sha,
-                        normalized_sha,
-                    ],
+                    ["update-ref", "--stdin"],
                     operation="restore agent commit before remote race",
                     target=branch,
-                    pre_state=normalized_sha,
-                    observe=lambda: self._checkout_sha(branch),
-                    desired=lambda: self._branch_matches(branch, current_sha, True),
+                    pre_state=feature_refs_normalized,
+                    observe=lambda: self._feature_recovery_refs(branch),
+                    desired=lambda: (
+                        self._feature_recovery_refs(branch) == feature_refs_before
+                    ),
+                    input_text=ref_transaction(
+                        feature_refs_normalized, feature_refs_before
+                    ),
                 )
             except WorkerFailure as exc:
                 raise MutationOutcomeUnknown(

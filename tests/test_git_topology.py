@@ -174,7 +174,11 @@ class UpdateRefRaceGitRunner(RecordingGitRunner):
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         ref = f"refs/heads/{self.branch}"
-        is_branch_update = command[1:3] == ["update-ref", ref]
+        is_branch_update = (
+            command[1:] == ["update-ref", "--stdin"]
+            and input is not None
+            and f"update {ref} " in input
+        )
         if is_branch_update and self.triggered and self.reject_restore:
             return subprocess.CompletedProcess(command, 1, "", "restore rejected")
         completed = super().__call__(
@@ -1591,6 +1595,78 @@ def test_recover_feature_finds_local_commit_in_retained_run_worktree(
     assert git(retained, "rev-parse", "HEAD") == implementation_sha
 
 
+def test_recovery_after_normalization_reconciles_retained_source_refs(
+    repositories: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _remote, _seed, work = repositories
+    base_sha = git(work, "rev-parse", "HEAD")
+    branch = "feature/normalized-recovery"
+    git(work, "switch", "-c", branch)
+    retained = tmp_path / "retained-run"
+    git(work, "worktree", "add", "--detach", str(retained), base_sha)
+    retained_repo = open_repo(retained, RecordingGitRunner())
+    retained_repo.prepare_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    retained_branch = git(retained, "branch", "--show-current")
+    git(
+        retained,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "implementation",
+        "-m",
+        "AWM-Process: implementation",
+    )
+    intermediate_sha = git(retained, "rev-parse", "HEAD")
+    intermediate_ref = f"awm-run/{'b' * 12}/{branch}"
+    git(retained, "branch", intermediate_ref, intermediate_sha)
+    git(
+        retained,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "cleanup",
+        "-m",
+        "AWM-Process: cleanup",
+    )
+    raw_sha = git(retained, "rev-parse", "HEAD")
+
+    current = tmp_path / "current-run"
+    git(work, "worktree", "add", "--detach", str(current), base_sha)
+    current_repo = open_repo(current, RecordingGitRunner())
+    recovered = current_repo.recover_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+    assert recovered.branch.local_sha == raw_sha
+
+    normalized = current_repo.normalize_agent_declared_commit_provenance(
+        branch,
+        base_sha,
+        raw_sha,
+        expected_agent="codex",
+        allowed_processes=("implementation", "reviewer-fix", "cleanup"),
+    )
+    assert normalized.local_sha is not None
+    assert normalized.local_sha != raw_sha
+    assert git(retained, "rev-parse", retained_branch) == normalized.local_sha
+    normalized_commits = git(
+        current, "rev-list", "--reverse", f"{base_sha}..{normalized.local_sha}"
+    ).splitlines()
+    assert git(retained, "rev-parse", intermediate_ref) == normalized_commits[0]
+    assert git(retained, "status", "--porcelain=v1") == ""
+
+    retry = tmp_path / "retry-run"
+    git(work, "worktree", "add", "--detach", str(retry), base_sha)
+    retry_repo = open_repo(retry, RecordingGitRunner())
+    retried = retry_repo.recover_feature_branch(
+        branch, base="main", expected_base_sha=base_sha
+    )
+
+    assert retried.reused_existing_work
+    assert retried.branch.local_sha == normalized.local_sha
+
+
 def test_recover_feature_reuses_pushed_commit_without_pull_request(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:
@@ -1619,6 +1695,13 @@ def test_recover_feature_reuses_pushed_commit_without_pull_request(
     assert recovered.branch.local_sha == implementation_sha
     assert recovered.branch.remote_sha == implementation_sha
     assert unchanged.local_sha == implementation_sha
+    with pytest.raises(WorkerFailure, match="allowed AWM-Process"):
+        new_repo.require_agent_commit_declared_provenance(
+            base_sha,
+            implementation_sha,
+            expected_agent="codex",
+            allowed_processes=("implementation", "reviewer-fix", "cleanup"),
+        )
 
 
 def test_recover_feature_rejects_unreconciled_prior_run_commit(

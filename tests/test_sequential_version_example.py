@@ -245,6 +245,77 @@ def test_prepare_issue_preserves_recovered_processes_before_unchanged_turn() -> 
     assert events == ["normalize", "verify"]
 
 
+def test_pushed_recovery_without_pr_fails_provenance_before_unchanged_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["process_issue"].__globals__
+    issue = workflow["Issue"](218, "feature/issue-218")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    events: list[str] = []
+
+    class Repository:
+        expected_github_slug = "acme/project"
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def require_clean(self) -> None:
+            pass
+
+        def synchronize_branch(self, branch: str) -> BranchState:
+            assert branch == config.integration_branch
+            return BranchState(branch, "base", "base", True)
+
+        def recover_feature_branch(self, branch: str, **kwargs: object):
+            assert branch == issue.branch
+            assert kwargs["expected_base_sha"] == "base"
+            return SimpleNamespace(
+                branch=BranchState(branch, "pushed", "pushed", True),
+                reused_existing_work=True,
+            )
+
+        def require_agent_commit_declared_provenance(
+            self, start: str, end: str, **kwargs: object
+        ) -> None:
+            events.append("verify-published")
+            assert (start, end) == ("base", "pushed")
+            assert kwargs["allowed_processes"] == (
+                "implementation",
+                "reviewer-fix",
+                "cleanup",
+            )
+            raise WorkerFailure("published commit has invalid agent provenance")
+
+    class GitHub:
+        def find_pr(self, **kwargs: object) -> None:
+            assert kwargs["state"] in {"OPEN", "MERGED"}
+            return None
+
+        def create_draft_pr(self, **_kwargs: object) -> None:
+            events.append("draft")
+            raise AssertionError("Draft PR mutation must not be reached")
+
+    monkeypatch.setitem(
+        globals_,
+        "create_agent",
+        lambda *_args, **_kwargs: events.append("agent") or "agent",
+    )
+
+    with pytest.raises(WorkerFailure, match="invalid agent provenance"):
+        workflow["process_issue"](
+            issue,
+            config,
+            SimpleNamespace(workspace_id="ws-test"),
+            Repository(),
+            GitHub(),
+        )
+
+    assert events == ["verify-published"]
+
+
 def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
