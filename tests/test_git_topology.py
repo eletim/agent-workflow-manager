@@ -304,6 +304,50 @@ def test_local_branch_head_inspection_includes_linked_worktrees(
     assert heads[branch] == git(linked, "rev-parse", "HEAD")
 
 
+def test_recovery_history_protection_rejects_amend_and_force_push(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = git(work, "rev-parse", "HEAD")
+    branch = "feature/protected-recovery"
+    git(work, "switch", "-c", branch)
+    git(work, "commit", "--allow-empty", "-m", "published result")
+    published = git(work, "rev-parse", "HEAD")
+    git(work, "push", "origin", branch)
+
+    with repo.protect_branch_history():
+        amend = subprocess.run(
+            ["git", "commit", "--amend", "--allow-empty", "-m", "rewritten"],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        force_push = subprocess.run(
+            ["git", "push", "--force", "origin", f"{base}:refs/heads/{branch}"],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert amend.returncode != 0
+    assert force_push.returncode != 0
+    assert git(work, "rev-parse", "HEAD") == published
+    assert repo.inspect_remote_branch_heads()[branch] == published
+    for key in ("core.hooksPath", "remote.origin.pushurl"):
+        restored = subprocess.run(
+            ["git", "config", "--local", "--get-all", key],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert restored.returncode == 1
+        assert restored.stdout == ""
+
+
 def test_remote_notes_persist_recovery_state_without_moving_branches(
     repositories: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:

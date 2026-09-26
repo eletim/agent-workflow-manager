@@ -6,7 +6,8 @@ import re
 import signal
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -336,6 +337,63 @@ class GitRepository:
                 raise WorkerFailure("ambiguous local branch enumeration result")
             result[branch] = sha
         return result
+
+    @contextmanager
+    def protect_branch_history(self) -> Iterator[None]:
+        """Reject local ref transactions and pushes during recovery."""
+        self._validate_identity()
+        hooks_key = "core.hooksPath"
+        push_key = f"remote.{self.remote}.pushurl"
+        hooks_before = self._local_config_values(hooks_key)
+        push_before = self._local_config_values(push_key)
+        with tempfile.TemporaryDirectory(prefix="awm-recovery-git-guard-") as temporary:
+            hooks = Path(temporary)
+            reject = "#!/bin/sh\nexit 1\n"
+            reference_hook = hooks / "reference-transaction"
+            push_hook = hooks / "pre-push"
+            reference_hook.write_text(reject, encoding="utf-8")
+            push_hook.write_text(reject, encoding="utf-8")
+            reference_hook.chmod(0o700)
+            push_hook.chmod(0o700)
+            configured_hooks = False
+            configured_push = False
+            try:
+                configured_hooks = True
+                self._replace_local_config_values(hooks_key, (str(hooks),))
+                configured_push = True
+                self._replace_local_config_values(
+                    push_key,
+                    (f"file://{hooks / 'push-disabled'}",),
+                )
+                yield
+            finally:
+                failures: list[str] = []
+                if configured_push:
+                    try:
+                        self._replace_local_config_values(push_key, push_before)
+                    except WorkerFailure as exc:
+                        failures.append(str(exc))
+                if configured_hooks:
+                    try:
+                        self._replace_local_config_values(hooks_key, hooks_before)
+                    except WorkerFailure as exc:
+                        failures.append(str(exc))
+                if failures:
+                    raise WorkerFailure(
+                        "could not remove recovery Git history protection: "
+                        + "; ".join(failures)
+                    )
+
+    def _local_config_values(self, key: str) -> tuple[str, ...]:
+        completed = self._command(["config", "--local", "--get-all", key], {0, 1})
+        return tuple(completed.stdout.splitlines())
+
+    def _replace_local_config_values(
+        self, key: str, values: Sequence[str]
+    ) -> None:
+        self._command(["config", "--local", "--unset-all", key], {0, 5})
+        for value in values:
+            self._command(["config", "--local", "--add", key, value], {0})
 
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
         """Read a note from an AWM-owned remote ref without changing branch heads."""

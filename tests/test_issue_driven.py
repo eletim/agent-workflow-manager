@@ -6,6 +6,7 @@ import inspect
 import json
 import subprocess
 import sys
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -2959,6 +2960,7 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         },
         inspect_local_branch_heads=lambda: {"feature/work": "b" * 40},
         inspect_remote_branch_heads=lambda: {"feature/work": "b" * 40},
+        protect_branch_history=nullcontext,
     )
     github = SimpleNamespace(find_pr=lambda **kwargs: None)
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3023,6 +3025,7 @@ def test_repository_recovery_rejects_unrecoverable_report(
         require_committed_result=require_recovery_commit,
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        protect_branch_history=nullcontext,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -3085,6 +3088,7 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
         },
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        protect_branch_history=nullcontext,
     )
     github = SimpleNamespace(find_pr=lambda **kwargs: None)
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3175,6 +3179,7 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
         },
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        protect_branch_history=nullcontext,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(
@@ -3231,6 +3236,7 @@ def test_repository_recovery_rejects_changed_branch_history(
         inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
         inspect_local_branch_heads=inspect_local_branch_heads,
         inspect_remote_branch_heads=inspect_remote_branch_heads,
+        protect_branch_history=nullcontext,
         require_committed_result=lambda *args, **kwargs: pytest.fail(
             "changed history must fail before provenance validation"
         ),
@@ -3369,6 +3375,7 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
         ),
         inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40},
         inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        protect_branch_history=nullcontext,
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
     workflow["GitHubRepository"] = SimpleNamespace(

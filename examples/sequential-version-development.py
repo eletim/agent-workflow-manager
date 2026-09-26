@@ -5748,13 +5748,14 @@ def _run_repository(
             state = recovery_authoritative_state(config, repo, github, plan)
             recovery_execution: list[_AgentTurnExecution] = []
             try:
-                report = recover_error(
-                    client,
-                    config,
-                    exc,
-                    state,
-                    deferred_execution=recovery_execution,
-                )
+                with repo.protect_branch_history():
+                    report = recover_error(
+                        client,
+                        config,
+                        exc,
+                        state,
+                        deferred_execution=recovery_execution,
+                    )
             finally:
                 recovered_local_refs = repo.inspect_local_branch_heads()
                 recovered_remote_refs = repo.inspect_remote_branch_heads()
