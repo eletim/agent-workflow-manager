@@ -349,16 +349,20 @@ by the UI or a second runtime.
 Plain Python workflows can enforce repository and pull-request structure through
 `GitRepository` and `GitHubRepository`. These validated handles recheck repository
 identity on every public operation, keep read-named methods mutation-free, and only
-permit branch creation/tracking/switching and fast-forward Git changes. The narrow
-exception is provenance normalization: it may rewrite only the linear, unpublished
-commit range created by the current agent turn. Before rewriting, it enumerates all
+permit branch creation/tracking/switching and fast-forward Git changes during ordinary
+topology operations. Provenance normalization is one narrow exception: it may rewrite
+only the linear, unpublished commit range created by the current agent turn. Before
+rewriting, it enumerates all
 authoritative remote refs (including tags), fetches missing referenced history, and
 refuses any commit already remote-visible; it also restores the original local head
-if a remote-ref race is detected. The API never rebases, force-pushes, deletes
-branches, stashes changes, or resolves conflicts. An internal recovery safeguard may
-hard-reset only when both the captured pre-recovery worktree and the rejected result
-are clean, solely to restore its captured head after a recovery agent attempts a
-forbidden history rewrite. Recovery refuses to start over staged or unstaged changes.
+if a remote-ref race is detected. Ordinary operations never rebase, force-push, delete
+branches, stash changes, or resolve conflicts. A second tightly scoped exception is
+rejected-recovery rollback: it may hard-reset the active branch, restore deleted or
+changed non-active refs, and delete refs created without authorization, solely to
+reproduce the captured pre-recovery ref snapshot. Multi-ref rollback is atomic and
+refuses unsupported symbolic-ref restoration before mutation. The hard reset runs only
+when both the captured pre-recovery worktree and the rejected result are clean.
+Recovery refuses to start over staged or unstaged changes.
 Restricted recovery sessions also install a temporary Git ref-transaction boundary:
 only a fast-forward of the active branch is accepted, pushes and unrelated ref updates
 are rejected, and any detected non-active local ref mutation is CAS-restored before

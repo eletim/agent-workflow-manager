@@ -87,6 +87,7 @@ class RecordingGitRunner:
         timeout: float,
         check: bool,
         env: Mapping[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         self.calls.append(command)
@@ -102,6 +103,7 @@ class RecordingGitRunner:
             timeout=timeout,
             check=check,
             env=env,
+            input=input,
         )
 
 
@@ -122,6 +124,7 @@ class RefRaceGitRunner(RecordingGitRunner):
         timeout: float,
         check: bool,
         env: Mapping[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         completed = super().__call__(
             args,
@@ -131,6 +134,7 @@ class RefRaceGitRunner(RecordingGitRunner):
             timeout=timeout,
             check=check,
             env=env,
+            input=input,
         )
         if not self.triggered and list(args[1:]) == [
             "rev-parse",
@@ -166,6 +170,7 @@ class UpdateRefRaceGitRunner(RecordingGitRunner):
         timeout: float,
         check: bool,
         env: Mapping[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         ref = f"refs/heads/{self.branch}"
@@ -180,11 +185,52 @@ class UpdateRefRaceGitRunner(RecordingGitRunner):
             timeout=timeout,
             check=check,
             env=env,
+            input=input,
         )
         if is_branch_update and not self.triggered and completed.returncode == 0:
             self.triggered = True
             self.race()
         return completed
+
+
+class AtomicRefRaceGitRunner(RecordingGitRunner):
+    def __init__(self, ref: str, replacement_sha: str) -> None:
+        super().__init__()
+        self.ref = ref
+        self.replacement_sha = replacement_sha
+        self.triggered = False
+
+    def __call__(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+        env: Mapping[str, str] | None = None,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if list(args[1:]) == ["update-ref", "--no-deref", "--stdin"]:
+            assert input is not None
+            assert not self.triggered
+            self.triggered = True
+            subprocess.run(
+                ["git", "update-ref", self.ref, self.replacement_sha],
+                cwd=cwd,
+                check=True,
+            )
+        return super().__call__(
+            args,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+            env=env,
+            input=input,
+        )
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -944,7 +990,7 @@ def test_rejected_recovery_restore_refuses_dirty_staged_and_unstaged_state(
 def test_rejected_recovery_restores_non_active_refs_before_amended_branch(
     repositories: tuple[Path, Path, Path],
 ) -> None:
-    _remote, _seed, work = repositories
+    remote, _seed, work = repositories
     repo = open_repo(work, RecordingGitRunner())
     original_sha = repo.synchronize_branch("main").local_sha or ""
     original_refs = repo.inspect_local_refs()
@@ -954,11 +1000,16 @@ def test_rejected_recovery_restores_non_active_refs_before_amended_branch(
     git(work, "tag", "recovery-created", rejected_sha)
     recovered_refs = repo.inspect_local_refs()
 
-    repo.restore_rejected_recovery_refs(
+    git(work, "remote", "set-url", "origin", "https://github.com/acme/project.git")
+    process_group_repo = GitRepository.open(
+        work, expected_github_slug="acme/project"
+    )
+    process_group_repo.restore_rejected_recovery_refs(
         original_refs,
         recovered_refs,
         active_ref="refs/heads/main",
     )
+    git(work, "remote", "set-url", "origin", str(remote))
     repo.restore_rejected_recovery_branch(
         "main", original_sha=original_sha, rejected_sha=rejected_sha
     )
@@ -967,6 +1018,56 @@ def test_rejected_recovery_restores_non_active_refs_before_amended_branch(
     assert repo.inspect_remote_refs() == remote_before
     assert git(work, "rev-parse", "HEAD") == original_sha
     assert repo.inspect_worktree().dirty is False
+
+
+def test_rejected_recovery_multi_ref_restore_is_atomic_on_late_cas_failure(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    original_sha = git(work, "rev-parse", "HEAD")
+    git(work, "tag", "recovery-first", original_sha)
+    git(work, "tag", "recovery-second", original_sha)
+    original_repo = open_repo(work, RecordingGitRunner())
+    original_refs = original_repo.inspect_local_refs()
+    git(work, "commit", "--allow-empty", "-m", "recovery result")
+    recovered_sha = git(work, "rev-parse", "HEAD")
+    git(work, "tag", "-f", "recovery-first", recovered_sha)
+    git(work, "tag", "-f", "recovery-second", recovered_sha)
+    recovered_refs = original_repo.inspect_local_refs()
+    runner = AtomicRefRaceGitRunner("refs/tags/recovery-second", original_sha)
+    repo = open_repo(work, runner)
+
+    with pytest.raises(WorkerFailure):
+        repo.restore_rejected_recovery_refs(
+            original_refs,
+            recovered_refs,
+            active_ref="refs/heads/main",
+        )
+
+    assert runner.triggered is True
+    assert git(work, "rev-parse", "refs/tags/recovery-first") == recovered_sha
+    assert git(work, "rev-parse", "refs/tags/recovery-second") == original_sha
+
+
+def test_rejected_recovery_ref_restore_rejects_symbolic_shape_before_mutation(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    original_refs = repo.inspect_local_refs()
+    main_sha = git(work, "rev-parse", "HEAD")
+    git(work, "symbolic-ref", "refs/recovery-alias", "refs/heads/main")
+    recovered_refs = repo.inspect_local_refs()
+
+    with pytest.raises(WorkerFailure, match="symbolic recovery refs"):
+        repo.restore_rejected_recovery_refs(
+            original_refs,
+            recovered_refs,
+            active_ref="refs/heads/main",
+        )
+
+    assert git(work, "symbolic-ref", "refs/recovery-alias") == "refs/heads/main"
+    assert git(work, "rev-parse", "refs/recovery-alias") == main_sha
 
 
 def test_normalize_refuses_commit_fast_forwarded_from_remote_side_branch(

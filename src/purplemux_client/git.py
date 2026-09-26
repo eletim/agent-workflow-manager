@@ -55,6 +55,7 @@ class GitCommandRunner(Protocol):
         timeout: float,
         check: bool,
         env: Mapping[str, str] | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -943,52 +944,62 @@ class GitRepository:
             for ref in set(original) | set(recovered)
             if ref != active_ref and original.get(ref) != recovered.get(ref)
         )
-        expected = dict(recovered)
+        unsupported = [
+            ref
+            for ref in changed
+            if (
+                original.get(ref) is not None
+                and original[ref].symbolic_target is not None
+            )
+            or (
+                recovered.get(ref) is not None
+                and recovered[ref].symbolic_target is not None
+            )
+        ]
+        if unsupported:
+            raise WorkerFailure(
+                "cannot atomically restore changed symbolic recovery refs: "
+                + ", ".join(unsupported)
+            )
+        if not changed:
+            return
+
+        commands = ["start"]
         for ref in changed:
-            before = expected.get(ref)
+            before = recovered.get(ref)
             desired_state = original.get(ref)
-
-            def require_expected_refs() -> None:
-                if self.inspect_local_refs() != expected:
-                    raise WorkerFailure(
-                        "local refs changed during recovery ref restoration"
-                    )
-
             if desired_state is None:
                 assert before is not None
-                args = ["update-ref", "--no-deref", "-d", ref, before.object_sha]
-            elif desired_state.symbolic_target is None:
-                args = [
-                    "update-ref",
-                    "--no-deref",
-                    ref,
-                    desired_state.object_sha,
-                    "0" * 40 if before is None else before.object_sha,
-                ]
+                commands.append(f"delete {ref} {before.object_sha}")
             else:
-                # Older supported Git versions cannot update symbolic refs in an
-                # update-ref transaction. The complete snapshot recheck above is
-                # the CAS guard for this uncommon restoration path.
-                args = ["symbolic-ref", ref, desired_state.symbolic_target]
-
-            next_expected = dict(expected)
-            if desired_state is None:
-                next_expected.pop(ref, None)
+                commands.append(
+                    f"update {ref} {desired_state.object_sha} "
+                    f"{'0' * 40 if before is None else before.object_sha}"
+                )
+        commands.extend(("prepare", "commit"))
+        desired_refs = dict(recovered)
+        for ref in changed:
+            if ref in original:
+                desired_refs[ref] = original[ref]
             else:
-                next_expected[ref] = desired_state
-            self._git_mutation(
-                args,
-                operation="restore ref changed by rejected recovery",
-                target=ref,
-                pre_state=before,
-                observe=lambda: self.inspect_local_refs().get(ref),
-                desired=lambda: self.inspect_local_refs().get(ref) == desired_state,
-                pre_dispatch=require_expected_refs,
-            )
-            expected = next_expected
+                desired_refs.pop(ref, None)
 
-        if self.inspect_local_refs() != expected:
-            raise WorkerFailure("recovery ref restoration postcondition failed")
+        def require_recovered_refs() -> None:
+            if self.inspect_local_refs() != dict(recovered):
+                raise WorkerFailure(
+                    "local refs changed before atomic recovery ref restoration"
+                )
+
+        self._git_mutation(
+            ["update-ref", "--no-deref", "--stdin"],
+            operation="atomically restore refs changed by rejected recovery",
+            target=f"{len(changed)} local ref(s)",
+            pre_state=dict(recovered),
+            observe=self.inspect_local_refs,
+            desired=lambda: self.inspect_local_refs() == desired_refs,
+            pre_dispatch=require_recovered_refs,
+            input_text="\n".join(commands) + "\n",
+        )
 
     def _normalize_agent_message(
         self,
@@ -2044,14 +2055,20 @@ class GitRepository:
         observe: Callable[[], object],
         desired: Callable[[], bool],
         pre_dispatch: Callable[[], None] | None = None,
+        input_text: str | None = None,
     ) -> None:
         def dispatch() -> None:
             if pre_dispatch is not None:
                 pre_dispatch()
             try:
                 if self._owns_process_group:
-                    completed = self._run_mutation_process_group(args)
+                    completed = self._run_mutation_process_group(
+                        args, input_text=input_text
+                    )
                 else:
+                    runner_kwargs: dict[str, Any] = {}
+                    if input_text is not None:
+                        runner_kwargs["input"] = input_text
                     completed = self._runner(
                         ["git", *args],
                         cwd=self.root,
@@ -2059,6 +2076,7 @@ class GitRepository:
                         text=True,
                         timeout=self.command_timeout_seconds,
                         check=False,
+                        **runner_kwargs,
                     )
             except _QuiescentMutationTimeout as exc:
                 raise AuthoritativeMutationRejection(
@@ -2128,10 +2146,13 @@ class GitRepository:
         )
 
     def _run_mutation_process_group(
-        self, args: Sequence[str]
+        self, args: Sequence[str], *, input_text: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         return _run_git_mutation_process_group(
-            args, cwd=self.root, timeout=self.command_timeout_seconds
+            args,
+            cwd=self.root,
+            timeout=self.command_timeout_seconds,
+            input_text=input_text,
         )
 
     @staticmethod
@@ -2253,7 +2274,11 @@ def _raise_mutation_signal(signum: int, _frame: object) -> None:
 
 
 def _run_git_mutation_process_group(
-    args: Sequence[str], *, cwd: Path, timeout: float
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a mutating Git command and quiesce its whole process group on failure."""
     command = ["git", *args]
@@ -2263,6 +2288,7 @@ def _run_git_mutation_process_group(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2270,7 +2296,7 @@ def _run_git_mutation_process_group(
         )
         try:
             GitRepository._restore_signal_mask(previous_mask)
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             GitRepository._quiesce_process_group(process, exc)
             raise _QuiescentMutationTimeout(command, timeout) from exc

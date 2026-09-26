@@ -386,6 +386,97 @@ def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_ta
     ).stdout == ""
 
 
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_restricted_git_boundary_allows_fast_forward_merge(
+    provider: str, tmp_path: Path
+) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "switch", "-c", "authoritative"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "authoritative advance",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    authoritative = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "switch", "main"],
+        check=True,
+        capture_output=True,
+    )
+    fake_provider = tmp_path / provider
+    fake_provider.write_text(
+        "#!/bin/sh\n"
+        "git merge --ff-only authoritative >/dev/null 2>&1\n"
+        "printf '%s\\n' \"$?\"\n",
+        encoding="utf-8",
+    )
+    fake_provider.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._restricted_agent_command(provider, "adopt remote head"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "0"
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == authoritative
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "ORIG_HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+
+
 def test_session_deadline_only_limits_tab_create_command() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
     cli = client(runner, command_timeout_seconds=30)

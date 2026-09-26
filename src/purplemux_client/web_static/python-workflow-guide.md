@@ -666,8 +666,9 @@ allows only a fast-forward of the active branch, plus a pre-push hook that rejec
 pushes. Codex also loses Git/GitHub credentials and network access; Claude retains
 only explicitly allowlisted local Git and non-ref GitHub operations. After the turn,
 the remote ref set and every unrelated local ref must remain exact. Any detected
-non-active local ref mutation is CAS-restored, including when the recovery agent
-failed after making it. The active local branch must still
+non-active local ref mutation is CAS-restored in one transaction, including when the
+recovery agent failed after making it; unsupported symbolic-ref rollback is rejected
+before any restoration mutation. The active local branch must still
 descend from its pre-turn head; an exact advance to the snapshotted authoritative
 remote head keeps its existing provenance, while any other new commits require
 recovery provenance. Only when the pre-recovery local head is an ancestor of the

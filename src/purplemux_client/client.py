@@ -1377,6 +1377,11 @@ phase=$1
 [ "$phase" = prepared ] || exit 0
 zero=0000000000000000000000000000000000000000
 while read old new ref; do
+    if [ "$ref" = ORIG_HEAD ]; then
+        protected=$(git rev-parse "$AWM_RECOVERY_PROTECTED_REF") || exit 1
+        [ "$new" = "$protected" ] || exit 1
+        continue
+    fi
     [ "$ref" = HEAD ] || [ "$ref" = "$AWM_RECOVERY_PROTECTED_REF" ] || exit 1
     [ "$old" != "$zero" ] || exit 1
     [ "$new" != "$zero" ] || exit 1
