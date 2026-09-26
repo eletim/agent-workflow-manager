@@ -611,13 +611,20 @@ def correlated_agent_tab_name(name: str) -> str:
 
 def reconcile_completed_retry_tabs(
     client: PurpleMuxCLIClient,
-    logical_tabs: tuple[tuple[str, str], ...],
+    logical_tabs: tuple[
+        tuple[
+            str,
+            str,
+            Literal["local-git-only", "publication-disabled"] | None,
+        ],
+        ...,
+    ],
     *,
     context: str,
 ) -> None:
     """Close only exact, completed Agent tabs that would collide on retry."""
-    expected: list[tuple[str, str, str]] = []
-    for logical_name, agent_type in logical_tabs:
+    expected: list[tuple[str, str, str | None]] = []
+    for logical_name, agent_type, restriction in logical_tabs:
         normalized = agent_type.lower()
         if normalized in {"codex", "codex-cli"}:
             panel_type, provider = "codex-cli", "codex"
@@ -625,6 +632,8 @@ def reconcile_completed_retry_tabs(
             panel_type, provider = "claude-code", "claude"
         else:
             raise WorkerFailure(f"unsupported retry Agent type {agent_type!r}")
+        if restriction is not None:
+            panel_type, provider = "terminal", None
         expected.append(
             (correlated_agent_tab_name(logical_name), panel_type, provider)
         )
@@ -655,13 +664,20 @@ def reconcile_completed_retry_tabs(
             raise WorkerFailure(
                 f"retry tab correlation {name!r} status identity is uncertain"
             )
-        if status.get("cliState") not in {"idle", "ready-for-review"}:
+        try:
+            if panel_type == "terminal":
+                # Restricted agents are terminal-backed. Their managed shell result
+                # is the authoritative completion record, including failed turns.
+                client.read_shell_result(tab.id)
+            else:
+                if status.get("cliState") not in {"idle", "ready-for-review"}:
+                    raise WorkerFailure("Agent tab is not ready")
+                # A ready-looking CLI state alone does not prove completion.
+                client.read_result(tab.id)
+        except WorkerFailure as exc:
             raise WorkerFailure(
                 f"retry tab correlation {name!r} is not completed; refusing cleanup"
-            )
-        # A ready-looking CLI state alone does not prove that this Agent tab
-        # completed a turn. Require PurpleMux's structured result as well.
-        client.read_result(tab.id)
+            ) from exc
         completed.append(tab)
 
     for tab in completed:
@@ -678,9 +694,13 @@ def reconcile_work_item_retry_tabs(client: PurpleMuxCLIClient, issue: Issue) -> 
     reconcile_completed_retry_tabs(
         client,
         (
-            (f"{issue.label} implementer", IMPLEMENTER_AGENT),
-            (f"{issue.label} scope reviewer", REVIEWER_AGENT),
-            (f"{issue.label} correctness reviewer", REVIEWER_AGENT),
+            (
+                f"{issue.label} implementer",
+                IMPLEMENTER_AGENT,
+                "publication-disabled",
+            ),
+            (f"{issue.label} scope reviewer", REVIEWER_AGENT, None),
+            (f"{issue.label} correctness reviewer", REVIEWER_AGENT, None),
         ),
         context=issue.label,
     )
@@ -689,8 +709,77 @@ def reconcile_work_item_retry_tabs(client: PurpleMuxCLIClient, issue: Issue) -> 
 def reconcile_planner_retry_tab(client: PurpleMuxCLIClient) -> None:
     reconcile_completed_retry_tabs(
         client,
-        (("Work-item planner", REVIEWER_AGENT),),
+        (("Work-item planner", REVIEWER_AGENT, None),),
         context="work-item planner",
+    )
+
+
+def reconcile_whole_version_retry_tabs(
+    client: PurpleMuxCLIClient,
+    *,
+    design_principles: bool,
+) -> None:
+    logical_tabs: list[
+        tuple[
+            str,
+            str,
+            Literal["local-git-only", "publication-disabled"] | None,
+        ]
+    ] = [
+        ("Whole-version fixer", IMPLEMENTER_AGENT, "publication-disabled"),
+        ("Whole-version reviewer", REVIEWER_AGENT, None),
+        ("Version / README reviewer", REVIEWER_AGENT, None),
+    ]
+    if SCENARIOS:
+        logical_tabs.append(("Scenario Gate reviewer", REVIEWER_AGENT, None))
+    if design_principles:
+        logical_tabs.append(("Design Principles reviewer", REVIEWER_AGENT, None))
+    reconcile_completed_retry_tabs(
+        client, tuple(logical_tabs), context="whole-version review"
+    )
+
+
+def reconcile_completed_shell_retry_tab(
+    client: PurpleMuxCLIClient, logical_name: str
+) -> None:
+    """Close one exact completed managed shell that will be recreated."""
+    name = PurpleMuxCLIClient.correlated_session_name(
+        logical_name, run_correlation(logical_name)
+    )
+    matches = [tab for tab in client.list_sessions() if tab.name == name]
+    if not matches:
+        return
+    if len(matches) != 1:
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} is ambiguous; refusing cleanup"
+        )
+    tab = matches[0]
+    if tab.panel_type != "terminal" or tab.provider is not None:
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} has an unrelated identity; "
+            "refusing cleanup"
+        )
+    status = client.read_status(tab.id)
+    if (
+        status.get("tabId") != tab.id
+        or status.get("workspaceId") != client.workspace_id
+        or status.get("panelType") != "terminal"
+        or status.get("agentProviderId") is not None
+    ):
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} status identity is uncertain"
+        )
+    try:
+        client.read_shell_result(tab.id)
+    except WorkerFailure as exc:
+        raise WorkerFailure(
+            f"retry tab correlation {name!r} is not completed; refusing cleanup"
+        ) from exc
+    client.close_session(tab.id, expected_state=tab)
+    emit_finding(
+        "runtime",
+        f"reconciled 1 completed {logical_name} retry tab(s)",
+        status="warning",
     )
 
 
@@ -4446,6 +4535,7 @@ def process_work_items(
 
 
 def run_final_checks(client: PurpleMuxCLIClient, config: Config) -> None:
+    reconcile_completed_shell_retry_tab(client, "Final checks")
     shell = client.start_shell(
         ShellCommandRequest(config.check_command, str(config.repo), "Final checks")
     )
@@ -4583,6 +4673,7 @@ def _review_whole_version(
     github: GitHubRepository,
     pr: PullRequestState,
     work_items: tuple[Issue, ...],
+    reconcile_tabs: bool = False,
 ) -> tuple[PullRequestState, ReviewDelivery]:
     """Review, fix, and check the whole version as one outline-level phase."""
     pr = reconcile_review_audits_after_head_change(
@@ -4670,6 +4761,10 @@ def _review_whole_version(
         ) if complete_current_head else None
     if completed_warning is not None:
         prior_limit = None
+    if reconcile_tabs:
+        reconcile_whole_version_retry_tabs(
+            client, design_principles=has_design_principles(repo, pr.head_sha)
+        )
     fixer = create_agent(
         client,
         config,
@@ -5340,11 +5435,15 @@ def review_whole_version(
     github: GitHubRepository,
     pr: PullRequestState,
     work_items: tuple[Issue, ...],
+    retrying: bool = False,
 ) -> tuple[PullRequestState, ReviewDelivery]:
     """Repeat a whole review when its audit vanished after safe reinspection."""
     for attempt in range(MAX_REPOSITORY_RECOVERIES + 1):
         try:
-            return _review_whole_version(config, client, repo, github, pr, work_items)
+            return _review_whole_version(
+                config, client, repo, github, pr, work_items,
+                retrying or attempt > 0,
+            )
         except MissingReviewAudit:
             if attempt == MAX_REPOSITORY_RECOVERIES:
                 raise
@@ -5378,6 +5477,7 @@ def integration_delivery(
     repo: GitRepository,
     github: GitHubRepository,
     deferred_deliveries: list[RepositoryDelivery] | None = None,
+    retrying: bool = False,
 ) -> PullRequestState | None:
     terminal_progress(
         "PREPARE",
@@ -5525,7 +5625,7 @@ def integration_delivery(
         pr, delivery = run_outline_step(
             "Whole-version review",
             lambda: review_whole_version(
-                config, client, repo, github, pr, work_items
+                config, client, repo, github, pr, work_items, retrying
             ),
         )
         pr = ensure_base_pr_policy_notes(github, pr, config)
@@ -5535,6 +5635,16 @@ def integration_delivery(
             run_final_checks(client, config)
             state = repo.inspect_worktree()
             if state.dirty and cleanup is None:
+                if retrying:
+                    reconcile_completed_retry_tabs(
+                        client,
+                        ((
+                            "Whole-version cleanup",
+                            IMPLEMENTER_AGENT,
+                            "publication-disabled",
+                        ),),
+                        context="whole-version cleanup",
+                    )
                 cleanup = create_agent(
                     client,
                     config,
@@ -5908,7 +6018,8 @@ def _run_repository(
                 ),
             )
             ready = integration_delivery(
-                config, work_items, client, repo, github, deferred_deliveries
+                config, work_items, client, repo, github, deferred_deliveries,
+                recovery_attempt > 0,
             )
         except Exception as exc:
             if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):

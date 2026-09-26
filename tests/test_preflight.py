@@ -4,6 +4,7 @@ import ast
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Mapping
@@ -232,6 +233,31 @@ def test_nested_existing_module_is_accepted(tmp_path: Path) -> None:
     result = WorkflowValidator(cwd=tmp_path).validate("import json.decoder")
 
     assert result.valid
+
+
+def test_dotted_import_validation_does_not_execute_package_initializer(
+    tmp_path: Path,
+) -> None:
+    package = Path(tempfile.gettempdir()) / f"preflight_sentinel_{os.getpid()}"
+    sentinel = tmp_path / "initializer-ran"
+    package.mkdir(exist_ok=False)
+    try:
+        (package / "__init__.py").write_text(
+            f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n",
+            encoding="utf-8",
+        )
+        (package / "child.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        result = WorkflowValidator(cwd=tmp_path).validate(
+            f"import {package.name}.child"
+        )
+
+        assert result.valid
+        assert not sentinel.exists()
+    finally:
+        (package / "child.py").unlink(missing_ok=True)
+        (package / "__init__.py").unlink(missing_ok=True)
+        package.rmdir()
 
 
 def test_python_3_14_collections_abc_runtime_alias_is_accepted(

@@ -429,13 +429,13 @@ def test_same_run_retry_reconciles_all_completed_work_item_tabs(
         def __init__(self) -> None:
             self.tabs = {
                 f"old-{index}": TabState(
-                    f"old-{index}",
-                    self.workspace_id,
-                    name,
-                    "codex-cli",
-                    "codex",
-                    True,
-                    "ready-for-review",
+                f"old-{index}",
+                self.workspace_id,
+                name,
+                "terminal" if index == 1 else "codex-cli",
+                None if index == 1 else "codex",
+                True,
+                None if index == 1 else "ready-for-review",
                 )
                 for index, name in enumerate(names, 1)
             }
@@ -459,6 +459,10 @@ def test_same_run_retry_reconciles_all_completed_work_item_tabs(
             assert tab_id in self.tabs
             return "completed"
 
+        def read_shell_result(self, tab_id: str) -> object:
+            assert self.tabs[tab_id].panel_type == "terminal"
+            return SimpleNamespace(exit_code=0, stdout="completed")
+
         def close_session(
             self, tab_id: str, *, expected_state: TabState | None = None
         ) -> None:
@@ -476,10 +480,10 @@ def test_same_run_retry_reconciles_all_completed_work_item_tabs(
                 tab_id,
                 self.workspace_id,
                 name,
-                "codex-cli",
-                "codex",
+                "terminal" if request.restriction is not None else "codex-cli",
+                None if request.restriction is not None else "codex",
                 True,
-                "idle",
+                None if request.restriction is not None else "idle",
             )
             self.created.append(request)
             return tab_id
@@ -497,6 +501,92 @@ def test_same_run_retry_reconciles_all_completed_work_item_tabs(
     assert tuple(request.correlation_id for request in client.created) == tuple(
         workflow["run_correlation"](name) for name in logical_names
     )
+
+
+def test_whole_version_retry_reconciles_all_completed_agent_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "whole-retry-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    logical_names = (
+        "Whole-version fixer",
+        "Whole-version reviewer",
+        "Version / README reviewer",
+        "Design Principles reviewer",
+    )
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs = {
+                f"old-{index}": TabState(
+                    f"old-{index}",
+                    self.workspace_id,
+                    workflow["correlated_agent_tab_name"](name),
+                    "terminal" if index == 1 else "codex-cli",
+                    None if index == 1 else "codex",
+                    True,
+                    None if index == 1 else "ready-for-review",
+                )
+                for index, name in enumerate(logical_names, 1)
+            }
+            self.closed: list[str] = []
+            self.created: list[object] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            return SimpleNamespace(exit_code=0, stdout="completed")
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+        def create_session(self, request: object) -> str:
+            name = f"{request.name} [awm:{request.correlation_id}]"  # type: ignore[attr-defined]
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"new-{len(self.created) + 1}"
+            self.created.append(request)
+            return tab_id
+
+    client = Client()
+    workflow["reconcile_whole_version_retry_tabs"](
+        client, design_principles=True
+    )
+    recreated = tuple(
+        workflow["create_agent"](
+            client,
+            config,
+            agent_type="codex",
+            name=name,
+            restriction="publication-disabled" if index == 0 else None,
+        )
+        for index, name in enumerate(logical_names)
+    )
+
+    assert client.closed == ["old-1", "old-2", "old-3", "old-4"]
+    assert recreated == ("new-1", "new-2", "new-3", "new-4")
 
 
 def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
@@ -550,16 +640,19 @@ def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
                 tab_id,
                 self.workspace_id,
                 name,
-                "codex-cli",
-                "codex",
+                "terminal" if request.restriction is not None else "codex-cli",
+                None if request.restriction is not None else "codex",
                 True,
-                "busy",
+                None if request.restriction is not None else "busy",
             )
             mutations.append(("create", tab_id, name, correlation_id))
             return tab_id
 
         def complete(self, tab_id: str) -> None:
-            self.tabs[tab_id] = replace(self.tabs[tab_id], cli_state="ready-for-review")
+            if self.tabs[tab_id].panel_type != "terminal":
+                self.tabs[tab_id] = replace(
+                    self.tabs[tab_id], cli_state="ready-for-review"
+                )
 
         def list_sessions(self) -> tuple[TabState, ...]:
             return tuple(self.tabs.values())
@@ -577,6 +670,10 @@ def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
         def read_result(self, tab_id: str) -> str:
             assert self.tabs[tab_id].cli_state == "ready-for-review"
             return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            assert self.tabs[tab_id].panel_type == "terminal"
+            return SimpleNamespace(exit_code=0, stdout="completed")
 
         def close_session(
             self, tab_id: str, *, expected_state: TabState | None = None
@@ -631,7 +728,9 @@ def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
             assert number == draft.number
             assert len(client.tabs) == 4
             assert all(
-                tab.cli_state == "ready-for-review" for tab in client.tabs.values()
+                tab.panel_type == "terminal"
+                or tab.cli_state == "ready-for-review"
+                for tab in client.tabs.values()
             )
             self.ready_attempts += 1
             if self.ready_attempts == 1:
@@ -775,10 +874,10 @@ def test_retry_tab_reconciliation_never_closes_uncertain_tabs(
         "tab-1",
         "workspace",
         implementer_name,
-        "terminal" if unsafe == "unrelated" else "codex-cli",
-        None if unsafe == "unrelated" else "codex",
+        "codex-cli" if unsafe == "unrelated" else "terminal",
+        "codex" if unsafe == "unrelated" else None,
         True,
-        "busy" if unsafe == "busy" else "ready-for-review",
+        None,
     )
     later = TabState(
         "tab-scope",
@@ -813,6 +912,11 @@ def test_retry_tab_reconciliation_never_closes_uncertain_tabs(
 
         def read_result(self, tab_id: str) -> str:
             return "completed"
+
+        def read_shell_result(self, tab_id: str) -> object:
+            if unsafe == "busy" and tab_id == tab.id:
+                raise WorkerFailure("result is not ready")
+            return SimpleNamespace(exit_code=0, stdout="completed")
 
         def close_session(self, tab_id: str, **_kwargs: object) -> None:
             self.closed.append(tab_id)
@@ -5759,7 +5863,7 @@ def test_missing_whole_review_audit_restarts_at_verified_head(
             assert kwargs["expected_head_sha"] == current.head_sha
             return current
 
-    def review(_config, _client, _repo, _github, pr, _work_items):
+    def review(_config, _client, _repo, _github, pr, _work_items, *_args):
         reviewed.append(pr.head_sha)
         if len(reviewed) == 1:
             raise workflow["MissingReviewAudit"]("record missing")
@@ -5848,6 +5952,111 @@ def test_skipped_final_review_is_ready_without_being_recorded_as_approved(
     assert result.is_draft is False
     assert outcomes == ["skipped"]
     assert events == ["final checks", f"ready:{draft.head_sha}"]
+
+
+def test_integration_delivery_retry_reconciles_completed_final_check_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "final-check-retry")
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["integration_delivery"].__globals__
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    draft = open_pr(head=config.integration_branch, base=config.main_branch, draft=True)
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs: dict[str, TabState] = {}
+            self.results: dict[str, object] = {}
+            self.started = 0
+            self.closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+            }
+
+        def start_shell(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{workflow['run_correlation'](logical_name)}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            self.started += 1
+            tab_id = f"check-{self.started}"
+            self.tabs[tab_id] = TabState(
+                tab_id, self.workspace_id, name, "terminal", None, True, None
+            )
+            exit_code = 1 if self.started == 1 else 0
+            self.results[tab_id] = SimpleNamespace(
+                exit_code=exit_code,
+                failure_message=lambda _step: "checks failed",
+            )
+            return tab_id
+
+        def wait_for_shell_completion(self, tab_id: str, _timeout: float) -> None:
+            assert tab_id in self.results
+
+        def read_shell_result(self, tab_id: str) -> object:
+            return self.results[tab_id]
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+    class Repository:
+        def synchronize_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.head_sha, draft.head_sha, True)
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            return BranchState(branch, draft.base_sha, draft.base_sha, False)
+
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False)
+
+        def require_committed_result(self, *args: object, **kwargs: object) -> BranchState:
+            return BranchState(
+                config.integration_branch, draft.head_sha, draft.head_sha, True
+            )
+
+    class GitHub:
+        def find_pr(
+            self, *, head: str, base: str, state: str
+        ) -> PullRequestState | None:
+            return draft if state == "OPEN" else None
+
+        def require_pr(self, **kwargs: object) -> PullRequestState:
+            return draft
+
+        def set_draft(self, number: int, **kwargs: object) -> PullRequestState:
+            return replace(draft, is_draft=False)
+
+    client = Client()
+    monkeypatch.setitem(globals_, "FINAL_REVIEW", False)
+    monkeypatch.setitem(globals_, "emit_finding", lambda *args, **kwargs: None)
+
+    with pytest.raises(WorkerFailure, match="checks failed"):
+        workflow["integration_delivery"](
+            config, config.issues, client, Repository(), GitHub()
+        )
+    delivered = workflow["integration_delivery"](
+        config, config.issues, client, Repository(), GitHub()
+    )
+
+    assert delivered is not None and delivered.is_draft is False
+    assert client.closed == ["check-1"]
+    assert client.started == 2
 
 
 def test_final_check_dirty_state_invalidates_approval_and_repeats_review(
