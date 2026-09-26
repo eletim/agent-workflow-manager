@@ -589,7 +589,7 @@ def create_agent(
     *,
     agent_type: str,
     name: str,
-    restriction: Literal["local-git-only"] | None = None,
+    restriction: Literal["local-git-only", "publication-disabled"] | None = None,
 ) -> str:
     correlation_id = run_correlation(name)
     return client.create_session(
@@ -1208,6 +1208,10 @@ def implementer_prompt(prompt: str, *, process: str = "implementation") -> str:
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers; "
         "the workflow owns and reconciles those markers from its persisted "
         "work-item plan.\n\n"
+        "Your delivery responsibility ends with clean local commits. Do not push, "
+        "create or update a PR, or change PR state; AWM will normalize and verify "
+        "commit provenance before it publishes the exact commit and manages the "
+        "Draft PR.\n\n"
         "Every commit you create must end with these exact Git trailers, preserving "
         "any additional trailers the agent adds:\n"
         f"Co-authored-by: {coauthor}\n"
@@ -2599,16 +2603,15 @@ existing branch {issue.branch}, based on {config.integration_branch}. Read the
 work-item requirement below. Inspect existing Git and GitHub state before editing
 because this may be a new recovery run. Implement only the requested work item and run appropriate
 project tests and checks. Commit every intended source, test, and configuration
-change, leaving none uncommitted or untracked. Push the exact feature branch
-{issue.branch} after committing. Create or update exactly one Draft PR from
-{issue.branch} to {config.integration_branch}. Finish with a clean worktree.
+change, leaving none uncommitted or untracked. Leave publication to AWM, which
+will push the exact normalized commit on {issue.branch} and create or update
+exactly one Draft PR to {config.integration_branch}. Finish with a clean worktree.
 
 {issue.requirement}
 
 Never reset, rebase, stash, force-push, merge the work-item PR, target
 {config.main_branch}, create unrelated PRs, or discard ambiguous local work.
-Return a concise summary including the commit SHA and PR number or URL when
-available.""")
+Return a concise summary including the local commit SHA.""")
     scope_review = review_context + f"""Perform only the Scope / Design Review for
 {issue.label} and its PR from {issue.branch} to {config.integration_branch}.
 {issue.requirement} Inspect the PR diff. Decide whether the changed targets,
@@ -2663,6 +2666,7 @@ def prepare_issue(
     repo.require_clean()
     integration = repo.synchronize_branch(config.integration_branch)
     assert integration.remote_sha is not None
+    allowed_processes = ("implementation", "reviewer-fix", "cleanup")
     if open_pr is None:
         recovery = repo.recover_feature_branch(
             issue.branch,
@@ -2671,6 +2675,30 @@ def prepare_issue(
         )
         feature = recovery.branch
         reused_existing_work = recovery.reused_existing_work
+        published_ancestor = feature.remote_sha or integration.remote_sha
+        if feature.remote_sha is not None:
+            repo.require_agent_commit_declared_provenance(
+                integration.remote_sha,
+                feature.remote_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
+        if reused_existing_work and feature.local_sha != published_ancestor:
+            assert feature.local_sha is not None
+            feature = repo.normalize_agent_declared_commit_provenance(
+                issue.branch,
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
+            assert feature.local_sha is not None
+            repo.require_agent_commit_declared_provenance(
+                published_ancestor,
+                feature.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                allowed_processes=allowed_processes,
+            )
     else:
         feature = repo.synchronize_branch(
             issue.branch, expected_remote_sha=open_pr.head_sha
@@ -2686,6 +2714,13 @@ def prepare_issue(
                 f"existing {issue.branch} does not contain authoritative base "
                 f"{integration.remote_sha}; reconcile it before starting a new run"
             )
+        assert feature.remote_sha is not None
+        repo.require_agent_commit_declared_provenance(
+            integration.remote_sha,
+            feature.remote_sha,
+            expected_agent=IMPLEMENTER_AGENT,
+            allowed_processes=allowed_processes,
+        )
     assert feature.local_sha is not None
     emit_finding(
         "git",
@@ -2728,12 +2763,11 @@ def ensure_issue_pr(
     issue: Issue,
     config: Config,
     *,
+    expected_local_sha: str,
     expected_base_sha: str,
     reconcile_plan_owned_inline_identity: bool = False,
 ) -> PullRequestState:
-    local = repo.require_current_branch(issue.branch)
-    assert local.local_sha is not None
-    feature = repo.ensure_pushed(issue.branch, expected_local_sha=local.local_sha)
+    feature = repo.ensure_pushed(issue.branch, expected_local_sha=expected_local_sha)
     assert feature.remote_sha is not None
     reconciled_pr_number: int | None = None
     if reconcile_plan_owned_inline_identity and issue.task_fingerprint is not None:
@@ -3254,6 +3288,7 @@ def process_issue(
             config,
             agent_type=IMPLEMENTER_AGENT,
             name=f"{issue.label} worktree cleanup",
+            restriction="publication-disabled",
         )
         require_clean_worktree(
             repo,
@@ -3422,6 +3457,7 @@ def process_issue(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name=f"{issue.label} implementer",
+        restriction="publication-disabled",
     )
     scope_reviewer = create_agent(
         client,
@@ -3491,6 +3527,7 @@ def process_issue(
         github,
         issue,
         config,
+        expected_local_sha=implementation_sha,
         expected_base_sha=integration.remote_sha,
         reconcile_plan_owned_inline_identity=existing_pr is None,
     )
@@ -4514,6 +4551,11 @@ def design_principles_review_prompt(
     )
 
 
+def has_design_principles(repo: GitRepository, head_sha: str) -> bool:
+    """Check optional design guidance at the exact integration head."""
+    return repo.has_path_at_commit(head_sha, "docs/design-principles.md")
+
+
 def version_readme_review_prompt(
     pr: PullRequestState, config: Config, work_items: tuple[Issue, ...]
 ) -> str:
@@ -4598,29 +4640,34 @@ def _review_whole_version(
         and latest_changed_head.fix_sha == pr.head_sha
         else None
     )
-    required_roles = {"design_principles", "whole_version", "version_readme"}
-    if SCENARIOS:
-        required_roles.add("scenario_gate")
-    latest_by_role = {
-        role: next(
-            (record for record in reversed(audits) if record.role == role), None
+    completed_warning: ReviewAuditRecord | None = None
+    if prior_limit is None:
+        design_principles_present = has_design_principles(repo, pr.head_sha)
+        required_roles = {"whole_version", "version_readme"}
+        if design_principles_present:
+            required_roles.add("design_principles")
+        if SCENARIOS:
+            required_roles.add("scenario_gate")
+        latest_by_role = {
+            role: next(
+                (record for record in reversed(audits) if record.role == role), None
+            )
+            for role in required_roles
+        }
+        complete_current_head = all(
+            record is not None
+            and record.reviewed_sha == pr.head_sha
+            and record.fix_disposition != "pending"
+            for record in latest_by_role.values()
         )
-        for role in required_roles
-    }
-    complete_current_head = all(
-        record is not None
-        and record.reviewed_sha == pr.head_sha
-        and record.fix_disposition != "pending"
-        for record in latest_by_role.values()
-    )
-    completed_warning = next(
-        (record for record in latest_by_role.values()
-         if record is not None
-         and record.fix_disposition in (
-             "review_limit_reached", "no_change_after_re_evaluation"
-         )),
-        None,
-    ) if complete_current_head else None
+        completed_warning = next(
+            (record for record in latest_by_role.values()
+             if record is not None
+             and record.fix_disposition in (
+                 "review_limit_reached", "no_change_after_re_evaluation"
+             )),
+            None,
+        ) if complete_current_head else None
     if completed_warning is not None:
         prior_limit = None
     fixer = create_agent(
@@ -4628,6 +4675,7 @@ def _review_whole_version(
         config,
         agent_type=IMPLEMENTER_AGENT,
         name="Whole-version fixer",
+        restriction="publication-disabled",
     )
     reviewer = create_agent(
         client,
@@ -4635,12 +4683,7 @@ def _review_whole_version(
         agent_type=REVIEWER_AGENT,
         name="Whole-version reviewer",
     )
-    design_principles_reviewer = create_agent(
-        client,
-        config,
-        agent_type=REVIEWER_AGENT,
-        name="Design Principles reviewer",
-    )
+    design_principles_reviewer: str | None = None
     version_readme_reviewer = create_agent(
         client,
         config,
@@ -4662,12 +4705,14 @@ def _review_whole_version(
         () if prior_limit is not None or completed_warning is not None
         else range(1, MAX_REVIEWS + 1)
     ):
+        design_principles_present = has_design_principles(repo, pr.head_sha)
         result: str
         resumed_records = tuple(
             record
             for record in review_audit_from_body(pr.body)
             if record.fix_disposition == "pending"
             and record.reviewed_sha == pr.head_sha
+            and (record.role != "design_principles" or design_principles_present)
         )
         review_results = [
             json.dumps(
@@ -4779,107 +4824,115 @@ def _review_whole_version(
         else:
             result = "APPROVED\nScenario Gate not configured."
             verdict = "APPROVED"
-        principles_execution: list[_AgentTurnExecution] = []
-        principles_result, principles_verdict = run_validated_turn(
-            client,
-            design_principles_reviewer,
-            "Design Principles reviewer turn",
-            policy_context(
-                config,
-                scope="the design-principles conformance review",
-                structured_conflicts=True,
+        if design_principles_present:
+            if design_principles_reviewer is None:
+                design_principles_reviewer = create_agent(
+                    client,
+                    config,
+                    agent_type=REVIEWER_AGENT,
+                    name="Design Principles reviewer",
+                )
+            principles_execution: list[_AgentTurnExecution] = []
+            principles_result, principles_verdict = run_validated_turn(
+                client,
+                design_principles_reviewer,
+                "Design Principles reviewer turn",
+                policy_context(
+                    config,
+                    scope="the design-principles conformance review",
+                    structured_conflicts=True,
+                )
+                + design_principles_review_prompt(pr, config, work_items),
+                decision,
+                repository_identity=config.slug,
+                role="reviewer",
+                iteration=review_number,
+                pr=pr,
+                phase="whole-review",
+                _deferred_execution=principles_execution,
             )
-            + design_principles_review_prompt(pr, config, work_items),
-            decision,
-            repository_identity=config.slug,
-            role="reviewer",
-            iteration=review_number,
-            pr=pr,
-            phase="whole-review",
-            _deferred_execution=principles_execution,
-        )
-        review_results.append(principles_result)
-        changes_requested = (
-            changes_requested or principles_verdict == "CHANGES_REQUESTED"
-        )
-        emit_policy_conflicts(
-            principles_result, config, scope="the integrated version"
-        )
-        principles_audit = allocate_review_audit(
-            pr.body,
-            "design_principles",
-            principles_verdict,
-            pr.head_sha,
-            principles_result,
-        )
-        pr = persist_review_audit(
-            github,
-            pr,
-            principles_audit,
-            head=config.integration_branch,
-            base=config.main_branch,
-        )
-        if principles_verdict == "CHANGES_REQUESTED":
-            requested_change_audits.append(principles_audit.audit_id)
-        principles_sha, principles_reviewer_changed = require_agent_result(
-            repo,
-            client,
-            fixer,
-            config.integration_branch,
-            pr.head_sha,
-            allow_unchanged=True,
-            expected_process="cleanup",
-            iteration=review_number,
-        )
-        if principles_reviewer_changed:
-            pushed = repo.ensure_pushed(
-                config.integration_branch, expected_local_sha=principles_sha
+            review_results.append(principles_result)
+            changes_requested = (
+                changes_requested or principles_verdict == "CHANGES_REQUESTED"
             )
-            assert pushed.remote_sha is not None
-            pr = github.require_pr(
-                number=pr.number,
-                head=config.integration_branch,
-                base=config.main_branch,
-                state="OPEN",
-                expected_head_sha=pushed.remote_sha,
-                expected_base_sha=pr.base_sha,
-                draft=True,
+            emit_policy_conflicts(
+                principles_result, config, scope="the integrated version"
             )
-            pr = ensure_base_pr_policy_notes(github, pr, config)
-            pending_audits = tuple(
-                record.audit_id
-                for record in review_audit_from_body(pr.body)
-                if record.fix_disposition == "pending"
+            principles_audit = allocate_review_audit(
+                pr.body,
+                "design_principles",
+                principles_verdict,
+                pr.head_sha,
+                principles_result,
             )
-            pr = review_audit_dispositions(
+            pr = persist_review_audit(
                 github,
                 pr,
-                tuple(requested_change_audits)
-                + pending_audits
-                + (principles_audit.audit_id,),
-                "reviewer_changed_head",
+                principles_audit,
                 head=config.integration_branch,
                 base=config.main_branch,
-                fix_sha=principles_sha,
             )
-            if review_number == MAX_REVIEWS:
-                pr = persist_whole_limit_head_change(
-                    github, pr, round_number=review_number,
-                    reviewed_sha=principles_audit.reviewed_sha,
-                    head=config.integration_branch, base=config.main_branch,
+            if principles_verdict == "CHANGES_REQUESTED":
+                requested_change_audits.append(principles_audit.audit_id)
+            principles_sha, principles_reviewer_changed = require_agent_result(
+                repo,
+                client,
+                fixer,
+                config.integration_branch,
+                pr.head_sha,
+                allow_unchanged=True,
+                expected_process="cleanup",
+                iteration=review_number,
+            )
+            if principles_reviewer_changed:
+                pushed = repo.ensure_pushed(
+                    config.integration_branch, expected_local_sha=principles_sha
                 )
-            emit_finding(
-                "git",
-                "design-principles review changed the integration branch; "
-                f"approval invalidated at {principles_sha}",
-            )
+                assert pushed.remote_sha is not None
+                pr = github.require_pr(
+                    number=pr.number,
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    state="OPEN",
+                    expected_head_sha=pushed.remote_sha,
+                    expected_base_sha=pr.base_sha,
+                    draft=True,
+                )
+                pr = ensure_base_pr_policy_notes(github, pr, config)
+                pending_audits = tuple(
+                    record.audit_id
+                    for record in review_audit_from_body(pr.body)
+                    if record.fix_disposition == "pending"
+                )
+                pr = review_audit_dispositions(
+                    github,
+                    pr,
+                    tuple(requested_change_audits)
+                    + pending_audits
+                    + (principles_audit.audit_id,),
+                    "reviewer_changed_head",
+                    head=config.integration_branch,
+                    base=config.main_branch,
+                    fix_sha=principles_sha,
+                )
+                if review_number == MAX_REVIEWS:
+                    pr = persist_whole_limit_head_change(
+                        github, pr, round_number=review_number,
+                        reviewed_sha=principles_audit.reviewed_sha,
+                        head=config.integration_branch, base=config.main_branch,
+                    )
+                emit_finding(
+                    "git",
+                    "design-principles review changed the integration branch; "
+                    f"approval invalidated at {principles_sha}",
+                )
+                _complete_deferred_validated_turn(
+                    principles_execution, "head_changed"
+                )
+                continue
             _complete_deferred_validated_turn(
-                principles_execution, "head_changed"
+                principles_execution, principles_verdict.lower()
             )
-            continue
-        _complete_deferred_validated_turn(
-            principles_execution, principles_verdict.lower()
-        )
         whole_execution: list[_AgentTurnExecution] = []
         result, verdict = run_validated_turn(
             client,
@@ -5487,6 +5540,7 @@ def integration_delivery(
                     config,
                     agent_type=IMPLEMENTER_AGENT,
                     name="Whole-version cleanup",
+                    restriction="publication-disabled",
                 )
             if cleanup is None:
                 checked = repo.require_committed_result(

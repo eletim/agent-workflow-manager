@@ -392,9 +392,9 @@ feature = repo.prepare_feature_branch(
     expected_base_sha=context.base_sha,
 )
 
-# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told
-# to commit, push, create or update one exact Draft PR, and leave a clean
-# worktree. The Workflow independently verifies each delivery postcondition.
+# Capture the pre-turn SHA before invoking the CodingAgent. The agent is told to
+# leave clean local commits. The Workflow owns normalization, verification,
+# publication, and exact Draft-PR management.
 turn_start_sha = feature.local_sha
 # ... run the CodingAgent ...
 feature = repo.require_current_branch("feature/issue-123")
@@ -412,17 +412,35 @@ feature = repo.require_committed_result(
     expected_agent="codex",
     expected_process="implementation",
 )
-# Push is also orchestration-owned gap absorption if the agent omitted it. This
-# only creates the exact remote branch or fast-forwards it; remote-ahead or
-# diverged states fail closed.
+# Only after normalization and verification does orchestration publish the exact
+# commit. This only creates the remote branch or fast-forwards it; remote-ahead
+# or diverged states fail closed.
 feature = repo.ensure_pushed(
     "feature/issue-123",
     expected_local_sha=feature.local_sha,
 )
+pull_request = github.find_pr(
+    head="feature/issue-123",
+    base="dev/v1.2.3",
+    state="OPEN",
+)
+if pull_request is None:
+    pull_request = github.create_draft_pr(
+        head="feature/issue-123",
+        base="dev/v1.2.3",
+        expected_head_sha=feature.remote_sha,
+        expected_base_sha=context.base_sha,
+        title="Issue #123",
+        body="Implements Issue #123.",
+        correlation_id="issue-123-pr",
+    )
 pull_request = github.require_pr(
+    number=pull_request.number,
     head="feature/issue-123",
     base="dev/v1.2.3",
     expected_head_sha=feature.remote_sha,
+    expected_base_sha=context.base_sha,
+    draft=True,
 )
 ```
 
@@ -430,9 +448,10 @@ When a workflow does not already know the repository slug, omitting
 `expected_github_slug` derives and pins it from the validated GitHub origin. The
 origin is still rechecked on every topology operation.
 
-The Workflow similarly creates or reuses the exact Draft PR when the agent did
-not create one, then verifies its head, base, SHAs, and Draft state before
-review. Each Issue first receives a Scope / Design Review of whether its diff is
+The Workflow creates or reuses the exact Draft PR, then verifies its head, base,
+SHAs, and Draft state before review. Coding Agents never publish commits or
+manage PR state. Each Issue first receives a Scope / Design Review of whether
+its diff is
 necessary, sufficient, appropriately placed, and consistent with the shared
 minimal-change principle. Directly out-of-scope incidental changes are judged by
 their necessity, proportionality, natural responsibility placement, and the
@@ -444,11 +463,14 @@ defaults to three when omitted; the recommended values are six for Scope Review
 and four for the Correctness and whole-version review limit. The higher
 recommended Scope limit reserves capacity for the required rechecks after
 Correctness fixes change the head. Whole Review first applies any configured
-Scenario Gate, then runs a dedicated Design Principles reviewer, the
+Scenario Gate, then runs a dedicated Design Principles reviewer when
+`docs/design-principles.md` exists at the exact integration head, followed by the
 integration/cross-Issue Whole-version reviewer, and the independent Version /
-README reviewer on every eligible head. The Design Principles turn reads
+README reviewer on every eligible head. When applicable, the Design Principles
+turn reads
 `docs/design-principles.md` from the exact integration head and reviews solely
-for conformance with that authoritative document. Findings from the independent
+for conformance with that authoritative document. Its absence is normal and does
+not request creation or restoration. Findings from the independent
 reviews are aggregated into one fix turn, and any changed head is reviewed again
 in the same order within the bounded whole-review loop.
 Each consequential review round is also recorded in a bounded managed section
@@ -485,10 +507,11 @@ before making the PR Ready.
 
 CodingAgent prompts require every implementation, review-fix, cleanup, and
 recovery commit to retain the configured agent as a co-author and to include
-machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The clean committed
-result check mechanically normalizes unambiguous provenance on unpublished
-commits, then verifies it before a branch can advance. Conflicting provenance
-and commits already visible on the remote fail closed. Scripted
+machine-readable `AWM-Agent` and `AWM-Process` Git trailers. The post-turn and
+delivery gate mechanically normalizes unambiguous provenance on unpublished
+commits before the clean committed-result verification allows a branch to
+advance. Conflicting provenance and commits already visible on the remote fail
+closed. Scripted
 merge commits instead record `AWM-Automation: agent-workflow-manager` and
 `AWM-Process: merge`; AWM is automation provenance, not a co-author.
 

@@ -28,8 +28,9 @@ The JSON is never interpreted as runtime control flow, and it has no generic
 actions, conditions, loops, graph edges, or executable nesting.
 
 The generated workflow uses the canonical commit-and-clean CodingAgent
-postcondition, fills safe push/Draft-PR gaps before independent review, and uses
-Runner-scoped correlation through named PurpleMux resources and
+postcondition, then unconditionally owns provenance normalization, exact push,
+and Draft-PR management before independent review. It uses Runner-scoped
+correlation through named PurpleMux resources and
 `run_correlation()`. It does not generate UUIDs or correlation tokens. With
 `merge_final: false`, it generates no final-branch merge call. The displayed
 Python remains the sole execution and control-flow source of truth.
@@ -166,9 +167,10 @@ On Resume, the workflow calls `recover_issue_driven_work_item_topology` only for
 an inline item whose dispatch identity was restored from the persisted plan.
 After all topology checks succeed, the helper may restore a missing or malformed
 fingerprint on the exact open Draft PR. After a fresh implementation, the
-workflow uses the same plan-owned identity and guarded reconciliation to adopt a
-Draft PR created by the CodingAgent, or creates the PR with the marker itself if
-none exists. Subsequent PR metadata updates use
+workflow normalizes and verifies the CodingAgent's clean local commits before it
+publishes the exact head and creates or reuses the Draft PR with the marker.
+Coding Agents never publish commits or manage PR state. Subsequent PR metadata
+updates use
 `reconcile_inline_task_pr_body()` and `require_inline_task_pr_fingerprint()` as
 the same strict reconciliation and validation boundary. CodingAgent prompts
 prohibit marker changes: only AWM creates or repairs the fingerprint marker. If
@@ -199,13 +201,24 @@ expected_process="implementation")` (or the agent and process for that turn).
 prompt that this postcondition verifies. Before validation and delivery,
 `normalize_agent_commit_provenance()` makes unambiguous unpublished agent
 trailers contiguous and exact while preserving unrelated trailers. It fails
-closed for conflicting provenance or a remote-visible commit. Use
-`ensure_pushed()` to complete
-delivery through the logical remote branch name. It creates an absent branch or
+closed for conflicting provenance or a remote-visible commit. A recovered local
+commit range is normalized and verified from its authoritative published ancestor
+before an unchanged resumed turn may deliver it.
+`normalize_agent_declared_commit_provenance()` preserves each commit's declared
+implementation, reviewer-fix, or cleanup process and fails closed when that
+declaration is missing or ambiguous. It atomically advances every matching
+logical and run-private recovery ref, so an interruption cannot leave raw and
+normalized sibling histories. Already-published recovered ranges are verified
+from the authoritative integration head before an unchanged turn or PR mutation.
+The same verification gates every existing open Draft or Ready PR before
+orchestration may mutate, review, or terminally reuse it. Use
+`ensure_pushed()` to publish the exact normalized commit through the logical
+remote branch name. It creates an absent branch or
 fast-forwards a behind branch only; remote-ahead and divergence fail closed. The
 Workflow must then create or reuse and verify the exact Draft PR before starting
-review. Push and PR creation may be agent conveniences, but are not CodingAgent
-hard postconditions.
+review. Coding Agents never push or manage PR state. Reusing an exact pre-existing
+Draft PR is recovery compatibility for an interrupted or older run, not delegated
+publication ownership.
 
 The workflow process itself runs in a PurpleMux Bash tab from a stable
 Runner-controlled directory;
@@ -563,14 +576,20 @@ project state. An absolute `CLAUDE_CONFIG_DIR` is honored using Claude's migrate
 `.config.json`, legacy `.claude.json`, and custom-OAuth state precedence;
 unrelated state is preserved, and updates coordinate on Claude's state-file lock.
 Claude home-directory trust fails early because Claude does not persist it.
-Ordinary provider sessions do not change sandbox or approval policy. A session
-may explicitly request the `local-git-only` restriction; that reusable profile
-runs turns in a managed terminal with local Git access but no remote Git ref
-mutation capability. Codex recovery has no shell network or GitHub credentials
-and retains read-only remote inspection through native search. Claude recovery
-has an explicit allowlist of local Git inspection, staging, commit, and
-fast-forward commands plus non-ref GitHub operations; push, reset, rebase, and
-unrestricted shell commands remain unavailable.
+Ordinary provider sessions do not change sandbox or approval policy. Normal
+commit-producing sessions use the `publication-disabled` restriction. It retains
+the provider's repository development tools, including project-specific test,
+build, lint, and formatting commands, while removing authenticated publication
+credentials, rejecting Git pushes, and preventing PR management. Claude Bash
+commands run in its strict OS sandbox with no network domains, no unsandboxed
+fallback, and denied GitHub/SSH credential sources. The protected-checkout ref
+hook ignores separate temporary or nested repositories so project test fixtures
+can create and commit to them normally. Recovery uses
+the separate, tighter `local-git-only` restriction. Codex recovery has no shell
+network or GitHub credentials and retains read-only remote inspection through
+native search. Claude recovery has an explicit allowlist of local Git inspection,
+staging, commit, and fast-forward commands plus non-ref GitHub operations; push,
+reset, rebase, and unrestricted shell commands remain unavailable.
 AWM does not use a broad permission bypass, screen-text detection, or simulated
 trust-dialog keystrokes.
 
@@ -624,6 +643,7 @@ The supported Git inspection and assertion methods are:
 ```python
 repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
+repo.has_path_at_commit(commit_sha, path) -> bool
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_remote_branch_heads() -> dict[str, str]
 repo.inspect_remote_refs() -> dict[str, str]
@@ -658,8 +678,10 @@ development branch with the remote's current branch set.
 branch set across linked worktrees. Repository recovery instead snapshots all
 local `refs/*` and all authoritative remote refs, including tags and notes, and
 records both the object ID and symbolic target of each local ref. It then starts
-the recovery agent through the normal session and validated-turn APIs
-with the `local-git-only` restriction. Recovery requires a clean worktree before
+the recovery agent through the normal session and validated-turn APIs with the
+Recovery-only `local-git-only` restriction, never the broader
+`publication-disabled` development profile. That boundary has no remote Git ref
+mutation capability. Recovery requires a clean worktree before
 launch so restoration cannot discard pre-existing staged or unstaged changes.
 The restricted session installs a temporary Git reference-transaction hook that
 allows only a fast-forward of the active branch, plus a pre-push hook that rejects
@@ -1223,13 +1245,13 @@ Do not:
 - run observable/parallel Bash work as an invisible local subprocess;
 - invent a checkpoint, graph, state-machine, or durable-execution abstraction.
 
-## Complete example: implement, review, fix, and ready a PR
+## Complete example: implement, review, and fix with orchestrated delivery
 
 This lower-level example focuses on agent turn orchestration. Production
 repository workflows should combine it with the commit/clean and delivery gates
 above; the canonical `examples/sequential-version-development.py` shows safe
-push and exact Draft-PR gap absorption. All owned resources remain available
-until explicit Cleanup.
+provenance normalization, exact publication, and Draft-PR management. All owned
+resources remain available until explicit Cleanup.
 
 ```python
 from __future__ import annotations
@@ -1254,6 +1276,8 @@ context = prepare_run_repository(
 )
 REPO = context.execution_root
 ISSUE_URL = "https://github.com/OWNER/REPO/issues/123"
+# Orchestration reads the Issue before starting the restricted CodingAgent.
+ISSUE_REQUIREMENT = "The exact authoritative Issue body fetched by AWM."
 BASE_BRANCH = "dev/v0.1.0"
 FEATURE_BRANCH = "feature/issue-123"
 MAX_REVIEWS = 5
@@ -1385,15 +1409,20 @@ try:
         client,
         implementer,
         "implementation",
-        f"""Implement {ISSUE_URL}. Treat the Issue body as Source of Truth.
-Work in the prepared checkout based on {BASE_BRANCH}; publish its HEAD to the
-logical branch {FEATURE_BRANCH} and create no other branch yourself.
+        f"""Implement this authoritative requirement: {ISSUE_REQUIREMENT}
+Work in the prepared checkout based on {BASE_BRANCH}; advance the local logical
+branch {FEATURE_BRANCH} only through clean commits.
 Run required format/lint/typecheck/tests and git diff --check.
-Commit, push with `git push origin HEAD:refs/heads/{FEATURE_BRANCH}`, and create a
-Draft PR targeting {BASE_BRANCH}.
-Do not merge main or {BASE_BRANCH}. Do not start a review yourself.
+Commit locally. Do not push or create, update, or ready a PR.
+Do not merge main or {BASE_BRANCH}. Do not start a review yourself. AWM will
+normalize and verify provenance before publishing the exact commit and managing
+the Draft PR.
 Return a concise implementation and verification summary.""",
     )
+
+    # Before review, orchestration applies the commit/clean gates shown above,
+    # normalizes and verifies provenance, pushes the exact resulting SHA, and
+    # creates or reuses the exact Draft PR.
 
     approved = False
     for review_number in range(1, MAX_REVIEWS + 1):
@@ -1420,8 +1449,8 @@ Otherwise return CHANGES_REQUESTED on the first non-empty line, followed by spec
             "fix",
             f"""Fix only the actionable review findings below for {ISSUE_URL}.
 Keep branch {FEATURE_BRANCH}; do not create another branch or merge anything.
-Run required checks, commit, and push with
-`git push origin HEAD:refs/heads/{FEATURE_BRANCH}` to the existing Draft PR.
+Run required checks and commit locally. Do not push or modify PR state; AWM
+normalizes and verifies provenance before publishing the exact commit.
 Do not start a review yourself.
 
 REVIEW FINDINGS:
@@ -1429,17 +1458,15 @@ REVIEW FINDINGS:
             iteration=review_number,
         )
 
+        # Before re-review, orchestration repeats the commit/clean, provenance,
+        # exact-push, and Draft-PR topology gates.
+
     if not approved:
         raise WorkerFailure("workflow ended without approval")
 
-    run_turn(
-        client,
-        implementer,
-        "pr ready",
-        f"""Run final required checks for {FEATURE_BRANCH}, confirm it is pushed,
-and convert its existing Draft PR targeting {BASE_BRANCH} to Ready for review.
-Do not merge the PR and do not start another review. Return the PR URL and final status.""",
-    )
+    # Orchestration runs final checks, revalidates the exact pushed topology,
+    # and changes the verified Draft PR to Ready without delegating PR state to
+    # the CodingAgent.
     workflow_succeeded = True
 except BaseException as exc:
     emit_step(

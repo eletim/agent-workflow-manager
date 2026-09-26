@@ -2209,6 +2209,7 @@ def test_fresh_inline_delivery_creates_pr_with_plan_owned_identity() -> None:
         GitHub(),
         issue,
         config,
+        expected_local_sha=head_sha,
         expected_base_sha=base_sha,
         reconcile_plan_owned_inline_identity=True,
     )
@@ -2246,6 +2247,7 @@ def test_fresh_inline_delivery_propagates_foreign_fingerprint_rejection() -> Non
             ),
             issue,
             config,
+            expected_local_sha=head_sha,
             expected_base_sha="b" * 40,
             reconcile_plan_owned_inline_identity=True,
         )
@@ -2503,6 +2505,7 @@ def test_generated_workflow_requires_agent_commit_provenance(
     reviewer_fix = workflow["implementer_prompt"](
         "Fix the review.", process="reviewer-fix"
     )
+    cleanup = workflow["implementer_prompt"]("Clean it.", process="cleanup")
     implementation_trailers = (
         f"Co-authored-by: {coauthor}\n"
         f"AWM-Agent: {agent}\n"
@@ -2513,12 +2516,20 @@ def test_generated_workflow_requires_agent_commit_provenance(
         f"AWM-Agent: {agent}\n"
         "AWM-Process: reviewer-fix"
     )
+    cleanup_trailers = (
+        f"Co-authored-by: {coauthor}\n"
+        f"AWM-Agent: {agent}\n"
+        "AWM-Process: cleanup"
+    )
 
-    for prompt in (implementation, reviewer_fix):
+    for prompt in (implementation, reviewer_fix, cleanup):
         assert f"Co-authored-by: {coauthor}" in prompt
         assert f"AWM-Agent: {agent}" in prompt
+        assert "Your delivery responsibility ends with clean local commits" in prompt
+        assert "Do not push, create or update a PR, or change PR state" in prompt
     assert implementation_trailers in implementation
     assert reviewer_fix_trailers in reviewer_fix
+    assert cleanup_trailers in cleanup
     assert "agent_commit_coauthor(IMPLEMENTER_AGENT)" in source
     assert "AGENT_COAUTHORS" not in source
 
@@ -2558,6 +2569,44 @@ def test_generated_workflow_routes_every_agent_session_by_role() -> None:
         "Whole-version cleanup": "IMPLEMENTER_AGENT",
         "Base PR human handoff writer": "REVIEWER_AGENT",
         "Multi-repository human handoff writer": "REVIEWER_AGENT",
+    }
+
+
+def test_generated_workflow_restricts_every_coding_session_from_publication() -> None:
+    tree = ast.parse(generate_issue_driven_workflow(parse(payload())))
+    restrictions: dict[str, str | None] = {}
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != "create_agent":
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        name = keywords["name"]
+        if isinstance(name, ast.Constant):
+            label = str(name.value)
+        elif isinstance(name, ast.JoinedStr):
+            label = "".join(
+                str(value.value)
+                for value in name.values
+                if isinstance(value, ast.Constant)
+            )
+        else:
+            continue
+        restriction = keywords.get("restriction")
+        restrictions[label] = (
+            str(restriction.value)
+            if isinstance(restriction, ast.Constant)
+            else None
+        )
+
+    assert restrictions["Recovery agent"] == "local-git-only"
+    assert {
+        label
+        for label, restriction in restrictions.items()
+        if restriction == "publication-disabled"
+    } == {
+        " worktree cleanup",
+        " implementer",
+        "Whole-version fixer",
+        "Whole-version cleanup",
     }
 
 
@@ -2669,6 +2718,7 @@ def test_generated_workflow_passes_supported_static_validation() -> None:
 
 def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     code = generate_issue_driven_workflow(parse(payload()))
+    prompt = load_generated_workflow()["implementer_prompt"]("Implement it.")
 
     assert "require_committed_result(" in code
     assert "normalize_agent_commit_provenance(" in code
@@ -2683,8 +2733,12 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert "continuing without reviewer approval" in code
     assert 'status="warning"' in code
     assert "Commit every intended source, test, and configuration" in code
-    assert "Push the exact feature branch" in code
-    assert "Create or update exactly one Draft PR" in code
+    assert "Leave publication to AWM" in code
+    assert "push the exact normalized commit" in code
+    assert "Your delivery responsibility ends with clean local commits" in code
+    assert "Do not push, create or update a PR, or change PR state" in prompt
+    assert code.count('restriction="local-git-only"') == 1
+    assert code.count('restriction="publication-disabled"') == 4
     assert (
         "Do not create, remove, or edit agent-workflow-manager fingerprint markers"
         in code
@@ -2698,7 +2752,7 @@ def test_generated_workflow_uses_coding_agent_delivery_contract() -> None:
     assert '"skipped"' in code
     assert '{"pr_number": pr.number, "pr_url": pr.url}' in code
     assert "Finish with a clean worktree" in code
-    assert "commit SHA and PR number or URL" in code
+    assert "local commit SHA" in code
     assert "You may push" not in code
     for prohibited in (
         "reset, rebase, stash, force-push",
@@ -4881,6 +4935,7 @@ def test_interrupted_dispatched_item_is_reinspected_before_planning(
         inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
             base_is_ancestor=True
         ),
+        require_agent_commit_declared_provenance=lambda *args, **kwargs: None,
     )
     github = GitHub()
 
@@ -5040,6 +5095,7 @@ def test_recovered_dynamic_plan_reuses_open_and_merged_pr_topology() -> None:
         inspect_feature_preparation=lambda *args, **kwargs: SimpleNamespace(
             base_is_ancestor=True
         ),
+        require_agent_commit_declared_provenance=lambda *args, **kwargs: None,
     )
 
     github = GitHub()
