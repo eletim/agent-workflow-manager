@@ -677,6 +677,16 @@ class PurpleMuxCLIClient:
         self._completed_shell_runs: dict[str, ShellResult] = {}
         self._restricted_sessions: dict[str, _RestrictedSession] = {}
 
+    @staticmethod
+    def correlated_session_name(name: str, correlation_id: str) -> str:
+        """Return the exact public display name for a correlated Agent tab."""
+        _validate_correlation(correlation_id)
+        if not name.strip() or "\0" in name:
+            raise ValueError("tab name must be non-empty and contain no nulls")
+        if correlation_id in name:
+            return name
+        return f"{name} [awm:{correlation_id}]"
+
     def create_session(self, request: CreateSessionRequest) -> str:
         """Create and launch a Codex or Claude session."""
         if request.deadline_check is not None:
@@ -715,8 +725,8 @@ class PurpleMuxCLIClient:
         )
         _validate_correlation(correlation_id)
         name = request.name or f"awm-{panel_type}-{correlation_id}"
-        if request.name is not None and correlation_id not in name:
-            name = f"{name} [awm:{correlation_id}]"
+        if request.name is not None:
+            name = self.correlated_session_name(name, correlation_id)
         restricted = request.restriction == "local-git-only"
         tab = self._create_correlated_tab(
             panel_type="terminal" if restricted else panel_type,

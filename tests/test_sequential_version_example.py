@@ -17,6 +17,7 @@ from purplemux_client import (
     GitRepository,
     MutationOutcomeUnknown,
     PullRequestState,
+    TabState,
     WorkerFailure,
     WorkerInterrupted,
 )
@@ -177,6 +178,429 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
     assert '"Deliver the exact Issue topology"' in source
     assert "Deliver the exact approved Issue topology" not in source
+
+
+def test_same_run_retry_reconciles_all_completed_work_item_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-retry-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](
+        None,
+        "feature/work-item-retry-tabs",
+        "retry-tabs",
+        "Retry completed tabs.",
+        hashlib.sha256(b"Retry completed tabs.").hexdigest(),
+    )
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    logical_names = (
+        f"{issue.label} implementer",
+        f"{issue.label} scope reviewer",
+        f"{issue.label} correctness reviewer",
+    )
+    names = tuple(workflow["correlated_agent_tab_name"](name) for name in logical_names)
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs = {
+                f"old-{index}": TabState(
+                    f"old-{index}",
+                    self.workspace_id,
+                    name,
+                    "codex-cli",
+                    "codex",
+                    True,
+                    "ready-for-review",
+                )
+                for index, name in enumerate(names, 1)
+            }
+            self.closed: list[str] = []
+            self.created: list[object] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert tab_id in self.tabs
+            return "completed"
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+        def create_session(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            correlation_id = request.correlation_id  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{correlation_id}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"new-{len(self.created) + 1}"
+            self.tabs[tab_id] = TabState(
+                tab_id,
+                self.workspace_id,
+                name,
+                "codex-cli",
+                "codex",
+                True,
+                "idle",
+            )
+            self.created.append(request)
+            return tab_id
+
+    client = Client()
+    workflow["reconcile_work_item_retry_tabs"](client, issue)
+    recreated = tuple(
+        workflow["create_agent"](client, config, agent_type="codex", name=logical_name)
+        for logical_name in logical_names
+    )
+
+    assert client.closed == ["old-1", "old-2", "old-3"]
+    assert recreated == ("new-1", "new-2", "new-3")
+    assert tuple(tab.name for tab in client.tabs.values()) == names
+    assert tuple(request.correlation_id for request in client.created) == tuple(
+        workflow["run_correlation"](name) for name in logical_names
+    )
+
+
+def test_repository_recovery_recreates_completed_planner_and_work_item_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-recovery-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    globals_ = workflow["_run_repository"].__globals__
+    issue = workflow["Issue"](334, "feature/issue-334")
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (issue,), "true"
+    )
+    feature_sha = "feature-head"
+    integration_sha = "integration-head"
+    draft = replace(
+        open_pr(head=issue.branch, base=config.integration_branch, draft=True),
+        head_sha=feature_sha,
+        base_sha=integration_sha,
+    )
+    ready = replace(draft, is_draft=False)
+    mutations: list[tuple[str, str, str, str | None]] = []
+    work_item_logical_names = (
+        f"{issue.label} implementer",
+        f"{issue.label} scope reviewer",
+        f"{issue.label} correctness reviewer",
+    )
+    work_item_names = tuple(
+        workflow["correlated_agent_tab_name"](name) for name in work_item_logical_names
+    )
+    work_item_correlations = tuple(
+        workflow["run_correlation"](name) for name in work_item_logical_names
+    )
+    planner_name = workflow["correlated_agent_tab_name"]("Work-item planner")
+    planner_correlation = workflow["run_correlation"]("Work-item planner")
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs: dict[str, TabState] = {}
+            self.next_id = 1
+
+        def create_session(self, request: object) -> str:
+            logical_name = request.name  # type: ignore[attr-defined]
+            correlation_id = request.correlation_id  # type: ignore[attr-defined]
+            name = f"{logical_name} [awm:{correlation_id}]"
+            assert all(tab.name != name for tab in self.tabs.values())
+            tab_id = f"tab-{self.next_id}"
+            self.next_id += 1
+            self.tabs[tab_id] = TabState(
+                tab_id,
+                self.workspace_id,
+                name,
+                "codex-cli",
+                "codex",
+                True,
+                "busy",
+            )
+            mutations.append(("create", tab_id, name, correlation_id))
+            return tab_id
+
+        def complete(self, tab_id: str) -> None:
+            self.tabs[tab_id] = replace(self.tabs[tab_id], cli_state="ready-for-review")
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert self.tabs[tab_id].cli_state == "ready-for-review"
+            return "completed"
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            tab = self.tabs.pop(tab_id)
+            mutations.append(("close", tab_id, tab.name, None))
+
+    client = Client()
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(dirty=False, current_branch=issue.branch, status=())
+
+        def inspect_branch(self, branch: str) -> BranchState:
+            sha = (
+                integration_sha if branch == config.integration_branch else feature_sha
+            )
+            return BranchState(branch, sha, sha, branch == issue.branch)
+
+        def inspect_local_refs(self) -> dict[str, object]:
+            return {
+                f"refs/heads/{issue.branch}": workflow["LocalRefState"](
+                    feature_sha, None
+                )
+            }
+
+        def inspect_remote_refs(self) -> dict[str, str]:
+            return {f"refs/heads/{issue.branch}": feature_sha}
+
+        def require_committed_result(
+            self,
+            branch: str,
+            *,
+            previous_sha: str,
+            allow_unchanged: bool,
+        ) -> BranchState:
+            assert (branch, previous_sha, allow_unchanged) == (
+                issue.branch,
+                feature_sha,
+                True,
+            )
+            return BranchState(branch, feature_sha, feature_sha, True)
+
+    repository = Repository()
+
+    class GitHub:
+        def __init__(self) -> None:
+            self.ready_attempts = 0
+
+        def set_draft(self, number: int, **_kwargs: object) -> PullRequestState:
+            assert number == draft.number
+            assert len(client.tabs) == 4
+            assert all(
+                tab.cli_state == "ready-for-review" for tab in client.tabs.values()
+            )
+            self.ready_attempts += 1
+            if self.ready_attempts == 1:
+                raise WorkerFailure("recoverable repository failure")
+            return ready
+
+    github = GitHub()
+
+    plan_attempts = 0
+
+    def prepared_plan(*_args: object) -> tuple[None, object]:
+        nonlocal plan_attempts
+        plan = workflow["WorkItemPlan"](config)
+        plan.position = plan_attempts
+        plan_attempts += 1
+        return None, plan
+
+    def run_turn(*args: object, **_kwargs: object) -> str:
+        client.complete(str(args[1]))
+        return "implemented"
+
+    def review_phase(*args: object, **kwargs: object) -> object:
+        client.complete(str(args[6]))
+        return workflow["IssueReviewPhaseResult"](
+            draft,
+            "approved",
+            feature_sha,
+            integration_sha,
+            1,
+        )
+
+    planner_turns = 0
+
+    def run_validated_turn(*args: object, **_kwargs: object) -> tuple[str, object]:
+        nonlocal planner_turns
+        planner_turns += 1
+        source = json.dumps(
+            {
+                "actions": [],
+                "complete": planner_turns == 2,
+                "policy_conflicts": [],
+            }
+        )
+        client.complete(str(args[1]))
+        validator = args[4]
+        return source, validator(source)  # type: ignore[operator]
+
+    monkeypatch.setitem(
+        globals_,
+        "GitRepository",
+        SimpleNamespace(open=lambda *_args, **_kwargs: repository),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "GitHubRepository",
+        SimpleNamespace(open=lambda *_args, **_kwargs: github),
+    )
+    monkeypatch.setitem(globals_, "create_runtime", lambda _config: client)
+    monkeypatch.setitem(globals_, "prepare_work_item_plan_pr", prepared_plan)
+    monkeypatch.setitem(globals_, "persist_work_item_plan", lambda _plan, *_args: None)
+    monkeypatch.setitem(
+        globals_, "inspect_dynamic_work_item_topology", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setitem(
+        globals_, "prepare_issue", lambda *_args: (None, feature_sha, False)
+    )
+    monkeypatch.setitem(globals_, "run_turn", run_turn)
+    monkeypatch.setitem(globals_, "run_validated_turn", run_validated_turn)
+    monkeypatch.setitem(
+        globals_,
+        "require_agent_result",
+        lambda *_args, **_kwargs: (feature_sha, False),
+    )
+    monkeypatch.setitem(globals_, "ensure_issue_pr", lambda *_args, **_kwargs: draft)
+    monkeypatch.setitem(
+        globals_, "ensure_issue_pr_metadata", lambda *_args, **_kwargs: draft
+    )
+    monkeypatch.setitem(globals_, "review_issue_phase", review_phase)
+    monkeypatch.setitem(globals_, "MERGE_TO_INTEGRATION", False)
+    monkeypatch.setitem(
+        globals_,
+        "recovery_authoritative_state",
+        lambda *_args: '{"stable":true}',
+    )
+    monkeypatch.setitem(
+        globals_,
+        "recover_error",
+        lambda *_args, **_kwargs: workflow["RecoveryReport"](
+            True, True, "repaired", "verified"
+        ),
+    )
+    monkeypatch.setitem(globals_, "require_recovery_retry_state", lambda *_args: None)
+    monkeypatch.setitem(
+        globals_, "integration_delivery", lambda *_args, **_kwargs: ready
+    )
+    monkeypatch.setitem(globals_, "report_repository_delivery", lambda *_args: None)
+    monkeypatch.setitem(
+        globals_, "emit_issue_driven_context", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setitem(globals_, "emit_finding", lambda *_args, **_kwargs: None)
+
+    result = workflow["_run_repository"](config)
+
+    assert result == ready
+    assert github.ready_attempts == 2
+    assert [mutation[:2] for mutation in mutations] == [
+        ("create", "tab-1"),  # Initial planner.
+        ("create", "tab-2"),
+        ("create", "tab-3"),
+        ("create", "tab-4"),
+        ("close", "tab-2"),
+        ("close", "tab-3"),
+        ("close", "tab-4"),
+        ("create", "tab-5"),
+        ("create", "tab-6"),
+        ("create", "tab-7"),
+        ("close", "tab-1"),
+        ("create", "tab-8"),  # Retry planner.
+    ]
+    assert tuple(mutation[2] for mutation in mutations[1:4]) == work_item_names
+    assert tuple(mutation[2] for mutation in mutations[7:10]) == work_item_names
+    assert tuple(mutation[3] for mutation in mutations[1:4]) == work_item_correlations
+    assert tuple(mutation[3] for mutation in mutations[7:10]) == work_item_correlations
+    assert mutations[0][2:] == (planner_name, planner_correlation)
+    assert mutations[-1][2:] == (planner_name, planner_correlation)
+
+
+@pytest.mark.parametrize(
+    "unsafe", ("ambiguous", "unrelated", "busy", "later-busy")
+)
+def test_retry_tab_reconciliation_never_closes_uncertain_tabs(
+    monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-unsafe-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](334, "feature/issue-334")
+    implementer_name = workflow["correlated_agent_tab_name"](
+        f"{issue.label} implementer"
+    )
+    tab = TabState(
+        "tab-1",
+        "workspace",
+        implementer_name,
+        "terminal" if unsafe == "unrelated" else "codex-cli",
+        None if unsafe == "unrelated" else "codex",
+        True,
+        "busy" if unsafe == "busy" else "ready-for-review",
+    )
+    later = TabState(
+        "tab-scope",
+        "workspace",
+        workflow["correlated_agent_tab_name"](f"{issue.label} scope reviewer"),
+        "codex-cli",
+        "codex",
+        True,
+        "busy",
+    )
+
+    class Client:
+        workspace_id = "workspace"
+        closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            if unsafe == "ambiguous":
+                return (tab, replace(tab, id="tab-2"))
+            if unsafe == "later-busy":
+                return (tab, later)
+            return (tab,)
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            selected = later if tab_id == later.id else tab
+            return {
+                "tabId": tab_id,
+                "workspaceId": self.workspace_id,
+                "panelType": selected.panel_type,
+                "agentProviderId": selected.provider,
+                "cliState": selected.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            return "completed"
+
+        def close_session(self, tab_id: str, **_kwargs: object) -> None:
+            self.closed.append(tab_id)
+
+    client = Client()
+    with pytest.raises(WorkerFailure, match="refusing cleanup"):
+        workflow["reconcile_work_item_retry_tabs"](client, issue)
+
+    assert client.closed == []
 
 
 def test_existing_work_item_pr_adopts_its_verified_remote_head(

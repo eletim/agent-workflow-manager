@@ -591,14 +591,106 @@ def create_agent(
     name: str,
     restriction: Literal["local-git-only"] | None = None,
 ) -> str:
+    correlation_id = run_correlation(name)
     return client.create_session(
         CreateSessionRequest(
             agent_type,
             str(config.repo),
             agent_type,
             name=name,
+            correlation_id=correlation_id,
             restriction=restriction,
         )
+    )
+
+
+def correlated_agent_tab_name(name: str) -> str:
+    """Return the exact display identity used by an Agent tab in this run."""
+    return PurpleMuxCLIClient.correlated_session_name(name, run_correlation(name))
+
+
+def reconcile_completed_retry_tabs(
+    client: PurpleMuxCLIClient,
+    logical_tabs: tuple[tuple[str, str], ...],
+    *,
+    context: str,
+) -> None:
+    """Close only exact, completed Agent tabs that would collide on retry."""
+    expected: list[tuple[str, str, str]] = []
+    for logical_name, agent_type in logical_tabs:
+        normalized = agent_type.lower()
+        if normalized in {"codex", "codex-cli"}:
+            panel_type, provider = "codex-cli", "codex"
+        elif normalized in {"claude", "claude-code"}:
+            panel_type, provider = "claude-code", "claude"
+        else:
+            raise WorkerFailure(f"unsupported retry Agent type {agent_type!r}")
+        expected.append(
+            (correlated_agent_tab_name(logical_name), panel_type, provider)
+        )
+
+    current = client.list_sessions()
+    completed = []
+    for name, panel_type, provider in expected:
+        matches = [tab for tab in current if tab.name == name]
+        if not matches:
+            continue
+        if len(matches) != 1:
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} is ambiguous; refusing cleanup"
+            )
+        tab = matches[0]
+        if tab.panel_type != panel_type or tab.provider != provider:
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} has an unrelated identity; "
+                "refusing cleanup"
+            )
+        status = client.read_status(tab.id)
+        if (
+            status.get("tabId") != tab.id
+            or status.get("workspaceId") != client.workspace_id
+            or status.get("panelType") != panel_type
+            or status.get("agentProviderId") != provider
+        ):
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} status identity is uncertain"
+            )
+        if status.get("cliState") not in {"idle", "ready-for-review"}:
+            raise WorkerFailure(
+                f"retry tab correlation {name!r} is not completed; refusing cleanup"
+            )
+        # A ready-looking CLI state alone does not prove that this Agent tab
+        # completed a turn. Require PurpleMux's structured result as well.
+        client.read_result(tab.id)
+        completed.append(tab)
+
+    for tab in completed:
+        client.close_session(tab.id, expected_state=tab)
+    if completed:
+        emit_finding(
+            "runtime",
+            f"reconciled {len(completed)} completed {context} retry tab(s)",
+            status="warning",
+        )
+
+
+def reconcile_work_item_retry_tabs(client: PurpleMuxCLIClient, issue: Issue) -> None:
+    reconcile_completed_retry_tabs(
+        client,
+        (
+            (f"{issue.label} implementer", IMPLEMENTER_AGENT),
+            (f"{issue.label} scope reviewer", REVIEWER_AGENT),
+            (f"{issue.label} correctness reviewer", REVIEWER_AGENT),
+        ),
+        context=issue.label,
+    )
+
+
+def reconcile_planner_retry_tab(client: PurpleMuxCLIClient) -> None:
+    reconcile_completed_retry_tabs(
+        client,
+        (("Work-item planner", REVIEWER_AGENT),),
+        context="work-item planner",
     )
 
 
@@ -3153,6 +3245,7 @@ def process_issue(
     client: PurpleMuxCLIClient,
     repo: GitRepository,
     github: GitHubRepository,
+    retrying: bool = False,
 ) -> PullRequestState:
     terminal_progress("WORK ITEM", issue.label, detail=issue.branch)
     if repo.inspect_worktree().dirty:
@@ -3322,6 +3415,8 @@ def process_issue(
             pr_number=existing_pr.number,
             pr_url=existing_pr.url,
         )
+    if retrying:
+        reconcile_work_item_retry_tabs(client, issue)
     implementer = create_agent(
         client,
         config,
@@ -4219,6 +4314,7 @@ def process_work_items(
     github: GitHubRepository,
     plan_pr: PullRequestState | None,
     plan: WorkItemPlan,
+    retrying: bool = False,
 ) -> tuple[Issue, ...]:
     for recovered_issue in plan.items[: plan.position]:
         plan.active = recovered_issue
@@ -4227,13 +4323,17 @@ def process_work_items(
         )
         run_outline_step(
             recovered_issue.label,
-            lambda issue=recovered_issue: process_issue(
-                issue, config, client, repo, github
+            lambda issue=recovered_issue: (
+                process_issue(issue, config, client, repo, github, True)
+                if retrying
+                else process_issue(issue, config, client, repo, github)
             ),
         )
         plan.active = None
     if plan.finalized:
         return plan.snapshot
+    if retrying:
+        reconcile_planner_retry_tab(client)
     planner = create_agent(
         client,
         config,
@@ -4296,7 +4396,11 @@ def process_work_items(
         )
         run_outline_step(
             issue.label,
-            lambda issue=issue: process_issue(issue, config, client, repo, github),
+            lambda issue=issue: (
+                process_issue(issue, config, client, repo, github, True)
+                if retrying
+                else process_issue(issue, config, client, repo, github)
+            ),
         )
         plan.active = None
         if plan_pr is None:
@@ -5739,7 +5843,15 @@ def _run_repository(
             plan_pr, plan = prepare_work_item_plan_pr(config, repo, github)
             work_items = run_outline_step(
                 "Work items",
-                lambda: process_work_items(config, client, repo, github, plan_pr, plan),
+                lambda: process_work_items(
+                    config,
+                    client,
+                    repo,
+                    github,
+                    plan_pr,
+                    plan,
+                    recovery_attempt > 0,
+                ),
             )
             ready = integration_delivery(
                 config, work_items, client, repo, github, deferred_deliveries
