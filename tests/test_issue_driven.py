@@ -2900,7 +2900,8 @@ def test_recovery_uses_a_fresh_agent_and_validated_report_for_each_error() -> No
     assert "first" in prompts[0] and "branch: absent" in prompts[0]
     assert "second" in prompts[1] and "branch: present" in prompts[1]
     assert "Do not amend, reset, rebase" in prompts[0]
-    assert "Leave every local and remote branch ref unchanged" in prompts[0]
+    assert "Leave every remote branch ref" in prompts[0]
+    assert "exact fast-forward to its authoritative remote head" in prompts[0]
     assert closed == ["recovery-1", "recovery-2"]
 
 
@@ -3063,8 +3064,6 @@ def test_repository_recovery_rejects_unrecoverable_report(
             {
                 "previous_sha": "b" * 40,
                 "allow_unchanged": True,
-                "expected_agent": "codex",
-                "expected_process": "recovery",
             },
         )
     ]
@@ -3145,8 +3144,6 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
             {
                 "previous_sha": "b" * 40,
                 "allow_unchanged": True,
-                "expected_agent": "codex",
-                "expected_process": "recovery",
             },
         )
     ]
@@ -3240,8 +3237,8 @@ def test_repository_recovery_rejects_changed_branch_history(
         inspect_branch=lambda branch: BranchState(branch, "a" * 40, "a" * 40, True),
         inspect_local_branch_heads=inspect_local_branch_heads,
         inspect_remote_branch_heads=inspect_remote_branch_heads,
-        require_committed_result=lambda *args, **kwargs: pytest.fail(
-            "changed history must fail before provenance validation"
+        require_committed_result=lambda *args, **kwargs: (_ for _ in ()).throw(
+            WorkerFailure("branch no longer descends from its pre-recovery head")
         ),
     )
     workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
@@ -3268,6 +3265,106 @@ def test_repository_recovery_rejects_changed_branch_history(
     ):
         workflow["run_repository"](config)
     assert inspections == ["local", "remote", "local", "remote"]
+
+
+def test_recovery_accepts_zero_commit_remote_fast_forward_without_provenance() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    local_heads = iter(({"dev/v1": "a" * 40}, {"dev/v1": "b" * 40}))
+    committed_checks: list[tuple[str, dict[str, object]]] = []
+
+    def require_fast_forward(branch: str, **kwargs: object) -> BranchState:
+        committed_checks.append((branch, kwargs))
+        return BranchState(branch, "b" * 40, "b" * 40, True)
+
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "a" * 40, "b" * 40, True
+        ),
+        inspect_local_branch_heads=lambda: next(local_heads),
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40},
+        require_committed_result=require_fast_forward,
+        require_agent_commit_provenance=lambda *args, **kwargs: pytest.fail(
+            "an adopted remote head has no recovery-created commits"
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: "inspected state"
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("stale local head")
+    )
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
+        False, False, "Fast-forwarded local branch.", "Remote head verified."
+    )
+
+    with pytest.raises(WorkerFailure, match="stale local head"):
+        workflow["run_repository"](config)
+
+    assert committed_checks == [
+        (
+            "dev/v1",
+            {"previous_sha": "a" * 40, "allow_unchanged": True},
+        )
+    ]
+
+
+def test_repository_recovery_requires_provenance_for_created_commits() -> None:
+    workflow = load_generated_workflow(issues=[90])
+    config = workflow["Config"](
+        Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
+    )
+    local_heads = iter(({"dev/v1": "a" * 40}, {"dev/v1": "c" * 40}))
+    provenance_checks: list[tuple[str, str, dict[str, object]]] = []
+    repo = SimpleNamespace(
+        inspect_worktree=lambda: SimpleNamespace(
+            current_branch="dev/v1", dirty=False, status=()
+        ),
+        inspect_branch=lambda branch: BranchState(
+            branch, "a" * 40, "a" * 40, True
+        ),
+        inspect_local_branch_heads=lambda: next(local_heads),
+        inspect_remote_branch_heads=lambda: {"dev/v1": "a" * 40},
+        require_committed_result=lambda branch, **kwargs: BranchState(
+            branch, "c" * 40, "a" * 40, True
+        ),
+        require_agent_commit_provenance=lambda start, end, **kwargs: (
+            provenance_checks.append((start, end, kwargs))
+        ),
+    )
+    workflow["GitRepository"] = SimpleNamespace(open=lambda *args, **kwargs: repo)
+    workflow["GitHubRepository"] = SimpleNamespace(
+        open=lambda *args, **kwargs: object()
+    )
+    workflow["create_runtime"] = lambda config: object()
+    workflow["emit_issue_driven_context"] = lambda *args, **kwargs: None
+    workflow["recovery_authoritative_state"] = lambda *args: "inspected state"
+    workflow["prepare_work_item_plan_pr"] = lambda *args: (_ for _ in ()).throw(
+        WorkerFailure("repair needed")
+    )
+    workflow["recover_error"] = lambda *args, **kwargs: workflow["RecoveryReport"](
+        False, False, "Committed repair.", "Commit verified."
+    )
+
+    with pytest.raises(WorkerFailure, match="repair needed"):
+        workflow["run_repository"](config)
+
+    assert provenance_checks == [
+        (
+            "a" * 40,
+            "c" * 40,
+            {"expected_agent": "codex", "expected_process": "recovery"},
+        )
+    ]
 
 
 def test_repository_does_not_retry_unknown_mutation_outcome() -> None:
