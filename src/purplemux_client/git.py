@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import signal
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -11,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from purplemux_client.client import MutationOutcomeUnknown, WorkerFailure
 from purplemux_client.operations import (
@@ -340,60 +342,110 @@ class GitRepository:
 
     @contextmanager
     def protect_branch_history(self) -> Iterator[None]:
-        """Reject local ref transactions and pushes during recovery."""
+        """Freeze locally enforceable local and remote refs during recovery."""
         self._validate_identity()
-        hooks_key = "core.hooksPath"
-        push_key = f"remote.{self.remote}.pushurl"
-        hooks_before = self._local_config_values(hooks_key)
-        push_before = self._local_config_values(push_key)
-        with tempfile.TemporaryDirectory(prefix="awm-recovery-git-guard-") as temporary:
-            hooks = Path(temporary)
-            reject = "#!/bin/sh\nexit 1\n"
-            reference_hook = hooks / "reference-transaction"
-            push_hook = hooks / "pre-push"
-            reference_hook.write_text(reject, encoding="utf-8")
-            push_hook.write_text(reject, encoding="utf-8")
-            reference_hook.chmod(0o700)
-            push_hook.chmod(0o700)
-            configured_hooks = False
-            configured_push = False
-            try:
-                configured_hooks = True
-                self._replace_local_config_values(hooks_key, (str(hooks),))
-                configured_push = True
-                self._replace_local_config_values(
-                    push_key,
-                    (f"file://{hooks / 'push-disabled'}",),
+        local_git = self._git_common_directory()
+        remote_gits = self._local_remote_git_directories()
+        git_directories = tuple(sorted({local_git, *remote_gits}))
+        lock_fds: list[int] = []
+        protected: list[tuple[Path, int]] = []
+        try:
+            for git_directory in git_directories:
+                lock_name = hashlib.sha256(
+                    str(git_directory).encode("utf-8")
+                ).hexdigest()
+                lock_path = (
+                    Path(tempfile.gettempdir())
+                    / f"awm-recovery-refs-{lock_name}.lock"
                 )
+                lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                lock_fds.append(lock_fd)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                for git_directory in git_directories:
+                    for path in self._ref_storage_paths(git_directory):
+                        mode = stat.S_IMODE(path.stat().st_mode)
+                        protected.append((path, mode))
+                        path.chmod(mode & ~0o222)
                 yield
             finally:
                 failures: list[str] = []
-                if configured_push:
+                for path, mode in reversed(protected):
                     try:
-                        self._replace_local_config_values(push_key, push_before)
-                    except WorkerFailure as exc:
-                        failures.append(str(exc))
-                if configured_hooks:
-                    try:
-                        self._replace_local_config_values(hooks_key, hooks_before)
-                    except WorkerFailure as exc:
-                        failures.append(str(exc))
+                        path.chmod(mode)
+                    except OSError as exc:
+                        failures.append(f"{path}: {exc}")
                 if failures:
                     raise WorkerFailure(
                         "could not remove recovery Git history protection: "
                         + "; ".join(failures)
                     )
+        finally:
+            for lock_fd in reversed(lock_fds):
+                os.close(lock_fd)
 
-    def _local_config_values(self, key: str) -> tuple[str, ...]:
-        completed = self._command(["config", "--local", "--get-all", key], {0, 1})
-        return tuple(completed.stdout.splitlines())
+    def _git_common_directory(self) -> Path:
+        value = self._read(["rev-parse", "--git-common-dir"])
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.root / path
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise WorkerFailure(f"could not resolve Git common directory: {exc}") from exc
+        if not resolved.is_dir():
+            raise WorkerFailure("Git common directory is not a directory")
+        return resolved
 
-    def _replace_local_config_values(
-        self, key: str, values: Sequence[str]
-    ) -> None:
-        self._command(["config", "--local", "--unset-all", key], {0, 5})
-        for value in values:
-            self._command(["config", "--local", "--add", key, value], {0})
+    def _local_remote_git_directories(self) -> tuple[Path, ...]:
+        values = {
+            *self._read(["remote", "get-url", "--all", self.remote]).splitlines(),
+            *self._read(
+                ["remote", "get-url", "--push", "--all", self.remote]
+            ).splitlines(),
+        }
+        if not values:
+            raise WorkerFailure("repository recovery requires a remote URL")
+        return tuple(sorted(self._local_git_directory(value) for value in values))
+
+    def _local_git_directory(self, value: str) -> Path:
+        parsed = urlsplit(value)
+        if parsed.scheme == "file" and parsed.hostname in (None, "", "localhost"):
+            path = Path(unquote(parsed.path))
+        elif not parsed.scheme and ":" not in value:
+            path = Path(value)
+            if not path.is_absolute():
+                path = self.root / path
+        else:
+            raise WorkerFailure(
+                "repository recovery cannot guarantee remote ref preservation "
+                "without a credential-isolated recovery agent"
+            )
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise WorkerFailure(f"could not resolve local Git remote: {exc}") from exc
+        if not resolved.is_dir():
+            raise WorkerFailure("local Git remote is not a directory")
+        return resolved
+
+    @staticmethod
+    def _ref_storage_paths(git_directory: Path) -> tuple[Path, ...]:
+        paths = [git_directory]
+        for filename in ("HEAD", "packed-refs"):
+            path = git_directory / filename
+            if path.exists():
+                paths.append(path)
+        refs = git_directory / "refs"
+        heads = refs / "heads"
+        if heads.exists():
+            paths.extend(sorted(heads.rglob("*")))
+            paths.append(heads)
+        if refs.exists():
+            paths.append(refs)
+        if any(path.is_symlink() for path in paths):
+            raise WorkerFailure("Git ref storage must not contain symbolic links")
+        return tuple(dict.fromkeys(paths))
 
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
         """Read a note from an AWM-owned remote ref without changing branch heads."""

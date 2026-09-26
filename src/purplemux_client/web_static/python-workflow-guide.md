@@ -635,10 +635,12 @@ trust local tracking refs. Use it when a workflow must compare a configured
 development branch with the remote's current branch set.
 `inspect_local_branch_heads()` provides the corresponding authoritative local
 branch set across linked worktrees. Repository recovery snapshots both sets and
-uses `protect_branch_history()` to reject local ref transactions and pushes
-before asking an agent to act. It then requires both ref sets to remain exact as
-defense in depth: recovery never repairs provenance by amending, rebasing,
-resetting, or otherwise rewriting local or remote-visible history.
+uses `protect_branch_history()` to serialize recovery and make locally enforceable
+local and remote ref storage read-only before asking an agent to act. Hosted
+remotes fail closed before agent execution because the workflow cannot guarantee
+that the agent lacks push credentials. It then requires both ref sets to remain
+exact as defense in depth: recovery never repairs provenance by amending,
+rebasing, resetting, or otherwise rewriting local or remote-visible history.
 
 The inspection-aware Git operations that may mutate are:
 

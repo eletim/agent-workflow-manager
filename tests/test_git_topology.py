@@ -315,17 +315,31 @@ def test_recovery_history_protection_rejects_amend_and_force_push(
     git(work, "commit", "--allow-empty", "-m", "published result")
     published = git(work, "rev-parse", "HEAD")
     git(work, "push", "origin", branch)
+    remote_url = git(work, "remote", "get-url", "origin")
+    git(work, "config", "--local", "core.hooksPath", ".existing-hooks")
+    git(work, "config", "--local", "remote.origin.pushurl", remote_url)
 
     with repo.protect_branch_history():
+        assert git(work, "config", "--local", "core.hooksPath") == ".existing-hooks"
+        assert git(work, "config", "--local", "remote.origin.pushurl") == remote_url
         amend = subprocess.run(
-            ["git", "commit", "--amend", "--allow-empty", "-m", "rewritten"],
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--amend",
+                "--allow-empty",
+                "-m",
+                "rewritten",
+            ],
             cwd=work,
             capture_output=True,
             text=True,
             check=False,
         )
         force_push = subprocess.run(
-            ["git", "push", "--force", "origin", f"{base}:refs/heads/{branch}"],
+            ["git", "push", "--force", remote_url, f"{base}:refs/heads/{branch}"],
             cwd=work,
             capture_output=True,
             text=True,
@@ -336,16 +350,56 @@ def test_recovery_history_protection_rejects_amend_and_force_push(
     assert force_push.returncode != 0
     assert git(work, "rev-parse", "HEAD") == published
     assert repo.inspect_remote_branch_heads()[branch] == published
-    for key in ("core.hooksPath", "remote.origin.pushurl"):
-        restored = subprocess.run(
-            ["git", "config", "--local", "--get-all", key],
-            cwd=work,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert restored.returncode == 1
-        assert restored.stdout == ""
+    assert git(work, "config", "--local", "core.hooksPath") == ".existing-hooks"
+    assert git(work, "config", "--local", "remote.origin.pushurl") == remote_url
+
+
+def test_recovery_history_protection_serializes_overlapping_contexts(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    first = open_repo(work, RecordingGitRunner())
+    second = open_repo(work, RecordingGitRunner())
+    second_entered = threading.Event()
+    release_second = threading.Event()
+
+    def enter_second() -> None:
+        with second.protect_branch_history():
+            second_entered.set()
+            assert release_second.wait(5)
+
+    thread = threading.Thread(target=enter_second)
+    with first.protect_branch_history():
+        thread.start()
+        assert not second_entered.wait(0.2)
+
+    assert second_entered.wait(5)
+    release_second.set()
+    thread.join(5)
+    assert not thread.is_alive()
+
+    git(work, "commit", "--allow-empty", "-m", "protection was restored")
+
+
+def test_recovery_history_protection_fails_closed_for_hosted_remote(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    before = git(work, "rev-parse", "HEAD")
+    git(
+        work,
+        "config",
+        "--local",
+        "remote.origin.pushurl",
+        "https://github.com/acme/project.git",
+    )
+
+    with pytest.raises(WorkerFailure, match="credential-isolated recovery agent"):
+        with repo.protect_branch_history():
+            pytest.fail("hosted-remote recovery must not start")
+
+    assert git(work, "rev-parse", "HEAD") == before
 
 
 def test_remote_notes_persist_recovery_state_without_moving_branches(
