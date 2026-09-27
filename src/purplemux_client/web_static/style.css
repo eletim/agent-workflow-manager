@@ -29,15 +29,14 @@ h2, label { font-size: 14px; font-weight: 650; }
   background: #171b24;
   padding: 16px;
 }
-.runtime-panel { margin-top: 14px; padding: 0; }
-.runtime-heading {
-  padding: 16px;
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 650;
-}
-.runtime-panel[open] .runtime-heading { border-bottom: 1px solid #303746; }
-.runtime-content { padding: 0 14px 14px; }
+.runtime-panel { margin-top: 14px; }
+.runtime-content { min-width: 0; }
+.runtime-view-active .editor-panel > :not(.execution-navigation):not(.editor-mode-bar):not(.controls),
+.runtime-view-active #validate,
+.runtime-view-active #dry-run,
+.runtime-view-active #run { display: none; }
+.runtime-view-active .editor-panel { padding-bottom: 2px; }
+.runtime-view-active .execution-navigation { margin-bottom: 14px; }
 .runs-panel { margin-top: 14px; }
 .runs-heading {
   display: flex;
@@ -184,7 +183,7 @@ textarea {
 }
 .primary-view-entry span { font-size: 16px; font-weight: 650; }
 .primary-view-entry small { margin-top: 3px; color: #c9c0ec; }
-.issue-driven-entry.selected { background: #6846d7; }
+.primary-view-entry.selected { background: #6846d7; }
 .developer-views {
   margin-top: 8px;
   padding: 0 10px;
