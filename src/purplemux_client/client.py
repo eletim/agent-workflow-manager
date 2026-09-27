@@ -2380,6 +2380,8 @@ exec "$real_git" "$@"
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
+            "awm_delivery_transition_pending=0 && "
+            "awm_delivery_new='' && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
@@ -2428,10 +2430,38 @@ exec "$real_git" "$@"
             'retained at $awm_delivery_recovery" >&2; fi; '
             'exit "$awm_delivery_primary_status"; '
             "} && "
+            "awm_delivery_rollback() { "
+            "awm_delivery_rollback_failed=0; "
+            'awm_delivery_rollback_current=$("$awm_delivery_real_git" '
+            'rev-parse "$awm_delivery_ref") || '
+            "awm_delivery_rollback_failed=1; "
+            'if [ "$awm_delivery_rollback_failed" -eq 0 ] && '
+            '[ "$awm_delivery_rollback_current" = "$awm_delivery_new" ]; then '
+            '"$awm_delivery_real_git" -c core.hooksPath=/dev/null update-ref '
+            '"$awm_delivery_ref" "$awm_delivery_old" "$awm_delivery_new" || '
+            "awm_delivery_rollback_failed=1; "
+            'elif [ "$awm_delivery_rollback_failed" -eq 0 ] && '
+            '[ "$awm_delivery_rollback_current" != "$awm_delivery_old" ]; then '
+            "awm_delivery_rollback_failed=1; fi; "
+            'if [ "$awm_delivery_rollback_failed" -eq 0 ]; then '
+            '"$awm_delivery_real_git" read-tree --reset -u '
+            '"$awm_delivery_old" 2>/dev/null || '
+            "awm_delivery_rollback_failed=1; fi; "
+            "awm_delivery_transition_pending=0; "
+            'if [ "$awm_delivery_rollback_failed" -ne 0 ]; then '
+            "printf '%s\\n' 'publication-disabled delivery rollback failed' >&2; "
+            "return 1; fi; return 0; "
+            "} && "
+            "awm_delivery_signal() { "
+            "trap - HUP INT TERM; "
+            'if [ "$awm_delivery_transition_pending" -ne 0 ]; then '
+            "awm_delivery_rollback || :; fi; "
+            'awm_delivery_cleanup "$1"; '
+            "} && "
             "trap 'awm_delivery_cleanup $?' EXIT && "
-            "trap 'awm_delivery_cleanup 129' HUP && "
-            "trap 'awm_delivery_cleanup 130' INT && "
-            "trap 'awm_delivery_cleanup 143' TERM && "
+            "trap 'awm_delivery_signal 129' HUP && "
+            "trap 'awm_delivery_signal 130' INT && "
+            "trap 'awm_delivery_signal 143' TERM && "
             ': > "$awm_delivery_manifest" && '
             f"awm_delivery_allocate=$(printf %s {resource_allocator} | "
             "base64 --decode) && "
@@ -2581,26 +2611,23 @@ exec "$real_git" "$@"
             '"$awm_delivery_real_git" index-pack --stdin --fix-thin --strict '
             ">/dev/null || awm_delivery_delivery_status=$?; fi; "
             'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
+            "awm_delivery_transition_pending=1; "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             'AWM_DELIVERY_PROTECTED_ROOT="$awm_delivery_root" '
             '"$awm_delivery_real_git" -c '
             'core.hooksPath="$awm_delivery_hooks" update-ref '
             '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" || '
-            "awm_delivery_delivery_status=$?; fi; "
+            "awm_delivery_delivery_status=$?; "
+            'if [ "$awm_delivery_delivery_status" -ne 0 ]; then '
+            "awm_delivery_transition_pending=0; fi; fi; "
             'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
             '"$awm_delivery_real_git" read-tree --reset -u '
             '"$awm_delivery_new"; '
             "awm_delivery_index_status=$?; "
             'if [ "$awm_delivery_index_status" -ne 0 ]; then '
-            'if ! "$awm_delivery_real_git" -c core.hooksPath=/dev/null '
-            'update-ref "$awm_delivery_ref" "$awm_delivery_old" '
-            '"$awm_delivery_new"; then '
-            "printf '%s\\n' 'publication-disabled delivery rollback failed' >&2; "
-            "fi; "
-            '"$awm_delivery_real_git" read-tree "$awm_delivery_old" '
-            "2>/dev/null || :; "
+            "awm_delivery_rollback || :; "
             "awm_delivery_delivery_status=$awm_delivery_index_status; "
-            "fi; fi; "
+            "else awm_delivery_transition_pending=0; fi; fi; "
             'if [ "$awm_delivery_delivery_status" -ne 0 ]; then '
             "printf '%s\\n' 'publication-disabled delivery failed' >&2; "
             'exit "$awm_delivery_delivery_status"; fi'

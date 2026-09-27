@@ -1859,6 +1859,115 @@ def test_publication_disabled_reports_rollback_separately_from_delivery_failure(
             shutil.rmtree(recovery, ignore_errors=True)
 
 
+def test_publication_disabled_signal_rolls_back_pending_delivery(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    blocked = tmp_path / "delivery-read-tree-blocked"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = read-tree ] && [ "$2" = --reset ] && [ "$3" = -u ] '
+        '&& [ ! -e "$AWM_TEST_DELIVERY_BLOCKED" ]; then\n'
+        '    : > "$AWM_TEST_DELIVERY_BLOCKED"\n'
+        "    while :; do sleep 1; done\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'after\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m interrupted-delivery >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_DELIVERY_BLOCKED": str(blocked),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "commit a change"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    recovery: Path | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while process.poll() is None and not blocked.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail("delivery read-tree was not reached")
+            time.sleep(0.01)
+        if process.poll() is not None:
+            pytest.fail("publication-disabled session exited before delivery signal")
+
+        os.killpg(process.pid, signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+
+        assert process.returncode == 143
+        assert "publication-disabled delivery rollback failed" not in stderr
+        recovery_line = next(
+            line
+            for line in stderr.splitlines()
+            if line.startswith(
+                "publication-disabled agent output recovery retained at "
+            )
+        )
+        recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+        assert (recovery / ".complete").is_file()
+        assert (recovery / "recovery.bundle").is_file()
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "before\n"
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == ""
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+        )
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        if recovery is not None:
+            shutil.rmtree(recovery, ignore_errors=True)
+
+
 @pytest.mark.parametrize(
     ("agent_status", "use_pty"),
     [(0, False), (29, False), (0, True), (29, True)],
