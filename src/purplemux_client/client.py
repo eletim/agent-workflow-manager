@@ -1553,6 +1553,44 @@ done
 """
         ).decode("ascii")
         pre_push_hook = base64.b64encode(b"#!/bin/sh\nexit 1\n").decode("ascii")
+        git_wrapper = base64.b64encode(
+            b"""#!/bin/sh
+probe=$PWD
+next_is_c=false
+skip_next=false
+for argument do
+    if [ "$skip_next" = true ]; then
+        skip_next=false
+        continue
+    fi
+    if [ "$next_is_c" = true ]; then
+        probe=$(cd "$probe" && cd "$argument" && pwd -P) || exec "$AWM_DELIVERY_REAL_GIT" "$@"
+        next_is_c=false
+        continue
+    fi
+    case $argument in
+        -C) next_is_c=true ;;
+        -C?*) probe=$(cd "$probe" && cd "${argument#-C}" && pwd -P) || exec "$AWM_DELIVERY_REAL_GIT" "$@" ;;
+        -c|--config-env) skip_next=true ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+root=$("$AWM_DELIVERY_REAL_GIT" -C "$probe" rev-parse --show-toplevel 2>/dev/null) || {
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    exec "$AWM_DELIVERY_REAL_GIT" "$@"
+}
+root=$(cd "$root" && pwd -P) || exit 1
+if [ "$root" = "$AWM_DELIVERY_PROTECTED_ROOT" ]; then
+    GIT_DIR=$AWM_DELIVERY_SHADOW_GIT_DIR
+    GIT_WORK_TREE=$AWM_DELIVERY_PROTECTED_ROOT
+    export GIT_DIR GIT_WORK_TREE
+else
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+fi
+exec "$AWM_DELIVERY_REAL_GIT" "$@"
+"""
+        ).decode("ascii")
         environment_options = [
             "env",
             "-u",
@@ -1569,6 +1607,12 @@ done
             "GIT_DIR",
             "-u",
             "GIT_WORK_TREE",
+            "-u",
+            "GIT_INDEX_FILE",
+            "-u",
+            "GIT_OBJECT_DIRECTORY",
+            "-u",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         ]
         git_environment = [
             "GIT_CONFIG_GLOBAL=/dev/null",
@@ -1614,6 +1658,7 @@ done
                         "enabled": True,
                         "allowUnsandboxedCommands": False,
                         "failIfUnavailable": True,
+                        "filesystem": {"denyWrite": ["./.git"]},
                         "network": {
                             "allowedDomains": [],
                             "deniedDomains": ["github.com", "*.github.com"],
@@ -1669,29 +1714,108 @@ done
             raise WorkerFailure(
                 "publication-disabled session worker must be codex or claude"
             )
-        launch = shlex.join(command)
+        additional_git_directories = '--add-dir "$awm_delivery_shadow_git_dir"'
+        option_index = (
+            command.index("exec") if worker == "codex" else command.index("claude") + 1
+        )
+        launch = (
+            f"{shlex.join(command[:option_index])} {additional_git_directories} "
+            f"{shlex.join(command[option_index:])}"
+        )
         return (
-            "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
-            "mkdir -p -- \"$awm_delivery_hooks_root\" && "
-            "awm_delivery_hooks_root=$(cd \"$awm_delivery_hooks_root\" && pwd -P) && "
-            'awm_delivery_hooks=$(mktemp -d '
-            '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
-            'mkdir -p -- "$awm_delivery_hooks/gh" && '
-            "trap 'rm -r -- \"$awm_delivery_hooks\"' EXIT && "
+            "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY "
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES && "
+            "awm_delivery_real_git=$(command -v git) && "
+            'case "$awm_delivery_real_git" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_root=$(pwd -P) && "
+            "awm_delivery_object_dir=$(git rev-parse --path-format=absolute "
+            "--git-path objects) && "
+            'awm_delivery_object_dir=$(cd "$awm_delivery_object_dir" && pwd -P) && '
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
+            'awm_delivery_old=$(git rev-parse "$awm_delivery_ref") && '
+            "awm_delivery_sparse=$(git config --bool core.sparseCheckout "
+            "2>/dev/null || :) && "
+            'if [ "$awm_delivery_sparse" = true ]; then '
+            "printf '%s\\n' 'publication-disabled sessions do not support "
+            "sparse checkouts' >&2; exit 1; fi && "
+            "awm_delivery_user_name=$(git config --get user.name) && "
+            "awm_delivery_user_email=$(git config --get user.email) && "
+            "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
+            'mkdir -p -- "$awm_delivery_hooks_root" && '
+            'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
+            "umask 077 && "
+            "awm_delivery_hooks=$(mktemp -d "
+            '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
+            "awm_delivery_shadow_git_dir=$(mktemp -d "
+            '"/tmp/awm-delivery-shadow.XXXXXX") && '
+            'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
+            "trap 'rm -r -- \"$awm_delivery_hooks\" "
+            "\"$awm_delivery_shadow_git_dir\"' EXIT && "
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
             f"printf %s {pre_push_hook} | base64 --decode > "
             '"$awm_delivery_hooks/pre-push" && '
+            f"printf %s {git_wrapper} | base64 --decode > "
+            '"$awm_delivery_hooks/bin/git" && '
             'chmod 500 "$awm_delivery_hooks/reference-transaction" '
-            '"$awm_delivery_hooks/pre-push" && '
+            '"$awm_delivery_hooks/pre-push" "$awm_delivery_hooks/bin/git" && '
+            '"$awm_delivery_real_git" init --bare --quiet '
+            '"$awm_delivery_shadow_git_dir" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            "config core.bare false && "
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'config core.worktree "$awm_delivery_root" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'config user.name "$awm_delivery_user_name" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'config user.email "$awm_delivery_user_email" && '
+            "printf '%s\\n' \"$awm_delivery_object_dir\" > "
+            '"$awm_delivery_shadow_git_dir/objects/info/alternates" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'symbolic-ref HEAD "$awm_delivery_ref" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'update-ref "$awm_delivery_ref" "$awm_delivery_old" && '
+            'GIT_DIR="$awm_delivery_shadow_git_dir" '
+            'GIT_WORK_TREE="$awm_delivery_root" '
+            '"$awm_delivery_real_git" read-tree "$awm_delivery_old" && '
+            "awm_delivery_original_path=$PATH && "
+            'PATH="$awm_delivery_hooks/bin:$PATH" && '
+            'export PATH AWM_DELIVERY_REAL_GIT="$awm_delivery_real_git" '
+            'AWM_DELIVERY_SHADOW_GIT_DIR="$awm_delivery_shadow_git_dir" '
+            'AWM_DELIVERY_PROTECTED_ROOT="$awm_delivery_root" && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
-            'AWM_DELIVERY_PROTECTED_ROOT="$(pwd -P)" '
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
             'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
-            f"{launch}"
+            f"{launch}; "
+            "awm_delivery_status=$?; "
+            "PATH=$awm_delivery_original_path; export PATH; "
+            '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
+            'awm_delivery_new=$(tr -d \'\\n\' < '
+            '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '
+            'case "$awm_delivery_new" in \'\'|*[!0-9a-f]*) exit 1 ;; esac && '
+            'awm_delivery_current=$("$awm_delivery_real_git" rev-parse '
+            '"$awm_delivery_ref") && '
+            '[ "$awm_delivery_current" = "$awm_delivery_old" ] && '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
+            '"$awm_delivery_real_git" cat-file -e "$awm_delivery_new^{commit}" && '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
+            '"$awm_delivery_real_git" merge-base --is-ancestor '
+            '"$awm_delivery_old" "$awm_delivery_new" && '
+            "printf '%s\\n^%s\\n' \"$awm_delivery_new\" "
+            '"$awm_delivery_old" | '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
+            '"$awm_delivery_real_git" '
+            "pack-objects --quiet --stdout --revs | "
+            '"$awm_delivery_real_git" index-pack --stdin --fix-thin --strict '
+            ">/dev/null && "
+            'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
+            'AWM_DELIVERY_PROTECTED_ROOT="$awm_delivery_root" '
+            '"$awm_delivery_real_git" -c '
+            'core.hooksPath="$awm_delivery_hooks" update-ref '
+            '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" && '
+            '"$awm_delivery_real_git" read-tree "$awm_delivery_new"'
         )
 
     def _with_shell_diagnostic(

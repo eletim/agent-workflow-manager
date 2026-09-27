@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -284,6 +285,18 @@ def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
     attempt: str, worker: str, tmp_path: Path
 ) -> None:
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
     fake_worker = tmp_path / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
@@ -352,6 +365,7 @@ def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:
     assert settings["sandbox"]["enabled"] is True
     assert settings["sandbox"]["allowUnsandboxedCommands"] is False
     assert settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["filesystem"]["denyWrite"] == ["./.git"]
     assert settings["sandbox"]["network"]["allowedDomains"] == []
     assert settings["sandbox"]["network"]["strictAllowlist"] is True
     assert settings["sandbox"]["network"]["deniedDomains"] == [
@@ -418,6 +432,583 @@ def test_publication_disabled_allows_commits_in_nested_repository(
         capture_output=True,
         text=True,
     ).stdout.strip() == "nested"
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_allows_only_linked_checkout_git_metadata(
+    worker: str, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository parent"
+    checkout = tmp_path / "linked checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "test@example.com",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/scoped-commit",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    arguments_path = tmp_path / f"{worker}-arguments"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$@" > "$AWM_TEST_ARGUMENTS"\n'
+        "git commit --allow-empty -m linked-forward >/dev/null 2>&1\n"
+        "forward=$?\n"
+        "git commit --amend --allow-empty -m forbidden-rewrite >/dev/null 2>&1\n"
+        "rewrite=$?\n"
+        "git tag forbidden-tag >/dev/null 2>&1\n"
+        "tag=$?\n"
+        'printf \'%s %s %s\\n\' "$forward" "$rewrite" "$tag"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_ARGUMENTS"] = str(arguments_path)
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    forward, rewrite, tag = result.stdout.strip().split()
+    assert forward == "0"
+    assert rewrite != "0"
+    assert tag != "0"
+    arguments = arguments_path.read_text(encoding="utf-8").splitlines()
+    writable_directories = {
+        arguments[index + 1]
+        for index, argument in enumerate(arguments[:-1])
+        if argument == "--add-dir"
+    }
+    git_dir = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    common_dir = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert len(writable_directories) == 1
+    (shadow_git_path,) = writable_directories
+    shadow_git_dir = Path(shadow_git_path)
+    assert shadow_git_dir.name.startswith("awm-delivery-shadow.")
+    assert Path(common_dir) not in shadow_git_dir.parents
+    assert git_dir not in writable_directories
+    assert common_dir not in writable_directories
+    assert str(Path(common_dir) / "objects") not in writable_directories
+    assert str(Path(common_dir) / "refs" / "heads" / "feature") not in writable_directories
+    assert (
+        str(Path(common_dir) / "logs" / "refs" / "heads" / "feature")
+        not in writable_directories
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "linked-forward"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "tag", "--list", "forbidden-tag"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_rejects_modified_sparse_checkout_before_launch(
+    worker: str, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    checkout = tmp_path / "linked-checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    (repository / "included").mkdir()
+    (repository / "included" / "tracked.txt").write_text("before\n", encoding="utf-8")
+    (repository / "omitted").mkdir()
+    (repository / "omitted" / "tracked.txt").write_text("preserve\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/sparse",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "sparse-checkout", "set", "included"],
+        check=True,
+        capture_output=True,
+    )
+    modified = checkout / "included" / "tracked.txt"
+    modified.write_text("after\n", encoding="utf-8")
+    original_head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    marker = tmp_path / "worker-launched"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        'printf launched > "$AWM_TEST_LAUNCH_MARKER"\n'
+        "git add -A && git commit -m unintended\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_LAUNCH_MARKER"] = str(marker)
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit change"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "do not support sparse checkouts" in result.stderr
+    assert not marker.exists()
+    assert modified.read_text(encoding="utf-8") == "after\n"
+    assert not (checkout / "omitted" / "tracked.txt").exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == original_head
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "status", "--short"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == " M included/tracked.txt\n"
+    )
+
+
+def test_publication_disabled_repeated_commits_transfer_only_new_objects(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    checkout = tmp_path / "linked-checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    tracked = repository / "tracked"
+    tracked.mkdir()
+    for index in range(32):
+        (tracked / f"file-{index:02}.txt").write_text(
+            f"base {index}\n", encoding="utf-8"
+        )
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    for index in range(3):
+        (tracked / f"file-{index:02}.txt").write_text(
+            f"history {index}\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-am", f"history {index}"],
+            check=True,
+            capture_output=True,
+        )
+    historical_object_count = len(
+        subprocess.run(
+            ["git", "-C", str(repository), "rev-list", "--objects", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/repeated",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf 'next\\n' >> tracked/file-00.txt\n"
+        "git add tracked/file-00.txt\n"
+        "git commit -m incremental >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    pack_directory = repository / ".git" / "objects" / "pack"
+
+    transferred_object_counts: list[int] = []
+    for _ in range(2):
+        packs_before = set(pack_directory.glob("*.idx"))
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(
+                "codex", "commit one change"
+            ),
+            cwd=checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        new_packs = set(pack_directory.glob("*.idx")) - packs_before
+        assert len(new_packs) == 1
+        (new_pack,) = new_packs
+        verify_lines = subprocess.run(
+            ["git", "verify-pack", "-v", str(new_pack)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        transferred_object_counts.append(
+            sum(
+                len(fields) >= 5 and fields[1] in {"blob", "commit", "tag", "tree"}
+                for fields in (line.split() for line in verify_lines)
+            )
+        )
+
+    assert historical_object_count > 32
+    assert transferred_object_counts == [4, 4]
+    assert all(count < historical_object_count for count in transferred_object_counts)
+    assert subprocess.run(
+        ["git", "-C", str(checkout), "log", "-2", "--format=%s"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines() == ["incremental", "incremental"]
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
+    worker: str, tmp_path: Path
+) -> None:
+    sandbox_engine = shutil.which("codex" if worker == "codex" else "bwrap")
+    if sandbox_engine is None:
+        pytest.skip(f"{worker} sandbox engine is unavailable")
+
+    repository = tmp_path / "repository"
+    checkout = tmp_path / "linked-checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "branch", "feature/sibling"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/scoped-commit",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    def git_path(name: str) -> Path:
+        return Path(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    name,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+
+    active_ref = git_path("refs/heads/feature/scoped-commit")
+    sibling_ref = git_path("refs/heads/feature/sibling")
+    active_log = git_path("logs/refs/heads/feature/scoped-commit")
+    git_pointer = checkout / ".git"
+    common_git_dir = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    protected_contents = {
+        path: path.read_bytes()
+        for path in (active_ref, sibling_ref, active_log, git_pointer)
+    }
+    base = protected_contents[active_ref].decode().strip()
+
+    payload = checkout / "sandbox-payload"
+    payload.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m sandbox-forward >/dev/null 2>&1\n"
+        "forward=$?\n"
+        "git commit --amend --allow-empty -m forbidden-rewrite >/dev/null 2>&1\n"
+        "rewrite=$?\n"
+        "git tag forbidden-tag >/dev/null 2>&1\n"
+        "tag=$?\n"
+        '(printf attack > "$AWM_TEST_ACTIVE_REF") 2>/dev/null\n'
+        "active=$?\n"
+        '(printf attack > "$AWM_TEST_SIBLING_REF") 2>/dev/null\n'
+        "sibling=$?\n"
+        '(printf attack >> "$AWM_TEST_ACTIVE_LOG") 2>/dev/null\n'
+        "reflog=$?\n"
+        "(printf attack > .git) 2>/dev/null\n"
+        "git_pointer=$?\n"
+        '"$AWM_TEST_REAL_GIT" update-ref "$AWM_TEST_ACTIVE_REF_NAME" '
+        '"$AWM_TEST_BASE" >/dev/null 2>&1\n'
+        "direct_git=$?\n"
+        'printf \'%s %s %s %s %s %s %s %s\\n\' "$forward" "$rewrite" '
+        '"$tag" "$active" "$sibling" "$reflog" "$git_pointer" '
+        '"$direct_git" > sandbox-results\n',
+        encoding="utf-8",
+    )
+    payload.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        "arguments = sys.argv[1:]\n"
+        "shadow = arguments[arguments.index('--add-dir') + 1]\n"
+        "engine = os.environ['AWM_TEST_SANDBOX_ENGINE']\n"
+        "payload = os.environ['AWM_TEST_SANDBOX_PAYLOAD']\n"
+        "if os.environ['AWM_TEST_SANDBOX_KIND'] == 'codex':\n"
+        "    filesystem = (\n"
+        '        \'{":workspace_roots"={".git"="read","."="write"},\'\n'
+        "        + json.dumps(shadow) + '=\"write\"}'\n"
+        "    )\n"
+        "    command = [engine, 'sandbox', '-P', 'awm-test', '-C', os.getcwd(),\n"
+        "        '-c', 'permissions.awm-test.extends=\":read-only\"',\n"
+        "        '-c', 'permissions.awm-test.filesystem=' + filesystem, '--', payload]\n"
+        "else:\n"
+        "    settings = json.loads(arguments[arguments.index('--settings') + 1])\n"
+        "    deny_write = settings['sandbox']['filesystem']['denyWrite']\n"
+        "    mandatory_deny_write = [\n"
+        "        os.path.join(os.environ['AWM_TEST_COMMON_GIT_DIR'], 'config'),\n"
+        "        os.path.join(os.environ['AWM_TEST_COMMON_GIT_DIR'], 'hooks'),\n"
+        "    ]\n"
+        "    command = [engine, '--die-with-parent', '--new-session', '--unshare-net',\n"
+        "        '--ro-bind', '/', '/', '--dev-bind', '/dev', '/dev',\n"
+        "        '--proc', '/proc', '--bind', os.getcwd(), os.getcwd(),\n"
+        "        '--bind', shadow, shadow]\n"
+        "    for denied in deny_write + mandatory_deny_write:\n"
+        "        denied_path = (denied if os.path.isabs(denied) else\n"
+        "            os.path.realpath(os.path.join(os.getcwd(), denied)))\n"
+        "        command.extend(['--ro-bind', denied_path, denied_path])\n"
+        "    command.extend(['--chdir', os.getcwd(), payload])\n"
+        "raise SystemExit(subprocess.run(command, check=False).returncode)\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_ACTIVE_LOG": str(active_log),
+            "AWM_TEST_ACTIVE_REF": str(active_ref),
+            "AWM_TEST_ACTIVE_REF_NAME": "refs/heads/feature/scoped-commit",
+            "AWM_TEST_BASE": base,
+            "AWM_TEST_COMMON_GIT_DIR": str(common_git_dir),
+            "AWM_TEST_REAL_GIT": shutil.which("git") or "git",
+            "AWM_TEST_SANDBOX_ENGINE": sandbox_engine,
+            "AWM_TEST_SANDBOX_KIND": worker,
+            "AWM_TEST_SANDBOX_PAYLOAD": str(payload),
+            "AWM_TEST_SIBLING_REF": str(sibling_ref),
+        }
+    )
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    statuses = (checkout / "sandbox-results").read_text(encoding="utf-8").split()
+    assert statuses[0] == "0"
+    assert all(status != "0" for status in statuses[1:])
+    assert protected_contents[sibling_ref] == sibling_ref.read_bytes()
+    assert protected_contents[git_pointer] == git_pointer.read_bytes()
+    assert active_ref.read_text(encoding="utf-8").strip() != base
+    assert active_log.read_bytes().startswith(protected_contents[active_log])
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "sandbox-forward"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "tag", "--list", "forbidden-tag"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
 
 
 def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_tags(
