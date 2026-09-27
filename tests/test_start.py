@@ -99,7 +99,6 @@ fi
 """,
     )
     _executable(fake_bin / "tailscale", "exit 1\n")
-    _executable(fake_bin / "bwrap", "exit 0\n")
     if with_notify:
         _executable(fake_bin / "notify", "exit 0\n")
     environment = {
@@ -157,35 +156,6 @@ def test_start_syncs_and_launches_runner_with_notify_disabled(
         in calls[2]
     )
     assert "notifications disabled" in completed.stdout.lower()
-
-
-def test_start_reports_missing_bubblewrap_before_sync(tmp_path: Path) -> None:
-    environment, call_log, _ = _start_environment(tmp_path)
-    (tmp_path / "bin" / "bwrap").unlink()
-    missing_path = tmp_path / "missing-bin"
-    missing_path.mkdir()
-    for command in ("bash", "timeout"):
-        (missing_path / command).symlink_to(shutil.which(command) or f"/bin/{command}")
-    environment["PATH"] = f"{tmp_path / 'bin'}:{missing_path}"
-
-    completed = _run_start(environment)
-
-    assert completed.returncode != 0
-    assert "require Bubblewrap (bwrap)" in completed.stderr
-    assert "bubblewrap package" in completed.stderr
-    assert not call_log.exists()
-
-
-def test_start_reports_unusable_bubblewrap_before_sync(tmp_path: Path) -> None:
-    environment, call_log, _ = _start_environment(tmp_path)
-    _executable(tmp_path / "bin" / "bwrap", "exit 1\n")
-
-    completed = _run_start(environment)
-
-    assert completed.returncode != 0
-    assert "cannot create the sandbox" in completed.stderr
-    assert "unprivileged user namespaces" in completed.stderr
-    assert not call_log.exists()
 
 
 def test_start_passes_environment_selected_purplemux_port(tmp_path: Path) -> None:
