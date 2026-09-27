@@ -284,6 +284,18 @@ def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
     attempt: str, worker: str, tmp_path: Path
 ) -> None:
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
     fake_worker = tmp_path / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
@@ -420,10 +432,7 @@ def test_publication_disabled_allows_commits_in_nested_repository(
     ).stdout.strip() == "nested"
 
 
-@pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_allows_only_linked_checkout_git_metadata(
-    worker: str, tmp_path: Path
-) -> None:
+def linked_delivery_checkout(tmp_path: Path) -> tuple[Path, Path]:
     repository = tmp_path / "repository parent"
     checkout = tmp_path / "linked checkout"
     subprocess.run(
@@ -454,6 +463,9 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
         capture_output=True,
     )
     subprocess.run(
+        ["git", "-C", str(repository), "branch", "feature/sibling"], check=True
+    )
+    subprocess.run(
         [
             "git",
             "-C",
@@ -467,6 +479,14 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
         check=True,
         capture_output=True,
     )
+    return repository, checkout
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_allows_only_linked_checkout_git_metadata(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
     arguments_path = tmp_path / f"{worker}-arguments"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -560,6 +580,111 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
         ).stdout
         == ""
     )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+@pytest.mark.parametrize("attack", ["sibling-ref", "hook-override"])
+def test_publication_disabled_audits_ref_writes_that_bypass_hooks(
+    worker: str, attack: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    sibling_before = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    attack_command = (
+        'active=$(git rev-parse --git-path refs/heads/feature/scoped-commit)\n'
+        'sibling=$(git rev-parse --git-path refs/heads/feature/sibling)\n'
+        'cp -- "$active" "$sibling"\n'
+        if attack == "sibling-ref"
+        else "git -c core.hooksPath=/dev/null commit --amend --allow-empty "
+        "-m forbidden-rewrite >/dev/null 2>&1\n"
+    )
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m forward >/dev/null 2>&1\n"
+        + attack_command
+        + 'printf \'%s\\n\' "$?"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "attack refs"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.stdout.strip() == "0"
+    assert result.returncode != 0
+    assert "Git ref audit failed" in result.stderr
+    if attack == "sibling-ref":
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            != sibling_before
+        )
+    else:
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == "forbidden-rewrite"
+        )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_rejects_non_files_ref_storage_before_launch(
+    worker: str, tmp_path: Path
+) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "extensions.refStorage", "reftable"],
+        check=True,
+    )
+    launched = tmp_path / "launched"
+    fake_worker = tmp_path / worker
+    fake_worker.write_text(
+        f"#!/bin/sh\nprintf launched > {shlex.quote(str(launched))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "not reached"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "require the Git files ref backend" in result.stderr
+    assert not launched.exists()
 
 
 def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_tags(

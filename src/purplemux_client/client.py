@@ -1694,6 +1694,11 @@ done
         return (
             "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY "
             "GIT_ALTERNATE_OBJECT_DIRECTORIES && "
+            "awm_delivery_ref_storage=$(git config --get extensions.refStorage "
+            "|| :) && "
+            'case "$awm_delivery_ref_storage" in ""|files) ;; *) '
+            "printf '%s\\n' 'publication-disabled sessions require the Git "
+            "files ref backend' >&2; exit 1 ;; esac && "
             "awm_delivery_git_dir=$(git rev-parse --absolute-git-dir) && "
             'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
             "awm_delivery_common_dir=$(git rev-parse --path-format=absolute "
@@ -1711,9 +1716,8 @@ done
             "awm_delivery_ref_log_path=$(git rev-parse --path-format=absolute "
             '--git-path "logs/$awm_delivery_ref") && '
             "awm_delivery_ref_log_dir=${awm_delivery_ref_log_path%/*} && "
-            'if [ -d "$awm_delivery_ref_log_dir" ]; then '
-            'awm_delivery_ref_log_dir=$(cd "$awm_delivery_ref_log_dir" && pwd -P); '
-            'else awm_delivery_ref_log_dir="$awm_delivery_object_dir"; fi && '
+            '[ -f "$awm_delivery_ref_log_path" ] && '
+            'awm_delivery_ref_log_dir=$(cd "$awm_delivery_ref_log_dir" && pwd -P) && '
             'if [ "$awm_delivery_git_dir" = "$awm_delivery_common_dir" ]; then '
             'awm_delivery_checkout_git_dir="$awm_delivery_object_dir"; '
             'else awm_delivery_checkout_git_dir="$awm_delivery_git_dir"; fi && '
@@ -1731,13 +1735,53 @@ done
             '"$awm_delivery_hooks/pre-push" && '
             'chmod 500 "$awm_delivery_hooks/reference-transaction" '
             '"$awm_delivery_hooks/pre-push" && '
+            "awm_delivery_list_other_refs() { "
+            'git for-each-ref --format="%(refname) %(objectname) %(symref)" '
+            '> "$1.all" && '
+            'awk -v protected="$awm_delivery_ref" \'$1 != protected\' '
+            '"$1.all" > "$1" && rm -- "$1.all"; } && '
+            'awm_delivery_list_other_refs "$awm_delivery_hooks/refs-before" && '
+            'cp -- "$awm_delivery_ref_log_path" '
+            '"$awm_delivery_hooks/ref-log-before" && '
+            'awm_delivery_old=$(git rev-parse "$awm_delivery_ref") && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             'AWM_DELIVERY_PROTECTED_ROOT="$(pwd -P)" '
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
             'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
-            f"{launch}"
+            f"{launch}; "
+            "awm_delivery_status=$?; "
+            "awm_delivery_audit() { "
+            'awm_delivery_current_ref=$(git symbolic-ref -q HEAD) && '
+            '[ "$awm_delivery_current_ref" = "$awm_delivery_ref" ] && '
+            'awm_delivery_current=$(git rev-parse "$awm_delivery_ref") && '
+            'awm_delivery_list_other_refs "$awm_delivery_hooks/refs-after" && '
+            'cmp -s "$awm_delivery_hooks/refs-before" '
+            '"$awm_delivery_hooks/refs-after" && '
+            'awm_delivery_log_size=$(wc -c < '
+            '"$awm_delivery_hooks/ref-log-before") && '
+            'head -c "$awm_delivery_log_size" "$awm_delivery_ref_log_path" '
+            '| cmp -s "$awm_delivery_hooks/ref-log-before" - && '
+            'printf \'%s\\n\' "$awm_delivery_old" > '
+            '"$awm_delivery_hooks/ref-log-tip" && '
+            'tail -c "+$((awm_delivery_log_size + 1))" '
+            '"$awm_delivery_ref_log_path" | '
+            '( awm_delivery_expected="$awm_delivery_old"; '
+            "while IFS=' ' read -r awm_delivery_log_old "
+            "awm_delivery_log_new awm_delivery_log_rest; do "
+            '[ "$awm_delivery_log_old" = "$awm_delivery_expected" ] || exit 1; '
+            'git cat-file -e "$awm_delivery_log_new^{commit}" || exit 1; '
+            'git merge-base --is-ancestor "$awm_delivery_log_old" '
+            '"$awm_delivery_log_new" || exit 1; '
+            'awm_delivery_expected="$awm_delivery_log_new"; '
+            'printf \'%s\\n\' "$awm_delivery_expected" > '
+            '"$awm_delivery_hooks/ref-log-tip"; done ) && '
+            '[ "$(cat "$awm_delivery_hooks/ref-log-tip")" = '
+            '"$awm_delivery_current" ]; } && '
+            'if ! awm_delivery_audit; then printf \'%s\\n\' '
+            "'publication-disabled Git ref audit failed' >&2; exit 1; fi; "
+            'exit "$awm_delivery_status"'
         )
 
     def _with_shell_diagnostic(
