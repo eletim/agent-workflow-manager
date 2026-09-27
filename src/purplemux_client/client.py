@@ -1587,6 +1587,37 @@ print(path, flush=True)
 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 """
         ).decode("ascii")
+        gitfile_rewriter = base64.b64encode(
+            b"""import os
+from pathlib import Path
+import sys
+
+source_root, copied_root, common_git_dir = map(Path, sys.argv[1:])
+common_git_dir = common_git_dir.resolve()
+for current, directories, files in os.walk(copied_root, followlinks=False):
+    if ".git" in directories:
+        directories.remove(".git")
+    if ".git" not in files:
+        continue
+    copied_marker = Path(current) / ".git"
+    try:
+        marker_text = copied_marker.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        continue
+    prefix = "gitdir: "
+    if not marker_text.startswith(prefix):
+        continue
+    git_dir_text = marker_text[len(prefix):].strip()
+    if os.path.isabs(git_dir_text):
+        continue
+    relative_parent = Path(current).relative_to(copied_root)
+    source_marker = source_root / relative_parent / ".git"
+    git_dir = (source_marker.parent / git_dir_text).resolve()
+    if not git_dir.is_relative_to(common_git_dir):
+        raise RuntimeError("linked Git directory escapes the common repository")
+    copied_marker.write_text(f"gitdir: {git_dir}\\n", encoding="utf-8")
+"""
+        ).decode("ascii")
         recovery_snapshot = base64.b64encode(
             b"""import json
 import os
@@ -1595,6 +1626,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 
 (
     git,
@@ -1605,18 +1637,100 @@ import sys
     protected_ref,
     old,
     common_git_dir,
+    publication_state,
+    pending_signal,
 ) = sys.argv[1:]
 blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
-signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
 recovery_path = Path(recovery)
 base_environment = os.environ.copy()
 base_environment.update({"GIT_DIR": shadow, "GIT_WORK_TREE": worktree})
+active_processes = set()
+active_processes_lock = threading.Lock()
+shutdown_requested = threading.Event()
+recovery_interrupted = threading.Event()
+recovery_handoff_required = threading.Event()
+recovery_finished = threading.Event()
+
+
+def kill_process_group(process):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def run_process(arguments, **kwargs):
+    input_data = kwargs.pop("input", None)
+    timeout = kwargs.pop("timeout", None)
+    check = kwargs.pop("check", False)
+    if input_data is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        kwargs["stdin"] = subprocess.PIPE
+    process = subprocess.Popen(arguments, **kwargs)
+    with active_processes_lock:
+        active_processes.add(process)
+    try:
+        try:
+            stdout, stderr = process.communicate(input_data, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            kill_process_group(process)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                error.cmd, error.timeout, output=stdout, stderr=stderr
+            ) from None
+        except BaseException:
+            kill_process_group(process)
+            process.wait()
+            raise
+    finally:
+        with active_processes_lock:
+            active_processes.discard(process)
+    result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+    if check:
+        result.check_returncode()
+    return result
+
+
+def watch_for_interrupted_shutdown():
+    shutdown_requested.wait()
+    if recovery_finished.wait(1.5):
+        return
+    recovery_interrupted.set()
+    with active_processes_lock:
+        processes = tuple(active_processes)
+    for process in processes:
+        kill_process_group(process)
+    if recovery_finished.wait(1.0):
+        return
+    recovery_handoff_required.set()
+    with active_processes_lock:
+        processes = tuple(active_processes)
+    for process in processes:
+        kill_process_group(process)
+    if recovery_finished.wait(1.0):
+        return
+    with active_processes_lock:
+        processes = tuple(active_processes)
+    for process in processes:
+        kill_process_group(process)
+    os._exit(75)
+
+
+threading.Thread(target=watch_for_interrupted_shutdown, daemon=True).start()
+for blocked_signal in blocked:
+    signal.signal(blocked_signal, lambda _number, _frame: shutdown_requested.set())
+signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
+if int(pending_signal):
+    shutdown_requested.set()
 
 
 def run_git(
     arguments, *, environment=None, stdout=subprocess.PIPE, input_text=None, text=True
 ):
-    result = subprocess.run(
+    result = run_process(
         [
             timeout_command,
             "--signal=TERM",
@@ -1650,6 +1764,139 @@ def commit_tree(tree, parent, message):
     ).stdout.strip()
 
 
+def fsync_directory(path):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_recovery_marker():
+    complete_temporary = recovery_path / ".complete.tmp"
+    with complete_temporary.open("x", encoding="ascii") as marker:
+        marker.write("1\\n")
+        marker.flush()
+        os.fsync(marker.fileno())
+    os.replace(complete_temporary, recovery_path / ".complete")
+    fsync_directory(recovery_path)
+    fsync_directory(recovery_path.parent)
+    fsync_directory(recovery_path.parent.parent)
+    Path(publication_state).write_text("1\\n", encoding="ascii")
+
+
+def publish_recovery():
+    directories = []
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    for current, _, files in os.walk(recovery_path, followlinks=False):
+        current_path = Path(current)
+        directories.append(current_path)
+        for name in files:
+            path = current_path / name
+            if path.is_symlink():
+                continue
+            descriptor = os.open(path, os.O_RDONLY | no_follow)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    for directory in reversed(directories):
+        fsync_directory(directory)
+
+    publish_recovery_marker()
+
+
+def publish_handoff(handoff_path, source_parent):
+    fsync_directory(source_parent)
+    fsync_directory(handoff_path)
+    metadata_path = recovery_path / "metadata.json"
+    descriptor = os.open(metadata_path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    publish_recovery_marker()
+
+
+def reset_publication_marker():
+    changed = False
+    for name in (".complete", ".complete.tmp"):
+        marker = recovery_path / name
+        if marker.exists():
+            marker.unlink()
+            changed = True
+    if changed:
+        fsync_directory(recovery_path)
+
+
+def write_metadata(cleanliness, *, interrupted=False, error=None, handoff=None):
+    metadata = {
+        "formatVersion": 1,
+        "protectedRef": protected_ref,
+        "baseCommit": old,
+        "shadowCommit": shadow_commit,
+        "stagedCommit": staged_commit,
+        "worktreeCommit": worktree_commit,
+        "conflictState": conflict_state,
+        "cleanliness": cleanliness,
+        "nestedRecoveryCount": len(nested_repositories),
+        "ordinaryGitMarkers": marker_metadata,
+    }
+    if interrupted:
+        metadata["interrupted"] = True
+        metadata["recoveryError"] = str(error)[:1000]
+    if handoff is not None:
+        metadata["uncapturedInputs"] = handoff
+    metadata_temporary = recovery_path / "metadata.json.tmp"
+    metadata_temporary.write_text(
+        json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
+    )
+    os.replace(metadata_temporary, recovery_path / "metadata.json")
+
+
+def build_interrupted_bundle():
+    bundle = recovery_path / "recovery.bundle"
+    if bundle.is_file():
+        return
+    bundle_temporary = recovery_path / "recovery.bundle.tmp"
+    bundle_temporary.unlink(missing_ok=True)
+    if worktree_commit is None or not recovery_refs:
+        raise RuntimeError("interrupted recovery root capture is incomplete")
+    references = recovery_refs
+    pack_input = "\\n".join([*references.values(), "^" + old, ""])
+    with bundle_temporary.open("wb") as output:
+        output.write(b"# v2 git bundle\\n")
+        output.write(f"-{old} required base\\n".encode("ascii"))
+        for reference, commit in references.items():
+            output.write(f"{commit} {reference}\\n".encode("ascii"))
+        output.write(b"\\n")
+        output.flush()
+        result = run_process(
+            [
+                timeout_command,
+                "--signal=KILL",
+                "1s",
+                git,
+                "pack-objects",
+                "--stdout",
+                "--revs",
+            ],
+            cwd=worktree,
+            env=base_environment,
+            input=pack_input.encode("ascii"),
+            stdout=output,
+            stderr=subprocess.PIPE,
+            timeout=1.2,
+            check=False,
+            start_new_session=True,
+        )
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError((detail or "interrupted recovery pack failed")[:1000])
+    os.replace(bundle_temporary, bundle)
+
+
 def capture_index_state(
     environment, index_path, destination, *, source_environment=None
 ):
@@ -1662,7 +1909,8 @@ def capture_index_state(
     else:
         run_git(["read-tree", "--empty"], environment=private_environment)
     shared_index_text = run_git(
-        ["rev-parse", "--shared-index-path"], environment=source_environment
+        ["rev-parse", "--path-format=absolute", "--shared-index-path"],
+        environment=source_environment,
     ).stdout.strip()
     shared_index = Path(shared_index_text).resolve() if shared_index_text else None
     if shared_index is not None:
@@ -1780,7 +2028,7 @@ def run_nested(
         environment["GIT_DIR"] = requested_git_dir
     if requested_worktree is not None:
         environment["GIT_WORK_TREE"] = requested_worktree
-    result = subprocess.run(
+    result = run_process(
         [
             timeout_command,
             "--signal=TERM",
@@ -1844,7 +2092,7 @@ def capture_nested_repository(root, destination):
 
     destination.mkdir(mode=0o700)
     side_git = destination / "snapshot.git"
-    initialize = subprocess.run(
+    initialize = run_process(
         [
             timeout_command,
             "--signal=TERM",
@@ -1889,7 +2137,7 @@ def capture_nested_repository(root, destination):
     def run_side(arguments, *, input_text=None):
         return run_git(arguments, environment=side_environment, input_text=input_text)
 
-    head_result = subprocess.run(
+    head_result = run_process(
         [git, "rev-parse", "--verify", "HEAD"],
         env={
             **os.environ,
@@ -1982,7 +2230,9 @@ def capture_nested_repository(root, destination):
     )
 
 
-try:
+def capture_root_repository():
+    global conflict_state, recovery_refs, shadow_commit, staged_commit, worktree_commit
+
     shadow_commit = run_git(["rev-parse", protected_ref]).stdout.strip()
     staged_tree, conflict_state = capture_index_state(
         base_environment, Path(shadow) / "index", recovery_path
@@ -2020,18 +2270,10 @@ try:
     for reference, commit in recovery_refs.items():
         run_git(["update-ref", reference, commit])
 
-    bundle_temporary = recovery_path / "recovery.bundle.tmp"
-    bundle = recovery_path / "recovery.bundle"
-    run_git(
-        [
-            "bundle",
-            "create",
-            str(bundle_temporary),
-            *recovery_refs,
-            "^" + old,
-        ]
-    )
-    os.replace(bundle_temporary, bundle)
+
+def capture_nested_state():
+    global marker_metadata, nested_capture_complete, nested_repositories
+    global nested_residual
 
     nested_root = recovery_path / "nested"
     nested_repositories, invalid_git_markers = nested_git_roots()
@@ -2062,12 +2304,90 @@ try:
                     "storedAt": os.path.relpath(stored, recovery_path),
                 }
             )
+    nested_capture_complete = True
+
+
+def reset_incomplete_capture():
+    for path in recovery_path.iterdir():
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def handoff_uncaptured_inputs(error):
+    reset_incomplete_capture()
+    source_parent = Path(worktree).parent
+    if Path(shadow).parent != source_parent:
+        raise RuntimeError("recovery inputs do not share an ownership directory")
+    if source_parent.stat().st_dev != recovery_path.stat().st_dev:
+        raise RuntimeError("recovery inputs are not on the recovery filesystem")
+    temporary = recovery_path / "uncaptured-inputs.tmp"
+    published = recovery_path / "uncaptured-inputs"
+    temporary.mkdir(mode=0o700)
+    moved = []
+    try:
+        for source, name in (
+            (Path(worktree), "worktree"),
+            (Path(shadow), "shadow.git"),
+        ):
+            destination = temporary / name
+            os.replace(source, destination)
+            moved.append((source, destination))
+        os.replace(temporary, published)
+    except BaseException:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                os.replace(destination, source)
+        if temporary.exists():
+            temporary.rmdir()
+        raise
+    write_metadata(
+        "unverified",
+        interrupted=True,
+        error=error,
+        handoff={
+            "format": "delivery-inputs-v1",
+            "worktree": "uncaptured-inputs/worktree",
+            "shadowGit": "uncaptured-inputs/shadow.git",
+        },
+    )
+    publish_handoff(published, source_parent)
+
+shadow_commit = old
+staged_commit = None
+worktree_commit = None
+conflict_state = None
+recovery_refs = {}
+nested_repositories = []
+marker_metadata = []
+nested_residual = False
+nested_capture_complete = False
+publication_attempted = False
+
+try:
+    capture_root_repository()
+
+    bundle_temporary = recovery_path / "recovery.bundle.tmp"
+    bundle = recovery_path / "recovery.bundle"
+    run_git(
+        [
+            "bundle",
+            "create",
+            str(bundle_temporary),
+            *recovery_refs,
+            "^" + old,
+        ]
+    )
+    os.replace(bundle_temporary, bundle)
+
+    capture_nested_state()
 
     status_path = recovery_path / "status.porcelain"
     cleanliness = "verified"
     try:
         with status_path.open("w", encoding="utf-8") as status_output:
-            status = subprocess.run(
+            status = run_process(
                 [
                     timeout_command,
                     "--signal=TERM",
@@ -2089,33 +2409,48 @@ try:
             )
         if status.returncode:
             cleanliness = "unverified"
-        elif status_path.stat().st_size or nested_residual or invalid_git_markers:
+        elif status_path.stat().st_size or nested_residual or marker_metadata:
             cleanliness = "residual"
     except (OSError, subprocess.SubprocessError):
         cleanliness = "unverified"
 
-    metadata = {
-        "formatVersion": 1,
-        "protectedRef": protected_ref,
-        "baseCommit": old,
-        "shadowCommit": shadow_commit,
-        "stagedCommit": staged_commit,
-        "worktreeCommit": worktree_commit,
-        "conflictState": conflict_state,
-        "cleanliness": cleanliness,
-        "nestedRecoveryCount": len(nested_repositories),
-        "ordinaryGitMarkers": marker_metadata,
-    }
-    metadata_temporary = recovery_path / "metadata.json.tmp"
-    metadata_temporary.write_text(
-        json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
-    )
-    os.replace(metadata_temporary, recovery_path / "metadata.json")
-    complete_temporary = recovery_path / ".complete.tmp"
-    complete_temporary.write_text("1\\n", encoding="ascii")
-    os.replace(complete_temporary, recovery_path / ".complete")
+    write_metadata(cleanliness)
+    publication_attempted = True
+    publish_recovery()
+    recovery_finished.set()
     print(cleanliness)
 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+    try:
+        reset_publication_marker()
+        if recovery_interrupted.is_set():
+            try:
+                if worktree_commit is None:
+                    reset_incomplete_capture()
+                    capture_root_repository()
+                build_interrupted_bundle()
+                if not nested_capture_complete:
+                    for name in ("nested", "ordinary-git-markers"):
+                        path = recovery_path / name
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        elif path.exists():
+                            path.unlink()
+                    capture_nested_state()
+                write_metadata("unverified", interrupted=True, error=error)
+                publish_recovery()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as retry_error:
+                if not recovery_handoff_required.is_set():
+                    recovery_handoff_required.wait(1.0)
+                handoff_uncaptured_inputs(retry_error)
+        elif publication_attempted:
+            publish_recovery()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as fallback_error:
+        print(
+            f"publication-disabled interrupted recovery failed: {fallback_error}",
+            file=sys.stderr,
+        )
+    finally:
+        recovery_finished.set()
     print(f"publication-disabled recovery failed: {error}", file=sys.stderr)
     raise SystemExit(74)
 """
@@ -2343,14 +2678,13 @@ exec "$real_git" "$@"
             'case "$awm_delivery_python" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_timeout=$(command -v timeout) && "
             'case "$awm_delivery_timeout" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_env=$(command -v env) && "
+            'case "$awm_delivery_env" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_original_path=$PATH && "
             f"awm_delivery_worker=$(command -v {worker}) && "
             'case "$awm_delivery_worker" in /*) ;; *) exit 1 ;; esac && '
             'awm_delivery_worker_dir=${awm_delivery_worker%/*} && '
             "awm_delivery_root=$(pwd -P) && "
-            'awm_delivery_resource_parent=${awm_delivery_root%/*} && '
-            '[ -n "$awm_delivery_resource_parent" ] || '
-            'awm_delivery_resource_parent=/ && '
             "awm_delivery_git_dir=$(git rev-parse --path-format=absolute "
             "--absolute-git-dir) && "
             'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
@@ -2377,21 +2711,38 @@ exec "$real_git" "$@"
             'awm_delivery_manifest="$awm_delivery_hooks_root/'
             '.awm-delivery.$$.resources" && '
             "awm_delivery_hooks='' && "
+            "awm_delivery_resource_root='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
+            "awm_delivery_recovery_state='' && "
+            "awm_delivery_recovery_started=0 && "
+            "awm_delivery_recovery_published=0 && "
             "awm_delivery_transition_pending=0 && "
             "awm_delivery_new='' && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
             "awm_delivery_cleanup_failed=0; "
+            'if [ -n "$awm_delivery_recovery_state" ] && '
+            '[ -f "$awm_delivery_recovery_state" ]; then '
+            "awm_delivery_recovery_published=1; fi; "
+            'if [ "$awm_delivery_recovery_started" -ne 0 ] && '
+            '[ "$awm_delivery_recovery_published" -eq 0 ] && '
+            '[ -n "$awm_delivery_recovery" ]; then '
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
+            '"$awm_delivery_rm" -f -- "$awm_delivery_recovery/.complete" '
+            "2>/dev/null; then awm_delivery_cleanup_failed=1; fi; "
+            'if [ -e "$awm_delivery_recovery/.complete" ]; then '
+            "awm_delivery_cleanup_failed=1; fi; fi; "
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
-            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ] && '
-            '[ -f "$awm_delivery_recovery/.complete" ]; then continue; fi; '
+            '[ "$awm_delivery_recovery_published" -ne 0 ] && '
+            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ]; '
+            "then continue; fi; "
+            '[ -e "$awm_delivery_cleanup_dir" ] || continue; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "
@@ -2425,7 +2776,7 @@ exec "$real_git" "$@"
             "fi; "
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
             '[ -n "$awm_delivery_recovery" ] && '
-            '[ -f "$awm_delivery_recovery/.complete" ]; then '
+            '[ "$awm_delivery_recovery_published" -ne 0 ]; then '
             "printf '%s\\n' \"publication-disabled agent output recovery "
             'retained at $awm_delivery_recovery" >&2; fi; '
             'exit "$awm_delivery_primary_status"; '
@@ -2467,21 +2818,40 @@ exec "$real_git" "$@"
             "base64 --decode) && "
             'awm_delivery_hooks=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_hooks_root" "awm-delivery.") && '
-            'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
-            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") && '
-            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
-            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            '"$awm_delivery_hooks_root" "awm-delivery.") || exit; '
+            'awm_delivery_recovery_state="$awm_delivery_hooks/'
+            'recovery-published" && '
             'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
             'awm-delivery-recovery" && '
             'mkdir -p -- "$awm_delivery_recovery_root" && '
+            'awm_delivery_resource_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_recovery_root" "inputs.") || exit; '
+            'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_root" "shadow.") || exit; '
+            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_root" "worktree.") || exit; '
             'awm_delivery_recovery=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_recovery_root" "output.") && '
-            '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
-            '"$awm_delivery_isolated_root/" && '
+            '"$awm_delivery_recovery_root" "output.") || exit; '
+            'if [ "$awm_delivery_git_dir" = "$awm_delivery_root/.git" ] && '
+            '[ -d "$awm_delivery_root/.git" ]; then '
+            'for awm_delivery_source in "$awm_delivery_root"/* '
+            '"$awm_delivery_root"/.[!.]* "$awm_delivery_root"/..?*; do '
+            '[ -e "$awm_delivery_source" ] || '
+            '[ -L "$awm_delivery_source" ] || continue; '
+            '[ "$awm_delivery_source" = "$awm_delivery_root/.git" ] && continue; '
+            '"$awm_delivery_cp" -a -- "$awm_delivery_source" '
+            '"$awm_delivery_isolated_root/" || exit; done; '
+            'else "$awm_delivery_cp" -a -- "$awm_delivery_root/." '
+            '"$awm_delivery_isolated_root/" || exit; fi && '
+            f"awm_delivery_rewrite_gitfiles=$(printf %s {gitfile_rewriter} | "
+            "base64 --decode) && "
+            '"$awm_delivery_python" -c "$awm_delivery_rewrite_gitfiles" '
+            '"$awm_delivery_root" "$awm_delivery_isolated_root" '
+            '"$awm_delivery_common_git_dir" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
@@ -2532,43 +2902,70 @@ exec "$real_git" "$@"
             '"$awm_delivery_real_git" read-tree "$awm_delivery_old" && '
             'PATH="$awm_delivery_hooks/bin:$PATH" && '
             "export PATH && "
+            f"awm_delivery_snapshot=$(printf %s {recovery_snapshot} | "
+            "base64 --decode) && "
+            "awm_delivery_pending_signal=0 && "
+            "awm_delivery_worker_pid='' && "
+            "awm_delivery_phase_signal() { "
+            'if [ -n "$awm_delivery_worker_pid" ] && '
+            '! kill -0 "$awm_delivery_worker_pid" 2>/dev/null; then '
+            'if [ "$awm_delivery_pending_signal" -eq 0 ]; then '
+            "awm_delivery_pending_signal=$1; fi; "
+            'else awm_delivery_signal "$1"; fi; '
+            "} && "
+            "trap 'awm_delivery_phase_signal 129' HUP && "
+            "trap 'awm_delivery_phase_signal 130' INT && "
+            "trap 'awm_delivery_phase_signal 143' TERM && "
             'set -- "$awm_delivery_bwrap" --die-with-parent --new-session '
             '--ro-bind / / --dev-bind /dev /dev --proc /proc '
             '--tmpfs /tmp '
             '--bind "$awm_delivery_isolated_root" "$awm_delivery_root" '
-            '--bind "$awm_delivery_shadow_git_dir" '
-            '"$awm_delivery_shadow_git_dir" '
             '--ro-bind "$awm_delivery_common_git_dir" '
             '"$awm_delivery_common_git_dir" '
             '--ro-bind "$awm_delivery_git_dir" "$awm_delivery_git_dir" '
             '--ro-bind "$awm_delivery_object_dir" "$awm_delivery_object_dir" '
             '--ro-bind "$awm_delivery_hooks" "$awm_delivery_hooks" '
+            '--bind "$awm_delivery_shadow_git_dir" '
+            '"$awm_delivery_shadow_git_dir" '
             '--chdir "$awm_delivery_root" && '
             'case "$awm_delivery_worker_dir" in '
             '"$awm_delivery_root"|"$awm_delivery_root"/*) ;; '
             '*) set -- "$@" --ro-bind "$awm_delivery_worker_dir" '
             '"$awm_delivery_worker_dir" ;; esac && '
-            f"printf %s {encoded} | base64 --decode | "
+            f"{{ printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
             'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
             'GIT_EXEC_PATH="$awm_delivery_hooks/bin" '
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
-            f'"$@" {launch}; '
-            "awm_delivery_status=$?; "
+            f'"$@" {launch} & '
+            "awm_delivery_worker_pid=$!; "
+            'wait "$awm_delivery_worker_pid"; '
+            "awm_delivery_status=$?; } && "
             "PATH=$awm_delivery_original_path; export PATH; "
-            f"awm_delivery_snapshot=$(printf %s {recovery_snapshot} | "
-            "base64 --decode) && "
-            'awm_delivery_cleanliness=$("$awm_delivery_python" -c '
+            "awm_delivery_recovery_started=1 && "
+            'awm_delivery_cleanliness=$("$awm_delivery_env" '
+            '--block-signal=HUP --block-signal=INT --block-signal=TERM '
+            '"$awm_delivery_python" -c '
             '"$awm_delivery_snapshot" "$awm_delivery_real_git" '
             '"$awm_delivery_timeout" '
             '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
             '"$awm_delivery_recovery" "$awm_delivery_ref" '
-            '"$awm_delivery_old" "$awm_delivery_common_git_dir") || { '
+            '"$awm_delivery_old" "$awm_delivery_common_git_dir" '
+            '"$awm_delivery_recovery_state" '
+            '"$awm_delivery_pending_signal"); '
+            "awm_delivery_recovery_status=$?; "
+            "trap 'awm_delivery_signal 129' HUP; "
+            "trap 'awm_delivery_signal 130' INT; "
+            "trap 'awm_delivery_signal 143' TERM; "
+            'if [ "$awm_delivery_pending_signal" -ne 0 ]; then '
+            'awm_delivery_signal "$awm_delivery_pending_signal"; fi; '
+            'if [ "$awm_delivery_recovery_status" -ne 0 ]; then '
             "printf '%s\\n' "
             '"publication-disabled agent output recovery failed" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '
-            'exit "$awm_delivery_status"; fi; exit 74; }; '
+            'exit "$awm_delivery_status"; fi; exit 74; fi; '
+            "awm_delivery_recovery_published=1; "
             'if [ "$awm_delivery_cleanliness" = unverified ]; then '
             "printf '%s\\n' "
             '"publication-disabled session cleanliness could not be verified" >&2; '
