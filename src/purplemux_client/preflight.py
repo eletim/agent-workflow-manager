@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import os
 import shutil
@@ -1011,11 +1010,42 @@ class WorkflowValidator:
         try:
             sys.path[:] = self._module_search_path
             try:
-                return importlib.util.find_spec(name) is not None
+                loaded = sys.modules.get(name)
+                if getattr(loaded, "__spec__", None) is not None:
+                    return True
+                search_path: Sequence[str] | None = None
+                for index in range(len(parts)):
+                    fullname = ".".join(parts[: index + 1])
+                    loaded = sys.modules.get(fullname)
+                    spec = getattr(loaded, "__spec__", None)
+                    if spec is None:
+                        spec = self._find_spec_without_import(fullname, search_path)
+                    if spec is None:
+                        return False
+                    if index != len(parts) - 1:
+                        locations = spec.submodule_search_locations
+                        if locations is None:
+                            return False
+                        search_path = tuple(locations)
+                return True
             except (AttributeError, ImportError, ValueError):
                 return False
         finally:
             sys.path[:] = original_path
+
+    @staticmethod
+    def _find_spec_without_import(
+        fullname: str, path: Sequence[str] | None
+    ) -> object | None:
+        """Ask runtime finders directly, without importing a dotted-name parent."""
+        for finder in sys.meta_path:
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, None)
+            if spec is not None:
+                return spec
+        return None
 
     @staticmethod
     def _workflow_module_search_path() -> tuple[str, ...]:
