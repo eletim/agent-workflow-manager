@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import codecs
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -3642,7 +3644,7 @@ class PythonRunner:
             git_dir_text = resource.metadata.get("git_dir")
             if git_dir_text is not None:
                 PythonRunner._cleanup_worktree_object_alternates(
-                    Path(git_dir_text), PythonRunner._git_common_objects(repository)
+                    Path(git_dir_text), PythonRunner._git_common_objects(repository), repository
                 )
             return
         required_identity = {
@@ -3745,7 +3747,7 @@ class PythonRunner:
                     + (removed.stderr.strip() or "no stderr")
                 )
         PythonRunner._cleanup_worktree_object_alternates(
-            git_dir, common_objects
+            git_dir, common_objects, repository
         )
 
     @staticmethod
@@ -3776,7 +3778,7 @@ class PythonRunner:
             return False
         if alternates.is_symlink() or not alternates.is_file():
             raise OSError("Git alternates metadata has an unexpected file type")
-        owned_root = git_dir / "awm-delivery-objects"
+        owned_root = PythonRunner._worktree_object_root(git_dir, objects)
         return any(
             Path(line).is_absolute()
             and Path(line).parent == owned_root
@@ -3785,14 +3787,21 @@ class PythonRunner:
         )
 
     @staticmethod
-    def _cleanup_worktree_object_alternates(git_dir: Path, objects: Path) -> None:
+    def _worktree_object_root(git_dir: Path, objects: Path) -> Path:
+        owner = hashlib.sha256(f"{git_dir}\n".encode()).hexdigest()
+        return objects / "awm-delivery" / owner
+
+    @staticmethod
+    def _cleanup_worktree_object_alternates(
+        git_dir: Path, objects: Path, repository: Path
+    ) -> None:
         """Remove private object-store dependencies owned by a removed worktree."""
         alternates = objects / "info" / "alternates"
         if not os.path.lexists(alternates):
             return
         if alternates.is_symlink() or not alternates.is_file():
             raise OSError("Git alternates metadata has an unexpected file type")
-        owned_root = git_dir / "awm-delivery-objects"
+        owned_root = PythonRunner._worktree_object_root(git_dir, objects)
         lock_path = objects.parent / "hooks" / "awm-delivery-alternates.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a", encoding="utf-8") as lock:
@@ -3800,29 +3809,70 @@ class PythonRunner:
             if alternates.is_symlink() or not alternates.is_file():
                 raise OSError("Git alternates metadata has an unexpected file type")
             lines = alternates.read_text(encoding="utf-8").splitlines()
+            owned = [
+                Path(line)
+                for line in lines
+                if Path(line).is_absolute()
+                and Path(line).parent == owned_root
+                and Path(line).name.startswith("awm-delivery.")
+            ]
             retained = [
                 line
                 for line in lines
-                if not (
-                    Path(line).is_absolute()
-                    and Path(line).parent == owned_root
-                    and Path(line).name.startswith("awm-delivery.")
-                )
+                if Path(line) not in owned
             ]
             if retained == lines:
                 return
-            replacement = alternates.with_name(
-                f"{alternates.name}.awm-cleanup-{secrets.token_hex(8)}"
-            )
+            mode = stat.S_IMODE(alternates.stat().st_mode)
+            PythonRunner._replace_alternates(alternates, retained, mode)
             try:
-                replacement.write_text(
-                    "".join(f"{line}\n" for line in retained), encoding="utf-8"
+                connected = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "fsck",
+                        "--connectivity-only",
+                        "--no-dangling",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
                 )
-                os.chmod(replacement, stat.S_IMODE(alternates.stat().st_mode))
-                os.replace(replacement, alternates)
             finally:
-                if replacement.exists():
-                    replacement.unlink()
+                PythonRunner._replace_alternates(alternates, lines, mode)
+            if connected.returncode != 0:
+                raise OSError(
+                    "retained local refs still depend on the owned private object store"
+                )
+            for directory in owned:
+                if not os.path.lexists(directory):
+                    continue
+                if directory.is_symlink() or not directory.is_dir():
+                    raise OSError("owned private object store has an unexpected type")
+                shutil.rmtree(directory)
+            PythonRunner._replace_alternates(alternates, retained, mode)
+            try:
+                owned_root.rmdir()
+                owned_root.parent.rmdir()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _replace_alternates(alternates: Path, lines: list[str], mode: int) -> None:
+        replacement = alternates.with_name(
+            f"{alternates.name}.awm-cleanup-{secrets.token_hex(8)}"
+        )
+        try:
+            replacement.write_text(
+                "".join(f"{line}\n" for line in lines), encoding="utf-8"
+            )
+            os.chmod(replacement, mode)
+            os.replace(replacement, alternates)
+        finally:
+            if replacement.exists():
+                replacement.unlink()
 
     def close(self) -> None:
         with self._lock:

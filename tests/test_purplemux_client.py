@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -659,7 +660,7 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     private_object_directories = {
         path
         for path in writable_directories
-        if Path(path).parent == Path(git_dir) / "awm-delivery-objects"
+        if Path(path).parent.parent == Path(common_dir) / "objects" / "awm-delivery"
         and Path(path).name.startswith("awm-delivery.")
     }
     assert len(private_object_directories) == 1
@@ -667,8 +668,6 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     assert writable_directories == {
         git_dir,
         private_object_directory,
-        str(Path(common_dir) / "refs" / "heads" / "feature"),
-        str(Path(common_dir) / "logs" / "refs" / "heads" / "feature"),
     }
     assert str(Path(common_dir) / "objects") not in writable_directories
     assert private_object_directory in (
@@ -699,33 +698,19 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-@pytest.mark.parametrize("attack", ["sibling-ref", "hook-override"])
 def test_publication_disabled_audits_ref_writes_that_bypass_hooks(
-    worker: str, attack: str, tmp_path: Path
+    worker: str, tmp_path: Path
 ) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
-    sibling_before = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    _, checkout = linked_delivery_checkout(tmp_path)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_worker = fake_bin / worker
-    attack_command = (
-        'active=$(git rev-parse --git-path refs/heads/feature/scoped-commit)\n'
-        'sibling=$(git rev-parse --git-path refs/heads/feature/sibling)\n'
-        'cp -- "$active" "$sibling"\n'
-        if attack == "sibling-ref"
-        else "git -c core.hooksPath=/dev/null commit --amend --allow-empty "
-        "-m forbidden-rewrite >/dev/null 2>&1\n"
-    )
     fake_worker.write_text(
         "#!/bin/sh\n"
         "git commit --allow-empty -m forward >/dev/null 2>&1\n"
-        + attack_command
-        + 'printf \'%s\\n\' "$?"\n',
+        "git -c core.hooksPath=/dev/null commit --amend --allow-empty "
+        "-m forbidden-rewrite >/dev/null 2>&1\n"
+        'printf \'%s\\n\' "$?"\n',
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
@@ -744,71 +729,62 @@ def test_publication_disabled_audits_ref_writes_that_bypass_hooks(
 
     assert result.stdout.strip() == "0"
     assert result.returncode != 0
-    assert "Git ref audit failed" in result.stderr
-    if attack == "sibling-ref":
-        assert (
-            subprocess.run(
-                ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            == sibling_before
-        )
-    else:
-        assert (
-            subprocess.run(
-                ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            == "forward"
-        )
-
-
-@pytest.mark.parametrize("worker", ["codex", "claude"])
-@pytest.mark.parametrize("target", ["protected", "sibling"])
-def test_publication_disabled_rejects_equivalent_symbolic_refs(
-    worker: str, target: str, tmp_path: Path
-) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
-    active_path = Path(
+    assert "protected ref not advanced" in result.stderr
+    assert (
         subprocess.run(
-            [
-                "git",
-                "-C",
-                str(checkout),
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "refs/heads/feature/scoped-commit",
-            ],
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
+        == "base"
     )
-    sibling_path = active_path.with_name("sibling")
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_does_not_revert_concurrent_protected_ref_update(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    original = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    concurrent = subprocess.run(
+        ["git", "-C", str(repository), "commit-tree", tree, "-p", original],
+        input="concurrent update\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_worker = fake_bin / worker
-    ref_path = active_path if target == "protected" else sibling_path
-    symref_target = (
-        "refs/heads/feature/sibling" if target == "protected" else "refs/heads/main"
-    )
     fake_worker.write_text(
         "#!/bin/sh\n"
-        f"printf 'ref: %s\\n' {shlex.quote(symref_target)} > "
-        f"{shlex.quote(str(ref_path))}\n",
+        "git commit --allow-empty -m worker-forward >/dev/null 2>&1\n"
+        "env -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES "
+        '"$AWM_TEST_REAL_GIT" -C "$AWM_TEST_REPOSITORY" update-ref '
+        'refs/heads/feature/scoped-commit "$AWM_TEST_CONCURRENT"\n',
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_REAL_GIT"] = shutil.which("git") or "git"
+    environment["AWM_TEST_REPOSITORY"] = str(repository)
+    environment["AWM_TEST_CONCURRENT"] = concurrent
 
     result = subprocess.run(
-        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "replace ref"),
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
         cwd=checkout,
         env=environment,
         shell=True,
@@ -818,34 +794,23 @@ def test_publication_disabled_rejects_equivalent_symbolic_refs(
     )
 
     assert result.returncode != 0
-    assert "changes rolled back" in result.stderr
-    assert not ref_path.read_text(encoding="utf-8").startswith("ref:")
-    ref_name = (
-        "refs/heads/feature/scoped-commit"
-        if target == "protected"
-        else "refs/heads/feature/sibling"
-    )
+    assert "protected ref not advanced" in result.stderr
     assert (
         subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", ref_name],
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
-        == subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "main"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        == concurrent
     )
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
+def test_publication_disabled_restores_gitdir_backlink(
     worker: str, tmp_path: Path
 ) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
+    _, checkout = linked_delivery_checkout(tmp_path)
     git_dir = Path(
         subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
@@ -854,8 +819,6 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
             text=True,
         ).stdout.strip()
     )
-    sibling_log = repository / ".git/logs/refs/heads/feature/sibling"
-    sibling_log_before = sibling_log.read_bytes()
     backlink_before = (git_dir / "gitdir").read_bytes()
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -864,10 +827,7 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
         "#!/bin/sh\n"
         "git commit --allow-empty -m forward >/dev/null 2>&1\n"
         "git_dir=$(git rev-parse --absolute-git-dir)\n"
-        "sibling_log=$(git rev-parse --path-format=absolute "
-        "--git-path logs/refs/heads/feature/sibling)\n"
-        'printf tampered >> "$sibling_log"\n'
-        'printf \'%s\\n\' "$PWD/.git" > "$git_dir/gitdir"\n',
+        'printf \'tampered\\n\' > "$git_dir/gitdir"\n',
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
@@ -885,8 +845,7 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
     )
 
     assert result.returncode != 0
-    assert "changes rolled back" in result.stderr
-    assert sibling_log.read_bytes() == sibling_log_before
+    assert "protected ref not advanced" in result.stderr
     assert (git_dir / "gitdir").read_bytes() == backlink_before
     assert (
         subprocess.run(
@@ -895,7 +854,7 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
             capture_output=True,
             text=True,
         ).stdout.strip()
-        == "forward"
+        == "base"
     )
 
 
@@ -939,7 +898,7 @@ def test_publication_disabled_rolls_back_commit_with_missing_reachable_object(
     )
 
     assert result.returncode != 0
-    assert "changes rolled back" in result.stderr
+    assert "protected ref not advanced" in result.stderr
     assert (
         subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -952,13 +911,11 @@ def test_publication_disabled_rolls_back_commit_with_missing_reachable_object(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-@pytest.mark.parametrize(
-    "metadata", ["HEAD", "commondir", "gitdir", "active-log", "sibling-log"]
-)
+@pytest.mark.parametrize("metadata", ["HEAD", "commondir", "gitdir", "head-log"])
 def test_publication_disabled_rejects_metadata_symlinks(
     worker: str, metadata: str, tmp_path: Path
 ) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
+    _, checkout = linked_delivery_checkout(tmp_path)
     git_dir = Path(
         subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
@@ -967,10 +924,8 @@ def test_publication_disabled_rejects_metadata_symlinks(
             text=True,
         ).stdout.strip()
     )
-    if metadata == "active-log":
-        target = repository / ".git/logs/refs/heads/feature/scoped-commit"
-    elif metadata == "sibling-log":
-        target = repository / ".git/logs/refs/heads/feature/sibling"
+    if metadata == "head-log":
+        target = git_dir / "logs" / "HEAD"
     else:
         target = git_dir / metadata
     original = target.read_bytes()
@@ -1000,9 +955,56 @@ def test_publication_disabled_rejects_metadata_symlinks(
     )
 
     assert result.returncode != 0
-    assert "changes rolled back" in result.stderr
+    assert "protected ref not advanced" in result.stderr
     assert not target.is_symlink()
-    assert target.read_bytes() == original
+    if metadata != "head-log":
+        assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+@pytest.mark.parametrize("metadata", ["HEAD", "commondir", "gitdir", "head-log"])
+def test_publication_disabled_rejects_metadata_hardlinks(
+    worker: str, metadata: str, tmp_path: Path
+) -> None:
+    _, checkout = linked_delivery_checkout(tmp_path)
+    git_dir = Path(
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    target = git_dir / ("logs/HEAD" if metadata == "head-log" else metadata)
+    alias = tmp_path / f"{metadata}-alias"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m forward >/dev/null 2>&1\n"
+        f"ln -- {shlex.quote(str(target))} {shlex.quote(str(alias))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "alias metadata"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "protected ref not advanced" in result.stderr
+    assert target.stat().st_nlink == 1
+    assert alias.stat().st_nlink == 1
+    assert target.stat().st_ino != alias.stat().st_ino
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
@@ -1164,13 +1166,7 @@ def test_publication_disabled_top_level_branch_lock_overlaps_nested_branches(
 def test_publication_disabled_pins_and_restores_linked_commondir(
     worker: str, tmp_path: Path
 ) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
-    sibling_before = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    _, checkout = linked_delivery_checkout(tmp_path)
     git_dir = Path(
         subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
@@ -1187,11 +1183,8 @@ def test_publication_disabled_pins_and_restores_linked_commondir(
         "#!/bin/sh\n"
         "git commit --allow-empty -m forward >/dev/null 2>&1\n"
         "git_dir=$(git rev-parse --absolute-git-dir)\n"
-        "active=$(git rev-parse --git-path refs/heads/feature/scoped-commit)\n"
-        "sibling=$(git rev-parse --git-path refs/heads/feature/sibling)\n"
-        'cp -- "$active" "$sibling"\n'
         'fake_common="$PWD/fake-common"\n'
-        'mkdir -p "$fake_common/refs/heads/feature" "$fake_common/objects"\n'
+        'mkdir -p "$fake_common/objects"\n'
         'printf \'%s\\n\' "$fake_common" > "$git_dir/commondir"\n',
         encoding="utf-8",
     )
@@ -1210,17 +1203,8 @@ def test_publication_disabled_pins_and_restores_linked_commondir(
     )
 
     assert result.returncode != 0
-    assert "changes rolled back" in result.stderr
+    assert "protected ref not advanced" in result.stderr
     assert (git_dir / "commondir").read_text(encoding="utf-8") == commondir_before
-    assert (
-        subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        == sibling_before
-    )
     assert (
         subprocess.run(
             ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
@@ -1228,7 +1212,7 @@ def test_publication_disabled_pins_and_restores_linked_commondir(
             capture_output=True,
             text=True,
         ).stdout.strip()
-        == "forward"
+        == "base"
     )
 
 
