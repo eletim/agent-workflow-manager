@@ -1691,12 +1691,19 @@ def capture_index_state(
         environment=private_environment,
         text=False,
     ).stdout
+
+    def packable_object_ids(records):
+        object_ids = set()
+        for record in records.split(b"\\0"):
+            if not record:
+                continue
+            mode, object_id, _ = record.split(b"\\t", 1)[0].split()
+            if mode != b"160000":
+                object_ids.add(object_id.decode("ascii"))
+        return object_ids
+
     object_ids = sorted(
-        {
-            record.split(b"\\t", 1)[0].split()[1].decode("ascii")
-            for record in (entries + resolve_undo).split(b"\\0")
-            if record
-        }
+        packable_object_ids(entries) | packable_object_ids(resolve_undo)
     )
     pack_prefix = destination / "conflict-objects"
     pack_hash = run_git(

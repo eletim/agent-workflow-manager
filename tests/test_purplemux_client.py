@@ -985,6 +985,34 @@ def test_publication_disabled_recovers_unmerged_index(
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
     repository, checkout, _, base = linked_delivery_repository
+    submodule_source = tmp_path / "conflict-submodule-source"
+    initialize_test_repository(submodule_source)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "-C",
+            str(checkout),
+            "submodule",
+            "add",
+            str(submodule_source),
+            "nested",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "add conflict submodule"],
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_worker = fake_bin / "codex"
@@ -1072,6 +1100,13 @@ def test_publication_disabled_recovers_unmerged_index(
         assert " 1\tconflicted.txt" in stages
         assert " 2\tconflicted.txt" in stages
         assert " 3\tconflicted.txt" in stages
+        gitlink = subprocess.run(
+            ["git", "-C", str(recovered), "ls-files", "--stage", "nested"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert gitlink.startswith("160000 ")
         for stage, content in ((1, "base stage\n"), (2, "ours stage\n"), (3, "theirs stage\n")):
             assert (
                 subprocess.run(
@@ -1085,6 +1120,8 @@ def test_publication_disabled_recovers_unmerged_index(
         subprocess.run(
             [
                 "git",
+                "-c",
+                "fetch.recurseSubmodules=false",
                 "-C",
                 str(recovered),
                 "fetch",
