@@ -1579,6 +1579,221 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+@pytest.mark.parametrize("failed_barrier", [1, 2, 3])
+def test_publication_disabled_durability_failure_retains_recovery_inputs(
+    failed_barrier: int,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_python = shutil.which("python3")
+    assert real_python is not None
+    bootstrap = """import os
+import sys
+
+code = sys.argv[1]
+sys.argv = ["-c", *sys.argv[2:]]
+real_fsync = os.fsync
+after_marker = False
+barrier = 0
+
+
+def injected_fsync(descriptor):
+    global after_marker, barrier
+    path = os.readlink(f"/proc/self/fd/{descriptor}")
+    if path.endswith("/.complete.tmp"):
+        after_marker = True
+    elif after_marker:
+        barrier += 1
+        if barrier == int(os.environ["AWM_TEST_FAILED_BARRIER"]):
+            raise OSError("injected post-marker fsync failure")
+    return real_fsync(descriptor)
+
+
+os.fsync = injected_fsync
+exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
+"""
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'case "$1:$2" in *"def publish_recovery"*)\n'
+        "    AWM_TEST_CODE=$2\n"
+        "    export AWM_TEST_CODE\n"
+        "    shift 2\n"
+        f'    exec "{real_python}" -c {shlex.quote(bootstrap)} "$AWM_TEST_CODE" "$@"\n'
+        ";;\n"
+        "esac\n"
+        f'exec "{real_python}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m before-durability-failure >/dev/null 2>&1\n"
+        "printf 'residual\\n' > residual.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_FAILED_BARRIER": str(failed_barrier),
+        }
+    )
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave recoverable output"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    retained = [
+        *tmp_path.glob("awm-delivery-shadow.*"),
+        *tmp_path.glob("awm-delivery-worktree.*"),
+        *(repository / ".git" / "awm-delivery-recovery").glob("output.*"),
+    ]
+    try:
+        assert result.returncode == 74
+        assert "injected post-marker fsync failure" in result.stderr
+        assert "publication-disabled agent output recovery retained at " not in result.stderr
+        assert (
+            "publication-disabled recovery inputs retained after incomplete publication"
+            in result.stderr
+        )
+        assert len(retained) == 3
+        assert not (retained[2] / ".complete").exists()
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+        )
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+    finally:
+        for path in retained:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def test_publication_disabled_signal_bounds_stalled_recovery_capture(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "stalled-recovery-pid"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = bundle ]; then\n'
+        '    printf \'%s\\n\' "$$" > "$AWM_TEST_STALLED_RECOVERY_PID"\n'
+        "    while :; do sleep 1; done\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m before-stalled-recovery >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_STALLED_RECOVERY_PID": str(marker),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "commit before stalled recovery"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while process.poll() is None and not marker.exists():
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("stalled recovery capture was not reached")
+        time.sleep(0.01)
+    if process.poll() is not None:
+        pytest.fail("publication-disabled session exited before recovery signal")
+
+    started = time.monotonic()
+    os.killpg(process.pid, signal.SIGTERM)
+    _, stderr = process.communicate(timeout=5)
+    elapsed = time.monotonic() - started
+
+    retained = [
+        *tmp_path.glob("awm-delivery-shadow.*"),
+        *tmp_path.glob("awm-delivery-worktree.*"),
+        *(repository / ".git" / "awm-delivery-recovery").glob("output.*"),
+    ]
+    try:
+        assert process.returncode == 143
+        assert elapsed < 4
+        assert "publication-disabled agent output recovery retained at " not in stderr
+        assert (
+            "publication-disabled recovery inputs retained after incomplete publication"
+            in stderr
+        )
+        assert len(retained) == 3
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+        )
+        stalled_pid = int(marker.read_text(encoding="ascii"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(stalled_pid, 0)
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        for path in retained:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_isolates_late_and_nested_local_remotes(
     worker: str,
