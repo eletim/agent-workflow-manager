@@ -851,6 +851,176 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+@pytest.mark.parametrize(
+    (
+        "residual",
+        "worker_action",
+        "expected_status",
+        "expected_staged",
+        "expected_final",
+    ),
+    [
+        (
+            "staged",
+            "printf 'staged\\n' > tracked.txt\ngit add tracked.txt\n",
+            "M  tracked.txt",
+            {"tracked.txt": "staged\n"},
+            {"tracked.txt": "staged\n"},
+        ),
+        (
+            "unstaged",
+            "printf 'unstaged\\n' > tracked.txt\n",
+            " M tracked.txt",
+            {"tracked.txt": "committed\n"},
+            {"tracked.txt": "unstaged\n"},
+        ),
+        (
+            "untracked",
+            "printf 'untracked\\n' > residual.txt\n",
+            "?? residual.txt",
+            {"tracked.txt": "committed\n"},
+            {"tracked.txt": "committed\n", "residual.txt": "untracked\n"},
+        ),
+    ],
+)
+def test_publication_disabled_recovers_exactly_one_residual_after_clean_commit(
+    worker: str,
+    residual: str,
+    worker_action: str,
+    expected_status: str,
+    expected_staged: dict[str, str],
+    expected_final: dict[str, str],
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m committed-before-residual >/dev/null 2>&1\n" + worker_action,
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            worker, f"commit once, then leave exactly one {residual} residual"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "publication-disabled session left uncommitted changes" in result.stderr
+    recovery_diagnostic = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_diagnostic.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        assert {path.name for path in recovery.iterdir()} == {
+            ".complete",
+            "metadata.json",
+            "recovery.bundle",
+            "status.porcelain",
+        }
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["cleanliness"] == "residual"
+        assert metadata["baseCommit"] == base
+        assert metadata["shadowCommit"] != base
+        assert metadata["stagedCommit"] != metadata["shadowCommit"]
+        assert metadata["worktreeCommit"] != metadata["stagedCommit"]
+        assert (recovery / "status.porcelain").read_text(encoding="utf-8") == (
+            expected_status + "\n"
+        )
+
+        recovered = tmp_path / f"recovered-{residual}-{worker}"
+        subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(recovered), "fetch", str(repository), base],
+            check=True,
+            capture_output=True,
+        )
+        for name in ("shadow", "staged", "worktree"):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "fetch",
+                    str(recovery / "recovery.bundle"),
+                    f"refs/awm-delivery/{name}:refs/awm-delivery/{name}",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+        def tree_files(reference: str) -> dict[str, str]:
+            names = subprocess.run(
+                ["git", "-C", str(recovered), "ls-tree", "--name-only", reference],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            return {
+                name: subprocess.run(
+                    ["git", "-C", str(recovered), "show", f"{reference}:{name}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                for name in names
+            }
+
+        assert tree_files("refs/awm-delivery/shadow") == {"tracked.txt": "committed\n"}
+        assert tree_files("refs/awm-delivery/staged") == expected_staged
+        assert tree_files("refs/awm-delivery/worktree") == expected_final
+
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "before\n"
+        assert not (checkout / "residual.txt").exists()
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == ""
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+        )
+        assert not list(
+            (repository / ".git" / "awm-delivery-recovery").glob("inputs.*")
+        )
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
 @pytest.mark.parametrize("topology", ["embedded", "submodule"])
 def test_publication_disabled_recovers_nested_git_worktree_content(
     topology: str,
