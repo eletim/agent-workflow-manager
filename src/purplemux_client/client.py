@@ -1587,6 +1587,37 @@ print(path, flush=True)
 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 """
         ).decode("ascii")
+        gitfile_rewriter = base64.b64encode(
+            b"""import os
+from pathlib import Path
+import sys
+
+source_root, copied_root, common_git_dir = map(Path, sys.argv[1:])
+common_git_dir = common_git_dir.resolve()
+for current, directories, files in os.walk(copied_root, followlinks=False):
+    if ".git" in directories:
+        directories.remove(".git")
+    if ".git" not in files:
+        continue
+    copied_marker = Path(current) / ".git"
+    try:
+        marker_text = copied_marker.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        continue
+    prefix = "gitdir: "
+    if not marker_text.startswith(prefix):
+        continue
+    git_dir_text = marker_text[len(prefix):].strip()
+    if os.path.isabs(git_dir_text):
+        continue
+    relative_parent = Path(current).relative_to(copied_root)
+    source_marker = source_root / relative_parent / ".git"
+    git_dir = (source_marker.parent / git_dir_text).resolve()
+    if not git_dir.is_relative_to(common_git_dir):
+        raise RuntimeError("linked Git directory escapes the common repository")
+    copied_marker.write_text(f"gitdir: {git_dir}\\n", encoding="utf-8")
+"""
+        ).decode("ascii")
         recovery_snapshot = base64.b64encode(
             b"""import json
 import os
@@ -1742,6 +1773,19 @@ def fsync_directory(path):
         os.close(descriptor)
 
 
+def publish_recovery_marker():
+    complete_temporary = recovery_path / ".complete.tmp"
+    with complete_temporary.open("x", encoding="ascii") as marker:
+        marker.write("1\\n")
+        marker.flush()
+        os.fsync(marker.fileno())
+    os.replace(complete_temporary, recovery_path / ".complete")
+    fsync_directory(recovery_path)
+    fsync_directory(recovery_path.parent)
+    fsync_directory(recovery_path.parent.parent)
+    Path(publication_state).write_text("1\\n", encoding="ascii")
+
+
 def publish_recovery():
     directories = []
     no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -1760,16 +1804,19 @@ def publish_recovery():
     for directory in reversed(directories):
         fsync_directory(directory)
 
-    complete_temporary = recovery_path / ".complete.tmp"
-    with complete_temporary.open("x", encoding="ascii") as marker:
-        marker.write("1\\n")
-        marker.flush()
-        os.fsync(marker.fileno())
-    os.replace(complete_temporary, recovery_path / ".complete")
-    fsync_directory(recovery_path)
-    fsync_directory(recovery_path.parent)
-    fsync_directory(recovery_path.parent.parent)
-    Path(publication_state).write_text("1\\n", encoding="ascii")
+    publish_recovery_marker()
+
+
+def publish_handoff(handoff_path, source_parent):
+    fsync_directory(source_parent)
+    fsync_directory(handoff_path)
+    metadata_path = recovery_path / "metadata.json"
+    descriptor = os.open(metadata_path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    publish_recovery_marker()
 
 
 def reset_publication_marker():
@@ -1862,7 +1909,8 @@ def capture_index_state(
     else:
         run_git(["read-tree", "--empty"], environment=private_environment)
     shared_index_text = run_git(
-        ["rev-parse", "--shared-index-path"], environment=source_environment
+        ["rev-parse", "--path-format=absolute", "--shared-index-path"],
+        environment=source_environment,
     ).stdout.strip()
     shared_index = Path(shared_index_text).resolve() if shared_index_text else None
     if shared_index is not None:
@@ -2269,6 +2317,11 @@ def reset_incomplete_capture():
 
 def handoff_uncaptured_inputs(error):
     reset_incomplete_capture()
+    source_parent = Path(worktree).parent
+    if Path(shadow).parent != source_parent:
+        raise RuntimeError("recovery inputs do not share an ownership directory")
+    if source_parent.stat().st_dev != recovery_path.stat().st_dev:
+        raise RuntimeError("recovery inputs are not on the recovery filesystem")
     temporary = recovery_path / "uncaptured-inputs.tmp"
     published = recovery_path / "uncaptured-inputs"
     temporary.mkdir(mode=0o700)
@@ -2299,7 +2352,7 @@ def handoff_uncaptured_inputs(error):
             "shadowGit": "uncaptured-inputs/shadow.git",
         },
     )
-    publish_recovery()
+    publish_handoff(published, source_parent)
 
 shadow_commit = old
 staged_commit = None
@@ -2632,9 +2685,6 @@ exec "$real_git" "$@"
             'case "$awm_delivery_worker" in /*) ;; *) exit 1 ;; esac && '
             'awm_delivery_worker_dir=${awm_delivery_worker%/*} && '
             "awm_delivery_root=$(pwd -P) && "
-            'awm_delivery_resource_parent=${awm_delivery_root%/*} && '
-            '[ -n "$awm_delivery_resource_parent" ] || '
-            'awm_delivery_resource_parent=/ && '
             "awm_delivery_git_dir=$(git rev-parse --path-format=absolute "
             "--absolute-git-dir) && "
             'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
@@ -2661,6 +2711,7 @@ exec "$real_git" "$@"
             'awm_delivery_manifest="$awm_delivery_hooks_root/'
             '.awm-delivery.$$.resources" && '
             "awm_delivery_hooks='' && "
+            "awm_delivery_resource_root='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
@@ -2770,20 +2821,37 @@ exec "$real_git" "$@"
             '"$awm_delivery_hooks_root" "awm-delivery.") || exit; '
             'awm_delivery_recovery_state="$awm_delivery_hooks/'
             'recovery-published" && '
-            'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
-            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") || exit; '
-            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
-            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") || exit; '
             'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
             'awm-delivery-recovery" && '
             'mkdir -p -- "$awm_delivery_recovery_root" && '
+            'awm_delivery_resource_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_recovery_root" "inputs.") || exit; '
+            'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_root" "shadow.") || exit; '
+            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_root" "worktree.") || exit; '
             'awm_delivery_recovery=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_recovery_root" "output.") || exit; '
-            '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
-            '"$awm_delivery_isolated_root/" && '
+            'if [ "$awm_delivery_git_dir" = "$awm_delivery_root/.git" ] && '
+            '[ -d "$awm_delivery_root/.git" ]; then '
+            'for awm_delivery_source in "$awm_delivery_root"/* '
+            '"$awm_delivery_root"/.[!.]* "$awm_delivery_root"/..?*; do '
+            '[ -e "$awm_delivery_source" ] || '
+            '[ -L "$awm_delivery_source" ] || continue; '
+            '[ "$awm_delivery_source" = "$awm_delivery_root/.git" ] && continue; '
+            '"$awm_delivery_cp" -a -- "$awm_delivery_source" '
+            '"$awm_delivery_isolated_root/" || exit; done; '
+            'else "$awm_delivery_cp" -a -- "$awm_delivery_root/." '
+            '"$awm_delivery_isolated_root/" || exit; fi && '
+            f"awm_delivery_rewrite_gitfiles=$(printf %s {gitfile_rewriter} | "
+            "base64 --decode) && "
+            '"$awm_delivery_python" -c "$awm_delivery_rewrite_gitfiles" '
+            '"$awm_delivery_root" "$awm_delivery_isolated_root" '
+            '"$awm_delivery_common_git_dir" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
@@ -2852,13 +2920,13 @@ exec "$real_git" "$@"
             '--ro-bind / / --dev-bind /dev /dev --proc /proc '
             '--tmpfs /tmp '
             '--bind "$awm_delivery_isolated_root" "$awm_delivery_root" '
-            '--bind "$awm_delivery_shadow_git_dir" '
-            '"$awm_delivery_shadow_git_dir" '
             '--ro-bind "$awm_delivery_common_git_dir" '
             '"$awm_delivery_common_git_dir" '
             '--ro-bind "$awm_delivery_git_dir" "$awm_delivery_git_dir" '
             '--ro-bind "$awm_delivery_object_dir" "$awm_delivery_object_dir" '
             '--ro-bind "$awm_delivery_hooks" "$awm_delivery_hooks" '
+            '--bind "$awm_delivery_shadow_git_dir" '
+            '"$awm_delivery_shadow_git_dir" '
             '--chdir "$awm_delivery_root" && '
             'case "$awm_delivery_worker_dir" in '
             '"$awm_delivery_root"|"$awm_delivery_root"/*) ;; '

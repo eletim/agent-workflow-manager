@@ -8,8 +8,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -162,13 +163,9 @@ def initialize_test_repository(path: Path) -> None:
     )
 
 
-@pytest.fixture
-def linked_delivery_repository(
-    tmp_path: Path,
+def initialize_linked_delivery_repository(
+    repository: Path, checkout: Path, remote: Path
 ) -> tuple[Path, Path, Path, str]:
-    repository = tmp_path / "repository parent"
-    checkout = tmp_path / "linked checkout"
-    remote = tmp_path / "test remote.git"
     subprocess.run(
         ["git", "init", "-b", "main", str(repository)],
         check=True,
@@ -223,6 +220,47 @@ def linked_delivery_repository(
         check=True,
     )
     return repository, checkout, remote, base
+
+
+@pytest.fixture
+def linked_delivery_repository(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    return initialize_linked_delivery_repository(
+        tmp_path / "repository parent",
+        tmp_path / "linked checkout",
+        tmp_path / "test remote.git",
+    )
+
+
+@pytest.fixture
+def cross_device_linked_delivery_repository(
+    tmp_path: Path,
+) -> Iterator[tuple[Path, Path, Path, str]]:
+    cross_device_root = Path("/dev/shm")
+    if not cross_device_root.is_dir() or not os.access(cross_device_root, os.W_OK):
+        pytest.skip("a writable /dev/shm is required for the cross-device test")
+    if cross_device_root.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("/dev/shm and the test directory use the same filesystem")
+    checkout_parent = Path(tempfile.mkdtemp(prefix="awm-cross-device-", dir="/dev/shm"))
+    checkout = checkout_parent / "linked checkout"
+    repository = tmp_path / "repository parent"
+    try:
+        result = initialize_linked_delivery_repository(
+            repository,
+            checkout,
+            tmp_path / "test remote.git",
+        )
+        assert checkout.stat().st_dev != (repository / ".git").stat().st_dev
+        yield result
+    finally:
+        if checkout.exists():
+            subprocess.run(
+                ["git", "-C", str(repository), "worktree", "remove", "--force", str(checkout)],
+                check=False,
+                capture_output=True,
+            )
+        shutil.rmtree(checkout_parent, ignore_errors=True)
 
 
 def test_create_response_parsing_and_codex_panel_type() -> None:
@@ -901,10 +939,14 @@ def test_publication_disabled_recovers_nested_git_worktree_content(
 
     assert result.returncode != 0, result.stderr
     recovery_line = next(
-        line
-        for line in result.stderr.splitlines()
-        if line.startswith("publication-disabled agent output recovery retained at ")
+        (
+            line
+            for line in result.stderr.splitlines()
+            if line.startswith("publication-disabled agent output recovery retained at ")
+        ),
+        None,
     )
+    assert recovery_line is not None, result.stderr
     recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
     try:
         metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
@@ -1049,10 +1091,14 @@ def test_publication_disabled_recovers_unmerged_index(
 
     assert result.returncode != 0, result.stderr
     recovery_line = next(
-        line
-        for line in result.stderr.splitlines()
-        if line.startswith("publication-disabled agent output recovery retained at ")
+        (
+            line
+            for line in result.stderr.splitlines()
+            if line.startswith("publication-disabled agent output recovery retained at ")
+        ),
+        None,
     )
+    assert recovery_line is not None, result.stderr
     recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
     try:
         metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
@@ -1572,6 +1618,7 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
         )
         assert not list(tmp_path.glob("awm-delivery-shadow.*"))
         assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert not list(recovery.parent.glob("inputs.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1974,6 +2021,7 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         )
         assert not list(tmp_path.glob("awm-delivery-shadow.*"))
         assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert not list(recovery.parent.glob("inputs.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1993,17 +2041,36 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
 
 
 @pytest.mark.parametrize(
-    ("stalled_command", "stall_every_attempt"),
-    [("ls-files", False), ("bundle", False), ("ls-files", True)],
-    ids=("initial-capture", "bundle", "persistent-initial-capture"),
+    (
+        "stalled_command",
+        "stall_every_attempt",
+        "repository_fixture",
+        "slow_recursive_fsync",
+    ),
+    [
+        ("ls-files", False, "linked_delivery_repository", False),
+        ("bundle", False, "linked_delivery_repository", False),
+        ("ls-files", True, "linked_delivery_repository", False),
+        ("ls-files", True, "cross_device_linked_delivery_repository", False),
+        ("ls-files", True, "linked_delivery_repository", True),
+    ],
+    ids=(
+        "initial-capture",
+        "bundle",
+        "persistent-initial-capture",
+        "persistent-cross-device-capture",
+        "persistent-slow-recursive-fsync",
+    ),
 )
 def test_publication_disabled_signal_bounds_stalled_recovery_capture(
     stalled_command: str,
     stall_every_attempt: bool,
+    repository_fixture: str,
+    slow_recursive_fsync: bool,
+    request: pytest.FixtureRequest,
     tmp_path: Path,
-    linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
-    repository, checkout, _, base = linked_delivery_repository
+    repository, checkout, _, base = request.getfixturevalue(repository_fixture)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     marker = tmp_path / "stalled-recovery-pid"
@@ -2026,6 +2093,43 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
         encoding="utf-8",
     )
     fake_git.chmod(0o755)
+    if slow_recursive_fsync:
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        bootstrap = """import os
+import sys
+import time
+
+code = sys.argv[1]
+sys.argv = ["-c", *sys.argv[2:]]
+real_fsync = os.fsync
+
+
+def injected_fsync(descriptor):
+    path = os.readlink(f"/proc/self/fd/{descriptor}")
+    if "/uncaptured-inputs/" in path and not os.path.isdir(path):
+        time.sleep(0.4)
+    return real_fsync(descriptor)
+
+
+os.fsync = injected_fsync
+exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
+"""
+        fake_python = fake_bin / "python3"
+        fake_python.write_text(
+            "#!/bin/sh\n"
+            'case "$1:$2" in *"def publish_recovery"*)\n'
+            "    AWM_TEST_CODE=$2\n"
+            "    export AWM_TEST_CODE\n"
+            "    shift 2\n"
+            f'    exec "{real_python}" -c {shlex.quote(bootstrap)} '
+            '"$AWM_TEST_CODE" "$@"\n'
+            ";;\n"
+            "esac\n"
+            f'exec "{real_python}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
     fake_worker = fake_bin / "codex"
     fake_worker.write_text(
         "#!/bin/sh\n"
@@ -2149,6 +2253,7 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
         )
+        assert not list(recovery.parent.glob("inputs.*"))
         stalled_pid = int(marker.read_text(encoding="ascii"))
         with pytest.raises(ProcessLookupError):
             os.kill(stalled_pid, 0)
@@ -2716,7 +2821,9 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         deadline = time.monotonic() + 5
         while process.poll() is None:
             records = list(
-                tmp_path.parent.glob("awm-delivery-shadow.*/cleanup-resources")
+                (tmp_path / ".git" / "awm-delivery-recovery").glob(
+                    "inputs.*/shadow.*/cleanup-resources"
+                )
             )
             if records:
                 resources = records[0].read_text(encoding="utf-8").splitlines()
@@ -2738,12 +2845,16 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        assert len(directory_removals) == 4
+        assert len(directory_removals) == 3
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
         }
-        assert removed_directories.issuperset(resources)
-        assert any("awm-delivery-worktree." in path for path in removed_directories)
+        assert resources[0] in removed_directories
+        assert any(
+            Path(resources[1]).is_relative_to(removed)
+            for removed in map(Path, removed_directories)
+        )
+        assert any("/awm-delivery-recovery/inputs." in path for path in removed_directories)
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
@@ -2995,13 +3106,13 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        expected_directory_removals = 4 if agent_status == 0 else 3
+        expected_directory_removals = 5 if agent_status == 0 else 4
         assert len(directory_removals) == expected_directory_removals
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
         }
         assert removed_directories.issuperset(resources)
-        assert any("awm-delivery-worktree." in path for path in removed_directories)
+        assert any("/worktree." in path for path in removed_directories)
         cleanup_pids = cleanup_pid_record.read_text(encoding="utf-8").splitlines()
         assert len(cleanup_pids) == expected_directory_removals + 1
         for cleanup_pid in cleanup_pids:
@@ -3261,8 +3372,9 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     assert len(writable_directories) == 1
     (shadow_git_path,) = writable_directories
     shadow_git_dir = Path(shadow_git_path)
-    assert shadow_git_dir.name.startswith("awm-delivery-shadow.")
-    assert Path(common_dir) not in shadow_git_dir.parents
+    assert shadow_git_dir.name.startswith("shadow.")
+    assert Path(common_dir) in shadow_git_dir.parents
+    assert shadow_git_dir.parent.name.startswith("inputs.")
     assert git_dir not in writable_directories
     assert common_dir not in writable_directories
     assert str(Path(common_dir) / "objects") not in writable_directories
