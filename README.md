@@ -249,6 +249,7 @@ dispatch is persisted.
   "policy_issue": 88,
   "issues": [90, 89],
   "max_reviews": 4,
+  "whole_max_reviews": 4,
   "scope_max_reviews": 6,
   "turn_timeout": 7200,
   "implementer_agent": "codex",
@@ -274,6 +275,7 @@ original Issue as its work definition:
   "final_branch": "main",
   "one_shot_issue": 169,
   "max_reviews": 4,
+  "whole_max_reviews": 4,
   "scope_max_reviews": 6,
   "merge_to_integration": true,
   "final_review": true,
@@ -288,10 +290,12 @@ previous planning result. Replanning appends a new comment instead of replacing
 history; the workflow does not create child Issues or publish raw agent logs.
 
 The fixed `mode` discriminator, `make_integration_branch`, `policy_issue`,
-`scope_max_reviews`, `turn_timeout`, the two agent fields, and `scenarios` are optional; every
-other field is required. When omitted, `scope_max_reviews` retains the existing
-limit of 3 and controls only Scope / Design Review; the recommended samples set
-it to 6. `max_reviews` controls Correctness and whole-version review.
+`whole_max_reviews`, `scope_max_reviews`, `turn_timeout`, the
+two agent fields, and `scenarios` are optional; every other field is required. When omitted,
+`scope_max_reviews` retains the existing limit of 3 and controls only Scope /
+Design Review; the recommended samples set it to 6. `max_reviews` controls
+Correctness Review. `whole_max_reviews` controls Whole Review and defaults to
+`max_reviews` when omitted.
 `turn_timeout` is the agent-turn timeout in seconds from 1 through
 9,007,199,254,740,991 and defaults to 7200 when omitted; longer runs can set it
 to values such as 10800. If the timeout is reached while PurpleMux still reports
@@ -412,7 +416,8 @@ necessary, sufficient, appropriately placed, and consistent with the shared
 minimal-change principle. Only then does a separately counted Correctness Review
 check implementation quality. Scope Review uses `scope_max_reviews`, which
 defaults to three when omitted; the recommended values are six for Scope Review
-and four for the Correctness and whole-version review limit. The higher
+and four for the Correctness Review limit. Whole Review uses
+`whole_max_reviews`, which defaults to `max_reviews` when omitted. The higher
 recommended Scope limit reserves capacity for the required rechecks after
 Correctness fixes change the head. Whole Review first applies any configured
 Scenario Gate, then runs a dedicated Design Principles reviewer, the
@@ -522,6 +527,12 @@ outside the Runner falls back to one process-stable random namespace. The public
 creation that still need an explicit value. Correlations identify creation and
 reconciliation; Cleanup ownership continues to use returned concrete workspace,
 tab, and filesystem identities.
+
+When repository recovery retries the same work item within one Run, the canonical
+workflow keeps the planner, implementer, and reviewer correlations stable. Before
+recreating those sessions, it closes every uniquely matched prior tab only after
+public status and result reads prove that tab completed. An ambiguous, unrelated,
+or still-running match is retained and stops the retry.
 
 Static Validation reports Dry Run eligibility separately. Eligible trusted
 workflows declare `WORKFLOW_DRY_RUN = 1`; Dry Run executes that same Python program

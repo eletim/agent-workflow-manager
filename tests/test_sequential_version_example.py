@@ -17,6 +17,7 @@ from purplemux_client import (
     GitRepository,
     MutationOutcomeUnknown,
     PullRequestState,
+    TabState,
     WorkerFailure,
     WorkerInterrupted,
 )
@@ -177,6 +178,139 @@ def test_example_preserves_authoritative_inspection_and_mutation_safety() -> Non
     assert "existing_pr is not None or reused_existing_work" in source
     assert '"Deliver the exact Issue topology"' in source
     assert "Deliver the exact approved Issue topology" not in source
+
+
+def test_same_run_retry_reconciles_all_completed_collision_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-retry-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](334, "feature/issue-334")
+    logical_tabs = (
+        ("Work-item planner", "codex"),
+        (f"{issue.label} implementer", "codex"),
+        (f"{issue.label} scope reviewer", "codex"),
+        (f"{issue.label} correctness reviewer", "codex"),
+    )
+    names = tuple(
+        workflow["correlated_agent_tab_name"](logical_name)
+        for logical_name, _agent in logical_tabs
+    )
+
+    class Client:
+        workspace_id = "workspace"
+
+        def __init__(self) -> None:
+            self.tabs = {
+                f"old-{index}": TabState(
+                    f"old-{index}",
+                    self.workspace_id,
+                    name,
+                    "codex-cli",
+                    "codex",
+                    True,
+                    "ready-for-review",
+                )
+                for index, name in enumerate(names, 1)
+            }
+            self.closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(self.tabs.values())
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            tab = self.tabs[tab_id]
+            return {
+                "tabId": tab.id,
+                "workspaceId": tab.workspace_id,
+                "panelType": tab.panel_type,
+                "agentProviderId": tab.provider,
+                "cliState": tab.cli_state,
+            }
+
+        def read_result(self, tab_id: str) -> str:
+            assert tab_id in self.tabs
+            return "completed"
+
+        def close_session(
+            self, tab_id: str, *, expected_state: TabState | None = None
+        ) -> None:
+            assert self.tabs[tab_id] == expected_state
+            self.closed.append(tab_id)
+            del self.tabs[tab_id]
+
+    client = Client()
+    workflow["reconcile_completed_retry_tabs"](
+        client, logical_tabs, context="same-run retry"
+    )
+
+    assert client.closed == ["old-1", "old-2", "old-3", "old-4"]
+    assert client.tabs == {}
+
+
+@pytest.mark.parametrize(
+    "unsafe", ("ambiguous", "unrelated", "busy", "later-busy", "uncertain-status")
+)
+def test_retry_tab_reconciliation_does_not_close_uncertain_matches(
+    monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    monkeypatch.setenv("AGENT_WORKFLOW_MANAGER_RUN_IDENTITY", "run-unsafe-tabs")
+    workflow = runpy.run_path(str(EXAMPLE))
+    issue = workflow["Issue"](334, "feature/issue-334")
+    name = workflow["correlated_agent_tab_name"](f"{issue.label} implementer")
+    tab = TabState(
+        "tab-1",
+        "workspace",
+        name,
+        "terminal" if unsafe == "unrelated" else "codex-cli",
+        None if unsafe == "unrelated" else "codex",
+        True,
+        "busy" if unsafe == "busy" else "ready-for-review",
+    )
+    later = TabState(
+        "tab-2",
+        "workspace",
+        workflow["correlated_agent_tab_name"](f"{issue.label} scope reviewer"),
+        "codex-cli",
+        "codex",
+        True,
+        "busy",
+    )
+
+    class Client:
+        workspace_id = "workspace"
+        closed: list[str] = []
+
+        def list_sessions(self) -> tuple[TabState, ...]:
+            if unsafe == "ambiguous":
+                return (tab, replace(tab, id="tab-2"))
+            if unsafe == "later-busy":
+                return (tab, later)
+            return (tab,)
+
+        def read_status(self, tab_id: str) -> dict[str, object]:
+            selected = later if tab_id == later.id else tab
+            return {
+                "tabId": "different" if unsafe == "uncertain-status" else tab_id,
+                "workspaceId": self.workspace_id,
+                "panelType": selected.panel_type,
+                "agentProviderId": selected.provider,
+                "cliState": selected.cli_state,
+            }
+
+        def read_result(self, _tab_id: str) -> str:
+            return "completed"
+
+        def close_session(self, tab_id: str, **_kwargs: object) -> None:
+            self.closed.append(tab_id)
+
+    client = Client()
+    with pytest.raises(
+        WorkerFailure, match="ambiguous|unrelated|not completed|uncertain"
+    ):
+        workflow["reconcile_work_item_retry_tabs"](client, issue)
+
+    assert client.closed == []
 
 
 @pytest.mark.parametrize(
@@ -1362,8 +1496,11 @@ def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> Non
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert "MAX_SCOPE_REVIEWS = 6" in source
+    assert "MAX_WHOLE_REVIEWS = 4" in source
     assert "max_reviews=MAX_SCOPE_REVIEWS" in source
     assert "max_reviews=MAX_REVIEWS" in source
+    assert "range(1, MAX_WHOLE_REVIEWS + 1)" in source
+    assert "for check_number in range(1, MAX_REVIEWS + 1)" in source
     for field in (
         "scope_reviews=",
         "correctness_reviews=",
@@ -3759,7 +3896,7 @@ def test_same_head_partial_review_limit_recovery_finishes_atomically(
             return current
 
     agent_results = iter((current.head_sha, False) for _ in range(4))
-    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 1)
+    monkeypatch.setitem(workflow_globals, "MAX_WHOLE_REVIEWS", 1)
     monkeypatch.setitem(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
@@ -3987,7 +4124,7 @@ def test_scenario_gate_failure_does_not_skip_independent_reviews(
         return "APPROVED"
 
     monkeypatch.setitem(workflow_globals, "SCENARIOS", ("scenario",))
-    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 1)
+    monkeypatch.setitem(workflow_globals, "MAX_WHOLE_REVIEWS", 1)
     monkeypatch.setitem(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
@@ -4080,7 +4217,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
         lambda *args: events.append("final checks"),
     )
     monkeypatch.setitem(workflow_globals, "require_warning_delivery", warning_delivery)
-    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(workflow_globals, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(
         workflow_globals,
         "emit_finding",
@@ -4134,7 +4271,7 @@ def test_whole_warning_retries_from_durable_audit_after_recovery(
             assert kwargs["expected_head_sha"] == current.head_sha
             return current
 
-    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(
         globals_, "create_agent", lambda *args, **kwargs: pytest.fail("review restarted")
     )
@@ -4193,7 +4330,7 @@ def test_whole_limit_after_head_change_persists_retry_decision(
             current = replace(current, body=body)
             return current
 
-    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
     monkeypatch.setitem(
         globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
@@ -4216,7 +4353,7 @@ def test_whole_limit_after_head_change_persists_retry_decision(
 
     recovered = runpy.run_path(str(EXAMPLE))
     recovered_globals = recovered["review_whole_version"].__globals__
-    monkeypatch.setitem(recovered_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(recovered_globals, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(
         recovered_globals, "create_agent",
         lambda *args, **kwargs: pytest.fail("recovery restarted review"),
@@ -4303,7 +4440,7 @@ def test_whole_retry_finishes_warning_after_dispositions_but_before_marker(
             current = replace(current, body=body)
             return current
 
-    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
     monkeypatch.setitem(
         globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
