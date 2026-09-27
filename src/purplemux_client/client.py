@@ -1532,6 +1532,124 @@ done
     def _publication_disabled_agent_command(worker: str, prompt: str) -> str:
         """Launch a development agent with local commits but no publication."""
         encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        audit_script = base64.b64encode(
+            b"""#!/bin/sh
+zero=0000000000000000000000000000000000000000
+failed=0
+rollback_failed=0
+
+pinned_git() {
+    env GIT_DIR="$AWM_DELIVERY_GIT_DIR" \
+        GIT_COMMON_DIR="$AWM_DELIVERY_COMMON_DIR" \
+        GIT_WORK_TREE="$AWM_DELIVERY_ROOT" \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        "$AWM_DELIVERY_GIT_EXECUTABLE" -c core.hooksPath=/dev/null "$@"
+}
+
+restore_routing_file() {
+    source=$1
+    destination=$2
+    replacement=$(mktemp "${destination}.awm-restore.XXXXXX") || return 1
+    cat "$source" > "$replacement" &&
+        chmod 644 "$replacement" &&
+        if [ -d "$destination" ] && [ ! -L "$destination" ]; then
+            mv "$destination" \
+                "$AWM_DELIVERY_HOOKS/replaced-$(basename "$destination")" ||
+                return 1
+        fi &&
+        mv -f "$replacement" "$destination"
+}
+
+if ! cmp -s "$AWM_DELIVERY_HOOKS/head-before" \
+        "$AWM_DELIVERY_GIT_DIR/HEAD"; then
+    failed=1
+    restore_routing_file "$AWM_DELIVERY_HOOKS/head-before" \
+        "$AWM_DELIVERY_GIT_DIR/HEAD" || rollback_failed=1
+fi
+if [ "$AWM_DELIVERY_LINKED" = 1 ] &&
+        ! cmp -s "$AWM_DELIVERY_HOOKS/commondir-before" \
+            "$AWM_DELIVERY_GIT_DIR/commondir"; then
+    failed=1
+    restore_routing_file "$AWM_DELIVERY_HOOKS/commondir-before" \
+        "$AWM_DELIVERY_GIT_DIR/commondir" || rollback_failed=1
+fi
+
+if pinned_git for-each-ref --format='%(refname) %(objectname)' \
+        "$AWM_DELIVERY_REF_SCOPE" \
+        > "$AWM_DELIVERY_HOOKS/refs-after-all" &&
+        awk -v protected="$AWM_DELIVERY_REF" '$1 != protected' \
+            "$AWM_DELIVERY_HOOKS/refs-after-all" \
+            > "$AWM_DELIVERY_HOOKS/refs-after"; then
+    rm "$AWM_DELIVERY_HOOKS/refs-after-all"
+else
+    failed=1
+fi
+
+authorized=$(cat "$AWM_DELIVERY_HOOKS/ref-before")
+log_valid=1
+log_size=$(wc -c < "$AWM_DELIVERY_HOOKS/ref-log-before")
+if ! head -c "$log_size" "$AWM_DELIVERY_REF_LOG_PATH" |
+        cmp -s "$AWM_DELIVERY_HOOKS/ref-log-before" -; then
+    log_valid=0
+else
+    tail -c "+$((log_size + 1))" "$AWM_DELIVERY_REF_LOG_PATH" \
+        > "$AWM_DELIVERY_HOOKS/ref-log-after"
+    while IFS=' ' read -r old new rest ||
+            [ -n "$old$new$rest" ]; do
+        if [ -z "$old" ] || [ -z "$new" ] || [ -z "$rest" ] ||
+                [ "$old" != "$authorized" ] ||
+                ! pinned_git cat-file -e "$new^{commit}" ||
+                ! pinned_git merge-base --is-ancestor "$old" "$new"; then
+            log_valid=0
+            break
+        fi
+        authorized=$new
+    done < "$AWM_DELIVERY_HOOKS/ref-log-after"
+fi
+
+current=$(pinned_git rev-parse --verify "$AWM_DELIVERY_REF" 2>/dev/null || :)
+if [ "$log_valid" != 1 ] || [ "$current" != "$authorized" ]; then
+    failed=1
+    if [ -n "$current" ]; then
+        pinned_git update-ref "$AWM_DELIVERY_REF" "$authorized" "$current" ||
+            rollback_failed=1
+    else
+        pinned_git update-ref "$AWM_DELIVERY_REF" "$authorized" "$zero" ||
+            rollback_failed=1
+    fi
+fi
+
+while read -r ref before; do
+    after=$(awk -v ref="$ref" '$1 == ref { print $2 }' \
+        "$AWM_DELIVERY_HOOKS/refs-after")
+    if [ "$after" != "$before" ]; then
+        failed=1
+        if [ -n "$after" ]; then
+            pinned_git update-ref "$ref" "$before" "$after" || rollback_failed=1
+        else
+            pinned_git update-ref "$ref" "$before" "$zero" || rollback_failed=1
+        fi
+    fi
+done < "$AWM_DELIVERY_HOOKS/refs-before"
+
+while read -r ref after; do
+    if ! awk -v ref="$ref" '$1 == ref { found=1 } END { exit !found }' \
+            "$AWM_DELIVERY_HOOKS/refs-before"; then
+        failed=1
+        pinned_git update-ref -d "$ref" "$after" || rollback_failed=1
+    fi
+done < "$AWM_DELIVERY_HOOKS/refs-after"
+
+if [ "$rollback_failed" = 1 ]; then
+    printf '%s\n' 'publication-disabled Git ref rollback failed' >&2
+    exit 1
+fi
+if [ "$failed" = 1 ]; then
+    printf '%s\n' 'publication-disabled Git ref audit failed; changes rolled back' >&2
+    exit 1
+fi
+"""
+        ).decode("ascii")
         reference_hook = base64.b64encode(
             b"""#!/bin/sh
 phase=$1
@@ -1701,6 +1819,9 @@ done
             "files ref backend' >&2; exit 1 ;; esac && "
             "awm_delivery_git_dir=$(git rev-parse --absolute-git-dir) && "
             'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
+            "awm_delivery_root=$(git rev-parse --show-toplevel) && "
+            'awm_delivery_root=$(cd "$awm_delivery_root" && pwd -P) && '
+            "awm_delivery_git_executable=$(command -v git) && "
             "awm_delivery_common_dir=$(git rev-parse --path-format=absolute "
             "--git-common-dir) && "
             'awm_delivery_common_dir=$(cd "$awm_delivery_common_dir" && pwd -P) && '
@@ -1708,6 +1829,7 @@ done
             "--git-path objects) && "
             'awm_delivery_object_dir=$(cd "$awm_delivery_object_dir" && pwd -P) && '
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
+            "awm_delivery_ref_scope=${awm_delivery_ref%/*} && "
             "awm_delivery_ref_path=$(git rev-parse --path-format=absolute "
             '--git-path "$awm_delivery_ref") && '
             "awm_delivery_ref_dir=${awm_delivery_ref_path%/*} && "
@@ -1716,11 +1838,17 @@ done
             "awm_delivery_ref_log_path=$(git rev-parse --path-format=absolute "
             '--git-path "logs/$awm_delivery_ref") && '
             "awm_delivery_ref_log_dir=${awm_delivery_ref_log_path%/*} && "
-            '[ -f "$awm_delivery_ref_log_path" ] && '
+            'mkdir -p -- "$awm_delivery_ref_log_dir" && '
             'awm_delivery_ref_log_dir=$(cd "$awm_delivery_ref_log_dir" && pwd -P) && '
+            'if [ -f "$awm_delivery_ref_log_path" ]; then '
+            'awm_delivery_log_was_missing=0; else '
+            ': > "$awm_delivery_ref_log_path" && '
+            'awm_delivery_log_was_missing=1; fi && '
             'if [ "$awm_delivery_git_dir" = "$awm_delivery_common_dir" ]; then '
-            'awm_delivery_checkout_git_dir="$awm_delivery_object_dir"; '
-            'else awm_delivery_checkout_git_dir="$awm_delivery_git_dir"; fi && '
+            'awm_delivery_checkout_git_dir="$awm_delivery_object_dir" && '
+            'awm_delivery_linked=0; else '
+            'awm_delivery_checkout_git_dir="$awm_delivery_git_dir" && '
+            'awm_delivery_linked=1; fi && '
             "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
             'mkdir -p -- "$awm_delivery_hooks_root" && '
             'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
@@ -1733,17 +1861,31 @@ done
             '"$awm_delivery_hooks/reference-transaction" && '
             f"printf %s {pre_push_hook} | base64 --decode > "
             '"$awm_delivery_hooks/pre-push" && '
+            f"printf %s {audit_script} | base64 --decode > "
+            '"$awm_delivery_hooks/audit" && '
             'chmod 500 "$awm_delivery_hooks/reference-transaction" '
-            '"$awm_delivery_hooks/pre-push" && '
-            "awm_delivery_list_other_refs() { "
-            'git for-each-ref --format="%(refname) %(objectname) %(symref)" '
-            '> "$1.all" && '
+            '"$awm_delivery_hooks/pre-push" "$awm_delivery_hooks/audit" && '
+            'env GIT_DIR="$awm_delivery_git_dir" '
+            'GIT_COMMON_DIR="$awm_delivery_common_dir" '
+            'GIT_WORK_TREE="$awm_delivery_root" '
+            '"$awm_delivery_git_executable" for-each-ref '
+            "--format='%(refname) %(objectname)' "
+            '"$awm_delivery_ref_scope" '
+            '> "$awm_delivery_hooks/refs-before-all" && '
             'awk -v protected="$awm_delivery_ref" \'$1 != protected\' '
-            '"$1.all" > "$1" && rm -- "$1.all"; } && '
-            'awm_delivery_list_other_refs "$awm_delivery_hooks/refs-before" && '
+            '"$awm_delivery_hooks/refs-before-all" '
+            '> "$awm_delivery_hooks/refs-before" && '
+            'rm -- "$awm_delivery_hooks/refs-before-all" && '
+            'cp -- "$awm_delivery_git_dir/HEAD" '
+            '"$awm_delivery_hooks/head-before" && '
+            'if [ "$awm_delivery_linked" = 1 ]; then '
+            'cp -- "$awm_delivery_git_dir/commondir" '
+            '"$awm_delivery_hooks/commondir-before"; fi && '
             'cp -- "$awm_delivery_ref_log_path" '
             '"$awm_delivery_hooks/ref-log-before" && '
             'awm_delivery_old=$(git rev-parse "$awm_delivery_ref") && '
+            'printf \'%s\\n\' "$awm_delivery_old" > '
+            '"$awm_delivery_hooks/ref-before" && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             'AWM_DELIVERY_PROTECTED_ROOT="$(pwd -P)" '
@@ -1752,35 +1894,19 @@ done
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
             f"{launch}; "
             "awm_delivery_status=$?; "
-            "awm_delivery_audit() { "
-            'awm_delivery_current_ref=$(git symbolic-ref -q HEAD) && '
-            '[ "$awm_delivery_current_ref" = "$awm_delivery_ref" ] && '
-            'awm_delivery_current=$(git rev-parse "$awm_delivery_ref") && '
-            'awm_delivery_list_other_refs "$awm_delivery_hooks/refs-after" && '
-            'cmp -s "$awm_delivery_hooks/refs-before" '
-            '"$awm_delivery_hooks/refs-after" && '
-            'awm_delivery_log_size=$(wc -c < '
-            '"$awm_delivery_hooks/ref-log-before") && '
-            'head -c "$awm_delivery_log_size" "$awm_delivery_ref_log_path" '
-            '| cmp -s "$awm_delivery_hooks/ref-log-before" - && '
-            'printf \'%s\\n\' "$awm_delivery_old" > '
-            '"$awm_delivery_hooks/ref-log-tip" && '
-            'tail -c "+$((awm_delivery_log_size + 1))" '
-            '"$awm_delivery_ref_log_path" | '
-            '( awm_delivery_expected="$awm_delivery_old"; '
-            "while IFS=' ' read -r awm_delivery_log_old "
-            "awm_delivery_log_new awm_delivery_log_rest; do "
-            '[ "$awm_delivery_log_old" = "$awm_delivery_expected" ] || exit 1; '
-            'git cat-file -e "$awm_delivery_log_new^{commit}" || exit 1; '
-            'git merge-base --is-ancestor "$awm_delivery_log_old" '
-            '"$awm_delivery_log_new" || exit 1; '
-            'awm_delivery_expected="$awm_delivery_log_new"; '
-            'printf \'%s\\n\' "$awm_delivery_expected" > '
-            '"$awm_delivery_hooks/ref-log-tip"; done ) && '
-            '[ "$(cat "$awm_delivery_hooks/ref-log-tip")" = '
-            '"$awm_delivery_current" ]; } && '
-            'if ! awm_delivery_audit; then printf \'%s\\n\' '
-            "'publication-disabled Git ref audit failed' >&2; exit 1; fi; "
+            'AWM_DELIVERY_GIT_EXECUTABLE="$awm_delivery_git_executable" '
+            'AWM_DELIVERY_GIT_DIR="$awm_delivery_git_dir" '
+            'AWM_DELIVERY_COMMON_DIR="$awm_delivery_common_dir" '
+            'AWM_DELIVERY_ROOT="$awm_delivery_root" '
+            'AWM_DELIVERY_REF="$awm_delivery_ref" '
+            'AWM_DELIVERY_REF_SCOPE="$awm_delivery_ref_scope" '
+            'AWM_DELIVERY_REF_LOG_PATH="$awm_delivery_ref_log_path" '
+            'AWM_DELIVERY_HOOKS="$awm_delivery_hooks" '
+            'AWM_DELIVERY_LINKED="$awm_delivery_linked" '
+            '"$awm_delivery_hooks/audit"; awm_delivery_audit_status=$?; '
+            'if [ "$awm_delivery_log_was_missing" = 1 ]; then '
+            'rm -- "$awm_delivery_ref_log_path"; fi; '
+            'if [ "$awm_delivery_audit_status" != 0 ]; then exit 1; fi; '
             'exit "$awm_delivery_status"'
         )
 

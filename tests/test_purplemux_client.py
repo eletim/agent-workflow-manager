@@ -432,7 +432,9 @@ def test_publication_disabled_allows_commits_in_nested_repository(
     ).stdout.strip() == "nested"
 
 
-def linked_delivery_checkout(tmp_path: Path) -> tuple[Path, Path]:
+def linked_delivery_checkout(
+    tmp_path: Path, *, reflogs_enabled: bool = True
+) -> tuple[Path, Path]:
     repository = tmp_path / "repository parent"
     checkout = tmp_path / "linked checkout"
     subprocess.run(
@@ -454,6 +456,18 @@ def linked_delivery_checkout(tmp_path: Path) -> tuple[Path, Path]:
         ],
         check=True,
     )
+    if not reflogs_enabled:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "config",
+                "core.logAllRefUpdates",
+                "false",
+            ],
+            check=True,
+        )
     tracked = repository / "tracked.txt"
     tracked.write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
@@ -637,7 +651,7 @@ def test_publication_disabled_audits_ref_writes_that_bypass_hooks(
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            != sibling_before
+            == sibling_before
         )
     else:
         assert (
@@ -647,8 +661,143 @@ def test_publication_disabled_audits_ref_writes_that_bypass_hooks(
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            == "forbidden-rewrite"
+            == "forward"
         )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_pins_and_restores_linked_commondir(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    sibling_before = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    git_dir = Path(
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    commondir_before = (git_dir / "commondir").read_text(encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m forward >/dev/null 2>&1\n"
+        "git_dir=$(git rev-parse --absolute-git-dir)\n"
+        "active=$(git rev-parse --git-path refs/heads/feature/scoped-commit)\n"
+        "sibling=$(git rev-parse --git-path refs/heads/feature/sibling)\n"
+        'cp -- "$active" "$sibling"\n'
+        'fake_common="$PWD/fake-common"\n'
+        'mkdir -p "$fake_common/refs/heads/feature" "$fake_common/objects"\n'
+        'printf \'%s\\n\' "$fake_common" > "$git_dir/commondir"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "redirect refs"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "changes rolled back" in result.stderr
+    assert (git_dir / "commondir").read_text(encoding="utf-8") == commondir_before
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "feature/sibling"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == sibling_before
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "forward"
+    )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_supports_branches_without_reflogs(
+    worker: str, tmp_path: Path
+) -> None:
+    _, checkout = linked_delivery_checkout(tmp_path, reflogs_enabled=False)
+    ref = subprocess.run(
+        ["git", "-C", str(checkout), "symbolic-ref", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ref_log = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                f"logs/{ref}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    assert not ref_log.exists()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m forward-without-reflog >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert not ref_log.exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "forward-without-reflog"
+    )
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
