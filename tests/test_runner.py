@@ -1687,6 +1687,31 @@ def test_git_worktree_cleanup_retries_owned_alternates_after_worktree_removal(
     assert alternates.read_text(encoding="utf-8") == ""
 
 
+def test_git_worktree_cleanup_rejects_hardlinked_alternates(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(exist_ok=True)
+    redirected = tmp_path / "redirected-alternates"
+    redirected.write_text("preserved\n", encoding="utf-8")
+    os.link(redirected, alternates)
+    resource = RunResource(
+        "git_worktree",
+        str(tmp_path / "removed-worktree"),
+        {
+            "repository": str(repository),
+            "git_dir": str(repository / ".git" / "worktrees" / "removed"),
+        },
+    )
+
+    with pytest.raises(OSError, match="alternates metadata has an unexpected"):
+        runner._cleanup_resource(resource)
+
+    assert redirected.read_text(encoding="utf-8") == "preserved\n"
+
+
 def test_git_worktree_cleanup_retains_objects_needed_by_local_refs(
     runner: PythonRunner, tmp_path: Path
 ) -> None:
@@ -1755,7 +1780,7 @@ def test_git_worktree_cleanup_retains_objects_needed_by_local_refs(
     with pytest.raises(OSError, match="retained local refs still depend"):
         runner._cleanup_resource(resource)
 
-    assert not worktree.exists()
+    assert worktree.exists()
     assert private_store.is_dir()
     assert alternates.read_text(encoding="utf-8") == f"{private_store}\n"
     assert (

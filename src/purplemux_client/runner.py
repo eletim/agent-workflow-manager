@@ -3723,6 +3723,9 @@ class PythonRunner:
             )
         if dirty.stdout:
             raise OSError("Git worktree has uncommitted changes; refusing cleanup")
+        PythonRunner._cleanup_worktree_object_alternates(
+            git_dir, common_objects, repository
+        )
         removed = subprocess.run(
             ["git", "-C", str(repository), "worktree", "remove", str(worktree)],
             capture_output=True,
@@ -3746,9 +3749,6 @@ class PythonRunner:
                     "Git worktree removal could not be confirmed: "
                     + (removed.stderr.strip() or "no stderr")
                 )
-        PythonRunner._cleanup_worktree_object_alternates(
-            git_dir, common_objects, repository
-        )
 
     @staticmethod
     def _git_common_objects(repository: Path) -> Path:
@@ -3776,7 +3776,11 @@ class PythonRunner:
         alternates = objects / "info" / "alternates"
         if not os.path.lexists(alternates):
             return False
-        if alternates.is_symlink() or not alternates.is_file():
+        state = alternates.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(state.st_mode)
+            or state.st_nlink != 1
+        ):
             raise OSError("Git alternates metadata has an unexpected file type")
         owned_root = PythonRunner._worktree_object_root(git_dir, objects)
         return any(
@@ -3799,14 +3803,16 @@ class PythonRunner:
         alternates = objects / "info" / "alternates"
         if not os.path.lexists(alternates):
             return
-        if alternates.is_symlink() or not alternates.is_file():
+        state = alternates.stat(follow_symlinks=False)
+        if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
             raise OSError("Git alternates metadata has an unexpected file type")
         owned_root = PythonRunner._worktree_object_root(git_dir, objects)
         lock_path = objects.parent / "hooks" / "awm-delivery-alternates.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if alternates.is_symlink() or not alternates.is_file():
+            state = alternates.stat(follow_symlinks=False)
+            if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
                 raise OSError("Git alternates metadata has an unexpected file type")
             lines = alternates.read_text(encoding="utf-8").splitlines()
             owned = [

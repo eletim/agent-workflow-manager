@@ -1535,7 +1535,6 @@ done
         audit_script = base64.b64encode(
             b"""#!/bin/sh
 failed=0
-rollback_failed=0
 
 pinned_git() {
     env GIT_DIR="$AWM_DELIVERY_GIT_DIR" \
@@ -1545,44 +1544,23 @@ pinned_git() {
         "$AWM_DELIVERY_GIT_EXECUTABLE" -c core.hooksPath=/dev/null "$@"
 }
 
-restore_file() {
-    source=$1
-    destination=$2
-    replacement=$(mktemp "${destination}.awm-restore.XXXXXX") || return 1
-    cat "$source" > "$replacement" &&
-        chmod 644 "$replacement" &&
-        if [ -d "$destination" ] && [ ! -L "$destination" ]; then
-            mv "$destination" \
-                "$AWM_DELIVERY_HOOKS/replaced-$(basename "$destination")" ||
-                return 1
-        fi &&
-        mv -f "$replacement" "$destination"
+session_git() {
+    env GIT_DIR="$AWM_DELIVERY_SESSION_GIT_DIR" \
+        GIT_COMMON_DIR="$AWM_DELIVERY_COMMON_DIR" \
+        GIT_WORK_TREE="$AWM_DELIVERY_ROOT" \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        "$AWM_DELIVERY_GIT_EXECUTABLE" -c core.hooksPath=/dev/null "$@"
 }
 
 regular_unaliased_file() {
     [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %h "$1")" = 1 ]
 }
 
-if ! regular_unaliased_file "$AWM_DELIVERY_GIT_DIR/HEAD"; then
+if ! regular_unaliased_file "$AWM_DELIVERY_SESSION_GIT_DIR/HEAD"; then
     failed=1
-    restore_file "$AWM_DELIVERY_HOOKS/head-detached-before" \
-        "$AWM_DELIVERY_GIT_DIR/HEAD" || rollback_failed=1
 fi
-if [ "$AWM_DELIVERY_LINKED" = 1 ] &&
-        { ! regular_unaliased_file "$AWM_DELIVERY_GIT_DIR/commondir" ||
-          ! cmp -s "$AWM_DELIVERY_HOOKS/commondir-before" \
-            "$AWM_DELIVERY_GIT_DIR/commondir"; }; then
+if ! regular_unaliased_file "$AWM_DELIVERY_SESSION_GIT_DIR/index"; then
     failed=1
-    restore_file "$AWM_DELIVERY_HOOKS/commondir-before" \
-        "$AWM_DELIVERY_GIT_DIR/commondir" || rollback_failed=1
-fi
-if [ "$AWM_DELIVERY_LINKED" = 1 ] &&
-        { ! regular_unaliased_file "$AWM_DELIVERY_GIT_DIR/gitdir" ||
-          ! cmp -s "$AWM_DELIVERY_HOOKS/gitdir-before" \
-            "$AWM_DELIVERY_GIT_DIR/gitdir"; }; then
-    failed=1
-    restore_file "$AWM_DELIVERY_HOOKS/gitdir-before" \
-        "$AWM_DELIVERY_GIT_DIR/gitdir" || rollback_failed=1
 fi
 
 authorized=$(cat "$AWM_DELIVERY_HOOKS/ref-before")
@@ -1608,21 +1586,11 @@ else
     done < "$AWM_DELIVERY_HOOKS/head-log-after"
 fi
 
-current=$(pinned_git rev-parse --verify HEAD 2>/dev/null || :)
-current_symref=$(pinned_git symbolic-ref -q HEAD 2>/dev/null || :)
+current=$(session_git rev-parse --verify HEAD 2>/dev/null || :)
+current_symref=$(session_git symbolic-ref -q HEAD 2>/dev/null || :)
 if [ "$log_valid" != 1 ] || [ "$current" != "$authorized" ] ||
         [ -n "$current_symref" ]; then
     failed=1
-    if [ -n "$current" ]; then
-        pinned_git update-ref --no-deref HEAD \
-            "$(cat "$AWM_DELIVERY_HOOKS/ref-before")" "$current" ||
-            rollback_failed=1
-    fi
-    authorized=$(cat "$AWM_DELIVERY_HOOKS/ref-before")
-fi
-if [ "$log_valid" != 1 ]; then
-    restore_file "$AWM_DELIVERY_HOOKS/head-log-before" \
-        "$AWM_DELIVERY_HEAD_LOG_PATH" || rollback_failed=1
 fi
 
 old=$(cat "$AWM_DELIVERY_HOOKS/ref-before")
@@ -1630,14 +1598,6 @@ if [ "$failed" = 0 ] &&
         ! pinned_git update-ref --no-deref "$AWM_DELIVERY_REF" \
         "$authorized" "$old"; then
     failed=1
-fi
-if ! pinned_git symbolic-ref HEAD "$AWM_DELIVERY_REF"; then
-    rollback_failed=1
-fi
-
-if [ "$rollback_failed" = 1 ]; then
-    printf '%s\n' 'publication-disabled Git metadata recovery failed' >&2
-    exit 1
 fi
 if [ "$failed" = 1 ]; then
     printf '%s\n' \
@@ -1662,11 +1622,15 @@ root=$(env -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
     "$AWM_DELIVERY_REAL_GIT" -C "${probe:-/}" rev-parse --show-toplevel \
     2>/dev/null || :)
 if [ "$root" = "$AWM_DELIVERY_PROTECTED_ROOT" ]; then
-    exec env GIT_OBJECT_DIRECTORY="$AWM_DELIVERY_OBJECT_DIR" \
+    exec env GIT_DIR="$AWM_DELIVERY_SESSION_GIT_DIR" \
+        GIT_COMMON_DIR="$AWM_DELIVERY_COMMON_DIR" \
+        GIT_WORK_TREE="$AWM_DELIVERY_PROTECTED_ROOT" \
+        GIT_OBJECT_DIRECTORY="$AWM_DELIVERY_OBJECT_DIR" \
         GIT_ALTERNATE_OBJECT_DIRECTORIES="$AWM_DELIVERY_SHARED_OBJECT_DIR" \
         "$AWM_DELIVERY_REAL_GIT" "$@"
 fi
-exec env -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+exec env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
     "$AWM_DELIVERY_REAL_GIT" "$@"
 """
         ).decode("ascii")
@@ -1812,7 +1776,7 @@ done
         additional_git_directories = " ".join(
             f'--add-dir "${{{variable}}}"'
             for variable in (
-                "awm_delivery_checkout_git_dir",
+                "awm_delivery_session_git_dir",
                 "awm_delivery_object_dir",
             )
         )
@@ -1850,14 +1814,9 @@ done
             "awm_delivery_ref_dir=${awm_delivery_ref_path%/*} && "
             'mkdir -p -- "$awm_delivery_ref_dir" && '
             'awm_delivery_ref_dir=$(cd "$awm_delivery_ref_dir" && pwd -P) && '
-            "awm_delivery_head_log_path=$(git rev-parse --path-format=absolute "
-            '--git-path "logs/HEAD") && '
-            'awm_delivery_head_log_dir=${awm_delivery_head_log_path%/*} && '
             'if [ "$awm_delivery_git_dir" = "$awm_delivery_common_dir" ]; then '
             "awm_delivery_object_dir=$(mktemp -d "
-            '"$awm_delivery_shared_object_dir/awm-delivery.XXXXXX") && '
-            'awm_delivery_checkout_git_dir="$awm_delivery_object_dir" && '
-            'awm_delivery_linked=0; else '
+            '"$awm_delivery_shared_object_dir/awm-delivery.XXXXXX"); else '
             "awm_delivery_object_owner=$(printf '%s\\n' "
             '"$awm_delivery_git_dir" | sha256sum) && '
             'awm_delivery_object_owner=${awm_delivery_object_owner%% *} && '
@@ -1865,48 +1824,44 @@ done
             'awm-delivery/$awm_delivery_object_owner" && '
             'mkdir -p -- "$awm_delivery_object_root" && '
             "awm_delivery_object_dir=$(mktemp -d "
-            '"$awm_delivery_object_root/awm-delivery.XXXXXX") && '
-            'awm_delivery_checkout_git_dir="$awm_delivery_git_dir" && '
-            'awm_delivery_linked=1; fi && '
-            '[ -f "$awm_delivery_git_dir/HEAD" ] && '
-            '[ ! -L "$awm_delivery_git_dir/HEAD" ] && '
-            '[ "$(stat -c %h "$awm_delivery_git_dir/HEAD")" = 1 ] && '
-            'if [ "$awm_delivery_linked" = 1 ]; then '
-            '[ -f "$awm_delivery_git_dir/commondir" ] && '
-            '[ ! -L "$awm_delivery_git_dir/commondir" ] && '
-            '[ "$(stat -c %h "$awm_delivery_git_dir/commondir")" = 1 ] && '
-            '[ -f "$awm_delivery_git_dir/gitdir" ] && '
-            '[ ! -L "$awm_delivery_git_dir/gitdir" ] && '
-            '[ "$(stat -c %h "$awm_delivery_git_dir/gitdir")" = 1 ]; fi && '
-            'mkdir -p -- "$awm_delivery_head_log_dir" && '
-            'if [ ! -e "$awm_delivery_head_log_path" ]; then '
-            ': > "$awm_delivery_head_log_path"; fi && '
-            '[ -f "$awm_delivery_head_log_path" ] && '
-            '[ ! -L "$awm_delivery_head_log_path" ] && '
-            '[ "$(stat -c %h "$awm_delivery_head_log_path")" = 1 ] && '
+            '"$awm_delivery_object_root/awm-delivery.XXXXXX"); fi && '
             "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
             'mkdir -p -- "$awm_delivery_hooks_root" && '
             'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
             "awm_delivery_hooks=$(mktemp -d "
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
-            'mkdir -p -- "$awm_delivery_hooks/gh" && '
-            'awm_delivery_detached=0 && '
-            "trap 'if [ \"$awm_delivery_detached\" = 1 ]; then "
-            'env GIT_DIR="$awm_delivery_git_dir" '
-            'GIT_COMMON_DIR="$awm_delivery_common_dir" '
-            'GIT_WORK_TREE="$awm_delivery_root" '
-            '"$awm_delivery_git_executable" -c core.hooksPath=/dev/null '
-            'symbolic-ref HEAD "$awm_delivery_ref" >/dev/null 2>&1 || :; fi; '
+            'awm_delivery_session_git_dir="$awm_delivery_hooks/git" && '
+            'awm_delivery_head_log_path="$awm_delivery_session_git_dir/logs/HEAD" && '
+            'mkdir -p -- "$awm_delivery_hooks/gh" '
+            '"$awm_delivery_session_git_dir/logs" && '
+            'awm_delivery_alternate_registered=0 && '
+            "trap 'if [ \"$awm_delivery_alternate_registered\" = 0 ]; then "
+            "rm -r -- \"$awm_delivery_object_dir\"; fi; "
             "rm -r -- \"$awm_delivery_hooks\"' EXIT && "
             'mkdir -p -- "$awm_delivery_shared_object_dir/info" && '
             'exec 8>"$awm_delivery_hooks_root/awm-delivery-alternates.lock" && '
             'flock 8 && '
+            'awm_delivery_alternates_dir="$awm_delivery_shared_object_dir/info" && '
+            'if [ ! -d "$awm_delivery_alternates_dir" ] || '
+            '[ -L "$awm_delivery_alternates_dir" ]; then printf \'%s\\n\' '
+            "'Git alternates directory has an unexpected file type' >&2; "
+            'exit 1; fi && '
             'awm_delivery_alternates="$awm_delivery_shared_object_dir/'
             'info/alternates" && '
+            'if [ -L "$awm_delivery_alternates" ]; then '
+            "printf '%s\\n' 'Git alternates metadata has an unexpected "
+            "file type' >&2; exit 1; fi && "
+            'if [ ! -e "$awm_delivery_alternates" ]; then '
+            ': > "$awm_delivery_alternates"; fi && '
+            'if [ ! -f "$awm_delivery_alternates" ] || '
+            '[ "$(stat -c %h "$awm_delivery_alternates")" != 1 ]; then '
+            "printf '%s\\n' 'Git alternates metadata has an unexpected "
+            "file type' >&2; exit 1; fi && "
             'if ! grep -Fxq "$awm_delivery_object_dir" '
             '"$awm_delivery_alternates" 2>/dev/null; then '
             'printf \'%s\\n\' "$awm_delivery_object_dir" '
             '>> "$awm_delivery_alternates"; fi && '
+            'awm_delivery_alternate_registered=1 && '
             'flock -u 8 && exec 8>&- && '
             'case "$awm_delivery_ref_scope" in refs/heads/*) '
             'awm_delivery_lock_namespace=${awm_delivery_ref_scope#refs/heads/}; '
@@ -1963,28 +1918,43 @@ done
             'chmod 500 "$awm_delivery_hooks/reference-transaction" '
             '"$awm_delivery_hooks/pre-push" "$awm_delivery_hooks/audit" '
             '"$awm_delivery_hooks/bin/git" && '
-            'if [ "$awm_delivery_linked" = 1 ]; then '
-            'cp -- "$awm_delivery_git_dir/commondir" '
-            '"$awm_delivery_hooks/commondir-before" && '
-            'cp -- "$awm_delivery_git_dir/gitdir" '
-            '"$awm_delivery_hooks/gitdir-before"; fi && '
             'awm_delivery_old=$(git rev-parse "$awm_delivery_ref") && '
             'printf \'%s\\n\' "$awm_delivery_old" > '
             '"$awm_delivery_hooks/ref-before" && '
-            'env GIT_DIR="$awm_delivery_git_dir" '
+            'printf \'%s\\n\' "$awm_delivery_old" > '
+            '"$awm_delivery_session_git_dir/HEAD" && '
+            'awm_delivery_real_index=$(git rev-parse --path-format=absolute '
+            '--git-path index) && '
+            'if [ -f "$awm_delivery_real_index" ] && '
+            '[ ! -L "$awm_delivery_real_index" ]; then '
+            'cp -- "$awm_delivery_real_index" '
+            '"$awm_delivery_session_git_dir/index"; else '
+            'env GIT_DIR="$awm_delivery_session_git_dir" '
             'GIT_COMMON_DIR="$awm_delivery_common_dir" '
             'GIT_WORK_TREE="$awm_delivery_root" '
-            '"$awm_delivery_git_executable" update-ref --no-deref '
-            '--create-reflog HEAD "$awm_delivery_old" && '
-            'awm_delivery_detached=1 && '
-            'cp -- "$awm_delivery_git_dir/HEAD" '
-            '"$awm_delivery_hooks/head-detached-before" && '
+            'GIT_OBJECT_DIRECTORY="$awm_delivery_object_dir" '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shared_object_dir" '
+            '"$awm_delivery_git_executable" read-tree "$awm_delivery_old"; fi && '
+            ': > "$awm_delivery_head_log_path" && '
+            'if [ ! -f "$awm_delivery_session_git_dir/HEAD" ] || '
+            '[ -L "$awm_delivery_session_git_dir/HEAD" ] || '
+            '[ "$(stat -c %h "$awm_delivery_session_git_dir/HEAD")" != 1 ] || '
+            '[ ! -f "$awm_delivery_session_git_dir/index" ] || '
+            '[ -L "$awm_delivery_session_git_dir/index" ] || '
+            '[ "$(stat -c %h "$awm_delivery_session_git_dir/index")" != 1 ] || '
+            '[ ! -f "$awm_delivery_head_log_path" ] || '
+            '[ -L "$awm_delivery_head_log_path" ] || '
+            '[ "$(stat -c %h "$awm_delivery_head_log_path")" != 1 ]; then '
+            "printf '%s\\n' 'publication-disabled session metadata has an "
+            "unexpected file type' >&2; exit 1; fi && "
             'cp -- "$awm_delivery_head_log_path" '
             '"$awm_delivery_hooks/head-log-before" && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             'AWM_DELIVERY_PROTECTED_ROOT="$(pwd -P)" '
             'AWM_DELIVERY_REAL_GIT="$awm_delivery_git_executable" '
+            'AWM_DELIVERY_SESSION_GIT_DIR="$awm_delivery_session_git_dir" '
+            'AWM_DELIVERY_COMMON_DIR="$awm_delivery_common_dir" '
             'AWM_DELIVERY_OBJECT_DIR="$awm_delivery_object_dir" '
             'AWM_DELIVERY_SHARED_OBJECT_DIR="$awm_delivery_shared_object_dir" '
             'PATH="$awm_delivery_hooks/bin:$PATH" '
@@ -1995,20 +1965,13 @@ done
             "awm_delivery_status=$?; "
             'AWM_DELIVERY_GIT_EXECUTABLE="$awm_delivery_git_executable" '
             'AWM_DELIVERY_GIT_DIR="$awm_delivery_git_dir" '
+            'AWM_DELIVERY_SESSION_GIT_DIR="$awm_delivery_session_git_dir" '
             'AWM_DELIVERY_COMMON_DIR="$awm_delivery_common_dir" '
             'AWM_DELIVERY_ROOT="$awm_delivery_root" '
             'AWM_DELIVERY_REF="$awm_delivery_ref" '
             'AWM_DELIVERY_HEAD_LOG_PATH="$awm_delivery_head_log_path" '
             'AWM_DELIVERY_HOOKS="$awm_delivery_hooks" '
-            'AWM_DELIVERY_LINKED="$awm_delivery_linked" '
             '"$awm_delivery_hooks/audit"; awm_delivery_audit_status=$?; '
-            'if [ "$(env GIT_DIR="$awm_delivery_git_dir" '
-            'GIT_COMMON_DIR="$awm_delivery_common_dir" '
-            'GIT_WORK_TREE="$awm_delivery_root" '
-            'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null '
-            '"$awm_delivery_git_executable" symbolic-ref -q HEAD '
-            '2>/dev/null || :)" = '
-            '"$awm_delivery_ref" ]; then awm_delivery_detached=0; fi; '
             'if [ "$awm_delivery_audit_status" != 0 ]; then exit 1; fi; '
             'exit "$awm_delivery_status"'
         )

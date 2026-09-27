@@ -665,10 +665,20 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     }
     assert len(private_object_directories) == 1
     private_object_directory = private_object_directories.pop()
+    session_git_directories = {
+        path
+        for path in writable_directories
+        if Path(path).name == "git"
+        and Path(path).parent.name.startswith("awm-delivery.")
+        and Path(path).parent.parent == Path(common_dir) / "hooks"
+    }
+    assert len(session_git_directories) == 1
+    session_git_directory = session_git_directories.pop()
     assert writable_directories == {
-        git_dir,
+        session_git_directory,
         private_object_directory,
     }
+    assert git_dir not in writable_directories
     assert str(Path(common_dir) / "objects") not in writable_directories
     assert private_object_directory in (
         Path(common_dir) / "objects" / "info" / "alternates"
@@ -807,58 +817,6 @@ def test_publication_disabled_does_not_revert_concurrent_protected_ref_update(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_restores_gitdir_backlink(
-    worker: str, tmp_path: Path
-) -> None:
-    _, checkout = linked_delivery_checkout(tmp_path)
-    git_dir = Path(
-        subprocess.run(
-            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    backlink_before = (git_dir / "gitdir").read_bytes()
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_worker = fake_bin / worker
-    fake_worker.write_text(
-        "#!/bin/sh\n"
-        "git commit --allow-empty -m forward >/dev/null 2>&1\n"
-        "git_dir=$(git rev-parse --absolute-git-dir)\n"
-        'printf \'tampered\\n\' > "$git_dir/gitdir"\n',
-        encoding="utf-8",
-    )
-    fake_worker.chmod(0o755)
-    environment = os.environ.copy()
-    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-
-    result = subprocess.run(
-        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "tamper metadata"),
-        cwd=checkout,
-        env=environment,
-        shell=True,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode != 0
-    assert "protected ref not advanced" in result.stderr
-    assert (git_dir / "gitdir").read_bytes() == backlink_before
-    assert (
-        subprocess.run(
-            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        == "base"
-    )
-
-
-@pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_rolls_back_commit_with_missing_reachable_object(
     worker: str, tmp_path: Path
 ) -> None:
@@ -911,33 +869,22 @@ def test_publication_disabled_rolls_back_commit_with_missing_reachable_object(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-@pytest.mark.parametrize("metadata", ["HEAD", "commondir", "gitdir", "head-log"])
+@pytest.mark.parametrize("metadata", ["HEAD", "head-log"])
 def test_publication_disabled_rejects_metadata_symlinks(
     worker: str, metadata: str, tmp_path: Path
 ) -> None:
     _, checkout = linked_delivery_checkout(tmp_path)
-    git_dir = Path(
-        subprocess.run(
-            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    if metadata == "head-log":
-        target = git_dir / "logs" / "HEAD"
-    else:
-        target = git_dir / metadata
-    original = target.read_bytes()
     replacement = tmp_path / f"{metadata}-replacement"
-    replacement.write_bytes(original)
+    replacement.write_text("replacement\n", encoding="utf-8")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_worker = fake_bin / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
-        f"rm -- {shlex.quote(str(target))}\n"
-        f"ln -s -- {shlex.quote(str(replacement))} {shlex.quote(str(target))}\n",
+        "git_dir=$(git rev-parse --absolute-git-dir)\n"
+        f'target="$git_dir/{"logs/HEAD" if metadata == "head-log" else metadata}"\n'
+        'rm -- "$target"\n'
+        f"ln -s -- {shlex.quote(str(replacement))} \"$target\"\n",
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
@@ -956,26 +903,15 @@ def test_publication_disabled_rejects_metadata_symlinks(
 
     assert result.returncode != 0
     assert "protected ref not advanced" in result.stderr
-    assert not target.is_symlink()
-    if metadata != "head-log":
-        assert target.read_bytes() == original
+    assert replacement.read_text(encoding="utf-8") == "replacement\n"
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-@pytest.mark.parametrize("metadata", ["HEAD", "commondir", "gitdir", "head-log"])
+@pytest.mark.parametrize("metadata", ["HEAD", "head-log"])
 def test_publication_disabled_rejects_metadata_hardlinks(
     worker: str, metadata: str, tmp_path: Path
 ) -> None:
     _, checkout = linked_delivery_checkout(tmp_path)
-    git_dir = Path(
-        subprocess.run(
-            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    target = git_dir / ("logs/HEAD" if metadata == "head-log" else metadata)
     alias = tmp_path / f"{metadata}-alias"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -983,7 +919,9 @@ def test_publication_disabled_rejects_metadata_hardlinks(
     fake_worker.write_text(
         "#!/bin/sh\n"
         "git commit --allow-empty -m forward >/dev/null 2>&1\n"
-        f"ln -- {shlex.quote(str(target))} {shlex.quote(str(alias))}\n",
+        "git_dir=$(git rev-parse --absolute-git-dir)\n"
+        f'target="$git_dir/{"logs/HEAD" if metadata == "head-log" else metadata}"\n'
+        f"ln -- \"$target\" {shlex.quote(str(alias))}\n",
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
@@ -1002,9 +940,53 @@ def test_publication_disabled_rejects_metadata_hardlinks(
 
     assert result.returncode != 0
     assert "protected ref not advanced" in result.stderr
-    assert target.stat().st_nlink == 1
     assert alias.stat().st_nlink == 1
-    assert target.stat().st_ino != alias.stat().st_ino
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+@pytest.mark.parametrize("alias_type", ["symlink", "dangling-symlink", "hardlink"])
+def test_publication_disabled_rejects_aliased_alternates_before_launch(
+    worker: str, alias_type: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(exist_ok=True)
+    redirected = tmp_path / "redirected-alternates"
+    if alias_type != "dangling-symlink":
+        redirected.write_text("preserved\n", encoding="utf-8")
+    if alias_type in {"symlink", "dangling-symlink"}:
+        alternates.symlink_to(redirected)
+    else:
+        os.link(redirected, alternates)
+    launched = tmp_path / "launched"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        f"#!/bin/sh\nprintf launched > {shlex.quote(str(launched))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "do not run"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "alternates metadata has an unexpected file type" in result.stderr
+    if alias_type == "dangling-symlink":
+        assert not redirected.exists()
+    else:
+        assert redirected.read_text(encoding="utf-8") == "preserved\n"
+    assert not launched.exists()
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
@@ -1160,60 +1142,6 @@ def test_publication_disabled_top_level_branch_lock_overlaps_nested_branches(
     assert result.returncode != 0
     assert "owns overlapping Git metadata" in result.stderr
     assert not launched.exists()
-
-
-@pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_pins_and_restores_linked_commondir(
-    worker: str, tmp_path: Path
-) -> None:
-    _, checkout = linked_delivery_checkout(tmp_path)
-    git_dir = Path(
-        subprocess.run(
-            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    commondir_before = (git_dir / "commondir").read_text(encoding="utf-8")
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_worker = fake_bin / worker
-    fake_worker.write_text(
-        "#!/bin/sh\n"
-        "git commit --allow-empty -m forward >/dev/null 2>&1\n"
-        "git_dir=$(git rev-parse --absolute-git-dir)\n"
-        'fake_common="$PWD/fake-common"\n'
-        'mkdir -p "$fake_common/objects"\n'
-        'printf \'%s\\n\' "$fake_common" > "$git_dir/commondir"\n',
-        encoding="utf-8",
-    )
-    fake_worker.chmod(0o755)
-    environment = os.environ.copy()
-    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-
-    result = subprocess.run(
-        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "redirect refs"),
-        cwd=checkout,
-        env=environment,
-        shell=True,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode != 0
-    assert "protected ref not advanced" in result.stderr
-    assert (git_dir / "commondir").read_text(encoding="utf-8") == commondir_before
-    assert (
-        subprocess.run(
-            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        == "base"
-    )
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
