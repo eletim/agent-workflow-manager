@@ -1607,6 +1607,7 @@ import threading
     old,
     common_git_dir,
     publication_state,
+    pending_signal,
 ) = sys.argv[1:]
 blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
 recovery_path = Path(recovery)
@@ -1682,6 +1683,9 @@ def watch_for_interrupted_shutdown():
 threading.Thread(target=watch_for_interrupted_shutdown, daemon=True).start()
 for blocked_signal in blocked:
     signal.signal(blocked_signal, lambda _number, _frame: shutdown_requested.set())
+signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
+if int(pending_signal):
+    shutdown_requested.set()
 
 
 def run_git(
@@ -1800,7 +1804,9 @@ def build_interrupted_bundle():
         return
     bundle_temporary = recovery_path / "recovery.bundle.tmp"
     bundle_temporary.unlink(missing_ok=True)
-    references = recovery_refs or {"refs/awm-delivery/shadow": shadow_commit}
+    if worktree_commit is None or not recovery_refs:
+        raise RuntimeError("interrupted recovery root capture is incomplete")
+    references = recovery_refs
     pack_input = "\\n".join([*references.values(), "^" + old, ""])
     with bundle_temporary.open("wb") as output:
         output.write(b"# v2 git bundle\\n")
@@ -2165,16 +2171,10 @@ def capture_nested_repository(root, destination):
         or staged_tree != worktree_tree
     )
 
-shadow_commit = old
-staged_commit = None
-worktree_commit = None
-conflict_state = None
-recovery_refs = {}
-nested_repositories = []
-marker_metadata = []
-publication_attempted = False
 
-try:
+def capture_root_repository():
+    global conflict_state, recovery_refs, shadow_commit, staged_commit, worktree_commit
+
     shadow_commit = run_git(["rev-parse", protected_ref]).stdout.strip()
     staged_tree, conflict_state = capture_index_state(
         base_environment, Path(shadow) / "index", recovery_path
@@ -2212,18 +2212,10 @@ try:
     for reference, commit in recovery_refs.items():
         run_git(["update-ref", reference, commit])
 
-    bundle_temporary = recovery_path / "recovery.bundle.tmp"
-    bundle = recovery_path / "recovery.bundle"
-    run_git(
-        [
-            "bundle",
-            "create",
-            str(bundle_temporary),
-            *recovery_refs,
-            "^" + old,
-        ]
-    )
-    os.replace(bundle_temporary, bundle)
+
+def capture_nested_state():
+    global marker_metadata, nested_capture_complete, nested_repositories
+    global nested_residual
 
     nested_root = recovery_path / "nested"
     nested_repositories, invalid_git_markers = nested_git_roots()
@@ -2254,6 +2246,44 @@ try:
                     "storedAt": os.path.relpath(stored, recovery_path),
                 }
             )
+    nested_capture_complete = True
+
+
+def reset_incomplete_capture():
+    for path in recovery_path.iterdir():
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+shadow_commit = old
+staged_commit = None
+worktree_commit = None
+conflict_state = None
+recovery_refs = {}
+nested_repositories = []
+marker_metadata = []
+nested_residual = False
+nested_capture_complete = False
+publication_attempted = False
+
+try:
+    capture_root_repository()
+
+    bundle_temporary = recovery_path / "recovery.bundle.tmp"
+    bundle = recovery_path / "recovery.bundle"
+    run_git(
+        [
+            "bundle",
+            "create",
+            str(bundle_temporary),
+            *recovery_refs,
+            "^" + old,
+        ]
+    )
+    os.replace(bundle_temporary, bundle)
+
+    capture_nested_state()
 
     status_path = recovery_path / "status.porcelain"
     cleanliness = "verified"
@@ -2281,7 +2311,7 @@ try:
             )
         if status.returncode:
             cleanliness = "unverified"
-        elif status_path.stat().st_size or nested_residual or invalid_git_markers:
+        elif status_path.stat().st_size or nested_residual or marker_metadata:
             cleanliness = "residual"
     except (OSError, subprocess.SubprocessError):
         cleanliness = "unverified"
@@ -2295,7 +2325,18 @@ except (OSError, RuntimeError, subprocess.SubprocessError) as error:
     try:
         reset_publication_marker()
         if recovery_interrupted.is_set():
+            if worktree_commit is None:
+                reset_incomplete_capture()
+                capture_root_repository()
             build_interrupted_bundle()
+            if not nested_capture_complete:
+                for name in ("nested", "ordinary-git-markers"):
+                    path = recovery_path / name
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    elif path.exists():
+                        path.unlink()
+                capture_nested_state()
             write_metadata("unverified", interrupted=True, error=error)
             publish_recovery()
         elif publication_attempted:
@@ -2534,6 +2575,8 @@ exec "$real_git" "$@"
             'case "$awm_delivery_python" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_timeout=$(command -v timeout) && "
             'case "$awm_delivery_timeout" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_env=$(command -v env) && "
+            'case "$awm_delivery_env" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_original_path=$PATH && "
             f"awm_delivery_worker=$(command -v {worker}) && "
             'case "$awm_delivery_worker" in /*) ;; *) exit 1 ;; esac && '
@@ -2673,21 +2716,21 @@ exec "$real_git" "$@"
             "base64 --decode) && "
             'awm_delivery_hooks=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_hooks_root" "awm-delivery.") && '
+            '"$awm_delivery_hooks_root" "awm-delivery.") || exit; '
             'awm_delivery_recovery_state="$awm_delivery_hooks/'
             'recovery-published" && '
             'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") && '
+            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") || exit; '
             'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") || exit; '
             'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
             'awm-delivery-recovery" && '
             'mkdir -p -- "$awm_delivery_recovery_root" && '
             'awm_delivery_recovery=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_recovery_root" "output.") && '
+            '"$awm_delivery_recovery_root" "output.") || exit; '
             '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
             '"$awm_delivery_isolated_root/" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
@@ -2740,6 +2783,20 @@ exec "$real_git" "$@"
             '"$awm_delivery_real_git" read-tree "$awm_delivery_old" && '
             'PATH="$awm_delivery_hooks/bin:$PATH" && '
             "export PATH && "
+            f"awm_delivery_snapshot=$(printf %s {recovery_snapshot} | "
+            "base64 --decode) && "
+            "awm_delivery_pending_signal=0 && "
+            "awm_delivery_worker_pid='' && "
+            "awm_delivery_phase_signal() { "
+            'if [ -n "$awm_delivery_worker_pid" ] && '
+            '! kill -0 "$awm_delivery_worker_pid" 2>/dev/null; then '
+            'if [ "$awm_delivery_pending_signal" -eq 0 ]; then '
+            "awm_delivery_pending_signal=$1; fi; "
+            'else awm_delivery_signal "$1"; fi; '
+            "} && "
+            "trap 'awm_delivery_phase_signal 129' HUP && "
+            "trap 'awm_delivery_phase_signal 130' INT && "
+            "trap 'awm_delivery_phase_signal 143' TERM && "
             'set -- "$awm_delivery_bwrap" --die-with-parent --new-session '
             '--ro-bind / / --dev-bind /dev /dev --proc /proc '
             '--tmpfs /tmp '
@@ -2756,29 +2813,39 @@ exec "$real_git" "$@"
             '"$awm_delivery_root"|"$awm_delivery_root"/*) ;; '
             '*) set -- "$@" --ro-bind "$awm_delivery_worker_dir" '
             '"$awm_delivery_worker_dir" ;; esac && '
-            f"printf %s {encoded} | base64 --decode | "
+            f"{{ printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
             'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
             'GIT_EXEC_PATH="$awm_delivery_hooks/bin" '
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
-            f'"$@" {launch}; '
-            "awm_delivery_status=$?; "
+            f'"$@" {launch} & '
+            "awm_delivery_worker_pid=$!; "
+            'wait "$awm_delivery_worker_pid"; '
+            "awm_delivery_status=$?; } && "
             "PATH=$awm_delivery_original_path; export PATH; "
-            f"awm_delivery_snapshot=$(printf %s {recovery_snapshot} | "
-            "base64 --decode) && "
             "awm_delivery_recovery_started=1 && "
-            'awm_delivery_cleanliness=$("$awm_delivery_python" -c '
+            'awm_delivery_cleanliness=$("$awm_delivery_env" '
+            '--block-signal=HUP --block-signal=INT --block-signal=TERM '
+            '"$awm_delivery_python" -c '
             '"$awm_delivery_snapshot" "$awm_delivery_real_git" '
             '"$awm_delivery_timeout" '
             '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
             '"$awm_delivery_recovery" "$awm_delivery_ref" '
             '"$awm_delivery_old" "$awm_delivery_common_git_dir" '
-            '"$awm_delivery_recovery_state") || { '
+            '"$awm_delivery_recovery_state" '
+            '"$awm_delivery_pending_signal"); '
+            "awm_delivery_recovery_status=$?; "
+            "trap 'awm_delivery_signal 129' HUP; "
+            "trap 'awm_delivery_signal 130' INT; "
+            "trap 'awm_delivery_signal 143' TERM; "
+            'if [ "$awm_delivery_pending_signal" -ne 0 ]; then '
+            'awm_delivery_signal "$awm_delivery_pending_signal"; fi; '
+            'if [ "$awm_delivery_recovery_status" -ne 0 ]; then '
             "printf '%s\\n' "
             '"publication-disabled agent output recovery failed" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '
-            'exit "$awm_delivery_status"; fi; exit 74; }; '
+            'exit "$awm_delivery_status"; fi; exit 74; fi; '
             "awm_delivery_recovery_published=1; "
             'if [ "$awm_delivery_cleanliness" = unverified ]; then '
             "printf '%s\\n' "
