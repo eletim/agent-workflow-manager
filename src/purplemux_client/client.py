@@ -1617,6 +1617,7 @@ active_processes = set()
 active_processes_lock = threading.Lock()
 shutdown_requested = threading.Event()
 recovery_interrupted = threading.Event()
+recovery_handoff_required = threading.Event()
 recovery_finished = threading.Event()
 
 
@@ -1671,7 +1672,14 @@ def watch_for_interrupted_shutdown():
         processes = tuple(active_processes)
     for process in processes:
         kill_process_group(process)
-    if recovery_finished.wait(1.5):
+    if recovery_finished.wait(1.0):
+        return
+    recovery_handoff_required.set()
+    with active_processes_lock:
+        processes = tuple(active_processes)
+    for process in processes:
+        kill_process_group(process)
+    if recovery_finished.wait(1.0):
         return
     with active_processes_lock:
         processes = tuple(active_processes)
@@ -1775,7 +1783,7 @@ def reset_publication_marker():
         fsync_directory(recovery_path)
 
 
-def write_metadata(cleanliness, *, interrupted=False, error=None):
+def write_metadata(cleanliness, *, interrupted=False, error=None, handoff=None):
     metadata = {
         "formatVersion": 1,
         "protectedRef": protected_ref,
@@ -1791,6 +1799,8 @@ def write_metadata(cleanliness, *, interrupted=False, error=None):
     if interrupted:
         metadata["interrupted"] = True
         metadata["recoveryError"] = str(error)[:1000]
+    if handoff is not None:
+        metadata["uncapturedInputs"] = handoff
     metadata_temporary = recovery_path / "metadata.json.tmp"
     metadata_temporary.write_text(
         json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
@@ -2256,6 +2266,41 @@ def reset_incomplete_capture():
         else:
             path.unlink()
 
+
+def handoff_uncaptured_inputs(error):
+    reset_incomplete_capture()
+    temporary = recovery_path / "uncaptured-inputs.tmp"
+    published = recovery_path / "uncaptured-inputs"
+    temporary.mkdir(mode=0o700)
+    moved = []
+    try:
+        for source, name in (
+            (Path(worktree), "worktree"),
+            (Path(shadow), "shadow.git"),
+        ):
+            destination = temporary / name
+            os.replace(source, destination)
+            moved.append((source, destination))
+        os.replace(temporary, published)
+    except BaseException:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                os.replace(destination, source)
+        if temporary.exists():
+            temporary.rmdir()
+        raise
+    write_metadata(
+        "unverified",
+        interrupted=True,
+        error=error,
+        handoff={
+            "format": "delivery-inputs-v1",
+            "worktree": "uncaptured-inputs/worktree",
+            "shadowGit": "uncaptured-inputs/shadow.git",
+        },
+    )
+    publish_recovery()
+
 shadow_commit = old
 staged_commit = None
 worktree_commit = None
@@ -2325,20 +2370,25 @@ except (OSError, RuntimeError, subprocess.SubprocessError) as error:
     try:
         reset_publication_marker()
         if recovery_interrupted.is_set():
-            if worktree_commit is None:
-                reset_incomplete_capture()
-                capture_root_repository()
-            build_interrupted_bundle()
-            if not nested_capture_complete:
-                for name in ("nested", "ordinary-git-markers"):
-                    path = recovery_path / name
-                    if path.is_dir():
-                        shutil.rmtree(path)
-                    elif path.exists():
-                        path.unlink()
-                capture_nested_state()
-            write_metadata("unverified", interrupted=True, error=error)
-            publish_recovery()
+            try:
+                if worktree_commit is None:
+                    reset_incomplete_capture()
+                    capture_root_repository()
+                build_interrupted_bundle()
+                if not nested_capture_complete:
+                    for name in ("nested", "ordinary-git-markers"):
+                        path = recovery_path / name
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        elif path.exists():
+                            path.unlink()
+                    capture_nested_state()
+                write_metadata("unverified", interrupted=True, error=error)
+                publish_recovery()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as retry_error:
+                if not recovery_handoff_required.is_set():
+                    recovery_handoff_required.wait(1.0)
+                handoff_uncaptured_inputs(retry_error)
         elif publication_attempted:
             publish_recovery()
     except (OSError, RuntimeError, subprocess.SubprocessError) as fallback_error:
@@ -2641,6 +2691,7 @@ exec "$real_git" "$@"
             '[ "$awm_delivery_recovery_published" -ne 0 ] && '
             '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ]; '
             "then continue; fi; "
+            '[ -e "$awm_delivery_cleanup_dir" ] || continue; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "

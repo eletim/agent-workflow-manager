@@ -1722,7 +1722,13 @@ def test_publication_disabled_signal_is_deferred_until_recovery_handler_ready(
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+@pytest.mark.parametrize(
+    "stall_every_attempt",
+    [False, True],
+    ids=("one-time-stall", "persistent-stall"),
+)
 def test_publication_disabled_signal_during_nested_recovery_preserves_nested_state(
+    stall_every_attempt: bool,
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
@@ -1746,7 +1752,8 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
     fake_git.write_text(
         "#!/bin/sh\n"
         'case " $* " in *staged.bundle.tmp*)\n'
-        '    if [ ! -e "$AWM_TEST_NESTED_STALLED_ONCE" ]; then\n'
+        '    if [ "$AWM_TEST_STALL_EVERY_ATTEMPT" = true ] || '
+        '[ ! -e "$AWM_TEST_NESTED_STALLED_ONCE" ]; then\n'
         '        printf reached > "$AWM_TEST_NESTED_RECOVERY_MARKER"\n'
         '        printf stalled > "$AWM_TEST_NESTED_STALLED_ONCE"\n'
         "        while :; do sleep 1; done\n"
@@ -1771,6 +1778,7 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "AWM_TEST_NESTED_RECOVERY_MARKER": str(marker),
             "AWM_TEST_NESTED_STALLED_ONCE": str(stalled_once),
+            "AWM_TEST_STALL_EVERY_ATTEMPT": str(stall_every_attempt).lower(),
         }
     )
     process = subprocess.Popen(
@@ -1810,6 +1818,19 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
     recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
     recovered = tmp_path / "nested-recovered"
     try:
+        if stall_every_attempt:
+            metadata = json.loads(
+                (recovery / "metadata.json").read_text(encoding="utf-8")
+            )
+            assert metadata["uncapturedInputs"]["format"] == "delivery-inputs-v1"
+            handed_off_nested = recovery / "uncaptured-inputs" / "worktree" / "nested"
+            assert (handed_off_nested / "tracked.txt").read_text() == "changed\n"
+            assert (handed_off_nested / "untracked.txt").read_text() == "untracked\n"
+            assert (handed_off_nested / ".git").exists()
+            assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+            assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+            assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+            return
         nested_bundle = recovery / "nested" / "0000" / "staged.bundle"
         subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
         subprocess.run(
@@ -1972,10 +1993,13 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
 
 
 @pytest.mark.parametrize(
-    "stalled_command", ["ls-files", "bundle"], ids=("initial-capture", "bundle")
+    ("stalled_command", "stall_every_attempt"),
+    [("ls-files", False), ("bundle", False), ("ls-files", True)],
+    ids=("initial-capture", "bundle", "persistent-initial-capture"),
 )
 def test_publication_disabled_signal_bounds_stalled_recovery_capture(
     stalled_command: str,
+    stall_every_attempt: bool,
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
@@ -1990,7 +2014,8 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
     fake_git.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = "$AWM_TEST_STALLED_RECOVERY_COMMAND" ]; then\n'
-        '    if [ "$1" != ls-files ] || '
+        '    if [ "$AWM_TEST_STALL_EVERY_ATTEMPT" = true ] || '
+        '[ "$1" != ls-files ] || '
         '[ ! -e "$AWM_TEST_STALLED_RECOVERY_ONCE" ]; then\n'
         '        printf stalled > "$AWM_TEST_STALLED_RECOVERY_ONCE"\n'
         '        printf \'%s\\n\' "$$" > "$AWM_TEST_STALLED_RECOVERY_PID"\n'
@@ -2027,6 +2052,7 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
             "AWM_TEST_STALLED_RECOVERY_COMMAND": stalled_command,
             "AWM_TEST_STALLED_RECOVERY_PID": str(marker),
             "AWM_TEST_STALLED_RECOVERY_ONCE": str(stalled_once),
+            "AWM_TEST_STALL_EVERY_ATTEMPT": str(stall_every_attempt).lower(),
         }
     )
     process = subprocess.Popen(
@@ -2071,23 +2097,52 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
             (recovery / "metadata.json").read_text(encoding="utf-8")
         )
         assert metadata["interrupted"] is True
-        assert metadata["conflictState"] is not None
-        assert_recovery_worktree_file(
-            recovery,
-            repository,
-            base,
-            tmp_path / "recovered",
-            "residual.txt",
-            "residual\n",
-        )
-        assert_recovery_worktree_file(
-            recovery,
-            repository,
-            base,
-            tmp_path / "conflict-recovered",
-            "conflicted.txt",
-            "worktree resolution\n",
-        )
+        if stall_every_attempt:
+            handoff = recovery / "uncaptured-inputs"
+            assert metadata["uncapturedInputs"] == {
+                "format": "delivery-inputs-v1",
+                "shadowGit": "uncaptured-inputs/shadow.git",
+                "worktree": "uncaptured-inputs/worktree",
+            }
+            assert (handoff / "worktree" / "tracked.txt").read_text() == "committed\n"
+            assert (handoff / "worktree" / "residual.txt").read_text() == "residual\n"
+            assert (handoff / "worktree" / "conflicted.txt").read_text() == (
+                "worktree resolution\n"
+            )
+            shadow = handoff / "shadow.git"
+            assert (
+                subprocess.run(
+                    ["git", f"--git-dir={shadow}", "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                != base
+            )
+            assert "conflicted.txt" in subprocess.run(
+                ["git", f"--git-dir={shadow}", "ls-files", "--unmerged"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        else:
+            assert metadata["conflictState"] is not None
+            assert_recovery_worktree_file(
+                recovery,
+                repository,
+                base,
+                tmp_path / "recovered",
+                "residual.txt",
+                "residual\n",
+            )
+            assert_recovery_worktree_file(
+                recovery,
+                repository,
+                base,
+                tmp_path / "conflict-recovered",
+                "conflicted.txt",
+                "worktree resolution\n",
+            )
         assert not list(tmp_path.glob("awm-delivery-shadow.*"))
         assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
