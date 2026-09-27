@@ -813,6 +813,173 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+@pytest.mark.parametrize("topology", ["embedded", "submodule"])
+def test_publication_disabled_recovers_nested_git_worktree_content(
+    topology: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, _ = linked_delivery_repository
+    nested = checkout / "nested"
+    if topology == "submodule":
+        source = tmp_path / "submodule-source"
+        initialize_test_repository(source)
+        (source / "tracked.txt").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "commit", "-m", "submodule base"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "-C",
+                str(checkout),
+                "submodule",
+                "add",
+                str(source),
+                "nested",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "commit", "-am", "add submodule"],
+            check=True,
+            capture_output=True,
+        )
+        worker_body = (
+            "printf 'unstaged\\n' > nested/tracked.txt\n"
+            "printf 'untracked\\n' > nested/untracked.txt\n"
+        )
+        staged_text = "before\n"
+    else:
+        initialize_test_repository(nested)
+        (nested / "tracked.txt").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(nested), "add", "tracked.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(nested), "commit", "-m", "embedded base"],
+            check=True,
+            capture_output=True,
+        )
+        worker_body = (
+            "printf 'staged\\n' > nested/tracked.txt\n"
+            "git -C nested add tracked.txt\n"
+            "printf 'unstaged\\n' >> nested/tracked.txt\n"
+            "printf 'untracked\\n' > nested/untracked.txt\n"
+        )
+        staged_text = "staged\n"
+
+    original_head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text("#!/bin/sh\n" + worker_body, encoding="utf-8")
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave nested repository changes"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stderr
+    recovery_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["nestedRecoveryCount"] == 1
+        nested_recovery = recovery / "nested" / "0000"
+        nested_metadata = json.loads(
+            (nested_recovery / "metadata.json").read_text(encoding="ascii")
+        )
+        assert nested_metadata["path"] == "nested"
+        assert metadata["cleanliness"] == "residual"
+
+        restored = tmp_path / "restored-nested"
+        subprocess.run(["git", "init", str(restored)], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(restored),
+                "fetch",
+                str(nested_recovery / "staged.bundle"),
+                "refs/awm-delivery/*:refs/awm-delivery/*",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(restored),
+                "checkout",
+                "--force",
+                "refs/awm-delivery/staged",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert (restored / "tracked.txt").read_text(encoding="utf-8") == staged_text
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(restored),
+                "checkout",
+                "--force",
+                "refs/awm-delivery/worktree",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        expected_worktree = (
+            "staged\nunstaged\n" if topology == "embedded" else "unstaged\n"
+        )
+        assert (restored / "tracked.txt").read_text(encoding="utf-8") == expected_worktree
+        assert (restored / "untracked.txt").read_text(encoding="utf-8") == (
+            "untracked\n"
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == original_head
+        )
+        if topology == "submodule":
+            assert (nested / "tracked.txt").read_text(encoding="utf-8") == "before\n"
+            assert not (nested / "untracked.txt").exists()
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
 def test_publication_disabled_recovers_when_cleanliness_cannot_be_verified(
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
