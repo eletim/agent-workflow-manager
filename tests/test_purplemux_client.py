@@ -463,9 +463,16 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         'git -c core.hooksPath=/dev/null push "$AWM_TEST_REMOTE" '
         "HEAD:refs/heads/forbidden-hook-override >/dev/null 2>&1\n"
         "hook_override_status=$?\n"
+        'git -c alias.ship=push ship --no-verify "$AWM_TEST_REMOTE" '
+        "HEAD:refs/heads/forbidden-alias >/dev/null 2>&1\n"
+        "alias_status=$?\n"
         'git --git-dir "$shadow" push --no-verify "$AWM_TEST_REMOTE" '
         "HEAD:refs/heads/forbidden-separated-git-dir >/dev/null 2>&1\n"
         "separated_git_dir_status=$?\n"
+        '"$AWM_TEST_REAL_GIT" --git-dir="$shadow" push --no-verify '
+        '"$AWM_TEST_REMOTE" HEAD:refs/heads/forbidden-real-git '
+        ">/dev/null 2>&1\n"
+        "real_git_status=$?\n"
         '"${AWM_DELIVERY_REAL_GIT:-false}" '
         '--git-dir="${AWM_DELIVERY_SHADOW_GIT_DIR:-}" push --no-verify '
         '"$AWM_TEST_REMOTE" HEAD:refs/heads/forbidden-direct >/dev/null 2>&1\n'
@@ -473,10 +480,11 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         "status=$(git status --porcelain)\n"
         "config_exposed=0\n"
         '[ ! -e "$GH_CONFIG_DIR/hosts.yml" ] || config_exposed=1\n'
-        'printf \'%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n\' '
+        "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "
         '"$commit_status" "$push_status" "$no_verify_status" '
-        '"$hook_override_status" "$separated_git_dir_status" '
-        '"$direct_git_status" "${AWM_DELIVERY_REAL_GIT-unset}" '
+        '"$hook_override_status" "$alias_status" "$separated_git_dir_status" '
+        '"$real_git_status" "$direct_git_status" '
+        '"${AWM_DELIVERY_REAL_GIT-unset}" '
         '"${AWM_DELIVERY_SHADOW_GIT_DIR-unset}" '
         '"${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "$config_exposed" '
         '"$status"\n',
@@ -496,6 +504,7 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
             "GH_TOKEN": "push-capable-gh-token",
             "GITHUB_TOKEN": "push-capable-github-token",
             "AWM_TEST_REMOTE": str(remote),
+            "AWM_TEST_REAL_GIT": shutil.which("git") or "git",
             "AWM_DELIVERY_REAL_GIT": shutil.which("git") or "git",
             "AWM_DELIVERY_SHADOW_GIT_DIR": str(remote),
         }
@@ -519,7 +528,9 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         push_status,
         no_verify_status,
         hook_override_status,
+        alias_status,
         separated_git_dir_status,
+        real_git_status,
         direct_git_status,
         exposed_real_git,
         exposed_shadow_git_dir,
@@ -527,12 +538,14 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         github_token,
         config_exposed,
         status,
-    ) = result.stdout.strip().split("|", 11)
+    ) = result.stdout.strip().split("|", 13)
     assert commit_status == "0"
     assert push_status != "0"
     assert no_verify_status != "0"
     assert hook_override_status != "0"
+    assert alias_status != "0"
     assert separated_git_dir_status != "0"
+    assert real_git_status != "0"
     assert direct_git_status != "0"
     assert exposed_real_git == exposed_shadow_git_dir == "unset"
     assert token == github_token == "unset"
@@ -583,7 +596,9 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         "refs/heads/forbidden",
         "refs/heads/forbidden-no-verify",
         "refs/heads/forbidden-hook-override",
+        "refs/heads/forbidden-alias",
         "refs/heads/forbidden-separated-git-dir",
+        "refs/heads/forbidden-real-git",
         "refs/heads/forbidden-direct",
     ):
         assert (
@@ -896,33 +911,37 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
 
 @pytest.mark.parametrize("blocked_call", [1, 2], ids=("hooks", "shadow"))
 @pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
-def test_publication_disabled_signal_cleans_create_then_blocking_mktemp(
+def test_publication_disabled_signal_cleans_directory_before_mkdir_returns(
     blocked_call: int, use_pty: bool, tmp_path: Path
 ) -> None:
     initialize_test_repository(tmp_path)
     resource_record = tmp_path / "created-resources"
-    call_record = tmp_path / "mktemp-calls"
+    call_record = tmp_path / "mkdir-calls"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    real_mktemp = shutil.which("mktemp")
-    assert real_mktemp is not None
-    fake_mktemp = fake_bin / "mktemp"
-    fake_mktemp.write_text(
+    real_mkdir = shutil.which("mkdir")
+    assert real_mkdir is not None
+    fake_mkdir = fake_bin / "mkdir"
+    fake_mkdir.write_text(
         "#!/bin/sh\n"
+        'case "${2:-}" in\n'
+        "    */awm-delivery.*|/tmp/awm-delivery-shadow.*) ;;\n"
+        f'    *) exec "{real_mkdir}" "$@" ;;\n'
+        "esac\n"
         "call=0\n"
         'if [ -f "$AWM_TEST_CALL_RECORD" ]; then '
         'IFS= read -r call < "$AWM_TEST_CALL_RECORD"; fi\n'
         "call=$((call + 1))\n"
         'printf \'%s\\n\' "$call" > "$AWM_TEST_CALL_RECORD"\n'
-        f'created=$("{real_mktemp}" "$@") || exit $?\n'
-        'printf \'%s\\n\' "$created"\n'
-        'printf \'%s\\n\' "$created" >> "$AWM_TEST_RESOURCE_RECORD"\n'
+        f'"{real_mkdir}" "$@" || exit $?\n'
+        'printf \'%s\\n\' "$2" >> "$AWM_TEST_RESOURCE_RECORD"\n'
         'if [ "$call" -eq "$AWM_TEST_BLOCK_CALL" ]; then\n'
         "    while :; do sleep 1; done\n"
-        "fi\n",
+        "fi\n"
+        "exit 0\n",
         encoding="utf-8",
     )
-    fake_mktemp.chmod(0o755)
+    fake_mkdir.chmod(0o755)
     environment = os.environ.copy()
     environment.update(
         {
@@ -963,10 +982,10 @@ def test_publication_disabled_signal_cleans_create_then_blocking_mktemp(
                 if len(resources) == blocked_call:
                     break
             if time.monotonic() >= deadline:
-                pytest.fail("blocking mktemp did not record its created directory")
+                pytest.fail("blocking mkdir did not record its created directory")
             time.sleep(0.01)
         if len(resources) != blocked_call:
-            pytest.fail("mktemp exited before the acquisition could be interrupted")
+            pytest.fail("mkdir exited before the acquisition could be interrupted")
 
         os.killpg(process.pid, signal.SIGTERM)
         process.communicate(timeout=5)
@@ -1535,7 +1554,7 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
 
     repository = tmp_path / "repository"
     checkout = tmp_path / "linked-checkout"
-    remote = tmp_path / "forbidden-remote.git"
+    remote = checkout / "forbidden-remote.git"
     subprocess.run(
         ["git", "init", "-b", "main", str(repository)],
         check=True,
@@ -1557,9 +1576,6 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         ["git", "-C", str(repository), "branch", "feature/sibling"], check=True
     )
     subprocess.run(
-        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
-    )
-    subprocess.run(
         [
             "git",
             "-C",
@@ -1572,6 +1588,9 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         ],
         check=True,
         capture_output=True,
+    )
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
     )
 
     def git_path(name: str) -> Path:
@@ -1641,9 +1660,12 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         'push --no-verify "$AWM_TEST_REMOTE" '
         "HEAD:refs/heads/forbidden >/dev/null 2>&1\n"
         "direct_push=$?\n"
-        'printf \'%s %s %s %s %s %s %s %s %s\\n\' "$forward" "$rewrite" '
+        'git -c alias.ship=push ship --no-verify "$AWM_TEST_REMOTE" '
+        "HEAD:refs/heads/forbidden-alias >/dev/null 2>&1\n"
+        "alias_push=$?\n"
+        'printf \'%s %s %s %s %s %s %s %s %s %s\\n\' "$forward" "$rewrite" '
         '"$tag" "$active" "$sibling" "$reflog" "$git_pointer" '
-        '"$direct_git" "$direct_push" > sandbox-results\n',
+        '"$direct_git" "$direct_push" "$alias_push" > sandbox-results\n',
         encoding="utf-8",
     )
     payload.chmod(0o755)
@@ -1726,21 +1748,15 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
     assert protected_contents[git_pointer] == git_pointer.read_bytes()
     assert active_ref.read_text(encoding="utf-8").strip() != base
     assert active_log.read_bytes().startswith(protected_contents[active_log])
-    assert (
-        subprocess.run(
-            [
-                "git",
-                "--git-dir",
-                str(remote),
-                "show-ref",
-                "--verify",
-                "refs/heads/forbidden",
-            ],
-            check=False,
-            capture_output=True,
-        ).returncode
-        != 0
-    )
+    for ref in ("refs/heads/forbidden", "refs/heads/forbidden-alias"):
+        assert (
+            subprocess.run(
+                ["git", "--git-dir", str(remote), "show-ref", "--verify", ref],
+                check=False,
+                capture_output=True,
+            ).returncode
+            != 0
+        )
     assert (
         subprocess.run(
             ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
