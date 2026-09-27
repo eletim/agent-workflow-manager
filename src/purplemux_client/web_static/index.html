@@ -22,11 +22,17 @@
       </header>
 
       <section class="panel editor-panel">
-        <nav class="execution-navigation" aria-label="Workflow type">
-          <button id="issue-driven-mode" class="issue-driven-entry selected" type="button" aria-pressed="true">
-            <span>Issue Driven</span>
-            <small>Plan and deliver work from GitHub Issues or inline mini tasks</small>
-          </button>
+        <nav class="execution-navigation" aria-label="Views">
+          <div class="primary-views" role="group" aria-label="Primary views">
+            <button id="issue-driven-mode" class="primary-view-entry issue-driven-entry selected" type="button" aria-pressed="true">
+              <span>Issue Driven</span>
+              <small>Plan and deliver work from GitHub Issues or inline mini tasks</small>
+            </button>
+            <button id="runtime-view" class="primary-view-entry runtime-entry" type="button">
+              <span>Runtime</span>
+              <small>Inspect runs, progress, and output</small>
+            </button>
+          </div>
           <details id="developer-views" class="developer-views">
             <summary>Developer &amp; detail views</summary>
             <div class="mode-switch" role="group" aria-label="Developer workflow type">
@@ -34,7 +40,6 @@
               <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
               <button id="review-mode" type="button" aria-pressed="false">Review</button>
               <button id="workflow-mode" type="button" aria-pressed="false">Python Workflow</button>
-              <button id="runtime-view" type="button">Runtime</button>
               <a href="#diagnostics-panel">Diagnostics</a>
             </div>
           </details>

@@ -169,7 +169,12 @@ textarea {
   margin-bottom: 10px;
 }
 .execution-navigation { margin-bottom: 14px; }
-.issue-driven-entry {
+.primary-views {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.primary-view-entry {
   display: grid;
   width: 100%;
   padding: 14px 16px;
@@ -177,8 +182,8 @@ textarea {
   border-color: #8061e8;
   background: #34295a;
 }
-.issue-driven-entry span { font-size: 16px; font-weight: 650; }
-.issue-driven-entry small { margin-top: 3px; color: #c9c0ec; }
+.primary-view-entry span { font-size: 16px; font-weight: 650; }
+.primary-view-entry small { margin-top: 3px; color: #c9c0ec; }
 .issue-driven-entry.selected { background: #6846d7; }
 .developer-views {
   margin-top: 8px;

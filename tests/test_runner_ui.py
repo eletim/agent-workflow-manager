@@ -137,10 +137,26 @@ def test_review_editor_keeps_generated_python_read_only() -> None:
     assert 'id="review-result-panel"' in html
 
 
-def test_issue_driven_is_primary_and_developer_views_remain_linked() -> None:
+def test_runtime_is_primary_and_developer_views_remain_linked() -> None:
     html = INDEX.read_text(encoding="utf-8")
+    runtime_ancestors = _ancestors("runtime-view")
 
-    assert 'id="issue-driven-mode" class="issue-driven-entry selected"' in html
+    assert (
+        'id="issue-driven-mode" class="primary-view-entry issue-driven-entry selected"'
+        in html
+    )
+    assert any(
+        tag == "div" and attributes.get("class") == "primary-views"
+        for tag, attributes in runtime_ancestors
+    )
+    assert not any(
+        tag == "details" and attributes.get("id") == "developer-views"
+        for tag, attributes in runtime_ancestors
+    )
+    assert (
+        'id="runtime-view" class="primary-view-entry runtime-entry" type="button"'
+        in html
+    )
     assert '<div id="issue-driven-fields">' in html
     assert '<div id="workflow-fields" hidden>' in html
     assert '<details id="developer-views" class="developer-views">' in html
@@ -149,11 +165,9 @@ def test_issue_driven_is_primary_and_developer_views_remain_linked() -> None:
         "Environment Setup",
         "Review",
         "Python Workflow",
-        "Runtime",
         "Diagnostics",
     ):
         assert f">{label}<" in html
-    assert 'id="runtime-view" type="button">Runtime</button>' in html
     assert '<details id="runtime-panel" class="panel runtime-panel" hidden>' in html
     assert 'href="#diagnostics-panel">Diagnostics</a>' in html
 

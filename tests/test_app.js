@@ -818,7 +818,7 @@ test("Settings opens Notifications repeatedly without losing form state", async 
   assert.equal(elements["notify-topic"].value, "edited-topic");
 });
 
-test("Issue Driven is the default draft and developer modes remain available", async () => {
+test("Issue Driven defaults while top-level Runtime and developer modes remain available", async () => {
   const {elements} = await loadApp({
     runs: [],
     details: {},
@@ -828,6 +828,7 @@ test("Issue Driven is the default draft and developer modes remain available", a
   assert.equal(elements["issue-driven-fields"].hidden, false);
   assert.equal(elements["workflow-fields"].hidden, true);
   assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
+  assert.match(elements["issue-driven-mode"].className, /primary-view-entry/);
   assert.equal(elements["developer-views"].open, false);
   assert.equal(elements["runtime-panel"].open, false);
   assert.equal(elements["runtime-panel"].hidden, true);
