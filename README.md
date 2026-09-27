@@ -1026,9 +1026,11 @@ only when `.complete` exists. Read `metadata.json` first: it records the protect
 ref and base commit, cleanliness result, commit IDs, conflict details, and whether
 recovery was interrupted. When present, `recovery.bundle` contains the available
 `refs/awm-delivery/shadow`, `refs/awm-delivery/staged`, and
-`refs/awm-delivery/worktree` snapshots; the staged ref is omitted when there is no
-distinct staged state. Nested repositories have their own metadata and bundle
-under `nested/`.
+`refs/awm-delivery/worktree` snapshots. A mergeable index always has a staged ref,
+even when its tree matches the shadow state. For a conflicted or unmerged index,
+the staged ref is omitted and `metadata.json`'s `conflictState` identifies the
+retained index and object pack needed to reconstruct its stages. Nested
+repositories have their own metadata and bundle under `nested/`.
 
 Inspect a bundle without changing the original checkout by creating a temporary
 repository, fetching the recorded base commit from the original repository, and
@@ -1036,9 +1038,13 @@ then fetching the desired recovery ref from `recovery.bundle`. Compare or restor
 files from those fetched refs in the temporary repository before applying any
 chosen changes manually. Do not treat an artifact without `.complete` as durable.
 If interrupted recovery could not finish capturing Git state, `metadata.json`
-points to the bounded `uncaptured-inputs` record; that record explicitly identifies
-the shadow and worktree inputs that were not captured and does not contain the
-temporary directories themselves.
+points to the bounded `interrupted-inputs` payload. Its shadow-state archive and
+worktree overlay/deletion manifest preserve agent-created Git, staged, worktree,
+and nested-repository output without retaining a second complete checkout. Apply
+the deletion manifest and overlay only to a disposable copy of the protected
+worktree recorded in the payload metadata, then inspect the extracted shadow Git
+state against that copy. If root bundle capture finished before a nested capture
+was interrupted, the normal root bundle remains available alongside this payload.
 
 Residual output or an unverifiable cleanliness check fails the session without
 updating the real ref or worktree. After the needed commits or files have been

@@ -1624,8 +1624,10 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import threading
 
 (
@@ -1637,6 +1639,7 @@ import threading
     protected_ref,
     old,
     common_git_dir,
+    protected_worktree,
     pending_signal,
 ) = sys.argv[1:]
 blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
@@ -1648,6 +1651,7 @@ active_processes_lock = threading.Lock()
 shutdown_requested = threading.Event()
 recovery_interrupted = threading.Event()
 recovery_handoff_required = threading.Event()
+bounded_fallback_started = threading.Event()
 recovery_finished = threading.Event()
 
 
@@ -1710,6 +1714,8 @@ def watch_for_interrupted_shutdown():
     for process in processes:
         kill_process_group(process)
     if recovery_finished.wait(1.0):
+        return
+    if bounded_fallback_started.is_set() and recovery_finished.wait(60.0):
         return
     with active_processes_lock:
         processes = tuple(active_processes)
@@ -1817,7 +1823,7 @@ def reset_publication_marker():
 
 
 def write_metadata(
-    cleanliness, *, interrupted=False, error=None, uncaptured_inputs=None
+    cleanliness, *, interrupted=False, error=None, interrupted_inputs=None
 ):
     metadata = {
         "formatVersion": 1,
@@ -1834,8 +1840,8 @@ def write_metadata(
     if interrupted:
         metadata["interrupted"] = True
         metadata["recoveryError"] = str(error)[:1000]
-    if uncaptured_inputs is not None:
-        metadata["uncapturedInputs"] = uncaptured_inputs
+    if interrupted_inputs is not None:
+        metadata["interruptedInputs"] = interrupted_inputs
     metadata_temporary = recovery_path / "metadata.json.tmp"
     metadata_temporary.write_text(
         json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
@@ -2303,27 +2309,140 @@ def reset_incomplete_capture():
             path.unlink()
 
 
-def record_uncaptured_inputs(error):
-    reset_incomplete_capture()
-    uncaptured = {
+def tree_entries(root, *, exclude_root_git=False):
+    root = Path(root)
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        if exclude_root_git and current_path == root:
+            directories[:] = [name for name in directories if name != ".git"]
+            files = [name for name in files if name != ".git"]
+        for name in [*directories, *files]:
+            yield current_path / name
+
+
+def contained_lstat(root, relative):
+    path = Path(root)
+    parts = relative.parts
+    for index, part in enumerate(parts):
+        path /= part
+        status = path.lstat()
+        if index != len(parts) - 1 and not stat.S_ISDIR(status.st_mode):
+            raise FileNotFoundError(path)
+    return path, status
+
+
+def same_entry(source, baseline_root, relative):
+    try:
+        source_status = source.lstat()
+        baseline, baseline_status = contained_lstat(baseline_root, relative)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    source_type = stat.S_IFMT(source_status.st_mode)
+    if source_type != stat.S_IFMT(baseline_status.st_mode):
+        return False
+    if (source_status.st_mode & 0o7777) != (baseline_status.st_mode & 0o7777):
+        return False
+    if stat.S_ISLNK(source_type):
+        return os.readlink(source) == os.readlink(baseline)
+    if not stat.S_ISREG(source_type):
+        return True
+    if source_status.st_size != baseline_status.st_size:
+        return False
+    with source.open("rb") as source_file, baseline.open("rb") as baseline_file:
+        while True:
+            source_chunk = source_file.read(1024 * 1024)
+            baseline_chunk = baseline_file.read(1024 * 1024)
+            if source_chunk != baseline_chunk:
+                return False
+            if not source_chunk:
+                return True
+
+
+def build_interrupted_inputs(error):
+    global marker_metadata, nested_repositories
+    bounded_fallback_started.set()
+    bundle_complete = (recovery_path / "recovery.bundle").is_file()
+    if not bundle_complete:
+        reset_incomplete_capture()
+    else:
+        for name in ("nested", "ordinary-git-markers"):
+            path = recovery_path / name
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+    marker_metadata = []
+    nested_repositories = []
+
+    temporary = recovery_path / "interrupted-inputs.tmp"
+    published = recovery_path / "interrupted-inputs"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(mode=0o700)
+    worktree_path = Path(worktree)
+    baseline_path = Path(protected_worktree)
+    overlay_temporary = temporary / "worktree-overlay.tar.tmp"
+    with tarfile.open(overlay_temporary, "w") as archive:
+        for source in tree_entries(worktree_path, exclude_root_git=True):
+            relative = source.relative_to(worktree_path)
+            if not same_entry(source, baseline_path, relative):
+                archive.add(source, arcname=relative.as_posix(), recursive=False)
+    os.replace(overlay_temporary, temporary / "worktree-overlay.tar")
+
+    deletions = []
+    for baseline in tree_entries(baseline_path, exclude_root_git=True):
+        relative = baseline.relative_to(baseline_path)
+        try:
+            _, source_status = contained_lstat(worktree_path, relative)
+            source_type = stat.S_IFMT(source_status.st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            deletions.append(relative.as_posix())
+            continue
+        if source_type != stat.S_IFMT(baseline.lstat().st_mode):
+            deletions.append(relative.as_posix())
+    deletions_temporary = temporary / "worktree-deletions.json.tmp"
+    deletions_temporary.write_text(
+        json.dumps(deletions, ensure_ascii=True, sort_keys=True) + "\\n",
+        encoding="ascii",
+    )
+    os.replace(deletions_temporary, temporary / "worktree-deletions.json")
+
+    shadow_temporary = temporary / "shadow-state.tar.tmp"
+    with tarfile.open(shadow_temporary, "w") as archive:
+        shadow_path = Path(shadow)
+        for path in shadow_path.iterdir():
+            if path.is_dir() and path.name not in {"info", "logs", "objects", "refs"}:
+                continue
+            archive.add(
+                path,
+                arcname=(Path("shadow.git") / path.name).as_posix(),
+                recursive=True,
+            )
+    os.replace(shadow_temporary, temporary / "shadow-state.tar")
+    manifest = {
         "formatVersion": 1,
-        "kind": "uncaptured-inputs",
-        "shadowGit": False,
-        "worktree": False,
+        "kind": "interrupted-delivery-inputs",
+        "baseCommit": old,
+        "protectedWorktree": protected_worktree,
+        "shadowState": "shadow-state.tar",
+        "worktreeOverlay": "worktree-overlay.tar",
+        "worktreeDeletions": "worktree-deletions.json",
         "reason": str(error)[:1000],
     }
-    temporary = recovery_path / "uncaptured-inputs.tmp"
-    temporary.write_text(
-        json.dumps(uncaptured, sort_keys=True) + "\\n", encoding="utf-8"
+    manifest_temporary = temporary / "metadata.json.tmp"
+    manifest_temporary.write_text(
+        json.dumps(manifest, sort_keys=True) + "\\n", encoding="utf-8"
     )
-    os.replace(temporary, recovery_path / "uncaptured-inputs")
+    os.replace(manifest_temporary, temporary / "metadata.json")
+    os.replace(temporary, published)
     write_metadata(
         "unverified",
         interrupted=True,
         error=error,
-        uncaptured_inputs={
-            "format": "uncaptured-inputs-v1",
-            "path": "uncaptured-inputs",
+        interrupted_inputs={
+            "format": "interrupted-delivery-inputs-v1",
+            "path": "interrupted-inputs",
+            "rootBundleComplete": bundle_complete,
         },
     )
     publish_recovery()
@@ -2415,7 +2534,7 @@ except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             except (OSError, RuntimeError, subprocess.SubprocessError) as retry_error:
                 if not recovery_handoff_required.is_set():
                     recovery_handoff_required.wait(1.0)
-                record_uncaptured_inputs(retry_error)
+                build_interrupted_inputs(retry_error)
         elif publication_attempted:
             publish_recovery()
     except (OSError, RuntimeError, subprocess.SubprocessError) as fallback_error:
@@ -2929,6 +3048,7 @@ exec "$real_git" "$@"
             '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
             '"$awm_delivery_recovery" "$awm_delivery_ref" '
             '"$awm_delivery_old" "$awm_delivery_common_git_dir" '
+            '"$awm_delivery_root" '
             '"$awm_delivery_pending_signal"); '
             "awm_delivery_recovery_status=$?; "
             "trap 'awm_delivery_signal 129' HUP; "

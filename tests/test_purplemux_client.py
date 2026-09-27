@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Iterator, Sequence
@@ -1849,6 +1850,32 @@ def assert_recovery_worktree_file(
     )
 
 
+def restore_interrupted_inputs(
+    recovery: Path, protected_worktree: Path, destination: Path
+) -> tuple[Path, Path]:
+    payload = recovery / "interrupted-inputs"
+    manifest = json.loads((payload / "metadata.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == "interrupted-delivery-inputs"
+    restored = destination / "worktree"
+    shutil.copytree(protected_worktree, restored, symlinks=True)
+    deletions = json.loads(
+        (payload / manifest["worktreeDeletions"]).read_text(encoding="ascii")
+    )
+    for relative in sorted(deletions, key=lambda value: value.count("/"), reverse=True):
+        target = restored / relative
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)
+    with tarfile.open(payload / manifest["worktreeOverlay"]) as archive:
+        archive.extractall(restored)
+    shadow_root = destination / "shadow"
+    shadow_root.mkdir()
+    with tarfile.open(payload / manifest["shadowState"]) as archive:
+        archive.extractall(shadow_root)
+    return restored, shadow_root / "shadow.git"
+
+
 def test_publication_disabled_signal_is_deferred_until_recovery_handler_ready(
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
@@ -1949,7 +1976,7 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
-    repository, checkout, _, _ = linked_delivery_repository
+    repository, checkout, _, base = linked_delivery_repository
     nested = checkout / "nested"
     initialize_test_repository(nested)
     (nested / "tracked.txt").write_text("before\n", encoding="utf-8")
@@ -2039,17 +2066,35 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
             metadata = json.loads(
                 (recovery / "metadata.json").read_text(encoding="utf-8")
             )
-            assert metadata["uncapturedInputs"] == {
-                "format": "uncaptured-inputs-v1",
-                "path": "uncaptured-inputs",
+            assert metadata["interruptedInputs"] == {
+                "format": "interrupted-delivery-inputs-v1",
+                "path": "interrupted-inputs",
+                "rootBundleComplete": True,
             }
-            uncaptured = json.loads(
-                (recovery / "uncaptured-inputs").read_text(encoding="utf-8")
+            assert (recovery / "recovery.bundle").is_file()
+            assert_recovery_worktree_file(
+                recovery,
+                repository,
+                base,
+                tmp_path / "interrupted-root-bundle",
+                "tracked.txt",
+                "before\n",
             )
-            assert uncaptured["kind"] == "uncaptured-inputs"
-            assert uncaptured["shadowGit"] is False
-            assert uncaptured["worktree"] is False
-            assert (recovery / "uncaptured-inputs").stat().st_size < 2048
+            restored, _ = restore_interrupted_inputs(
+                recovery, checkout, tmp_path / "interrupted-nested"
+            )
+            restored_nested = restored / "nested"
+            assert (restored_nested / "tracked.txt").read_text() == "changed\n"
+            assert (restored_nested / "untracked.txt").read_text() == "untracked\n"
+            assert (
+                subprocess.run(
+                    ["git", "-C", str(restored_nested), "status", "--porcelain"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                == " M tracked.txt\n?? untracked.txt\n"
+            )
             assert not list(tmp_path.glob("awm-delivery-shadow.*"))
             assert not list(tmp_path.glob("awm-delivery-worktree.*"))
             assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
@@ -2392,9 +2437,13 @@ def injected_replace(source, destination):
     destination = os.fspath(destination)
     if destination.endswith("/.complete"):
         recovery = os.path.dirname(destination)
+        interrupted = os.path.join(recovery, "interrupted-inputs")
         required = {
             os.path.join(recovery, "metadata.json"),
-            os.path.join(recovery, "uncaptured-inputs"),
+            os.path.join(interrupted, "metadata.json"),
+            os.path.join(interrupted, "shadow-state.tar"),
+            os.path.join(interrupted, "worktree-deletions.json"),
+            os.path.join(interrupted, "worktree-overlay.tar"),
         }
         if not required.issubset(synced):
             raise OSError("completion published before payload fsync")
@@ -2492,16 +2541,47 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         )
         assert metadata["interrupted"] is True
         if stall_every_attempt:
-            handoff = recovery / "uncaptured-inputs"
-            assert metadata["uncapturedInputs"] == {
-                "format": "uncaptured-inputs-v1",
-                "path": "uncaptured-inputs",
+            assert metadata["interruptedInputs"] == {
+                "format": "interrupted-delivery-inputs-v1",
+                "path": "interrupted-inputs",
+                "rootBundleComplete": False,
             }
-            uncaptured = json.loads(handoff.read_text(encoding="utf-8"))
-            assert uncaptured["kind"] == "uncaptured-inputs"
-            assert uncaptured["shadowGit"] is False
-            assert uncaptured["worktree"] is False
-            assert handoff.stat().st_size < 2048
+            restored, shadow = restore_interrupted_inputs(
+                recovery, checkout, tmp_path / "interrupted-root"
+            )
+            assert (restored / "tracked.txt").read_text() == "committed\n"
+            assert (restored / "residual.txt").read_text() == "residual\n"
+            assert (restored / "conflicted.txt").read_text() == (
+                "worktree resolution\n"
+            )
+            git_state = [
+                "git",
+                f"--git-dir={shadow}",
+                f"--work-tree={restored}",
+            ]
+            assert (
+                subprocess.run(
+                    [*git_state, "show", "HEAD:tracked.txt"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                == "committed\n"
+            )
+            for stage, expected in (
+                (1, "base stage\n"),
+                (2, "ours stage\n"),
+                (3, "theirs stage\n"),
+            ):
+                assert (
+                    subprocess.run(
+                        [*git_state, "show", f":{stage}:conflicted.txt"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout
+                    == expected
+                )
         else:
             assert metadata["conflictState"] is not None
             assert_recovery_worktree_file(
