@@ -1053,6 +1053,15 @@ AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
   uv run pytest tests/test_live_claude_trust.py
 ```
 
+The opt-in Claude linked-commit integration test proves the same direct staging,
+commit, branch advancement, clean worktree, and publication-disabled boundary
+in a real AWM Run worktree:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_LINKED_COMMIT=1 \
+  uv run pytest tests/test_live_claude_linked_commit.py
+```
+
 External AWM targets can be registered in **Settings → External AWM targets** or
 through `GET` / `POST /api/settings/external-targets`. POST replaces the list and
 uses the existing trusted JSON request policy (`X-Python-Runner-Token`). Example:
