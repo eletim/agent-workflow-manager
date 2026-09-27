@@ -639,9 +639,40 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         )
 
 
+@pytest.mark.parametrize(
+    ("residual_script", "expected_status", "expected_content"),
+    [
+        (
+            "printf 'unstaged\\n' > tracked.txt\n",
+            " M tracked.txt",
+            "unstaged\n",
+        ),
+        (
+            "printf 'staged\\n' > tracked.txt\ngit add tracked.txt\n",
+            "M  tracked.txt",
+            "staged\n",
+        ),
+        (
+            "printf 'untracked\\n' > residual.txt\n",
+            "?? residual.txt",
+            "untracked\n",
+        ),
+        (
+            "printf 'staged\\n' > tracked.txt\n"
+            "git add tracked.txt\n"
+            "printf 'unstaged\\n' >> tracked.txt\n",
+            "MM tracked.txt",
+            "staged\nunstaged\n",
+        ),
+    ],
+    ids=("unstaged", "staged", "untracked", "staged-and-unstaged"),
+)
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_retains_residual_changes_before_delivery(
+def test_publication_disabled_delivers_residual_changes_for_normal_cleanup(
     worker: str,
+    residual_script: str,
+    expected_status: str,
+    expected_content: str,
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
@@ -651,18 +682,25 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
     fake_worker = fake_bin / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
+        "prompt=$(cat)\n"
+        'case "$prompt" in\n'
+        '    *"Clean worktree"*)\n'
+        "        git add -A\n"
+        "        git commit -m cleanup-residual >/dev/null 2>&1\n"
+        "        exit $?\n"
+        "        ;;\n"
+        "esac\n"
         "printf 'committed\\n' > tracked.txt\n"
         "git add tracked.txt\n"
         "git commit -m committed-before-residual >/dev/null 2>&1\n"
-        "printf 'staged\\n' > tracked.txt\n"
-        "git add tracked.txt\n"
-        "printf 'unstaged\\n' >> tracked.txt\n"
-        "printf 'untracked\\n' > residual.txt\n",
+        f"{residual_script}",
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    resource_parent = checkout.parent
+    resources_before = set(resource_parent.glob("awm-delivery-*"))
 
     result = subprocess.run(
         PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
@@ -674,75 +712,74 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
         check=False,
     )
 
-    assert result.returncode != 0
-    diagnostic = next(
-        line
-        for line in result.stderr.splitlines()
-        if line.startswith(
-            "publication-disabled session left uncommitted changes; "
-        )
-    )
-    isolated_text, shadow_text = diagnostic.split(
-        "; shadow Git directory retained at ", maxsplit=1
-    )
-    isolated = Path(isolated_text.rsplit(" retained at ", maxsplit=1)[1])
-    shadow = Path(shadow_text)
-    try:
-        assert isolated.is_dir()
-        assert shadow.is_dir()
-        assert (isolated / "tracked.txt").read_text(encoding="utf-8") == (
-            "staged\nunstaged\n"
-        )
-        assert (isolated / "residual.txt").read_text(encoding="utf-8") == (
-            "untracked\n"
-        )
-        retained_status = subprocess.run(
-            [
-                "git",
-                f"--git-dir={shadow}",
-                f"--work-tree={isolated}",
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-            ],
+    assert result.returncode == 0, result.stderr
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
-        ).stdout.splitlines()
-        assert "MM tracked.txt" in retained_status
-        assert "?? residual.txt" in retained_status
-        assert (
-            subprocess.run(
-                ["git", f"--git-dir={shadow}", "log", "-1", "--format=%s"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            == "committed-before-residual"
-        )
-        assert (
-            subprocess.run(
-                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            == base
-        )
-        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "before\n"
-        assert not (checkout / "residual.txt").exists()
-        assert (
-            subprocess.run(
-                ["git", "-C", str(checkout), "status", "--porcelain"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            == ""
-        )
-    finally:
-        shutil.rmtree(isolated, ignore_errors=True)
-        shutil.rmtree(shadow, ignore_errors=True)
+        ).stdout.strip()
+        != base
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "committed-before-residual"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain=v1"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.rstrip("\n")
+        == expected_status
+    )
+    residual_path = (
+        checkout / "residual.txt"
+        if expected_status.startswith("??")
+        else checkout / "tracked.txt"
+    )
+    assert residual_path.read_text(encoding="utf-8") == expected_content
+    assert set(resource_parent.glob("awm-delivery-*")) == resources_before
+
+    cleanup = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            worker, "Clean worktree: commit all intended residual changes"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain=v1"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "cleanup-residual"
+    )
+    assert set(resource_parent.glob("awm-delivery-*")) == resources_before
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])

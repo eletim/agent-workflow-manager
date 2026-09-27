@@ -1792,6 +1792,8 @@ exec "$real_git" "$@"
             'case "$awm_delivery_ln" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_cp=$(command -v cp) && "
             'case "$awm_delivery_cp" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_tar=$(command -v tar) && "
+            'case "$awm_delivery_tar" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_bwrap=$(command -v bwrap) || { "
             "printf '%s\\n' 'publication-disabled sessions require Bubblewrap "
             "(bwrap); install it and restart Agent Workflow Manager' >&2; "
@@ -1844,7 +1846,6 @@ exec "$real_git" "$@"
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
-            "awm_delivery_preserve_resources=0 && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
@@ -1852,11 +1853,6 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
-            'if [ "$awm_delivery_preserve_resources" -eq 1 ] && '
-            '{ [ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_shadow_git_dir" ] || '
-            '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_isolated_root" ]; }; then continue; fi; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "
@@ -1977,25 +1973,6 @@ exec "$real_git" "$@"
             f'"$@" {launch}; '
             "awm_delivery_status=$?; "
             "PATH=$awm_delivery_original_path; export PATH; "
-            "awm_delivery_preserve_resources=1; "
-            'awm_delivery_residual=$("$awm_delivery_real_git" '
-            '--git-dir="$awm_delivery_shadow_git_dir" '
-            '--work-tree="$awm_delivery_isolated_root" '
-            'status --porcelain=v1 --untracked-files=all) || { '
-            "printf '%s\\n' "
-            '"publication-disabled session cleanliness could not be verified; '
-            'isolated worktree retained at $awm_delivery_isolated_root; shadow '
-            'Git directory retained at $awm_delivery_shadow_git_dir" >&2; '
-            'if [ "$awm_delivery_status" -ne 0 ]; then '
-            'exit "$awm_delivery_status"; fi; exit 1; }; '
-            'if [ -n "$awm_delivery_residual" ]; then '
-            "printf '%s\\n' "
-            '"publication-disabled session left uncommitted changes; isolated '
-            'worktree retained at $awm_delivery_isolated_root; shadow Git '
-            'directory retained at $awm_delivery_shadow_git_dir" >&2; '
-            'if [ "$awm_delivery_status" -ne 0 ]; then '
-            'exit "$awm_delivery_status"; fi; exit 1; fi; '
-            "awm_delivery_preserve_resources=0; "
             '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
             'awm_delivery_new=$(tr -d \'\\n\' < '
             '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '
@@ -2032,7 +2009,40 @@ exec "$real_git" "$@"
             '"$awm_delivery_real_git" read-tree "$awm_delivery_old" '
             "2>/dev/null || :; "
             'exit "$awm_delivery_index_status"; '
-            "fi; }"
+            "fi; } && "
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --cached --quiet --no-ext-diff; '
+            "awm_delivery_staged_status=$?; "
+            'if [ "$awm_delivery_staged_status" -eq 1 ]; then '
+            '"$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --cached --binary --no-ext-diff | '
+            '"$awm_delivery_real_git" apply --index --whitespace=nowarn; '
+            'elif [ "$awm_delivery_staged_status" -ne 0 ]; then '
+            'exit "$awm_delivery_staged_status"; fi && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --quiet --no-ext-diff; '
+            "awm_delivery_unstaged_status=$?; "
+            'if [ "$awm_delivery_unstaged_status" -eq 1 ]; then '
+            '"$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --binary --no-ext-diff | '
+            '"$awm_delivery_real_git" apply --whitespace=nowarn; '
+            'elif [ "$awm_delivery_unstaged_status" -ne 0 ]; then '
+            'exit "$awm_delivery_unstaged_status"; fi && '
+            '"$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'ls-files --others --exclude-standard -z | '
+            '(cd "$awm_delivery_isolated_root" && '
+            '"$awm_delivery_tar" --null --verbatim-files-from '
+            '--files-from=- --create --file=-) | '
+            '(cd "$awm_delivery_root" && '
+            '"$awm_delivery_tar" --extract --file=-)'
         )
 
     def _with_shell_diagnostic(
