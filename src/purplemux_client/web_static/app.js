@@ -163,6 +163,7 @@ let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
 let currentMode = "issue-driven";
+let runtimeViewActive = false;
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
@@ -445,32 +446,34 @@ function applyModeVisibility() {
   recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
-  issueDrivenModeButton.className = issueDrivenMode
-    ? "primary-view-entry issue-driven-entry selected"
-    : "primary-view-entry issue-driven-entry";
   reviewModeButton.className = reviewMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
   if (!issueDrivenMode) developerViews.open = true;
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
-  issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
   reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
   environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
+  applyPrimaryViewSelection();
 }
 
-function showRuntimeView(show) {
-  document.body.classList[show ? "add" : "remove"]("runtime-view-active");
-  runtimePanel.hidden = !show;
-  runtimeView.className = show
-    ? "primary-view-entry runtime-entry selected"
-    : "primary-view-entry runtime-entry";
-  runtimeView.setAttribute("aria-pressed", String(show));
-  const issueDrivenSelected = !show && currentMode === "issue-driven";
+function applyPrimaryViewSelection() {
+  const issueDrivenSelected = !runtimeViewActive && currentMode === "issue-driven";
   issueDrivenModeButton.className = issueDrivenSelected
     ? "primary-view-entry issue-driven-entry selected"
     : "primary-view-entry issue-driven-entry";
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenSelected));
+  runtimeView.className = runtimeViewActive
+    ? "primary-view-entry runtime-entry selected"
+    : "primary-view-entry runtime-entry";
+  runtimeView.setAttribute("aria-pressed", String(runtimeViewActive));
+}
+
+function showRuntimeView(show) {
+  runtimeViewActive = show;
+  document.body.classList[show ? "add" : "remove"]("runtime-view-active");
+  runtimePanel.hidden = !show;
+  applyPrimaryViewSelection();
 }
 
 function showDraftLabel() {

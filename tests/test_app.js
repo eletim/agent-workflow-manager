@@ -850,6 +850,28 @@ test("Runtime is a distinct dominant view and workflow views restore the editor"
   assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "false");
 });
 
+test("selected-run refresh keeps Runtime as the only selected primary view", async () => {
+  const run = snapshot({
+    runId: 1,
+    state: "running",
+    stdout: "working",
+    mode: "issue-driven",
+  });
+  const {elements, refresh} = await loadApp({
+    runs: [{runId: 1, state: "running", mode: "issue-driven"}],
+    details: {1: run},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["runtime-view"].dispatch("click");
+  await refresh();
+
+  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
+  assert.match(elements["runtime-view"].className, /selected/);
+  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
+  assert.doesNotMatch(elements["issue-driven-mode"].className, /selected/);
+});
+
 test("New run leaves Runtime and restores the current workflow draft", async () => {
   const {elements} = await loadApp({
     runs: [],
