@@ -1893,9 +1893,15 @@ done
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
             'mkdir -p -- "$awm_delivery_hooks/gh" && '
             "trap 'rm -r -- \"$awm_delivery_hooks\"' EXIT && "
-            'exec 9>"$awm_delivery_hooks_root/awm-delivery.lock" && '
+            "awm_delivery_lock_key=$(printf '%s\\n%s\\n' "
+            '"$awm_delivery_ref_dir" "$awm_delivery_ref_log_dir" | '
+            "sha256sum) && "
+            "awm_delivery_lock_key=${awm_delivery_lock_key%% *} && "
+            'exec 9>"$awm_delivery_hooks_root/awm-delivery-'
+            '$awm_delivery_lock_key.lock" && '
             'if ! flock -n 9; then printf \'%s\\n\' '
-            "'another publication-disabled session owns this repository' >&2; "
+            "'another publication-disabled session owns overlapping Git metadata' "
+            ">&2; "
             "exit 1; fi && "
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
             f"printf %s {reference_hook} | base64 --decode > "

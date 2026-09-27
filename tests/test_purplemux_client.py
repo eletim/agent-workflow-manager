@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -497,11 +498,71 @@ def linked_delivery_checkout(
     return repository, checkout
 
 
+def delivery_metadata_lock_path(checkout: Path) -> Path:
+    common_dir = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(checkout), "symbolic-ref", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ref_path = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                ref,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    log_path = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                f"logs/{ref}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    lock_key = hashlib.sha256(
+        f"{ref_path.parent}\n{log_path.parent}\n".encode()
+    ).hexdigest()
+    return common_dir / "hooks" / f"awm-delivery-{lock_key}.lock"
+
+
 @pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     worker: str, tmp_path: Path
 ) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
+    _, checkout = linked_delivery_checkout(tmp_path)
     arguments_path = tmp_path / f"{worker}-arguments"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -799,11 +860,11 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_requires_repository_exclusion(
+def test_publication_disabled_requires_overlapping_metadata_exclusion(
     worker: str, tmp_path: Path
 ) -> None:
-    repository, checkout = linked_delivery_checkout(tmp_path)
-    lock_path = repository / ".git/hooks/awm-delivery.lock"
+    _, checkout = linked_delivery_checkout(tmp_path)
+    lock_path = delivery_metadata_lock_path(checkout)
     lock_path.parent.mkdir(exist_ok=True)
     launched = tmp_path / "launched"
     fake_bin = tmp_path / "bin"
@@ -830,8 +891,58 @@ def test_publication_disabled_requires_repository_exclusion(
         )
 
     assert result.returncode != 0
-    assert "owns this repository" in result.stderr
+    assert "owns overlapping Git metadata" in result.stderr
     assert not launched.exists()
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_allows_non_overlapping_metadata_sessions(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    independent_checkout = tmp_path / "independent checkout"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "independent/scoped-commit",
+            str(independent_checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    independent_lock_path = delivery_metadata_lock_path(independent_checkout)
+    assert independent_lock_path != delivery_metadata_lock_path(checkout)
+    launched = tmp_path / "launched"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        f"#!/bin/sh\nprintf launched > {shlex.quote(str(launched))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    with independent_lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(worker, "run"),
+            cwd=checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert result.returncode == 0
+    assert launched.read_text(encoding="utf-8") == "launched"
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
