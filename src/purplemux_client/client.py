@@ -1844,6 +1844,7 @@ exec "$real_git" "$@"
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
+            "awm_delivery_preserve_resources=0 && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
@@ -1851,6 +1852,11 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
+            'if [ "$awm_delivery_preserve_resources" -eq 1 ] && '
+            '{ [ "$awm_delivery_cleanup_dir" = '
+            '"$awm_delivery_shadow_git_dir" ] || '
+            '[ "$awm_delivery_cleanup_dir" = '
+            '"$awm_delivery_isolated_root" ]; }; then continue; fi; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "
@@ -1971,6 +1977,25 @@ exec "$real_git" "$@"
             f'"$@" {launch}; '
             "awm_delivery_status=$?; "
             "PATH=$awm_delivery_original_path; export PATH; "
+            "awm_delivery_preserve_resources=1; "
+            'awm_delivery_residual=$("$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'status --porcelain=v1 --untracked-files=all) || { '
+            "printf '%s\\n' "
+            '"publication-disabled session cleanliness could not be verified; '
+            'isolated worktree retained at $awm_delivery_isolated_root; shadow '
+            'Git directory retained at $awm_delivery_shadow_git_dir" >&2; '
+            'if [ "$awm_delivery_status" -ne 0 ]; then '
+            'exit "$awm_delivery_status"; fi; exit 1; }; '
+            'if [ -n "$awm_delivery_residual" ]; then '
+            "printf '%s\\n' "
+            '"publication-disabled session left uncommitted changes; isolated '
+            'worktree retained at $awm_delivery_isolated_root; shadow Git '
+            'directory retained at $awm_delivery_shadow_git_dir" >&2; '
+            'if [ "$awm_delivery_status" -ne 0 ]; then '
+            'exit "$awm_delivery_status"; fi; exit 1; fi; '
+            "awm_delivery_preserve_resources=0; "
             '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
             'awm_delivery_new=$(tr -d \'\\n\' < '
             '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '

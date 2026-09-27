@@ -375,7 +375,9 @@ def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
         check=True,
         capture_output=True,
     )
-    fake_worker = tmp_path / worker
+    fake_bin = tmp_path.parent / f"{tmp_path.name}-bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
         "printf '%s\\n' \"${GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|\""
@@ -387,7 +389,7 @@ def test_publication_disabled_agent_denies_authenticated_mutation_capabilities(
     environment = os.environ.copy()
     environment.update(
         {
-            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "PATH": f"{fake_bin}:{environment['PATH']}",
             "GH_TOKEN": "push-capable-gh-token",
             "GITHUB_TOKEN": "push-capable-github-token",
         }
@@ -638,6 +640,112 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_retains_residual_changes_before_delivery(
+    worker: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m committed-before-residual >/dev/null 2>&1\n"
+        "printf 'staged\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "printf 'unstaged\\n' >> tracked.txt\n"
+        "printf 'untracked\\n' > residual.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    diagnostic = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith(
+            "publication-disabled session left uncommitted changes; "
+        )
+    )
+    isolated_text, shadow_text = diagnostic.split(
+        "; shadow Git directory retained at ", maxsplit=1
+    )
+    isolated = Path(isolated_text.rsplit(" retained at ", maxsplit=1)[1])
+    shadow = Path(shadow_text)
+    try:
+        assert isolated.is_dir()
+        assert shadow.is_dir()
+        assert (isolated / "tracked.txt").read_text(encoding="utf-8") == (
+            "staged\nunstaged\n"
+        )
+        assert (isolated / "residual.txt").read_text(encoding="utf-8") == (
+            "untracked\n"
+        )
+        retained_status = subprocess.run(
+            [
+                "git",
+                f"--git-dir={shadow}",
+                f"--work-tree={isolated}",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        assert "MM tracked.txt" in retained_status
+        assert "?? residual.txt" in retained_status
+        assert (
+            subprocess.run(
+                ["git", f"--git-dir={shadow}", "log", "-1", "--format=%s"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == "committed-before-residual"
+        )
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "before\n"
+        assert not (checkout / "residual.txt").exists()
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == ""
+        )
+    finally:
+        shutil.rmtree(isolated, ignore_errors=True)
+        shutil.rmtree(shadow, ignore_errors=True)
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_isolates_late_and_nested_local_remotes(
     worker: str,
     tmp_path: Path,
@@ -851,7 +959,9 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
     agent_status: int, use_pty: bool, tmp_path: Path
 ) -> None:
     initialize_test_repository(tmp_path)
-    fake_worker = tmp_path / "codex"
+    fake_bin = tmp_path.parent / f"{tmp_path.name}-bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
     fake_worker.write_text(
         "#!/bin/sh\n"
         "shadow=\n"
@@ -873,7 +983,7 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
     )
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
-    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     command = PurpleMuxCLIClient._publication_disabled_agent_command(
         "codex", "exercise cleanup"
     )
@@ -1192,7 +1302,7 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
 ) -> None:
     initialize_test_repository(tmp_path)
     removal_record = tmp_path / "cleanup-removals"
-    fake_bin = tmp_path / "bin"
+    fake_bin = tmp_path.parent / f"{tmp_path.name}-bin"
     fake_bin.mkdir()
     fake_worker = fake_bin / "codex"
     fake_worker.write_text(
@@ -1318,7 +1428,9 @@ def test_publication_disabled_allows_ephemeral_nested_repository_work(
         check=True,
         capture_output=True,
     )
-    fake_worker = tmp_path / worker
+    fake_bin = tmp_path.parent / f"{tmp_path.name}-bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
         'nested=$(mktemp -d "${PWD%/*}/nested-repository.XXXXXX")\n'
@@ -1331,7 +1443,7 @@ def test_publication_disabled_allows_ephemeral_nested_repository_work(
     )
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
-    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
     result = subprocess.run(
         PurpleMuxCLIClient._publication_disabled_agent_command(worker, "run tests"),
@@ -1741,8 +1853,14 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
         check=True,
     )
+    (repository / ".gitignore").write_text(
+        "forbidden-remote.git/\nsandbox-payload\n", encoding="utf-8"
+    )
     subprocess.run(
-        ["git", "-C", str(repository), "commit", "--allow-empty", "-m", "base"],
+        ["git", "-C", str(repository), "add", ".gitignore"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "base"],
         check=True,
         capture_output=True,
     )
