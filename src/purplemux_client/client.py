@@ -1587,6 +1587,539 @@ print(path, flush=True)
 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 """
         ).decode("ascii")
+        recovery_snapshot = base64.b64encode(
+            b"""import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import subprocess
+import sys
+
+(
+    git,
+    timeout_command,
+    shadow,
+    worktree,
+    recovery,
+    protected_ref,
+    old,
+    common_git_dir,
+) = sys.argv[1:]
+blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+recovery_path = Path(recovery)
+base_environment = os.environ.copy()
+base_environment.update({"GIT_DIR": shadow, "GIT_WORK_TREE": worktree})
+
+
+def run_git(
+    arguments, *, environment=None, stdout=subprocess.PIPE, input_text=None, text=True
+):
+    result = subprocess.run(
+        [
+            timeout_command,
+            "--signal=TERM",
+            "--kill-after=1s",
+            "60s",
+            git,
+            *arguments,
+        ],
+        cwd=worktree,
+        env=environment or base_environment,
+        input=input_text,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        text=text,
+        timeout=65,
+        check=False,
+        start_new_session=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip()
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        detail = detail or "Git command failed"
+        raise RuntimeError(detail[:1000])
+    return result
+
+
+def commit_tree(tree, parent, message):
+    return run_git(
+        ["commit-tree", tree, "-p", parent], input_text=message + "\\n"
+    ).stdout.strip()
+
+
+def capture_index_state(
+    environment, index_path, destination, *, source_environment=None
+):
+    source_environment = source_environment or environment
+    private_index = destination / "staged.index"
+    private_environment = environment.copy()
+    private_environment["GIT_INDEX_FILE"] = str(private_index)
+    if index_path.is_file():
+        shutil.copyfile(index_path, private_index)
+    else:
+        run_git(["read-tree", "--empty"], environment=private_environment)
+    shared_index_text = run_git(
+        ["rev-parse", "--shared-index-path"], environment=source_environment
+    ).stdout.strip()
+    shared_index = Path(shared_index_text).resolve() if shared_index_text else None
+    if shared_index is not None:
+        private_shared_index = Path(environment["GIT_DIR"]) / shared_index.name
+        if private_shared_index.resolve() != shared_index:
+            shutil.copyfile(shared_index, private_shared_index)
+    unmerged = run_git(
+        ["ls-files", "--unmerged", "-z"],
+        environment=private_environment,
+        text=False,
+    ).stdout
+    if not unmerged:
+        tree = run_git(
+            ["write-tree"], environment=private_environment
+        ).stdout.strip()
+        private_index.unlink()
+        return tree, None
+
+    entries = run_git(
+        ["ls-files", "--stage", "-z"],
+        environment=private_environment,
+        text=False,
+    ).stdout
+    resolve_undo = run_git(
+        ["ls-files", "--resolve-undo", "-z"],
+        environment=private_environment,
+        text=False,
+    ).stdout
+
+    def packable_object_ids(records):
+        object_ids = set()
+        for record in records.split(b"\\0"):
+            if not record:
+                continue
+            mode, object_id, _ = record.split(b"\\t", 1)[0].split()
+            if mode != b"160000":
+                object_ids.add(object_id.decode("ascii"))
+        return object_ids
+
+    object_ids = sorted(
+        packable_object_ids(entries) | packable_object_ids(resolve_undo)
+    )
+    pack_prefix = destination / "conflict-objects"
+    pack_hash = run_git(
+        ["pack-objects", str(pack_prefix)],
+        environment=environment,
+        input_text="\\n".join(object_ids) + "\\n",
+    ).stdout.strip()
+    conflict_index = destination / "conflicted.index"
+    os.replace(private_index, conflict_index)
+    retained_shared_index = None
+    if shared_index is not None:
+        retained_shared_index = destination / shared_index.name
+        shutil.copyfile(shared_index, retained_shared_index)
+    return None, {
+        "indexFile": conflict_index.name,
+        "objectPack": f"{pack_prefix.name}-{pack_hash}.pack",
+        "objectIndex": f"{pack_prefix.name}-{pack_hash}.idx",
+        "sharedIndexFile": (
+            retained_shared_index.name if retained_shared_index is not None else None
+        ),
+    }
+
+
+def nested_git_roots():
+    roots = []
+    invalid_markers = []
+    for current, directories, files in os.walk(worktree, followlinks=False):
+        if current != worktree and (".git" in directories or ".git" in files):
+            candidate = Path(current)
+            marker = candidate / ".git"
+            probe = run_nested(
+                candidate, ["rev-parse", "--absolute-git-dir"], required=False
+            )
+            if probe.returncode == 0:
+                roots.append(candidate)
+            else:
+                invalid_markers.append(marker)
+        if ".git" in directories:
+            directories.remove(".git")
+    return roots, invalid_markers
+
+
+def is_within(path, parent):
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def run_nested(
+    root, arguments, *, environment=None, stdout=subprocess.PIPE, required=True
+):
+    environment = (environment or os.environ).copy()
+    requested_git_dir = environment.get("GIT_DIR")
+    requested_worktree = environment.get("GIT_WORK_TREE")
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+    )
+    if requested_git_dir is not None:
+        environment["GIT_DIR"] = requested_git_dir
+    if requested_worktree is not None:
+        environment["GIT_WORK_TREE"] = requested_worktree
+    result = subprocess.run(
+        [
+            timeout_command,
+            "--signal=TERM",
+            "--kill-after=1s",
+            "60s",
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(root),
+            *arguments,
+        ],
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        timeout=65,
+        check=False,
+        start_new_session=True,
+    )
+    if result.returncode and required:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError((detail or "nested Git command failed")[:1000])
+    return result
+
+
+def capture_nested_repository(root, destination):
+    isolated = Path(worktree).resolve()
+    common = Path(common_git_dir).resolve()
+    git_dir = Path(
+        os.fsdecode(run_nested(root, ["rev-parse", "--absolute-git-dir"]).stdout).strip()
+    ).resolve()
+    if not (is_within(git_dir, isolated) or is_within(git_dir, common)):
+        raise RuntimeError("nested Git directory escapes owned repository state")
+    nested_environment = os.environ.copy()
+    nested_environment.update(
+        {"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(root)}
+    )
+    object_dir = Path(
+        os.fsdecode(
+            run_nested(
+                root,
+                ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+                environment=nested_environment,
+            ).stdout
+        ).strip()
+    ).resolve()
+    if not (is_within(object_dir, isolated) or is_within(object_dir, common)):
+        raise RuntimeError("nested Git object directory escapes owned repository state")
+    index_path = Path(
+        os.fsdecode(
+            run_nested(
+                root,
+                ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                environment=nested_environment,
+            ).stdout
+        ).strip()
+    ).resolve()
+    if not (is_within(index_path, isolated) or is_within(index_path, common)):
+        raise RuntimeError("nested Git index escapes owned repository state")
+
+    destination.mkdir(mode=0o700)
+    side_git = destination / "snapshot.git"
+    initialize = subprocess.run(
+        [
+            timeout_command,
+            "--signal=TERM",
+            "--kill-after=1s",
+            "60s",
+            git,
+            "init",
+            "--bare",
+            "--quiet",
+            str(side_git),
+        ],
+        env={
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=65,
+        check=False,
+        start_new_session=True,
+    )
+    if initialize.returncode:
+        detail = initialize.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError((detail or "nested recovery repository init failed")[:1000])
+    (side_git / "objects" / "info" / "alternates").write_text(
+        str(object_dir) + "\\n", encoding="utf-8"
+    )
+    side_environment = os.environ.copy()
+    side_environment.pop("GIT_COMMON_DIR", None)
+    side_environment.update(
+        {
+            "GIT_DIR": str(side_git),
+            "GIT_WORK_TREE": str(root),
+            "GIT_AUTHOR_NAME": "Agent Workflow Manager",
+            "GIT_AUTHOR_EMAIL": "recovery@localhost",
+            "GIT_COMMITTER_NAME": "Agent Workflow Manager",
+            "GIT_COMMITTER_EMAIL": "recovery@localhost",
+        }
+    )
+
+    def run_side(arguments, *, input_text=None):
+        return run_git(arguments, environment=side_environment, input_text=input_text)
+
+    head_result = subprocess.run(
+        [git, "rev-parse", "--verify", "HEAD"],
+        env={
+            **os.environ,
+            "GIT_DIR": str(git_dir),
+            "GIT_WORK_TREE": str(root),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=60,
+        check=False,
+        start_new_session=True,
+    )
+    head = head_result.stdout.strip() if head_result.returncode == 0 else None
+    if head is None:
+        baseline_tree = run_side(
+            ["hash-object", "-t", "tree", "-w", "--stdin"], input_text=""
+        ).stdout.strip()
+    else:
+        baseline_tree = os.fsdecode(
+            run_nested(
+                root, ["rev-parse", "HEAD^{tree}"], environment=nested_environment
+            ).stdout
+        ).strip()
+    staged_tree, conflict_state = capture_index_state(
+        side_environment,
+        index_path,
+        destination,
+        source_environment=nested_environment,
+    )
+    baseline_commit = run_side(
+        ["commit-tree", baseline_tree], input_text="AWM nested recovery: baseline\\n"
+    ).stdout.strip()
+    staged_commit = None
+    if staged_tree is not None:
+        staged_commit = run_side(
+            ["commit-tree", staged_tree, "-p", baseline_commit],
+            input_text="AWM nested recovery: staged state\\n",
+        ).stdout.strip()
+    worktree_index = destination / "worktree.index"
+    worktree_environment = side_environment.copy()
+    worktree_environment["GIT_INDEX_FILE"] = str(worktree_index)
+    if conflict_state is None:
+        run_git(["read-tree", staged_tree], environment=worktree_environment)
+    else:
+        shutil.copyfile(destination / "conflicted.index", worktree_index)
+    run_git(["add", "-A", "--", "."], environment=worktree_environment)
+    worktree_tree = run_git(
+        ["write-tree"], environment=worktree_environment
+    ).stdout.strip()
+    worktree_commit = run_side(
+        ["commit-tree", worktree_tree, "-p", staged_commit or baseline_commit],
+        input_text="AWM nested recovery: final worktree\\n",
+    ).stdout.strip()
+    worktree_index.unlink()
+    run_side(["update-ref", "refs/awm-delivery/baseline", baseline_commit])
+    if staged_commit is not None:
+        run_side(["update-ref", "refs/awm-delivery/staged", staged_commit])
+    run_side(["update-ref", "refs/awm-delivery/worktree", worktree_commit])
+    bundle_temporary = destination / "staged.bundle.tmp"
+    bundle_refs = [
+        "refs/awm-delivery/baseline",
+        "refs/awm-delivery/worktree",
+    ]
+    if staged_commit is not None:
+        bundle_refs.append("refs/awm-delivery/staged")
+    run_side(["bundle", "create", str(bundle_temporary), *bundle_refs])
+    os.replace(bundle_temporary, destination / "staged.bundle")
+    metadata = {
+        "formatVersion": 1,
+        "path": os.path.relpath(root, worktree),
+        "headCommit": head,
+        "baselineCommit": baseline_commit,
+        "stagedCommit": staged_commit,
+        "worktreeCommit": worktree_commit,
+        "conflictState": conflict_state,
+    }
+    (destination / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=True, sort_keys=True) + "\\n",
+        encoding="ascii",
+    )
+    shutil.rmtree(side_git)
+    return (
+        conflict_state is not None
+        or baseline_tree != staged_tree
+        or staged_tree != worktree_tree
+    )
+
+
+try:
+    shadow_commit = run_git(["rev-parse", protected_ref]).stdout.strip()
+    staged_tree, conflict_state = capture_index_state(
+        base_environment, Path(shadow) / "index", recovery_path
+    )
+    staged_commit = None
+    if staged_tree is not None:
+        staged_commit = commit_tree(
+            staged_tree, shadow_commit, "AWM recovery: staged agent state"
+        )
+
+    recovery_index = recovery_path / "worktree.index"
+    worktree_environment = base_environment.copy()
+    worktree_environment["GIT_INDEX_FILE"] = str(recovery_index)
+    if conflict_state is None:
+        run_git(["read-tree", staged_tree], environment=worktree_environment)
+    else:
+        shutil.copyfile(recovery_path / "conflicted.index", recovery_index)
+    run_git(["add", "-A", "--", "."], environment=worktree_environment)
+    worktree_tree = run_git(
+        ["write-tree"], environment=worktree_environment
+    ).stdout.strip()
+    worktree_commit = commit_tree(
+        worktree_tree,
+        staged_commit or shadow_commit,
+        "AWM recovery: final agent worktree",
+    )
+    recovery_index.unlink()
+
+    recovery_refs = {
+        "refs/awm-delivery/shadow": shadow_commit,
+        "refs/awm-delivery/worktree": worktree_commit,
+    }
+    if staged_commit is not None:
+        recovery_refs["refs/awm-delivery/staged"] = staged_commit
+    for reference, commit in recovery_refs.items():
+        run_git(["update-ref", reference, commit])
+
+    bundle_temporary = recovery_path / "recovery.bundle.tmp"
+    bundle = recovery_path / "recovery.bundle"
+    run_git(
+        [
+            "bundle",
+            "create",
+            str(bundle_temporary),
+            *recovery_refs,
+            "^" + old,
+        ]
+    )
+    os.replace(bundle_temporary, bundle)
+
+    nested_root = recovery_path / "nested"
+    nested_repositories, invalid_git_markers = nested_git_roots()
+    nested_residual = False
+    for index, nested_repository in enumerate(nested_repositories):
+        if index == 0:
+            nested_root.mkdir(mode=0o700)
+        nested_residual = (
+            capture_nested_repository(
+                nested_repository, nested_root / f"{index:04d}"
+            )
+            or nested_residual
+        )
+
+    marker_metadata = []
+    if invalid_git_markers:
+        marker_root = recovery_path / "ordinary-git-markers"
+        marker_root.mkdir(mode=0o700)
+        for index, marker in enumerate(invalid_git_markers):
+            stored = marker_root / f"{index:04d}"
+            if marker.is_symlink() or marker.is_file():
+                shutil.copy2(marker, stored, follow_symlinks=False)
+            else:
+                shutil.copytree(marker, stored, symlinks=True)
+            marker_metadata.append(
+                {
+                    "path": os.path.relpath(marker, worktree),
+                    "storedAt": os.path.relpath(stored, recovery_path),
+                }
+            )
+
+    status_path = recovery_path / "status.porcelain"
+    cleanliness = "verified"
+    try:
+        with status_path.open("w", encoding="utf-8") as status_output:
+            status = subprocess.run(
+                [
+                    timeout_command,
+                    "--signal=TERM",
+                    "--kill-after=1s",
+                    "60s",
+                    git,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                cwd=worktree,
+                env=base_environment,
+                stdout=status_output,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=65,
+                check=False,
+                start_new_session=True,
+            )
+        if status.returncode:
+            cleanliness = "unverified"
+        elif status_path.stat().st_size or nested_residual or invalid_git_markers:
+            cleanliness = "residual"
+    except (OSError, subprocess.SubprocessError):
+        cleanliness = "unverified"
+
+    metadata = {
+        "formatVersion": 1,
+        "protectedRef": protected_ref,
+        "baseCommit": old,
+        "shadowCommit": shadow_commit,
+        "stagedCommit": staged_commit,
+        "worktreeCommit": worktree_commit,
+        "conflictState": conflict_state,
+        "cleanliness": cleanliness,
+        "nestedRecoveryCount": len(nested_repositories),
+        "ordinaryGitMarkers": marker_metadata,
+    }
+    metadata_temporary = recovery_path / "metadata.json.tmp"
+    metadata_temporary.write_text(
+        json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
+    )
+    os.replace(metadata_temporary, recovery_path / "metadata.json")
+    complete_temporary = recovery_path / ".complete.tmp"
+    complete_temporary.write_text("1\\n", encoding="ascii")
+    os.replace(complete_temporary, recovery_path / ".complete")
+    print(cleanliness)
+except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+    print(f"publication-disabled recovery failed: {error}", file=sys.stderr)
+    raise SystemExit(74)
+"""
+        ).decode("ascii")
         git_wrapper = base64.b64encode(
             b"""#!/bin/sh
 probe=$PWD
@@ -1663,6 +2196,8 @@ exec "$real_git" "$@"
             "GIT_OBJECT_DIRECTORY",
             "-u",
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "-u",
+            "GIT_COMMON_DIR",
             "-u",
             "AWM_DELIVERY_REAL_GIT",
             "-u",
@@ -1780,7 +2315,7 @@ exec "$real_git" "$@"
         )
         return (
             "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY "
-            "GIT_EXEC_PATH "
+            "GIT_EXEC_PATH GIT_COMMON_DIR "
             "GIT_ALTERNATE_OBJECT_DIRECTORIES && "
             "awm_delivery_real_git=$(command -v git) && "
             'case "$awm_delivery_real_git" in /*) ;; *) exit 1 ;; esac && '
@@ -1844,7 +2379,7 @@ exec "$real_git" "$@"
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
-            "awm_delivery_preserve_resources=0 && "
+            "awm_delivery_recovery='' && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
@@ -1852,11 +2387,9 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
-            'if [ "$awm_delivery_preserve_resources" -eq 1 ] && '
-            '{ [ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_shadow_git_dir" ] || '
-            '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_isolated_root" ]; }; then continue; fi; '
+            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
+            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ] && '
+            '[ -f "$awm_delivery_recovery/.complete" ]; then continue; fi; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "
@@ -1882,6 +2415,11 @@ exec "$real_git" "$@"
             "fi; "
             "exit 1; "
             "fi; "
+            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
+            '[ -n "$awm_delivery_recovery" ] && '
+            '[ -f "$awm_delivery_recovery/.complete" ]; then '
+            "printf '%s\\n' \"publication-disabled agent output recovery "
+            'retained at $awm_delivery_recovery" >&2; fi; '
             'exit "$awm_delivery_primary_status"; '
             "} && "
             "trap 'awm_delivery_cleanup $?' EXIT && "
@@ -1900,6 +2438,12 @@ exec "$real_git" "$@"
             'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
+            'awm-delivery-recovery" && '
+            'mkdir -p -- "$awm_delivery_recovery_root" && '
+            'awm_delivery_recovery=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_recovery_root" "output.") && '
             '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
             '"$awm_delivery_isolated_root/" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
@@ -1977,25 +2521,28 @@ exec "$real_git" "$@"
             f'"$@" {launch}; '
             "awm_delivery_status=$?; "
             "PATH=$awm_delivery_original_path; export PATH; "
-            "awm_delivery_preserve_resources=1; "
-            'awm_delivery_residual=$("$awm_delivery_real_git" '
-            '--git-dir="$awm_delivery_shadow_git_dir" '
-            '--work-tree="$awm_delivery_isolated_root" '
-            'status --porcelain=v1 --untracked-files=all) || { '
+            f"awm_delivery_snapshot=$(printf %s {recovery_snapshot} | "
+            "base64 --decode) && "
+            'awm_delivery_cleanliness=$("$awm_delivery_python" -c '
+            '"$awm_delivery_snapshot" "$awm_delivery_real_git" '
+            '"$awm_delivery_timeout" '
+            '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
+            '"$awm_delivery_recovery" "$awm_delivery_ref" '
+            '"$awm_delivery_old" "$awm_delivery_common_git_dir") || { '
             "printf '%s\\n' "
-            '"publication-disabled session cleanliness could not be verified; '
-            'isolated worktree retained at $awm_delivery_isolated_root; shadow '
-            'Git directory retained at $awm_delivery_shadow_git_dir" >&2; '
+            '"publication-disabled agent output recovery failed" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '
-            'exit "$awm_delivery_status"; fi; exit 1; }; '
-            'if [ -n "$awm_delivery_residual" ]; then '
+            'exit "$awm_delivery_status"; fi; exit 74; }; '
+            'if [ "$awm_delivery_cleanliness" = unverified ]; then '
             "printf '%s\\n' "
-            '"publication-disabled session left uncommitted changes; isolated '
-            'worktree retained at $awm_delivery_isolated_root; shadow Git '
-            'directory retained at $awm_delivery_shadow_git_dir" >&2; '
+            '"publication-disabled session cleanliness could not be verified" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '
             'exit "$awm_delivery_status"; fi; exit 1; fi; '
-            "awm_delivery_preserve_resources=0; "
+            'if [ "$awm_delivery_cleanliness" = residual ]; then '
+            "printf '%s\\n' "
+            '"publication-disabled session left uncommitted changes" >&2; '
+            'if [ "$awm_delivery_status" -ne 0 ]; then '
+            'exit "$awm_delivery_status"; fi; exit 1; fi; '
             '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
             'awm_delivery_new=$(tr -d \'\\n\' < '
             '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '
