@@ -80,9 +80,6 @@ def test_copy_actions_on_insecure_http_origin(
                 By.ID, "issue-driven-mode"
             ).is_displayed()
         )
-        developer_views = driver.find_element(By.ID, "developer-views")
-        if developer_views.get_attribute("open") is None:
-            driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
         driver.find_element(By.ID, "runtime-view").click()
         wait.until(
             lambda browser: browser.find_element(
@@ -218,31 +215,57 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         runtime_panel = driver.find_element(By.ID, "runtime-panel")
         assert not runtime_panel.is_displayed()
         developer_views = driver.find_element(By.ID, "developer-views")
-        if developer_views.get_attribute("open") is None:
-            driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
-        assert driver.find_element(By.ID, "prompt-mode").is_displayed()
-        assert driver.find_element(By.ID, "workflow-mode").is_displayed()
+        issue_driven_json = driver.find_element(By.ID, "issue-driven-json")
+        issue_driven_json.send_keys(" ")
+        preserved_issue_driven_json = issue_driven_json.get_attribute("value")
+        assert developer_views.get_attribute("open") is None
+
         driver.find_element(By.ID, "runtime-view").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "run-list").is_displayed()
         )
         assert not driver.find_elements(By.CSS_SELECTOR, "#run-list .run-item.selected")
         assert runtime_panel.is_displayed()
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "true"
+        )
+        assert (
+            driver.find_element(By.ID, "issue-driven-mode").get_attribute(
+                "aria-pressed"
+            )
+            == "false"
+        )
+        assert developer_views.get_attribute("open") is None
         assert driver.find_element(By.ID, "new-run").is_displayed()
 
         runs_panel = driver.find_element(By.ID, "runs-panel")
+        assert runs_panel.is_displayed()
+        assert driver.find_element(By.CSS_SELECTOR, ".runs-title").text == "Runs"
         runs_summary = driver.find_element(By.CSS_SELECTOR, "#runs-panel > summary")
         runs_summary.click()
         assert runs_panel.get_attribute("open") is None
         runs_summary.click()
         assert runs_panel.get_attribute("open") is not None
 
-        driver.find_element(By.ID, "new-run").click()
+        driver.find_element(By.ID, "issue-driven-mode").click()
         wait.until(
-            lambda browser: (
-                browser.find_element(By.ID, "code").get_attribute("readonly") is None
-            )
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-fields"
+            ).is_displayed()
         )
+        assert issue_driven_json.get_attribute("value") == preserved_issue_driven_json
+        assert (
+            driver.find_element(By.ID, "issue-driven-mode").get_attribute(
+                "aria-pressed"
+            )
+            == "true"
+        )
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "false"
+        )
+
         driver.find_element(By.ID, "runtime-view").click()
         driver.find_element(By.CSS_SELECTOR, "#run-list .run-item").click()
         wait.until(
@@ -251,13 +274,21 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
                 is not None
             )
         )
+        progress_panel = driver.find_element(By.CSS_SELECTOR, ".progress-panel")
+        assert progress_panel.is_displayed()
+        assert progress_panel.find_element(By.TAG_NAME, "h2").text == "Progress"
+        assert driver.find_element(By.ID, "progress-empty").is_displayed()
+        assert driver.find_element(By.ID, "stdout").text.endswith("HTTP_STDOUT")
+        assert driver.find_element(By.ID, "stderr").text.endswith("HTTP_STDERR")
         driver.find_element(By.ID, "new-run").click()
 
         mobile_workflow = (
             "from purplemux_client import emit_step\n"
+            "import sys\n"
             'WORKFLOW_OUTLINE = ["mobile step"]\n'
             'emit_step("mobile step", "started")\n'
             'print("X" * 4000, flush=True)\n'
+            'print("MOBILE_STDERR", file=sys.stderr, flush=True)\n'
             "import time\n"
             "time.sleep(30)\n"
         )
@@ -277,8 +308,14 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         wait.until(
             lambda browser: len(browser.find_element(By.ID, "stdout").text) >= 4000
         )
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "stderr").text.endswith(
+                "MOBILE_STDERR"
+            )
+        )
         assert driver.find_element(By.ID, "progress").is_displayed()
         assert driver.find_element(By.ID, "stdout").is_displayed()
+        assert driver.find_element(By.ID, "stderr").is_displayed()
         assert page_fits_viewport(driver)
         driver.find_element(By.ID, "stop").click()
         wait.until(lambda browser: not browser.find_element(By.ID, "stop").is_enabled())
@@ -388,7 +425,6 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
         assert not driver.find_element(By.ID, "workflow-fields").is_displayed()
         developer_views = driver.find_element(By.ID, "developer-views")
         assert developer_views.get_attribute("open") is None
-        driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
         driver.find_element(By.ID, "runtime-view").click()
 
         failed_item = wait.until(
@@ -448,7 +484,6 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
         assert (
             driver.find_element(By.ID, "developer-views").get_attribute("open") is None
         )
-        driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
         driver.find_element(By.ID, "runtime-view").click()
         driver.find_element(
             By.CSS_SELECTOR, f'[data-run-id="{recovered_run_id}"]'
