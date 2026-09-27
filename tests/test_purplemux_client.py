@@ -451,10 +451,17 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         "commit_status=$?\n"
         'git push "$AWM_TEST_REMOTE" HEAD:refs/heads/forbidden >/dev/null 2>&1\n'
         "push_status=$?\n"
+        'git push --no-verify "$AWM_TEST_REMOTE" '
+        "HEAD:refs/heads/forbidden-no-verify >/dev/null 2>&1\n"
+        "no_verify_status=$?\n"
+        'git -c core.hooksPath=/dev/null push "$AWM_TEST_REMOTE" '
+        "HEAD:refs/heads/forbidden-hook-override >/dev/null 2>&1\n"
+        "hook_override_status=$?\n"
         "status=$(git status --porcelain)\n"
         "config_exposed=0\n"
         '[ ! -e "$GH_CONFIG_DIR/hosts.yml" ] || config_exposed=1\n'
-        'printf \'%s|%s|%s|%s|%s|%s\\n\' "$commit_status" "$push_status" '
+        'printf \'%s|%s|%s|%s|%s|%s|%s|%s\\n\' "$commit_status" "$push_status" '
+        '"$no_verify_status" "$hook_override_status" '
         '"${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "$config_exposed" '
         '"$status"\n',
         encoding="utf-8",
@@ -489,11 +496,20 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
     )
 
     assert result.returncode == 0, result.stderr
-    commit_status, push_status, token, github_token, config_exposed, status = (
-        result.stdout.strip().split("|", 5)
-    )
+    (
+        commit_status,
+        push_status,
+        no_verify_status,
+        hook_override_status,
+        token,
+        github_token,
+        config_exposed,
+        status,
+    ) = result.stdout.strip().split("|", 7)
     assert commit_status == "0"
     assert push_status != "0"
+    assert no_verify_status != "0"
+    assert hook_override_status != "0"
     assert token == github_token == "unset"
     assert config_exposed == "0"
     assert status == ""
@@ -538,21 +554,100 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         ).stdout
         == ""
     )
-    assert (
+    for ref in (
+        "refs/heads/forbidden",
+        "refs/heads/forbidden-no-verify",
+        "refs/heads/forbidden-hook-override",
+    ):
+        assert (
+            subprocess.run(
+                ["git", "--git-dir", str(remote), "show-ref", "--verify", ref],
+                check=False,
+                capture_output=True,
+            ).returncode
+            != 0
+        )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_rolls_back_ref_when_real_index_update_fails(
+    worker: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, base = linked_delivery_repository
+    index_path = Path(
         subprocess.run(
             [
                 "git",
-                "--git-dir",
-                str(remote),
-                "show-ref",
-                "--verify",
-                "refs/heads/forbidden",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
             ],
-            check=False,
+            check=True,
             capture_output=True,
-        ).returncode
-        != 0
+            text=True,
+        ).stdout.strip()
     )
+    index_lock = index_path.with_name("index.lock")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'after\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m index-failure >/dev/null 2>&1\n"
+        ': > "$AWM_TEST_INDEX_LOCK"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_INDEX_LOCK": str(index_lock),
+        }
+    )
+
+    try:
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(
+                worker, "commit a change"
+            ),
+            cwd=checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "diff", "--cached", "--name-only"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == ""
+        )
+        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "after\n"
+    finally:
+        index_lock.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize(
@@ -756,8 +851,9 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
 
 
 @pytest.mark.parametrize("agent_status", [0, 29], ids=("success", "agent-failure"))
+@pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
 def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_status(
-    agent_status: int, tmp_path: Path
+    agent_status: int, use_pty: bool, tmp_path: Path
 ) -> None:
     initialize_test_repository(tmp_path)
     resource_record = tmp_path / "cleanup-resources"
@@ -777,12 +873,9 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     fake_rm.write_text(
         "#!/bin/sh\n"
         'printf \'%s\\n\' "$*" >> "$AWM_TEST_REMOVAL_RECORD"\n'
-        "index=0\n"
-        'while [ "$index" -lt 100 ]; do\n'
-        "    printf 'unbounded implementation detail\\n' >&2\n"
-        "    index=$((index + 1))\n"
-        "done\n"
-        "exit 88\n",
+        'printf \'%s\\n\' "$$" >> "$AWM_TEST_CLEANUP_PID_RECORD"\n'
+        "trap '' TERM\n"
+        "while :; do sleep 1; done\n",
         encoding="utf-8",
     )
     fake_rm.chmod(0o755)
@@ -790,12 +883,20 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["AWM_TEST_REMOVAL_RECORD"] = str(removal_record)
     environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
+    cleanup_pid_record = tmp_path / "cleanup-pids"
+    environment["AWM_TEST_CLEANUP_PID_RECORD"] = str(cleanup_pid_record)
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        "codex", "fail cleanup"
+    )
+    arguments: str | list[str] = command
+    if use_pty:
+        arguments = ["script", "-q", "-e", "-c", command, "/dev/null"]
 
     result = subprocess.run(
-        PurpleMuxCLIClient._publication_disabled_agent_command("codex", "fail cleanup"),
+        arguments,
         cwd=tmp_path,
         env=environment,
-        shell=True,
+        shell=not use_pty,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -807,14 +908,20 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     try:
         expected_status = agent_status if agent_status else 1
         assert result.returncode == expected_status
-        assert result.stderr == (
-            "publication-disabled session cleanup failed; temporary resources may remain\n"
+        assert (
+            "publication-disabled session cleanup failed; temporary resources may remain"
+            in result.stdout + result.stderr
         )
         removals = removal_record.read_text(encoding="utf-8").splitlines()
         assert len(removals) == 2
         assert {removal.removeprefix("-rf -- ") for removal in removals} == set(
             resources
         )
+        cleanup_pids = cleanup_pid_record.read_text(encoding="utf-8").splitlines()
+        assert len(cleanup_pids) == 2
+        for cleanup_pid in cleanup_pids:
+            with pytest.raises(ProcessLookupError):
+                os.kill(int(cleanup_pid), 0)
     finally:
         for resource in resources:
             shutil.rmtree(resource, ignore_errors=True)

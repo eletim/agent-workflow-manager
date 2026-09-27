@@ -1556,6 +1556,7 @@ done
         git_wrapper = base64.b64encode(
             b"""#!/bin/sh
 probe=$PWD
+command=
 next_is_c=false
 skip_next=false
 for argument do
@@ -1573,9 +1574,10 @@ for argument do
         -C?*) probe=$(cd "$probe" && cd "${argument#-C}" && pwd -P) || exec "$AWM_DELIVERY_REAL_GIT" "$@" ;;
         -c|--config-env) skip_next=true ;;
         -*) ;;
-        *) break ;;
+        *) command=$argument; break ;;
     esac
 done
+[ "$command" != push ] || exit 1
 root=$("$AWM_DELIVERY_REAL_GIT" -C "$probe" rev-parse --show-toplevel 2>/dev/null) || {
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
     exec "$AWM_DELIVERY_REAL_GIT" "$@"
@@ -1731,6 +1733,8 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'case "$awm_delivery_chmod" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_rm=$(command -v rm) && "
             'case "$awm_delivery_rm" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_timeout=$(command -v timeout) && "
+            'case "$awm_delivery_timeout" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_original_path=$PATH && "
             "awm_delivery_root=$(pwd -P) && "
             "awm_delivery_object_dir=$(git rev-parse --path-format=absolute "
@@ -1758,9 +1762,13 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'for awm_delivery_cleanup_dir in "$awm_delivery_hooks" '
             '"$awm_delivery_shadow_git_dir"; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
-            "2>/dev/null || :; "
-            'if ! "$awm_delivery_rm" -rf -- "$awm_delivery_cleanup_dir" '
+            "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
+            '"$awm_delivery_rm" -rf -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "
             "awm_delivery_cleanup_failed=1; "
             "fi; "
@@ -1847,7 +1855,18 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             '"$awm_delivery_real_git" -c '
             'core.hooksPath="$awm_delivery_hooks" update-ref '
             '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" && '
-            '"$awm_delivery_real_git" read-tree "$awm_delivery_new"'
+            '{ "$awm_delivery_real_git" read-tree "$awm_delivery_new"; '
+            "awm_delivery_index_status=$?; "
+            'if [ "$awm_delivery_index_status" -ne 0 ]; then '
+            'if ! "$awm_delivery_real_git" -c core.hooksPath=/dev/null '
+            'update-ref "$awm_delivery_ref" "$awm_delivery_old" '
+            '"$awm_delivery_new"; then '
+            "printf '%s\\n' 'publication-disabled delivery rollback failed' >&2; "
+            "fi; "
+            '"$awm_delivery_real_git" read-tree "$awm_delivery_old" '
+            "2>/dev/null || :; "
+            'exit "$awm_delivery_index_status"; '
+            "fi; }"
         )
 
     def _with_shell_diagnostic(
