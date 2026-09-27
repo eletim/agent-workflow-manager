@@ -445,8 +445,8 @@ function applyModeVisibility() {
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
   issueDrivenModeButton.className = issueDrivenMode
-    ? "issue-driven-entry selected"
-    : "issue-driven-entry";
+    ? "primary-view-entry issue-driven-entry selected"
+    : "primary-view-entry issue-driven-entry";
   reviewModeButton.className = reviewMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
