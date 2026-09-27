@@ -645,7 +645,7 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
-    _, checkout, _, base = linked_delivery_repository
+    repository, checkout, _, base = linked_delivery_repository
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_worker = fake_bin / worker
@@ -678,48 +678,117 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
     diagnostic = next(
         line
         for line in result.stderr.splitlines()
-        if line.startswith(
-            "publication-disabled session left uncommitted changes; "
-        )
+        if line.startswith("publication-disabled session left uncommitted changes")
     )
-    isolated_text, shadow_text = diagnostic.split(
-        "; shadow Git directory retained at ", maxsplit=1
+    assert diagnostic == "publication-disabled session left uncommitted changes"
+    recovery_diagnostic = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
     )
-    isolated = Path(isolated_text.rsplit(" retained at ", maxsplit=1)[1])
-    shadow = Path(shadow_text)
+    recovery = Path(recovery_diagnostic.rsplit(" retained at ", maxsplit=1)[1])
     try:
-        assert isolated.is_dir()
-        assert shadow.is_dir()
-        assert (isolated / "tracked.txt").read_text(encoding="utf-8") == (
-            "staged\nunstaged\n"
+        assert recovery.is_dir()
+        assert {path.name for path in recovery.iterdir()} == {
+            ".complete",
+            "metadata.json",
+            "recovery.bundle",
+            "status.porcelain",
+        }
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["cleanliness"] == "residual"
+        assert metadata["baseCommit"] == base
+        assert metadata["shadowCommit"] != base
+        assert metadata["stagedCommit"] != metadata["shadowCommit"]
+        assert metadata["worktreeCommit"] != metadata["stagedCommit"]
+        retained_status = (
+            (recovery / "status.porcelain").read_text(encoding="utf-8").splitlines()
         )
-        assert (isolated / "residual.txt").read_text(encoding="utf-8") == (
-            "untracked\n"
-        )
-        retained_status = subprocess.run(
-            [
-                "git",
-                f"--git-dir={shadow}",
-                f"--work-tree={isolated}",
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
         assert "MM tracked.txt" in retained_status
         assert "?? residual.txt" in retained_status
+
+        recovered = tmp_path / "recovered"
+        subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(recovered), "fetch", str(repository), base],
+            check=True,
+            capture_output=True,
+        )
+        for name in ("shadow", "staged", "worktree"):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "fetch",
+                    str(recovery / "recovery.bundle"),
+                    f"refs/awm-delivery/{name}:refs/awm-delivery/{name}",
+                ],
+                check=True,
+                capture_output=True,
+            )
         assert (
             subprocess.run(
-                ["git", f"--git-dir={shadow}", "log", "-1", "--format=%s"],
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/shadow:tracked.txt",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
-            ).stdout.strip()
-            == "committed-before-residual"
+            ).stdout
+            == "committed\n"
         )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/staged:tracked.txt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "staged\n"
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/worktree:tracked.txt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "staged\nunstaged\n"
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/worktree:residual.txt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "untracked\n"
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert (
             subprocess.run(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -741,8 +810,182 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
             == ""
         )
     finally:
-        shutil.rmtree(isolated, ignore_errors=True)
-        shutil.rmtree(shadow, ignore_errors=True)
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
+def test_publication_disabled_recovers_when_cleanliness_cannot_be_verified(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f'#!/bin/sh\nif [ "$1" = status ]; then exit 71; fi\nexec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m recover-before-status-failure >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "commit before status failure"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "publication-disabled session cleanliness could not be verified"
+        in result.stderr
+    )
+    recovery_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["cleanliness"] == "unverified"
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "bundle",
+                    "list-heads",
+                    str(recovery / "recovery.bundle"),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.count("refs/awm-delivery/")
+            == 3
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "blocked_command", ["bundle", "status"], ids=("recovery", "cleanliness")
+)
+def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_delivery(
+    blocked_command: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "post-agent-phase"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "$AWM_TEST_BLOCKED_GIT_COMMAND" ]; then\n'
+        '    printf reached > "$AWM_TEST_POST_AGENT_MARKER"\n'
+        "    sleep 0.5\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m before-post-agent-signal >/dev/null 2>&1\n"
+        "printf 'residual\\n' > residual.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_BLOCKED_GIT_COMMAND": blocked_command,
+            "AWM_TEST_POST_AGENT_MARKER": str(marker),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave recoverable output"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while process.poll() is None and not marker.exists():
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("post-agent phase was not reached")
+        time.sleep(0.01)
+    if process.poll() is not None:
+        pytest.fail("publication-disabled session exited before post-agent signal")
+
+    os.killpg(process.pid, signal.SIGTERM)
+    _, stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 143
+    recovery_line = next(
+        line
+        for line in stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        assert (recovery / ".complete").is_file()
+        assert (recovery / "recovery.bundle").is_file()
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
@@ -1115,7 +1358,7 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        assert len(directory_removals) == 3
+        assert len(directory_removals) == 4
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
         }
@@ -1196,7 +1439,9 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
 
 
 @pytest.mark.parametrize(
-    "blocked_call", [1, 2, 3], ids=("hooks", "shadow", "worktree")
+    "blocked_call",
+    [1, 2, 3, 4],
+    ids=("hooks", "shadow", "worktree", "recovery"),
 )
 @pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
 def test_publication_disabled_signal_cleans_directory_before_allocator_returns(
@@ -1369,14 +1614,15 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        assert len(directory_removals) == 3
+        expected_directory_removals = 4 if agent_status == 0 else 3
+        assert len(directory_removals) == expected_directory_removals
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
         }
         assert removed_directories.issuperset(resources)
         assert any("awm-delivery-worktree." in path for path in removed_directories)
         cleanup_pids = cleanup_pid_record.read_text(encoding="utf-8").splitlines()
-        assert len(cleanup_pids) == 4
+        assert len(cleanup_pids) == expected_directory_removals + 1
         for cleanup_pid in cleanup_pids:
             with pytest.raises(ProcessLookupError):
                 os.kill(int(cleanup_pid), 0)

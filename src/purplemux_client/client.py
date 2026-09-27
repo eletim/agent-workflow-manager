@@ -1587,6 +1587,149 @@ print(path, flush=True)
 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 """
         ).decode("ascii")
+        recovery_snapshot = base64.b64encode(
+            b"""import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+git, timeout_command, shadow, worktree, recovery, protected_ref, old = sys.argv[1:]
+blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+recovery_path = Path(recovery)
+base_environment = os.environ.copy()
+base_environment.update({"GIT_DIR": shadow, "GIT_WORK_TREE": worktree})
+
+
+def run_git(arguments, *, environment=None, stdout=subprocess.PIPE, input_text=None):
+    result = subprocess.run(
+        [
+            timeout_command,
+            "--signal=TERM",
+            "--kill-after=1s",
+            "60s",
+            git,
+            *arguments,
+        ],
+        cwd=worktree,
+        env=environment or base_environment,
+        input=input_text,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=65,
+        check=False,
+        start_new_session=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or "Git command failed"
+        raise RuntimeError(detail[:1000])
+    return result
+
+
+def commit_tree(tree, parent, message):
+    return run_git(
+        ["commit-tree", tree, "-p", parent], input_text=message + "\\n"
+    ).stdout.strip()
+
+
+try:
+    shadow_commit = run_git(["rev-parse", protected_ref]).stdout.strip()
+    staged_tree = run_git(["write-tree"]).stdout.strip()
+    staged_commit = commit_tree(
+        staged_tree, shadow_commit, "AWM recovery: staged agent state"
+    )
+
+    recovery_index = recovery_path / "worktree.index"
+    worktree_environment = base_environment.copy()
+    worktree_environment["GIT_INDEX_FILE"] = str(recovery_index)
+    run_git(["read-tree", staged_tree], environment=worktree_environment)
+    run_git(["add", "-A", "--", "."], environment=worktree_environment)
+    worktree_tree = run_git(
+        ["write-tree"], environment=worktree_environment
+    ).stdout.strip()
+    worktree_commit = commit_tree(
+        worktree_tree, staged_commit, "AWM recovery: final agent worktree"
+    )
+    recovery_index.unlink()
+
+    recovery_refs = {
+        "refs/awm-delivery/shadow": shadow_commit,
+        "refs/awm-delivery/staged": staged_commit,
+        "refs/awm-delivery/worktree": worktree_commit,
+    }
+    for reference, commit in recovery_refs.items():
+        run_git(["update-ref", reference, commit])
+
+    bundle_temporary = recovery_path / "recovery.bundle.tmp"
+    bundle = recovery_path / "recovery.bundle"
+    run_git(
+        [
+            "bundle",
+            "create",
+            str(bundle_temporary),
+            *recovery_refs,
+            "^" + old,
+        ]
+    )
+    os.replace(bundle_temporary, bundle)
+
+    status_path = recovery_path / "status.porcelain"
+    cleanliness = "verified"
+    try:
+        with status_path.open("w", encoding="utf-8") as status_output:
+            status = subprocess.run(
+                [
+                    timeout_command,
+                    "--signal=TERM",
+                    "--kill-after=1s",
+                    "60s",
+                    git,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                cwd=worktree,
+                env=base_environment,
+                stdout=status_output,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=65,
+                check=False,
+                start_new_session=True,
+            )
+        if status.returncode:
+            cleanliness = "unverified"
+        elif status_path.stat().st_size:
+            cleanliness = "residual"
+    except (OSError, subprocess.SubprocessError):
+        cleanliness = "unverified"
+
+    metadata = {
+        "formatVersion": 1,
+        "protectedRef": protected_ref,
+        "baseCommit": old,
+        "shadowCommit": shadow_commit,
+        "stagedCommit": staged_commit,
+        "worktreeCommit": worktree_commit,
+        "cleanliness": cleanliness,
+    }
+    metadata_temporary = recovery_path / "metadata.json.tmp"
+    metadata_temporary.write_text(
+        json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
+    )
+    os.replace(metadata_temporary, recovery_path / "metadata.json")
+    complete_temporary = recovery_path / ".complete.tmp"
+    complete_temporary.write_text("1\\n", encoding="ascii")
+    os.replace(complete_temporary, recovery_path / ".complete")
+    print(cleanliness)
+except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+    print(f"publication-disabled recovery failed: {error}", file=sys.stderr)
+    raise SystemExit(74)
+"""
+        ).decode("ascii")
         git_wrapper = base64.b64encode(
             b"""#!/bin/sh
 probe=$PWD
@@ -1844,7 +1987,7 @@ exec "$real_git" "$@"
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
-            "awm_delivery_preserve_resources=0 && "
+            "awm_delivery_recovery='' && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
@@ -1852,11 +1995,9 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
-            'if [ "$awm_delivery_preserve_resources" -eq 1 ] && '
-            '{ [ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_shadow_git_dir" ] || '
-            '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_isolated_root" ]; }; then continue; fi; '
+            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
+            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ] && '
+            '[ -f "$awm_delivery_recovery/.complete" ]; then continue; fi; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
             "2>/dev/null; then "
@@ -1882,6 +2023,11 @@ exec "$real_git" "$@"
             "fi; "
             "exit 1; "
             "fi; "
+            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
+            '[ -n "$awm_delivery_recovery" ] && '
+            '[ -f "$awm_delivery_recovery/.complete" ]; then '
+            "printf '%s\\n' \"publication-disabled agent output recovery "
+            'retained at $awm_delivery_recovery" >&2; fi; '
             'exit "$awm_delivery_primary_status"; '
             "} && "
             "trap 'awm_delivery_cleanup $?' EXIT && "
@@ -1900,6 +2046,12 @@ exec "$real_git" "$@"
             'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
+            'awm-delivery-recovery" && '
+            'mkdir -p -- "$awm_delivery_recovery_root" && '
+            'awm_delivery_recovery=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_recovery_root" "output.") && '
             '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
             '"$awm_delivery_isolated_root/" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
@@ -1977,25 +2129,28 @@ exec "$real_git" "$@"
             f'"$@" {launch}; '
             "awm_delivery_status=$?; "
             "PATH=$awm_delivery_original_path; export PATH; "
-            "awm_delivery_preserve_resources=1; "
-            'awm_delivery_residual=$("$awm_delivery_real_git" '
-            '--git-dir="$awm_delivery_shadow_git_dir" '
-            '--work-tree="$awm_delivery_isolated_root" '
-            'status --porcelain=v1 --untracked-files=all) || { '
+            f"awm_delivery_snapshot=$(printf %s {recovery_snapshot} | "
+            "base64 --decode) && "
+            'awm_delivery_cleanliness=$("$awm_delivery_python" -c '
+            '"$awm_delivery_snapshot" "$awm_delivery_real_git" '
+            '"$awm_delivery_timeout" '
+            '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
+            '"$awm_delivery_recovery" "$awm_delivery_ref" '
+            '"$awm_delivery_old") || { '
             "printf '%s\\n' "
-            '"publication-disabled session cleanliness could not be verified; '
-            'isolated worktree retained at $awm_delivery_isolated_root; shadow '
-            'Git directory retained at $awm_delivery_shadow_git_dir" >&2; '
+            '"publication-disabled agent output recovery failed" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '
-            'exit "$awm_delivery_status"; fi; exit 1; }; '
-            'if [ -n "$awm_delivery_residual" ]; then '
+            'exit "$awm_delivery_status"; fi; exit 74; }; '
+            'if [ "$awm_delivery_cleanliness" = unverified ]; then '
             "printf '%s\\n' "
-            '"publication-disabled session left uncommitted changes; isolated '
-            'worktree retained at $awm_delivery_isolated_root; shadow Git '
-            'directory retained at $awm_delivery_shadow_git_dir" >&2; '
+            '"publication-disabled session cleanliness could not be verified" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '
             'exit "$awm_delivery_status"; fi; exit 1; fi; '
-            "awm_delivery_preserve_resources=0; "
+            'if [ "$awm_delivery_cleanliness" = residual ]; then '
+            "printf '%s\\n' "
+            '"publication-disabled session left uncommitted changes" >&2; '
+            'if [ "$awm_delivery_status" -ne 0 ]; then '
+            'exit "$awm_delivery_status"; fi; exit 1; fi; '
             '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
             'awm_delivery_new=$(tr -d \'\\n\' < '
             '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '
