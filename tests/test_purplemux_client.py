@@ -2497,6 +2497,14 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
             '"$AWM_TEST_CODE" "$@"\n'
             ";;\n"
             "esac\n"
+            'case "$1" in */recovery-snapshot.py)\n'
+            "    AWM_TEST_CODE=$(cat \"$1\")\n"
+            "    export AWM_TEST_CODE\n"
+            "    shift\n"
+            f'    exec "{real_python}" -c {shlex.quote(bootstrap)} '
+            '"$AWM_TEST_CODE" "$@"\n'
+            ";;\n"
+            "esac\n"
             f'exec "{real_python}" "$@"\n',
             encoding="utf-8",
         )
@@ -2663,16 +2671,16 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
             shutil.rmtree(path, ignore_errors=True)
 
 
-def test_publication_disabled_detaches_slow_interrupted_conversion(
+def test_publication_disabled_cleans_up_timed_out_interrupted_conversion(
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
-    repository, checkout, _, base = linked_delivery_repository
+    repository, checkout, _, _ = linked_delivery_repository
+    recovery_root = repository / ".git" / "awm-delivery-recovery"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     stalled_capture = tmp_path / "stalled-capture"
     conversion_started = tmp_path / "conversion-started"
-    release_conversion = tmp_path / "release-conversion"
     real_git = shutil.which("git")
     assert real_git is not None
     fake_git = fake_bin / "git"
@@ -2684,7 +2692,7 @@ def test_publication_disabled_detaches_slow_interrupted_conversion(
         "fi\n"
         "if [ \"$1\" = archive ]; then\n"
         '    : > "$AWM_TEST_CONVERSION_STARTED"\n'
-        '    while [ ! -e "$AWM_TEST_RELEASE_CONVERSION" ]; do sleep 0.05; done\n'
+        "    while :; do sleep 1; done\n"
         "fi\n"
         f'exec "{real_git}" "$@"\n',
         encoding="utf-8",
@@ -2705,8 +2713,8 @@ def test_publication_disabled_detaches_slow_interrupted_conversion(
         {
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "AWM_TEST_CONVERSION_STARTED": str(conversion_started),
-            "AWM_TEST_RELEASE_CONVERSION": str(release_conversion),
             "AWM_TEST_STALLED_CAPTURE": str(stalled_capture),
+            "AWM_DELIVERY_RECOVERY_TIMEOUT_SECONDS": "0.5",
         }
     )
     process = subprocess.Popen(
@@ -2735,52 +2743,269 @@ def test_publication_disabled_detaches_slow_interrupted_conversion(
     os.killpg(process.pid, signal.SIGTERM)
     _, stderr = process.communicate(timeout=5)
     elapsed = time.monotonic() - started
-    recovery_line = next(
-        line
-        for line in stderr.splitlines()
-        if line.startswith("publication-disabled agent output recovery retained at ")
-    )
-    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
     try:
         assert process.returncode == 143
         assert elapsed < 4
-        deadline = time.monotonic() + 5
-        while not conversion_started.exists():
-            if time.monotonic() >= deadline:
-                pytest.fail("detached conversion did not start")
-            time.sleep(0.01)
-        assert (recovery / ".capturing").is_file()
-        assert not (recovery / ".complete").exists()
-        capture = recovery / "interrupted-inputs.capture"
-        assert (capture / "worktree" / "tracked.txt").read_text() == "committed\n"
-        assert (capture / "worktree" / "residual.txt").read_text() == "residual\n"
-        assert (capture / "baseline" / "tracked.txt").read_text() == "before\n"
-        assert (capture / "shadow.git" / "HEAD").is_file()
-        assert not list(recovery.parent.glob("inputs.*"))
-
-        release_conversion.touch()
-        wait_for_recovery_complete(recovery)
-        assert not (recovery / ".capturing").exists()
-        assert not capture.exists()
-        restored, shadow = restore_interrupted_inputs(
-            recovery, repository, base, tmp_path / "slow-conversion-restored"
-        )
-        assert (restored / "residual.txt").read_text() == "residual\n"
-        assert (
-            subprocess.run(
-                ["git", f"--git-dir={shadow}", "show", "HEAD:tracked.txt"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            == "committed\n"
+        assert conversion_started.is_file()
+        assert "publication-disabled agent output recovery retained at " not in stderr
+        assert not list(recovery_root.glob("output.*"))
+        assert not list(recovery_root.glob("inputs.*"))
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
         )
     finally:
-        release_conversion.touch(exist_ok=True)
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
-        shutil.rmtree(recovery, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "failed_boundary",
+    ("rename", "recovery-fsync", "parent-fsync"),
+)
+def test_publication_disabled_cleans_up_failed_interrupted_handoff(
+    failed_boundary: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    recovery_root = repository / ".git" / "awm-delivery-recovery"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stalled_capture = tmp_path / "stalled-capture"
+    real_git = shutil.which("git")
+    real_python = shutil.which("python3")
+    assert real_git is not None
+    assert real_python is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = ls-files ]; then\n"
+        '    : > "$AWM_TEST_STALLED_CAPTURE"\n'
+        "    while :; do sleep 1; done\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    bootstrap = """import os
+import sys
+
+code = sys.argv[1]
+sys.argv = ["-c", *sys.argv[2:]]
+real_fsync = os.fsync
+real_replace = os.replace
+handed_off = False
+handoff_fsyncs = 0
+
+
+def injected_replace(source, destination):
+    global handed_off
+    if os.fspath(destination).endswith("/interrupted-inputs.capture"):
+        if os.environ["AWM_TEST_FAILED_HANDOFF"] == "rename":
+            raise OSError("injected handoff rename failure")
+        result = real_replace(source, destination)
+        handed_off = True
+        return result
+    return real_replace(source, destination)
+
+
+def injected_fsync(descriptor):
+    global handoff_fsyncs
+    path = os.readlink(f"/proc/self/fd/{descriptor}")
+    result = real_fsync(descriptor)
+    if handed_off and os.path.isdir(path):
+        handoff_fsyncs += 1
+        expected = {"recovery-fsync": 1, "parent-fsync": 2}.get(
+            os.environ["AWM_TEST_FAILED_HANDOFF"]
+        )
+        if handoff_fsyncs == expected:
+            raise OSError("injected handoff fsync failure")
+    return result
+
+
+os.replace = injected_replace
+os.fsync = injected_fsync
+exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
+"""
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'case "$1:$2" in *"def publish_recovery"*)\n'
+        "    code=$2\n"
+        "    shift 2\n"
+        f'    exec "{real_python}" -c {shlex.quote(bootstrap)} "$code" "$@"\n'
+        ";;\n"
+        "esac\n"
+        f'exec "{real_python}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m before-handoff-failure >/dev/null 2>&1\n"
+        "printf 'residual\\n' > residual.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_FAILED_HANDOFF": failed_boundary,
+            "AWM_TEST_STALLED_CAPTURE": str(stalled_capture),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave output before handoff failure"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while process.poll() is None and not stalled_capture.exists():
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("stalled recovery capture was not reached")
+        time.sleep(0.01)
+    if process.poll() is not None:
+        pytest.fail("session exited before recovery interruption")
+
+    os.killpg(process.pid, signal.SIGTERM)
+    _, stderr = process.communicate(timeout=5)
+    assert process.returncode == 143
+    assert "injected handoff" in stderr
+    assert "publication-disabled agent output recovery retained at " not in stderr
+    assert not list(recovery_root.glob("output.*"))
+    assert not list(recovery_root.glob("inputs.*"))
+    assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+    assert not list(
+        (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base
+    )
+
+
+@pytest.mark.parametrize("helper_failure", ("exit", "crash"))
+def test_publication_disabled_cleans_up_failed_interrupted_converter(
+    helper_failure: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    recovery_root = repository / ".git" / "awm-delivery-recovery"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stalled_capture = tmp_path / "stalled-capture"
+    helper_started = tmp_path / "helper-started"
+    real_git = shutil.which("git")
+    real_python = shutil.which("python3")
+    assert real_git is not None
+    assert real_python is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = ls-files ]; then\n"
+        '    : > "$AWM_TEST_STALLED_CAPTURE"\n'
+        "    while :; do sleep 1; done\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$2" = --convert-interrupted ]; then\n'
+        '    : > "$AWM_TEST_HELPER_STARTED"\n'
+        '    if [ "$AWM_TEST_HELPER_FAILURE" = crash ]; then\n'
+        "        kill -KILL $$\n"
+        "    fi\n"
+        "    exit 75\n"
+        "fi\n"
+        f'exec "{real_python}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m before-converter-failure >/dev/null 2>&1\n"
+        "printf 'residual\\n' > residual.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_HELPER_FAILURE": helper_failure,
+            "AWM_TEST_HELPER_STARTED": str(helper_started),
+            "AWM_TEST_STALLED_CAPTURE": str(stalled_capture),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave output before converter failure"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while process.poll() is None and not stalled_capture.exists():
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("stalled recovery capture was not reached")
+        time.sleep(0.01)
+    if process.poll() is not None:
+        pytest.fail("session exited before recovery interruption")
+
+    os.killpg(process.pid, signal.SIGTERM)
+    _, stderr = process.communicate(timeout=5)
+    assert process.returncode == 143
+    assert helper_started.is_file()
+    assert "publication-disabled agent output recovery retained at " not in stderr
+    assert not list(recovery_root.glob("output.*"))
+    assert not list(recovery_root.glob("inputs.*"))
+    assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+    assert not list(
+        (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base
+    )
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])

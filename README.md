@@ -1046,14 +1046,14 @@ then apply the `worktree` pair for agent output; inspect the extracted shadow Gi
 state against that disposable reconstruction. This process does not depend on the
 original checkout still existing. If root bundle capture finished before a nested
 capture was interrupted, the normal root bundle remains available alongside this
-payload. A `.capturing` marker without `.complete` means conversion is continuing
-or failed: the AWM-owned raw inputs remain in that artifact for manual recovery,
-and `capture-error.txt` records a conversion error when one is available.
+payload. Interrupted conversion is supervised during shutdown; if it cannot
+publish a complete bounded artifact within the shutdown deadline, AWM removes the
+incomplete artifact and all temporary inputs.
 
 Residual output or an unverifiable cleanliness check fails the session without
 updating the real ref or worktree. After the needed commits or files have been
 inspected and restored, remove only the exact reported, `.complete` `output.*`
-artifact path. Do not remove an artifact while `.capturing` exists.
+artifact path.
 After successful conversion, the temporary shadow repository, immutable baseline,
 and isolated worktree are removed automatically.
 
