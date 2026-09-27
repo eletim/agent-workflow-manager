@@ -1658,6 +1658,7 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
                         "enabled": True,
                         "allowUnsandboxedCommands": False,
                         "failIfUnavailable": True,
+                        "filesystem": {"denyWrite": ["./.git"]},
                         "network": {
                             "allowedDomains": [],
                             "deniedDomains": ["github.com", "*.github.com"],

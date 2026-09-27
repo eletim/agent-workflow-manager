@@ -365,6 +365,7 @@ def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:
     assert settings["sandbox"]["enabled"] is True
     assert settings["sandbox"]["allowUnsandboxedCommands"] is False
     assert settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["filesystem"]["denyWrite"] == ["./.git"]
     assert settings["sandbox"]["network"]["allowedDomains"] == []
     assert settings["sandbox"]["network"]["strictAllowlist"] is True
     assert settings["sandbox"]["network"]["deniedDomains"] == [
@@ -922,12 +923,17 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         "        '-c', 'permissions.awm-test.extends=\":read-only\"',\n"
         "        '-c', 'permissions.awm-test.filesystem=' + filesystem, '--', payload]\n"
         "else:\n"
+        "    settings = json.loads(arguments[arguments.index('--settings') + 1])\n"
+        "    deny_write = settings['sandbox']['filesystem']['denyWrite']\n"
         "    command = [engine, '--die-with-parent', '--new-session', '--unshare-net',\n"
         "        '--ro-bind', '/', '/', '--dev-bind', '/dev', '/dev',\n"
         "        '--proc', '/proc', '--bind', os.getcwd(), os.getcwd(),\n"
-        "        '--ro-bind', os.path.join(os.getcwd(), '.git'),\n"
-        "        os.path.join(os.getcwd(), '.git'), '--bind', shadow, shadow,\n"
-        "        '--chdir', os.getcwd(), payload]\n"
+        "        '--bind', shadow, shadow]\n"
+        "    for denied in deny_write:\n"
+        "        denied_path = (denied if os.path.isabs(denied) else\n"
+        "            os.path.realpath(os.path.join(os.getcwd(), denied)))\n"
+        "        command.extend(['--ro-bind', denied_path, denied_path])\n"
+        "    command.extend(['--chdir', os.getcwd(), payload])\n"
         "raise SystemExit(subprocess.run(command, check=False).returncode)\n",
         encoding="utf-8",
     )
