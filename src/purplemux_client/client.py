@@ -1645,14 +1645,66 @@ def commit_tree(tree, parent, message):
     ).stdout.strip()
 
 
+def capture_index_state(environment, index_path, destination):
+    private_index = destination / "staged.index"
+    private_environment = environment.copy()
+    private_environment["GIT_INDEX_FILE"] = str(private_index)
+    if index_path.is_file():
+        shutil.copyfile(index_path, private_index)
+    else:
+        run_git(["read-tree", "--empty"], environment=private_environment)
+    unmerged = run_git(
+        ["ls-files", "--unmerged", "-z"], environment=private_environment
+    ).stdout
+    if not unmerged:
+        tree = run_git(
+            ["write-tree"], environment=private_environment
+        ).stdout.strip()
+        private_index.unlink()
+        return tree, None
+
+    entries = run_git(
+        ["ls-files", "--stage", "-z"], environment=private_environment
+    ).stdout
+    object_ids = sorted(
+        {
+            record.split("\\t", 1)[0].split()[1]
+            for record in entries.split("\\0")
+            if record
+        }
+    )
+    pack_prefix = destination / "conflict-objects"
+    pack_hash = run_git(
+        ["pack-objects", str(pack_prefix)],
+        environment=environment,
+        input_text="\\n".join(object_ids) + "\\n",
+    ).stdout.strip()
+    conflict_index = destination / "conflicted.index"
+    os.replace(private_index, conflict_index)
+    return None, {
+        "indexFile": conflict_index.name,
+        "objectPack": f"{pack_prefix.name}-{pack_hash}.pack",
+        "objectIndex": f"{pack_prefix.name}-{pack_hash}.idx",
+    }
+
+
 def nested_git_roots():
     roots = []
+    invalid_markers = []
     for current, directories, files in os.walk(worktree, followlinks=False):
         if current != worktree and (".git" in directories or ".git" in files):
-            roots.append(Path(current))
+            candidate = Path(current)
+            marker = candidate / ".git"
+            probe = run_nested(
+                candidate, ["rev-parse", "--absolute-git-dir"], required=False
+            )
+            if probe.returncode == 0:
+                roots.append(candidate)
+            else:
+                invalid_markers.append(marker)
         if ".git" in directories:
             directories.remove(".git")
-    return roots
+    return roots, invalid_markers
 
 
 def is_within(path, parent):
@@ -1663,7 +1715,9 @@ def is_within(path, parent):
     return True
 
 
-def run_nested(root, arguments, *, environment=None, stdout=subprocess.PIPE):
+def run_nested(
+    root, arguments, *, environment=None, stdout=subprocess.PIPE, required=True
+):
     environment = (environment or os.environ).copy()
     requested_git_dir = environment.get("GIT_DIR")
     requested_worktree = environment.get("GIT_WORK_TREE")
@@ -1708,7 +1762,7 @@ def run_nested(root, arguments, *, environment=None, stdout=subprocess.PIPE):
         check=False,
         start_new_session=True,
     )
-    if result.returncode:
+    if result.returncode and required:
         detail = result.stderr.decode("utf-8", "replace").strip()
         raise RuntimeError((detail or "nested Git command failed")[:1000])
     return result
@@ -1824,51 +1878,46 @@ def capture_nested_repository(root, destination):
                 root, ["rev-parse", "HEAD^{tree}"], environment=nested_environment
             ).stdout
         ).strip()
-    staged_index = destination / "staged.index"
-    staged_environment = side_environment.copy()
-    staged_environment["GIT_INDEX_FILE"] = str(staged_index)
-    if index_path.is_file():
-        shutil.copyfile(index_path, staged_index)
-    else:
-        run_git(["read-tree", "--empty"], environment=staged_environment)
-    staged_tree = run_git(
-        ["write-tree"], environment=staged_environment
-    ).stdout.strip()
-    staged_index.unlink()
+    staged_tree, conflict_state = capture_index_state(
+        side_environment, index_path, destination
+    )
     baseline_commit = run_side(
         ["commit-tree", baseline_tree], input_text="AWM nested recovery: baseline\\n"
     ).stdout.strip()
-    staged_commit = run_side(
-        ["commit-tree", staged_tree, "-p", baseline_commit],
-        input_text="AWM nested recovery: staged state\\n",
-    ).stdout.strip()
+    staged_commit = None
+    if staged_tree is not None:
+        staged_commit = run_side(
+            ["commit-tree", staged_tree, "-p", baseline_commit],
+            input_text="AWM nested recovery: staged state\\n",
+        ).stdout.strip()
     worktree_index = destination / "worktree.index"
     worktree_environment = side_environment.copy()
     worktree_environment["GIT_INDEX_FILE"] = str(worktree_index)
-    run_git(["read-tree", staged_tree], environment=worktree_environment)
+    if conflict_state is None:
+        run_git(["read-tree", staged_tree], environment=worktree_environment)
+    else:
+        shutil.copyfile(destination / "conflicted.index", worktree_index)
     run_git(["add", "-A", "--", "."], environment=worktree_environment)
     worktree_tree = run_git(
         ["write-tree"], environment=worktree_environment
     ).stdout.strip()
     worktree_commit = run_side(
-        ["commit-tree", worktree_tree, "-p", staged_commit],
+        ["commit-tree", worktree_tree, "-p", staged_commit or baseline_commit],
         input_text="AWM nested recovery: final worktree\\n",
     ).stdout.strip()
     worktree_index.unlink()
     run_side(["update-ref", "refs/awm-delivery/baseline", baseline_commit])
-    run_side(["update-ref", "refs/awm-delivery/staged", staged_commit])
+    if staged_commit is not None:
+        run_side(["update-ref", "refs/awm-delivery/staged", staged_commit])
     run_side(["update-ref", "refs/awm-delivery/worktree", worktree_commit])
     bundle_temporary = destination / "staged.bundle.tmp"
-    run_side(
-        [
-            "bundle",
-            "create",
-            str(bundle_temporary),
-            "refs/awm-delivery/baseline",
-            "refs/awm-delivery/staged",
-            "refs/awm-delivery/worktree",
-        ]
-    )
+    bundle_refs = [
+        "refs/awm-delivery/baseline",
+        "refs/awm-delivery/worktree",
+    ]
+    if staged_commit is not None:
+        bundle_refs.append("refs/awm-delivery/staged")
+    run_side(["bundle", "create", str(bundle_temporary), *bundle_refs])
     os.replace(bundle_temporary, destination / "staged.bundle")
     metadata = {
         "formatVersion": 1,
@@ -1877,40 +1926,55 @@ def capture_nested_repository(root, destination):
         "baselineCommit": baseline_commit,
         "stagedCommit": staged_commit,
         "worktreeCommit": worktree_commit,
+        "conflictState": conflict_state,
     }
     (destination / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=True, sort_keys=True) + "\\n",
         encoding="ascii",
     )
     shutil.rmtree(side_git)
-    return baseline_tree != staged_tree or staged_tree != worktree_tree
+    return (
+        conflict_state is not None
+        or baseline_tree != staged_tree
+        or staged_tree != worktree_tree
+    )
 
 
 try:
     shadow_commit = run_git(["rev-parse", protected_ref]).stdout.strip()
-    staged_tree = run_git(["write-tree"]).stdout.strip()
-    staged_commit = commit_tree(
-        staged_tree, shadow_commit, "AWM recovery: staged agent state"
+    staged_tree, conflict_state = capture_index_state(
+        base_environment, Path(shadow) / "index", recovery_path
     )
+    staged_commit = None
+    if staged_tree is not None:
+        staged_commit = commit_tree(
+            staged_tree, shadow_commit, "AWM recovery: staged agent state"
+        )
 
     recovery_index = recovery_path / "worktree.index"
     worktree_environment = base_environment.copy()
     worktree_environment["GIT_INDEX_FILE"] = str(recovery_index)
-    run_git(["read-tree", staged_tree], environment=worktree_environment)
+    if conflict_state is None:
+        run_git(["read-tree", staged_tree], environment=worktree_environment)
+    else:
+        shutil.copyfile(recovery_path / "conflicted.index", recovery_index)
     run_git(["add", "-A", "--", "."], environment=worktree_environment)
     worktree_tree = run_git(
         ["write-tree"], environment=worktree_environment
     ).stdout.strip()
     worktree_commit = commit_tree(
-        worktree_tree, staged_commit, "AWM recovery: final agent worktree"
+        worktree_tree,
+        staged_commit or shadow_commit,
+        "AWM recovery: final agent worktree",
     )
     recovery_index.unlink()
 
     recovery_refs = {
         "refs/awm-delivery/shadow": shadow_commit,
-        "refs/awm-delivery/staged": staged_commit,
         "refs/awm-delivery/worktree": worktree_commit,
     }
+    if staged_commit is not None:
+        recovery_refs["refs/awm-delivery/staged"] = staged_commit
     for reference, commit in recovery_refs.items():
         run_git(["update-ref", reference, commit])
 
@@ -1928,7 +1992,7 @@ try:
     os.replace(bundle_temporary, bundle)
 
     nested_root = recovery_path / "nested"
-    nested_repositories = nested_git_roots()
+    nested_repositories, invalid_git_markers = nested_git_roots()
     nested_residual = False
     for index, nested_repository in enumerate(nested_repositories):
         if index == 0:
@@ -1939,6 +2003,23 @@ try:
             )
             or nested_residual
         )
+
+    marker_metadata = []
+    if invalid_git_markers:
+        marker_root = recovery_path / "ordinary-git-markers"
+        marker_root.mkdir(mode=0o700)
+        for index, marker in enumerate(invalid_git_markers):
+            stored = marker_root / f"{index:04d}"
+            if marker.is_symlink() or marker.is_file():
+                shutil.copy2(marker, stored, follow_symlinks=False)
+            else:
+                shutil.copytree(marker, stored, symlinks=True)
+            marker_metadata.append(
+                {
+                    "path": os.path.relpath(marker, worktree),
+                    "storedAt": os.path.relpath(stored, recovery_path),
+                }
+            )
 
     status_path = recovery_path / "status.porcelain"
     cleanliness = "verified"
@@ -1966,7 +2047,7 @@ try:
             )
         if status.returncode:
             cleanliness = "unverified"
-        elif status_path.stat().st_size or nested_residual:
+        elif status_path.stat().st_size or nested_residual or invalid_git_markers:
             cleanliness = "residual"
     except (OSError, subprocess.SubprocessError):
         cleanliness = "unverified"
@@ -1978,8 +2059,10 @@ try:
         "shadowCommit": shadow_commit,
         "stagedCommit": staged_commit,
         "worktreeCommit": worktree_commit,
+        "conflictState": conflict_state,
         "cleanliness": cleanliness,
         "nestedRecoveryCount": len(nested_repositories),
+        "ordinaryGitMarkers": marker_metadata,
     }
     metadata_temporary = recovery_path / "metadata.json.tmp"
     metadata_temporary.write_text(

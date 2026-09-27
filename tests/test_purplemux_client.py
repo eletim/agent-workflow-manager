@@ -980,6 +980,249 @@ def test_publication_disabled_recovers_nested_git_worktree_content(
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+def test_publication_disabled_recovers_unmerged_index(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "base_blob=$(printf 'base stage\\n' | git hash-object -w --stdin)\n"
+        "ours_blob=$(printf 'ours stage\\n' | git hash-object -w --stdin)\n"
+        "theirs_blob=$(printf 'theirs stage\\n' | git hash-object -w --stdin)\n"
+        "printf '100644 %s 1\\tconflicted.txt\\n"
+        "100644 %s 2\\tconflicted.txt\\n"
+        "100644 %s 3\\tconflicted.txt\\n' "
+        '"$base_blob" "$ours_blob" "$theirs_blob" '
+        "| git update-index --index-info\n"
+        "printf 'worktree resolution\\n' > conflicted.txt\n"
+        "printf 'untracked beside conflict\\n' > conflict-untracked.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave an unresolved index"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stderr
+    recovery_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        conflict_state = metadata["conflictState"]
+        assert metadata["cleanliness"] == "residual"
+        assert metadata["stagedCommit"] is None
+        assert (recovery / conflict_state["indexFile"]).is_file()
+        object_pack = recovery / conflict_state["objectPack"]
+        assert object_pack.is_file()
+        assert (recovery / conflict_state["objectIndex"]).is_file()
+
+        recovered = tmp_path / "recovered-conflict"
+        subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(recovered), "fetch", str(repository), base],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(recovered), "index-pack", "--stdin"],
+            input=object_pack.read_bytes(),
+            check=True,
+            capture_output=True,
+        )
+        recovered_index = Path(
+            subprocess.run(
+                ["git", "-C", str(recovered), "rev-parse", "--absolute-git-dir"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        ) / "index"
+        shutil.copyfile(recovery / conflict_state["indexFile"], recovered_index)
+        stages = subprocess.run(
+            ["git", "-C", str(recovered), "ls-files", "--unmerged"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert " 1\tconflicted.txt" in stages
+        assert " 2\tconflicted.txt" in stages
+        assert " 3\tconflicted.txt" in stages
+        for stage, content in ((1, "base stage\n"), (2, "ours stage\n"), (3, "theirs stage\n")):
+            assert (
+                subprocess.run(
+                    ["git", "-C", str(recovered), "show", f":{stage}:conflicted.txt"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                == content
+            )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(recovered),
+                "fetch",
+                str(recovery / "recovery.bundle"),
+                "refs/awm-delivery/worktree:refs/awm-delivery/worktree",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/worktree:conflicted.txt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "worktree resolution\n"
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/worktree:conflict-untracked.txt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "untracked beside conflict\n"
+        )
+        assert subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout == ""
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
+def test_publication_disabled_ignores_invalid_nested_git_marker(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "mkdir -p fixture\n"
+        "printf 'not a gitdir\\n' > fixture/.git\n"
+        "printf 'recoverable fixture data\\n' > fixture/data.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "generate a fixture with an invalid .git marker"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stderr
+    recovery_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["cleanliness"] == "residual"
+        assert metadata["nestedRecoveryCount"] == 0
+        assert metadata["ordinaryGitMarkers"] == [
+            {
+                "path": "fixture/.git",
+                "storedAt": "ordinary-git-markers/0000",
+            }
+        ]
+        assert (recovery / "ordinary-git-markers" / "0000").read_text(
+            encoding="utf-8"
+        ) == "not a gitdir\n"
+        recovered = tmp_path / "recovered-fixture"
+        subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(recovered), "fetch", str(repository), base],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(recovered),
+                "fetch",
+                str(recovery / "recovery.bundle"),
+                "refs/awm-delivery/worktree:refs/awm-delivery/worktree",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(recovered),
+                    "show",
+                    "refs/awm-delivery/worktree:fixture/data.txt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "recoverable fixture data\n"
+        )
+        assert subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout == ""
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
 def test_publication_disabled_recovers_when_cleanliness_cannot_be_verified(
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
