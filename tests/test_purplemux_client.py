@@ -787,7 +787,8 @@ def test_publication_disabled_retains_residual_changes_before_delivery(
             ).stdout
             == "untracked\n"
         )
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert (
             subprocess.run(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -961,7 +962,8 @@ def test_publication_disabled_recovers_nested_git_worktree_content(
         assert (restored / "untracked.txt").read_text(encoding="utf-8") == (
             "untracked\n"
         )
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert (
             subprocess.run(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -1063,7 +1065,8 @@ def test_publication_disabled_recovers_unmerged_index(
         object_pack = recovery / conflict_state["objectPack"]
         assert object_pack.is_file()
         assert (recovery / conflict_state["objectIndex"]).is_file()
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
 
         recovered = tmp_path / "recovered-conflict"
         subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
@@ -1238,7 +1241,8 @@ def test_publication_disabled_recovers_non_utf8_and_resolve_undo_index(
         conflict_state = metadata["conflictState"]
         assert metadata["cleanliness"] == "residual"
         assert conflict_state["sharedIndexFile"] is None
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
 
         recovered = tmp_path / "recovered-index-extensions"
         subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
@@ -1452,7 +1456,8 @@ def test_publication_disabled_recovers_when_cleanliness_cannot_be_verified(
             ).stdout.count("refs/awm-delivery/")
             == 3
         )
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert (
             subprocess.run(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -1555,7 +1560,8 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
     try:
         assert (recovery / ".complete").is_file()
         assert (recovery / "recovery.bundle").is_file()
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1574,7 +1580,7 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
 
 
 @pytest.mark.parametrize("failed_barrier", [1, 2, 3])
-def test_publication_disabled_durability_failure_hands_off_recovery_inputs(
+def test_publication_disabled_durability_failure_retains_recovery_inputs(
     failed_barrier: int,
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
@@ -1653,26 +1659,21 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         check=False,
     )
 
-    recoveries = list(tmp_path.glob("awm-recovery-output.*"))
+    retained = [
+        *tmp_path.glob("awm-delivery-shadow.*"),
+        *tmp_path.glob("awm-delivery-worktree.*"),
+        *(repository / ".git" / "awm-delivery-recovery").glob("output.*"),
+    ]
     try:
         assert result.returncode == 74
         assert "injected post-marker fsync failure" in result.stderr
-        assert "publication-disabled agent output recovery retained at " in result.stderr
-        assert len(recoveries) == 1
-        recovery = recoveries[0]
-        assert (recovery / ".complete").is_file()
-        metadata = json.loads(
-            (recovery / ".awm-recovery.json").read_text(encoding="ascii")
+        assert "publication-disabled agent output recovery retained at " not in result.stderr
+        assert (
+            "publication-disabled recovery inputs retained after incomplete publication"
+            in result.stderr
         )
-        assert metadata["kind"] == "post-agent-inputs"
-        assert metadata["baseCommit"] == base
-        assert metadata["worktreeDirectory"] == "."
-        assert (recovery / metadata["shadowGitDirectory"]).is_dir()
-        assert (recovery / "residual.txt").is_file()
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
-        assert not list(
-            (repository / ".git" / "awm-delivery-recovery").glob("output.*")
-        )
+        assert len(retained) == 3
+        assert not (retained[2] / ".complete").exists()
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1687,7 +1688,7 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
             == base
         )
     finally:
-        for path in recoveries:
+        for path in retained:
             shutil.rmtree(path, ignore_errors=True)
 
 
@@ -1755,23 +1756,20 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
     _, stderr = process.communicate(timeout=5)
     elapsed = time.monotonic() - started
 
-    recoveries = list(tmp_path.glob("awm-recovery-output.*"))
+    retained = [
+        *tmp_path.glob("awm-delivery-shadow.*"),
+        *tmp_path.glob("awm-delivery-worktree.*"),
+        *(repository / ".git" / "awm-delivery-recovery").glob("output.*"),
+    ]
     try:
         assert process.returncode == 143
         assert elapsed < 4
-        assert "publication-disabled agent output recovery retained at " in stderr
-        assert len(recoveries) == 1
-        recovery = recoveries[0]
-        assert (recovery / ".complete").is_file()
-        metadata = json.loads(
-            (recovery / ".awm-recovery.json").read_text(encoding="ascii")
+        assert "publication-disabled agent output recovery retained at " not in stderr
+        assert (
+            "publication-disabled recovery inputs retained after incomplete publication"
+            in stderr
         )
-        assert metadata["worktreeDirectory"] == "."
-        assert (recovery / metadata["shadowGitDirectory"]).is_dir()
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
-        assert not list(
-            (repository / ".git" / "awm-delivery-recovery").glob("output.*")
-        )
+        assert len(retained) == 3
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1792,7 +1790,7 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
-        for path in recoveries:
+        for path in retained:
             shutil.rmtree(path, ignore_errors=True)
 
 
@@ -2083,7 +2081,8 @@ def test_publication_disabled_reports_rollback_separately_from_delivery_failure(
             ).stdout.strip()
             != base
         )
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
     finally:
         index_path.with_name("index.lock").unlink(missing_ok=True)
         if recovery is not None:
@@ -2185,7 +2184,8 @@ def test_publication_disabled_signal_rolls_back_pending_delivery(
             ).stdout
             == ""
         )
-        assert not list(tmp_path.glob("awm-delivery-source.*"))
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -2341,10 +2341,7 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         deadline = time.monotonic() + 5
         while process.poll() is None:
             records = list(
-                tmp_path.parent.glob(
-                    "awm-delivery-source.*/.awm-delivery-shadow.*.git/"
-                    "cleanup-resources"
-                )
+                tmp_path.parent.glob("awm-delivery-shadow.*/cleanup-resources")
             )
             if records:
                 resources = records[0].read_text(encoding="utf-8").splitlines()
@@ -2366,13 +2363,12 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        assert len(directory_removals) == 3
+        assert len(directory_removals) == 4
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
         }
-        assert resources[0] in removed_directories
-        assert str(Path(resources[1]).parent) in removed_directories
-        assert any("awm-delivery-source." in path for path in removed_directories)
+        assert removed_directories.issuperset(resources)
+        assert any("awm-delivery-worktree." in path for path in removed_directories)
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
@@ -2449,8 +2445,8 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
 
 @pytest.mark.parametrize(
     "blocked_call",
-    [1, 2, 3],
-    ids=("hooks", "source", "recovery"),
+    [1, 2, 3, 4],
+    ids=("hooks", "shadow", "worktree", "recovery"),
 )
 @pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
 def test_publication_disabled_signal_cleans_directory_before_allocator_returns(
@@ -2624,14 +2620,13 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        expected_directory_removals = 3 if agent_status == 0 else 2
+        expected_directory_removals = 4 if agent_status == 0 else 3
         assert len(directory_removals) == expected_directory_removals
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
         }
-        assert resources[0] in removed_directories
-        assert str(Path(resources[1]).parent) in removed_directories
-        assert any("awm-delivery-source." in path for path in removed_directories)
+        assert removed_directories.issuperset(resources)
+        assert any("awm-delivery-worktree." in path for path in removed_directories)
         cleanup_pids = cleanup_pid_record.read_text(encoding="utf-8").splitlines()
         assert len(cleanup_pids) == expected_directory_removals + 1
         for cleanup_pid in cleanup_pids:
@@ -2695,7 +2690,8 @@ def test_publication_disabled_cleanup_does_not_mask_recovery_failure(
         "publication-disabled session cleanup failed; temporary resources may remain"
         in result.stderr
     )
-    assert not list(tmp_path.parent.glob("awm-delivery-source.*"))
+    assert not list(tmp_path.parent.glob("awm-delivery-shadow.*"))
+    assert not list(tmp_path.parent.glob("awm-delivery-worktree.*"))
     assert not list((tmp_path / ".git" / "hooks").glob("awm-delivery.*"))
     assert not list((tmp_path / ".git" / "hooks").glob(".awm-delivery.*.resources"))
     assert not list(
@@ -2890,9 +2886,7 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     assert len(writable_directories) == 1
     (shadow_git_path,) = writable_directories
     shadow_git_dir = Path(shadow_git_path)
-    assert shadow_git_dir.name.startswith(".awm-delivery-shadow.")
-    assert shadow_git_dir.name.endswith(".git")
-    assert shadow_git_dir.parent.name.startswith("awm-delivery-source.")
+    assert shadow_git_dir.name.startswith("awm-delivery-shadow.")
     assert Path(common_dir) not in shadow_git_dir.parents
     assert git_dir not in writable_directories
     assert common_dir not in writable_directories
