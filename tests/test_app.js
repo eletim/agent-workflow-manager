@@ -256,7 +256,7 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "runtime-view", "runtime-panel", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "runtime-view", "runtime-panel", "diagnostics-view", "prompt-fields",
     "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
     "review-result-panel", "review-result-status", "review-result-json",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
@@ -818,7 +818,7 @@ test("Settings opens Notifications repeatedly without losing form state", async 
   assert.equal(elements["notify-topic"].value, "edited-topic");
 });
 
-test("Issue Driven defaults while top-level Runtime and developer modes remain available", async () => {
+test("Runtime is a distinct dominant view and workflow views restore the editor", async () => {
   const {elements} = await loadApp({
     runs: [],
     details: {},
@@ -830,18 +830,55 @@ test("Issue Driven defaults while top-level Runtime and developer modes remain a
   assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
   assert.match(elements["issue-driven-mode"].className, /primary-view-entry/);
   assert.equal(elements["developer-views"].open, false);
-  assert.equal(elements["runtime-panel"].open, false);
   assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 
   await elements["runtime-view"].dispatch("click");
-  assert.equal(elements["runtime-panel"].open, true);
   assert.equal(elements["runtime-panel"].hidden, false);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), true);
+  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
+  assert.match(elements["runtime-view"].className, /selected/);
+  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
 
   await elements["workflow-mode"].dispatch("click");
 
   assert.equal(elements["workflow-fields"].hidden, false);
   assert.equal(elements["developer-views"].open, true);
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
+  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "false");
+});
+
+test("New run leaves Runtime and restores the current workflow draft", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["runtime-view"].dispatch("click");
+  await elements["new-run"].dispatch("click");
+
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
+  assert.equal(elements["issue-driven-fields"].hidden, false);
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
+});
+
+test("Diagnostics leaves Runtime while preserving its existing navigation", async () => {
+  const {elements} = await loadApp({
+    runs: [],
+    details: {},
+    validation: {status: 200, body: {validation: []}},
+  });
+
+  await elements["runtime-view"].dispatch("click");
+  await elements["diagnostics-view"].dispatch("click");
+
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
+  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "false");
 });
 
 test("saved run history stays unselected across startup reconciliation", async () => {

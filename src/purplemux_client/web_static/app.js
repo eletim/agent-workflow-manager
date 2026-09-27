@@ -8,6 +8,7 @@ const workflowModeButton = document.querySelector("#workflow-mode");
 const developerViews = document.querySelector("#developer-views");
 const runtimeView = document.querySelector("#runtime-view");
 const runtimePanel = document.querySelector("#runtime-panel");
+const diagnosticsView = document.querySelector("#diagnostics-view");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
 const reviewFields = document.querySelector("#review-fields");
@@ -456,6 +457,20 @@ function applyModeVisibility() {
   reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
   environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
+}
+
+function showRuntimeView(show) {
+  document.body.classList[show ? "add" : "remove"]("runtime-view-active");
+  runtimePanel.hidden = !show;
+  runtimeView.className = show
+    ? "primary-view-entry runtime-entry selected"
+    : "primary-view-entry runtime-entry";
+  runtimeView.setAttribute("aria-pressed", String(show));
+  const issueDrivenSelected = !show && currentMode === "issue-driven";
+  issueDrivenModeButton.className = issueDrivenSelected
+    ? "primary-view-entry issue-driven-entry selected"
+    : "primary-view-entry issue-driven-entry";
+  issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenSelected));
 }
 
 function showDraftLabel() {
@@ -2531,34 +2546,40 @@ runButton.addEventListener("click", async () => {
 });
 
 newRunButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode();
 });
 
 promptModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("prompt");
 });
 
 workflowModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("workflow");
 });
 
 environmentSetupModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("environment-setup");
 });
 
 issueDrivenModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("issue-driven");
 });
 
 reviewModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("review");
 });
 
 runtimeView.addEventListener("click", () => {
-  runtimePanel.hidden = false;
-  runtimePanel.open = true;
-  runtimePanel.scrollIntoView?.({behavior: "smooth", block: "start"});
+  showRuntimeView(true);
 });
+
+diagnosticsView.addEventListener("click", () => showRuntimeView(false));
 
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot

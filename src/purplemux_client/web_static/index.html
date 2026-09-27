@@ -28,7 +28,7 @@
               <span>Issue Driven</span>
               <small>Plan and deliver work from GitHub Issues or inline mini tasks</small>
             </button>
-            <button id="runtime-view" class="primary-view-entry runtime-entry" type="button">
+            <button id="runtime-view" class="primary-view-entry runtime-entry" type="button" aria-pressed="false">
               <span>Runtime</span>
               <small>Inspect runs, progress, and output</small>
             </button>
@@ -40,7 +40,7 @@
               <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
               <button id="review-mode" type="button" aria-pressed="false">Review</button>
               <button id="workflow-mode" type="button" aria-pressed="false">Python Workflow</button>
-              <a href="#diagnostics-panel">Diagnostics</a>
+              <a id="diagnostics-view" href="#diagnostics-panel">Diagnostics</a>
             </div>
           </details>
         </nav>
@@ -185,8 +185,7 @@ emit_step("workspace create", "completed")</textarea>
         <ol id="agent-turns" class="agent-turn-list" hidden></ol>
       </section>
 
-      <details id="runtime-panel" class="panel runtime-panel" hidden>
-        <summary class="runtime-heading">Runtime</summary>
+      <section id="runtime-panel" class="runtime-panel" aria-label="Runtime" hidden>
         <div class="runtime-content">
           <details id="runs-panel" class="panel runs-panel" open>
             <summary class="runs-heading">
@@ -274,7 +273,7 @@ emit_step("workspace create", "completed")</textarea>
         </div>
       </section>
         </div>
-      </details>
+      </section>
 
       <details id="diagnostics-panel" class="panel settings-panel diagnostics-panel">
         <summary>Diagnostics</summary>
