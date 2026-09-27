@@ -1723,7 +1723,7 @@ done
             "awm_delivery_hooks=$(mktemp -d "
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
             'mkdir -p -- "$awm_delivery_hooks/gh" && '
-            "trap 'rm -r -- \"$awm_delivery_hooks\"' EXIT && "
+            "trap 'rm -rf -- \"$awm_delivery_hooks\"' EXIT && "
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
@@ -1788,8 +1788,11 @@ done
         command_done = shlex.quote(f"{result_path}.command_done")
         capture = f"{shlex.quote(sys.executable)} -m purplemux_client.shell_capture"
         capture_chars = max_output_chars + 1
+        # PurpleMux uses bracketed paste for multiline input. Keep the wrapper
+        # multiline so long commands are not truncated by the terminal's
+        # canonical single-line input limit before Bash can parse them.
         return (
-            f"mkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
+            f":\nmkfifo -- {stdout_pipe} {stderr_pipe} || exit 1; "
             f"{capture} {stdout_text} {command_done} {capture_chars} 1 "
             f"< {stdout_pipe} & __awm_stdout_pid=$!; "
             f"{capture} {stderr_text} {command_done} {capture_chars} 2 "

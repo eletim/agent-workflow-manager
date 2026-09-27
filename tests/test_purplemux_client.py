@@ -332,6 +332,7 @@ def test_publication_disabled_agent_retains_development_tools(worker: str) -> No
 
     assert "GIT_SSH_COMMAND=false" in command
     assert "pre-push" in command
+    assert "trap 'rm -rf -- \"$awm_delivery_hooks\"' EXIT" in command
     if worker == "codex":
         assert "--sandbox workspace-write" in command
         assert "--ask-for-approval never" in command
@@ -1066,6 +1067,27 @@ def test_visible_managed_shell_keeps_stderr_separate(tmp_path: Path) -> None:
     finally:
         subprocess.run(tmux + ["kill-server"], check=False, capture_output=True)
         cli._cleanup_shell_result(cli._shell_runs[session_id])
+
+
+def test_managed_shell_uses_multiline_transport_for_long_commands(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [completed({"tabId": "tab-shell"}), completed({"status": "sent"})]
+    )
+    cli = client(runner)
+
+    cli.start_shell(
+        ShellCommandRequest(
+            command=f"printf %s {shlex.quote('x' * 5_000)}",
+            cwd=str(tmp_path),
+            name="Long command",
+        )
+    )
+
+    wrapper = next(call for call in runner.calls if call[1:3] == ["tab", "send"])[-1]
+    assert len(wrapper) > 4_096
+    assert wrapper.startswith(":\n")
 
 
 def test_managed_shell_capture_bounds_sidecars_before_result_read(

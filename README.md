@@ -1036,6 +1036,15 @@ AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_TRUST=1 \
   uv run pytest tests/test_live_codex_trust.py
 ```
 
+The opt-in Codex linked-commit integration test prepares a real AWM Run
+worktree and proves that the publication-disabled boundary lets Codex directly
+stage and commit there, advance the feature branch, and leave it clean:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_LINKED_COMMIT=1 \
+  uv run pytest tests/test_live_codex_linked_commit.py
+```
+
 The equivalent Claude test verifies both a fresh worktree's first turn and a
 second launch using its already-established project trust:
 
