@@ -1587,6 +1587,72 @@ print(path, flush=True)
 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 """
         ).decode("ascii")
+        recovery_handoff = base64.b64encode(
+            b"""import json
+import os
+from pathlib import Path
+import signal
+import sys
+
+source, destination = map(Path, sys.argv[1:3])
+protected_ref, base_commit, shadow_name = sys.argv[3:]
+blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+
+
+def fsync_directory(path):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+metadata_temporary = source / ".awm-recovery.json.tmp"
+metadata = source / ".awm-recovery.json"
+complete_temporary = source / ".complete.tmp"
+complete = source / ".complete"
+renamed = False
+try:
+    with metadata_temporary.open("x", encoding="ascii") as output:
+        json.dump(
+            {
+                "formatVersion": 1,
+                "kind": "post-agent-inputs",
+                "protectedRef": protected_ref,
+                "baseCommit": base_commit,
+                "shadowGitDirectory": shadow_name,
+                "worktreeDirectory": ".",
+            },
+            output,
+            sort_keys=True,
+        )
+        output.write("\\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(metadata_temporary, metadata)
+    with complete_temporary.open("x", encoding="ascii") as marker:
+        marker.write("1\\n")
+        marker.flush()
+        os.fsync(marker.fileno())
+    os.replace(complete_temporary, complete)
+    fsync_directory(source)
+    os.replace(source, destination)
+    renamed = True
+    fsync_directory(destination.parent)
+except BaseException:
+    if renamed:
+        try:
+            os.replace(destination, source)
+            fsync_directory(source.parent)
+        except OSError:
+            pass
+    raise
+finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+"""
+        ).decode("ascii")
         recovery_snapshot = base64.b64encode(
             b"""import json
 import os
@@ -1774,6 +1840,8 @@ def capture_index_state(
     shared_index = Path(shared_index_text).resolve() if shared_index_text else None
     if shared_index is not None:
         private_shared_index = Path(environment["GIT_DIR"]) / shared_index.name
+        if not shared_index.is_file() and private_shared_index.is_file():
+            shared_index = private_shared_index.resolve()
         if private_shared_index.resolve() != shared_index:
             shutil.copyfile(shared_index, private_shared_index)
     unmerged = run_git(
@@ -1838,6 +1906,11 @@ def nested_git_roots():
     roots = []
     invalid_markers = []
     for current, directories, files in os.walk(worktree, followlinks=False):
+        if Path(current) == Path(worktree) and Path(shadow).parent == Path(worktree):
+            try:
+                directories.remove(Path(shadow).name)
+            except ValueError:
+                pass
         if current != worktree and (".git" in directories or ".git" in files):
             candidate = Path(current)
             marker = candidate / ".git"
@@ -2491,14 +2564,18 @@ exec "$real_git" "$@"
             'awm_delivery_manifest="$awm_delivery_hooks_root/'
             '.awm-delivery.$$.resources" && '
             "awm_delivery_hooks='' && "
+            "awm_delivery_source_root='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
+            "awm_delivery_handoff='' && "
+            "awm_delivery_handoff_recovery='' && "
             "awm_delivery_recovery_state='' && "
             "awm_delivery_retention_state='' && "
             "awm_delivery_recovery_started=0 && "
             "awm_delivery_recovery_published=0 && "
             "awm_delivery_recovery_inputs_retained=0 && "
+            "awm_delivery_recovery_handed_off=0 && "
             "awm_delivery_transition_pending=0 && "
             "awm_delivery_new='' && "
             "awm_delivery_cleanup() { "
@@ -2511,6 +2588,16 @@ exec "$real_git" "$@"
             'if [ -n "$awm_delivery_retention_state" ] && '
             '[ -f "$awm_delivery_retention_state" ]; then '
             "awm_delivery_recovery_inputs_retained=1; fi; "
+            'if [ "$awm_delivery_recovery_inputs_retained" -ne 0 ] && '
+            '[ -n "$awm_delivery_source_root" ] && '
+            '[ -d "$awm_delivery_source_root" ]; then '
+            'if "$awm_delivery_timeout" --signal=KILL 1s '
+            '"$awm_delivery_python" -c "$awm_delivery_handoff" '
+            '"$awm_delivery_source_root" "$awm_delivery_handoff_recovery" '
+            '"$awm_delivery_ref" "$awm_delivery_old" '
+            '"$awm_delivery_shadow_name"; then '
+            "awm_delivery_recovery_handed_off=1; "
+            "else awm_delivery_cleanup_failed=1; fi; fi; "
             'if [ "$awm_delivery_recovery_started" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -eq 0 ] && '
             '[ -n "$awm_delivery_recovery" ]; then '
@@ -2522,14 +2609,9 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
-            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
-            '[ "$awm_delivery_recovery_inputs_retained" -ne 0 ] && '
-            '{ [ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_shadow_git_dir" ] || '
+            'if [ "$awm_delivery_recovery_handed_off" -ne 0 ] && '
             '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_isolated_root" ] || '
-            '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_recovery" ]; }; then continue; fi; '
+            '"$awm_delivery_source_root" ]; then continue; fi; '
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -ne 0 ] && '
             '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ]; '
@@ -2571,11 +2653,9 @@ exec "$real_git" "$@"
             "printf '%s\\n' \"publication-disabled agent output recovery "
             'retained at $awm_delivery_recovery" >&2; fi; '
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
-            '[ "$awm_delivery_recovery_inputs_retained" -ne 0 ]; then '
-            "printf '%s\\n' \"publication-disabled recovery inputs retained "
-            "after incomplete publication: shadow=$awm_delivery_shadow_git_dir "
-            "worktree=$awm_delivery_isolated_root "
-            'recovery=$awm_delivery_recovery" >&2; fi; '
+            '[ "$awm_delivery_recovery_handed_off" -ne 0 ]; then '
+            "printf '%s\\n' \"publication-disabled agent output recovery "
+            'retained at $awm_delivery_handoff_recovery" >&2; fi; '
             'exit "$awm_delivery_primary_status"; '
             "} && "
             "awm_delivery_rollback() { "
@@ -2613,6 +2693,8 @@ exec "$real_git" "$@"
             ': > "$awm_delivery_manifest" && '
             f"awm_delivery_allocate=$(printf %s {resource_allocator} | "
             "base64 --decode) && "
+            f"awm_delivery_handoff=$(printf %s {recovery_handoff} | "
+            "base64 --decode) && "
             'awm_delivery_hooks=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_hooks_root" "awm-delivery.") && '
@@ -2620,12 +2702,18 @@ exec "$real_git" "$@"
             'recovery-published" && '
             'awm_delivery_retention_state="$awm_delivery_hooks/'
             'recovery-inputs-retained" && '
-            'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
+            'awm_delivery_source_root=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") && '
-            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
-            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            '"$awm_delivery_resource_parent" "awm-delivery-source.") && '
+            'awm_delivery_source_name=${awm_delivery_source_root##*/} && '
+            'awm_delivery_source_token=${awm_delivery_source_name#awm-delivery-source.} && '
+            'awm_delivery_handoff_recovery="$awm_delivery_resource_parent/'
+            'awm-recovery-output.$awm_delivery_source_token" && '
+            'awm_delivery_shadow_name=".awm-delivery-shadow.'
+            '$awm_delivery_source_token.git" && '
+            'awm_delivery_shadow_git_dir="$awm_delivery_source_root/'
+            '$awm_delivery_shadow_name" && '
+            'awm_delivery_isolated_root="$awm_delivery_source_root" && '
             'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
             'awm-delivery-recovery" && '
             'mkdir -p -- "$awm_delivery_recovery_root" && '
@@ -2665,6 +2753,8 @@ exec "$real_git" "$@"
             'done && '
             '"$awm_delivery_real_git" init --bare --quiet '
             '"$awm_delivery_shadow_git_dir" && '
+            'printf "/%s/\\n" "$awm_delivery_shadow_name" > '
+            '"$awm_delivery_shadow_git_dir/info/exclude" && '
             '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
             "config core.bare false && "
             '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
