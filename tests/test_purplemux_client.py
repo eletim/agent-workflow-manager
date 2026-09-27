@@ -162,6 +162,69 @@ def initialize_test_repository(path: Path) -> None:
     )
 
 
+@pytest.fixture
+def linked_delivery_repository(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    repository = tmp_path / "repository parent"
+    checkout = tmp_path / "linked checkout"
+    remote = tmp_path / "test remote.git"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "test@example.com",
+        ],
+        check=True,
+    )
+    (repository / "tracked.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/delivery",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "test-remote", str(remote)],
+        check=True,
+    )
+    return repository, checkout, remote, base
+
+
 def test_create_response_parsing_and_codex_panel_type() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
 
@@ -368,6 +431,127 @@ def test_publication_disabled_agent_retains_development_tools(worker: str) -> No
         allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
         assert "Bash" in allowed_tools
         assert not any(tool.startswith("Bash(") for tool in allowed_tools)
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
+    worker: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, remote, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'after\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m linked-delivery >/dev/null 2>&1\n"
+        "commit_status=$?\n"
+        "git push test-remote HEAD:refs/heads/forbidden >/dev/null 2>&1\n"
+        "push_status=$?\n"
+        "status=$(git status --porcelain)\n"
+        "config_exposed=0\n"
+        '[ ! -e "$GH_CONFIG_DIR/hosts.yml" ] || config_exposed=1\n'
+        'printf \'%s|%s|%s|%s|%s|%s\\n\' "$commit_status" "$push_status" '
+        '"${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "$config_exposed" '
+        '"$status"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    publication_config = tmp_path / "publication-gh-config"
+    publication_config.mkdir()
+    (publication_config / "hosts.yml").write_text(
+        "github.com:\n  oauth_token: publication-secret\n", encoding="utf-8"
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "GH_CONFIG_DIR": str(publication_config),
+            "GH_TOKEN": "push-capable-gh-token",
+            "GITHUB_TOKEN": "push-capable-github-token",
+        }
+    )
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            worker, "edit, stage, commit, and verify delivery"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    commit_status, push_status, token, github_token, config_exposed, status = (
+        result.stdout.strip().split("|", 5)
+    )
+    assert commit_status == "0"
+    assert push_status != "0"
+    assert token == github_token == "unset"
+    assert config_exposed == "0"
+    assert status == ""
+    head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head != base
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "merge-base", "--is-ancestor", base, head],
+            check=False,
+        ).returncode
+        == 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-list", "--count", f"{base}..{head}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "1"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "show", "HEAD:tracked.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == "after\n"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(remote),
+                "show-ref",
+                "--verify",
+                "refs/heads/forbidden",
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
 
 
 @pytest.mark.parametrize(

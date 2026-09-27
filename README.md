@@ -1044,6 +1044,16 @@ AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
   uv run pytest tests/test_live_claude_trust.py
 ```
 
+To opt into the linked-worktree edit, stage, commit, clean-worktree, and blocked
+push checks in the real provider sandboxes, run either or both of:
+
+```bash
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_DELIVERY=1 \
+  uv run pytest tests/test_live_linked_worktree_delivery.py
+AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_DELIVERY=1 \
+  uv run pytest tests/test_live_linked_worktree_delivery.py
+```
+
 External AWM targets can be registered in **Settings → External AWM targets** or
 through `GET` / `POST /api/settings/external-targets`. POST replaces the list and
 uses the existing trusted JSON request policy (`X-Python-Runner-Token`). Example:
