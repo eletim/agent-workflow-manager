@@ -1639,7 +1639,7 @@ import threading
     protected_ref,
     old,
     common_git_dir,
-    protected_worktree,
+    baseline,
     pending_signal,
 ) = sys.argv[1:]
 blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
@@ -2301,8 +2301,11 @@ def capture_nested_state():
     nested_capture_complete = True
 
 
-def reset_incomplete_capture():
+def reset_incomplete_capture(*, preserve=()):
+    preserved = set(preserve)
     for path in recovery_path.iterdir():
+        if path.name in preserved:
+            continue
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)
         else:
@@ -2358,58 +2361,39 @@ def same_entry(source, baseline_root, relative):
                 return True
 
 
-def build_interrupted_inputs(error):
-    global marker_metadata, nested_repositories
-    bounded_fallback_started.set()
-    bundle_complete = (recovery_path / "recovery.bundle").is_file()
-    if not bundle_complete:
-        reset_incomplete_capture()
-    else:
-        for name in ("nested", "ordinary-git-markers"):
-            path = recovery_path / name
-            if path.is_dir():
-                shutil.rmtree(path)
-            elif path.exists():
-                path.unlink()
-    marker_metadata = []
-    nested_repositories = []
-
-    temporary = recovery_path / "interrupted-inputs.tmp"
-    published = recovery_path / "interrupted-inputs"
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    temporary.mkdir(mode=0o700)
-    worktree_path = Path(worktree)
-    baseline_path = Path(protected_worktree)
-    overlay_temporary = temporary / "worktree-overlay.tar.tmp"
+def write_tree_delta(source_root, baseline_root, destination, name):
+    source_root = Path(source_root)
+    baseline_root = Path(baseline_root)
+    overlay_temporary = destination / f"{name}-overlay.tar.tmp"
     with tarfile.open(overlay_temporary, "w") as archive:
-        for source in tree_entries(worktree_path, exclude_root_git=True):
-            relative = source.relative_to(worktree_path)
-            if not same_entry(source, baseline_path, relative):
+        for source in tree_entries(source_root, exclude_root_git=True):
+            relative = source.relative_to(source_root)
+            if not same_entry(source, baseline_root, relative):
                 archive.add(source, arcname=relative.as_posix(), recursive=False)
-    os.replace(overlay_temporary, temporary / "worktree-overlay.tar")
-
+    os.replace(overlay_temporary, destination / f"{name}-overlay.tar")
     deletions = []
-    for baseline in tree_entries(baseline_path, exclude_root_git=True):
-        relative = baseline.relative_to(baseline_path)
+    for baseline_entry in tree_entries(baseline_root, exclude_root_git=True):
+        relative = baseline_entry.relative_to(baseline_root)
         try:
-            _, source_status = contained_lstat(worktree_path, relative)
+            _, source_status = contained_lstat(source_root, relative)
             source_type = stat.S_IFMT(source_status.st_mode)
         except (FileNotFoundError, NotADirectoryError):
             deletions.append(relative.as_posix())
             continue
-        if source_type != stat.S_IFMT(baseline.lstat().st_mode):
+        if source_type != stat.S_IFMT(baseline_entry.lstat().st_mode):
             deletions.append(relative.as_posix())
-    deletions_temporary = temporary / "worktree-deletions.json.tmp"
+    deletions_temporary = destination / f"{name}-deletions.json.tmp"
     deletions_temporary.write_text(
         json.dumps(deletions, ensure_ascii=True, sort_keys=True) + "\\n",
         encoding="ascii",
     )
-    os.replace(deletions_temporary, temporary / "worktree-deletions.json")
+    os.replace(deletions_temporary, destination / f"{name}-deletions.json")
 
-    shadow_temporary = temporary / "shadow-state.tar.tmp"
+
+def archive_shadow_state(shadow_path, destination):
+    shadow_path = Path(shadow_path)
+    shadow_temporary = destination / "shadow-state.tar.tmp"
     with tarfile.open(shadow_temporary, "w") as archive:
-        shadow_path = Path(shadow)
         for path in shadow_path.iterdir():
             if path.is_dir() and path.name not in {"info", "logs", "objects", "refs"}:
                 continue
@@ -2418,13 +2402,53 @@ def build_interrupted_inputs(error):
                 arcname=(Path("shadow.git") / path.name).as_posix(),
                 recursive=True,
             )
-    os.replace(shadow_temporary, temporary / "shadow-state.tar")
+    os.replace(shadow_temporary, destination / "shadow-state.tar")
+
+
+def finish_interrupted_inputs(capture, error, bundle_complete):
+    captured_baseline = capture / "baseline"
+    captured_worktree = capture / "worktree"
+    captured_shadow = capture / "shadow.git"
+    temporary = recovery_path / "interrupted-inputs.tmp"
+    published = recovery_path / "interrupted-inputs"
+    temporary.mkdir(mode=0o700)
+
+    base_archive = temporary / "base.tar"
+    archive_environment = base_environment.copy()
+    archive_environment.update(
+        {"GIT_DIR": str(captured_shadow), "GIT_WORK_TREE": str(captured_baseline)}
+    )
+    with base_archive.open("wb") as output:
+        result = subprocess.run(
+            [git, "archive", "--format=tar", old],
+            cwd=captured_baseline,
+            env=archive_environment,
+            stdout=output,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+            start_new_session=True,
+        )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError((detail or "base snapshot archive failed")[:1000])
+    base_root = recovery_path / "interrupted-base.tmp"
+    base_root.mkdir(mode=0o700)
+    with tarfile.open(base_archive) as archive:
+        archive.extractall(base_root)
+    base_archive.unlink()
+
+    write_tree_delta(captured_baseline, base_root, temporary, "baseline")
+    write_tree_delta(captured_worktree, captured_baseline, temporary, "worktree")
+    archive_shadow_state(captured_shadow, temporary)
+    shutil.rmtree(base_root)
     manifest = {
         "formatVersion": 1,
         "kind": "interrupted-delivery-inputs",
         "baseCommit": old,
-        "protectedWorktree": protected_worktree,
         "shadowState": "shadow-state.tar",
+        "baselineOverlay": "baseline-overlay.tar",
+        "baselineDeletions": "baseline-deletions.json",
         "worktreeOverlay": "worktree-overlay.tar",
         "worktreeDeletions": "worktree-deletions.json",
         "reason": str(error)[:1000],
@@ -2445,7 +2469,97 @@ def build_interrupted_inputs(error):
             "rootBundleComplete": bundle_complete,
         },
     )
+    shutil.rmtree(capture)
     publish_recovery()
+    capturing_marker = recovery_path / ".capturing"
+    capturing_marker.unlink()
+    fsync_directory(recovery_path)
+
+
+def detach_interrupted_capture(error):
+    global marker_metadata, nested_repositories
+    bounded_fallback_started.set()
+    source_root = Path(worktree).parent
+    capturing_temporary = recovery_path / ".capturing.tmp"
+    with capturing_temporary.open("x", encoding="ascii") as marker:
+        marker.write(
+            json.dumps(
+                {
+                    "formatVersion": 1,
+                    "capture": "interrupted-inputs.capture",
+                    "sourceRoot": str(source_root),
+                },
+                sort_keys=True,
+            )
+            + "\\n"
+        )
+        marker.flush()
+        os.fsync(marker.fileno())
+    os.replace(capturing_temporary, recovery_path / ".capturing")
+    fsync_directory(recovery_path)
+    fsync_directory(recovery_path.parent)
+    fsync_directory(recovery_path.parent.parent)
+
+    bundle_complete = (recovery_path / "recovery.bundle").is_file()
+    if not bundle_complete:
+        reset_incomplete_capture(preserve={".capturing"})
+    else:
+        for name in ("nested", "ordinary-git-markers"):
+            path = recovery_path / name
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+    marker_metadata = []
+    nested_repositories = []
+
+    capture_temporary = recovery_path / "interrupted-inputs.capture.tmp"
+    capture = recovery_path / "interrupted-inputs.capture"
+    capture_temporary.mkdir(mode=0o700)
+    moved = []
+    try:
+        for source, name in (
+            (Path(baseline), "baseline"),
+            (Path(worktree), "worktree"),
+            (Path(shadow), "shadow.git"),
+        ):
+            destination = capture_temporary / name
+            os.replace(source, destination)
+            moved.append((source, destination))
+        os.replace(capture_temporary, capture)
+    except BaseException:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                os.replace(destination, source)
+        if capture_temporary.exists():
+            capture_temporary.rmdir()
+        raise
+    fsync_directory(capture)
+    fsync_directory(recovery_path)
+    source_root.rmdir()
+    fsync_directory(source_root.parent)
+
+    child = os.fork()
+    if child:
+        return
+    try:
+        os.setsid()
+        null_descriptor = os.open(os.devnull, os.O_RDWR)
+        for descriptor in (0, 1, 2):
+            os.dup2(null_descriptor, descriptor)
+        if null_descriptor > 2:
+            os.close(null_descriptor)
+        finish_interrupted_inputs(capture, error, bundle_complete)
+    except BaseException as background_error:
+        try:
+            failure = recovery_path / "capture-error.txt.tmp"
+            failure.write_text(str(background_error)[:1000] + "\\n", encoding="utf-8")
+            os.replace(failure, recovery_path / "capture-error.txt")
+            fsync_directory(recovery_path)
+        except BaseException:
+            pass
+        os._exit(75)
+    os._exit(0)
 
 shadow_commit = old
 staged_commit = None
@@ -2534,7 +2648,7 @@ except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             except (OSError, RuntimeError, subprocess.SubprocessError) as retry_error:
                 if not recovery_handoff_required.is_set():
                     recovery_handoff_required.wait(1.0)
-                build_interrupted_inputs(retry_error)
+                detach_interrupted_capture(retry_error)
         elif publication_attempted:
             publish_recovery()
     except (OSError, RuntimeError, subprocess.SubprocessError) as fallback_error:
@@ -2806,10 +2920,12 @@ exec "$real_git" "$@"
             "awm_delivery_hooks='' && "
             "awm_delivery_resource_root='' && "
             "awm_delivery_shadow_git_dir='' && "
+            "awm_delivery_baseline_root='' && "
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
             "awm_delivery_recovery_started=0 && "
             "awm_delivery_recovery_published=0 && "
+            "awm_delivery_recovery_capturing=0 && "
             "awm_delivery_transition_pending=0 && "
             "awm_delivery_new='' && "
             "awm_delivery_cleanup() { "
@@ -2824,8 +2940,12 @@ exec "$real_git" "$@"
             "awm_delivery_primary_status=$1; "
             "awm_delivery_cleanup_failed=0; "
             'if [ -n "$awm_delivery_recovery" ] && '
-            '[ -f "$awm_delivery_recovery/.complete" ]; then '
+            '{ [ -f "$awm_delivery_recovery/.complete" ] || '
+            '[ -f "$awm_delivery_recovery/.capturing" ]; }; then '
             "awm_delivery_recovery_published=1; fi; "
+            'if [ -n "$awm_delivery_recovery" ] && '
+            '[ -f "$awm_delivery_recovery/.capturing" ]; then '
+            "awm_delivery_recovery_capturing=1; fi; "
             'if [ "$awm_delivery_recovery_started" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -eq 0 ] && '
             '[ -n "$awm_delivery_recovery" ]; then '
@@ -2837,6 +2957,13 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
+            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
+            '[ "$awm_delivery_recovery_capturing" -ne 0 ] && '
+            '{ [ "$awm_delivery_cleanup_dir" = "$awm_delivery_resource_root" ] || '
+            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_shadow_git_dir" ] || '
+            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_baseline_root" ] || '
+            '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_isolated_root" ]; }; '
+            "then continue; fi; "
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -ne 0 ] && '
             '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ]; '
@@ -2926,6 +3053,9 @@ exec "$real_git" "$@"
             'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_resource_root" "shadow.") || exit; '
+            'awm_delivery_baseline_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_root" "baseline.") || exit; '
             'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_resource_root" "worktree.") || exit; '
@@ -2940,9 +3070,11 @@ exec "$real_git" "$@"
             '[ -L "$awm_delivery_source" ] || continue; '
             '[ "$awm_delivery_source" = "$awm_delivery_root/.git" ] && continue; '
             '"$awm_delivery_cp" -a -- "$awm_delivery_source" '
-            '"$awm_delivery_isolated_root/" || exit; done; '
+            '"$awm_delivery_baseline_root/" || exit; done; '
             'else "$awm_delivery_cp" -a -- "$awm_delivery_root/." '
-            '"$awm_delivery_isolated_root/" || exit; fi && '
+            '"$awm_delivery_baseline_root/" || exit; fi && '
+            '"$awm_delivery_cp" -a -- "$awm_delivery_baseline_root/." '
+            '"$awm_delivery_isolated_root/" && '
             f"awm_delivery_rewrite_gitfiles=$(printf %s {gitfile_rewriter} | "
             "base64 --decode) && "
             '"$awm_delivery_python" -c "$awm_delivery_rewrite_gitfiles" '
@@ -3048,7 +3180,7 @@ exec "$real_git" "$@"
             '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
             '"$awm_delivery_recovery" "$awm_delivery_ref" '
             '"$awm_delivery_old" "$awm_delivery_common_git_dir" '
-            '"$awm_delivery_root" '
+            '"$awm_delivery_baseline_root" '
             '"$awm_delivery_pending_signal"); '
             "awm_delivery_recovery_status=$?; "
             "trap 'awm_delivery_signal 129' HUP; "

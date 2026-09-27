@@ -1039,18 +1039,23 @@ files from those fetched refs in the temporary repository before applying any
 chosen changes manually. Do not treat an artifact without `.complete` as durable.
 If interrupted recovery could not finish capturing Git state, `metadata.json`
 points to the bounded `interrupted-inputs` payload. Its shadow-state archive and
-worktree overlay/deletion manifest preserve agent-created Git, staged, worktree,
-and nested-repository output without retaining a second complete checkout. Apply
-the deletion manifest and overlay only to a disposable copy of the protected
-worktree recorded in the payload metadata, then inspect the extracted shadow Git
-state against that copy. If root bundle capture finished before a nested capture
-was interrupted, the normal root bundle remains available alongside this payload.
+two overlay/deletion pairs preserve agent-created Git, staged, worktree, and
+nested-repository output without retaining a second complete checkout. Start from
+the immutable `baseCommit`, apply the `baseline` pair for pre-session content, and
+then apply the `worktree` pair for agent output; inspect the extracted shadow Git
+state against that disposable reconstruction. This process does not depend on the
+original checkout still existing. If root bundle capture finished before a nested
+capture was interrupted, the normal root bundle remains available alongside this
+payload. A `.capturing` marker without `.complete` means conversion is continuing
+or failed: the AWM-owned raw inputs remain in that artifact for manual recovery,
+and `capture-error.txt` records a conversion error when one is available.
 
 Residual output or an unverifiable cleanliness check fails the session without
 updating the real ref or worktree. After the needed commits or files have been
-inspected and restored, remove only the exact reported `output.*` artifact path.
-The temporary shadow repository and isolated worktree are removed automatically,
-including on the interrupted fallback path.
+inspected and restored, remove only the exact reported, `.complete` `output.*`
+artifact path. Do not remove an artifact while `.capturing` exists.
+After successful conversion, the temporary shadow repository, immutable baseline,
+and isolated worktree are removed automatically.
 
 ## Development
 

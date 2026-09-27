@@ -1851,29 +1851,54 @@ def assert_recovery_worktree_file(
 
 
 def restore_interrupted_inputs(
-    recovery: Path, protected_worktree: Path, destination: Path
+    recovery: Path, repository: Path, base: str, destination: Path
 ) -> tuple[Path, Path]:
     payload = recovery / "interrupted-inputs"
     manifest = json.loads((payload / "metadata.json").read_text(encoding="utf-8"))
     assert manifest["kind"] == "interrupted-delivery-inputs"
+    assert manifest["baseCommit"] == base
     restored = destination / "worktree"
-    shutil.copytree(protected_worktree, restored, symlinks=True)
-    deletions = json.loads(
-        (payload / manifest["worktreeDeletions"]).read_text(encoding="ascii")
-    )
-    for relative in sorted(deletions, key=lambda value: value.count("/"), reverse=True):
-        target = restored / relative
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        else:
-            target.unlink(missing_ok=True)
-    with tarfile.open(payload / manifest["worktreeOverlay"]) as archive:
+    restored.mkdir(parents=True)
+    base_archive = destination / "base.tar"
+    with base_archive.open("wb") as output:
+        subprocess.run(
+            ["git", "-C", str(repository), "archive", "--format=tar", base],
+            check=True,
+            stdout=output,
+        )
+    with tarfile.open(base_archive) as archive:
         archive.extractall(restored)
+    base_archive.unlink()
+
+    for name in ("baseline", "worktree"):
+        deletions = json.loads(
+            (payload / manifest[f"{name}Deletions"]).read_text(encoding="ascii")
+        )
+        for relative in sorted(
+            deletions, key=lambda value: value.count("/"), reverse=True
+        ):
+            target = restored / relative
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+        with tarfile.open(payload / manifest[f"{name}Overlay"]) as archive:
+            archive.extractall(restored)
     shadow_root = destination / "shadow"
     shadow_root.mkdir()
     with tarfile.open(payload / manifest["shadowState"]) as archive:
         archive.extractall(shadow_root)
     return restored, shadow_root / "shadow.git"
+
+
+def wait_for_recovery_complete(recovery: Path, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while not (recovery / ".complete").is_file():
+        if (recovery / "capture-error.txt").is_file():
+            pytest.fail((recovery / "capture-error.txt").read_text(encoding="utf-8"))
+        if time.monotonic() >= deadline:
+            pytest.fail("interrupted recovery conversion did not complete")
+        time.sleep(0.01)
 
 
 def test_publication_disabled_signal_is_deferred_until_recovery_handler_ready(
@@ -2062,6 +2087,7 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
     recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
     recovered = tmp_path / "nested-recovered"
     try:
+        wait_for_recovery_complete(recovery)
         if stall_every_attempt:
             metadata = json.loads(
                 (recovery / "metadata.json").read_text(encoding="utf-8")
@@ -2080,8 +2106,12 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
                 "tracked.txt",
                 "before\n",
             )
+            shutil.rmtree(checkout)
             restored, _ = restore_interrupted_inputs(
-                recovery, checkout, tmp_path / "interrupted-nested"
+                recovery,
+                repository,
+                base,
+                tmp_path / "interrupted-nested",
             )
             restored_nested = restored / "nested"
             assert (restored_nested / "tracked.txt").read_text() == "changed\n"
@@ -2440,6 +2470,8 @@ def injected_replace(source, destination):
         interrupted = os.path.join(recovery, "interrupted-inputs")
         required = {
             os.path.join(recovery, "metadata.json"),
+            os.path.join(interrupted, "baseline-deletions.json"),
+            os.path.join(interrupted, "baseline-overlay.tar"),
             os.path.join(interrupted, "metadata.json"),
             os.path.join(interrupted, "shadow-state.tar"),
             os.path.join(interrupted, "worktree-deletions.json"),
@@ -2534,6 +2566,7 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         assert "publication-disabled agent output recovery retained at " in stderr
         assert len(recoveries) == 1
         recovery = recoveries[0]
+        wait_for_recovery_complete(recovery)
         assert (recovery / ".complete").is_file()
         assert not (recovery / "tracked.txt").exists()
         metadata = json.loads(
@@ -2547,7 +2580,10 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
                 "rootBundleComplete": False,
             }
             restored, shadow = restore_interrupted_inputs(
-                recovery, checkout, tmp_path / "interrupted-root"
+                recovery,
+                repository,
+                base,
+                tmp_path / "interrupted-root",
             )
             assert (restored / "tracked.txt").read_text() == "committed\n"
             assert (restored / "residual.txt").read_text() == "residual\n"
@@ -2625,6 +2661,126 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
             process.communicate()
         for path in recoveries:
             shutil.rmtree(path, ignore_errors=True)
+
+
+def test_publication_disabled_detaches_slow_interrupted_conversion(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stalled_capture = tmp_path / "stalled-capture"
+    conversion_started = tmp_path / "conversion-started"
+    release_conversion = tmp_path / "release-conversion"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = ls-files ]; then\n"
+        '    : > "$AWM_TEST_STALLED_CAPTURE"\n'
+        "    while :; do sleep 1; done\n"
+        "fi\n"
+        "if [ \"$1\" = archive ]; then\n"
+        '    : > "$AWM_TEST_CONVERSION_STARTED"\n'
+        '    while [ ! -e "$AWM_TEST_RELEASE_CONVERSION" ]; do sleep 0.05; done\n'
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'committed\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m before-slow-conversion >/dev/null 2>&1\n"
+        "printf 'residual\\n' > residual.txt\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_CONVERSION_STARTED": str(conversion_started),
+            "AWM_TEST_RELEASE_CONVERSION": str(release_conversion),
+            "AWM_TEST_STALLED_CAPTURE": str(stalled_capture),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave output before slow conversion"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while process.poll() is None and not stalled_capture.exists():
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("stalled recovery capture was not reached")
+        time.sleep(0.01)
+    if process.poll() is not None:
+        pytest.fail("session exited before recovery interruption")
+
+    started = time.monotonic()
+    os.killpg(process.pid, signal.SIGTERM)
+    _, stderr = process.communicate(timeout=5)
+    elapsed = time.monotonic() - started
+    recovery_line = next(
+        line
+        for line in stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        assert process.returncode == 143
+        assert elapsed < 4
+        deadline = time.monotonic() + 5
+        while not conversion_started.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail("detached conversion did not start")
+            time.sleep(0.01)
+        assert (recovery / ".capturing").is_file()
+        assert not (recovery / ".complete").exists()
+        capture = recovery / "interrupted-inputs.capture"
+        assert (capture / "worktree" / "tracked.txt").read_text() == "committed\n"
+        assert (capture / "worktree" / "residual.txt").read_text() == "residual\n"
+        assert (capture / "baseline" / "tracked.txt").read_text() == "before\n"
+        assert (capture / "shadow.git" / "HEAD").is_file()
+        assert not list(recovery.parent.glob("inputs.*"))
+
+        release_conversion.touch()
+        wait_for_recovery_complete(recovery)
+        assert not (recovery / ".capturing").exists()
+        assert not capture.exists()
+        restored, shadow = restore_interrupted_inputs(
+            recovery, repository, base, tmp_path / "slow-conversion-restored"
+        )
+        assert (restored / "residual.txt").read_text() == "residual\n"
+        assert (
+            subprocess.run(
+                ["git", f"--git-dir={shadow}", "show", "HEAD:tracked.txt"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "committed\n"
+        )
+    finally:
+        release_conversion.touch(exist_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        shutil.rmtree(recovery, ignore_errors=True)
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
@@ -3371,8 +3527,8 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
 
 @pytest.mark.parametrize(
     "blocked_call",
-    [1, 2, 3, 4],
-    ids=("hooks", "shadow", "worktree", "recovery"),
+    [1, 2, 3, 4, 5, 6],
+    ids=("hooks", "resource-root", "shadow", "baseline", "worktree", "recovery"),
 )
 @pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
 def test_publication_disabled_signal_cleans_directory_before_allocator_returns(
@@ -3546,7 +3702,7 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        expected_directory_removals = 5 if agent_status == 0 else 4
+        expected_directory_removals = 6 if agent_status == 0 else 5
         assert len(directory_removals) == expected_directory_removals
         removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
