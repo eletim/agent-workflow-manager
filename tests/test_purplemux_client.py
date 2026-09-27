@@ -998,6 +998,7 @@ def test_publication_disabled_recovers_unmerged_index(
         "100644 %s 3\\tconflicted.txt\\n' "
         '"$base_blob" "$ours_blob" "$theirs_blob" '
         "| git update-index --index-info\n"
+        "git update-index --split-index\n"
         "printf 'worktree resolution\\n' > conflicted.txt\n"
         "printf 'untracked beside conflict\\n' > conflict-untracked.txt\n",
         encoding="utf-8",
@@ -1031,9 +1032,13 @@ def test_publication_disabled_recovers_unmerged_index(
         assert metadata["cleanliness"] == "residual"
         assert metadata["stagedCommit"] is None
         assert (recovery / conflict_state["indexFile"]).is_file()
+        shared_index = recovery / conflict_state["sharedIndexFile"]
+        assert shared_index.is_file()
         object_pack = recovery / conflict_state["objectPack"]
         assert object_pack.is_file()
         assert (recovery / conflict_state["objectIndex"]).is_file()
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
 
         recovered = tmp_path / "recovered-conflict"
         subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
@@ -1057,6 +1062,7 @@ def test_publication_disabled_recovers_unmerged_index(
             ).stdout.strip()
         ) / "index"
         shutil.copyfile(recovery / conflict_state["indexFile"], recovered_index)
+        shutil.copyfile(shared_index, recovered_index.parent / shared_index.name)
         stages = subprocess.run(
             ["git", "-C", str(recovered), "ls-files", "--unmerged"],
             check=True,

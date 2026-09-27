@@ -1645,7 +1645,10 @@ def commit_tree(tree, parent, message):
     ).stdout.strip()
 
 
-def capture_index_state(environment, index_path, destination):
+def capture_index_state(
+    environment, index_path, destination, *, source_environment=None
+):
+    source_environment = source_environment or environment
     private_index = destination / "staged.index"
     private_environment = environment.copy()
     private_environment["GIT_INDEX_FILE"] = str(private_index)
@@ -1653,6 +1656,14 @@ def capture_index_state(environment, index_path, destination):
         shutil.copyfile(index_path, private_index)
     else:
         run_git(["read-tree", "--empty"], environment=private_environment)
+    shared_index_text = run_git(
+        ["rev-parse", "--shared-index-path"], environment=source_environment
+    ).stdout.strip()
+    shared_index = Path(shared_index_text).resolve() if shared_index_text else None
+    if shared_index is not None:
+        private_shared_index = Path(environment["GIT_DIR"]) / shared_index.name
+        if private_shared_index.resolve() != shared_index:
+            shutil.copyfile(shared_index, private_shared_index)
     unmerged = run_git(
         ["ls-files", "--unmerged", "-z"], environment=private_environment
     ).stdout
@@ -1681,10 +1692,17 @@ def capture_index_state(environment, index_path, destination):
     ).stdout.strip()
     conflict_index = destination / "conflicted.index"
     os.replace(private_index, conflict_index)
+    retained_shared_index = None
+    if shared_index is not None:
+        retained_shared_index = destination / shared_index.name
+        shutil.copyfile(shared_index, retained_shared_index)
     return None, {
         "indexFile": conflict_index.name,
         "objectPack": f"{pack_prefix.name}-{pack_hash}.pack",
         "objectIndex": f"{pack_prefix.name}-{pack_hash}.idx",
+        "sharedIndexFile": (
+            retained_shared_index.name if retained_shared_index is not None else None
+        ),
     }
 
 
@@ -1879,7 +1897,10 @@ def capture_nested_repository(root, destination):
             ).stdout
         ).strip()
     staged_tree, conflict_state = capture_index_state(
-        side_environment, index_path, destination
+        side_environment,
+        index_path,
+        destination,
+        source_environment=nested_environment,
     )
     baseline_commit = run_side(
         ["commit-tree", baseline_tree], input_text="AWM nested recovery: baseline\\n"
