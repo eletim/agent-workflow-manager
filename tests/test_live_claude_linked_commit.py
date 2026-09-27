@@ -79,6 +79,7 @@ def test_real_claude_commits_cleanly_in_linked_run_worktree(tmp_path: Path) -> N
     try:
         branch = "feature/live-claude-linked-commit"
         _git("switch", "-c", branch, context.base_sha, cwd=worktree)
+        remote_refs_before = _git("ls-remote", "--refs", "origin", cwd=worktree)
         runtime = PurpleMuxRuntime()
         workspace = runtime.create_workspace(
             CreateWorkspaceRequest(
@@ -119,13 +120,22 @@ def test_real_claude_commits_cleanly_in_linked_run_worktree(tmp_path: Path) -> N
             _git("merge-base", "--is-ancestor", context.base_sha, head, cwd=worktree)
             == ""
         )
+        assert (
+            _git("rev-list", "--count", f"{context.base_sha}..{head}", cwd=worktree)
+            == "1"
+        )
+        assert _git("diff", "--name-only", context.base_sha, head, cwd=worktree) == (
+            "proof.txt"
+        )
         assert _git("branch", "--show-current", cwd=worktree) == branch
         assert _git("log", "-1", "--format=%s", cwd=worktree) == (
             "Verify Claude linked commit"
         )
         assert (worktree / "proof.txt").read_text(encoding="utf-8") == "base\nclaude\n"
         assert _git("status", "--porcelain", cwd=worktree) == ""
-        assert _git("ls-remote", "--heads", "origin", branch, cwd=worktree) == ""
+        assert _git("ls-remote", "--refs", "origin", cwd=worktree) == (
+            remote_refs_before
+        )
     finally:
         original_failure = sys.exc_info()[0] is not None
         cleanup_errors: list[str] = []
