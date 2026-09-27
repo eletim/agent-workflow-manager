@@ -1639,10 +1639,46 @@ def test_git_worktree_cleanup_allows_branch_and_head_to_change_after_registratio
         ["git", "-C", str(worktree), "commit", "-qm", "implementation"],
         check=True,
     )
+    git_dir = Path(output("rev-parse", "--absolute-git-dir"))
+    private_store = git_dir / "awm-delivery-objects" / "awm-delivery.owned"
+    private_store.mkdir(parents=True)
+    unrelated_store = tmp_path / "unrelated-objects"
+    unrelated_store.mkdir()
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(exist_ok=True)
+    alternates.write_text(
+        f"{private_store}\n{unrelated_store}\n", encoding="utf-8"
+    )
 
     runner._cleanup_resource(RunResource("git_worktree", str(worktree), metadata))
 
     assert not worktree.exists()
+    assert alternates.read_text(encoding="utf-8") == f"{unrelated_store}\n"
+
+
+def test_git_worktree_cleanup_retries_owned_alternates_after_worktree_removal(
+    runner: PythonRunner, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    removed_git_dir = repository / ".git" / "worktrees" / "removed"
+    private_store = (
+        removed_git_dir / "awm-delivery-objects" / "awm-delivery.interrupted"
+    )
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(exist_ok=True)
+    alternates.write_text(f"{private_store}\n", encoding="utf-8")
+    resource = RunResource(
+        "git_worktree",
+        str(tmp_path / "removed-worktree"),
+        {"repository": str(repository), "git_dir": str(removed_git_dir)},
+    )
+
+    assert not runner._resource_is_absent(resource)
+    runner._cleanup_resource(resource)
+
+    assert runner._resource_is_absent(resource)
+    assert alternates.read_text(encoding="utf-8") == ""
 
 
 def _test_path_identity(path: Path, *, ctime: bool = False) -> str:

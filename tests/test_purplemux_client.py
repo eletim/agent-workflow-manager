@@ -564,6 +564,28 @@ def delivery_metadata_lock_path(checkout: Path) -> Path:
     return common_dir / "hooks" / f"awm-delivery-{lock_key}.lock"
 
 
+def delivery_root_lock_path(checkout: Path) -> Path:
+    common_dir = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    lock_ref = common_dir / "refs" / "heads"
+    lock_log = common_dir / "logs" / "refs" / "heads"
+    lock_key = hashlib.sha256(f"{lock_ref}\n{lock_log}\n".encode()).hexdigest()
+    return common_dir / "hooks" / f"awm-delivery-{lock_key}.lock"
+
+
 @pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     worker: str, tmp_path: Path
@@ -637,7 +659,7 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     private_object_directories = {
         path
         for path in writable_directories
-        if Path(path).parent == Path(common_dir) / "objects"
+        if Path(path).parent == Path(git_dir) / "awm-delivery-objects"
         and Path(path).name.startswith("awm-delivery.")
     }
     assert len(private_object_directories) == 1
@@ -878,6 +900,58 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_rolls_back_commit_with_missing_reachable_object(
+    worker: str, tmp_path: Path
+) -> None:
+    _, checkout = linked_delivery_checkout(tmp_path)
+    before = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'new object\\n' > connectivity.txt\n"
+        "git add connectivity.txt\n"
+        "git commit -m incomplete-commit >/dev/null\n"
+        "blob=$(git rev-parse HEAD:connectivity.txt)\n"
+        "prefix=$(printf '%.2s' \"$blob\")\n"
+        "suffix=$(printf '%s' \"$blob\" | cut -c3-)\n"
+        'rm -- "$AWM_DELIVERY_OBJECT_DIR/$prefix/$suffix"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "changes rolled back" in result.stderr
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == before
+    )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
 @pytest.mark.parametrize(
     "metadata", ["HEAD", "commondir", "gitdir", "active-log", "sibling-log"]
 )
@@ -1031,6 +1105,59 @@ def test_publication_disabled_allows_non_overlapping_metadata_sessions(
 
     assert result.returncode == 0
     assert launched.read_text(encoding="utf-8") == "launched"
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_top_level_branch_lock_overlaps_nested_branches(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    top_level_checkout = tmp_path / "top-level checkout"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "top-level",
+            str(top_level_checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    root_lock = delivery_root_lock_path(checkout)
+    assert root_lock == delivery_root_lock_path(top_level_checkout)
+    launched = tmp_path / "launched"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        f"#!/bin/sh\nprintf launched > {shlex.quote(str(launched))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    with root_lock.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(
+                worker, "not run"
+            ),
+            cwd=top_level_checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert result.returncode != 0
+    assert "owns overlapping Git metadata" in result.stderr
+    assert not launched.exists()
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])

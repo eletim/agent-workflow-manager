@@ -3488,7 +3488,13 @@ class PythonRunner:
                 line == f"worktree {resource.identity}"
                 for line in listed.stdout.splitlines()
             )
-            return not registered and not os.path.lexists(resource.identity)
+            absent = not registered and not os.path.lexists(resource.identity)
+            git_dir = resource.metadata.get("git_dir")
+            if not absent or git_dir is None:
+                return absent
+            return not PythonRunner._has_worktree_object_alternates(
+                Path(git_dir), PythonRunner._git_common_objects(Path(repository))
+            )
         raise OSError(f"unsupported run resource kind: {resource.kind}")
 
     @staticmethod
@@ -3633,6 +3639,11 @@ class PythonRunner:
                     "Git worktree path exists but is not registered; refusing "
                     "partial-state cleanup"
                 )
+            git_dir_text = resource.metadata.get("git_dir")
+            if git_dir_text is not None:
+                PythonRunner._cleanup_worktree_object_alternates(
+                    Path(git_dir_text), PythonRunner._git_common_objects(repository)
+                )
             return
         required_identity = {
             "path_identity",
@@ -3694,6 +3705,8 @@ class PythonRunner:
             and observed_git_dir.stdout.strip() != resource.metadata["git_dir"]
         ):
             raise OSError("Git worktree git_dir identity changed; refusing cleanup")
+        git_dir = Path(observed_git_dir.stdout.strip())
+        common_objects = PythonRunner._git_common_objects(worktree)
         dirty = subprocess.run(
             ["git", "-C", str(worktree), "status", "--porcelain"],
             capture_output=True,
@@ -3715,23 +3728,101 @@ class PythonRunner:
             timeout=30,
             check=False,
         )
-        if removed.returncode == 0:
-            return
-        reconciled = subprocess.run(
-            ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+        if removed.returncode != 0:
+            reconciled = subprocess.run(
+                ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if reconciled.returncode != 0 or any(
+                line == f"worktree {worktree}"
+                for line in reconciled.stdout.splitlines()
+            ):
+                raise MutationOutcomeUnknown(
+                    "Git worktree removal could not be confirmed: "
+                    + (removed.stderr.strip() or "no stderr")
+                )
+        PythonRunner._cleanup_worktree_object_alternates(
+            git_dir, common_objects
+        )
+
+    @staticmethod
+    def _git_common_objects(repository: Path) -> Path:
+        inspected = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-        if reconciled.returncode == 0 and not any(
-            line == f"worktree {worktree}" for line in reconciled.stdout.splitlines()
-        ):
-            return
-        raise MutationOutcomeUnknown(
-            "Git worktree removal could not be confirmed: "
-            + (removed.stderr.strip() or "no stderr")
+        if inspected.returncode != 0:
+            raise OSError("could not inspect owned Git worktree object storage")
+        return Path(inspected.stdout.strip())
+
+    @staticmethod
+    def _has_worktree_object_alternates(git_dir: Path, objects: Path) -> bool:
+        alternates = objects / "info" / "alternates"
+        if not os.path.lexists(alternates):
+            return False
+        if alternates.is_symlink() or not alternates.is_file():
+            raise OSError("Git alternates metadata has an unexpected file type")
+        owned_root = git_dir / "awm-delivery-objects"
+        return any(
+            Path(line).is_absolute()
+            and Path(line).parent == owned_root
+            and Path(line).name.startswith("awm-delivery.")
+            for line in alternates.read_text(encoding="utf-8").splitlines()
         )
+
+    @staticmethod
+    def _cleanup_worktree_object_alternates(git_dir: Path, objects: Path) -> None:
+        """Remove private object-store dependencies owned by a removed worktree."""
+        alternates = objects / "info" / "alternates"
+        if not os.path.lexists(alternates):
+            return
+        if alternates.is_symlink() or not alternates.is_file():
+            raise OSError("Git alternates metadata has an unexpected file type")
+        owned_root = git_dir / "awm-delivery-objects"
+        lock_path = objects.parent / "hooks" / "awm-delivery-alternates.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if alternates.is_symlink() or not alternates.is_file():
+                raise OSError("Git alternates metadata has an unexpected file type")
+            lines = alternates.read_text(encoding="utf-8").splitlines()
+            retained = [
+                line
+                for line in lines
+                if not (
+                    Path(line).is_absolute()
+                    and Path(line).parent == owned_root
+                    and Path(line).name.startswith("awm-delivery.")
+                )
+            ]
+            if retained == lines:
+                return
+            replacement = alternates.with_name(
+                f"{alternates.name}.awm-cleanup-{secrets.token_hex(8)}"
+            )
+            try:
+                replacement.write_text(
+                    "".join(f"{line}\n" for line in retained), encoding="utf-8"
+                )
+                os.chmod(replacement, stat.S_IMODE(alternates.stat().st_mode))
+                os.replace(replacement, alternates)
+            finally:
+                if replacement.exists():
+                    replacement.unlink()
 
     def close(self) -> None:
         with self._lock:

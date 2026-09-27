@@ -1614,6 +1614,7 @@ else
         if [ -z "$old" ] || [ -z "$new" ] || [ -z "$rest" ] ||
                 [ "$old" != "$authorized" ] ||
                 ! pinned_git cat-file -e "$new^{commit}" ||
+                ! pinned_git fsck --connectivity-only --no-dangling "$new" ||
                 ! pinned_git merge-base --is-ancestor "$old" "$new"; then
             log_valid=0
             break
@@ -1904,8 +1905,6 @@ done
             "--git-path objects) && "
             'awm_delivery_shared_object_dir=$(cd "$awm_delivery_shared_object_dir" '
             "&& pwd -P) && "
-            "awm_delivery_object_dir=$(mktemp -d "
-            '"$awm_delivery_shared_object_dir/awm-delivery.XXXXXX") && '
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
             "awm_delivery_ref_scope=${awm_delivery_ref%/*} && "
             "awm_delivery_ref_path=$(git rev-parse --path-format=absolute "
@@ -1925,8 +1924,13 @@ done
             'awm_delivery_log_was_missing=1; fi && '
             '[ ! -L "$awm_delivery_ref_log_path" ] && '
             'if [ "$awm_delivery_git_dir" = "$awm_delivery_common_dir" ]; then '
+            "awm_delivery_object_dir=$(mktemp -d "
+            '"$awm_delivery_shared_object_dir/awm-delivery.XXXXXX") && '
             'awm_delivery_checkout_git_dir="$awm_delivery_object_dir" && '
             'awm_delivery_linked=0; else '
+            'mkdir -p -- "$awm_delivery_git_dir/awm-delivery-objects" && '
+            "awm_delivery_object_dir=$(mktemp -d "
+            '"$awm_delivery_git_dir/awm-delivery-objects/awm-delivery.XXXXXX") && '
             'awm_delivery_checkout_git_dir="$awm_delivery_git_dir" && '
             'awm_delivery_linked=1; fi && '
             '[ -f "$awm_delivery_git_dir/HEAD" ] && '
@@ -1956,22 +1960,44 @@ done
             'case "$awm_delivery_ref_scope" in refs/heads/*) '
             'awm_delivery_lock_namespace=${awm_delivery_ref_scope#refs/heads/}; '
             'awm_delivery_lock_namespace=${awm_delivery_lock_namespace%%/*}; '
+            'awm_delivery_root_lock_ref="$awm_delivery_common_dir/refs/heads"; '
+            'awm_delivery_root_lock_log="$awm_delivery_common_dir/logs/refs/heads"; '
             'awm_delivery_lock_ref="$awm_delivery_common_dir/refs/heads/'
             '$awm_delivery_lock_namespace"; '
             'awm_delivery_lock_log="$awm_delivery_common_dir/logs/refs/heads/'
-            '$awm_delivery_lock_namespace" ;; *) '
+            '$awm_delivery_lock_namespace"; '
+            'awm_delivery_root_lock_mode=shared ;; refs/heads) '
+            'awm_delivery_root_lock_ref="$awm_delivery_common_dir/refs/heads"; '
+            'awm_delivery_root_lock_log="$awm_delivery_common_dir/logs/refs/heads"; '
+            'awm_delivery_lock_ref=; awm_delivery_lock_log=; '
+            'awm_delivery_root_lock_mode=exclusive ;; *) '
+            'awm_delivery_root_lock_ref=; awm_delivery_root_lock_log=; '
             'awm_delivery_lock_ref="$awm_delivery_ref_dir"; '
             'awm_delivery_lock_log="$awm_delivery_ref_log_dir" ;; esac && '
+            'if [ -n "$awm_delivery_root_lock_ref" ]; then '
+            "awm_delivery_root_lock_key=$(printf '%s\\n%s\\n' "
+            '"$awm_delivery_root_lock_ref" "$awm_delivery_root_lock_log" | '
+            "sha256sum); "
+            'awm_delivery_root_lock_key=${awm_delivery_root_lock_key%% *}; '
+            'exec 9>"$awm_delivery_hooks_root/awm-delivery-'
+            '$awm_delivery_root_lock_key.lock"; '
+            'if [ "$awm_delivery_root_lock_mode" = shared ]; then '
+            'awm_delivery_root_flock="flock -s -n 9"; else '
+            'awm_delivery_root_flock="flock -n 9"; fi; '
+            'if ! $awm_delivery_root_flock; then printf \'%s\\n\' '
+            "'another publication-disabled session owns overlapping Git metadata' "
+            '>&2; exit 1; fi; fi && '
+            'if [ -n "$awm_delivery_lock_ref" ]; then '
             "awm_delivery_lock_key=$(printf '%s\\n%s\\n' "
             '"$awm_delivery_lock_ref" "$awm_delivery_lock_log" | '
             "sha256sum) && "
             "awm_delivery_lock_key=${awm_delivery_lock_key%% *} && "
-            'exec 9>"$awm_delivery_hooks_root/awm-delivery-'
+            'exec 8>"$awm_delivery_hooks_root/awm-delivery-'
             '$awm_delivery_lock_key.lock" && '
-            'if ! flock -n 9; then printf \'%s\\n\' '
+            'if ! flock -n 8; then printf \'%s\\n\' '
             "'another publication-disabled session owns overlapping Git metadata' "
             ">&2; "
-            "exit 1; fi && "
+            'exit 1; fi; fi && '
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
@@ -2036,7 +2062,7 @@ done
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
             'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
             'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
-            f"{launch} 9>&-; "
+            f"{launch} 8>&- 9>&-; "
             "awm_delivery_status=$?; "
             'AWM_DELIVERY_GIT_EXECUTABLE="$awm_delivery_git_executable" '
             'AWM_DELIVERY_GIT_DIR="$awm_delivery_git_dir" '
