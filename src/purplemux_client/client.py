@@ -1536,8 +1536,7 @@ done
             b"""#!/bin/sh
 phase=$1
 [ "$phase" = prepared ] || exit 0
-root=$(git rev-parse --show-toplevel) || exit 1
-[ "$root" = "$AWM_DELIVERY_PROTECTED_ROOT" ] || exit 0
+[ -n "${AWM_DELIVERY_PROTECTED_REF:-}" ] || exit 0
 zero=0000000000000000000000000000000000000000
 while read old new ref; do
     if [ "$ref" = ORIG_HEAD ]; then
@@ -1557,6 +1556,18 @@ done
             b"""#!/bin/sh
 probe=$PWD
 command=
+real_path=$PATH
+while :; do
+    real_git=$(PATH=$real_path command -v git) || exit 1
+    case $real_git in
+        "$0") case $real_path in *:*) real_path=${real_path#*:} ;; *) exit 1 ;; esac ;;
+        /*) break ;;
+        *) exit 1 ;;
+    esac
+done
+wrapper_root=${0%/*}/..
+shadow_git_dir=$(tr -d '\n' < "$wrapper_root/shadow-git-dir") || exit 1
+protected_root=$(tr -d '\n' < "$wrapper_root/protected-root") || exit 1
 next_is_c=false
 skip_next=false
 for argument do
@@ -1565,32 +1576,33 @@ for argument do
         continue
     fi
     if [ "$next_is_c" = true ]; then
-        probe=$(cd "$probe" && cd "$argument" && pwd -P) || exec "$AWM_DELIVERY_REAL_GIT" "$@"
+        probe=$(cd "$probe" && cd "$argument" && pwd -P) || exec "$real_git" "$@"
         next_is_c=false
         continue
     fi
     case $argument in
         -C) next_is_c=true ;;
-        -C?*) probe=$(cd "$probe" && cd "${argument#-C}" && pwd -P) || exec "$AWM_DELIVERY_REAL_GIT" "$@" ;;
-        -c|--config-env) skip_next=true ;;
+        -C?*) probe=$(cd "$probe" && cd "${argument#-C}" && pwd -P) || exec "$real_git" "$@" ;;
+        -c|--config-env|--git-dir|--work-tree|--namespace|--super-prefix) skip_next=true ;;
         -*) ;;
         *) command=$argument; break ;;
     esac
 done
 [ "$command" != push ] || exit 1
-root=$("$AWM_DELIVERY_REAL_GIT" -C "$probe" rev-parse --show-toplevel 2>/dev/null) || {
+root=$("$real_git" -C "$probe" rev-parse --show-toplevel 2>/dev/null) || {
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-    exec "$AWM_DELIVERY_REAL_GIT" "$@"
+    exec "$real_git" "$@"
 }
 root=$(cd "$root" && pwd -P) || exit 1
-if [ "$root" = "$AWM_DELIVERY_PROTECTED_ROOT" ]; then
-    GIT_DIR=$AWM_DELIVERY_SHADOW_GIT_DIR
-    GIT_WORK_TREE=$AWM_DELIVERY_PROTECTED_ROOT
+if [ "$root" = "$protected_root" ]; then
+    GIT_DIR=$shadow_git_dir
+    GIT_WORK_TREE=$protected_root
     export GIT_DIR GIT_WORK_TREE
 else
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    unset AWM_DELIVERY_PROTECTED_REF
 fi
-exec "$AWM_DELIVERY_REAL_GIT" "$@"
+exec "$real_git" "$@"
 """
         ).decode("ascii")
         environment_options = [
@@ -1615,6 +1627,12 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             "GIT_OBJECT_DIRECTORY",
             "-u",
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "-u",
+            "AWM_DELIVERY_REAL_GIT",
+            "-u",
+            "AWM_DELIVERY_SHADOW_GIT_DIR",
+            "-u",
+            "AWM_DELIVERY_PROTECTED_ROOT",
         ]
         git_environment = [
             "GIT_CONFIG_GLOBAL=/dev/null",
@@ -1753,14 +1771,16 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'mkdir -p -- "$awm_delivery_hooks_root" && '
             'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
             "umask 077 && "
+            'awm_delivery_manifest="$awm_delivery_hooks_root/'
+            '.awm-delivery.$$.resources" && '
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
             "awm_delivery_cleanup_failed=0; "
-            'for awm_delivery_cleanup_dir in "$awm_delivery_hooks" '
-            '"$awm_delivery_shadow_git_dir"; do '
+            'if [ -f "$awm_delivery_manifest" ]; then '
+            'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
@@ -1772,7 +1792,13 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             "2>/dev/null; then "
             "awm_delivery_cleanup_failed=1; "
             "fi; "
-            "done; "
+            'done < "$awm_delivery_manifest"; '
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
+            '"$awm_delivery_rm" -f -- "$awm_delivery_manifest" '
+            "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            "fi; "
             'if [ "$awm_delivery_cleanup_failed" -ne 0 ]; then '
             "printf '%s\\n' 'publication-disabled session cleanup failed; "
             "temporary resources may remain' >&2; "
@@ -1787,10 +1813,15 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             "trap 'awm_delivery_cleanup 129' HUP && "
             "trap 'awm_delivery_cleanup 130' INT && "
             "trap 'awm_delivery_cleanup 143' TERM && "
-            "awm_delivery_hooks=$(mktemp -d "
-            '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
-            "awm_delivery_shadow_git_dir=$(mktemp -d "
-            '"/tmp/awm-delivery-shadow.XXXXXX") && '
+            ': > "$awm_delivery_manifest" && '
+            'mktemp -d "$awm_delivery_hooks_root/awm-delivery.XXXXXX" '
+            '> "$awm_delivery_manifest" && '
+            'IFS= read -r awm_delivery_hooks < "$awm_delivery_manifest" && '
+            'mktemp -d "/tmp/awm-delivery-shadow.XXXXXX" '
+            '>> "$awm_delivery_manifest" && '
+            '{ IFS= read -r awm_delivery_hooks; '
+            'IFS= read -r awm_delivery_shadow_git_dir; } '
+            '< "$awm_delivery_manifest" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
@@ -1798,8 +1829,14 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             '"$awm_delivery_hooks/pre-push" && '
             f"printf %s {git_wrapper} | base64 --decode > "
             '"$awm_delivery_hooks/bin/git" && '
+            'printf \'%s\\n\' "$awm_delivery_shadow_git_dir" > '
+            '"$awm_delivery_hooks/shadow-git-dir" && '
+            'printf \'%s\\n\' "$awm_delivery_root" > '
+            '"$awm_delivery_hooks/protected-root" && '
             'chmod 500 "$awm_delivery_hooks/reference-transaction" '
             '"$awm_delivery_hooks/pre-push" "$awm_delivery_hooks/bin/git" && '
+            'chmod 400 "$awm_delivery_hooks/shadow-git-dir" '
+            '"$awm_delivery_hooks/protected-root" && '
             '"$awm_delivery_real_git" init --bare --quiet '
             '"$awm_delivery_shadow_git_dir" && '
             '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
@@ -1820,9 +1857,7 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'GIT_WORK_TREE="$awm_delivery_root" '
             '"$awm_delivery_real_git" read-tree "$awm_delivery_old" && '
             'PATH="$awm_delivery_hooks/bin:$PATH" && '
-            'export PATH AWM_DELIVERY_REAL_GIT="$awm_delivery_real_git" '
-            'AWM_DELIVERY_SHADOW_GIT_DIR="$awm_delivery_shadow_git_dir" '
-            'AWM_DELIVERY_PROTECTED_ROOT="$awm_delivery_root" && '
+            "export PATH && "
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "

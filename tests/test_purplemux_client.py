@@ -445,6 +445,12 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
     fake_worker = fake_bin / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
+        "shadow=\n"
+        "previous=\n"
+        "for argument do\n"
+        '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
+        "    previous=$argument\n"
+        "done\n"
         "printf 'after\\n' > tracked.txt\n"
         "git add tracked.txt\n"
         "git commit -m linked-delivery >/dev/null 2>&1\n"
@@ -457,11 +463,21 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         'git -c core.hooksPath=/dev/null push "$AWM_TEST_REMOTE" '
         "HEAD:refs/heads/forbidden-hook-override >/dev/null 2>&1\n"
         "hook_override_status=$?\n"
+        'git --git-dir "$shadow" push --no-verify "$AWM_TEST_REMOTE" '
+        "HEAD:refs/heads/forbidden-separated-git-dir >/dev/null 2>&1\n"
+        "separated_git_dir_status=$?\n"
+        '"${AWM_DELIVERY_REAL_GIT:-false}" '
+        '--git-dir="${AWM_DELIVERY_SHADOW_GIT_DIR:-}" push --no-verify '
+        '"$AWM_TEST_REMOTE" HEAD:refs/heads/forbidden-direct >/dev/null 2>&1\n'
+        "direct_git_status=$?\n"
         "status=$(git status --porcelain)\n"
         "config_exposed=0\n"
         '[ ! -e "$GH_CONFIG_DIR/hosts.yml" ] || config_exposed=1\n'
-        'printf \'%s|%s|%s|%s|%s|%s|%s|%s\\n\' "$commit_status" "$push_status" '
-        '"$no_verify_status" "$hook_override_status" '
+        'printf \'%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n\' '
+        '"$commit_status" "$push_status" "$no_verify_status" '
+        '"$hook_override_status" "$separated_git_dir_status" '
+        '"$direct_git_status" "${AWM_DELIVERY_REAL_GIT-unset}" '
+        '"${AWM_DELIVERY_SHADOW_GIT_DIR-unset}" '
         '"${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "$config_exposed" '
         '"$status"\n',
         encoding="utf-8",
@@ -480,6 +496,8 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
             "GH_TOKEN": "push-capable-gh-token",
             "GITHUB_TOKEN": "push-capable-github-token",
             "AWM_TEST_REMOTE": str(remote),
+            "AWM_DELIVERY_REAL_GIT": shutil.which("git") or "git",
+            "AWM_DELIVERY_SHADOW_GIT_DIR": str(remote),
         }
     )
 
@@ -501,15 +519,22 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         push_status,
         no_verify_status,
         hook_override_status,
+        separated_git_dir_status,
+        direct_git_status,
+        exposed_real_git,
+        exposed_shadow_git_dir,
         token,
         github_token,
         config_exposed,
         status,
-    ) = result.stdout.strip().split("|", 7)
+    ) = result.stdout.strip().split("|", 11)
     assert commit_status == "0"
     assert push_status != "0"
     assert no_verify_status != "0"
     assert hook_override_status != "0"
+    assert separated_git_dir_status != "0"
+    assert direct_git_status != "0"
+    assert exposed_real_git == exposed_shadow_git_dir == "unset"
     assert token == github_token == "unset"
     assert config_exposed == "0"
     assert status == ""
@@ -558,6 +583,8 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         "refs/heads/forbidden",
         "refs/heads/forbidden-no-verify",
         "refs/heads/forbidden-hook-override",
+        "refs/heads/forbidden-separated-git-dir",
+        "refs/heads/forbidden-direct",
     ):
         assert (
             subprocess.run(
@@ -663,10 +690,16 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
     fake_worker = tmp_path / "codex"
     fake_worker.write_text(
         "#!/bin/sh\n"
+        "shadow=\n"
+        "previous=\n"
+        "for argument do\n"
+        '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
+        "    previous=$argument\n"
+        "done\n"
         "hooks=${GH_CONFIG_DIR%/gh}\n"
-        'printf \'%s\\n%s\\n\' "$hooks" "$AWM_DELIVERY_SHADOW_GIT_DIR" '
+        'printf \'%s\\n%s\\n\' "$hooks" "$shadow" '
         '> "$AWM_TEST_RESOURCE_RECORD"\n'
-        'for directory in "$hooks" "$AWM_DELIVERY_SHADOW_GIT_DIR"; do\n'
+        'for directory in "$hooks" "$shadow"; do\n'
         '    mkdir "$directory/write-protected"\n'
         '    : > "$directory/write-protected/file"\n'
         '    chmod 400 "$directory/write-protected/file"\n'
@@ -732,8 +765,14 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
     fake_worker = fake_bin / "codex"
     fake_worker.write_text(
         "#!/bin/sh\n"
-        "printf '%s\\n%s\\n' \"${GH_CONFIG_DIR%/gh}\" "
-        '"$AWM_DELIVERY_SHADOW_GIT_DIR" > "$AWM_TEST_RESOURCE_RECORD"\n'
+        "shadow=\n"
+        "previous=\n"
+        "for argument do\n"
+        '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
+        "    previous=$argument\n"
+        "done\n"
+        'printf \'%s\\n%s\\n\' "${GH_CONFIG_DIR%/gh}" "$shadow" '
+        '> "$AWM_TEST_RESOURCE_RECORD"\n'
         "while :; do sleep 1; done\n",
         encoding="utf-8",
     )
@@ -795,8 +834,13 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         assert len(resources) == 2
         assert all(not Path(resource).exists() for resource in resources)
         removals = removal_record.read_text(encoding="utf-8").splitlines()
-        assert len(removals) == 2
-        assert {removal.removeprefix("-rf -- ") for removal in removals} == set(
+        directory_removals = [
+            removal for removal in removals if removal.startswith("-rf")
+        ]
+        assert len(directory_removals) == 2
+        assert {
+            removal.removeprefix("-rf -- ") for removal in directory_removals
+        } == set(
             resources
         )
     finally:
@@ -850,6 +894,104 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
     assert not Path(hook_record.read_text(encoding="utf-8").strip()).exists()
 
 
+@pytest.mark.parametrize("blocked_call", [1, 2], ids=("hooks", "shadow"))
+@pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
+def test_publication_disabled_signal_cleans_create_then_blocking_mktemp(
+    blocked_call: int, use_pty: bool, tmp_path: Path
+) -> None:
+    initialize_test_repository(tmp_path)
+    resource_record = tmp_path / "created-resources"
+    call_record = tmp_path / "mktemp-calls"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_mktemp = shutil.which("mktemp")
+    assert real_mktemp is not None
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        "#!/bin/sh\n"
+        "call=0\n"
+        'if [ -f "$AWM_TEST_CALL_RECORD" ]; then '
+        'IFS= read -r call < "$AWM_TEST_CALL_RECORD"; fi\n'
+        "call=$((call + 1))\n"
+        'printf \'%s\\n\' "$call" > "$AWM_TEST_CALL_RECORD"\n'
+        f'created=$("{real_mktemp}" "$@") || exit $?\n'
+        'printf \'%s\\n\' "$created"\n'
+        'printf \'%s\\n\' "$created" >> "$AWM_TEST_RESOURCE_RECORD"\n'
+        'if [ "$call" -eq "$AWM_TEST_BLOCK_CALL" ]; then\n'
+        "    while :; do sleep 1; done\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_BLOCK_CALL": str(blocked_call),
+            "AWM_TEST_CALL_RECORD": str(call_record),
+            "AWM_TEST_RESOURCE_RECORD": str(resource_record),
+        }
+    )
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        "codex", "not reached"
+    )
+    master_fd: int | None = None
+    slave_fd: int | None = None
+    stdin: int = subprocess.DEVNULL
+    if use_pty:
+        master_fd, slave_fd = pty.openpty()
+        stdin = slave_fd
+    process = subprocess.Popen(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if slave_fd is not None:
+        os.close(slave_fd)
+    resources: list[str] = []
+    try:
+        deadline = time.monotonic() + 5
+        while process.poll() is None:
+            if resource_record.exists():
+                resources = resource_record.read_text(encoding="utf-8").splitlines()
+                if len(resources) == blocked_call:
+                    break
+            if time.monotonic() >= deadline:
+                pytest.fail("blocking mktemp did not record its created directory")
+            time.sleep(0.01)
+        if len(resources) != blocked_call:
+            pytest.fail("mktemp exited before the acquisition could be interrupted")
+
+        os.killpg(process.pid, signal.SIGTERM)
+        process.communicate(timeout=5)
+
+        assert process.returncode == 143
+        assert all(not Path(resource).exists() for resource in resources)
+        hooks_root = Path(
+            subprocess.run(
+                ["git", "-C", str(tmp_path), "rev-parse", "--git-path", "hooks"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        assert not list(hooks_root.glob(".awm-delivery.*.resources"))
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        if master_fd is not None:
+            os.close(master_fd)
+        for resource in resources:
+            shutil.rmtree(resource, ignore_errors=True)
+
+
 @pytest.mark.parametrize("agent_status", [0, 29], ids=("success", "agent-failure"))
 @pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
 def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_status(
@@ -863,8 +1005,14 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     fake_worker = fake_bin / "codex"
     fake_worker.write_text(
         "#!/bin/sh\n"
-        "printf '%s\\n%s\\n' \"${GH_CONFIG_DIR%/gh}\" "
-        '"$AWM_DELIVERY_SHADOW_GIT_DIR" > "$AWM_TEST_RESOURCE_RECORD"\n'
+        "shadow=\n"
+        "previous=\n"
+        "for argument do\n"
+        '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
+        "    previous=$argument\n"
+        "done\n"
+        'printf \'%s\\n%s\\n\' "${GH_CONFIG_DIR%/gh}" "$shadow" '
+        '> "$AWM_TEST_RESOURCE_RECORD"\n'
         f"exit {agent_status}\n",
         encoding="utf-8",
     )
@@ -913,12 +1061,17 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
             in result.stdout + result.stderr
         )
         removals = removal_record.read_text(encoding="utf-8").splitlines()
-        assert len(removals) == 2
-        assert {removal.removeprefix("-rf -- ") for removal in removals} == set(
+        directory_removals = [
+            removal for removal in removals if removal.startswith("-rf")
+        ]
+        assert len(directory_removals) == 2
+        assert {
+            removal.removeprefix("-rf -- ") for removal in directory_removals
+        } == set(
             resources
         )
         cleanup_pids = cleanup_pid_record.read_text(encoding="utf-8").splitlines()
-        assert len(cleanup_pids) == 2
+        assert len(cleanup_pids) == 3
         for cleanup_pid in cleanup_pids:
             with pytest.raises(ProcessLookupError):
                 os.kill(int(cleanup_pid), 0)
@@ -1382,6 +1535,7 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
 
     repository = tmp_path / "repository"
     checkout = tmp_path / "linked-checkout"
+    remote = tmp_path / "forbidden-remote.git"
     subprocess.run(
         ["git", "init", "-b", "main", str(repository)],
         check=True,
@@ -1401,6 +1555,9 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
     )
     subprocess.run(
         ["git", "-C", str(repository), "branch", "feature/sibling"], check=True
+    )
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
     )
     subprocess.run(
         [
@@ -1480,9 +1637,13 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         '"$AWM_TEST_REAL_GIT" update-ref "$AWM_TEST_ACTIVE_REF_NAME" '
         '"$AWM_TEST_BASE" >/dev/null 2>&1\n'
         "direct_git=$?\n"
-        'printf \'%s %s %s %s %s %s %s %s\\n\' "$forward" "$rewrite" '
+        '"$AWM_TEST_REAL_GIT" --git-dir="$AWM_TEST_SANDBOX_SHADOW" '
+        'push --no-verify "$AWM_TEST_REMOTE" '
+        "HEAD:refs/heads/forbidden >/dev/null 2>&1\n"
+        "direct_push=$?\n"
+        'printf \'%s %s %s %s %s %s %s %s %s\\n\' "$forward" "$rewrite" '
         '"$tag" "$active" "$sibling" "$reflog" "$git_pointer" '
-        '"$direct_git" > sandbox-results\n',
+        '"$direct_git" "$direct_push" > sandbox-results\n',
         encoding="utf-8",
     )
     payload.chmod(0o755)
@@ -1498,6 +1659,7 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         "import sys\n"
         "arguments = sys.argv[1:]\n"
         "shadow = arguments[arguments.index('--add-dir') + 1]\n"
+        "os.environ['AWM_TEST_SANDBOX_SHADOW'] = shadow\n"
         "engine = os.environ['AWM_TEST_SANDBOX_ENGINE']\n"
         "payload = os.environ['AWM_TEST_SANDBOX_PAYLOAD']\n"
         "if os.environ['AWM_TEST_SANDBOX_KIND'] == 'codex':\n"
@@ -1539,6 +1701,7 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
             "AWM_TEST_BASE": base,
             "AWM_TEST_COMMON_GIT_DIR": str(common_git_dir),
             "AWM_TEST_REAL_GIT": shutil.which("git") or "git",
+            "AWM_TEST_REMOTE": str(remote),
             "AWM_TEST_SANDBOX_ENGINE": sandbox_engine,
             "AWM_TEST_SANDBOX_KIND": worker,
             "AWM_TEST_SANDBOX_PAYLOAD": str(payload),
@@ -1563,6 +1726,21 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
     assert protected_contents[git_pointer] == git_pointer.read_bytes()
     assert active_ref.read_text(encoding="utf-8").strip() != base
     assert active_log.read_bytes().startswith(protected_contents[active_log])
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(remote),
+                "show-ref",
+                "--verify",
+                "refs/heads/forbidden",
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
     assert (
         subprocess.run(
             ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
