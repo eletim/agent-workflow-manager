@@ -642,6 +642,7 @@ class IssueDrivenRepositoryConfig:
 class IssueDrivenConfig:
     repositories: tuple[IssueDrivenRepositoryConfig, ...]
     max_reviews: int
+    whole_max_reviews: int
     merge_to_integration: bool
     final_review: bool
     merge_final: bool
@@ -680,6 +681,7 @@ class IssueDrivenConfig:
             "mode": "issue-driven",
             "make_integration_branch": self.make_integration_branch,
             "max_reviews": self.max_reviews,
+            "whole_max_reviews": self.whole_max_reviews,
             "scope_max_reviews": self.scope_max_reviews,
             "turn_timeout": self.turn_timeout,
             "merge_to_integration": self.merge_to_integration,
@@ -725,6 +727,7 @@ _REQUIRED_FIELDS = {
 _OPTIONAL_FIELDS = {
     "mode",
     "make_integration_branch",
+    "whole_max_reviews",
     "scope_max_reviews",
     "turn_timeout",
     "implementer_agent",
@@ -1061,6 +1064,17 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
         findings.append(
             IssueDrivenFinding("$.max_reviews", "must be an integer from 1 to 100")
         )
+    whole_max_reviews = value.get("whole_max_reviews", max_reviews)
+    if "whole_max_reviews" in value and (
+        isinstance(whole_max_reviews, bool)
+        or not isinstance(whole_max_reviews, int)
+        or not 1 <= whole_max_reviews <= 100
+    ):
+        findings.append(
+            IssueDrivenFinding(
+                "$.whole_max_reviews", "must be an integer from 1 to 100"
+            )
+        )
     scope_max_reviews = value.get("scope_max_reviews", 3)
     if (
         isinstance(scope_max_reviews, bool)
@@ -1168,6 +1182,7 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
         ),
         make_integration_branch=value.get("make_integration_branch", False),
         max_reviews=value["max_reviews"],
+        whole_max_reviews=whole_max_reviews,
         merge_to_integration=value["merge_to_integration"],
         final_review=value["final_review"],
         merge_final=value["merge_final"],
@@ -1314,6 +1329,7 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
         repositories=repositories,
         make_integration_branch=first.make_integration_branch,
         max_reviews=first.max_reviews,
+        whole_max_reviews=first.whole_max_reviews,
         merge_to_integration=first.merge_to_integration,
         final_review=first.final_review,
         merge_final=first.merge_final,
