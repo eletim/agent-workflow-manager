@@ -552,9 +552,15 @@ def delivery_metadata_lock_path(checkout: Path) -> Path:
             text=True,
         ).stdout.strip()
     )
-    lock_key = hashlib.sha256(
-        f"{ref_path.parent}\n{log_path.parent}\n".encode()
-    ).hexdigest()
+    ref_scope = ref.rsplit("/", 1)[0]
+    if ref_scope.startswith("refs/heads/"):
+        namespace = ref_scope.removeprefix("refs/heads/").split("/", 1)[0]
+        lock_ref = common_dir / "refs" / "heads" / namespace
+        lock_log = common_dir / "logs" / "refs" / "heads" / namespace
+    else:
+        lock_ref = ref_path.parent
+        lock_log = log_path.parent
+    lock_key = hashlib.sha256(f"{lock_ref}\n{lock_log}\n".encode()).hexdigest()
     return common_dir / "hooks" / f"awm-delivery-{lock_key}.lock"
 
 
@@ -628,12 +634,24 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    private_object_directories = {
+        path
+        for path in writable_directories
+        if Path(path).parent == Path(common_dir) / "objects"
+        and Path(path).name.startswith("awm-delivery.")
+    }
+    assert len(private_object_directories) == 1
+    private_object_directory = private_object_directories.pop()
     assert writable_directories == {
         git_dir,
-        str(Path(common_dir) / "objects"),
+        private_object_directory,
         str(Path(common_dir) / "refs" / "heads" / "feature"),
         str(Path(common_dir) / "logs" / "refs" / "heads" / "feature"),
     }
+    assert str(Path(common_dir) / "objects") not in writable_directories
+    assert private_object_directory in (
+        Path(common_dir) / "objects" / "info" / "alternates"
+    ).read_text(encoding="utf-8").splitlines()
     assert common_dir not in writable_directories
     assert (
         subprocess.run(
@@ -860,11 +878,81 @@ def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
+@pytest.mark.parametrize(
+    "metadata", ["HEAD", "commondir", "gitdir", "active-log", "sibling-log"]
+)
+def test_publication_disabled_rejects_metadata_symlinks(
+    worker: str, metadata: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    git_dir = Path(
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    if metadata == "active-log":
+        target = repository / ".git/logs/refs/heads/feature/scoped-commit"
+    elif metadata == "sibling-log":
+        target = repository / ".git/logs/refs/heads/feature/sibling"
+    else:
+        target = git_dir / metadata
+    original = target.read_bytes()
+    replacement = tmp_path / f"{metadata}-replacement"
+    replacement.write_bytes(original)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        f"rm -- {shlex.quote(str(target))}\n"
+        f"ln -s -- {shlex.quote(str(replacement))} {shlex.quote(str(target))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "replace metadata"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "changes rolled back" in result.stderr
+    assert not target.is_symlink()
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_requires_overlapping_metadata_exclusion(
     worker: str, tmp_path: Path
 ) -> None:
-    _, checkout = linked_delivery_checkout(tmp_path)
-    lock_path = delivery_metadata_lock_path(checkout)
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    nested_checkout = tmp_path / "nested checkout"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/nested/scoped-commit",
+            str(nested_checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    lock_path = delivery_metadata_lock_path(nested_checkout)
+    assert lock_path == delivery_metadata_lock_path(checkout)
     lock_path.parent.mkdir(exist_ok=True)
     launched = tmp_path / "launched"
     fake_bin = tmp_path / "bin"
