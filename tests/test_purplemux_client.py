@@ -542,9 +542,8 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     assert len(writable_directories) == 1
     (shadow_git_path,) = writable_directories
     shadow_git_dir = Path(shadow_git_path)
-    assert shadow_git_dir.name == "shadow.git"
-    assert shadow_git_dir.parent.name.startswith("awm-delivery.")
-    assert shadow_git_dir.parent.parent == Path(common_dir) / "hooks"
+    assert shadow_git_dir.name.startswith("awm-delivery-shadow.")
+    assert Path(common_dir) not in shadow_git_dir.parents
     assert git_dir not in writable_directories
     assert common_dir not in writable_directories
     assert str(Path(common_dir) / "objects") not in writable_directories
@@ -868,6 +867,21 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
     sibling_ref = git_path("refs/heads/feature/sibling")
     active_log = git_path("logs/refs/heads/feature/scoped-commit")
     git_pointer = checkout / ".git"
+    common_git_dir = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
     protected_contents = {
         path: path.read_bytes()
         for path in (active_ref, sibling_ref, active_log, git_pointer)
@@ -925,11 +939,15 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         "else:\n"
         "    settings = json.loads(arguments[arguments.index('--settings') + 1])\n"
         "    deny_write = settings['sandbox']['filesystem']['denyWrite']\n"
+        "    mandatory_deny_write = [\n"
+        "        os.path.join(os.environ['AWM_TEST_COMMON_GIT_DIR'], 'config'),\n"
+        "        os.path.join(os.environ['AWM_TEST_COMMON_GIT_DIR'], 'hooks'),\n"
+        "    ]\n"
         "    command = [engine, '--die-with-parent', '--new-session', '--unshare-net',\n"
         "        '--ro-bind', '/', '/', '--dev-bind', '/dev', '/dev',\n"
         "        '--proc', '/proc', '--bind', os.getcwd(), os.getcwd(),\n"
         "        '--bind', shadow, shadow]\n"
-        "    for denied in deny_write:\n"
+        "    for denied in deny_write + mandatory_deny_write:\n"
         "        denied_path = (denied if os.path.isabs(denied) else\n"
         "            os.path.realpath(os.path.join(os.getcwd(), denied)))\n"
         "        command.extend(['--ro-bind', denied_path, denied_path])\n"
@@ -947,6 +965,7 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
             "AWM_TEST_ACTIVE_REF": str(active_ref),
             "AWM_TEST_ACTIVE_REF_NAME": "refs/heads/feature/scoped-commit",
             "AWM_TEST_BASE": base,
+            "AWM_TEST_COMMON_GIT_DIR": str(common_git_dir),
             "AWM_TEST_REAL_GIT": shutil.which("git") or "git",
             "AWM_TEST_SANDBOX_ENGINE": sandbox_engine,
             "AWM_TEST_SANDBOX_KIND": worker,

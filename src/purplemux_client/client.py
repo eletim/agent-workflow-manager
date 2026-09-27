@@ -1746,9 +1746,11 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             "umask 077 && "
             "awm_delivery_hooks=$(mktemp -d "
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
-            'awm_delivery_shadow_git_dir="$awm_delivery_hooks/shadow.git" && '
+            "awm_delivery_shadow_git_dir=$(mktemp -d "
+            '"/tmp/awm-delivery-shadow.XXXXXX") && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
-            "trap 'rm -r -- \"$awm_delivery_hooks\"' EXIT && "
+            "trap 'rm -r -- \"$awm_delivery_hooks\" "
+            "\"$awm_delivery_shadow_git_dir\"' EXIT && "
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
             f"printf %s {pre_push_hook} | base64 --decode > "
