@@ -36,6 +36,7 @@ from purplemux_client.git import (
     FeaturePreparationState,
     FeatureRecoveryState,
     GitRepository,
+    LocalRefState,
     WorktreeState,
     agent_commit_coauthor,
 )
@@ -61,6 +62,7 @@ from purplemux_client.issue_driven import (
 )
 from purplemux_client.operations import MutationConflict
 from purplemux_client.progress import (
+    emit_agent_turn,
     emit_finding,
     emit_issue_driven_context,
     emit_issue_driven_repositories,
@@ -91,6 +93,7 @@ __all__ = [
     "FeatureRecoveryState",
     "GitHubRepository",
     "GitRepository",
+    "LocalRefState",
     "IncompletePullRequestEnumeration",
     "IssueDrivenConfig",
     "IssueDrivenFinding",
@@ -118,6 +121,7 @@ __all__ = [
     "WorktreeState",
     "agent_commit_coauthor",
     "emit_step",
+    "emit_agent_turn",
     "emit_finding",
     "emit_issue_driven_context",
     "emit_issue_driven_repository",

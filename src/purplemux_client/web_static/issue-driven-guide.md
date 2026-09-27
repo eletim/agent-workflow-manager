@@ -125,11 +125,13 @@ Review uses `scope_max_reviews` (default 3) to check that the change is necessar
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
 safety, regressions, and tests; Whole Review also uses `max_reviews`. After any
-configured Scenario Gate, each eligible integration head receives the dedicated
-Design Principles review, the cross-Issue Whole-version review, and an
-independent Version / README review, in that order. The Design Principles turn
+configured Scenario Gate, each eligible integration head receives a dedicated
+Design Principles review when `docs/design-principles.md` exists at that exact
+head, then the cross-Issue Whole-version review and an independent Version /
+README review. When applicable, the Design Principles turn
 reads `docs/design-principles.md` from the exact integration head and checks
-solely for conformance with that authoritative document. Their findings are
+solely for conformance with that authoritative document. Its absence is normal
+and does not request creation or restoration. The independent findings are
 aggregated into one fix turn, and a changed head repeats every review within the
 bounded loop.
 The recommended six/four allocation reserves Scope capacity for required rechecks

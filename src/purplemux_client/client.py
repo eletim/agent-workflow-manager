@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -11,7 +12,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from purplemux_client.codex_trust import ensure_codex_project_trust
 from purplemux_client.correlation import run_correlation
@@ -43,7 +44,8 @@ class CreateSessionRequest:
     PurpleMux owns provider launch commands and the workspace directory. `worker`
     selects the provider; `cwd`, `command`, and `metadata` describe caller intent and
     are retained for generated-workflow APIs. A supplied `name` is also the logical
-    resource name used for automatic run-scoped correlation.
+    resource name used for automatic run-scoped correlation. `restriction` selects
+    an explicit reusable capability boundary for commit-producing agent turns.
     """
 
     worker: str
@@ -53,6 +55,7 @@ class CreateSessionRequest:
     name: str | None = None
     correlation_id: str | None = None
     deadline_check: Callable[[], float] | None = None
+    restriction: Literal["local-git-only", "publication-disabled"] | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +159,14 @@ class ShellResult:
 class _ShellRun:
     result_path: str
     cwd: str | None
+
+
+@dataclass
+class _RestrictedSession:
+    worker: str
+    cwd: str
+    restriction: Literal["local-git-only", "publication-disabled"]
+    initial_prompt: str | None = None
 
 
 class SubprocessRunner(Protocol):
@@ -665,11 +676,28 @@ class PurpleMuxCLIClient:
         self._completed_turns: dict[str, dict[str, Any]] = {}
         self._shell_runs: dict[str, _ShellRun] = {}
         self._completed_shell_runs: dict[str, ShellResult] = {}
+        self._restricted_sessions: dict[str, _RestrictedSession] = {}
+
+    @staticmethod
+    def correlated_session_name(name: str, correlation_id: str) -> str:
+        """Return the exact public display name for a correlated Agent tab."""
+        _validate_correlation(correlation_id)
+        if not name.strip() or "\0" in name:
+            raise ValueError("tab name must be non-empty and contain no nulls")
+        if correlation_id in name:
+            return name
+        return f"{name} [awm:{correlation_id}]"
 
     def create_session(self, request: CreateSessionRequest) -> str:
         """Create and launch a Codex or Claude session."""
         if request.deadline_check is not None:
             request.deadline_check()
+        if request.restriction not in (
+            None,
+            "local-git-only",
+            "publication-disabled",
+        ):
+            raise ValueError("unsupported agent session restriction")
         panel_type = _PANEL_TYPES.get(request.worker.lower())
         if panel_type is None:
             panel_type = _PANEL_TYPES.get(request.command.lower())
@@ -702,16 +730,26 @@ class PurpleMuxCLIClient:
         )
         _validate_correlation(correlation_id)
         name = request.name or f"awm-{panel_type}-{correlation_id}"
-        if request.name is not None and correlation_id not in name:
-            name = f"{name} [awm:{correlation_id}]"
+        if request.name is not None:
+            name = self.correlated_session_name(name, correlation_id)
+        restricted = request.restriction is not None
         tab = self._create_correlated_tab(
-            panel_type=panel_type,
-            provider="codex" if panel_type == "codex-cli" else "claude",
+            panel_type="terminal" if restricted else panel_type,
+            provider=None
+            if restricted
+            else ("codex" if panel_type == "codex-cli" else "claude"),
             name=name,
             deadline_check=request.deadline_check,
+            bound_reads=restricted,
         )
         if self.owned_by_run:
             self._register_owned_tab(tab)
+        if restricted:
+            self._restricted_sessions[tab.id] = _RestrictedSession(
+                "codex" if panel_type == "codex-cli" else "claude",
+                launch_directory,
+                request.restriction,
+            )
         return tab.id
 
     def list_sessions(
@@ -926,6 +964,27 @@ class PurpleMuxCLIClient:
             self._register_owned_tab(tab)
         session_id = tab.id
 
+        self._start_shell_run(
+            session_id,
+            request,
+            cwd,
+            on_created=on_created,
+        )
+        return session_id
+
+    def _start_shell_run(
+        self,
+        session_id: str,
+        request: ShellCommandRequest,
+        cwd: str,
+        *,
+        on_created: Callable[[str, str], None] | None = None,
+    ) -> None:
+        prior = self._shell_runs.pop(session_id, None)
+        self._completed_shell_runs.pop(session_id, None)
+        if prior is not None:
+            self._cleanup_shell_result(prior)
+
         result_dir = tempfile.mkdtemp(prefix="awm-shell-")
         result_path = os.path.join(result_dir, "result.json")
         if self.owned_by_run:
@@ -961,7 +1020,6 @@ class PurpleMuxCLIClient:
             raise WorkerFailure(
                 f"shell terminal {session_id} was created but command start failed: {exc}"
             ) from exc
-        return session_id
 
     @staticmethod
     def _register_owned_tab(tab: TabState) -> None:
@@ -1033,6 +1091,13 @@ class PurpleMuxCLIClient:
 
     def wait_until_ready(self, session_id: str, timeout_seconds: float) -> None:
         """Wait until the agent can accept input."""
+        if session_id in self._restricted_sessions:
+            status = self._status(session_id)
+            if status.get("panelType") != "terminal" or status.get("alive") is False:
+                raise WorkerFailure(
+                    f"restricted session {session_id} terminal is unavailable"
+                )
+            return
         deadline = self._monotonic() + timeout_seconds
         while True:
             status = self._status(session_id)
@@ -1062,6 +1127,29 @@ class PurpleMuxCLIClient:
         """Submit one prompt after recording a correlation baseline."""
         if not text:
             raise ValueError("text must not be empty")
+        restricted = self._restricted_sessions.get(session_id)
+        if restricted is not None:
+            prompt = text
+            if restricted.initial_prompt is None:
+                restricted.initial_prompt = text
+            else:
+                prompt = f"{restricted.initial_prompt}\n\nFollow-up instruction:\n{text}"
+            self._start_shell_run(
+                session_id,
+                ShellCommandRequest(
+                    (
+                        self._restricted_agent_command(restricted.worker, prompt)
+                        if restricted.restriction == "local-git-only"
+                        else self._publication_disabled_agent_command(
+                            restricted.worker, prompt
+                        )
+                    ),
+                    restricted.cwd,
+                    "Restricted agent turn",
+                ),
+                restricted.cwd,
+            )
+            return
         baseline = self._read_turn_baseline(session_id)
         self._send_mutation(session_id, text, operation="send")
         self._turn_baselines[session_id] = baseline
@@ -1081,6 +1169,9 @@ class PurpleMuxCLIClient:
         stays busy. A subsequent non-busy state gets a bounded grace period to
         publish a fresh result; returning to busy cancels that grace period.
         """
+        if session_id in self._restricted_sessions:
+            self.wait_for_shell_completion(session_id, timeout_seconds)
+            return
         deadline = self._monotonic() + timeout_seconds
         baseline = self._turn_baselines.get(session_id)
         if baseline is None:
@@ -1158,6 +1249,14 @@ class PurpleMuxCLIClient:
 
     def read_result(self, session_id: str) -> str:
         """Read the latest structured result, rejecting stale pending-turn data."""
+        if session_id in self._restricted_sessions:
+            result = self.read_shell_result(session_id)
+            if result.exit_code != 0:
+                raise WorkerFailure(result.failure_message("restricted agent turn"))
+            output = result.stdout.strip()
+            if not output:
+                raise WorkerFailure("restricted agent returned an empty result")
+            return output
         data = self._completed_turns.pop(session_id, None)
         if data is None:
             data = self._result_data(session_id)
@@ -1262,6 +1361,7 @@ class PurpleMuxCLIClient:
             )
         self._turn_baselines.pop(session_id, None)
         self._completed_turns.pop(session_id, None)
+        self._restricted_sessions.pop(session_id, None)
         shell_run = self._shell_runs.pop(session_id, None)
         self._completed_shell_runs.pop(session_id, None)
         if shell_run is not None:
@@ -1278,6 +1378,672 @@ class PurpleMuxCLIClient:
         if not isinstance(content, str):
             raise WorkerFailure("PurpleMux capture did not return text content")
         return content
+
+    @staticmethod
+    def _restricted_agent_command(worker: str, prompt: str) -> str:
+        """Launch a Recovery agent with tightly bounded local Git capability."""
+        encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        reference_hook = base64.b64encode(
+            b"""#!/bin/sh
+phase=$1
+[ "$phase" = prepared ] || exit 0
+zero=0000000000000000000000000000000000000000
+while read old new ref; do
+    if [ "$ref" = ORIG_HEAD ]; then
+        protected=$(git rev-parse "$AWM_RECOVERY_PROTECTED_REF") || exit 1
+        [ "$new" = "$protected" ] || exit 1
+        continue
+    fi
+    [ "$ref" = HEAD ] || [ "$ref" = "$AWM_RECOVERY_PROTECTED_REF" ] || exit 1
+    [ "$old" != "$zero" ] || exit 1
+    [ "$new" != "$zero" ] || exit 1
+    git merge-base --is-ancestor "$old" "$new" || exit 1
+done
+"""
+        ).decode("ascii")
+        pre_push_hook = base64.b64encode(b"#!/bin/sh\nexit 1\n").decode("ascii")
+        environment_options = [
+            "env",
+            "-u",
+            "GIT_ASKPASS",
+            "-u",
+            "SSH_ASKPASS",
+            "-u",
+            "SSH_AUTH_SOCK",
+            "-u",
+            "GIT_DIR",
+            "-u",
+            "GIT_WORK_TREE",
+        ]
+        git_environment = [
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_TERMINAL_PROMPT=0",
+            "GCM_INTERACTIVE=never",
+            "GIT_SSH_COMMAND=false",
+            "GIT_CONFIG_COUNT=2",
+            "GIT_CONFIG_KEY_0=credential.helper",
+            "GIT_CONFIG_VALUE_0=",
+            "GIT_CONFIG_KEY_1=core.hooksPath",
+        ]
+        if worker == "codex":
+            command = [
+                *environment_options,
+                "-u",
+                "GH_TOKEN",
+                "-u",
+                "GITHUB_TOKEN",
+                *git_environment,
+                "GH_CONFIG_DIR=/dev/null",
+                "codex",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "--search",
+                "--config",
+                "sandbox_workspace_write.network_access=false",
+                "--config",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                "--config",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "exec",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--color",
+                "never",
+                "--cd",
+                ".",
+                "-",
+            ]
+        elif worker == "claude":
+            safe_tools = ",".join(
+                (
+                    "Read",
+                    "Edit",
+                    "Write",
+                    "Glob",
+                    "Grep",
+                    "WebFetch",
+                    "Bash(git add *)",
+                    "Bash(git branch --show-current)",
+                    "Bash(git commit -m *)",
+                    "Bash(git diff *)",
+                    "Bash(git log *)",
+                    "Bash(git merge --ff-only *)",
+                    "Bash(git merge-base *)",
+                    "Bash(git rev-parse *)",
+                    "Bash(git show *)",
+                    "Bash(git status *)",
+                    "Bash(gh pr view *)",
+                    "Bash(gh pr edit *)",
+                    "Bash(gh pr ready *)",
+                    "Bash(gh pr reopen *)",
+                    "Bash(gh issue view *)",
+                    "Bash(gh issue edit *)",
+                    "Bash(gh issue close *)",
+                    "Bash(gh issue reopen *)",
+                    "Bash(gh issue comment *)",
+                )
+            )
+            command = [
+                *environment_options,
+                *git_environment,
+                "claude",
+                "--print",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--restricted",
+                "--allowed-tools",
+                safe_tools,
+                "--permission-mode",
+                "dontAsk",
+                "--permission-prompts",
+                "none",
+                "--output-format",
+                "text",
+            ]
+        else:
+            raise WorkerFailure("restricted session worker must be codex or claude")
+        launch = shlex.join(command)
+        return (
+            "awm_recovery_hooks_root=$(git rev-parse --git-path hooks) && "
+            "mkdir -p -- \"$awm_recovery_hooks_root\" && "
+            "awm_recovery_hooks_root=$(cd \"$awm_recovery_hooks_root\" && pwd -P) && "
+            'awm_recovery_hooks=$(mktemp -d '
+            '"$awm_recovery_hooks_root/awm-recovery.XXXXXX") && '
+            "trap 'rm -r -- \"$awm_recovery_hooks\"' EXIT && "
+            "awm_recovery_ref=$(git symbolic-ref -q HEAD) && "
+            f"printf %s {reference_hook} | base64 --decode > "
+            '"$awm_recovery_hooks/reference-transaction" && '
+            f"printf %s {pre_push_hook} | base64 --decode > "
+            '"$awm_recovery_hooks/pre-push" && '
+            'chmod 500 "$awm_recovery_hooks/reference-transaction" '
+            '"$awm_recovery_hooks/pre-push" && '
+            f"printf %s {encoded} | base64 --decode | "
+            'AWM_RECOVERY_PROTECTED_REF="$awm_recovery_ref" '
+            'GIT_CONFIG_VALUE_1="$awm_recovery_hooks" '
+            f"{launch}"
+        )
+
+    @staticmethod
+    def _publication_disabled_agent_command(worker: str, prompt: str) -> str:
+        """Launch a development agent with local commits but no publication."""
+        encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        reference_hook = base64.b64encode(
+            b"""#!/bin/sh
+phase=$1
+[ "$phase" = prepared ] || exit 0
+[ -n "${AWM_DELIVERY_PROTECTED_REF:-}" ] || exit 0
+zero=0000000000000000000000000000000000000000
+while read old new ref; do
+    if [ "$ref" = ORIG_HEAD ]; then
+        protected=$(git rev-parse "$AWM_DELIVERY_PROTECTED_REF") || exit 1
+        [ "$new" = "$protected" ] || exit 1
+        continue
+    fi
+    [ "$ref" = HEAD ] || [ "$ref" = "$AWM_DELIVERY_PROTECTED_REF" ] || exit 1
+    [ "$old" != "$zero" ] || exit 1
+    [ "$new" != "$zero" ] || exit 1
+    git merge-base --is-ancestor "$old" "$new" || exit 1
+done
+"""
+        ).decode("ascii")
+        pre_push_hook = base64.b64encode(b"#!/bin/sh\nexit 1\n").decode("ascii")
+        receive_pack_wrapper = base64.b64encode(
+            b"#!/bin/sh\n"
+            b"printf '%s\\n' 'git push is disabled for this session' >&2\n"
+            b"exit 1\n"
+        ).decode("ascii")
+        resource_allocator = base64.b64encode(
+            b"""import os
+import secrets
+import signal
+import sys
+
+manifest, parent, prefix = sys.argv[1:]
+blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+while True:
+    path = os.path.join(parent, prefix + secrets.token_hex(16))
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        continue
+    break
+try:
+    descriptor = os.open(manifest, os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(descriptor, os.fsencode(path) + b"\\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+except BaseException:
+    os.rmdir(path)
+    raise
+print(path, flush=True)
+signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+"""
+        ).decode("ascii")
+        git_wrapper = base64.b64encode(
+            b"""#!/bin/sh
+probe=$PWD
+command=
+real_path=$PATH
+while :; do
+    real_git=$(PATH=$real_path command -v git) || exit 1
+    case $real_git in
+        "$0") case $real_path in *:*) real_path=${real_path#*:} ;; *) exit 1 ;; esac ;;
+        /*) break ;;
+        *) exit 1 ;;
+    esac
+done
+wrapper_root=${0%/*}/..
+shadow_git_dir=$(tr -d '\n' < "$wrapper_root/shadow-git-dir") || exit 1
+protected_root=$(tr -d '\n' < "$wrapper_root/protected-root") || exit 1
+next_is_c=false
+skip_next=false
+for argument do
+    if [ "$skip_next" = true ]; then
+        skip_next=false
+        continue
+    fi
+    if [ "$next_is_c" = true ]; then
+        probe=$(cd "$probe" && cd "$argument" && pwd -P) || exec "$real_git" "$@"
+        next_is_c=false
+        continue
+    fi
+    case $argument in
+        -C) next_is_c=true ;;
+        -C?*) probe=$(cd "$probe" && cd "${argument#-C}" && pwd -P) || exec "$real_git" "$@" ;;
+        -c|-c?*|--config-env|--config-env=*) exit 1 ;;
+        --git-dir|--work-tree|--namespace|--super-prefix) skip_next=true ;;
+        -*) ;;
+        *) command=$argument; break ;;
+    esac
+done
+[ "$command" != push ] || exit 1
+root=$("$real_git" -C "$probe" rev-parse --show-toplevel 2>/dev/null) || {
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    exec "$real_git" "$@"
+}
+root=$(cd "$root" && pwd -P) || exit 1
+if [ "$root" = "$protected_root" ]; then
+    GIT_DIR=$shadow_git_dir
+    GIT_WORK_TREE=$protected_root
+    export GIT_DIR GIT_WORK_TREE
+else
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    unset AWM_DELIVERY_PROTECTED_REF
+fi
+exec "$real_git" "$@"
+"""
+        ).decode("ascii")
+        environment_options = [
+            "env",
+            "-u",
+            "GH_TOKEN",
+            "-u",
+            "GITHUB_TOKEN",
+            "-u",
+            "GIT_ASKPASS",
+            "-u",
+            "SSH_ASKPASS",
+            "-u",
+            "SSH_AUTH_SOCK",
+            "-u",
+            "GIT_DIR",
+            "-u",
+            "GIT_WORK_TREE",
+            "-u",
+            "GIT_INDEX_FILE",
+            "-u",
+            "GIT_OBJECT_DIRECTORY",
+            "-u",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "-u",
+            "AWM_DELIVERY_REAL_GIT",
+            "-u",
+            "AWM_DELIVERY_SHADOW_GIT_DIR",
+            "-u",
+            "AWM_DELIVERY_PROTECTED_ROOT",
+        ]
+        git_environment = [
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_TERMINAL_PROMPT=0",
+            "GCM_INTERACTIVE=never",
+            "GIT_SSH_COMMAND=false",
+            "GIT_CONFIG_COUNT=2",
+            "GIT_CONFIG_KEY_0=credential.helper",
+            "GIT_CONFIG_VALUE_0=",
+            "GIT_CONFIG_KEY_1=core.hooksPath",
+        ]
+        if worker == "codex":
+            command = [
+                *environment_options,
+                *git_environment,
+                "codex",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "--search",
+                "--config",
+                "sandbox_workspace_write.network_access=false",
+                "--config",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                "--config",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "exec",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--color",
+                "never",
+                "--cd",
+                ".",
+                "-",
+            ]
+        elif worker == "claude":
+            sandbox_settings = json.dumps(
+                {
+                    "sandbox": {
+                        "enabled": True,
+                        "allowUnsandboxedCommands": False,
+                        "failIfUnavailable": True,
+                        "filesystem": {"denyWrite": ["./.git"]},
+                        "network": {
+                            "allowedDomains": [],
+                            "deniedDomains": ["github.com", "*.github.com"],
+                            "strictAllowlist": True,
+                        },
+                        "credentials": {
+                            "envVars": [
+                                {"name": "GH_TOKEN", "mode": "deny"},
+                                {"name": "GITHUB_TOKEN", "mode": "deny"},
+                            ],
+                            "files": [
+                                {"path": "~/.config/gh", "mode": "deny"},
+                                {"path": "~/.git-credentials", "mode": "deny"},
+                                {"path": "~/.ssh", "mode": "deny"},
+                            ],
+                        },
+                    }
+                },
+                separators=(",", ":"),
+            )
+            safe_tools = ",".join(
+                (
+                    "Read",
+                    "Edit",
+                    "Write",
+                    "Glob",
+                    "Grep",
+                    "WebFetch",
+                    "Bash",
+                )
+            )
+            command = [
+                *environment_options,
+                *git_environment,
+                "claude",
+                "--print",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--restricted",
+                "--settings",
+                sandbox_settings,
+                "--allowed-tools",
+                safe_tools,
+                "--permission-mode",
+                "dontAsk",
+                "--permission-prompts",
+                "none",
+                "--output-format",
+                "text",
+            ]
+        else:
+            raise WorkerFailure(
+                "publication-disabled session worker must be codex or claude"
+            )
+        additional_git_directories = '--add-dir "$awm_delivery_shadow_git_dir"'
+        option_index = (
+            command.index("exec") if worker == "codex" else command.index("claude") + 1
+        )
+        launch = (
+            f"{shlex.join(command[:option_index])} {additional_git_directories} "
+            f"{shlex.join(command[option_index:])}"
+        )
+        return (
+            "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY "
+            "GIT_EXEC_PATH "
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES && "
+            "awm_delivery_real_git=$(command -v git) && "
+            'case "$awm_delivery_real_git" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_chmod=$(command -v chmod) && "
+            'case "$awm_delivery_chmod" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_rm=$(command -v rm) && "
+            'case "$awm_delivery_rm" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_ln=$(command -v ln) && "
+            'case "$awm_delivery_ln" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_cp=$(command -v cp) && "
+            'case "$awm_delivery_cp" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_tar=$(command -v tar) && "
+            'case "$awm_delivery_tar" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_bwrap=$(command -v bwrap) || { "
+            "printf '%s\\n' 'publication-disabled sessions require Bubblewrap "
+            "(bwrap); install it and restart Agent Workflow Manager' >&2; "
+            "exit 1; } && "
+            'case "$awm_delivery_bwrap" in /*) ;; *) exit 1 ;; esac && '
+            'if ! "$awm_delivery_bwrap" --die-with-parent --new-session '
+            "--ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp "
+            "-- /bin/true "
+            ">/dev/null 2>&1; then "
+            "printf '%s\\n' 'Bubblewrap cannot create the required sandbox; "
+            "enable unprivileged user namespaces or install a distribution "
+            "Bubblewrap package with supported privilege setup' >&2; exit 1; fi && "
+            "awm_delivery_python=$(command -v python3) && "
+            'case "$awm_delivery_python" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_timeout=$(command -v timeout) && "
+            'case "$awm_delivery_timeout" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_original_path=$PATH && "
+            f"awm_delivery_worker=$(command -v {worker}) && "
+            'case "$awm_delivery_worker" in /*) ;; *) exit 1 ;; esac && '
+            'awm_delivery_worker_dir=${awm_delivery_worker%/*} && '
+            "awm_delivery_root=$(pwd -P) && "
+            'awm_delivery_resource_parent=${awm_delivery_root%/*} && '
+            '[ -n "$awm_delivery_resource_parent" ] || '
+            'awm_delivery_resource_parent=/ && '
+            "awm_delivery_git_dir=$(git rev-parse --path-format=absolute "
+            "--absolute-git-dir) && "
+            'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
+            "awm_delivery_common_git_dir=$(git rev-parse --path-format=absolute "
+            "--git-common-dir) && "
+            'awm_delivery_common_git_dir=$(cd "$awm_delivery_common_git_dir" '
+            '&& pwd -P) && '
+            "awm_delivery_object_dir=$(git rev-parse --path-format=absolute "
+            "--git-path objects) && "
+            'awm_delivery_object_dir=$(cd "$awm_delivery_object_dir" && pwd -P) && '
+            "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
+            'awm_delivery_old=$(git rev-parse "$awm_delivery_ref") && '
+            "awm_delivery_sparse=$(git config --bool core.sparseCheckout "
+            "2>/dev/null || :) && "
+            'if [ "$awm_delivery_sparse" = true ]; then '
+            "printf '%s\\n' 'publication-disabled sessions do not support "
+            "sparse checkouts' >&2; exit 1; fi && "
+            "awm_delivery_user_name=$(git config --get user.name) && "
+            "awm_delivery_user_email=$(git config --get user.email) && "
+            "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
+            'mkdir -p -- "$awm_delivery_hooks_root" && '
+            'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
+            "umask 077 && "
+            'awm_delivery_manifest="$awm_delivery_hooks_root/'
+            '.awm-delivery.$$.resources" && '
+            "awm_delivery_hooks='' && "
+            "awm_delivery_shadow_git_dir='' && "
+            "awm_delivery_isolated_root='' && "
+            "awm_delivery_cleanup() { "
+            "trap - EXIT HUP INT TERM; "
+            "awm_delivery_primary_status=$1; "
+            "awm_delivery_cleanup_failed=0; "
+            'if [ -f "$awm_delivery_manifest" ]; then '
+            'while IFS= read -r awm_delivery_cleanup_dir; do '
+            '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
+            '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
+            "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
+            '"$awm_delivery_rm" -rf -- "$awm_delivery_cleanup_dir" '
+            "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            'done < "$awm_delivery_manifest"; '
+            'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
+            '"$awm_delivery_rm" -f -- "$awm_delivery_manifest" '
+            "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            "fi; "
+            'if [ "$awm_delivery_cleanup_failed" -ne 0 ]; then '
+            "printf '%s\\n' 'publication-disabled session cleanup failed; "
+            "temporary resources may remain' >&2; "
+            'if [ "$awm_delivery_primary_status" -ne 0 ]; then '
+            'exit "$awm_delivery_primary_status"; '
+            "fi; "
+            "exit 1; "
+            "fi; "
+            'exit "$awm_delivery_primary_status"; '
+            "} && "
+            "trap 'awm_delivery_cleanup $?' EXIT && "
+            "trap 'awm_delivery_cleanup 129' HUP && "
+            "trap 'awm_delivery_cleanup 130' INT && "
+            "trap 'awm_delivery_cleanup 143' TERM && "
+            ': > "$awm_delivery_manifest" && '
+            f"awm_delivery_allocate=$(printf %s {resource_allocator} | "
+            "base64 --decode) && "
+            'awm_delivery_hooks=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_hooks_root" "awm-delivery.") && '
+            'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") && '
+            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
+            '"$awm_delivery_isolated_root/" && '
+            'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
+            f"printf %s {reference_hook} | base64 --decode > "
+            '"$awm_delivery_hooks/reference-transaction" && '
+            f"printf %s {pre_push_hook} | base64 --decode > "
+            '"$awm_delivery_hooks/pre-push" && '
+            f"printf %s {git_wrapper} | base64 --decode > "
+            '"$awm_delivery_hooks/bin/git" && '
+            f"printf %s {receive_pack_wrapper} | base64 --decode > "
+            '"$awm_delivery_hooks/bin/git-receive-pack" && '
+            'printf \'%s\\n\' "$awm_delivery_shadow_git_dir" > '
+            '"$awm_delivery_hooks/shadow-git-dir" && '
+            'printf \'%s\\n\' "$awm_delivery_root" > '
+            '"$awm_delivery_hooks/protected-root" && '
+            'chmod 500 "$awm_delivery_hooks/reference-transaction" '
+            '"$awm_delivery_hooks/pre-push" "$awm_delivery_hooks/bin/git" '
+            '"$awm_delivery_hooks/bin/git-receive-pack" && '
+            'chmod 400 "$awm_delivery_hooks/shadow-git-dir" '
+            '"$awm_delivery_hooks/protected-root" && '
+            'awm_delivery_git_exec_path=$("$awm_delivery_real_git" '
+            '--exec-path) && '
+            'case "$awm_delivery_git_exec_path" in /*) ;; *) exit 1 ;; esac && '
+            'for awm_delivery_git_helper in '
+            '"$awm_delivery_git_exec_path"/git-*; do '
+            '[ -f "$awm_delivery_git_helper" ] || continue; '
+            'awm_delivery_git_helper_name=${awm_delivery_git_helper##*/}; '
+            '[ "$awm_delivery_git_helper_name" = git-receive-pack ] || '
+            '"$awm_delivery_ln" -s -- "$awm_delivery_git_helper" '
+            '"$awm_delivery_hooks/bin/$awm_delivery_git_helper_name" || exit; '
+            'done && '
+            '"$awm_delivery_real_git" init --bare --quiet '
+            '"$awm_delivery_shadow_git_dir" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            "config core.bare false && "
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'config core.worktree "$awm_delivery_root" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'config user.name "$awm_delivery_user_name" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'config user.email "$awm_delivery_user_email" && '
+            "printf '%s\\n' \"$awm_delivery_object_dir\" > "
+            '"$awm_delivery_shadow_git_dir/objects/info/alternates" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'symbolic-ref HEAD "$awm_delivery_ref" && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            'update-ref "$awm_delivery_ref" "$awm_delivery_old" && '
+            'GIT_DIR="$awm_delivery_shadow_git_dir" '
+            'GIT_WORK_TREE="$awm_delivery_root" '
+            '"$awm_delivery_real_git" read-tree "$awm_delivery_old" && '
+            'PATH="$awm_delivery_hooks/bin:$PATH" && '
+            "export PATH && "
+            'set -- "$awm_delivery_bwrap" --die-with-parent --new-session '
+            '--ro-bind / / --dev-bind /dev /dev --proc /proc '
+            '--tmpfs /tmp '
+            '--bind "$awm_delivery_isolated_root" "$awm_delivery_root" '
+            '--bind "$awm_delivery_shadow_git_dir" '
+            '"$awm_delivery_shadow_git_dir" '
+            '--ro-bind "$awm_delivery_common_git_dir" '
+            '"$awm_delivery_common_git_dir" '
+            '--ro-bind "$awm_delivery_git_dir" "$awm_delivery_git_dir" '
+            '--ro-bind "$awm_delivery_object_dir" "$awm_delivery_object_dir" '
+            '--ro-bind "$awm_delivery_hooks" "$awm_delivery_hooks" '
+            '--chdir "$awm_delivery_root" && '
+            'case "$awm_delivery_worker_dir" in '
+            '"$awm_delivery_root"|"$awm_delivery_root"/*) ;; '
+            '*) set -- "$@" --ro-bind "$awm_delivery_worker_dir" '
+            '"$awm_delivery_worker_dir" ;; esac && '
+            f"printf %s {encoded} | base64 --decode | "
+            'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
+            'GH_CONFIG_DIR="$awm_delivery_hooks/gh" '
+            'GIT_EXEC_PATH="$awm_delivery_hooks/bin" '
+            'GIT_CONFIG_VALUE_1="$awm_delivery_hooks" '
+            f'"$@" {launch}; '
+            "awm_delivery_status=$?; "
+            "PATH=$awm_delivery_original_path; export PATH; "
+            '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
+            'awm_delivery_new=$(tr -d \'\\n\' < '
+            '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '
+            'case "$awm_delivery_new" in \'\'|*[!0-9a-f]*) exit 1 ;; esac && '
+            'awm_delivery_current=$("$awm_delivery_real_git" rev-parse '
+            '"$awm_delivery_ref") && '
+            '[ "$awm_delivery_current" = "$awm_delivery_old" ] && '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
+            '"$awm_delivery_real_git" cat-file -e "$awm_delivery_new^{commit}" && '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
+            '"$awm_delivery_real_git" merge-base --is-ancestor '
+            '"$awm_delivery_old" "$awm_delivery_new" && '
+            "printf '%s\\n^%s\\n' \"$awm_delivery_new\" "
+            '"$awm_delivery_old" | '
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
+            '"$awm_delivery_real_git" '
+            "pack-objects --quiet --stdout --revs | "
+            '"$awm_delivery_real_git" index-pack --stdin --fix-thin --strict '
+            ">/dev/null && "
+            'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
+            'AWM_DELIVERY_PROTECTED_ROOT="$awm_delivery_root" '
+            '"$awm_delivery_real_git" -c '
+            'core.hooksPath="$awm_delivery_hooks" update-ref '
+            '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" && '
+            '{ "$awm_delivery_real_git" read-tree --reset -u '
+            '"$awm_delivery_new"; '
+            "awm_delivery_index_status=$?; "
+            'if [ "$awm_delivery_index_status" -ne 0 ]; then '
+            'if ! "$awm_delivery_real_git" -c core.hooksPath=/dev/null '
+            'update-ref "$awm_delivery_ref" "$awm_delivery_old" '
+            '"$awm_delivery_new"; then '
+            "printf '%s\\n' 'publication-disabled delivery rollback failed' >&2; "
+            "fi; "
+            '"$awm_delivery_real_git" read-tree "$awm_delivery_old" '
+            "2>/dev/null || :; "
+            'exit "$awm_delivery_index_status"; '
+            "fi; } && "
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --cached --quiet --no-ext-diff; '
+            "awm_delivery_staged_status=$?; "
+            'if [ "$awm_delivery_staged_status" -eq 1 ]; then '
+            '"$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --cached --binary --no-ext-diff | '
+            '"$awm_delivery_real_git" apply --index --whitespace=nowarn; '
+            'elif [ "$awm_delivery_staged_status" -ne 0 ]; then '
+            'exit "$awm_delivery_staged_status"; fi && '
+            '"$awm_delivery_real_git" --git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --quiet --no-ext-diff; '
+            "awm_delivery_unstaged_status=$?; "
+            'if [ "$awm_delivery_unstaged_status" -eq 1 ]; then '
+            '"$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'diff --binary --no-ext-diff | '
+            '"$awm_delivery_real_git" apply --whitespace=nowarn; '
+            'elif [ "$awm_delivery_unstaged_status" -ne 0 ]; then '
+            'exit "$awm_delivery_unstaged_status"; fi && '
+            '"$awm_delivery_real_git" '
+            '--git-dir="$awm_delivery_shadow_git_dir" '
+            '--work-tree="$awm_delivery_isolated_root" '
+            'ls-files --others --exclude-standard -z | '
+            '(cd "$awm_delivery_isolated_root" && '
+            '"$awm_delivery_tar" --null --verbatim-files-from '
+            '--files-from=- --create --file=-) | '
+            '(cd "$awm_delivery_root" && '
+            '"$awm_delivery_tar" --extract --file=-)'
+        )
 
     def _with_shell_diagnostic(
         self, session_id: str, result: ShellResult

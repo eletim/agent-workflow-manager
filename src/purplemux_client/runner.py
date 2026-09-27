@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import codecs
 import fcntl
 import json
@@ -46,6 +47,7 @@ from purplemux_client.preflight import (
     WorkflowValidator,
 )
 from purplemux_client.progress import (
+    AGENT_TURN_TRACE_FILE_ENV,
     EVENT_TOKEN_ENV,
     EVENT_URL_ENV,
     MAX_PROGRESS_EVENT_BYTES,
@@ -146,6 +148,57 @@ class ProgressEvent:
     pr_url: str | None = None
     repository: str | None = None
     observed_at: str | None = None
+
+
+AgentTurnStatus = Literal["started", "completed", "failed"]
+
+
+@dataclass(frozen=True)
+class AgentTurnTrace:
+    turn_id: int
+    purpose: str
+    prompt: str
+    role: str
+    attempt: int
+    status: AgentTurnStatus
+    phase: str | None = None
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    transition_outcome: str | None = None
+    commit_sha: str | None = None
+    result: str | None = None
+    error: str | None = None
+    previous_turn_id: int | None = None
+    next_turn_id: int | None = None
+    repository: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class _AgentTurnTraceChunk:
+    message_id: str
+    chunk_index: int
+    chunk_count: int
+    data: str
+
+
+@dataclass(frozen=True)
+class _AgentTurnTransition:
+    turn_id: int
+    purpose: str
+    role: str
+    attempt: int
+    status: AgentTurnStatus
+    repository: str | None
+    phase: str | None = None
+    work_item_id: int | str | None = None
+    work_item_label: str | None = None
+    transition_outcome: str | None = None
+    commit_sha: str | None = None
+    prompt: str | None = None
+    result: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +494,56 @@ def _finding_json(finding: TopologyFinding) -> dict[str, object]:
     return payload
 
 
+def _agent_turn_json(turn: AgentTurnTrace) -> dict[str, object]:
+    return {
+        "turnId": turn.turn_id,
+        "purpose": turn.purpose,
+        "prompt": turn.prompt,
+        "role": turn.role,
+        "attempt": turn.attempt,
+        "status": turn.status,
+        "phase": turn.phase,
+        "workItemId": turn.work_item_id,
+        "workItemLabel": turn.work_item_label,
+        "transitionOutcome": turn.transition_outcome,
+        "commitSha": turn.commit_sha,
+        "result": turn.result,
+        "error": turn.error,
+        "previousTurnId": turn.previous_turn_id,
+        "nextTurnId": turn.next_turn_id,
+        "repository": turn.repository,
+        "startedAt": turn.started_at,
+        "completedAt": turn.completed_at,
+    }
+
+
+def _validated_issue_driven_preview(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"status", "phases", "agents"}:
+        raise ValueError("invalid Issue Driven run preview")
+    phases = value.get("phases")
+    agents = value.get("agents")
+    if (
+        value.get("status") != "planned"
+        or not isinstance(phases, list)
+        or not phases
+        or any(not isinstance(phase, str) or not phase for phase in phases)
+        or not isinstance(agents, list)
+        or not agents
+    ):
+        raise ValueError("invalid Issue Driven run preview")
+    copied_agents: list[dict[str, str]] = []
+    for agent in agents:
+        if not isinstance(agent, dict) or set(agent) != {"role", "agent", "purpose"}:
+            raise ValueError("invalid Issue Driven run preview")
+        if any(
+            not isinstance(agent.get(key), str) or not agent[key]
+            for key in ("role", "agent", "purpose")
+        ):
+            raise ValueError("invalid Issue Driven run preview")
+        copied_agents.append(cast(dict[str, str], dict(agent)))
+    return {"status": "planned", "phases": list(phases), "agents": copied_agents}
+
+
 @dataclass(frozen=True)
 class RunnerSnapshot:
     state: RunnerState
@@ -482,12 +585,15 @@ class RunnerSnapshot:
     issue_driven_repositories: tuple[IssueDrivenRepositorySummary, ...] = ()
     identity: str | None = None
     issue_driven_json: str | None = None
+    issue_driven_preview: dict[str, object] | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
     review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
+    resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
+    agent_turns: tuple[AgentTurnTrace, ...] = ()
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -507,12 +613,16 @@ class RunnerSnapshot:
             else "workflow"
         )
         issue_driven_json = payload.pop("issue_driven_json")
+        issue_driven_preview = payload.pop("issue_driven_preview")
         environment_setup_json = payload.pop("environment_setup_json")
         review_json = payload.pop("review_json")
         review_result = payload.pop("review_result")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
+        resumed_from_state = payload.pop("resumed_from_state")
         if issue_driven_json is not None:
             payload["issueDrivenJson"] = issue_driven_json
+            if issue_driven_preview is not None:
+                payload["runPreview"] = issue_driven_preview
         if environment_setup_json is not None:
             payload["environmentSetupJson"] = environment_setup_json
         if review_json is not None:
@@ -520,6 +630,11 @@ class RunnerSnapshot:
             payload["reviewResult"] = review_result
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
+            payload["recoverySource"] = {
+                "runId": resumed_from_run_id,
+                "identity": f"{cast(str, self.identity).rsplit('-', 1)[0]}-{resumed_from_run_id}",
+                "state": resumed_from_state,
+            }
         if self.prompt is not None:
             payload["prompt"] = self.prompt.as_json()
             payload["repository"] = self.prompt.repository_json()
@@ -561,6 +676,11 @@ class RunnerSnapshot:
             }
             for repository, skip in scoped_planner_skips
         ]
+        payload.pop("agent_turns")
+        if self.issue_driven_json is not None:
+            payload["agentTurns"] = [
+                _agent_turn_json(turn) for turn in self.agent_turns
+            ]
         payload["stdoutEntries"] = [
             {"observedAt": entry.observed_at, "text": entry.text}
             for entry in self.stdout_entries
@@ -862,6 +982,7 @@ class _RunRecord:
     managed_tab_id: str | None = None
     managed_tab_name: str | None = None
     credential_path: Path | None = None
+    agent_turn_trace_path: Path | None = field(default=None, repr=False)
     event_token: str | None = None
     control_token: str | None = None
     integration_pr: PullRequestNavigation | None = None
@@ -876,12 +997,19 @@ class _RunRecord:
     )
     issue_driven_explicit_lifecycle: bool = False
     issue_driven_json: str | None = None
+    issue_driven_preview: dict[str, object] | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
     review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
+    resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
+    agent_turns: list[AgentTurnTrace] = field(default_factory=list)
+    agent_turn_chunks: dict[str, dict[int, str]] = field(
+        default_factory=dict, repr=False
+    )
+    agent_turn_chunk_counts: dict[str, int] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -1118,10 +1246,13 @@ class PythonRunner:
             ],
             "checked": run.checked,
             "issueDrivenJson": run.issue_driven_json,
+            "issueDrivenPreview": run.issue_driven_preview,
             "environmentSetupJson": run.environment_setup_json,
             "reviewJson": run.review_json,
             "reviewResult": run.review_result,
             "resumedFromRunId": run.resumed_from_run_id,
+            "resumedFromState": run.resumed_from_state,
+            "agentTurns": [asdict(turn) for turn in run.agent_turns],
         }
 
     def _family_links_locked(self) -> dict[str, list[str]]:
@@ -1217,10 +1348,12 @@ class PythonRunner:
         outline = value.get("outline")
         exit_code = value.get("exitCode")
         issue_driven_json = value.get("issueDrivenJson")
+        issue_driven_preview_value = value.get("issueDrivenPreview")
         environment_setup_json = value.get("environmentSetupJson")
         review_json = value.get("reviewJson")
         review_result = value.get("reviewResult")
         resumed_from_run_id = value.get("resumedFromRunId")
+        resumed_from_state = value.get("resumedFromState")
         if (
             isinstance(run_id, bool)
             or not isinstance(run_id, int)
@@ -1254,7 +1387,36 @@ class PythonRunner:
                     or resumed_from_run_id >= run_id
                 )
             )
+            or (
+                resumed_from_state is not None
+                and (
+                    resumed_from_run_id is None
+                    or resumed_from_state not in ("failed", "stopped")
+                )
+            )
         ):
+            raise ValueError
+        issue_driven_preview = (
+            _validated_issue_driven_preview(issue_driven_preview_value)
+            if issue_driven_preview_value is not None
+            else None
+        )
+        if issue_driven_preview is None and issue_driven_json is not None:
+            from purplemux_client.issue_driven import (
+                issue_driven_run_preview,
+                parse_issue_driven_json,
+            )
+
+            try:
+                issue_driven_preview = issue_driven_run_preview(
+                    parse_issue_driven_json(issue_driven_json)
+                ).as_json()
+            except (TypeError, ValueError):
+                # Early v1 histories did not validate or persist their preview.
+                # Keep otherwise readable legacy records available when their
+                # saved input no longer satisfies the current input schema.
+                pass
+        if issue_driven_preview is not None and issue_driven_json is None:
             raise ValueError
         if review_result is not None:
             from purplemux_client.review import validate_review_result
@@ -1306,6 +1468,101 @@ class PythonRunner:
             raise ValueError
         attempts = load_many(RunAttempt, "attempts")
         resources = load_many(RunResource, "resources")
+        agent_turn_values = value.get("agentTurns", [])
+        if not isinstance(agent_turn_values, list):
+            raise ValueError
+        agent_turns = [
+            self._history_dataclass(AgentTurnTrace, item) for item in agent_turn_values
+        ]
+        for index, turn in enumerate(agent_turns):
+            previous_id = agent_turns[index - 1].turn_id if index else None
+            next_id = (
+                agent_turns[index + 1].turn_id if index + 1 < len(agent_turns) else None
+            )
+            if (
+                turn.status not in ("started", "completed", "failed")
+                or isinstance(turn.turn_id, bool)
+                or not isinstance(turn.turn_id, int)
+                or turn.turn_id < 1
+                or not isinstance(turn.purpose, str)
+                or not turn.purpose.strip()
+                or not isinstance(turn.prompt, str)
+                or not isinstance(turn.role, str)
+                or not turn.role.strip()
+                or isinstance(turn.attempt, bool)
+                or not isinstance(turn.attempt, int)
+                or turn.attempt < 1
+                or (
+                    turn.phase is not None
+                    and (not isinstance(turn.phase, str) or not turn.phase.strip())
+                )
+                or isinstance(turn.work_item_id, bool)
+                or (
+                    turn.work_item_id is not None
+                    and not isinstance(turn.work_item_id, (int, str))
+                )
+                or (isinstance(turn.work_item_id, int) and turn.work_item_id < 1)
+                or (
+                    isinstance(turn.work_item_id, str) and not turn.work_item_id.strip()
+                )
+                or (turn.work_item_id is None) != (turn.work_item_label is None)
+                or (
+                    turn.work_item_label is not None
+                    and (
+                        not isinstance(turn.work_item_label, str)
+                        or not turn.work_item_label.strip()
+                    )
+                )
+                or (
+                    turn.transition_outcome is not None
+                    and (
+                        turn.status != "completed"
+                        or not isinstance(turn.transition_outcome, str)
+                        or not turn.transition_outcome.strip()
+                    )
+                )
+                or (
+                    turn.previous_turn_id is not None
+                    and (
+                        isinstance(turn.previous_turn_id, bool)
+                        or not isinstance(turn.previous_turn_id, int)
+                        or turn.previous_turn_id < 1
+                    )
+                )
+                or (
+                    turn.next_turn_id is not None
+                    and (
+                        isinstance(turn.next_turn_id, bool)
+                        or not isinstance(turn.next_turn_id, int)
+                        or turn.next_turn_id < 1
+                    )
+                )
+                or turn.previous_turn_id != previous_id
+                or turn.next_turn_id != next_id
+                or (turn.status == "completed") != (turn.result is not None)
+                or (turn.result is not None and not isinstance(turn.result, str))
+                or (turn.status == "failed") != (turn.error is not None)
+                or (turn.error is not None and not isinstance(turn.error, str))
+                or (isinstance(turn.error, str) and not turn.error)
+                or (turn.status == "started" and turn.completed_at is not None)
+                or not isinstance(turn.started_at, str)
+                or (turn.status != "started" and not isinstance(turn.completed_at, str))
+                or (
+                    turn.repository is not None
+                    and (
+                        not isinstance(turn.repository, str)
+                        or not turn.repository.strip()
+                    )
+                )
+                or (
+                    turn.commit_sha is not None
+                    and (
+                        not isinstance(turn.commit_sha, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", turn.commit_sha) is None
+                    )
+                )
+            ):
+                raise ValueError
         if any(
             resource.repository_index is not None
             and (
@@ -1558,12 +1815,17 @@ class PythonRunner:
             issue_driven_repositories=issue_driven_repositories,
             checked=checked,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
             review_result=review_result,
             resumed_from_run_id=resumed_from_run_id,
+            resumed_from_state=cast(
+                Literal["failed", "stopped"] | None, resumed_from_state
+            ),
             parent_run=parent_run,
             child_runs=tuple(child_runs),
+            agent_turns=agent_turns,
         )
 
     def _cleanup_ownership_from_history(self, value: object) -> _CleanupOwnership:
@@ -1666,6 +1928,16 @@ class PythonRunner:
                 and isinstance(run, dict)
                 and run.get("identity") == identity
             ]
+            restored_by_id = {run.run_id: run for run in restored}
+            for run in restored:
+                if (
+                    run.resumed_from_run_id is None
+                    or run.resumed_from_state is not None
+                ):
+                    continue
+                source = restored_by_id.get(run.resumed_from_run_id)
+                if source is not None and source.state in ("failed", "stopped"):
+                    run.resumed_from_state = source.state
             restored_ownership = [
                 self._cleanup_ownership_from_history(ownership)
                 for identity, ownership in cleanup_ownership.items()
@@ -1916,9 +2188,11 @@ class PythonRunner:
         args: Sequence[str] = (),
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
+        issue_driven_preview: Mapping[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
     ) -> int:
@@ -1927,6 +2201,13 @@ class PythonRunner:
             if parent_run_id is not None:
                 raise ValueError("provide only one parent reference")
         run_cwd, run_args, child_env = self._execution_context(args)
+        stored_preview = (
+            _validated_issue_driven_preview(dict(issue_driven_preview))
+            if issue_driven_preview is not None
+            else None
+        )
+        if stored_preview is not None and issue_driven_json is None:
+            raise ValueError("Issue Driven run preview requires issueDrivenJson")
         with self._validation_lock:
             with self._lock:
                 self._ensure_open()
@@ -1950,9 +2231,11 @@ class PythonRunner:
                     child_env=child_env,
                     prompt=prompt,
                     issue_driven_json=issue_driven_json,
+                    issue_driven_preview=stored_preview,
                     environment_setup_json=environment_setup_json,
                     review_json=review_json,
                     resumed_from_run_id=resumed_from_run_id,
+                    resumed_from_state=resumed_from_state,
                     parent_run_id=parent_run_id,
                     parent_identity=parent_identity,
                 )
@@ -1972,11 +2255,15 @@ class PythonRunner:
             code = source.code
             args = source.args
             issue_driven_json = source.issue_driven_json
+            issue_driven_preview = source.issue_driven_preview
+            resumed_from_state = source.state
         return self.start(
             code,
             args=args,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             resumed_from_run_id=run_id,
+            resumed_from_state=resumed_from_state,
         )
 
     def _start_validated(
@@ -1989,9 +2276,11 @@ class PythonRunner:
         child_env: Mapping[str, str],
         prompt: PromptExecution | None = None,
         issue_driven_json: str | None = None,
+        issue_driven_preview: dict[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
     ) -> int:
@@ -2010,9 +2299,11 @@ class PythonRunner:
                 run_args=run_args,
                 child_env=child_env,
                 issue_driven_json=issue_driven_json,
+                issue_driven_preview=issue_driven_preview,
                 environment_setup_json=environment_setup_json,
                 review_json=review_json,
                 resumed_from_run_id=resumed_from_run_id,
+                resumed_from_state=resumed_from_state,
                 parent_run_id=parent_run_id,
                 parent_identity=parent_identity,
             )
@@ -2034,9 +2325,11 @@ class PythonRunner:
             warning_findings=deque(maxlen=self._max_progress_events),
             prompt=prompt,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
             resumed_from_run_id=resumed_from_run_id,
+            resumed_from_state=resumed_from_state,
         )
         self._runs[run_id] = run
         try:
@@ -2217,9 +2510,11 @@ class PythonRunner:
         run_args: tuple[str, ...],
         child_env: Mapping[str, str],
         issue_driven_json: str | None = None,
+        issue_driven_preview: dict[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
         resumed_from_run_id: int | None = None,
+        resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
     ) -> int:
@@ -2240,9 +2535,17 @@ class PythonRunner:
         managed_env.pop(PROGRESS_FD_ENV, None)
         managed_env.pop(RESOURCE_ACK_FD_ENV, None)
         managed_env.pop(WORKFLOW_HOST_WORKSPACE_ENV, None)
+        managed_env.pop(AGENT_TURN_TRACE_FILE_ENV, None)
         managed_env[EVENT_URL_ENV] = event_url
         managed_env[EVENT_TOKEN_ENV] = event_token
         managed_env[RUN_IDENTITY_ENV] = self._run_identity(run_id)
+        agent_turn_trace_path: Path | None = None
+        if issue_driven_json is not None:
+            agent_turn_trace_file = tempfile.NamedTemporaryFile(delete=False)
+            agent_turn_trace_file.close()
+            agent_turn_trace_path = Path(agent_turn_trace_file.name)
+            agent_turn_trace_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            managed_env[AGENT_TURN_TRACE_FILE_ENV] = str(agent_turn_trace_path)
         try:
             for name, value in sorted(managed_env.items()):
                 if _SHELL_ENV_NAME.fullmatch(name):
@@ -2265,11 +2568,14 @@ class PythonRunner:
             findings=deque(maxlen=self._max_progress_events),
             warning_findings=deque(maxlen=self._max_progress_events),
             credential_path=credential_path,
+            agent_turn_trace_path=agent_turn_trace_path,
             event_token=event_token,
             issue_driven_json=issue_driven_json,
+            issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
             resumed_from_run_id=resumed_from_run_id,
+            resumed_from_state=resumed_from_state,
         )
         self._runs[run_id] = run
         correlation = self._run_identity(run_id)
@@ -2378,6 +2684,8 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
+        if run.agent_turn_trace_path is not None:
+            run.agent_turn_trace_path.unlink(missing_ok=True)
         self._fail_workflow_launch(run, exc)
 
     def _fail_workflow_launch(self, run: _RunRecord, exc: BaseException) -> None:
@@ -2673,12 +2981,15 @@ class PythonRunner:
             ),
             identity=self._run_identity(run.run_id),
             issue_driven_json=run.issue_driven_json,
+            issue_driven_preview=run.issue_driven_preview,
             environment_setup_json=run.environment_setup_json,
             review_json=run.review_json,
             review_result=run.review_result if run.state == "success" else None,
             resumed_from_run_id=run.resumed_from_run_id,
+            resumed_from_state=run.resumed_from_state,
             parent_run=run.parent_run,
             child_runs=run.child_runs,
+            agent_turns=tuple(run.agent_turns),
         )
 
     @staticmethod
@@ -3608,6 +3919,33 @@ class PythonRunner:
         parsed: tuple[str, object],
     ) -> bool:
         event_type, event = parsed
+        if event_type == "agent_turn_trace_chunk":
+            chunk = cast(_AgentTurnTraceChunk, event)
+            expected_count = run.agent_turn_chunk_counts.get(chunk.message_id)
+            if expected_count is not None and expected_count != chunk.chunk_count:
+                return False
+            chunks = run.agent_turn_chunks.setdefault(chunk.message_id, {})
+            existing = chunks.get(chunk.chunk_index)
+            if existing is not None and existing != chunk.data:
+                return False
+            run.agent_turn_chunk_counts[chunk.message_id] = chunk.chunk_count
+            chunks[chunk.chunk_index] = chunk.data
+            if len(chunks) != chunk.chunk_count:
+                return True
+            encoded = "".join(chunks[index] for index in range(chunk.chunk_count))
+            del run.agent_turn_chunks[chunk.message_id]
+            del run.agent_turn_chunk_counts[chunk.message_id]
+            try:
+                payload = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return False
+            transition = self._parse_agent_turn_transition(payload)
+            if (
+                transition is None
+                or chunk.message_id != f"{transition.turn_id}:{transition.status}"
+            ):
+                return False
+            return self._accept_agent_turn_transition(run, transition)
         if event_type == "finding":
             finding = cast(TopologyFinding, event)
             accepted = replace(finding, observed_at=self._accepted_at())
@@ -3753,6 +4091,184 @@ class PythonRunner:
             None,
         )
 
+    @staticmethod
+    def _parse_agent_turn_transition(payload: str) -> _AgentTurnTransition | None:
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        turn_id = value.get("turn_id")
+        purpose = value.get("purpose")
+        role = value.get("role")
+        attempt = value.get("attempt")
+        status = value.get("status")
+        repository = value.get("repository")
+        phase = value.get("phase")
+        work_item_id = value.get("work_item_id")
+        work_item_label = value.get("work_item_label")
+        transition_outcome = value.get("transition_outcome")
+        commit_sha = value.get("commit_sha")
+        if (
+            isinstance(turn_id, bool)
+            or not isinstance(turn_id, int)
+            or turn_id < 1
+            or not isinstance(purpose, str)
+            or not purpose.strip()
+            or not isinstance(role, str)
+            or not role.strip()
+            or isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt < 1
+            or status not in ("started", "completed", "failed")
+            or (
+                "repository" in value
+                and (not isinstance(repository, str) or not repository.strip())
+            )
+            or (phase is not None and (not isinstance(phase, str) or not phase.strip()))
+            or isinstance(work_item_id, bool)
+            or (work_item_id is not None and not isinstance(work_item_id, (int, str)))
+            or (isinstance(work_item_id, int) and work_item_id < 1)
+            or (isinstance(work_item_id, str) and not work_item_id.strip())
+            or (work_item_id is None) != (work_item_label is None)
+            or (
+                work_item_label is not None
+                and (
+                    not isinstance(work_item_label, str) or not work_item_label.strip()
+                )
+            )
+            or (
+                transition_outcome is not None
+                and (
+                    status != "completed"
+                    or not isinstance(transition_outcome, str)
+                    or not transition_outcome.strip()
+                )
+            )
+            or (
+                commit_sha is not None
+                and (
+                    not isinstance(commit_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None
+                )
+            )
+        ):
+            return None
+        expected_fields = {
+            "turn_id",
+            "purpose",
+            "role",
+            "attempt",
+            "status",
+        }
+        if repository is not None:
+            expected_fields.add("repository")
+        if phase is not None:
+            expected_fields.add("phase")
+        if work_item_id is not None:
+            expected_fields.update(("work_item_id", "work_item_label"))
+        if transition_outcome is not None:
+            expected_fields.add("transition_outcome")
+        if commit_sha is not None:
+            expected_fields.add("commit_sha")
+        content_field = {
+            "started": "prompt",
+            "completed": "result",
+            "failed": "error",
+        }[cast(str, status)]
+        if set(value) != expected_fields | {content_field}:
+            return None
+        content = value.get(content_field)
+        if not isinstance(content, str) or (status == "failed" and not content):
+            return None
+        return _AgentTurnTransition(
+            turn_id,
+            purpose,
+            role,
+            attempt,
+            cast(AgentTurnStatus, status),
+            repository,
+            phase=phase,
+            work_item_id=work_item_id,
+            work_item_label=work_item_label,
+            transition_outcome=transition_outcome,
+            commit_sha=commit_sha,
+            prompt=content if status == "started" else None,
+            result=content if status == "completed" else None,
+            error=content if status == "failed" else None,
+        )
+
+    def _accept_agent_turn_transition(
+        self, run: _RunRecord, transition: _AgentTurnTransition
+    ) -> bool:
+        if transition.status == "started":
+            if any(turn.turn_id == transition.turn_id for turn in run.agent_turns):
+                return False
+            previous = run.agent_turns[-1] if run.agent_turns else None
+            if previous is not None:
+                if transition.turn_id <= previous.turn_id:
+                    return False
+                run.agent_turns[-1] = replace(previous, next_turn_id=transition.turn_id)
+            repository = transition.repository
+            if repository is None and len(run.issue_driven_repositories) == 1:
+                repository = run.issue_driven_repositories[0].context.repository
+            run.agent_turns.append(
+                AgentTurnTrace(
+                    transition.turn_id,
+                    transition.purpose,
+                    cast(str, transition.prompt),
+                    transition.role,
+                    transition.attempt,
+                    "started",
+                    phase=transition.phase,
+                    work_item_id=transition.work_item_id,
+                    work_item_label=transition.work_item_label,
+                    commit_sha=transition.commit_sha,
+                    previous_turn_id=(
+                        previous.turn_id if previous is not None else None
+                    ),
+                    repository=repository,
+                    started_at=self._accepted_at(),
+                )
+            )
+            return True
+        index = next(
+            (
+                index
+                for index, turn in enumerate(run.agent_turns)
+                if turn.turn_id == transition.turn_id
+            ),
+            None,
+        )
+        if index is None:
+            return False
+        current = run.agent_turns[index]
+        if (
+            current.status != "started"
+            or current.purpose != transition.purpose
+            or current.role != transition.role
+            or current.attempt != transition.attempt
+            or current.phase != transition.phase
+            or current.work_item_id != transition.work_item_id
+            or current.work_item_label != transition.work_item_label
+            or (
+                transition.repository is not None
+                and current.repository != transition.repository
+            )
+        ):
+            return False
+        run.agent_turns[index] = replace(
+            current,
+            status=transition.status,
+            result=transition.result,
+            error=transition.error,
+            transition_outcome=transition.transition_outcome,
+            commit_sha=transition.commit_sha or current.commit_sha,
+            completed_at=self._accepted_at(),
+        )
+        return True
+
     @classmethod
     def _finish_active_repository(cls, run: _RunRecord) -> None:
         repository = cls._active_issue_driven_repository(run)
@@ -3783,6 +4299,7 @@ class PythonRunner:
                 "planner_skip",
                 "issue_result",
                 "whole_review_result",
+                "agent_turn_trace_chunk",
             ],
             object,
         ]
@@ -3795,6 +4312,32 @@ class PythonRunner:
         if not isinstance(value, dict):
             return None
         event_type = value.get("type")
+        if event_type == "agent_turn_trace_chunk":
+            message_id = value.get("message_id")
+            chunk_index = value.get("chunk_index")
+            chunk_count = value.get("chunk_count")
+            data = value.get("data")
+            if (
+                not isinstance(message_id, str)
+                or not re.fullmatch(
+                    r"[1-9][0-9]*:(?:started|completed|failed)", message_id
+                )
+                or isinstance(chunk_index, bool)
+                or not isinstance(chunk_index, int)
+                or chunk_index < 0
+                or isinstance(chunk_count, bool)
+                or not isinstance(chunk_count, int)
+                or not 1 <= chunk_count <= 4096
+                or chunk_index >= chunk_count
+                or not isinstance(data, str)
+                or not data
+                or len(data) > 2400
+                or re.fullmatch(r"[A-Za-z0-9+/=]+", data) is None
+            ):
+                return None
+            return "agent_turn_trace_chunk", _AgentTurnTraceChunk(
+                message_id, chunk_index, chunk_count, data
+            )
         if event_type == "finding":
             category = value.get("category")
             status = value.get("status")
@@ -4416,9 +4959,12 @@ class PythonRunner:
         diagnostic: str | None = None,
     ) -> None:
         exit_code = result.exit_code
+        trace_events = self._read_agent_turn_trace_spool(run)
         with self._lock:
             if run.state != "running":
                 return
+            for parsed in trace_events:
+                self._accept_parsed_event(run, parsed)
             if result.stdout:
                 self._append_output(run, "stdout", result.stdout, lock_held=True)
             if result.stderr:
@@ -4449,7 +4995,32 @@ class PythonRunner:
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
+        if run.agent_turn_trace_path is not None:
+            run.agent_turn_trace_path.unlink(missing_ok=True)
         self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
+
+    def _read_agent_turn_trace_spool(
+        self, run: _RunRecord
+    ) -> tuple[tuple[str, object], ...]:
+        path = run.agent_turn_trace_path
+        if path is None:
+            return ()
+        parsed_events: list[tuple[str, object]] = []
+        try:
+            with path.open("rb") as stream:
+                while line := stream.readline(MAX_PROGRESS_EVENT_BYTES + 1):
+                    if len(line) > MAX_PROGRESS_EVENT_BYTES or not line.endswith(b"\n"):
+                        while line and not line.endswith(b"\n"):
+                            line = stream.readline(MAX_PROGRESS_EVENT_BYTES + 1)
+                        continue
+                    parsed = self._parse_runner_event(
+                        line.decode("utf-8", errors="replace")
+                    )
+                    if parsed is not None and parsed[0] == "agent_turn_trace_chunk":
+                        parsed_events.append(parsed)
+        except OSError:
+            return ()
+        return tuple(parsed_events)
 
     def _notify_terminal(
         self, run: _RunRecord, *, state: RunnerState, exit_code: int
