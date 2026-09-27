@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shlex
@@ -663,6 +664,174 @@ def test_publication_disabled_audits_ref_writes_that_bypass_hooks(
             ).stdout.strip()
             == "forward"
         )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+@pytest.mark.parametrize("target", ["protected", "sibling"])
+def test_publication_disabled_rejects_equivalent_symbolic_refs(
+    worker: str, target: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    active_path = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "refs/heads/feature/scoped-commit",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    sibling_path = active_path.with_name("sibling")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    ref_path = active_path if target == "protected" else sibling_path
+    symref_target = (
+        "refs/heads/feature/sibling" if target == "protected" else "refs/heads/main"
+    )
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        f"printf 'ref: %s\\n' {shlex.quote(symref_target)} > "
+        f"{shlex.quote(str(ref_path))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "replace ref"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "changes rolled back" in result.stderr
+    assert not ref_path.read_text(encoding="utf-8").startswith("ref:")
+    ref_name = (
+        "refs/heads/feature/scoped-commit"
+        if target == "protected"
+        else "refs/heads/feature/sibling"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", ref_name],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_restores_sibling_reflog_and_gitdir_backlink(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    git_dir = Path(
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    sibling_log = repository / ".git/logs/refs/heads/feature/sibling"
+    sibling_log_before = sibling_log.read_bytes()
+    backlink_before = (git_dir / "gitdir").read_bytes()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "git commit --allow-empty -m forward >/dev/null 2>&1\n"
+        "git_dir=$(git rev-parse --absolute-git-dir)\n"
+        "sibling_log=$(git rev-parse --path-format=absolute "
+        "--git-path logs/refs/heads/feature/sibling)\n"
+        'printf tampered >> "$sibling_log"\n'
+        'printf \'%s\\n\' "$PWD/.git" > "$git_dir/gitdir"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "tamper metadata"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "changes rolled back" in result.stderr
+    assert sibling_log.read_bytes() == sibling_log_before
+    assert (git_dir / "gitdir").read_bytes() == backlink_before
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "forward"
+    )
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_requires_repository_exclusion(
+    worker: str, tmp_path: Path
+) -> None:
+    repository, checkout = linked_delivery_checkout(tmp_path)
+    lock_path = repository / ".git/hooks/awm-delivery.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    launched = tmp_path / "launched"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        f"#!/bin/sh\nprintf launched > {shlex.quote(str(launched))}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(worker, "not run"),
+            cwd=checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert result.returncode != 0
+    assert "owns this repository" in result.stderr
+    assert not launched.exists()
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
