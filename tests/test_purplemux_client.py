@@ -1474,12 +1474,23 @@ def test_publication_disabled_recovers_when_cleanliness_cannot_be_verified(
 @pytest.mark.parametrize(
     "blocked_command", ["bundle", "status"], ids=("recovery", "cleanliness")
 )
+@pytest.mark.parametrize(
+    ("interrupt_signal", "expected_status"),
+    [
+        (signal.SIGHUP, 129),
+        (signal.SIGINT, 130),
+        (signal.SIGTERM, 143),
+    ],
+    ids=("hup", "int", "term"),
+)
 def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_delivery(
     blocked_command: str,
+    interrupt_signal: signal.Signals,
+    expected_status: int,
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
 ) -> None:
-    _, checkout, _, base = linked_delivery_repository
+    repository, checkout, _, base = linked_delivery_repository
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     marker = tmp_path / "post-agent-phase"
@@ -1536,10 +1547,10 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
     if process.poll() is not None:
         pytest.fail("publication-disabled session exited before post-agent signal")
 
-    os.killpg(process.pid, signal.SIGTERM)
+    os.killpg(process.pid, interrupt_signal)
     _, stderr = process.communicate(timeout=5)
 
-    assert process.returncode == 143
+    assert process.returncode == expected_status
     recovery_line = next(
         line
         for line in stderr.splitlines()
@@ -1551,6 +1562,10 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
         assert (recovery / "recovery.bundle").is_file()
         assert not list(tmp_path.glob("awm-delivery-shadow.*"))
         assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+        )
         assert (
             subprocess.run(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"],

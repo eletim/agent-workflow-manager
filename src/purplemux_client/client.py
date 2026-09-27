@@ -1650,6 +1650,44 @@ def commit_tree(tree, parent, message):
     ).stdout.strip()
 
 
+def fsync_directory(path):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_recovery():
+    directories = []
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    for current, _, files in os.walk(recovery_path, followlinks=False):
+        current_path = Path(current)
+        directories.append(current_path)
+        for name in files:
+            path = current_path / name
+            if path.is_symlink():
+                continue
+            descriptor = os.open(path, os.O_RDONLY | no_follow)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    for directory in reversed(directories):
+        fsync_directory(directory)
+
+    complete_temporary = recovery_path / ".complete.tmp"
+    with complete_temporary.open("x", encoding="ascii") as marker:
+        marker.write("1\\n")
+        marker.flush()
+        os.fsync(marker.fileno())
+    os.replace(complete_temporary, recovery_path / ".complete")
+    fsync_directory(recovery_path)
+    fsync_directory(recovery_path.parent)
+    fsync_directory(recovery_path.parent.parent)
+
+
 def capture_index_state(
     environment, index_path, destination, *, source_environment=None
 ):
@@ -2111,9 +2149,7 @@ try:
         json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
     )
     os.replace(metadata_temporary, recovery_path / "metadata.json")
-    complete_temporary = recovery_path / ".complete.tmp"
-    complete_temporary.write_text("1\\n", encoding="ascii")
-    os.replace(complete_temporary, recovery_path / ".complete")
+    publish_recovery()
     print(cleanliness)
 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
     print(f"publication-disabled recovery failed: {error}", file=sys.stderr)
