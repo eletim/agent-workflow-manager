@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "purplemux-client"
-version = "0.5.1"
+version = "0.5.0"
 description = "PurpleMux CLI adapter and trusted local Python runner UI."
 authors = []
 requires-python = ">=3.10"
@@ -44,5 +44,5 @@ target-version = "py310"
 [tool.pytest.ini_options]
 addopts = "--strict-markers --strict-config --durations=5 -vv"
 markers = [
-    "live: requires a locally authenticated provider and PurpleMux services",
+    "live: requires local authenticated Codex and PurpleMux services",
 ]
