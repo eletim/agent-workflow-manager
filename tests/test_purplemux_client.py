@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import pty
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -422,6 +424,107 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
         assert len(resources) == 2
         assert all(not Path(resource).exists() for resource in resources)
     finally:
+        for resource in resources:
+            shutil.rmtree(resource, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("sent_signal", "expected_status"),
+    [
+        (signal.SIGHUP, 129),
+        (signal.SIGINT, 130),
+        (signal.SIGTERM, 143),
+    ],
+    ids=("hangup", "interrupt", "terminate"),
+)
+@pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
+def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
+    sent_signal: signal.Signals,
+    expected_status: int,
+    use_pty: bool,
+    tmp_path: Path,
+) -> None:
+    initialize_test_repository(tmp_path)
+    resource_record = tmp_path / "cleanup-resources"
+    removal_record = tmp_path / "cleanup-removals"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n%s\\n' \"${GH_CONFIG_DIR%/gh}\" "
+        '"$AWM_DELIVERY_SHADOW_GIT_DIR" > "$AWM_TEST_RESOURCE_RECORD"\n'
+        "while :; do sleep 1; done\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    real_rm = shutil.which("rm")
+    assert real_rm is not None
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$*" >> "$AWM_TEST_REMOVAL_RECORD"\n'
+        f'exec "{real_rm}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_REMOVAL_RECORD"] = str(removal_record)
+    environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        "codex", "wait for interruption"
+    )
+    master_fd: int | None = None
+    slave_fd: int | None = None
+    stdin: int = subprocess.DEVNULL
+    if use_pty:
+        master_fd, slave_fd = pty.openpty()
+        stdin = slave_fd
+    process = subprocess.Popen(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if slave_fd is not None:
+        os.close(slave_fd)
+    resources: list[str] = []
+    try:
+        deadline = time.monotonic() + 5
+        while process.poll() is None:
+            if resource_record.exists():
+                resources = resource_record.read_text(encoding="utf-8").splitlines()
+                if len(resources) == 2:
+                    break
+            if time.monotonic() >= deadline:
+                pytest.fail("blocking worker did not record cleanup resources")
+            time.sleep(0.01)
+        if len(resources) != 2:
+            pytest.fail("blocking worker exited before recording cleanup resources")
+
+        os.killpg(process.pid, sent_signal)
+        process.communicate(timeout=5)
+
+        assert process.returncode == expected_status
+        assert len(resources) == 2
+        assert all(not Path(resource).exists() for resource in resources)
+        removals = removal_record.read_text(encoding="utf-8").splitlines()
+        assert len(removals) == 2
+        assert {removal.removeprefix("-rf -- ") for removal in removals} == set(
+            resources
+        )
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        if master_fd is not None:
+            os.close(master_fd)
         for resource in resources:
             shutil.rmtree(resource, ignore_errors=True)
 

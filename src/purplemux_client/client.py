@@ -1752,8 +1752,8 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_cleanup() { "
+            "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
-            "trap - EXIT; "
             "awm_delivery_cleanup_failed=0; "
             'for awm_delivery_cleanup_dir in "$awm_delivery_hooks" '
             '"$awm_delivery_shadow_git_dir"; do '
@@ -1776,6 +1776,9 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'exit "$awm_delivery_primary_status"; '
             "} && "
             "trap 'awm_delivery_cleanup $?' EXIT && "
+            "trap 'awm_delivery_cleanup 129' HUP && "
+            "trap 'awm_delivery_cleanup 130' INT && "
+            "trap 'awm_delivery_cleanup 143' TERM && "
             "awm_delivery_hooks=$(mktemp -d "
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
             "awm_delivery_shadow_git_dir=$(mktemp -d "
