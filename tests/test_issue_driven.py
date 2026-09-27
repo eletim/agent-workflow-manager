@@ -2509,7 +2509,9 @@ def test_generated_workflow_selects_role_specific_agents(
 
     assert f"IMPLEMENTER_AGENT = {implementer!r}" in code
     assert f"REVIEWER_AGENT = {reviewer!r}" in code
-    assert "CreateSessionRequest(agent_type, str(config.repo), agent_type" in code
+    assert "CreateSessionRequest(" in code
+    assert "str(config.repo)," in code
+    assert "correlation_id=correlation_id" in code
 
 
 @pytest.mark.parametrize(
