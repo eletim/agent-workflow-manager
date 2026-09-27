@@ -420,6 +420,138 @@ def test_publication_disabled_allows_commits_in_nested_repository(
     ).stdout.strip() == "nested"
 
 
+@pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_allows_only_linked_checkout_git_metadata(
+    worker: str, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository parent"
+    checkout = tmp_path / "linked checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "test@example.com",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/scoped-commit",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    arguments_path = tmp_path / f"{worker}-arguments"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$@" > "$AWM_TEST_ARGUMENTS"\n'
+        "git commit --allow-empty -m linked-forward >/dev/null 2>&1\n"
+        "forward=$?\n"
+        "git commit --amend --allow-empty -m forbidden-rewrite >/dev/null 2>&1\n"
+        "rewrite=$?\n"
+        "git tag forbidden-tag >/dev/null 2>&1\n"
+        "tag=$?\n"
+        'printf \'%s %s %s\\n\' "$forward" "$rewrite" "$tag"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_ARGUMENTS"] = str(arguments_path)
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    forward, rewrite, tag = result.stdout.strip().split()
+    assert forward == "0"
+    assert rewrite != "0"
+    assert tag != "0"
+    arguments = arguments_path.read_text(encoding="utf-8").splitlines()
+    writable_directories = {
+        arguments[index + 1]
+        for index, argument in enumerate(arguments[:-1])
+        if argument == "--add-dir"
+    }
+    git_dir = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    common_dir = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert writable_directories == {
+        git_dir,
+        str(Path(common_dir) / "objects"),
+        str(Path(common_dir) / "refs" / "heads" / "feature"),
+        str(Path(common_dir) / "logs" / "refs" / "heads" / "feature"),
+    }
+    assert common_dir not in writable_directories
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "linked-forward"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "tag", "--list", "forbidden-tag"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+
+
 def test_restricted_codex_git_boundary_allows_advance_but_denies_rewrites_and_tags(
     tmp_path: Path,
 ) -> None:

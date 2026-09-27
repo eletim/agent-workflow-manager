@@ -1569,6 +1569,12 @@ done
             "GIT_DIR",
             "-u",
             "GIT_WORK_TREE",
+            "-u",
+            "GIT_INDEX_FILE",
+            "-u",
+            "GIT_OBJECT_DIRECTORY",
+            "-u",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         ]
         git_environment = [
             "GIT_CONFIG_GLOBAL=/dev/null",
@@ -1669,12 +1675,52 @@ done
             raise WorkerFailure(
                 "publication-disabled session worker must be codex or claude"
             )
-        launch = shlex.join(command)
+        additional_git_directories = " ".join(
+            f'--add-dir "${{{variable}}}"'
+            for variable in (
+                "awm_delivery_checkout_git_dir",
+                "awm_delivery_object_dir",
+                "awm_delivery_ref_dir",
+                "awm_delivery_ref_log_dir",
+            )
+        )
+        option_index = (
+            command.index("exec") if worker == "codex" else command.index("claude") + 1
+        )
+        launch = (
+            f"{shlex.join(command[:option_index])} {additional_git_directories} "
+            f"{shlex.join(command[option_index:])}"
+        )
         return (
+            "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY "
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES && "
+            "awm_delivery_git_dir=$(git rev-parse --absolute-git-dir) && "
+            'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
+            "awm_delivery_common_dir=$(git rev-parse --path-format=absolute "
+            "--git-common-dir) && "
+            'awm_delivery_common_dir=$(cd "$awm_delivery_common_dir" && pwd -P) && '
+            "awm_delivery_object_dir=$(git rev-parse --path-format=absolute "
+            "--git-path objects) && "
+            'awm_delivery_object_dir=$(cd "$awm_delivery_object_dir" && pwd -P) && '
+            "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
+            "awm_delivery_ref_path=$(git rev-parse --path-format=absolute "
+            '--git-path "$awm_delivery_ref") && '
+            "awm_delivery_ref_dir=${awm_delivery_ref_path%/*} && "
+            'mkdir -p -- "$awm_delivery_ref_dir" && '
+            'awm_delivery_ref_dir=$(cd "$awm_delivery_ref_dir" && pwd -P) && '
+            "awm_delivery_ref_log_path=$(git rev-parse --path-format=absolute "
+            '--git-path "logs/$awm_delivery_ref") && '
+            "awm_delivery_ref_log_dir=${awm_delivery_ref_log_path%/*} && "
+            'if [ -d "$awm_delivery_ref_log_dir" ]; then '
+            'awm_delivery_ref_log_dir=$(cd "$awm_delivery_ref_log_dir" && pwd -P); '
+            'else awm_delivery_ref_log_dir="$awm_delivery_object_dir"; fi && '
+            'if [ "$awm_delivery_git_dir" = "$awm_delivery_common_dir" ]; then '
+            'awm_delivery_checkout_git_dir="$awm_delivery_object_dir"; '
+            'else awm_delivery_checkout_git_dir="$awm_delivery_git_dir"; fi && '
             "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
-            "mkdir -p -- \"$awm_delivery_hooks_root\" && "
-            "awm_delivery_hooks_root=$(cd \"$awm_delivery_hooks_root\" && pwd -P) && "
-            'awm_delivery_hooks=$(mktemp -d '
+            'mkdir -p -- "$awm_delivery_hooks_root" && '
+            'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
+            "awm_delivery_hooks=$(mktemp -d "
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
             'mkdir -p -- "$awm_delivery_hooks/gh" && '
             "trap 'rm -r -- \"$awm_delivery_hooks\"' EXIT && "
