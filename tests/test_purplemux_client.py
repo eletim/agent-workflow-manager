@@ -449,7 +449,7 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         "git add tracked.txt\n"
         "git commit -m linked-delivery >/dev/null 2>&1\n"
         "commit_status=$?\n"
-        "git push test-remote HEAD:refs/heads/forbidden >/dev/null 2>&1\n"
+        'git push "$AWM_TEST_REMOTE" HEAD:refs/heads/forbidden >/dev/null 2>&1\n'
         "push_status=$?\n"
         "status=$(git status --porcelain)\n"
         "config_exposed=0\n"
@@ -472,6 +472,7 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
             "GH_CONFIG_DIR": str(publication_config),
             "GH_TOKEN": "push-capable-gh-token",
             "GITHUB_TOKEN": "push-capable-github-token",
+            "AWM_TEST_REMOTE": str(remote),
         }
     )
 

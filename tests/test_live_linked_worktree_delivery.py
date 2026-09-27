@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import uuid
 from pathlib import Path
@@ -83,7 +84,8 @@ def _exercise_linked_worktree_delivery(tmp_path: Path, worker: str) -> None:
             "Perform this exact local delivery check without changing any other file: "
             "replace tracked.txt with the single line 'after', run "
             "'git add tracked.txt', commit it with message 'linked-delivery-live', "
-            "attempt 'git push test-remote HEAD:refs/heads/forbidden' and require "
+            f"attempt 'git push {shlex.quote(str(remote))} "
+            "HEAD:refs/heads/forbidden' and require "
             "that push to fail, then require 'git status --porcelain' to be empty. "
             "Reply with exactly AWM_LINKED_DELIVERY_LIVE_OK only after every step "
             "has the required result.",
