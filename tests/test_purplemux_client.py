@@ -1746,6 +1746,7 @@ def test_publication_disabled_rolls_back_ref_when_real_index_update_fails(
         )
 
         assert result.returncode != 0
+        assert "publication-disabled delivery failed" in result.stderr
         assert (
             subprocess.run(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -1767,6 +1768,95 @@ def test_publication_disabled_rolls_back_ref_when_real_index_update_fails(
         assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "before\n"
     finally:
         index_lock.unlink(missing_ok=True)
+
+
+def test_publication_disabled_reports_rollback_separately_from_delivery_failure(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, base = linked_delivery_repository
+    index_path = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" core.hooksPath=/dev/null update-ref "*) exit 76;; esac\n'
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf 'after\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m rollback-failure >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    recovery: Path | None = None
+
+    try:
+        index_path.with_name("index.lock").touch()
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(
+                "codex", "commit a change"
+            ),
+            cwd=checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "publication-disabled delivery rollback failed" in result.stderr
+        assert "publication-disabled delivery failed" in result.stderr
+        recovery_line = next(
+            line
+            for line in result.stderr.splitlines()
+            if line.startswith(
+                "publication-disabled agent output recovery retained at "
+            )
+        )
+        recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+        assert (recovery / ".complete").is_file()
+        assert (
+            subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            != base
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+    finally:
+        index_path.with_name("index.lock").unlink(missing_ok=True)
+        if recovery is not None:
+            shutil.rmtree(recovery, ignore_errors=True)
 
 
 @pytest.mark.parametrize(
@@ -2161,6 +2251,7 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     if use_pty:
         arguments = ["script", "-q", "-e", "-c", command, "/dev/null"]
 
+    removed_directories: set[str] = set()
     result = subprocess.run(
         arguments,
         cwd=tmp_path,
@@ -2203,8 +2294,70 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
             with pytest.raises(ProcessLookupError):
                 os.kill(int(cleanup_pid), 0)
     finally:
-        for resource in resources:
+        for resource in {*resources, *removed_directories}:
             shutil.rmtree(resource, ignore_errors=True)
+
+
+def test_publication_disabled_cleanup_does_not_mask_recovery_failure(
+    tmp_path: Path,
+) -> None:
+    initialize_test_repository(tmp_path)
+    fake_bin = tmp_path.parent / f"{tmp_path.name}-bin"
+    fake_bin.mkdir()
+    real_git = shutil.which("git")
+    real_chmod = shutil.which("chmod")
+    assert real_git is not None
+    assert real_chmod is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = bundle ] && exit 71\n'
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_chmod = fake_bin / "chmod"
+    fake_chmod.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = -R ] && exit 72\n'
+        f'exec "{real_chmod}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_chmod.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "exercise recovery and cleanup failures"
+        ),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 74
+    assert "publication-disabled recovery failed:" in result.stderr
+    assert "publication-disabled agent output recovery failed" in result.stderr
+    assert (
+        "publication-disabled session cleanup failed; temporary resources may remain"
+        in result.stderr
+    )
+    assert not list(tmp_path.parent.glob("awm-delivery-shadow.*"))
+    assert not list(tmp_path.parent.glob("awm-delivery-worktree.*"))
+    assert not list((tmp_path / ".git" / "hooks").glob("awm-delivery.*"))
+    assert not list((tmp_path / ".git" / "hooks").glob(".awm-delivery.*.resources"))
+    assert not list(
+        (tmp_path / ".git" / "awm-delivery-recovery").glob("output.*")
+    )
 
 
 def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:

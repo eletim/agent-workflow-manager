@@ -2400,10 +2400,16 @@ exec "$real_git" "$@"
             "2>/dev/null; then "
             "awm_delivery_cleanup_failed=1; "
             "fi; "
+            'if [ -e "$awm_delivery_cleanup_dir" ]; then '
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
             'done < "$awm_delivery_manifest"; '
             'if ! "$awm_delivery_timeout" --signal=TERM --kill-after=0.2s 1s '
             '"$awm_delivery_rm" -f -- "$awm_delivery_manifest" '
             "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            'if [ -e "$awm_delivery_manifest" ]; then '
             "awm_delivery_cleanup_failed=1; "
             "fi; "
             "fi; "
@@ -2544,30 +2550,45 @@ exec "$real_git" "$@"
             'if [ "$awm_delivery_status" -ne 0 ]; then '
             'exit "$awm_delivery_status"; fi; exit 1; fi; '
             '[ "$awm_delivery_status" -eq 0 ] || exit "$awm_delivery_status"; '
+            "awm_delivery_delivery_status=0; "
             'awm_delivery_new=$(tr -d \'\\n\' < '
-            '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") && '
-            'case "$awm_delivery_new" in \'\'|*[!0-9a-f]*) exit 1 ;; esac && '
+            '"$awm_delivery_shadow_git_dir/$awm_delivery_ref") || '
+            "awm_delivery_delivery_status=$?; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
+            'case "$awm_delivery_new" in \'\'|*[!0-9a-f]*) '
+            "awm_delivery_delivery_status=1 ;; esac; fi; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
             'awm_delivery_current=$("$awm_delivery_real_git" rev-parse '
-            '"$awm_delivery_ref") && '
-            '[ "$awm_delivery_current" = "$awm_delivery_old" ] && '
+            '"$awm_delivery_ref") || awm_delivery_delivery_status=$?; fi; '
+            'if [ "$awm_delivery_delivery_status" -eq 0 ] && '
+            '[ "$awm_delivery_current" != "$awm_delivery_old" ]; then '
+            "awm_delivery_delivery_status=1; fi; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
             'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
-            '"$awm_delivery_real_git" cat-file -e "$awm_delivery_new^{commit}" && '
+            '"$awm_delivery_real_git" cat-file -e "$awm_delivery_new^{commit}" || '
+            "awm_delivery_delivery_status=$?; fi; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
             'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
             '"$awm_delivery_real_git" merge-base --is-ancestor '
-            '"$awm_delivery_old" "$awm_delivery_new" && '
+            '"$awm_delivery_old" "$awm_delivery_new" || '
+            "awm_delivery_delivery_status=$?; fi; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
             "printf '%s\\n^%s\\n' \"$awm_delivery_new\" "
             '"$awm_delivery_old" | '
             'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
             '"$awm_delivery_real_git" '
             "pack-objects --quiet --stdout --revs | "
             '"$awm_delivery_real_git" index-pack --stdin --fix-thin --strict '
-            ">/dev/null && "
+            ">/dev/null || awm_delivery_delivery_status=$?; fi; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             'AWM_DELIVERY_PROTECTED_ROOT="$awm_delivery_root" '
             '"$awm_delivery_real_git" -c '
             'core.hooksPath="$awm_delivery_hooks" update-ref '
-            '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" && '
-            '{ "$awm_delivery_real_git" read-tree --reset -u '
+            '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" || '
+            "awm_delivery_delivery_status=$?; fi; "
+            'if [ "$awm_delivery_delivery_status" -eq 0 ]; then '
+            '"$awm_delivery_real_git" read-tree --reset -u '
             '"$awm_delivery_new"; '
             "awm_delivery_index_status=$?; "
             'if [ "$awm_delivery_index_status" -ne 0 ]; then '
@@ -2578,8 +2599,11 @@ exec "$real_git" "$@"
             "fi; "
             '"$awm_delivery_real_git" read-tree "$awm_delivery_old" '
             "2>/dev/null || :; "
-            'exit "$awm_delivery_index_status"; '
-            "fi; }"
+            "awm_delivery_delivery_status=$awm_delivery_index_status; "
+            "fi; fi; "
+            'if [ "$awm_delivery_delivery_status" -ne 0 ]; then '
+            "printf '%s\\n' 'publication-disabled delivery failed' >&2; "
+            'exit "$awm_delivery_delivery_status"; fi'
         )
 
     def _with_shell_diagnostic(
