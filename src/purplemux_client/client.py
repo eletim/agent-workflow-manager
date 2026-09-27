@@ -1732,6 +1732,11 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'awm_delivery_object_dir=$(cd "$awm_delivery_object_dir" && pwd -P) && '
             "awm_delivery_ref=$(git symbolic-ref -q HEAD) && "
             'awm_delivery_old=$(git rev-parse "$awm_delivery_ref") && '
+            "awm_delivery_sparse=$(git config --bool core.sparseCheckout "
+            "2>/dev/null || :) && "
+            'if [ "$awm_delivery_sparse" = true ]; then '
+            "printf '%s\\n' 'publication-disabled sessions do not support "
+            "sparse checkouts' >&2; exit 1; fi && "
             "awm_delivery_user_name=$(git config --get user.name) && "
             "awm_delivery_user_email=$(git config --get user.email) && "
             "awm_delivery_hooks_root=$(git rev-parse --git-path hooks) && "
@@ -1795,7 +1800,8 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
             '"$awm_delivery_real_git" merge-base --is-ancestor '
             '"$awm_delivery_old" "$awm_delivery_new" && '
-            "printf '%s\\n' \"$awm_delivery_new\" | "
+            "printf '%s\\n^%s\\n' \"$awm_delivery_new\" "
+            '"$awm_delivery_old" | '
             'GIT_ALTERNATE_OBJECT_DIRECTORIES="$awm_delivery_shadow_git_dir/objects" '
             '"$awm_delivery_real_git" '
             "pack-objects --quiet --stdout --revs | "

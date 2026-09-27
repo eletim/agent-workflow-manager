@@ -573,6 +573,234 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_rejects_modified_sparse_checkout_before_launch(
+    worker: str, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    checkout = tmp_path / "linked-checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    (repository / "included").mkdir()
+    (repository / "included" / "tracked.txt").write_text("before\n", encoding="utf-8")
+    (repository / "omitted").mkdir()
+    (repository / "omitted" / "tracked.txt").write_text("preserve\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/sparse",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "sparse-checkout", "set", "included"],
+        check=True,
+        capture_output=True,
+    )
+    modified = checkout / "included" / "tracked.txt"
+    modified.write_text("after\n", encoding="utf-8")
+    original_head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    marker = tmp_path / "worker-launched"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        'printf launched > "$AWM_TEST_LAUNCH_MARKER"\n'
+        "git add -A && git commit -m unintended\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_LAUNCH_MARKER"] = str(marker)
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit change"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "do not support sparse checkouts" in result.stderr
+    assert not marker.exists()
+    assert modified.read_text(encoding="utf-8") == "after\n"
+    assert not (checkout / "omitted" / "tracked.txt").exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == original_head
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(checkout), "status", "--short"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == " M included/tracked.txt\n"
+    )
+
+
+def test_publication_disabled_repeated_commits_transfer_only_new_objects(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    checkout = tmp_path / "linked-checkout"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    tracked = repository / "tracked"
+    tracked.mkdir()
+    for index in range(32):
+        (tracked / f"file-{index:02}.txt").write_text(
+            f"base {index}\n", encoding="utf-8"
+        )
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    for index in range(3):
+        (tracked / f"file-{index:02}.txt").write_text(
+            f"history {index}\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-am", f"history {index}"],
+            check=True,
+            capture_output=True,
+        )
+    historical_object_count = len(
+        subprocess.run(
+            ["git", "-C", str(repository), "rev-list", "--objects", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "-b",
+            "feature/repeated",
+            str(checkout),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf 'next\\n' >> tracked/file-00.txt\n"
+        "git add tracked/file-00.txt\n"
+        "git commit -m incremental >/dev/null 2>&1\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    pack_directory = repository / ".git" / "objects" / "pack"
+
+    transferred_object_counts: list[int] = []
+    for _ in range(2):
+        packs_before = set(pack_directory.glob("*.idx"))
+        result = subprocess.run(
+            PurpleMuxCLIClient._publication_disabled_agent_command(
+                "codex", "commit one change"
+            ),
+            cwd=checkout,
+            env=environment,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        new_packs = set(pack_directory.glob("*.idx")) - packs_before
+        assert len(new_packs) == 1
+        (new_pack,) = new_packs
+        verify_lines = subprocess.run(
+            ["git", "verify-pack", "-v", str(new_pack)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        transferred_object_counts.append(
+            sum(
+                len(fields) >= 5 and fields[1] in {"blob", "commit", "tag", "tree"}
+                for fields in (line.split() for line in verify_lines)
+            )
+        )
+
+    assert historical_object_count > 32
+    assert transferred_object_counts == [4, 4]
+    assert all(count < historical_object_count for count in transferred_object_counts)
+    assert subprocess.run(
+        ["git", "-C", str(checkout), "log", "-2", "--format=%s"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines() == ["incremental", "incremental"]
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
     worker: str, tmp_path: Path
 ) -> None:
