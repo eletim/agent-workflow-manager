@@ -1727,6 +1727,11 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             "GIT_ALTERNATE_OBJECT_DIRECTORIES && "
             "awm_delivery_real_git=$(command -v git) && "
             'case "$awm_delivery_real_git" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_chmod=$(command -v chmod) && "
+            'case "$awm_delivery_chmod" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_rm=$(command -v rm) && "
+            'case "$awm_delivery_rm" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_original_path=$PATH && "
             "awm_delivery_root=$(pwd -P) && "
             "awm_delivery_object_dir=$(git rev-parse --path-format=absolute "
             "--git-path objects) && "
@@ -1744,13 +1749,38 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'mkdir -p -- "$awm_delivery_hooks_root" && '
             'awm_delivery_hooks_root=$(cd "$awm_delivery_hooks_root" && pwd -P) && '
             "umask 077 && "
+            "awm_delivery_hooks='' && "
+            "awm_delivery_shadow_git_dir='' && "
+            "awm_delivery_cleanup() { "
+            "awm_delivery_primary_status=$1; "
+            "trap - EXIT; "
+            "awm_delivery_cleanup_failed=0; "
+            'for awm_delivery_cleanup_dir in "$awm_delivery_hooks" '
+            '"$awm_delivery_shadow_git_dir"; do '
+            '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
+            '"$awm_delivery_chmod" -R u+rwX -- "$awm_delivery_cleanup_dir" '
+            "2>/dev/null || :; "
+            'if ! "$awm_delivery_rm" -rf -- "$awm_delivery_cleanup_dir" '
+            "2>/dev/null; then "
+            "awm_delivery_cleanup_failed=1; "
+            "fi; "
+            "done; "
+            'if [ "$awm_delivery_cleanup_failed" -ne 0 ]; then '
+            "printf '%s\\n' 'publication-disabled session cleanup failed; "
+            "temporary resources may remain' >&2; "
+            'if [ "$awm_delivery_primary_status" -ne 0 ]; then '
+            'exit "$awm_delivery_primary_status"; '
+            "fi; "
+            "exit 1; "
+            "fi; "
+            'exit "$awm_delivery_primary_status"; '
+            "} && "
+            "trap 'awm_delivery_cleanup $?' EXIT && "
             "awm_delivery_hooks=$(mktemp -d "
             '"$awm_delivery_hooks_root/awm-delivery.XXXXXX") && '
             "awm_delivery_shadow_git_dir=$(mktemp -d "
             '"/tmp/awm-delivery-shadow.XXXXXX") && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
-            "trap 'rm -r -- \"$awm_delivery_hooks\" "
-            "\"$awm_delivery_shadow_git_dir\"' EXIT && "
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
             f"printf %s {pre_push_hook} | base64 --decode > "
@@ -1778,7 +1808,6 @@ exec "$AWM_DELIVERY_REAL_GIT" "$@"
             'GIT_DIR="$awm_delivery_shadow_git_dir" '
             'GIT_WORK_TREE="$awm_delivery_root" '
             '"$awm_delivery_real_git" read-tree "$awm_delivery_old" && '
-            "awm_delivery_original_path=$PATH && "
             'PATH="$awm_delivery_hooks/bin:$PATH" && '
             'export PATH AWM_DELIVERY_REAL_GIT="$awm_delivery_real_git" '
             'AWM_DELIVERY_SHADOW_GIT_DIR="$awm_delivery_shadow_git_dir" '

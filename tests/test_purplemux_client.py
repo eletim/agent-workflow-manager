@@ -147,6 +147,19 @@ def baseline(
     ]
 
 
+def initialize_test_repository(path: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+    )
+
+
 def test_create_response_parsing_and_codex_panel_type() -> None:
     runner = FakeRunner([completed({"tabId": "tab-123"})])
 
@@ -353,6 +366,170 @@ def test_publication_disabled_agent_retains_development_tools(worker: str) -> No
         allowed_tools = arguments[arguments.index("--allowed-tools") + 1].split(",")
         assert "Bash" in allowed_tools
         assert not any(tool.startswith("Bash(") for tool in allowed_tools)
+
+
+@pytest.mark.parametrize(
+    ("agent_status", "use_pty"),
+    [(0, False), (29, False), (0, True), (29, True)],
+    ids=("success-no-stdin", "failure-no-stdin", "success-pty", "failure-pty"),
+)
+def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
+    agent_status: int, use_pty: bool, tmp_path: Path
+) -> None:
+    initialize_test_repository(tmp_path)
+    resource_record = tmp_path / "cleanup-resources"
+    fake_worker = tmp_path / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "hooks=${GH_CONFIG_DIR%/gh}\n"
+        'printf \'%s\\n%s\\n\' "$hooks" "$AWM_DELIVERY_SHADOW_GIT_DIR" '
+        '> "$AWM_TEST_RESOURCE_RECORD"\n'
+        'for directory in "$hooks" "$AWM_DELIVERY_SHADOW_GIT_DIR"; do\n'
+        '    mkdir "$directory/write-protected"\n'
+        '    : > "$directory/write-protected/file"\n'
+        '    chmod 400 "$directory/write-protected/file"\n'
+        '    chmod 500 "$directory/write-protected"\n'
+        "done\n"
+        f"exit {agent_status}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+    environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
+    command = PurpleMuxCLIClient._publication_disabled_agent_command(
+        "codex", "exercise cleanup"
+    )
+    arguments: str | list[str] = command
+    if use_pty:
+        arguments = ["script", "-q", "-e", "-c", command, "/dev/null"]
+
+    result = subprocess.run(
+        arguments,
+        cwd=tmp_path,
+        env=environment,
+        shell=not use_pty,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    resources = resource_record.read_text(encoding="utf-8").splitlines()
+    try:
+        assert result.returncode == agent_status
+        assert len(resources) == 2
+        assert all(not Path(resource).exists() for resource in resources)
+    finally:
+        for resource in resources:
+            shutil.rmtree(resource, ignore_errors=True)
+
+
+def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
+    tmp_path: Path,
+) -> None:
+    initialize_test_repository(tmp_path)
+    hook_record = tmp_path / "created-hook-directory"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_mktemp = shutil.which("mktemp")
+    assert real_mktemp is not None
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        "    /tmp/awm-delivery-shadow.*) exit 73 ;;\n"
+        "esac\n"
+        f'created=$("{real_mktemp}" "$@") || exit $?\n'
+        'printf \'%s\n\' "$created" > "$AWM_TEST_HOOK_RECORD"\n'
+        "printf '%s\n' \"$created\"\n",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_HOOK_RECORD"] = str(hook_record)
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command("codex", "not reached"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 73
+    assert not Path(hook_record.read_text(encoding="utf-8").strip()).exists()
+
+
+@pytest.mark.parametrize("agent_status", [0, 29], ids=("success", "agent-failure"))
+def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_status(
+    agent_status: int, tmp_path: Path
+) -> None:
+    initialize_test_repository(tmp_path)
+    resource_record = tmp_path / "cleanup-resources"
+    removal_record = tmp_path / "cleanup-removals"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n%s\\n' \"${GH_CONFIG_DIR%/gh}\" "
+        '"$AWM_DELIVERY_SHADOW_GIT_DIR" > "$AWM_TEST_RESOURCE_RECORD"\n'
+        f"exit {agent_status}\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$*" >> "$AWM_TEST_REMOVAL_RECORD"\n'
+        "index=0\n"
+        'while [ "$index" -lt 100 ]; do\n'
+        "    printf 'unbounded implementation detail\\n' >&2\n"
+        "    index=$((index + 1))\n"
+        "done\n"
+        "exit 88\n",
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["AWM_TEST_REMOVAL_RECORD"] = str(removal_record)
+    environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command("codex", "fail cleanup"),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    resources = resource_record.read_text(encoding="utf-8").splitlines()
+    try:
+        expected_status = agent_status if agent_status else 1
+        assert result.returncode == expected_status
+        assert result.stderr == (
+            "publication-disabled session cleanup failed; temporary resources may remain\n"
+        )
+        removals = removal_record.read_text(encoding="utf-8").splitlines()
+        assert len(removals) == 2
+        assert {removal.removeprefix("-rf -- ") for removal in removals} == set(
+            resources
+        )
+    finally:
+        for resource in resources:
+            shutil.rmtree(resource, ignore_errors=True)
 
 
 def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:
