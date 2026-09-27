@@ -1607,7 +1607,6 @@ import threading
     old,
     common_git_dir,
     publication_state,
-    retention_state,
 ) = sys.argv[1:]
 blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
 recovery_path = Path(recovery)
@@ -1616,6 +1615,7 @@ base_environment.update({"GIT_DIR": shadow, "GIT_WORK_TREE": worktree})
 active_processes = set()
 active_processes_lock = threading.Lock()
 shutdown_requested = threading.Event()
+recovery_interrupted = threading.Event()
 recovery_finished = threading.Event()
 
 
@@ -1663,12 +1663,15 @@ def run_process(arguments, **kwargs):
 
 def watch_for_interrupted_shutdown():
     shutdown_requested.wait()
-    if recovery_finished.wait(2):
+    if recovery_finished.wait(1.5):
         return
-    try:
-        Path(retention_state).write_text("1\\n", encoding="ascii")
-    except OSError:
-        pass
+    recovery_interrupted.set()
+    with active_processes_lock:
+        processes = tuple(active_processes)
+    for process in processes:
+        kill_process_group(process)
+    if recovery_finished.wait(1.5):
+        return
     with active_processes_lock:
         processes = tuple(active_processes)
     for process in processes:
@@ -1755,6 +1758,80 @@ def publish_recovery():
     fsync_directory(recovery_path.parent)
     fsync_directory(recovery_path.parent.parent)
     Path(publication_state).write_text("1\\n", encoding="ascii")
+
+
+def reset_publication_marker():
+    changed = False
+    for name in (".complete", ".complete.tmp"):
+        marker = recovery_path / name
+        if marker.exists():
+            marker.unlink()
+            changed = True
+    if changed:
+        fsync_directory(recovery_path)
+
+
+def write_metadata(cleanliness, *, interrupted=False, error=None):
+    metadata = {
+        "formatVersion": 1,
+        "protectedRef": protected_ref,
+        "baseCommit": old,
+        "shadowCommit": shadow_commit,
+        "stagedCommit": staged_commit,
+        "worktreeCommit": worktree_commit,
+        "conflictState": conflict_state,
+        "cleanliness": cleanliness,
+        "nestedRecoveryCount": len(nested_repositories),
+        "ordinaryGitMarkers": marker_metadata,
+    }
+    if interrupted:
+        metadata["interrupted"] = True
+        metadata["recoveryError"] = str(error)[:1000]
+    metadata_temporary = recovery_path / "metadata.json.tmp"
+    metadata_temporary.write_text(
+        json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
+    )
+    os.replace(metadata_temporary, recovery_path / "metadata.json")
+
+
+def build_interrupted_bundle():
+    bundle = recovery_path / "recovery.bundle"
+    if bundle.is_file():
+        return
+    bundle_temporary = recovery_path / "recovery.bundle.tmp"
+    bundle_temporary.unlink(missing_ok=True)
+    references = recovery_refs or {"refs/awm-delivery/shadow": shadow_commit}
+    pack_input = "\\n".join([*references.values(), "^" + old, ""])
+    with bundle_temporary.open("wb") as output:
+        output.write(b"# v2 git bundle\\n")
+        output.write(f"-{old} required base\\n".encode("ascii"))
+        for reference, commit in references.items():
+            output.write(f"{commit} {reference}\\n".encode("ascii"))
+        output.write(b"\\n")
+        output.flush()
+        result = run_process(
+            [
+                timeout_command,
+                "--signal=KILL",
+                "1s",
+                git,
+                "pack-objects",
+                "--stdout",
+                "--revs",
+            ],
+            cwd=worktree,
+            env=base_environment,
+            input=pack_input.encode("ascii"),
+            stdout=output,
+            stderr=subprocess.PIPE,
+            timeout=1.2,
+            check=False,
+            start_new_session=True,
+        )
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError((detail or "interrupted recovery pack failed")[:1000])
+    os.replace(bundle_temporary, bundle)
 
 
 def capture_index_state(
@@ -2088,6 +2165,14 @@ def capture_nested_repository(root, destination):
         or staged_tree != worktree_tree
     )
 
+shadow_commit = old
+staged_commit = None
+worktree_commit = None
+conflict_state = None
+recovery_refs = {}
+nested_repositories = []
+marker_metadata = []
+publication_attempted = False
 
 try:
     shadow_commit = run_git(["rev-parse", protected_ref]).stdout.strip()
@@ -2201,35 +2286,27 @@ try:
     except (OSError, subprocess.SubprocessError):
         cleanliness = "unverified"
 
-    metadata = {
-        "formatVersion": 1,
-        "protectedRef": protected_ref,
-        "baseCommit": old,
-        "shadowCommit": shadow_commit,
-        "stagedCommit": staged_commit,
-        "worktreeCommit": worktree_commit,
-        "conflictState": conflict_state,
-        "cleanliness": cleanliness,
-        "nestedRecoveryCount": len(nested_repositories),
-        "ordinaryGitMarkers": marker_metadata,
-    }
-    metadata_temporary = recovery_path / "metadata.json.tmp"
-    metadata_temporary.write_text(
-        json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
-    )
-    os.replace(metadata_temporary, recovery_path / "metadata.json")
+    write_metadata(cleanliness)
+    publication_attempted = True
     publish_recovery()
     recovery_finished.set()
     print(cleanliness)
 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-    completion_marker = recovery_path / ".complete"
-    if not Path(publication_state).is_file() and completion_marker.is_file():
-        try:
-            Path(retention_state).write_text("1\\n", encoding="ascii")
-            completion_marker.unlink()
-            fsync_directory(recovery_path)
-        except OSError:
-            pass
+    try:
+        reset_publication_marker()
+        if recovery_interrupted.is_set():
+            build_interrupted_bundle()
+            write_metadata("unverified", interrupted=True, error=error)
+            publish_recovery()
+        elif publication_attempted:
+            publish_recovery()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as fallback_error:
+        print(
+            f"publication-disabled interrupted recovery failed: {fallback_error}",
+            file=sys.stderr,
+        )
+    finally:
+        recovery_finished.set()
     print(f"publication-disabled recovery failed: {error}", file=sys.stderr)
     raise SystemExit(74)
 """
@@ -2495,10 +2572,8 @@ exec "$real_git" "$@"
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
             "awm_delivery_recovery_state='' && "
-            "awm_delivery_retention_state='' && "
             "awm_delivery_recovery_started=0 && "
             "awm_delivery_recovery_published=0 && "
-            "awm_delivery_recovery_inputs_retained=0 && "
             "awm_delivery_transition_pending=0 && "
             "awm_delivery_new='' && "
             "awm_delivery_cleanup() { "
@@ -2508,9 +2583,6 @@ exec "$real_git" "$@"
             'if [ -n "$awm_delivery_recovery_state" ] && '
             '[ -f "$awm_delivery_recovery_state" ]; then '
             "awm_delivery_recovery_published=1; fi; "
-            'if [ -n "$awm_delivery_retention_state" ] && '
-            '[ -f "$awm_delivery_retention_state" ]; then '
-            "awm_delivery_recovery_inputs_retained=1; fi; "
             'if [ "$awm_delivery_recovery_started" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -eq 0 ] && '
             '[ -n "$awm_delivery_recovery" ]; then '
@@ -2522,14 +2594,6 @@ exec "$real_git" "$@"
             'if [ -f "$awm_delivery_manifest" ]; then '
             'while IFS= read -r awm_delivery_cleanup_dir; do '
             '[ -n "$awm_delivery_cleanup_dir" ] || continue; '
-            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
-            '[ "$awm_delivery_recovery_inputs_retained" -ne 0 ] && '
-            '{ [ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_shadow_git_dir" ] || '
-            '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_isolated_root" ] || '
-            '[ "$awm_delivery_cleanup_dir" = '
-            '"$awm_delivery_recovery" ]; }; then continue; fi; '
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -ne 0 ] && '
             '[ "$awm_delivery_cleanup_dir" = "$awm_delivery_recovery" ]; '
@@ -2570,12 +2634,6 @@ exec "$real_git" "$@"
             '[ "$awm_delivery_recovery_published" -ne 0 ]; then '
             "printf '%s\\n' \"publication-disabled agent output recovery "
             'retained at $awm_delivery_recovery" >&2; fi; '
-            'if [ "$awm_delivery_primary_status" -ne 0 ] && '
-            '[ "$awm_delivery_recovery_inputs_retained" -ne 0 ]; then '
-            "printf '%s\\n' \"publication-disabled recovery inputs retained "
-            "after incomplete publication: shadow=$awm_delivery_shadow_git_dir "
-            "worktree=$awm_delivery_isolated_root "
-            'recovery=$awm_delivery_recovery" >&2; fi; '
             'exit "$awm_delivery_primary_status"; '
             "} && "
             "awm_delivery_rollback() { "
@@ -2618,8 +2676,6 @@ exec "$real_git" "$@"
             '"$awm_delivery_hooks_root" "awm-delivery.") && '
             'awm_delivery_recovery_state="$awm_delivery_hooks/'
             'recovery-published" && '
-            'awm_delivery_retention_state="$awm_delivery_hooks/'
-            'recovery-inputs-retained" && '
             'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_resource_parent" "awm-delivery-shadow.") && '
@@ -2718,8 +2774,7 @@ exec "$real_git" "$@"
             '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
             '"$awm_delivery_recovery" "$awm_delivery_ref" '
             '"$awm_delivery_old" "$awm_delivery_common_git_dir" '
-            '"$awm_delivery_recovery_state" '
-            '"$awm_delivery_retention_state") || { '
+            '"$awm_delivery_recovery_state") || { '
             "printf '%s\\n' "
             '"publication-disabled agent output recovery failed" >&2; '
             'if [ "$awm_delivery_status" -ne 0 ]; then '

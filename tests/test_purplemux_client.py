@@ -1579,8 +1579,51 @@ def test_publication_disabled_post_agent_signal_preserves_recovery_and_cleans_de
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+def assert_recovery_worktree_file(
+    recovery: Path,
+    repository: Path,
+    base: str,
+    recovered: Path,
+    path: str,
+    expected: str,
+) -> None:
+    subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(recovered), "fetch", str(repository), base],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(recovered),
+            "fetch",
+            str(recovery / "recovery.bundle"),
+            "refs/awm-delivery/worktree:refs/awm-delivery/worktree",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(recovered),
+                "show",
+                f"refs/awm-delivery/worktree:{path}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == expected
+    )
+
+
 @pytest.mark.parametrize("failed_barrier", [1, 2, 3])
-def test_publication_disabled_durability_failure_retains_recovery_inputs(
+def test_publication_disabled_durability_failure_republishes_recovery(
     failed_barrier: int,
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],
@@ -1659,21 +1702,29 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         check=False,
     )
 
-    retained = [
-        *tmp_path.glob("awm-delivery-shadow.*"),
-        *tmp_path.glob("awm-delivery-worktree.*"),
-        *(repository / ".git" / "awm-delivery-recovery").glob("output.*"),
-    ]
+    recoveries = list(
+        (repository / ".git" / "awm-delivery-recovery").glob("output.*")
+    )
     try:
         assert result.returncode == 74
         assert "injected post-marker fsync failure" in result.stderr
-        assert "publication-disabled agent output recovery retained at " not in result.stderr
-        assert (
-            "publication-disabled recovery inputs retained after incomplete publication"
-            in result.stderr
+        assert "publication-disabled agent output recovery retained at " in result.stderr
+        assert len(recoveries) == 1
+        recovery = recoveries[0]
+        assert (recovery / ".complete").is_file()
+        assert (recovery / "recovery.bundle").is_file()
+        assert not (recovery / "tracked.txt").exists()
+        assert not (recovery / "residual.txt").exists()
+        assert_recovery_worktree_file(
+            recovery,
+            repository,
+            base,
+            tmp_path / "recovered",
+            "residual.txt",
+            "residual\n",
         )
-        assert len(retained) == 3
-        assert not (retained[2] / ".complete").exists()
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1688,7 +1739,7 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
             == base
         )
     finally:
-        for path in retained:
+        for path in recoveries:
             shutil.rmtree(path, ignore_errors=True)
 
 
@@ -1756,20 +1807,31 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
     _, stderr = process.communicate(timeout=5)
     elapsed = time.monotonic() - started
 
-    retained = [
-        *tmp_path.glob("awm-delivery-shadow.*"),
-        *tmp_path.glob("awm-delivery-worktree.*"),
-        *(repository / ".git" / "awm-delivery-recovery").glob("output.*"),
-    ]
+    recoveries = list(
+        (repository / ".git" / "awm-delivery-recovery").glob("output.*")
+    )
     try:
         assert process.returncode == 143
         assert elapsed < 4
-        assert "publication-disabled agent output recovery retained at " not in stderr
-        assert (
-            "publication-disabled recovery inputs retained after incomplete publication"
-            in stderr
+        assert "publication-disabled agent output recovery retained at " in stderr
+        assert len(recoveries) == 1
+        recovery = recoveries[0]
+        assert (recovery / ".complete").is_file()
+        assert not (recovery / "tracked.txt").exists()
+        metadata = json.loads(
+            (recovery / "metadata.json").read_text(encoding="utf-8")
         )
-        assert len(retained) == 3
+        assert metadata["interrupted"] is True
+        assert_recovery_worktree_file(
+            recovery,
+            repository,
+            base,
+            tmp_path / "recovered",
+            "tracked.txt",
+            "committed\n",
+        )
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
         assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
         assert not list(
             (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
@@ -1790,7 +1852,7 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
-        for path in retained:
+        for path in recoveries:
             shutil.rmtree(path, ignore_errors=True)
 
 
