@@ -485,14 +485,18 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         '--git-dir="${AWM_DELIVERY_SHADOW_GIT_DIR:-}" push --no-verify '
         '"$AWM_TEST_REMOTE" HEAD:refs/heads/forbidden-direct >/dev/null 2>&1\n'
         "direct_git_status=$?\n"
+        '(printf attack > "${GH_CONFIG_DIR%/gh}/reference-transaction") '
+        "2>/dev/null\n"
+        "hook_file_status=$?\n"
         "status=$(git status --porcelain)\n"
         "config_exposed=0\n"
         '[ ! -e "$GH_CONFIG_DIR/hosts.yml" ] || config_exposed=1\n'
-        "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "
+        "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "
         '"$commit_status" "$push_status" "$no_verify_status" '
         '"$hook_override_status" "$alias_status" "$separated_git_dir_status" '
         '"$real_git_status" "$exec_path_status" "$receive_pack_status" '
         '"$direct_git_status" '
+        '"$hook_file_status" '
         '"${AWM_DELIVERY_REAL_GIT-unset}" '
         '"${AWM_DELIVERY_SHADOW_GIT_DIR-unset}" '
         '"${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "$config_exposed" '
@@ -548,14 +552,15 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
         exec_path_status,
         receive_pack_status,
         direct_git_status,
+        hook_file_status,
         exposed_real_git,
         exposed_shadow_git_dir,
         token,
         github_token,
         config_exposed,
         status,
-    ) = result.stdout.strip().split("|", 15)
-    assert commit_status == "0"
+    ) = result.stdout.strip().split("|", 16)
+    assert commit_status == "0", result.stderr
     assert push_status != "0"
     assert no_verify_status != "0"
     assert hook_override_status != "0"
@@ -565,6 +570,7 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
     assert exec_path_status != "0"
     assert receive_pack_status != "0"
     assert direct_git_status != "0"
+    assert hook_file_status != "0"
     assert exposed_real_git == exposed_shadow_git_dir == "unset"
     assert token == github_token == "unset"
     assert config_exposed == "0"
@@ -632,6 +638,135 @@ def test_publication_disabled_launch_contract_delivers_linked_worktree_commit(
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
+def test_publication_disabled_isolates_late_and_nested_local_remotes(
+    worker: str,
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, checkout, _, _ = linked_delivery_repository
+    (checkout / ".gitignore").write_text(
+        "late-remote.git/\nnested-remote/\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(checkout), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "ignore local remotes"],
+        check=True,
+        capture_output=True,
+    )
+    nested_remote = checkout / "nested-remote"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(nested_remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(nested_remote), "config", "user.name", "Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(nested_remote), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    (nested_remote / "nested.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(nested_remote), "add", "nested.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(nested_remote), "commit", "-m", "nested base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(nested_remote),
+            "config",
+            "receive.denyCurrentBranch",
+            "updateInstead",
+        ],
+        check=True,
+    )
+    nested_head = subprocess.run(
+        ["git", "-C", str(nested_remote), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / worker
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "shadow=\n"
+        "previous=\n"
+        "for argument do\n"
+        '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
+        "    previous=$argument\n"
+        "done\n"
+        "printf 'delivered\\n' > tracked.txt\n"
+        "git add tracked.txt\n"
+        "git commit -m isolated-delivery >/dev/null 2>&1\n"
+        '"$AWM_TEST_REAL_GIT" --git-dir="$shadow" push --force --no-verify '
+        '--receive-pack="$AWM_TEST_RECEIVE_PACK" nested-remote '
+        "HEAD:main >/dev/null 2>&1\n"
+        "nested_status=$?\n"
+        '"$AWM_TEST_REAL_GIT" init --bare late-remote.git >/dev/null 2>&1\n'
+        '"$AWM_TEST_REAL_GIT" --git-dir="$shadow" push --no-verify '
+        '--receive-pack="$AWM_TEST_RECEIVE_PACK" late-remote.git '
+        "HEAD:refs/heads/main >/dev/null 2>&1\n"
+        "late_status=$?\n"
+        'nested_after=$("$AWM_TEST_REAL_GIT" -C nested-remote rev-parse HEAD)\n'
+        'late_after=$("$AWM_TEST_REAL_GIT" --git-dir=late-remote.git '
+        "rev-parse refs/heads/main)\n"
+        "printf 'isolated-remotes:%s|%s|%s|%s\\n' "
+        '"$nested_status" "$late_status" "$nested_after" "$late_after"\n',
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_REAL_GIT": shutil.which("git") or "git",
+            "AWM_TEST_RECEIVE_PACK": shutil.which("git-receive-pack")
+            or "git-receive-pack",
+        }
+    )
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    marker = next(
+        line for line in result.stdout.splitlines() if line.startswith("isolated-remotes:")
+    )
+    nested_status, late_status, nested_after, late_after = marker.removeprefix(
+        "isolated-remotes:"
+    ).split("|")
+    assert nested_status == late_status == "0"
+    assert nested_after == late_after
+    assert nested_remote.joinpath("nested.txt").read_text(encoding="utf-8") == "before\n"
+    assert (
+        subprocess.run(
+            ["git", "-C", str(nested_remote), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == nested_head
+    )
+    assert not (checkout / "late-remote.git").exists()
+    assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "delivered\n"
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude"])
 def test_publication_disabled_rolls_back_ref_when_real_index_update_fails(
     worker: str,
     tmp_path: Path,
@@ -662,20 +797,15 @@ def test_publication_disabled_rolls_back_ref_when_real_index_update_fails(
         "#!/bin/sh\n"
         "printf 'after\\n' > tracked.txt\n"
         "git add tracked.txt\n"
-        "git commit -m index-failure >/dev/null 2>&1\n"
-        ': > "$AWM_TEST_INDEX_LOCK"\n',
+        "git commit -m index-failure >/dev/null 2>&1\n",
         encoding="utf-8",
     )
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
-    environment.update(
-        {
-            "PATH": f"{fake_bin}:{environment['PATH']}",
-            "AWM_TEST_INDEX_LOCK": str(index_lock),
-        }
-    )
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
     try:
+        index_lock.touch()
         result = subprocess.run(
             PurpleMuxCLIClient._publication_disabled_agent_command(
                 worker, "commit a change"
@@ -707,7 +837,7 @@ def test_publication_disabled_rolls_back_ref_when_real_index_update_fails(
             ).stdout
             == ""
         )
-        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "after\n"
+        assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "before\n"
     finally:
         index_lock.unlink(missing_ok=True)
 
@@ -721,7 +851,6 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
     agent_status: int, use_pty: bool, tmp_path: Path
 ) -> None:
     initialize_test_repository(tmp_path)
-    resource_record = tmp_path / "cleanup-resources"
     fake_worker = tmp_path / "codex"
     fake_worker.write_text(
         "#!/bin/sh\n"
@@ -732,9 +861,8 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
         "    previous=$argument\n"
         "done\n"
         "hooks=${GH_CONFIG_DIR%/gh}\n"
-        'printf \'%s\\n%s\\n\' "$hooks" "$shadow" '
-        '> "$AWM_TEST_RESOURCE_RECORD"\n'
-        'for directory in "$hooks" "$shadow"; do\n'
+        'printf \'cleanup-resources:%s|%s\\n\' "$hooks" "$shadow"\n'
+        'for directory in "$shadow"; do\n'
         '    mkdir "$directory/write-protected"\n'
         '    : > "$directory/write-protected/file"\n'
         '    chmod 400 "$directory/write-protected/file"\n'
@@ -746,7 +874,6 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
     environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
-    environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
     command = PurpleMuxCLIClient._publication_disabled_agent_command(
         "codex", "exercise cleanup"
     )
@@ -766,7 +893,12 @@ def test_publication_disabled_cleanup_is_unconditional_and_noninteractive(
         check=False,
     )
 
-    resources = resource_record.read_text(encoding="utf-8").splitlines()
+    resource_line = next(
+        line
+        for line in (result.stdout + result.stderr).splitlines()
+        if "cleanup-resources:" in line
+    )
+    resources = resource_line.split("cleanup-resources:", 1)[1].split("|")
     try:
         assert result.returncode == agent_status
         assert len(resources) == 2
@@ -793,7 +925,6 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
     tmp_path: Path,
 ) -> None:
     initialize_test_repository(tmp_path)
-    resource_record = tmp_path / "cleanup-resources"
     removal_record = tmp_path / "cleanup-removals"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -807,7 +938,7 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         "    previous=$argument\n"
         "done\n"
         'printf \'%s\\n%s\\n\' "${GH_CONFIG_DIR%/gh}" "$shadow" '
-        '> "$AWM_TEST_RESOURCE_RECORD"\n'
+        '> "$shadow/cleanup-resources"\n'
         "while :; do sleep 1; done\n",
         encoding="utf-8",
     )
@@ -825,7 +956,6 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["AWM_TEST_REMOVAL_RECORD"] = str(removal_record)
-    environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
     command = PurpleMuxCLIClient._publication_disabled_agent_command(
         "codex", "wait for interruption"
     )
@@ -852,8 +982,11 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
     try:
         deadline = time.monotonic() + 5
         while process.poll() is None:
-            if resource_record.exists():
-                resources = resource_record.read_text(encoding="utf-8").splitlines()
+            records = list(
+                tmp_path.parent.glob("awm-delivery-shadow.*/cleanup-resources")
+            )
+            if records:
+                resources = records[0].read_text(encoding="utf-8").splitlines()
                 if len(resources) == 2:
                     break
             if time.monotonic() >= deadline:
@@ -872,12 +1005,12 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        assert len(directory_removals) == 2
-        assert {
+        assert len(directory_removals) == 3
+        removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
-        } == set(
-            resources
-        )
+        }
+        assert removed_directories.issuperset(resources)
+        assert any("awm-delivery-worktree." in path for path in removed_directories)
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
@@ -952,7 +1085,9 @@ def test_publication_disabled_cleanup_is_registered_before_shadow_creation(
         collision.rmdir()
 
 
-@pytest.mark.parametrize("blocked_call", [1, 2], ids=("hooks", "shadow"))
+@pytest.mark.parametrize(
+    "blocked_call", [1, 2, 3], ids=("hooks", "shadow", "worktree")
+)
 @pytest.mark.parametrize("use_pty", [False, True], ids=("no-stdin", "pty"))
 def test_publication_disabled_signal_cleans_directory_before_allocator_returns(
     blocked_call: int, use_pty: bool, tmp_path: Path
@@ -1056,7 +1191,6 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     agent_status: int, use_pty: bool, tmp_path: Path
 ) -> None:
     initialize_test_repository(tmp_path)
-    resource_record = tmp_path / "cleanup-resources"
     removal_record = tmp_path / "cleanup-removals"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1069,8 +1203,7 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
         "    previous=$argument\n"
         "done\n"
-        'printf \'%s\\n%s\\n\' "${GH_CONFIG_DIR%/gh}" "$shadow" '
-        '> "$AWM_TEST_RESOURCE_RECORD"\n'
+        'printf \'cleanup-resources:%s|%s\\n\' "${GH_CONFIG_DIR%/gh}" "$shadow"\n'
         f"exit {agent_status}\n",
         encoding="utf-8",
     )
@@ -1088,7 +1221,6 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["AWM_TEST_REMOVAL_RECORD"] = str(removal_record)
-    environment["AWM_TEST_RESOURCE_RECORD"] = str(resource_record)
     cleanup_pid_record = tmp_path / "cleanup-pids"
     environment["AWM_TEST_CLEANUP_PID_RECORD"] = str(cleanup_pid_record)
     command = PurpleMuxCLIClient._publication_disabled_agent_command(
@@ -1110,7 +1242,12 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         check=False,
     )
 
-    resources = resource_record.read_text(encoding="utf-8").splitlines()
+    resource_line = next(
+        line
+        for line in (result.stdout + result.stderr).splitlines()
+        if "cleanup-resources:" in line
+    )
+    resources = resource_line.split("cleanup-resources:", 1)[1].split("|")
     try:
         expected_status = agent_status if agent_status else 1
         assert result.returncode == expected_status
@@ -1122,14 +1259,14 @@ def test_publication_disabled_cleanup_failure_is_bounded_and_preserves_agent_sta
         directory_removals = [
             removal for removal in removals if removal.startswith("-rf")
         ]
-        assert len(directory_removals) == 2
-        assert {
+        assert len(directory_removals) == 3
+        removed_directories = {
             removal.removeprefix("-rf -- ") for removal in directory_removals
-        } == set(
-            resources
-        )
+        }
+        assert removed_directories.issuperset(resources)
+        assert any("awm-delivery-worktree." in path for path in removed_directories)
         cleanup_pids = cleanup_pid_record.read_text(encoding="utf-8").splitlines()
-        assert len(cleanup_pids) == 3
+        assert len(cleanup_pids) == 4
         for cleanup_pid in cleanup_pids:
             with pytest.raises(ProcessLookupError):
                 os.kill(int(cleanup_pid), 0)
@@ -1163,7 +1300,7 @@ def test_claude_publication_disabled_uses_strict_os_sandbox() -> None:
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
-def test_publication_disabled_allows_commits_in_nested_repository(
+def test_publication_disabled_allows_ephemeral_nested_repository_work(
     worker: str, tmp_path: Path
 ) -> None:
     subprocess.run(
@@ -1209,12 +1346,7 @@ def test_publication_disabled_allows_commits_in_nested_repository(
     assert result.returncode == 0
     commit_status, nested_path = result.stdout.strip().split("|", 1)
     assert commit_status == "0"
-    assert subprocess.run(
-        ["git", "-C", nested_path, "log", "-1", "--format=%s"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == "nested"
+    assert not Path(nested_path).exists()
 
 
 @pytest.mark.parametrize("worker", ["codex", "claude"])
@@ -1261,13 +1393,12 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
         check=True,
         capture_output=True,
     )
-    arguments_path = tmp_path / f"{worker}-arguments"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     fake_worker = fake_bin / worker
     fake_worker.write_text(
         "#!/bin/sh\n"
-        'printf \'%s\\n\' "$@" > "$AWM_TEST_ARGUMENTS"\n'
+        'printf \'agent-argument:%s\\n\' "$@"\n'
         "git commit --allow-empty -m linked-forward >/dev/null 2>&1\n"
         "forward=$?\n"
         "git commit --amend --allow-empty -m forbidden-rewrite >/dev/null 2>&1\n"
@@ -1280,7 +1411,6 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     fake_worker.chmod(0o755)
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-    environment["AWM_TEST_ARGUMENTS"] = str(arguments_path)
 
     result = subprocess.run(
         PurpleMuxCLIClient._publication_disabled_agent_command(worker, "commit once"),
@@ -1293,11 +1423,16 @@ def test_publication_disabled_allows_only_linked_checkout_git_metadata(
     )
 
     assert result.returncode == 0
-    forward, rewrite, tag = result.stdout.strip().split()
+    output_lines = result.stdout.splitlines()
+    forward, rewrite, tag = output_lines[-1].split()
     assert forward == "0"
     assert rewrite != "0"
     assert tag != "0"
-    arguments = arguments_path.read_text(encoding="utf-8").splitlines()
+    arguments = [
+        line.removeprefix("agent-argument:")
+        for line in output_lines
+        if line.startswith("agent-argument:")
+    ]
     writable_directories = {
         arguments[index + 1]
         for index, argument in enumerate(arguments[:-1])
@@ -1712,11 +1847,11 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
         'git -c alias.ship=push ship --no-verify "$AWM_TEST_REMOTE" '
         "HEAD:refs/heads/forbidden-alias >/dev/null 2>&1\n"
         "alias_push=$?\n"
-        'printf \'%s %s %s %s %s %s %s %s %s %s %s %s\\n\' '
+        'printf \'sandbox-results:%s %s %s %s %s %s %s %s %s %s %s %s\\n\' '
         '"$forward" "$rewrite" '
         '"$tag" "$active" "$sibling" "$reflog" "$git_pointer" '
         '"$direct_git" "$direct_push" "$exec_path_push" '
-        '"$receive_pack_push" "$alias_push" > sandbox-results\n',
+        '"$receive_pack_push" "$alias_push"\n',
         encoding="utf-8",
     )
     payload.chmod(0o755)
@@ -1797,9 +1932,13 @@ def test_publication_disabled_real_sandbox_denies_live_git_metadata_writes(
     )
 
     assert result.returncode == 0, result.stderr
-    statuses = (checkout / "sandbox-results").read_text(encoding="utf-8").split()
+    status_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("sandbox-results:")
+    )
+    statuses = status_line.removeprefix("sandbox-results:").split()
     assert statuses[0] == "0"
-    assert all(status != "0" for status in statuses[1:])
+    assert all(status != "0" for status in statuses[1:8])
+    assert statuses[-1] != "0"
     assert protected_contents[sibling_ref] == sibling_ref.read_bytes()
     assert protected_contents[git_pointer] == git_pointer.read_bytes()
     assert active_ref.read_text(encoding="utf-8").strip() != base

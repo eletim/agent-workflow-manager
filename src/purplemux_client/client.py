@@ -1587,65 +1587,6 @@ print(path, flush=True)
 signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 """
         ).decode("ascii")
-        local_remote_locator = base64.b64encode(
-            b"""import os
-import subprocess
-import sys
-from urllib.parse import unquote, urlparse
-
-git, root, output = sys.argv[1:]
-paths = set()
-names = subprocess.run(
-    [git, "remote"], check=True, stdout=subprocess.PIPE, text=True
-).stdout.splitlines()
-for name in names:
-    urls = subprocess.run(
-        [git, "remote", "get-url", "--push", "--all", name],
-        check=True,
-        stdout=subprocess.PIPE,
-        text=True,
-    ).stdout.splitlines()
-    for url in urls:
-        if url.startswith("file://"):
-            parsed = urlparse(url)
-            if parsed.netloc not in ("", "localhost"):
-                continue
-            candidate = unquote(parsed.path)
-        elif "://" in url or (
-            ":" in url and not url.startswith(("./", "../", "/"))
-        ):
-            continue
-        else:
-            candidate = url
-        path = os.path.realpath(os.path.join(root, candidate))
-        git_directory = subprocess.run(
-            [git, "-C", path, "rev-parse", "--path-format=absolute", "--absolute-git-dir"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        if git_directory.returncode == 0:
-            paths.add(os.path.realpath(git_directory.stdout.strip()))
-for directory, child_directories, files in os.walk(root):
-    if {"HEAD", "config"}.issubset(files) and {"objects", "refs"}.issubset(
-        child_directories
-    ):
-        bare = subprocess.run(
-            [git, "--git-dir", directory, "rev-parse", "--is-bare-repository"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).stdout.strip()
-        if bare == "true":
-            paths.add(os.path.realpath(directory))
-        child_directories[:] = []
-with open(output, "w", encoding="utf-8") as stream:
-    for path in sorted(paths):
-        stream.write(path + "\\n")
-"""
-        ).decode("ascii")
         git_wrapper = base64.b64encode(
             b"""#!/bin/sh
 probe=$PWD
@@ -1849,17 +1790,39 @@ exec "$real_git" "$@"
             'case "$awm_delivery_rm" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_ln=$(command -v ln) && "
             'case "$awm_delivery_ln" in /*) ;; *) exit 1 ;; esac && '
-            "awm_delivery_bwrap=$(command -v bwrap) && "
+            "awm_delivery_cp=$(command -v cp) && "
+            'case "$awm_delivery_cp" in /*) ;; *) exit 1 ;; esac && '
+            "awm_delivery_bwrap=$(command -v bwrap) || { "
+            "printf '%s\\n' 'publication-disabled sessions require Bubblewrap "
+            "(bwrap); install it and restart Agent Workflow Manager' >&2; "
+            "exit 1; } && "
             'case "$awm_delivery_bwrap" in /*) ;; *) exit 1 ;; esac && '
+            'if ! "$awm_delivery_bwrap" --die-with-parent --new-session '
+            "--ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp "
+            "-- /bin/true "
+            ">/dev/null 2>&1; then "
+            "printf '%s\\n' 'Bubblewrap cannot create the required sandbox; "
+            "enable unprivileged user namespaces or install a distribution "
+            "Bubblewrap package with supported privilege setup' >&2; exit 1; fi && "
             "awm_delivery_python=$(command -v python3) && "
             'case "$awm_delivery_python" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_timeout=$(command -v timeout) && "
             'case "$awm_delivery_timeout" in /*) ;; *) exit 1 ;; esac && '
             "awm_delivery_original_path=$PATH && "
+            f"awm_delivery_worker=$(command -v {worker}) && "
+            'case "$awm_delivery_worker" in /*) ;; *) exit 1 ;; esac && '
+            'awm_delivery_worker_dir=${awm_delivery_worker%/*} && '
             "awm_delivery_root=$(pwd -P) && "
+            'awm_delivery_resource_parent=${awm_delivery_root%/*} && '
+            '[ -n "$awm_delivery_resource_parent" ] || '
+            'awm_delivery_resource_parent=/ && '
             "awm_delivery_git_dir=$(git rev-parse --path-format=absolute "
             "--absolute-git-dir) && "
             'awm_delivery_git_dir=$(cd "$awm_delivery_git_dir" && pwd -P) && '
+            "awm_delivery_common_git_dir=$(git rev-parse --path-format=absolute "
+            "--git-common-dir) && "
+            'awm_delivery_common_git_dir=$(cd "$awm_delivery_common_git_dir" '
+            '&& pwd -P) && '
             "awm_delivery_object_dir=$(git rev-parse --path-format=absolute "
             "--git-path objects) && "
             'awm_delivery_object_dir=$(cd "$awm_delivery_object_dir" && pwd -P) && '
@@ -1880,6 +1843,7 @@ exec "$real_git" "$@"
             '.awm-delivery.$$.resources" && '
             "awm_delivery_hooks='' && "
             "awm_delivery_shadow_git_dir='' && "
+            "awm_delivery_isolated_root='' && "
             "awm_delivery_cleanup() { "
             "trap - EXIT HUP INT TERM; "
             "awm_delivery_primary_status=$1; "
@@ -1926,7 +1890,12 @@ exec "$real_git" "$@"
             '"$awm_delivery_hooks_root" "awm-delivery.") && '
             'awm_delivery_shadow_git_dir=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
-            '"/tmp" "awm-delivery-shadow.") && '
+            '"$awm_delivery_resource_parent" "awm-delivery-shadow.") && '
+            'awm_delivery_isolated_root=$("$awm_delivery_python" -c '
+            '"$awm_delivery_allocate" "$awm_delivery_manifest" '
+            '"$awm_delivery_resource_parent" "awm-delivery-worktree.") && '
+            '"$awm_delivery_cp" -a -- "$awm_delivery_root/." '
+            '"$awm_delivery_isolated_root/" && '
             'mkdir -p -- "$awm_delivery_hooks/gh" "$awm_delivery_hooks/bin" && '
             f"printf %s {reference_hook} | base64 --decode > "
             '"$awm_delivery_hooks/reference-transaction" && '
@@ -1940,11 +1909,6 @@ exec "$real_git" "$@"
             '"$awm_delivery_hooks/shadow-git-dir" && '
             'printf \'%s\\n\' "$awm_delivery_root" > '
             '"$awm_delivery_hooks/protected-root" && '
-            f"printf %s {local_remote_locator} | base64 --decode > "
-            '"$awm_delivery_hooks/find-local-remotes.py" && '
-            '"$awm_delivery_python" "$awm_delivery_hooks/find-local-remotes.py" '
-            '"$awm_delivery_real_git" "$awm_delivery_root" '
-            '"$awm_delivery_hooks/protected-remotes" && '
             'chmod 500 "$awm_delivery_hooks/reference-transaction" '
             '"$awm_delivery_hooks/pre-push" "$awm_delivery_hooks/bin/git" '
             '"$awm_delivery_hooks/bin/git-receive-pack" && '
@@ -1984,17 +1948,20 @@ exec "$real_git" "$@"
             "export PATH && "
             'set -- "$awm_delivery_bwrap" --die-with-parent --new-session '
             '--ro-bind / / --dev-bind /dev /dev --proc /proc '
-            '--bind /tmp /tmp '
-            '--bind "$awm_delivery_root" "$awm_delivery_root" '
+            '--tmpfs /tmp '
+            '--bind "$awm_delivery_isolated_root" "$awm_delivery_root" '
             '--bind "$awm_delivery_shadow_git_dir" '
             '"$awm_delivery_shadow_git_dir" '
+            '--ro-bind "$awm_delivery_common_git_dir" '
+            '"$awm_delivery_common_git_dir" '
             '--ro-bind "$awm_delivery_git_dir" "$awm_delivery_git_dir" '
-            '--bind "$awm_delivery_hooks_root" "$awm_delivery_hooks_root" && '
-            'while IFS= read -r awm_delivery_protected_remote; do '
-            'set -- "$@" --ro-bind "$awm_delivery_protected_remote" '
-            '"$awm_delivery_protected_remote"; '
-            'done < "$awm_delivery_hooks/protected-remotes" && '
-            'set -- "$@" --chdir "$awm_delivery_root" && '
+            '--ro-bind "$awm_delivery_object_dir" "$awm_delivery_object_dir" '
+            '--ro-bind "$awm_delivery_hooks" "$awm_delivery_hooks" '
+            '--chdir "$awm_delivery_root" && '
+            'case "$awm_delivery_worker_dir" in '
+            '"$awm_delivery_root"|"$awm_delivery_root"/*) ;; '
+            '*) set -- "$@" --ro-bind "$awm_delivery_worker_dir" '
+            '"$awm_delivery_worker_dir" ;; esac && '
             f"printf %s {encoded} | base64 --decode | "
             'AWM_DELIVERY_PROTECTED_REF="$awm_delivery_ref" '
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "
@@ -2028,7 +1995,8 @@ exec "$real_git" "$@"
             '"$awm_delivery_real_git" -c '
             'core.hooksPath="$awm_delivery_hooks" update-ref '
             '"$awm_delivery_ref" "$awm_delivery_new" "$awm_delivery_old" && '
-            '{ "$awm_delivery_real_git" read-tree "$awm_delivery_new"; '
+            '{ "$awm_delivery_real_git" read-tree --reset -u '
+            '"$awm_delivery_new"; '
             "awm_delivery_index_status=$?; "
             'if [ "$awm_delivery_index_status" -ne 0 ]; then '
             'if ! "$awm_delivery_real_git" -c core.hooksPath=/dev/null '
