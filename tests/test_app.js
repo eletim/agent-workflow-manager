@@ -870,6 +870,7 @@ test("selected-run refresh keeps Runtime as the only selected primary view", asy
   assert.match(elements["runtime-view"].className, /selected/);
   assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
   assert.doesNotMatch(elements["issue-driven-mode"].className, /selected/);
+  assert.equal(elements.body.classList.contains("runtime-run-selected"), true);
 });
 
 test("New run leaves Runtime and restores the current workflow draft", async () => {
@@ -884,6 +885,7 @@ test("New run leaves Runtime and restores the current workflow draft", async () 
 
   assert.equal(elements["runtime-panel"].hidden, true);
   assert.equal(elements.body.classList.contains("runtime-view-active"), false);
+  assert.equal(elements.body.classList.contains("runtime-run-selected"), false);
   assert.equal(elements["issue-driven-fields"].hidden, false);
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 });

@@ -31,7 +31,7 @@ h2, label { font-size: 14px; font-weight: 650; }
 }
 .runtime-panel { margin-top: 14px; }
 .runtime-content { min-width: 0; }
-.runtime-view-active .editor-panel > :not(.execution-navigation):not(.editor-mode-bar):not(.controls),
+.runtime-view-active:not(.runtime-run-selected) .editor-panel > :not(.execution-navigation):not(.editor-mode-bar):not(.controls),
 .runtime-view-active #validate,
 .runtime-view-active #dry-run,
 .runtime-view-active #run { display: none; }

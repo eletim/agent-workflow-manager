@@ -9,6 +9,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from purplemux_client.prompt import PromptExecution
 from purplemux_client.runner import PythonRunner
 from purplemux_client.web import RunnerHTTPServer
 
@@ -50,6 +51,99 @@ def insecure_browser_server() -> Iterator[tuple[str, PythonRunner]]:
     server.shutdown()
     server.server_close()
     thread.join()
+
+
+def test_runtime_selected_run_retains_mode_detail(tmp_path) -> None:
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if chrome is None:
+        pytest.skip("Chrome or Chromium is required for the HTTP browser smoke test")
+
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    server = None
+    thread = None
+    driver = None
+    try:
+        workflow_code = 'print("WORKFLOW_DETAIL")'
+        issue_code = 'print("ISSUE_DETAIL")'
+        issue_json = '{"mode":"issue-driven","repository":"acme/project"}'
+        prompt_text = "Retain this exact selected-run prompt."
+        run_ids = {
+            "workflow": runner.start(workflow_code),
+            "issue": runner.start(issue_code, issue_driven_json=issue_json),
+            "prompt": runner.start(
+                'print("PROMPT_DETAIL")',
+                prompt=PromptExecution("codex", str(tmp_path), prompt_text),
+            ),
+        }
+        deadline = time.monotonic() + 5
+        while (
+            any(
+                runner.snapshot(run_id).state == "running"
+                for run_id in run_ids.values()
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert all(
+            runner.snapshot(run_id).state == "success" for run_id in run_ids.values()
+        )
+
+        server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        options = Options()
+        options.binary_location = chrome
+        for argument in (
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-proxy-server",
+        ):
+            options.add_argument(argument)
+        driver = webdriver.Chrome(options=options)
+        driver.get(f"http://127.0.0.1:{server.server_address[1]}/")
+        wait = WebDriverWait(driver, 5)
+        wait.until(
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-mode"
+            ).is_displayed()
+        )
+        driver.find_element(By.ID, "runtime-view").click()
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "run-list").is_displayed()
+        )
+        assert not driver.find_element(By.ID, "issue-driven-fields").is_displayed()
+
+        for run_id, field_id, expected in (
+            (run_ids["prompt"], "prompt-text", prompt_text),
+            (run_ids["issue"], "issue-driven-json", issue_json),
+            (run_ids["issue"], "issue-driven-python", issue_code),
+            (run_ids["workflow"], "code", workflow_code),
+        ):
+            driver.find_element(By.CSS_SELECTOR, f'[data-run-id="{run_id}"]').click()
+            field = wait.until(
+                lambda browser: (
+                    browser.find_element(By.ID, field_id)
+                    if browser.find_element(By.ID, field_id).is_displayed()
+                    else False
+                )
+            )
+            assert field.get_attribute("value") == expected
+            assert field.get_attribute("readonly") is not None
+            assert (
+                driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+                == "true"
+            )
+    finally:
+        if driver is not None:
+            driver.quit()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join()
+        runner.close()
 
 
 def test_copy_actions_on_insecure_http_origin(

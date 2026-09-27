@@ -403,6 +403,7 @@ function renderFavicon(runs) {
 // for which mode is active.
 function applyFieldMode() {
   const drafting = activeRunId === null;
+  document.body.classList[drafting ? "remove" : "add"]("runtime-run-selected");
   runArguments.readOnly = !drafting;
   code.readOnly = !drafting;
   promptAgent.disabled = !drafting;
