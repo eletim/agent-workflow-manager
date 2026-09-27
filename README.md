@@ -1017,6 +1017,35 @@ Workflow Manager core. Notification delivery belongs to the external `notify`
 CLI/service boundary, so the Runner itself remains fully usable on local/VPN
 HTTP without a service worker, Push API, or secure browser context.
 
+### Publication-disabled recovery
+
+When a `publication-disabled` session fails after the agent runs, AWM retains a
+recovery artifact under `awm-delivery-recovery/output.*` in the repository's
+common Git directory and prints its exact path on stderr. The artifact is usable
+only when `.complete` exists. Read `metadata.json` first: it records the protected
+ref and base commit, cleanliness result, commit IDs, conflict details, and whether
+recovery was interrupted. When present, `recovery.bundle` contains the available
+`refs/awm-delivery/shadow`, `refs/awm-delivery/staged`, and
+`refs/awm-delivery/worktree` snapshots; the staged ref is omitted when there is no
+distinct staged state. Nested repositories have their own metadata and bundle
+under `nested/`.
+
+Inspect a bundle without changing the original checkout by creating a temporary
+repository, fetching the recorded base commit from the original repository, and
+then fetching the desired recovery ref from `recovery.bundle`. Compare or restore
+files from those fetched refs in the temporary repository before applying any
+chosen changes manually. Do not treat an artifact without `.complete` as durable.
+If interrupted recovery could not finish capturing Git state, `metadata.json`
+points to the bounded `uncaptured-inputs` record; that record explicitly identifies
+the shadow and worktree inputs that were not captured and does not contain the
+temporary directories themselves.
+
+Residual output or an unverifiable cleanliness check fails the session without
+updating the real ref or worktree. After the needed commits or files have been
+inspected and restored, remove only the exact reported `output.*` artifact path.
+The temporary shadow repository and isolated worktree are removed automatically,
+including on the interrupted fallback path.
+
 ## Development
 
 Linux, Python 3.10 or later, `uv`, and a working Bubblewrap installation are

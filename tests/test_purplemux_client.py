@@ -2039,11 +2039,17 @@ def test_publication_disabled_signal_during_nested_recovery_preserves_nested_sta
             metadata = json.loads(
                 (recovery / "metadata.json").read_text(encoding="utf-8")
             )
-            assert metadata["uncapturedInputs"]["format"] == "delivery-inputs-v1"
-            handed_off_nested = recovery / "uncaptured-inputs" / "worktree" / "nested"
-            assert (handed_off_nested / "tracked.txt").read_text() == "changed\n"
-            assert (handed_off_nested / "untracked.txt").read_text() == "untracked\n"
-            assert (handed_off_nested / ".git").exists()
+            assert metadata["uncapturedInputs"] == {
+                "format": "uncaptured-inputs-v1",
+                "path": "uncaptured-inputs",
+            }
+            uncaptured = json.loads(
+                (recovery / "uncaptured-inputs").read_text(encoding="utf-8")
+            )
+            assert uncaptured["kind"] == "uncaptured-inputs"
+            assert uncaptured["shadowGit"] is False
+            assert uncaptured["worktree"] is False
+            assert (recovery / "uncaptured-inputs").stat().st_size < 2048
             assert not list(tmp_path.glob("awm-delivery-shadow.*"))
             assert not list(tmp_path.glob("awm-delivery-worktree.*"))
             assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
@@ -2210,12 +2216,110 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
             shutil.rmtree(path, ignore_errors=True)
 
 
+def test_publication_disabled_complete_marker_is_authoritative(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, _ = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_python = shutil.which("python3")
+    assert real_python is not None
+    bootstrap = """import os
+import sys
+
+code = sys.argv[1]
+sys.argv = ["-c", *sys.argv[2:]]
+real_fsync = os.fsync
+real_replace = os.replace
+marker_published = False
+durable_directories = 0
+
+
+def injected_replace(source, destination):
+    global marker_published
+    result = real_replace(source, destination)
+    if os.fspath(destination).endswith("/.complete"):
+        marker_published = True
+    return result
+
+
+def injected_fsync(descriptor):
+    global durable_directories
+    path = os.readlink(f"/proc/self/fd/{descriptor}")
+    result = real_fsync(descriptor)
+    if marker_published and os.path.isdir(path):
+        durable_directories += 1
+        if durable_directories == 3:
+            os._exit(86)
+    return result
+
+
+os.replace = injected_replace
+os.fsync = injected_fsync
+exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
+"""
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'case "$1:$2" in *"def publish_recovery"*)\n'
+        "    code=$2\n"
+        "    shift 2\n"
+        f'    exec "{real_python}" -c {shlex.quote(bootstrap)} "$code" "$@"\n'
+        ";;\n"
+        "esac\n"
+        f'exec "{real_python}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\nprintf 'residual\\n' > residual.txt\n", encoding="utf-8"
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave recoverable output"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    recoveries = list(
+        (repository / ".git" / "awm-delivery-recovery").glob("output.*")
+    )
+    try:
+        assert result.returncode == 74
+        assert "publication-disabled agent output recovery failed" in result.stderr
+        assert "publication-disabled agent output recovery retained at " in result.stderr
+        assert len(recoveries) == 1
+        recovery = recoveries[0]
+        assert (recovery / ".complete").is_file()
+        assert (recovery / "metadata.json").is_file()
+        assert (recovery / "recovery.bundle").is_file()
+        assert not list(recovery.parent.glob("inputs.*"))
+        assert not list((repository / ".git" / "hooks").glob("awm-delivery.*"))
+        assert not list(
+            (repository / ".git" / "hooks").glob(".awm-delivery.*.resources")
+        )
+    finally:
+        for recovery in recoveries:
+            shutil.rmtree(recovery, ignore_errors=True)
+
+
 @pytest.mark.parametrize(
     (
         "stalled_command",
         "stall_every_attempt",
         "repository_fixture",
-        "slow_recursive_fsync",
+        "verify_payload_fsync",
     ),
     [
         ("ls-files", False, "linked_delivery_repository", False),
@@ -2229,14 +2333,14 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         "bundle",
         "persistent-initial-capture",
         "persistent-cross-device-capture",
-        "persistent-slow-recursive-fsync",
+        "persistent-payload-fsync",
     ),
 )
 def test_publication_disabled_signal_bounds_stalled_recovery_capture(
     stalled_command: str,
     stall_every_attempt: bool,
     repository_fixture: str,
-    slow_recursive_fsync: bool,
+    verify_payload_fsync: bool,
     request: pytest.FixtureRequest,
     tmp_path: Path,
 ) -> None:
@@ -2263,26 +2367,42 @@ def test_publication_disabled_signal_bounds_stalled_recovery_capture(
         encoding="utf-8",
     )
     fake_git.chmod(0o755)
-    if slow_recursive_fsync:
+    if verify_payload_fsync:
         real_python = shutil.which("python3")
         assert real_python is not None
         bootstrap = """import os
 import sys
-import time
 
 code = sys.argv[1]
 sys.argv = ["-c", *sys.argv[2:]]
 real_fsync = os.fsync
+real_replace = os.replace
+synced = set()
 
 
 def injected_fsync(descriptor):
     path = os.readlink(f"/proc/self/fd/{descriptor}")
-    if "/uncaptured-inputs/" in path and not os.path.isdir(path):
-        time.sleep(0.4)
-    return real_fsync(descriptor)
+    result = real_fsync(descriptor)
+    synced.add(path)
+    return result
+
+
+def injected_replace(source, destination):
+    result = real_replace(source, destination)
+    destination = os.fspath(destination)
+    if destination.endswith("/.complete"):
+        recovery = os.path.dirname(destination)
+        required = {
+            os.path.join(recovery, "metadata.json"),
+            os.path.join(recovery, "uncaptured-inputs"),
+        }
+        if not required.issubset(synced):
+            raise OSError("completion published before payload fsync")
+    return result
 
 
 os.fsync = injected_fsync
+os.replace = injected_replace
 exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
 """
         fake_python = fake_bin / "python3"
@@ -2374,31 +2494,14 @@ exec(compile(code, "<recovery-snapshot>", "exec"), {"__name__": "__main__"})
         if stall_every_attempt:
             handoff = recovery / "uncaptured-inputs"
             assert metadata["uncapturedInputs"] == {
-                "format": "delivery-inputs-v1",
-                "shadowGit": "uncaptured-inputs/shadow.git",
-                "worktree": "uncaptured-inputs/worktree",
+                "format": "uncaptured-inputs-v1",
+                "path": "uncaptured-inputs",
             }
-            assert (handoff / "worktree" / "tracked.txt").read_text() == "committed\n"
-            assert (handoff / "worktree" / "residual.txt").read_text() == "residual\n"
-            assert (handoff / "worktree" / "conflicted.txt").read_text() == (
-                "worktree resolution\n"
-            )
-            shadow = handoff / "shadow.git"
-            assert (
-                subprocess.run(
-                    ["git", f"--git-dir={shadow}", "rev-parse", "HEAD"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
-                != base
-            )
-            assert "conflicted.txt" in subprocess.run(
-                ["git", f"--git-dir={shadow}", "ls-files", "--unmerged"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
+            uncaptured = json.loads(handoff.read_text(encoding="utf-8"))
+            assert uncaptured["kind"] == "uncaptured-inputs"
+            assert uncaptured["shadowGit"] is False
+            assert uncaptured["worktree"] is False
+            assert handoff.stat().st_size < 2048
         else:
             assert metadata["conflictState"] is not None
             assert_recovery_worktree_file(
@@ -3031,6 +3134,93 @@ def test_publication_disabled_signal_cleanup_is_prompt_and_exactly_once(
             process.communicate()
         if master_fd is not None:
             os.close(master_fd)
+        for resource in resources:
+            shutil.rmtree(resource, ignore_errors=True)
+
+
+def test_publication_disabled_signal_during_cleanup_is_latched(
+    tmp_path: Path,
+) -> None:
+    initialize_test_repository(tmp_path)
+    fake_bin = tmp_path.parent / f"{tmp_path.name}-bin"
+    fake_bin.mkdir()
+    cleanup_started = tmp_path / "cleanup-started"
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        "shadow=\n"
+        "previous=\n"
+        "for argument do\n"
+        '    if [ "$previous" = --add-dir ]; then shadow=$argument; break; fi\n'
+        "    previous=$argument\n"
+        "done\n"
+        'printf \'cleanup-resources:%s|%s\\n\' "${GH_CONFIG_DIR%/gh}" '
+        '"${shadow%/shadow.*}"\n'
+        "exit 29\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    real_rm = shutil.which("rm")
+    assert real_rm is not None
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = -rf ] && [ ! -e "$AWM_TEST_CLEANUP_STARTED" ]; then\n'
+        '    : > "$AWM_TEST_CLEANUP_STARTED"\n'
+        "    sleep 0.3\n"
+        "fi\n"
+        f'exec "{real_rm}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "AWM_TEST_CLEANUP_STARTED": str(cleanup_started),
+        }
+    )
+    process = subprocess.Popen(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "fail before cleanup"
+        ),
+        cwd=tmp_path,
+        env=environment,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while process.poll() is None and not cleanup_started.exists():
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("cleanup did not start")
+        time.sleep(0.01)
+    if process.poll() is not None:
+        pytest.fail("session exited before the cleanup signal")
+
+    os.kill(process.pid, signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=10)
+
+    resource_line = next(
+        line for line in stdout.splitlines() if line.startswith("cleanup-resources:")
+    )
+    resources = resource_line.removeprefix("cleanup-resources:").split("|")
+    recovery_line = next(
+        line
+        for line in stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        assert process.returncode == 143
+        assert all(not Path(resource).exists() for resource in resources)
+        assert not list((tmp_path / ".git" / "hooks").glob(".awm-delivery.*.resources"))
+        assert (recovery / ".complete").is_file()
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
         for resource in resources:
             shutil.rmtree(resource, ignore_errors=True)
 

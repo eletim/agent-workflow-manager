@@ -1637,7 +1637,6 @@ import threading
     protected_ref,
     old,
     common_git_dir,
-    publication_state,
     pending_signal,
 ) = sys.argv[1:]
 blocked = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
@@ -1783,7 +1782,6 @@ def publish_recovery_marker():
     fsync_directory(recovery_path)
     fsync_directory(recovery_path.parent)
     fsync_directory(recovery_path.parent.parent)
-    Path(publication_state).write_text("1\\n", encoding="ascii")
 
 
 def publish_recovery():
@@ -1807,18 +1805,6 @@ def publish_recovery():
     publish_recovery_marker()
 
 
-def publish_handoff(handoff_path, source_parent):
-    fsync_directory(source_parent)
-    fsync_directory(handoff_path)
-    metadata_path = recovery_path / "metadata.json"
-    descriptor = os.open(metadata_path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    publish_recovery_marker()
-
-
 def reset_publication_marker():
     changed = False
     for name in (".complete", ".complete.tmp"):
@@ -1830,7 +1816,9 @@ def reset_publication_marker():
         fsync_directory(recovery_path)
 
 
-def write_metadata(cleanliness, *, interrupted=False, error=None, handoff=None):
+def write_metadata(
+    cleanliness, *, interrupted=False, error=None, uncaptured_inputs=None
+):
     metadata = {
         "formatVersion": 1,
         "protectedRef": protected_ref,
@@ -1846,8 +1834,8 @@ def write_metadata(cleanliness, *, interrupted=False, error=None, handoff=None):
     if interrupted:
         metadata["interrupted"] = True
         metadata["recoveryError"] = str(error)[:1000]
-    if handoff is not None:
-        metadata["uncapturedInputs"] = handoff
+    if uncaptured_inputs is not None:
+        metadata["uncapturedInputs"] = uncaptured_inputs
     metadata_temporary = recovery_path / "metadata.json.tmp"
     metadata_temporary.write_text(
         json.dumps(metadata, sort_keys=True) + "\\n", encoding="utf-8"
@@ -2315,44 +2303,30 @@ def reset_incomplete_capture():
             path.unlink()
 
 
-def handoff_uncaptured_inputs(error):
+def record_uncaptured_inputs(error):
     reset_incomplete_capture()
-    source_parent = Path(worktree).parent
-    if Path(shadow).parent != source_parent:
-        raise RuntimeError("recovery inputs do not share an ownership directory")
-    if source_parent.stat().st_dev != recovery_path.stat().st_dev:
-        raise RuntimeError("recovery inputs are not on the recovery filesystem")
+    uncaptured = {
+        "formatVersion": 1,
+        "kind": "uncaptured-inputs",
+        "shadowGit": False,
+        "worktree": False,
+        "reason": str(error)[:1000],
+    }
     temporary = recovery_path / "uncaptured-inputs.tmp"
-    published = recovery_path / "uncaptured-inputs"
-    temporary.mkdir(mode=0o700)
-    moved = []
-    try:
-        for source, name in (
-            (Path(worktree), "worktree"),
-            (Path(shadow), "shadow.git"),
-        ):
-            destination = temporary / name
-            os.replace(source, destination)
-            moved.append((source, destination))
-        os.replace(temporary, published)
-    except BaseException:
-        for source, destination in reversed(moved):
-            if destination.exists() and not source.exists():
-                os.replace(destination, source)
-        if temporary.exists():
-            temporary.rmdir()
-        raise
+    temporary.write_text(
+        json.dumps(uncaptured, sort_keys=True) + "\\n", encoding="utf-8"
+    )
+    os.replace(temporary, recovery_path / "uncaptured-inputs")
     write_metadata(
         "unverified",
         interrupted=True,
         error=error,
-        handoff={
-            "format": "delivery-inputs-v1",
-            "worktree": "uncaptured-inputs/worktree",
-            "shadowGit": "uncaptured-inputs/shadow.git",
+        uncaptured_inputs={
+            "format": "uncaptured-inputs-v1",
+            "path": "uncaptured-inputs",
         },
     )
-    publish_handoff(published, source_parent)
+    publish_recovery()
 
 shadow_commit = old
 staged_commit = None
@@ -2441,7 +2415,7 @@ except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             except (OSError, RuntimeError, subprocess.SubprocessError) as retry_error:
                 if not recovery_handoff_required.is_set():
                     recovery_handoff_required.wait(1.0)
-                handoff_uncaptured_inputs(retry_error)
+                record_uncaptured_inputs(retry_error)
         elif publication_attempted:
             publish_recovery()
     except (OSError, RuntimeError, subprocess.SubprocessError) as fallback_error:
@@ -2715,17 +2689,23 @@ exec "$real_git" "$@"
             "awm_delivery_shadow_git_dir='' && "
             "awm_delivery_isolated_root='' && "
             "awm_delivery_recovery='' && "
-            "awm_delivery_recovery_state='' && "
             "awm_delivery_recovery_started=0 && "
             "awm_delivery_recovery_published=0 && "
             "awm_delivery_transition_pending=0 && "
             "awm_delivery_new='' && "
             "awm_delivery_cleanup() { "
-            "trap - EXIT HUP INT TERM; "
+            "trap - EXIT; "
+            "awm_delivery_cleanup_signal=0; "
+            "trap '[ \"$awm_delivery_cleanup_signal\" -ne 0 ] || "
+            "awm_delivery_cleanup_signal=129' HUP; "
+            "trap '[ \"$awm_delivery_cleanup_signal\" -ne 0 ] || "
+            "awm_delivery_cleanup_signal=130' INT; "
+            "trap '[ \"$awm_delivery_cleanup_signal\" -ne 0 ] || "
+            "awm_delivery_cleanup_signal=143' TERM; "
             "awm_delivery_primary_status=$1; "
             "awm_delivery_cleanup_failed=0; "
-            'if [ -n "$awm_delivery_recovery_state" ] && '
-            '[ -f "$awm_delivery_recovery_state" ]; then '
+            'if [ -n "$awm_delivery_recovery" ] && '
+            '[ -f "$awm_delivery_recovery/.complete" ]; then '
             "awm_delivery_recovery_published=1; fi; "
             'if [ "$awm_delivery_recovery_started" -ne 0 ] && '
             '[ "$awm_delivery_recovery_published" -eq 0 ] && '
@@ -2769,16 +2749,16 @@ exec "$real_git" "$@"
             'if [ "$awm_delivery_cleanup_failed" -ne 0 ]; then '
             "printf '%s\\n' 'publication-disabled session cleanup failed; "
             "temporary resources may remain' >&2; "
-            'if [ "$awm_delivery_primary_status" -ne 0 ]; then '
-            'exit "$awm_delivery_primary_status"; '
-            "fi; "
-            "exit 1; "
-            "fi; "
+            'if [ "$awm_delivery_primary_status" -eq 0 ]; then '
+            "awm_delivery_primary_status=1; fi; fi; "
+            'if [ "$awm_delivery_cleanup_signal" -ne 0 ]; then '
+            "awm_delivery_primary_status=$awm_delivery_cleanup_signal; fi; "
             'if [ "$awm_delivery_primary_status" -ne 0 ] && '
             '[ -n "$awm_delivery_recovery" ] && '
             '[ "$awm_delivery_recovery_published" -ne 0 ]; then '
             "printf '%s\\n' \"publication-disabled agent output recovery "
             'retained at $awm_delivery_recovery" >&2; fi; '
+            "trap - HUP INT TERM; "
             'exit "$awm_delivery_primary_status"; '
             "} && "
             "awm_delivery_rollback() { "
@@ -2804,7 +2784,6 @@ exec "$real_git" "$@"
             "return 1; fi; return 0; "
             "} && "
             "awm_delivery_signal() { "
-            "trap - HUP INT TERM; "
             'if [ "$awm_delivery_transition_pending" -ne 0 ]; then '
             "awm_delivery_rollback || :; fi; "
             'awm_delivery_cleanup "$1"; '
@@ -2819,8 +2798,6 @@ exec "$real_git" "$@"
             'awm_delivery_hooks=$("$awm_delivery_python" -c '
             '"$awm_delivery_allocate" "$awm_delivery_manifest" '
             '"$awm_delivery_hooks_root" "awm-delivery.") || exit; '
-            'awm_delivery_recovery_state="$awm_delivery_hooks/'
-            'recovery-published" && '
             'awm_delivery_recovery_root="$awm_delivery_common_git_dir/'
             'awm-delivery-recovery" && '
             'mkdir -p -- "$awm_delivery_recovery_root" && '
@@ -2952,7 +2929,6 @@ exec "$real_git" "$@"
             '"$awm_delivery_shadow_git_dir" "$awm_delivery_isolated_root" '
             '"$awm_delivery_recovery" "$awm_delivery_ref" '
             '"$awm_delivery_old" "$awm_delivery_common_git_dir" '
-            '"$awm_delivery_recovery_state" '
             '"$awm_delivery_pending_signal"); '
             "awm_delivery_recovery_status=$?; "
             "trap 'awm_delivery_signal 129' HUP; "
