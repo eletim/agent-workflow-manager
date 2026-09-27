@@ -25,15 +25,6 @@ cd "$HOME/DevEnv/agent-workflow-manager"
 bash start.sh
 ```
 
-Agent Workflow Manager requires Linux, Python 3.10 or later, `uv`, and
-[Bubblewrap](https://github.com/containers/bubblewrap). Install your
-distribution's `bubblewrap` package before running `start.sh` (for example,
-`sudo apt install bubblewrap` on Debian or Ubuntu). Bubblewrap must be able to
-create a mount sandbox, using either enabled unprivileged user namespaces or
-the privilege setup supplied by the distribution package. `start.sh` checks
-both availability and sandbox creation and reports the required remediation
-before syncing or launching the Runner.
-
 This setup intentionally uses the custom CLI from
 [`eletim/purplemux`](https://github.com/eletim/purplemux). Do **not** substitute
 the upstream `npm install -g purplemux` package: it does not provide the CLI
@@ -1019,9 +1010,7 @@ HTTP without a service worker, Push API, or secure browser context.
 
 ## Development
 
-Linux, Python 3.10 or later, `uv`, and a working Bubblewrap installation are
-required. The real-provider delivery tests use the same Bubblewrap boundary as
-normal `publication-disabled` Codex and Claude sessions.
+Python 3.10 or later and `uv` are required.
 
 ```bash
 make format
@@ -1053,16 +1042,6 @@ second launch using its already-established project trust:
 ```bash
 AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_TRUST=1 \
   uv run pytest tests/test_live_claude_trust.py
-```
-
-To opt into the linked-worktree edit, stage, commit, clean-worktree, and blocked
-push checks in the real provider sandboxes, run either or both of:
-
-```bash
-AGENT_WORKFLOW_MANAGER_RUN_LIVE_CODEX_DELIVERY=1 \
-  uv run pytest tests/test_live_linked_worktree_delivery.py
-AGENT_WORKFLOW_MANAGER_RUN_LIVE_CLAUDE_DELIVERY=1 \
-  uv run pytest tests/test_live_linked_worktree_delivery.py
 ```
 
 External AWM targets can be registered in **Settings → External AWM targets** or

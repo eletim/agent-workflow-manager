@@ -43,25 +43,6 @@ require_command() {
     fi
 }
 
-validate_bubblewrap() {
-    if ! command -v bwrap >/dev/null 2>&1; then
-        printf '%s\n' \
-            'ERROR: publication-disabled sessions require Bubblewrap (bwrap).' \
-            'Install the distribution bubblewrap package and restart Agent Workflow Manager.' >&2
-        exit 1
-    fi
-    if ! timeout --signal=TERM --kill-after=1 5 \
-        bwrap --die-with-parent --new-session \
-        --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp \
-        -- /bin/true \
-        >/dev/null 2>&1; then
-        printf '%s\n' \
-            'ERROR: Bubblewrap cannot create the sandbox required by publication-disabled sessions.' \
-            'Enable unprivileged user namespaces or install a distribution Bubblewrap package with supported privilege setup.' >&2
-        exit 1
-    fi
-}
-
 purplemux_remediation() {
     printf '%s\n' \
         'Install the custom eletim/purplemux CLI and ensure its runtime is running.' \
@@ -585,8 +566,6 @@ export AGENT_WORKFLOW_MANAGER_NOTIFY_STOPPED
 export AGENT_WORKFLOW_MANAGER_CONFIG_FILE="$config_file"
 
 require_command uv
-require_command timeout
-validate_bubblewrap
 printf 'Syncing Python dependencies...\n'
 uv sync --locked
 resolve_purplemux_port

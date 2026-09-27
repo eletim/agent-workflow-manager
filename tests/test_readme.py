@@ -20,15 +20,6 @@ def test_personal_setup_starts_agent_workflow_manager_without_secrets() -> None:
     assert "cli-token" not in personal_setup
 
 
-def test_setup_documents_bubblewrap_runtime_prerequisite() -> None:
-    personal_setup, _ = README.split("# Agent Workflow Manager", maxsplit=1)
-
-    assert "requires Linux, Python 3.10 or later, `uv`, and" in personal_setup
-    assert "Bubblewrap" in personal_setup
-    assert "unprivileged user namespaces" in personal_setup
-    assert "`start.sh` checks" in personal_setup
-
-
 def test_issue_driven_overview_documents_optional_scenario_gate() -> None:
     assert "two agent fields, and `scenarios` are optional" in README
     assert "dedicated AI Scenario Gate" in README
