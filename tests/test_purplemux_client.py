@@ -1134,6 +1134,129 @@ def test_publication_disabled_recovers_unmerged_index(
         shutil.rmtree(recovery, ignore_errors=True)
 
 
+def test_publication_disabled_recovers_non_utf8_and_resolve_undo_index(
+    tmp_path: Path,
+    linked_delivery_repository: tuple[Path, Path, Path, str],
+) -> None:
+    repository, checkout, _, base = linked_delivery_repository
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_worker = fake_bin / "codex"
+    fake_worker.write_text(
+        "#!/usr/bin/python3\n"
+        "import subprocess\n"
+        "\n"
+        "def git(*arguments, input_bytes=None):\n"
+        "    return subprocess.run(\n"
+        "        [b'git', *arguments], input=input_bytes, check=True,\n"
+        "        stdout=subprocess.PIPE,\n"
+        "    ).stdout.strip()\n"
+        "\n"
+        "def conflict(path, label):\n"
+        "    objects = [\n"
+        "        git(b'hash-object', b'-w', b'--stdin', "
+        "input_bytes=label + suffix)\n"
+        "        for suffix in (b' base\\n', b' ours\\n', b' theirs\\n')\n"
+        "    ]\n"
+        "    records = b''.join(\n"
+        "        b'100644 ' + object_id + b' ' + str(stage).encode() "
+        "+ b'\\t' + path + b'\\0'\n"
+        "        for stage, object_id in enumerate(objects, 1)\n"
+        "    )\n"
+        "    git(b'update-index', b'-z', b'--index-info', "
+        "input_bytes=records)\n"
+        "\n"
+        "unresolved = b'unresolved-\\xff.txt'\n"
+        "conflict(unresolved, b'non-utf8')\n"
+        "conflict(b'resolved.txt', b'resolve-undo')\n"
+        "with open(unresolved, 'wb') as output:\n"
+        "    output.write(b'non-utf8 worktree\\n')\n"
+        "with open(b'resolved.txt', 'wb') as output:\n"
+        "    output.write(b'resolved worktree\\n')\n"
+        "git(b'add', b'--', b'resolved.txt')\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    result = subprocess.run(
+        PurpleMuxCLIClient._publication_disabled_agent_command(
+            "codex", "leave non-UTF-8 and partially resolved conflicts"
+        ),
+        cwd=checkout,
+        env=environment,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stderr
+    recovery_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("publication-disabled agent output recovery retained at ")
+    )
+    recovery = Path(recovery_line.rsplit(" retained at ", maxsplit=1)[1])
+    try:
+        metadata = json.loads((recovery / "metadata.json").read_text(encoding="utf-8"))
+        conflict_state = metadata["conflictState"]
+        assert metadata["cleanliness"] == "residual"
+        assert conflict_state["sharedIndexFile"] is None
+        assert not list(tmp_path.glob("awm-delivery-shadow.*"))
+        assert not list(tmp_path.glob("awm-delivery-worktree.*"))
+
+        recovered = tmp_path / "recovered-index-extensions"
+        subprocess.run(["git", "init", str(recovered)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(recovered), "fetch", str(repository), base],
+            check=True,
+            capture_output=True,
+        )
+        object_pack = recovery / conflict_state["objectPack"]
+        subprocess.run(
+            ["git", "-C", str(recovered), "index-pack", "--stdin"],
+            input=object_pack.read_bytes(),
+            check=True,
+            capture_output=True,
+        )
+        recovered_git_dir = Path(
+            subprocess.run(
+                ["git", "-C", str(recovered), "rev-parse", "--absolute-git-dir"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        shutil.copyfile(
+            recovery / conflict_state["indexFile"], recovered_git_dir / "index"
+        )
+        unmerged = subprocess.run(
+            [b"git", b"ls-files", b"--unmerged", b"-z"],
+            cwd=os.fsencode(recovered),
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert b"unresolved-\xff.txt" in unmerged
+        resolve_undo = subprocess.run(
+            ["git", "-C", str(recovered), "ls-files", "--resolve-undo", "-z"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert b"resolved.txt" in resolve_undo
+        subprocess.run(
+            ["git", "-C", str(recovered), "checkout", "-m", "--", "resolved.txt"],
+            check=True,
+            capture_output=True,
+        )
+        restored = (recovered / "resolved.txt").read_text(encoding="utf-8")
+        assert "resolve-undo ours" in restored
+        assert "resolve-undo theirs" in restored
+    finally:
+        shutil.rmtree(recovery, ignore_errors=True)
+
+
 def test_publication_disabled_ignores_invalid_nested_git_marker(
     tmp_path: Path,
     linked_delivery_repository: tuple[Path, Path, Path, str],

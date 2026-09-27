@@ -1613,7 +1613,9 @@ base_environment = os.environ.copy()
 base_environment.update({"GIT_DIR": shadow, "GIT_WORK_TREE": worktree})
 
 
-def run_git(arguments, *, environment=None, stdout=subprocess.PIPE, input_text=None):
+def run_git(
+    arguments, *, environment=None, stdout=subprocess.PIPE, input_text=None, text=True
+):
     result = subprocess.run(
         [
             timeout_command,
@@ -1628,13 +1630,16 @@ def run_git(arguments, *, environment=None, stdout=subprocess.PIPE, input_text=N
         input=input_text,
         stdout=stdout,
         stderr=subprocess.PIPE,
-        text=True,
+        text=text,
         timeout=65,
         check=False,
         start_new_session=True,
     )
     if result.returncode:
-        detail = result.stderr.strip() or "Git command failed"
+        detail = result.stderr.strip()
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        detail = detail or "Git command failed"
         raise RuntimeError(detail[:1000])
     return result
 
@@ -1665,7 +1670,9 @@ def capture_index_state(
         if private_shared_index.resolve() != shared_index:
             shutil.copyfile(shared_index, private_shared_index)
     unmerged = run_git(
-        ["ls-files", "--unmerged", "-z"], environment=private_environment
+        ["ls-files", "--unmerged", "-z"],
+        environment=private_environment,
+        text=False,
     ).stdout
     if not unmerged:
         tree = run_git(
@@ -1675,12 +1682,19 @@ def capture_index_state(
         return tree, None
 
     entries = run_git(
-        ["ls-files", "--stage", "-z"], environment=private_environment
+        ["ls-files", "--stage", "-z"],
+        environment=private_environment,
+        text=False,
+    ).stdout
+    resolve_undo = run_git(
+        ["ls-files", "--resolve-undo", "-z"],
+        environment=private_environment,
+        text=False,
     ).stdout
     object_ids = sorted(
         {
-            record.split("\\t", 1)[0].split()[1]
-            for record in entries.split("\\0")
+            record.split(b"\\t", 1)[0].split()[1].decode("ascii")
+            for record in (entries + resolve_undo).split(b"\\0")
             if record
         }
     )
