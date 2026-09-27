@@ -1610,6 +1610,11 @@ def generate_issue_driven_workflow(config: IssueDrivenConfig) -> str:
     source = source[:outline_start] + _workflow_outline(config) + source[outline_end:]
     source = source.replace("MAX_REVIEWS = 4", f"MAX_REVIEWS = {config.max_reviews}", 1)
     source = source.replace(
+        "MAX_WHOLE_REVIEWS = 4",
+        f"MAX_WHOLE_REVIEWS = {config.whole_max_reviews}",
+        1,
+    )
+    source = source.replace(
         "MAX_SCOPE_REVIEWS = 6",
         f"MAX_SCOPE_REVIEWS = {config.scope_max_reviews}",
         1,

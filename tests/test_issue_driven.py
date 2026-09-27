@@ -1999,6 +1999,7 @@ def test_generation_is_deterministic_parseable_and_uses_ordered_issues() -> None
     ]
     assert positions == sorted(positions)
     assert "MAX_REVIEWS = 5" in first
+    assert "MAX_WHOLE_REVIEWS = 5" in first
     assert config.whole_max_reviews == config.max_reviews
     assert config.as_json()["whole_max_reviews"] == config.max_reviews
     assert config.scope_max_reviews == 3
@@ -2037,6 +2038,11 @@ def test_optional_whole_review_limit_round_trips_in_all_configuration_forms(
     assert config.whole_max_reviews == whole_max_reviews
     assert config.as_json()["whole_max_reviews"] == whole_max_reviews
     assert parse(config.as_json()) == config
+
+    code = generate_issue_driven_workflow(config)
+
+    assert f"MAX_WHOLE_REVIEWS = {whole_max_reviews}" in code
+    assert "MAX_REVIEWS = 5" in code
 
 
 @pytest.mark.parametrize("whole_max_reviews", [True, 0, 101, 1.5, "6"])

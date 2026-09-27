@@ -72,6 +72,7 @@ WORKFLOW_PREVIEW_PHASES = [
     ("Final integration PR", "always"),
 ]
 MAX_REVIEWS = 4
+MAX_WHOLE_REVIEWS = 4
 MAX_SCOPE_REVIEWS = 6
 MAX_WORK_ITEMS = 200
 MAX_PLANNER_TURNS = MAX_WORK_ITEMS + 1
@@ -4451,7 +4452,7 @@ def _review_whole_version(
     prior_limit = (
         latest_changed_head
         if latest_changed_head is not None
-        and latest_changed_head.round >= MAX_REVIEWS
+        and latest_changed_head.round >= MAX_WHOLE_REVIEWS
         and latest_changed_head.fix_sha == pr.head_sha
         else None
     )
@@ -4517,7 +4518,7 @@ def _review_whole_version(
     delivery: ReviewDelivery | None = None
     for review_number in (
         () if prior_limit is not None or completed_warning is not None
-        else range(1, MAX_REVIEWS + 1)
+        else range(1, MAX_WHOLE_REVIEWS + 1)
     ):
         result: str
         resumed_records = tuple(
@@ -4613,7 +4614,7 @@ def _review_whole_version(
                     base=config.main_branch,
                     fix_sha=scenario_sha,
                 )
-                if review_number == MAX_REVIEWS:
+                if review_number == MAX_WHOLE_REVIEWS:
                     pr = persist_whole_limit_head_change(
                         github, pr, round_number=review_number,
                         reviewed_sha=scenario_audit.reviewed_sha,
@@ -4719,7 +4720,7 @@ def _review_whole_version(
                 base=config.main_branch,
                 fix_sha=principles_sha,
             )
-            if review_number == MAX_REVIEWS:
+            if review_number == MAX_WHOLE_REVIEWS:
                 pr = persist_whole_limit_head_change(
                     github, pr, round_number=review_number,
                     reviewed_sha=principles_audit.reviewed_sha,
@@ -4811,7 +4812,7 @@ def _review_whole_version(
                 base=config.main_branch,
                 fix_sha=reviewed_sha,
             )
-            if review_number == MAX_REVIEWS:
+            if review_number == MAX_WHOLE_REVIEWS:
                 pr = persist_whole_limit_head_change(
                     github, pr, round_number=review_number,
                     reviewed_sha=whole_audit.reviewed_sha,
@@ -4904,7 +4905,7 @@ def _review_whole_version(
                 base=config.main_branch,
                 fix_sha=reviewed_sha,
             )
-            if review_number == MAX_REVIEWS:
+            if review_number == MAX_WHOLE_REVIEWS:
                 pr = persist_whole_limit_head_change(
                     github, pr, round_number=review_number,
                     reviewed_sha=version_audit.reviewed_sha,
@@ -4938,9 +4939,9 @@ def _review_whole_version(
         current = ensure_base_pr_policy_notes(github, current, config)
         warning: str | None = None
         if verdict == "CHANGES_REQUESTED":
-            if review_number == MAX_REVIEWS:
+            if review_number == MAX_WHOLE_REVIEWS:
                 warning = (
-                    f"Whole-version review limit {MAX_REVIEWS} reached with "
+                    f"Whole-version review limit {MAX_WHOLE_REVIEWS} reached with "
                     "CHANGES_REQUESTED; keeping the Base PR Draft and continuing "
                     "without reviewer approval."
                 )
@@ -5038,7 +5039,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
             iteration=review_number,
         )
         if checks_changed:
-            if review_number == MAX_REVIEWS:
+            if review_number == MAX_WHOLE_REVIEWS:
                 raise WorkerFailure(
                     "final checks changed the integration branch at the review "
                     "limit; refusing unreviewed delivery"
@@ -5080,7 +5081,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
                 github, pr,
                 whole_continuation_audit(
                     review_number, current.head_sha,
-                    "review_limit_reached" if review_number == MAX_REVIEWS
+                    "review_limit_reached" if review_number == MAX_WHOLE_REVIEWS
                     else "no_change_after_re_evaluation",
                 ),
                 head=config.integration_branch, base=config.main_branch,
@@ -5098,7 +5099,7 @@ and leave the worktree clean. If not, leave it clean and explain why.\n\n{result
         break
     if prior_limit is not None or completed_warning is not None:
         continuation_round = (
-            MAX_REVIEWS if prior_limit is not None else completed_warning.round
+            MAX_WHOLE_REVIEWS if prior_limit is not None else completed_warning.round
         )
         disposition = (
             "review_limit_reached_after_head_change" if prior_limit is not None

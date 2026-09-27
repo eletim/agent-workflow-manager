@@ -1362,8 +1362,11 @@ def test_scope_and_correctness_reviews_have_separate_limits_and_results() -> Non
     source = EXAMPLE.read_text(encoding="utf-8")
 
     assert "MAX_SCOPE_REVIEWS = 6" in source
+    assert "MAX_WHOLE_REVIEWS = 4" in source
     assert "max_reviews=MAX_SCOPE_REVIEWS" in source
     assert "max_reviews=MAX_REVIEWS" in source
+    assert "range(1, MAX_WHOLE_REVIEWS + 1)" in source
+    assert "for check_number in range(1, MAX_REVIEWS + 1)" in source
     for field in (
         "scope_reviews=",
         "correctness_reviews=",
@@ -3759,7 +3762,7 @@ def test_same_head_partial_review_limit_recovery_finishes_atomically(
             return current
 
     agent_results = iter((current.head_sha, False) for _ in range(4))
-    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 1)
+    monkeypatch.setitem(workflow_globals, "MAX_WHOLE_REVIEWS", 1)
     monkeypatch.setitem(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
@@ -3987,7 +3990,7 @@ def test_scenario_gate_failure_does_not_skip_independent_reviews(
         return "APPROVED"
 
     monkeypatch.setitem(workflow_globals, "SCENARIOS", ("scenario",))
-    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 1)
+    monkeypatch.setitem(workflow_globals, "MAX_WHOLE_REVIEWS", 1)
     monkeypatch.setitem(
         workflow_globals, "create_agent", lambda *args, **kwargs: kwargs["name"]
     )
@@ -4080,7 +4083,7 @@ def test_whole_version_review_limit_warns_without_an_extra_fix(
         lambda *args: events.append("final checks"),
     )
     monkeypatch.setitem(workflow_globals, "require_warning_delivery", warning_delivery)
-    monkeypatch.setitem(workflow_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(workflow_globals, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(
         workflow_globals,
         "emit_finding",
@@ -4134,7 +4137,7 @@ def test_whole_warning_retries_from_durable_audit_after_recovery(
             assert kwargs["expected_head_sha"] == current.head_sha
             return current
 
-    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(
         globals_, "create_agent", lambda *args, **kwargs: pytest.fail("review restarted")
     )
@@ -4193,7 +4196,7 @@ def test_whole_limit_after_head_change_persists_retry_decision(
             current = replace(current, body=body)
             return current
 
-    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
     monkeypatch.setitem(
         globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
@@ -4216,7 +4219,7 @@ def test_whole_limit_after_head_change_persists_retry_decision(
 
     recovered = runpy.run_path(str(EXAMPLE))
     recovered_globals = recovered["review_whole_version"].__globals__
-    monkeypatch.setitem(recovered_globals, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(recovered_globals, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(
         recovered_globals, "create_agent",
         lambda *args, **kwargs: pytest.fail("recovery restarted review"),
@@ -4303,7 +4306,7 @@ def test_whole_retry_finishes_warning_after_dispositions_but_before_marker(
             current = replace(current, body=body)
             return current
 
-    monkeypatch.setitem(globals_, "MAX_REVIEWS", 2)
+    monkeypatch.setitem(globals_, "MAX_WHOLE_REVIEWS", 2)
     monkeypatch.setitem(globals_, "create_agent", lambda *args, **kwargs: kwargs["name"])
     monkeypatch.setitem(
         globals_, "run_turn", lambda *args, **kwargs: pytest.fail("review restarted")
