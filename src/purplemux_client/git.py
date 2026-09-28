@@ -523,39 +523,28 @@ class GitRepository:
             ["rev-list", "--reverse", f"{previous_sha}..{current_sha}"]
         )
         for commit_sha in commits.splitlines():
-            agent = self._read(
-                [
-                    "show",
-                    "-s",
-                    "--format=%(trailers:key=AWM-Agent,valueonly)",
-                    commit_sha,
+            message = self._read(["show", "-s", "--format=%B", commit_sha])
+
+            def metadata_values(key: str) -> list[str]:
+                return [
+                    match.group(1).strip()
+                    for match in re.finditer(
+                        rf"(?m)^{re.escape(key)}:[ \t]*(.*?)[ \t]*$", message
+                    )
                 ]
-            ).splitlines()
-            process = self._read(
-                [
-                    "show",
-                    "-s",
-                    "--format=%(trailers:key=AWM-Process,valueonly)",
-                    commit_sha,
-                ]
-            ).splitlines()
-            coauthors = self._read(
-                [
-                    "show",
-                    "-s",
-                    "--format=%(trailers:key=Co-authored-by,valueonly)",
-                    commit_sha,
-                ]
-            ).splitlines()
-            if agent != [expected_agent]:
+
+            agents = metadata_values("AWM-Agent")
+            processes = metadata_values("AWM-Process")
+            coauthors = metadata_values("Co-authored-by")
+            if not agents or set(agents) != {expected_agent}:
                 raise WorkerFailure(
-                    f"commit {commit_sha} must have exactly one "
-                    f"AWM-Agent trailer naming {expected_agent}"
+                    f"commit {commit_sha} must have unambiguous AWM-Agent trailer "
+                    f"metadata naming {expected_agent}"
                 )
-            if process != [expected_process]:
+            if not processes or set(processes) != {expected_process}:
                 raise WorkerFailure(
-                    f"commit {commit_sha} must have exactly one AWM-Process "
-                    f"trailer naming {expected_process}"
+                    f"commit {commit_sha} must have unambiguous AWM-Process trailer "
+                    f"metadata naming {expected_process}"
                 )
             if coauthor not in coauthors:
                 raise WorkerFailure(

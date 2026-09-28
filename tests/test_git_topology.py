@@ -362,6 +362,104 @@ def test_committed_result_requires_uniform_agent_provenance(
     assert result.local_sha == git(work, "rev-parse", "HEAD")
 
 
+def test_agent_provenance_accepts_blank_lines_between_metadata(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/spaced-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n\n"
+        "AWM-Agent: codex\n\n"
+        "AWM-Process: implementation",
+    )
+
+    result = repo.require_committed_result(
+        branch,
+        previous_sha=base,
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+    assert result.local_sha == git(work, "rev-parse", "HEAD")
+
+
+def test_agent_provenance_accepts_repeated_consistent_metadata(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/repeated-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        "Co-authored-by: Codex <noreply@openai.com>\n"
+        "AWM-Agent: codex\nAWM-Agent: codex\n"
+        "AWM-Process: implementation\nAWM-Process: implementation",
+    )
+
+    repo.require_agent_commit_provenance(
+        base,
+        git(work, "rev-parse", "HEAD"),
+        expected_agent="codex",
+        expected_process="implementation",
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error"),
+    [
+        (
+            "AWM-Agent: codex\nAWM-Agent: claude\nAWM-Process: implementation",
+            "AWM-Agent",
+        ),
+        (
+            "AWM-Agent: codex\nAWM-Process: implementation\nAWM-Process: cleanup",
+            "AWM-Process",
+        ),
+    ],
+)
+def test_agent_provenance_rejects_conflicting_metadata(
+    repositories: tuple[Path, Path, Path], metadata: str, error: str
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    branch = "feature/conflicting-provenance"
+    repo.prepare_feature_branch(branch, base="main", expected_base_sha=base)
+    git(
+        work,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "agent result",
+        "-m",
+        f"Co-authored-by: Codex <noreply@openai.com>\n{metadata}",
+    )
+
+    with pytest.raises(WorkerFailure, match=error):
+        repo.require_agent_commit_provenance(
+            base,
+            git(work, "rev-parse", "HEAD"),
+            expected_agent="codex",
+            expected_process="implementation",
+        )
+
+
 def test_committed_result_rejects_missing_agent_provenance(
     repositories: tuple[Path, Path, Path],
 ) -> None:

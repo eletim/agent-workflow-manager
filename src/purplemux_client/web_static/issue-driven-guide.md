@@ -92,8 +92,8 @@ Incorrect when that version worktree does not already exist:
 Unknown fields are rejected. The single-repository form provides exactly one of
 `one_shot_issue`, `work_items`, or the legacy `issues` field together with its
 three repository fields. The multi-repository form provides `repositories`
-instead. `mode`, `make_integration_branch`, `policy_issue`, `scope_max_reviews`,
-`implementer_agent`, `reviewer_agent`, `turn_timeout`, and `scenarios` are otherwise optional;
+instead. `mode`, `make_integration_branch`, `policy_issue`, `whole_max_reviews`,
+`scope_max_reviews`, `implementer_agent`, `reviewer_agent`, `turn_timeout`, and `scenarios` are otherwise optional;
 the run-wide review and delivery fields are always required.
 
 | Field | Type | Meaning |
@@ -108,8 +108,9 @@ the run-wide review and delivery fields are always required.
 | `one_shot_issue` | integer | Positive source Issue for a manager-planned one-shot run. It starts with no work items and cannot be combined with `issues` or `work_items`. |
 | `issues` | array of integers | Legacy form for positive, unique GitHub Issue numbers, executed in the listed order. Do not combine it with `work_items`. |
 | `work_items` | array | Ordered GitHub Issue numbers and/or inline mini-task objects. A mini task is exactly `{"id": "lowercase-kebab-id", "task": "authoritative instruction"}` and does not require a GitHub Issue. |
-| `max_reviews` | integer | Correctness and whole-version review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 4 unless the user requests another value. |
-| `scope_max_reviews` | integer | Optional Scope / Design Review limit from 1 through 100; default 3 when omitted, recommended value 6. It does not affect Correctness or whole-version review. |
+| `max_reviews` | integer | Correctness Review limit from 1 through 100; reaching it continues with a structured warning after exact topology checks. Use 4 unless the user requests another value. |
+| `whole_max_reviews` | integer | Optional Whole Review limit from 1 through 100; defaults to `max_reviews` when omitted. |
+| `scope_max_reviews` | integer | Optional Scope / Design Review limit from 1 through 100; default 3 when omitted, recommended value 6. It does not affect Correctness or Whole Review. |
 | `turn_timeout` | integer | Optional agent-turn timeout in seconds from 1 through 9,007,199,254,740,991; default 7200. For longer turns, values such as 10800 are supported. |
 | `implementer_agent` | string | Agent used for implementation, fixes, and cleanup; `codex` or `claude`, default `codex`. |
 | `reviewer_agent` | string | Agent used for Issue and whole-version review; `codex` or `claude`, default `codex`. |
@@ -124,7 +125,8 @@ Each implementation work item is reviewed in two ordered phases. Scope / Design
 Review uses `scope_max_reviews` (default 3) to check that the change is necessary,
 sufficient, minimal, and placed within the right responsibilities. After that
 phase, Correctness Review uses `max_reviews` to check behavior, edge cases,
-safety, regressions, and tests; Whole Review also uses `max_reviews`. After any
+safety, regressions, and tests; Whole Review uses `whole_max_reviews`, falling
+back to `max_reviews` when the dedicated value is omitted. After any
 configured Scenario Gate, each eligible integration head receives the dedicated
 Design Principles review, the cross-Issue Whole-version review, and an
 independent Version / README review, in that order. The Design Principles turn
@@ -180,6 +182,7 @@ checks use live remote refs and perform no branch, PR, or repository mutation.
   "policy_issue": 80,
   "issues": [86, 99, 87, 84],
   "max_reviews": 4,
+  "whole_max_reviews": 4,
   "scope_max_reviews": 6,
   "turn_timeout": 7200,
   "implementer_agent": "codex",
@@ -211,6 +214,7 @@ level and moves the four repository-specific fields into ordered entries:
     }
   ],
   "max_reviews": 4,
+  "whole_max_reviews": 4,
   "scope_max_reviews": 6,
   "implementer_agent": "codex",
   "reviewer_agent": "claude",
@@ -237,6 +241,7 @@ To mix a GitHub Issue with a workflow-local task, replace `issues` with
     }
   ],
   "max_reviews": 4,
+  "whole_max_reviews": 4,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -254,6 +259,7 @@ To deliver one large Issue without preparing its work-item list, use
   "final_branch": "main",
   "one_shot_issue": 169,
   "max_reviews": 4,
+  "whole_max_reviews": 4,
   "merge_to_integration": true,
   "final_review": true,
   "merge_final": false
@@ -388,7 +394,9 @@ does not reconstruct the terminated Python process.
 - Use `policy_issue` only for shared version design context, never for workflow
   ordering or conditions, and never repeat it in `issues`.
 - Set `max_reviews` to 4 unless the user explicitly requests another value. This
-  controls only Correctness and whole-version review.
+  controls Correctness Review.
+- Omit `whole_max_reviews` to reuse `max_reviews`, or set it when the user
+  explicitly requests a distinct Whole Review limit.
 - Omit `scope_max_reviews` to retain its default of 3, or set it to the recommended
   value of 6 unless the user explicitly requests another Scope / Design Review
   limit. Keeping the recommended Scope limit above `max_reviews` leaves capacity
