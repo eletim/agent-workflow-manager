@@ -827,19 +827,14 @@ test("Runtime is a distinct dominant view and workflow views restore the editor"
 
   assert.equal(elements["issue-driven-fields"].hidden, false);
   assert.equal(elements["workflow-fields"].hidden, true);
-  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
+  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
   assert.match(elements["issue-driven-mode"].className, /primary-view-entry/);
   assert.equal(elements["developer-views"].open, false);
-  assert.equal(elements["runtime-panel"].hidden, true);
-  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
-  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
-
-  await elements["runtime-view"].dispatch("click");
   assert.equal(elements["runtime-panel"].hidden, false);
   assert.equal(elements.body.classList.contains("runtime-view-active"), true);
   assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
   assert.match(elements["runtime-view"].className, /selected/);
-  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
+  assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 
   await elements["workflow-mode"].dispatch("click");
 
@@ -927,7 +922,9 @@ test("saved run history stays unselected across startup reconciliation", async (
   assert.equal(elements["issue-driven-fields"].hidden, false);
   assert.equal(elements["workflow-fields"].hidden, true);
   assert.equal(elements["developer-views"].open, false);
-  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements["runtime-panel"].hidden, false);
+  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
+  assert.equal(elements.body.classList.contains("runtime-view-active"), true);
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
   assert.equal(calls.some(([url]) => url === "/api/runs/2"), false);
   assert.ok(runItem(elements, 1));

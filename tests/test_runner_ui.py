@@ -141,9 +141,10 @@ def test_runtime_is_primary_and_developer_views_remain_linked() -> None:
     html = INDEX.read_text(encoding="utf-8")
     runtime_ancestors = _ancestors("runtime-view")
 
+    assert '<body class="runtime-view-active">' in html
     assert (
-        'id="issue-driven-mode" class="primary-view-entry issue-driven-entry selected"'
-        in html
+        'id="issue-driven-mode" class="primary-view-entry issue-driven-entry" '
+        'type="button" aria-pressed="false"' in html
     )
     assert any(
         tag == "div" and attributes.get("class") == "primary-views"
@@ -154,7 +155,7 @@ def test_runtime_is_primary_and_developer_views_remain_linked() -> None:
         for tag, attributes in runtime_ancestors
     )
     assert (
-        'id="runtime-view" class="primary-view-entry runtime-entry" type="button"'
+        'id="runtime-view" class="primary-view-entry runtime-entry selected" type="button" aria-pressed="true"'
         in html
     )
     assert '<div id="issue-driven-fields">' in html
@@ -168,7 +169,10 @@ def test_runtime_is_primary_and_developer_views_remain_linked() -> None:
         "Diagnostics",
     ):
         assert f">{label}<" in html
-    assert '<section id="runtime-panel" class="runtime-panel"' in html
+    assert (
+        '<section id="runtime-panel" class="runtime-panel" aria-label="Runtime">'
+        in html
+    )
     assert 'id="diagnostics-view" href="#diagnostics-panel">Diagnostics</a>' in html
 
 
