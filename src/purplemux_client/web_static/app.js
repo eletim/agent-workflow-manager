@@ -163,7 +163,7 @@ let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
 let currentMode = "issue-driven";
-let runtimeViewActive = false;
+let runtimeViewActive = true;
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
@@ -2848,6 +2848,7 @@ testNotificationButton.addEventListener("click", async () => {
 });
 
 async function initialize() {
+  showRuntimeView(true);
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");

@@ -171,8 +171,8 @@ A stopped Run may end without a complete readiness JSON result.
 
 ## Issue Driven mode
 
-The UI opens in **Issue Driven**, its primary normal-use entry point, with
-**Runtime** beside it as the other primary view. Prompt, Environment Setup,
+The UI opens in **Runtime**, with **Issue Driven** beside it as the other
+primary view. Prompt, Environment Setup,
 Review, Python Workflow, and Diagnostics remain available under **Developer &
 detail views**. Issue Driven accepts only a small
 JSON configuration, validates it separately from Python, and
@@ -623,10 +623,10 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI opens in **Issue Driven** and keeps **Prompt**,
-**Environment Setup**, **Review**, and **Python Workflow** in its developer/detail
-navigation. Prompt accepts an agent,
-an existing working directory, and one prompt. It generates a single-step plain
+The trusted local Runner UI opens in **Runtime** and keeps **Issue Driven** as a
+primary view beside it. **Prompt**, **Environment Setup**, **Review**, and
+**Python Workflow** remain in its developer/detail navigation. Prompt accepts an
+agent, an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt
 resources stay directly available in PurpleMux; they are not registered as

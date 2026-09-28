@@ -7,7 +7,7 @@
     <link id="favicon" rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
     <link rel="stylesheet" href="/style.css">
   </head>
-  <body>
+  <body class="runtime-view-active">
     <main>
       <header>
         <div>
@@ -24,11 +24,11 @@
       <section class="panel editor-panel">
         <nav class="execution-navigation" aria-label="Views">
           <div class="primary-views" role="group" aria-label="Primary views">
-            <button id="issue-driven-mode" class="primary-view-entry issue-driven-entry selected" type="button" aria-pressed="true">
+            <button id="issue-driven-mode" class="primary-view-entry issue-driven-entry" type="button" aria-pressed="false">
               <span>Issue Driven</span>
               <small>Plan and deliver work from GitHub Issues or inline mini tasks</small>
             </button>
-            <button id="runtime-view" class="primary-view-entry runtime-entry" type="button" aria-pressed="false">
+            <button id="runtime-view" class="primary-view-entry runtime-entry selected" type="button" aria-pressed="true">
               <span>Runtime</span>
               <small>Inspect runs, progress, and output</small>
             </button>
@@ -185,7 +185,7 @@ emit_step("workspace create", "completed")</textarea>
         <ol id="agent-turns" class="agent-turn-list" hidden></ol>
       </section>
 
-      <section id="runtime-panel" class="runtime-panel" aria-label="Runtime" hidden>
+      <section id="runtime-panel" class="runtime-panel" aria-label="Runtime">
         <div class="runtime-content">
           <details id="runs-panel" class="panel runs-panel" open>
             <summary class="runs-heading">
