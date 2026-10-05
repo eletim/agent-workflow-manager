@@ -2557,9 +2557,12 @@ def test_post_result_validation_failure_returns_to_same_agent_session(
     prompts: list[tuple[str, str]] = []
 
     class Repository:
+        def __init__(self) -> None:
+            self.local_sha = "base-head"
+
         def require_current_branch(self, current: str) -> BranchState:
             assert current == branch
-            return BranchState(current, "agent-head", None, True)
+            return BranchState(current, self.local_sha, None, True)
 
         def require_agent_commit_provenance(
             self, start: str, end: str, **_kwargs: object
@@ -2568,8 +2571,13 @@ def test_post_result_validation_failure_returns_to_same_agent_session(
             if len(provenance_checks) == 1:
                 raise WorkerFailure("invalid agent commit provenance")
 
+    repository = Repository()
+
     class Client:
         workspace_id = "ws-test"
+
+        def __init__(self) -> None:
+            self.turns = 0
 
         def wait_until_ready(self, *_args: object) -> None:
             pass
@@ -2578,7 +2586,8 @@ def test_post_result_validation_failure_returns_to_same_agent_session(
             prompts.append((tab, prompt))
 
         def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
-            pass
+            self.turns += 1
+            repository.local_sha = "bad-head" if self.turns == 1 else "fixed-head"
 
         def read_result(self, *_args: object) -> str:
             return "agent completed"
@@ -2599,13 +2608,16 @@ def test_post_result_validation_failure_returns_to_same_agent_session(
         "Implementation",
         "prompt",
         repository_identity="acme/project",
-        repository=Repository(),
+        repository=repository,
         branch=branch,
         expected_process="implementation",
     )
 
     assert result == "agent completed"
-    assert provenance_checks == [("agent-head", "agent-head")] * 2
+    assert provenance_checks == [
+        ("base-head", "bad-head"),
+        ("base-head", "fixed-head"),
+    ]
     assert [tab for tab, _prompt in prompts] == ["tab", "tab"]
     assert "invalid agent commit provenance" in prompts[1][1]
     assert "same agent session" in prompts[1][1]
