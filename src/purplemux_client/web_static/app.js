@@ -471,7 +471,7 @@ function applyPrimaryViewSelection() {
 
 function applyRunNavigationSelection() {
   const drafting = activeRunId === null;
-  newRunButton.classList.toggle("selected", drafting);
+  newRunButton.classList[drafting ? "add" : "remove"]("selected");
   newRunButton.setAttribute("aria-pressed", String(drafting));
 }
 
