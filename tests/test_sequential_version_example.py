@@ -1049,7 +1049,49 @@ def test_post_agent_failure_finalizes_deferred_result_for_selected_branch(
     assert globals_["DEFERRED_AGENT_TURN_TRACES"] == []
 
 
-def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
+def test_machine_output_recovery_uses_same_agent_before_wider_recovery() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    corrected = review_result("APPROVED")
+    responses = iter(("APPROVE", "APPROVE", "APPROVE", corrected))
+    turns: list[tuple[str, str, str]] = []
+
+    def execute_turn(_client, tab, name, prompt, **kwargs):
+        turns.append((tab, name, prompt))
+        return workflow["_AgentTurnExecution"](
+            next(responses),
+            len(turns),
+            name,
+            kwargs.get("role", "agent"),
+            kwargs.get("iteration") or 1,
+            kwargs.get("phase"),
+            kwargs.get("work_item_id"),
+            kwargs.get("work_item_label"),
+            kwargs["repository_identity"],
+        )
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
+
+    result, verdict = workflow["run_validated_turn"](
+        object(),
+        "reviewer-tab",
+        "Scenario Gate",
+        "Review this.",
+        workflow["decision"],
+        repository_identity="acme/project",
+    )
+
+    assert (result, verdict) == (corrected, "APPROVED")
+    assert [turn[0] for turn in turns] == ["reviewer-tab"] * 4
+    assert [turn[1] for turn in turns] == [
+        "Scenario Gate",
+        "Scenario Gate output correction",
+        "Scenario Gate output correction",
+        "Scenario Gate same-agent recovery",
+    ]
+    assert "same agent that performed the original task" in turns[-1][2]
+
+
+def test_machine_output_recovery_fails_only_after_bounded_same_agent_retries() -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     turns: list[str] = []
 
@@ -1069,7 +1111,10 @@ def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
 
     workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
 
-    with pytest.raises(WorkerFailure, match="after 2 correction attempts"):
+    with pytest.raises(
+        WorkerFailure,
+        match="after 2 correction attempts and 3 same-agent recovery attempts",
+    ):
         workflow["run_validated_turn"](
             object(),
             "reviewer-tab",
@@ -1083,6 +1128,9 @@ def test_machine_output_recovery_fails_only_after_bounded_corrections() -> None:
         "Scenario Gate",
         "Scenario Gate output correction",
         "Scenario Gate output correction",
+        "Scenario Gate same-agent recovery",
+        "Scenario Gate same-agent recovery",
+        "Scenario Gate same-agent recovery",
     ]
 
 
@@ -2500,12 +2548,13 @@ def test_failed_mutating_turn_validates_commits_before_retry(
     ]
 
 
-def test_post_result_provenance_failure_closes_started_agent_trace(
+def test_post_result_validation_failure_returns_to_same_agent_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = runpy.run_path(str(EXAMPLE))
     branch = "feature/provenance-failure"
     provenance_checks: list[tuple[str, str]] = []
+    prompts: list[tuple[str, str]] = []
 
     class Repository:
         def require_current_branch(self, current: str) -> BranchState:
@@ -2516,7 +2565,8 @@ def test_post_result_provenance_failure_closes_started_agent_trace(
             self, start: str, end: str, **_kwargs: object
         ) -> None:
             provenance_checks.append((start, end))
-            raise WorkerFailure("invalid agent commit provenance")
+            if len(provenance_checks) == 1:
+                raise WorkerFailure("invalid agent commit provenance")
 
     class Client:
         workspace_id = "ws-test"
@@ -2524,8 +2574,8 @@ def test_post_result_provenance_failure_closes_started_agent_trace(
         def wait_until_ready(self, *_args: object) -> None:
             pass
 
-        def send_input(self, *_args: object) -> None:
-            pass
+        def send_input(self, tab: str, prompt: str) -> None:
+            prompts.append((tab, prompt))
 
         def wait_for_turn_completion(self, *_args: object, **_kwargs: object) -> None:
             pass
@@ -2543,22 +2593,28 @@ def test_post_result_provenance_failure_closes_started_agent_trace(
         lambda *args, **kwargs: events.append((args, kwargs)),
     )
 
-    with pytest.raises(WorkerFailure, match="invalid agent commit provenance"):
-        workflow["run_turn"](
-            Client(),
-            "tab",
-            "Implementation",
-            "prompt",
-            repository_identity="acme/project",
-            repository=Repository(),
-            branch=branch,
-            expected_process="implementation",
-        )
+    result = workflow["run_turn"](
+        Client(),
+        "tab",
+        "Implementation",
+        "prompt",
+        repository_identity="acme/project",
+        repository=Repository(),
+        branch=branch,
+        expected_process="implementation",
+    )
 
-    assert provenance_checks == [("agent-head", "agent-head")]
-    assert [args[4] for args, _kwargs in events] == ["started", "failed"]
-    assert events[-1][1]["error"] == "invalid agent commit provenance"
-    assert "result" not in events[-1][1]
+    assert result == "agent completed"
+    assert provenance_checks == [("agent-head", "agent-head")] * 2
+    assert [tab for tab, _prompt in prompts] == ["tab", "tab"]
+    assert "invalid agent commit provenance" in prompts[1][1]
+    assert "same agent session" in prompts[1][1]
+    assert [args[4] for args, _kwargs in events] == [
+        "started",
+        "failed",
+        "started",
+        "completed",
+    ]
 
 
 def test_interrupted_turn_is_not_masked_by_provenance_failure(
