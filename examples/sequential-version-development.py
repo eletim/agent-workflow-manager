@@ -80,6 +80,7 @@ MAX_PLANNER_ACTIONS = 100
 MAX_PLANNER_RATIONALE_BYTES = 2_000
 MAX_PLAN_STATE_CHARS = 32_000
 MAX_MACHINE_OUTPUT_CORRECTIONS = 2
+MAX_SAME_AGENT_RECOVERIES = 3
 MAX_RECOVERY_STATE_BYTES = 32_000
 MAX_RECOVERY_REPORT_BYTES = 2_000
 MAX_REPOSITORY_RECOVERIES = 2
@@ -113,6 +114,14 @@ DEVELOPMENT_BRANCH_VERSION = re.compile(
 
 class MissingReviewAudit(WorkerFailure):
     """A recorded review cannot be given its fix disposition."""
+
+
+class AgentTurnValidationFailure(WorkerFailure):
+    """An agent completed, but AWM rejected its resulting repository state."""
+
+    def __init__(self, message: str, validation_base_sha: str) -> None:
+        super().__init__(message)
+        self.validation_base_sha = validation_base_sha
 
 
 POLICY_CONFLICT_MARKER = "POLICY_CONFLICT:"
@@ -715,6 +724,7 @@ def _execute_turn(
     repository: GitRepository | None = None,
     branch: str | None = None,
     expected_process: str | None = None,
+    _commit_validation_base_sha: str | None = None,
 ) -> _AgentTurnExecution:
     if (repository is None) != (branch is None) or (repository is None) != (
         expected_process is None
@@ -757,19 +767,21 @@ def _execute_turn(
         print(f"WARN: {contextual.message}", flush=True)
         emit_finding("runtime", contextual.message, status="warning")
 
+    validation_base_sha = _commit_validation_base_sha or before_sha
+
     def verify_turn_commits() -> str | None:
         if (
             repository is None
             or branch is None
             or expected_process is None
-            or before_sha is None
+            or validation_base_sha is None
         ):
             return pr.head_sha if pr is not None else None
         after = repository.require_current_branch(branch)
         if after.local_sha is None:
             raise WorkerFailure(f"local branch {branch!r} disappeared")
         repository.require_agent_commit_provenance(
-            before_sha,
+            validation_base_sha,
             after.local_sha,
             expected_agent=IMPLEMENTER_AGENT,
             expected_process=expected_process,
@@ -801,7 +813,14 @@ def _execute_turn(
         )
         result = client.read_result(tab)
         result_observed = True
-        commit_sha = verify_turn_commits()
+        try:
+            commit_sha = verify_turn_commits()
+        except WorkerFailure as exc:
+            if validation_base_sha is None:
+                raise
+            raise AgentTurnValidationFailure(
+                short_error(exc), validation_base_sha
+            ) from exc
     except BaseException as exc:
         if "turn_id" in locals():
             try:
@@ -939,29 +958,62 @@ def run_turn(
     expected_process: str | None = None,
     _defer_trace: bool = False,
 ) -> str | _AgentTurnExecution:
-    execution = _execute_turn(
-        client,
-        tab,
-        name,
-        prompt,
-        repository_identity=repository_identity,
-        role=role,
-        phase=phase,
-        work_item_id=work_item_id,
-        work_item_label=work_item_label,
-        iteration=iteration,
-        pr=pr,
-        warning_scope=warning_scope,
-        repository=repository,
-        branch=branch,
-        expected_process=expected_process,
-    )
-    if _defer_trace:
-        DEFERRED_AGENT_TURN_TRACES.append(execution)
-        return execution
-    _emit_completed_turn(execution, transition_outcome)
-    return execution.result
-
+    """Run one agent turn, feeding post-turn validation failures back to that agent."""
+    current_name = name
+    current_prompt = prompt
+    validation_base_sha: str | None = None
+    for recovery_attempt in range(MAX_SAME_AGENT_RECOVERIES + 1):
+        try:
+            execution = _execute_turn(
+                client,
+                tab,
+                current_name,
+                current_prompt,
+                repository_identity=repository_identity,
+                role=role,
+                phase=phase,
+                work_item_id=work_item_id,
+                work_item_label=work_item_label,
+                iteration=iteration,
+                pr=pr,
+                warning_scope=warning_scope,
+                repository=repository,
+                branch=branch,
+                expected_process=expected_process,
+                _commit_validation_base_sha=validation_base_sha,
+            )
+        except AgentTurnValidationFailure as exc:
+            if recovery_attempt == MAX_SAME_AGENT_RECOVERIES:
+                raise WorkerFailure(
+                    f"{name} result remained invalid after "
+                    f"{MAX_SAME_AGENT_RECOVERIES} same-agent recovery attempts: "
+                    f"{short_error(exc)}"
+                ) from exc
+            validation_base_sha = exc.validation_base_sha
+            repair = (
+                "AWM rejected your previous turn after authoritative validation: "
+                f"{short_error(exc)}\n\n"
+                "Continue in this same agent session and repair only that concrete "
+                "validation failure. Preserve already-correct work and the original "
+                "task scope. Re-inspect the current Git/worktree state before acting. "
+                "Do not start a new branch, PR, or review; do not reset, rebase, stash, "
+                "force-push, merge, or discard ambiguous work. Leave the result ready "
+                "for AWM to run the same validation again, then return a concise "
+                "summary of the repair."
+            )
+            current_prompt = (
+                implementer_prompt(repair, process=expected_process)
+                if expected_process is not None
+                else repair
+            )
+            current_name = f"{name} recovery"
+            continue
+        if _defer_trace:
+            DEFERRED_AGENT_TURN_TRACES.append(execution)
+            return execution
+        _emit_completed_turn(execution, transition_outcome)
+        return execution.result
+    raise AssertionError("unreachable")
 
 ValidatedOutput = TypeVar("ValidatedOutput")
 
@@ -984,7 +1036,7 @@ def run_validated_turn(
     warning_scope: int | str | None = None,
     _deferred_execution: list[_AgentTurnExecution] | None = None,
 ) -> tuple[str, ValidatedOutput]:
-    """Retry an invalid machine-readable response in the same agent session."""
+    """Return invalid machine output to the same agent before wider recovery."""
     turn = run_turn(
         client,
         tab,
@@ -1000,45 +1052,75 @@ def run_validated_turn(
         work_item_label=work_item_label,
         _defer_trace=True,
     )
-    for correction in range(MAX_MACHINE_OUTPUT_CORRECTIONS + 1):
+    correction = 0
+    recovery = 0
+    while True:
         result = turn.result if isinstance(turn, _AgentTurnExecution) else turn
         try:
             value = validator(result)
         except WorkerFailure as exc:
+            can_correct = correction < MAX_MACHINE_OUTPUT_CORRECTIONS
+            can_recover = recovery < MAX_SAME_AGENT_RECOVERIES
             if isinstance(turn, _AgentTurnExecution):
                 _emit_completed_turn(
                     turn,
                     "correct_output"
-                    if correction < MAX_MACHINE_OUTPUT_CORRECTIONS
-                    else "invalid_output",
+                    if can_correct
+                    else ("recover_output" if can_recover else "invalid_output"),
                 )
-            if correction == MAX_MACHINE_OUTPUT_CORRECTIONS:
-                raise WorkerFailure(
-                    f"{name} returned invalid output after "
-                    f"{MAX_MACHINE_OUTPUT_CORRECTIONS} correction attempts: "
-                    f"{short_error(exc)}"
-                ) from exc
             validation_error = short_error(exc)
-            turn = run_turn(
-                client,
-                tab,
-                f"{name} output correction",
-                "The previous response violated its machine-readable output "
-                f"contract: {validation_error}\n\n"
-                "Return the complete corrected response only, following the "
-                "original response contract. Correct the output in this same "
-                "session; do not repeat the underlying task or mutate any state.",
-                repository_identity=repository_identity,
-                iteration=correction + 1,
-                pr=pr,
-                warning_scope=warning_scope,
-                role=role,
-                phase="output-correction",
-                work_item_id=work_item_id,
-                work_item_label=work_item_label,
-                _defer_trace=True,
-            )
-            continue
+            if can_correct:
+                correction += 1
+                turn = run_turn(
+                    client,
+                    tab,
+                    f"{name} output correction",
+                    "The previous response violated its machine-readable output "
+                    f"contract: {validation_error}\n\n"
+                    "Return the complete corrected response only, following the "
+                    "original response contract. Correct the output in this same "
+                    "session; do not repeat the underlying task or mutate any state.",
+                    repository_identity=repository_identity,
+                    iteration=correction,
+                    pr=pr,
+                    warning_scope=warning_scope,
+                    role=role,
+                    phase="output-correction",
+                    work_item_id=work_item_id,
+                    work_item_label=work_item_label,
+                    _defer_trace=True,
+                )
+                continue
+            if can_recover:
+                recovery += 1
+                turn = run_turn(
+                    client,
+                    tab,
+                    f"{name} same-agent recovery",
+                    "AWM still rejects the previous response after ordinary output "
+                    f"correction. The current validation error is: {validation_error}\n\n"
+                    "You are the same agent that performed the original task. Use "
+                    "that existing context and repair only the response-contract "
+                    "failure. Do not repeat the underlying review/task and do not "
+                    "mutate files, Git, or GitHub. Return the complete corrected "
+                    "machine-readable response only.",
+                    repository_identity=repository_identity,
+                    iteration=recovery,
+                    pr=pr,
+                    warning_scope=warning_scope,
+                    role=role,
+                    phase="same-agent-recovery",
+                    work_item_id=work_item_id,
+                    work_item_label=work_item_label,
+                    _defer_trace=True,
+                )
+                continue
+            raise WorkerFailure(
+                f"{name} returned invalid output after "
+                f"{MAX_MACHINE_OUTPUT_CORRECTIONS} correction attempts and "
+                f"{MAX_SAME_AGENT_RECOVERIES} same-agent recovery attempts: "
+                f"{validation_error}"
+            ) from exc
         outcome: str | None = None
         if transition_outcome is not None:
             try:
@@ -1051,8 +1133,6 @@ def run_validated_turn(
             else:
                 _deferred_execution.append(turn)
         return result, value
-    raise AssertionError("unreachable")
-
 
 @dataclass(frozen=True)
 class RecoveryReport:
@@ -2525,41 +2605,74 @@ def require_agent_result(
     iteration: int | None = None,
     warning_scope: int | str | None = None,
 ) -> tuple[str, bool]:
-    post_turn = repo.require_current_branch(branch)
-    if post_turn.local_sha is None:
-        raise WorkerFailure(f"local branch {branch!r} does not exist")
-    require_clean_worktree(
-        repo,
-        client,
-        tab,
-        context=f"verifying the coding result on {branch!r}",
-        iteration=iteration,
-        warning_scope=warning_scope,
-    )
-    result = repo.require_committed_result(
-        branch,
-        previous_sha=previous_sha,
-        allow_unchanged=True,
-    )
-    assert result.local_sha is not None
-    cleanup_changed = result.local_sha != post_turn.local_sha
-    repo.require_agent_commit_provenance(
-        previous_sha,
-        post_turn.local_sha,
-        expected_agent=IMPLEMENTER_AGENT,
-        expected_process=expected_process,
-        allow_unchanged=allow_unchanged or cleanup_changed,
-    )
-    if cleanup_changed:
-        repo.require_agent_commit_provenance(
-            post_turn.local_sha,
-            result.local_sha,
-            expected_agent=IMPLEMENTER_AGENT,
-            expected_process="cleanup",
-        )
-    emit_finding("git", f"{branch} is clean at {result.local_sha}")
-    return result.local_sha, result.local_sha != previous_sha
+    """Validate a coding result, returning concrete failures to the same agent."""
+    for recovery_attempt in range(MAX_SAME_AGENT_RECOVERIES + 1):
+        try:
+            post_turn = repo.require_current_branch(branch)
+            if post_turn.local_sha is None:
+                raise WorkerFailure(f"local branch {branch!r} does not exist")
+            require_clean_worktree(
+                repo,
+                client,
+                tab,
+                context=f"verifying the coding result on {branch!r}",
+                iteration=iteration,
+                warning_scope=warning_scope,
+            )
+            result = repo.require_committed_result(
+                branch,
+                previous_sha=previous_sha,
+                allow_unchanged=True,
+            )
+            assert result.local_sha is not None
+            cleanup_changed = result.local_sha != post_turn.local_sha
+            repo.require_agent_commit_provenance(
+                previous_sha,
+                post_turn.local_sha,
+                expected_agent=IMPLEMENTER_AGENT,
+                expected_process=expected_process,
+                allow_unchanged=allow_unchanged or cleanup_changed,
+            )
+            if cleanup_changed:
+                repo.require_agent_commit_provenance(
+                    post_turn.local_sha,
+                    result.local_sha,
+                    expected_agent=IMPLEMENTER_AGENT,
+                    expected_process="cleanup",
+                )
+            emit_finding("git", f"{branch} is clean at {result.local_sha}")
+            return result.local_sha, result.local_sha != previous_sha
+        except WorkerFailure as exc:
+            if recovery_attempt == MAX_SAME_AGENT_RECOVERIES:
+                raise WorkerFailure(
+                    "coding result remained invalid after "
+                    f"{MAX_SAME_AGENT_RECOVERIES} same-agent recovery attempts: "
+                    f"{short_error(exc)}"
+                ) from exc
+            run_turn(
+                client,
+                tab,
+                "Coding result recovery",
+                implementer_prompt(
+                    f"""AWM rejected your previous coding result during authoritative
+validation: {short_error(exc)}
 
+Continue in this same session and repair only that concrete failure. Inspect the
+current branch, commits, worktree, and relevant remote/PR state first. Preserve
+already-correct work and the original task scope. Keep branch {branch}. Do not
+start a new task or review. Do not reset, rebase, stash, force-push, merge, or
+discard ambiguous work. When safe, leave the intended result committed and the
+worktree clean so AWM can run the same validation again. Return a concise repair
+summary.""",
+                    process=expected_process,
+                ),
+                repository_identity=repo.expected_github_slug,
+                role="implementer",
+                phase="same-agent-recovery",
+                iteration=recovery_attempt + 1,
+                warning_scope=warning_scope,
+            )
+    raise AssertionError("unreachable")
 
 def issue_prompts(issue: Issue, config: Config) -> tuple[str, str, str]:
     context = policy_context(config, scope=issue.label)
