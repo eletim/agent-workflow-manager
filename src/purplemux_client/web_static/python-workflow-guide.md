@@ -912,11 +912,14 @@ Workflow recovery is authored as a new run manually. Its ordinary Python code sh
 branches and commits, GitHub PR topology, and any relevant PurpleMux resources
 before reusing external work or making a new mutation. Keep mutation-once and
 `MutationOutcomeUnknown` protections: reconcile a possibly dispatched mutation
-from authoritative state and never retry it blindly. The generated Issue Driven
-workflow may use a dedicated recovery agent and retry its repository pass at most
-twice after a repair. Python checks fresh Git and PR state before each retry and
-stops if the recovery outcome or an inspection is uncertain. This recovery model
-does not add a graph, state machine, or durable execution store.
+from authoritative state and never retry it blindly. The generated Issue Driven workflow first returns agent-result validation
+failures to the same CodingAgent or Reviewer session with the concrete validation
+error and re-runs the same validation. Those retries are bounded. Only failures
+that escape that local agent boundary may use a dedicated recovery agent and
+retry the repository pass at most twice after a repair. Python checks fresh Git
+and PR state before each repository retry and stops if the recovery outcome or an
+inspection is uncertain. This recovery model does not add a graph, state machine,
+or durable execution store.
 
 Use these examples when reasoning about resumability, even if an external caller
 records its own phase label:
