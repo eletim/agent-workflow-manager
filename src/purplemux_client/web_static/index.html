@@ -7,7 +7,7 @@
     <link id="favicon" rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
     <link rel="stylesheet" href="/style.css">
   </head>
-  <body class="runtime-view-active">
+  <body>
     <main>
       <header>
         <div>
@@ -21,17 +21,44 @@
         </div>
       </header>
 
+      <div class="app-shell">
+        <aside class="run-sidebar" aria-label="Run navigation">
+          <button id="new-run" class="sidebar-new-run selected" type="button" aria-pressed="true">＋ New RUN</button>
+          <div class="run-sidebar-heading">
+            <span class="runs-title">RUNS</span>
+            <span id="runs-empty">No runs yet.</span>
+          </div>
+          <div id="run-list" class="run-list"></div>
+          <div class="run-history-actions">
+            <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
+          </div>
+        </aside>
+
+        <div class="workspace-main">
+          <div class="workspace-toolbar">
+            <div class="workspace-context">
+              <p id="active-context" class="active-context"></p>
+              <nav id="run-family" aria-label="Run family" hidden></nav>
+            </div>
+            <div class="controls">
+              <button id="validate">Validate</button>
+              <button id="dry-run">Dry Run</button>
+              <button id="run" class="primary">Run</button>
+              <button id="stop" disabled>Stop</button>
+              <button id="cleanup" disabled>Cleanup</button>
+              <button id="checked-toggle" type="button" hidden>Mark checked</button>
+              <span id="exit-code">Exit code: —</span>
+            </div>
+          </div>
+
       <section class="panel editor-panel">
-        <nav class="execution-navigation" aria-label="Views">
-          <div class="primary-views" role="group" aria-label="Primary views">
-            <button id="issue-driven-mode" class="primary-view-entry issue-driven-entry" type="button" aria-pressed="false">
+        <nav class="execution-navigation" aria-label="Run type">
+          <div class="primary-views" role="group" aria-label="Primary run type">
+            <button id="issue-driven-mode" class="primary-view-entry issue-driven-entry selected" type="button" aria-pressed="true">
               <span>Issue Driven</span>
               <small>Plan and deliver work from GitHub Issues or inline mini tasks</small>
             </button>
-            <button id="runtime-view" class="primary-view-entry runtime-entry selected" type="button" aria-pressed="true">
-              <span>Runtime</span>
-              <small>Inspect runs, progress, and output</small>
-            </button>
+            <button id="runtime-view" type="button" hidden aria-pressed="false">Runtime</button>
           </div>
           <details id="developer-views" class="developer-views">
             <summary>Developer &amp; detail views</summary>
@@ -44,11 +71,6 @@
             </div>
           </details>
         </nav>
-        <div class="editor-mode-bar">
-          <p id="active-context" class="active-context"></p>
-          <nav id="run-family" aria-label="Run family" hidden></nav>
-          <button id="new-run" type="button">New run</button>
-        </div>
         <div id="repository-navigation" class="repository-navigation" hidden>
           <span>Repository: <strong id="repository-slug"></strong></span>
           <a id="repository-link" target="_blank" rel="noopener noreferrer">Open GitHub Repository</a>
@@ -162,15 +184,6 @@ emit_step("workspace create", "completed")</textarea>
             </div>
           </details>
         </div>
-        <div class="controls">
-          <button id="validate">Validate</button>
-          <button id="dry-run">Dry Run</button>
-          <button id="run" class="primary">Run</button>
-          <button id="stop" disabled>Stop</button>
-          <button id="cleanup" disabled>Cleanup</button>
-          <button id="checked-toggle" type="button" hidden>Mark checked</button>
-          <span id="exit-code">Exit code: —</span>
-        </div>
       </section>
 
       <section id="outline-panel" class="panel outline-panel" aria-live="polite" hidden>
@@ -187,18 +200,6 @@ emit_step("workspace create", "completed")</textarea>
 
       <section id="runtime-panel" class="runtime-panel" aria-label="Runtime">
         <div class="runtime-content">
-          <details id="runs-panel" class="panel runs-panel" open>
-            <summary class="runs-heading">
-              <span class="runs-title">Runs</span>
-              <span id="runs-empty">No runs yet.</span>
-              <span class="runs-toggle-hint" aria-hidden="true">Show / hide</span>
-            </summary>
-            <div class="run-history-actions">
-              <button id="delete-checked-runs" type="button" disabled>Delete checked runs (0)</button>
-            </div>
-            <div id="run-list" class="run-list"></div>
-          </details>
-
       <section id="recovery-panel" class="panel recovery-panel" aria-live="polite" hidden>
         <h2>Recovery</h2>
         <p id="recovery-summary"></p>
@@ -307,6 +308,8 @@ emit_step("workspace create", "completed")</textarea>
           </dl>
         </section>
       </details>
+        </div>
+      </div>
 
     </main>
 
