@@ -1,0 +1,22 @@
+name: tmp-full-ci
+
+on:
+  push:
+    branches:
+      - feature/same-agent-recovery
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group test --group lint
+      - name: Provide PurpleMux preflight stub
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/bin/purplemux"
+          chmod +x "$RUNNER_TEMP/bin/purplemux"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: uv run pytest
+      - run: uv run ruff check .
