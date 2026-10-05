@@ -502,7 +502,7 @@ test("terminal run checked state toggles from detail and list without leaking", 
   });
 
   assert.equal(elements["checked-toggle"].hidden, true);
-  assert.equal(runItem(elements, 1).textContent.includes("unchecked"), true);
+  assert.match(elements["new-run"].className, /selected/);
   assert.equal(
     elements["run-list"].children.filter(
       (item) => item.className.includes("run-check-toggle"),
@@ -516,7 +516,7 @@ test("terminal run checked state toggles from detail and list without leaking", 
   await elements["checked-toggle"].dispatch("click");
   assert.deepEqual(updates, [[1, true]]);
   assert.equal(elements["checked-toggle"].textContent, "Mark unchecked");
-  assert.equal(runItem(elements, 1).textContent.includes("checked"), true);
+  assert.match(runCheckToggle(elements, 1).className, /checked/);
   assert.equal(details[2].checked, false);
 
   const listToggle = elements["run-list"].children.find(
@@ -818,7 +818,7 @@ test("Settings opens Notifications repeatedly without losing form state", async 
   assert.equal(elements["notify-topic"].value, "edited-topic");
 });
 
-test("Runtime is a distinct dominant view and workflow views restore the editor", async () => {
+test("New RUN is the selected navigation state until a saved Run is chosen", async () => {
   const {elements} = await loadApp({
     runs: [],
     details: {},
@@ -827,13 +827,13 @@ test("Runtime is a distinct dominant view and workflow views restore the editor"
 
   assert.equal(elements["issue-driven-fields"].hidden, false);
   assert.equal(elements["workflow-fields"].hidden, true);
-  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
-  assert.match(elements["issue-driven-mode"].className, /primary-view-entry/);
+  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "true");
+  assert.match(elements["issue-driven-mode"].className, /selected/);
   assert.equal(elements["developer-views"].open, false);
-  assert.equal(elements["runtime-panel"].hidden, false);
-  assert.equal(elements.body.classList.contains("runtime-view-active"), true);
-  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
-  assert.match(elements["runtime-view"].className, /selected/);
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
+  assert.match(elements["new-run"].className, /selected/);
+  assert.equal(elements["new-run"].getAttribute("aria-pressed"), "true");
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 
   await elements["workflow-mode"].dispatch("click");
@@ -842,29 +842,30 @@ test("Runtime is a distinct dominant view and workflow views restore the editor"
   assert.equal(elements["developer-views"].open, true);
   assert.equal(elements["runtime-panel"].hidden, true);
   assert.equal(elements.body.classList.contains("runtime-view-active"), false);
-  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "false");
 });
 
-test("selected-run refresh keeps Runtime as the only selected primary view", async () => {
+test("selecting a Run switches the main workspace to that Run runtime", async () => {
   const run = snapshot({
     runId: 1,
     state: "running",
     stdout: "working",
     mode: "issue-driven",
   });
-  const {elements, refresh} = await loadApp({
+  const {elements} = await loadApp({
     runs: [{runId: 1, state: "running", mode: "issue-driven"}],
     details: {1: run},
     validation: {status: 200, body: {validation: []}},
+    selectLatest: false,
   });
 
-  await elements["runtime-view"].dispatch("click");
-  await refresh();
+  assert.match(elements["new-run"].className, /selected/);
+  await runItem(elements, 1).dispatch("click");
 
-  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
-  assert.match(elements["runtime-view"].className, /selected/);
-  assert.equal(elements["issue-driven-mode"].getAttribute("aria-pressed"), "false");
-  assert.doesNotMatch(elements["issue-driven-mode"].className, /selected/);
+  assert.equal(selectedRun(elements).dataset.runId, "1");
+  assert.doesNotMatch(elements["new-run"].className, /selected/);
+  assert.equal(elements["new-run"].getAttribute("aria-pressed"), "false");
+  assert.equal(elements["runtime-panel"].hidden, false);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), true);
   assert.equal(elements.body.classList.contains("runtime-run-selected"), true);
 });
 
@@ -922,9 +923,10 @@ test("saved run history stays unselected across startup reconciliation", async (
   assert.equal(elements["issue-driven-fields"].hidden, false);
   assert.equal(elements["workflow-fields"].hidden, true);
   assert.equal(elements["developer-views"].open, false);
-  assert.equal(elements["runtime-panel"].hidden, false);
-  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "true");
-  assert.equal(elements.body.classList.contains("runtime-view-active"), true);
+  assert.equal(elements["runtime-panel"].hidden, true);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
+  assert.match(elements["new-run"].className, /selected/);
+  assert.equal(elements["new-run"].getAttribute("aria-pressed"), "true");
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
   assert.equal(calls.some(([url]) => url === "/api/runs/2"), false);
   assert.ok(runItem(elements, 1));
@@ -2011,7 +2013,7 @@ test("Prompt history restores Prompt fields without exposing generated Python", 
   assert.equal(elements["prompt-agent"].value, "codex");
   assert.equal(elements["prompt-cwd"].value, prompt.cwd);
   assert.equal(elements["prompt-text"].value, prompt.prompt);
-  assert.match(selectedRun(elements).textContent, /Prompt.*selected\/project/);
+  assert.match(selectedRun(elements).textContent, /Prompt[\s\S]*selected\/project/);
   assert.equal(elements.code.value.includes("PurpleMuxRuntime"), false);
   assert.equal(elements["repository-navigation"].hidden, true);
 });
