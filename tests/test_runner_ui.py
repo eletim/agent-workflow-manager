@@ -137,27 +137,29 @@ def test_review_editor_keeps_generated_python_read_only() -> None:
     assert 'id="review-result-panel"' in html
 
 
-def test_runtime_is_primary_and_developer_views_remain_linked() -> None:
+def test_run_sidebar_is_primary_navigation_and_new_run_owns_the_editor() -> None:
     html = INDEX.read_text(encoding="utf-8")
-    runtime_ancestors = _ancestors("runtime-view")
+    new_run_ancestors = _ancestors("new-run")
+    run_list_ancestors = _ancestors("run-list")
 
-    assert '<body class="runtime-view-active">' in html
-    assert (
-        'id="issue-driven-mode" class="primary-view-entry issue-driven-entry" '
-        'type="button" aria-pressed="false"' in html
+    assert "<body>" in html
+    assert any(
+        tag == "aside" and attributes.get("class") == "run-sidebar"
+        for tag, attributes in new_run_ancestors
     )
     assert any(
-        tag == "div" and attributes.get("class") == "primary-views"
-        for tag, attributes in runtime_ancestors
-    )
-    assert not any(
-        tag == "details" and attributes.get("id") == "developer-views"
-        for tag, attributes in runtime_ancestors
+        tag == "aside" and attributes.get("class") == "run-sidebar"
+        for tag, attributes in run_list_ancestors
     )
     assert (
-        'id="runtime-view" class="primary-view-entry runtime-entry selected" type="button" aria-pressed="true"'
-        in html
+        'id="new-run" class="sidebar-new-run selected" type="button" '
+        'aria-pressed="true">＋ New RUN</button>' in html
     )
+    assert (
+        'id="issue-driven-mode" class="primary-view-entry issue-driven-entry selected" '
+        'type="button" aria-pressed="true"' in html
+    )
+    assert 'id="runtime-view" type="button" hidden aria-pressed="false"' in html
     assert '<div id="issue-driven-fields">' in html
     assert '<div id="workflow-fields" hidden>' in html
     assert '<details id="developer-views" class="developer-views">' in html
@@ -190,27 +192,24 @@ def test_issue_driven_story_is_separate_from_the_runtime_view() -> None:
     )
 
 
-def test_run_history_is_collapsible_without_a_duplicate_mobile_view() -> None:
+def test_run_history_is_persistent_in_the_sidebar() -> None:
     ancestors = _ancestors("run-list")
 
     assert any(
+        tag == "aside" and attributes.get("class") == "run-sidebar"
+        for tag, attributes in ancestors
+    )
+    assert not any(
         tag == "section" and attributes.get("id") == "runtime-panel"
         for tag, attributes in ancestors
     )
-    assert any(
-        tag == "details"
-        and attributes.get("id") == "runs-panel"
-        and "open" in attributes
-        for tag, attributes in ancestors
-    )
-    assert "runs-toggle-hint" in INDEX.read_text(encoding="utf-8")
 
 
-def test_checked_run_deletion_is_available_inside_run_history() -> None:
+def test_checked_run_deletion_is_available_inside_run_sidebar() -> None:
     ancestors = _ancestors("delete-checked-runs")
 
     assert any(
-        tag == "details" and attributes.get("id") == "runs-panel"
+        tag == "aside" and attributes.get("class") == "run-sidebar"
         for tag, attributes in ancestors
     )
     assert 'id="delete-checked-runs"' in INDEX.read_text(encoding="utf-8")
@@ -221,6 +220,8 @@ def test_mobile_styles_keep_primary_surfaces_inside_the_viewport() -> None:
 
     assert "@media (max-width: 760px)" in styles
     assert "overflow-x: clip" in styles
+    assert ".app-shell" in styles and "grid-template-columns: 1fr" in styles
+    assert ".run-sidebar" in styles and "max-height: 38dvh" in styles
     assert ".mode-switch" in styles and "repeat(2, minmax(0, 1fr))" in styles
     assert ".controls" in styles and "repeat(2, minmax(0, 1fr))" in styles
     assert ".output-panel { min-width: 0; }" in styles
