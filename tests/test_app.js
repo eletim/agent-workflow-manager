@@ -887,19 +887,31 @@ test("New run leaves Runtime and restores the current workflow draft", async () 
   assert.match(elements["active-context"].textContent, /New Issue Driven run/);
 });
 
-test("Diagnostics leaves Runtime while preserving its existing navigation", async () => {
+test("Diagnostics preserves the current sidebar selection", async () => {
+  const run = snapshot({
+    runId: 1,
+    state: "success",
+    stdout: "done",
+    mode: "workflow",
+  });
   const {elements} = await loadApp({
-    runs: [],
-    details: {},
+    runs: [{runId: 1, state: "success", mode: "workflow"}],
+    details: {1: run},
     validation: {status: 200, body: {validation: []}},
   });
 
-  await elements["runtime-view"].dispatch("click");
+  assert.equal(selectedRun(elements).dataset.runId, "1");
+  assert.equal(elements["runtime-panel"].hidden, false);
   await elements["diagnostics-view"].dispatch("click");
+  assert.equal(selectedRun(elements).dataset.runId, "1");
+  assert.equal(elements["runtime-panel"].hidden, false);
+  assert.equal(elements.body.classList.contains("runtime-view-active"), true);
 
+  await elements["new-run"].dispatch("click");
+  await elements["diagnostics-view"].dispatch("click");
+  assert.equal(selectedRun(elements), undefined);
+  assert.match(elements["new-run"].className, /selected/);
   assert.equal(elements["runtime-panel"].hidden, true);
-  assert.equal(elements.body.classList.contains("runtime-view-active"), false);
-  assert.equal(elements["runtime-view"].getAttribute("aria-pressed"), "false");
 });
 
 test("saved run history stays unselected across startup reconciliation", async () => {
