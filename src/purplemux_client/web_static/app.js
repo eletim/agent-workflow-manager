@@ -2597,7 +2597,9 @@ runtimeView.addEventListener("click", () => {
   if (activeRunId !== null) showRuntimeView(true);
 });
 
-diagnosticsView.addEventListener("click", () => showRuntimeView(false));
+diagnosticsView.addEventListener("click", () => {
+  // Diagnostics is an in-page destination; Run/New RUN selection remains authoritative.
+});
 
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
