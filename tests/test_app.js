@@ -502,7 +502,8 @@ test("terminal run checked state toggles from detail and list without leaking", 
   });
 
   assert.equal(elements["checked-toggle"].hidden, true);
-  assert.match(elements["new-run"].className, /selected/);
+  assert.equal(selectedRun(elements).dataset.runId, "2");
+  assert.doesNotMatch(elements["new-run"].className, /selected/);
   assert.equal(
     elements["run-list"].children.filter(
       (item) => item.className.includes("run-check-toggle"),
