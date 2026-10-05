@@ -9,6 +9,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from purplemux_client.prompt import PromptExecution
 from purplemux_client.runner import PythonRunner
 from purplemux_client.web import RunnerHTTPServer
 
@@ -52,6 +53,99 @@ def insecure_browser_server() -> Iterator[tuple[str, PythonRunner]]:
     thread.join()
 
 
+def test_runtime_selected_run_retains_mode_detail(tmp_path) -> None:
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if chrome is None:
+        pytest.skip("Chrome or Chromium is required for the HTTP browser smoke test")
+
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    server = None
+    thread = None
+    driver = None
+    try:
+        workflow_code = 'print("WORKFLOW_DETAIL")'
+        issue_code = 'print("ISSUE_DETAIL")'
+        issue_json = '{"mode":"issue-driven","repository":"acme/project"}'
+        prompt_text = "Retain this exact selected-run prompt."
+        run_ids = {
+            "workflow": runner.start(workflow_code),
+            "issue": runner.start(issue_code, issue_driven_json=issue_json),
+            "prompt": runner.start(
+                'print("PROMPT_DETAIL")',
+                prompt=PromptExecution("codex", str(tmp_path), prompt_text),
+            ),
+        }
+        deadline = time.monotonic() + 5
+        while (
+            any(
+                runner.snapshot(run_id).state == "running"
+                for run_id in run_ids.values()
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert all(
+            runner.snapshot(run_id).state == "success" for run_id in run_ids.values()
+        )
+
+        server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        options = Options()
+        options.binary_location = chrome
+        for argument in (
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-proxy-server",
+        ):
+            options.add_argument(argument)
+        driver = webdriver.Chrome(options=options)
+        driver.get(f"http://127.0.0.1:{server.server_address[1]}/")
+        wait = WebDriverWait(driver, 5)
+        wait.until(
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-mode"
+            ).is_displayed()
+        )
+        driver.find_element(By.ID, "runtime-view").click()
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "run-list").is_displayed()
+        )
+        assert not driver.find_element(By.ID, "issue-driven-fields").is_displayed()
+
+        for run_id, field_id, expected in (
+            (run_ids["prompt"], "prompt-text", prompt_text),
+            (run_ids["issue"], "issue-driven-json", issue_json),
+            (run_ids["issue"], "issue-driven-python", issue_code),
+            (run_ids["workflow"], "code", workflow_code),
+        ):
+            driver.find_element(By.CSS_SELECTOR, f'[data-run-id="{run_id}"]').click()
+            field = wait.until(
+                lambda browser: (
+                    browser.find_element(By.ID, field_id)
+                    if browser.find_element(By.ID, field_id).is_displayed()
+                    else False
+                )
+            )
+            assert field.get_attribute("value") == expected
+            assert field.get_attribute("readonly") is not None
+            assert (
+                driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+                == "true"
+            )
+    finally:
+        if driver is not None:
+            driver.quit()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join()
+        runner.close()
+
+
 def test_copy_actions_on_insecure_http_origin(
     insecure_browser_server: tuple[str, PythonRunner],
 ) -> None:
@@ -80,9 +174,6 @@ def test_copy_actions_on_insecure_http_origin(
                 By.ID, "issue-driven-mode"
             ).is_displayed()
         )
-        developer_views = driver.find_element(By.ID, "developer-views")
-        if developer_views.get_attribute("open") is None:
-            driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
         driver.find_element(By.ID, "runtime-view").click()
         wait.until(
             lambda browser: browser.find_element(
@@ -200,14 +291,11 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
             )
 
         assert page_fits_viewport(driver)
-        assert driver.find_element(By.ID, "issue-driven-fields").is_displayed()
+        assert not driver.find_element(By.ID, "issue-driven-fields").is_displayed()
         assert not driver.find_element(By.ID, "workflow-fields").is_displayed()
         for control_id in (
             "new-run",
             "issue-driven-mode",
-            "validate",
-            "dry-run",
-            "run",
             "stop",
             "cleanup",
             "settings-open",
@@ -216,34 +304,79 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         assert driver.find_element(By.ID, "diagnostics-panel").is_displayed()
 
         runtime_panel = driver.find_element(By.ID, "runtime-panel")
-        assert runtime_panel.get_attribute("open") is None
-        assert not runtime_panel.is_displayed()
+        assert runtime_panel.is_displayed()
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "true"
+        )
+        assert (
+            driver.find_element(By.ID, "issue-driven-mode").get_attribute(
+                "aria-pressed"
+            )
+            == "false"
+        )
         developer_views = driver.find_element(By.ID, "developer-views")
-        if developer_views.get_attribute("open") is None:
-            driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
-        assert driver.find_element(By.ID, "prompt-mode").is_displayed()
-        assert driver.find_element(By.ID, "workflow-mode").is_displayed()
+        assert developer_views.get_attribute("open") is None
+
+        driver.find_element(By.ID, "issue-driven-mode").click()
+        wait.until(
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-fields"
+            ).is_displayed()
+        )
+        for control_id in ("validate", "dry-run", "run"):
+            assert driver.find_element(By.ID, control_id).is_displayed()
+        issue_driven_json = driver.find_element(By.ID, "issue-driven-json")
+        issue_driven_json.send_keys(" ")
+        preserved_issue_driven_json = issue_driven_json.get_attribute("value")
+
         driver.find_element(By.ID, "runtime-view").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "run-list").is_displayed()
         )
         assert not driver.find_elements(By.CSS_SELECTOR, "#run-list .run-item.selected")
         assert runtime_panel.is_displayed()
-        assert runtime_panel.get_attribute("open") is not None
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "true"
+        )
+        assert (
+            driver.find_element(By.ID, "issue-driven-mode").get_attribute(
+                "aria-pressed"
+            )
+            == "false"
+        )
+        assert developer_views.get_attribute("open") is None
+        assert driver.find_element(By.ID, "new-run").is_displayed()
 
         runs_panel = driver.find_element(By.ID, "runs-panel")
+        assert runs_panel.is_displayed()
+        assert driver.find_element(By.CSS_SELECTOR, ".runs-title").text == "Runs"
         runs_summary = driver.find_element(By.CSS_SELECTOR, "#runs-panel > summary")
         runs_summary.click()
         assert runs_panel.get_attribute("open") is None
         runs_summary.click()
         assert runs_panel.get_attribute("open") is not None
 
-        driver.find_element(By.ID, "new-run").click()
+        driver.find_element(By.ID, "issue-driven-mode").click()
         wait.until(
-            lambda browser: (
-                browser.find_element(By.ID, "code").get_attribute("readonly") is None
-            )
+            lambda browser: browser.find_element(
+                By.ID, "issue-driven-fields"
+            ).is_displayed()
         )
+        assert issue_driven_json.get_attribute("value") == preserved_issue_driven_json
+        assert (
+            driver.find_element(By.ID, "issue-driven-mode").get_attribute(
+                "aria-pressed"
+            )
+            == "true"
+        )
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "false"
+        )
+
+        driver.find_element(By.ID, "runtime-view").click()
         driver.find_element(By.CSS_SELECTOR, "#run-list .run-item").click()
         wait.until(
             lambda browser: (
@@ -251,13 +384,21 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
                 is not None
             )
         )
+        progress_panel = driver.find_element(By.CSS_SELECTOR, ".progress-panel")
+        assert progress_panel.is_displayed()
+        assert progress_panel.find_element(By.TAG_NAME, "h2").text == "Progress"
+        assert driver.find_element(By.ID, "progress-empty").is_displayed()
+        assert driver.find_element(By.ID, "stdout").text.endswith("HTTP_STDOUT")
+        assert driver.find_element(By.ID, "stderr").text.endswith("HTTP_STDERR")
         driver.find_element(By.ID, "new-run").click()
 
         mobile_workflow = (
             "from purplemux_client import emit_step\n"
+            "import sys\n"
             'WORKFLOW_OUTLINE = ["mobile step"]\n'
             'emit_step("mobile step", "started")\n'
             'print("X" * 4000, flush=True)\n'
+            'print("MOBILE_STDERR", file=sys.stderr, flush=True)\n'
             "import time\n"
             "time.sleep(30)\n"
         )
@@ -270,14 +411,21 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         )
         driver.find_element(By.ID, "run").click()
         wait.until(lambda browser: browser.find_element(By.ID, "stop").is_enabled())
+        driver.find_element(By.ID, "runtime-view").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "outline-panel").is_displayed()
         )
         wait.until(
             lambda browser: len(browser.find_element(By.ID, "stdout").text) >= 4000
         )
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "stderr").text.endswith(
+                "MOBILE_STDERR"
+            )
+        )
         assert driver.find_element(By.ID, "progress").is_displayed()
         assert driver.find_element(By.ID, "stdout").is_displayed()
+        assert driver.find_element(By.ID, "stderr").is_displayed()
         assert page_fits_viewport(driver)
         driver.find_element(By.ID, "stop").click()
         wait.until(lambda browser: not browser.find_element(By.ID, "stop").is_enabled())
@@ -290,6 +438,7 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
 
         driver.set_window_rect(width=1200, height=900)
         wait.until(page_fits_viewport)
+        driver.find_element(By.ID, "runtime-view").click()
         assert driver.find_element(By.ID, "run-list").is_displayed()
         assert driver.find_element(By.ID, "stdout").is_displayed()
     finally:
@@ -382,12 +531,15 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
                 By.ID, "issue-driven-mode"
             ).is_displayed()
         )
-        assert driver.find_element(By.ID, "issue-driven-fields").is_displayed()
+        assert not driver.find_element(By.ID, "issue-driven-fields").is_displayed()
         assert not driver.find_element(By.ID, "workflow-fields").is_displayed()
+        assert driver.find_element(By.ID, "runtime-panel").is_displayed()
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "true"
+        )
         developer_views = driver.find_element(By.ID, "developer-views")
         assert developer_views.get_attribute("open") is None
-        driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
-        driver.find_element(By.ID, "runtime-view").click()
 
         failed_item = wait.until(
             lambda browser: browser.find_element(
@@ -446,8 +598,11 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
         assert (
             driver.find_element(By.ID, "developer-views").get_attribute("open") is None
         )
-        driver.find_element(By.CSS_SELECTOR, "#developer-views > summary").click()
-        driver.find_element(By.ID, "runtime-view").click()
+        assert driver.find_element(By.ID, "runtime-panel").is_displayed()
+        assert (
+            driver.find_element(By.ID, "runtime-view").get_attribute("aria-pressed")
+            == "true"
+        )
         driver.find_element(
             By.CSS_SELECTOR, f'[data-run-id="{recovered_run_id}"]'
         ).click()

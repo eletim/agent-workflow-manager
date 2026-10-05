@@ -171,9 +171,10 @@ A stopped Run may end without a complete readiness JSON result.
 
 ## Issue Driven mode
 
-The UI opens in **Issue Driven**, its primary normal-use entry point. Prompt,
-Environment Setup, Review, Python Workflow, Runtime, and Diagnostics remain
-available under **Developer & detail views**. Issue Driven accepts only a small
+The UI opens in **Runtime**, with **Issue Driven** beside it as the other
+primary view. Prompt, Environment Setup,
+Review, Python Workflow, and Diagnostics remain available under **Developer &
+detail views**. Issue Driven accepts only a small
 JSON configuration, validates it separately from Python, and
 deterministically expands it into the canonical sequential plain-Python workflow.
 The generated Python is visible for inspection and is then passed unchanged to the
@@ -622,10 +623,10 @@ terminal keystrokes.
 
 ## Local Python Runner UI
 
-The trusted local Runner UI opens in **Issue Driven** and keeps **Prompt**,
-**Environment Setup**, **Review**, and **Python Workflow** in its developer/detail
-navigation. Prompt accepts an agent,
-an existing working directory, and one prompt. It generates a single-step plain
+The trusted local Runner UI opens in **Runtime** and keeps **Issue Driven** as a
+primary view beside it. **Prompt**, **Environment Setup**, **Review**, and
+**Python Workflow** remain in its developer/detail navigation. Prompt accepts an
+agent, an existing working directory, and one prompt. It generates a single-step plain
 Python execution that creates a PurpleMux workspace rooted at that exact directory,
 creates the selected provider tab, and observes its structured turn result. Prompt
 resources stay directly available in PurpleMux; they are not registered as
@@ -645,9 +646,10 @@ only if needed to reach a deterministic stopped state. If neither structured
 completion nor tab closure can be confirmed, AWM reports the uncertainty and
 keeps the run non-terminal so events remain accepted and Cleanup stays disabled.
 The Python Workflow developer view keeps Python and its execution controls visible;
-optional arguments are under **Advanced options**. Runtime history and the explicit
-mutating agent-readiness probe remain accessible from **Developer & detail views**;
-the probe itself stays under **Diagnostics** near **Settings**.
+optional arguments are under **Advanced options**. Runtime history remains directly
+accessible from the primary **Runtime** view. The explicit mutating agent-readiness
+probe stays under **Diagnostics**, linked from **Developer & detail views** and near
+**Settings**.
 
 Failed and stopped runs remain available for inspection, including their output
 and run-owned resources, but are never continued in place. Recovery starts a new

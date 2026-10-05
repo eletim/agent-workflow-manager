@@ -8,6 +8,7 @@ const workflowModeButton = document.querySelector("#workflow-mode");
 const developerViews = document.querySelector("#developer-views");
 const runtimeView = document.querySelector("#runtime-view");
 const runtimePanel = document.querySelector("#runtime-panel");
+const diagnosticsView = document.querySelector("#diagnostics-view");
 const promptFields = document.querySelector("#prompt-fields");
 const issueDrivenFields = document.querySelector("#issue-driven-fields");
 const reviewFields = document.querySelector("#review-fields");
@@ -162,6 +163,7 @@ let guideCopyResetTimer = null;
 let outputCopyResetTimer = null;
 let activeRunId = null;
 let currentMode = "issue-driven";
+let runtimeViewActive = true;
 let rawStdout = "";
 let rawStderr = "";
 // `activeRunId === null` is the single source of truth for "drafting a new
@@ -401,6 +403,7 @@ function renderFavicon(runs) {
 // for which mode is active.
 function applyFieldMode() {
   const drafting = activeRunId === null;
+  document.body.classList[drafting ? "remove" : "add"]("runtime-run-selected");
   runArguments.readOnly = !drafting;
   code.readOnly = !drafting;
   promptAgent.disabled = !drafting;
@@ -444,18 +447,34 @@ function applyModeVisibility() {
   recoveryPanel.hidden = promptMode || recoveryPanel.hidden;
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
-  issueDrivenModeButton.className = issueDrivenMode
-    ? "issue-driven-entry selected"
-    : "issue-driven-entry";
   reviewModeButton.className = reviewMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
   if (!issueDrivenMode) developerViews.open = true;
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
-  issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenMode));
   reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
   environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
+  applyPrimaryViewSelection();
+}
+
+function applyPrimaryViewSelection() {
+  const issueDrivenSelected = !runtimeViewActive && currentMode === "issue-driven";
+  issueDrivenModeButton.className = issueDrivenSelected
+    ? "primary-view-entry issue-driven-entry selected"
+    : "primary-view-entry issue-driven-entry";
+  issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenSelected));
+  runtimeView.className = runtimeViewActive
+    ? "primary-view-entry runtime-entry selected"
+    : "primary-view-entry runtime-entry";
+  runtimeView.setAttribute("aria-pressed", String(runtimeViewActive));
+}
+
+function showRuntimeView(show) {
+  runtimeViewActive = show;
+  document.body.classList[show ? "add" : "remove"]("runtime-view-active");
+  runtimePanel.hidden = !show;
+  applyPrimaryViewSelection();
 }
 
 function showDraftLabel() {
@@ -2531,34 +2550,40 @@ runButton.addEventListener("click", async () => {
 });
 
 newRunButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode();
 });
 
 promptModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("prompt");
 });
 
 workflowModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("workflow");
 });
 
 environmentSetupModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("environment-setup");
 });
 
 issueDrivenModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("issue-driven");
 });
 
 reviewModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
   await enterDraftMode("review");
 });
 
 runtimeView.addEventListener("click", () => {
-  runtimePanel.hidden = false;
-  runtimePanel.open = true;
-  runtimePanel.scrollIntoView?.({behavior: "smooth", block: "start"});
+  showRuntimeView(true);
 });
+
+diagnosticsView.addEventListener("click", () => showRuntimeView(false));
 
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
@@ -2823,6 +2848,7 @@ testNotificationButton.addEventListener("click", async () => {
 });
 
 async function initialize() {
+  showRuntimeView(true);
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
