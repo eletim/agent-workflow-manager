@@ -1,0 +1,16 @@
+name: tmp-same-agent-recovery
+
+on:
+  push:
+    branches:
+      - feature/same-agent-recovery
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group test --group lint
+      - run: uv run pytest tests/test_sequential_version_example.py
+      - run: uv run ruff check examples/sequential-version-development.py tests/test_sequential_version_example.py
