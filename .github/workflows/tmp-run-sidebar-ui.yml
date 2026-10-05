@@ -1,0 +1,17 @@
+name: tmp-run-sidebar-ui
+
+on:
+  push:
+    branches:
+      - feature/run-sidebar-navigation
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group test --group lint
+      - run: node --test tests/test_app.js
+      - run: uv run pytest tests/test_runner_ui.py
+      - run: uv run ruff check src/purplemux_client/web_static tests/test_runner_ui.py
