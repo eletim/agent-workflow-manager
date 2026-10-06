@@ -404,6 +404,8 @@ function renderFavicon(runs) {
 function applyFieldMode() {
   const drafting = activeRunId === null;
   document.body.classList[drafting ? "remove" : "add"]("runtime-run-selected");
+  showRuntimeView(!drafting);
+  applyRunNavigationSelection();
   runArguments.readOnly = !drafting;
   code.readOnly = !drafting;
   promptAgent.disabled = !drafting;
@@ -464,10 +466,13 @@ function applyPrimaryViewSelection() {
     ? "primary-view-entry issue-driven-entry selected"
     : "primary-view-entry issue-driven-entry";
   issueDrivenModeButton.setAttribute("aria-pressed", String(issueDrivenSelected));
-  runtimeView.className = runtimeViewActive
-    ? "primary-view-entry runtime-entry selected"
-    : "primary-view-entry runtime-entry";
-  runtimeView.setAttribute("aria-pressed", String(runtimeViewActive));
+  runtimeView.setAttribute("aria-pressed", "false");
+}
+
+function applyRunNavigationSelection() {
+  const drafting = activeRunId === null;
+  newRunButton.classList[drafting ? "add" : "remove"]("selected");
+  newRunButton.setAttribute("aria-pressed", String(drafting));
 }
 
 function showRuntimeView(show) {
@@ -1028,7 +1033,8 @@ function renderRunList(runs, cleanupOwnership = []) {
   for (const run of [...runs].reverse()) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
+    const checkable = ["success", "failed", "stopped"].includes(run.state);
+    button.className = `run-item ${checkable ? "has-check-toggle" : "full-width"} ${run.runId === activeRunId ? "selected" : ""}`;
     const presentation = runPresentation(run);
     button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
@@ -1051,7 +1057,9 @@ function renderRunList(runs, cleanupOwnership = []) {
     const reviewVerdict = run.mode === "review"
       ? `  Review result: ${reviewLabel}`
       : "";
-    button.textContent = `#${run.runId}  ${mode}${resumed}  ${presentation.label}${reviewVerdict}  ${run.checked ? "checked" : "unchecked"}  ${executionRoot}`;
+    const detailParts = [presentation.label];
+    if (reviewVerdict) detailParts.push(reviewVerdict.trim());
+    button.textContent = `#${run.runId}  ${mode}${resumed}\n${detailParts.join(" · ")}\n${executionRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "run-state-marker";
@@ -1063,6 +1071,8 @@ function renderRunList(runs, cleanupOwnership = []) {
       activeRunSnapshot = null;
       activeRunGeneration += 1;
       explicitNewRun = false;
+      showRuntimeView(true);
+      applyRunNavigationSelection();
       await refresh();
     });
     runList.append(button);
@@ -1070,7 +1080,7 @@ function renderRunList(runs, cleanupOwnership = []) {
     family.className = "run-family";
     family.setAttribute("aria-label", `Run #${run.runId} family`);
     renderRunFamily(family, run);
-    if (["success", "failed", "stopped"].includes(run.state)) {
+    if (checkable) {
       const toggle = document.createElement("button");
       toggle.type = "button";
       toggle.className = `run-check-toggle ${run.checked ? "checked" : "unchecked"}`;
@@ -1089,6 +1099,7 @@ function renderRunList(runs, cleanupOwnership = []) {
     }
     if (!family.hidden) runList.append(family);
   }
+  applyRunNavigationSelection();
   for (const ownership of [...cleanupOwnership].reverse()) {
     const description = document.createElement("div");
     description.className = "cleanup-ownership-item";
@@ -1999,6 +2010,8 @@ async function refresh() {
         activeRunSnapshot = null;
         activeRunGeneration += 1;
         selectionGeneration = activeRunGeneration;
+        showRuntimeView(true);
+        applyRunNavigationSelection();
       } else {
         explicitNewRun = true;
         stderr.textContent = "The linked Run is no longer available.";
@@ -2016,6 +2029,8 @@ async function refresh() {
       activeRunSnapshot = null;
       activeRunGeneration += 1;
       selectionGeneration = activeRunGeneration;
+      showRuntimeView(true);
+      applyRunNavigationSelection();
     }
     const targetRunId = activeRunId;
     const selected = runs.find((run) => run.runId === targetRunId);
@@ -2580,10 +2595,12 @@ reviewModeButton.addEventListener("click", async () => {
 });
 
 runtimeView.addEventListener("click", () => {
-  showRuntimeView(true);
+  if (activeRunId !== null) showRuntimeView(true);
 });
 
-diagnosticsView.addEventListener("click", () => showRuntimeView(false));
+diagnosticsView.addEventListener("click", () => {
+  // Diagnostics is an in-page destination; Run/New RUN selection remains authoritative.
+});
 
 validateButton.addEventListener("click", async () => {
   if (activeRunId !== null) return; // validate the draft, never a viewed run's snapshot
@@ -2848,7 +2865,8 @@ testNotificationButton.addEventListener("click", async () => {
 });
 
 async function initialize() {
-  showRuntimeView(true);
+  showRuntimeView(false);
+  applyRunNavigationSelection();
   const response = await fetch("/api/token");
   requestToken = (await response.json()).token;
   const initialStatus = await request("/api/status");
