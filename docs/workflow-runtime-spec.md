@@ -133,7 +133,8 @@ mutation outcome is never retried. The Runner stores the Findings but does not
 interpret the report or schedule retries.
 
 For Issue Driven mode, the UI's Review & Resume action confirms the original
-immutable settings and starts a distinct run. Prompt and custom Python Workflow
+immutable settings, regenerates the Workflow code from those settings using the
+current AWM implementation, and starts a distinct run. Prompt and custom Python Workflow
 recovery is authored as a new run manually. The new workflow uses normal Python inspection of
 authoritative Git, GitHub, and PurpleMux state before deciding whether existing
 external work can be reused. Mutation helpers retain their mutation-once,

@@ -2241,7 +2241,7 @@ class PythonRunner:
                 )
 
     def resume(self, run_id: int) -> int:
-        """Start a new run from one terminal run's immutable settings."""
+        """Start a new run from saved settings using the current Workflow implementation."""
         with self._lock:
             source = self._get_run(run_id)
             if source.state not in ("failed", "stopped"):
@@ -2252,11 +2252,25 @@ class PythonRunner:
                 raise RunResumeNotAllowedError(
                     f"run {run_id} is not an Issue Driven run; only Issue Driven runs can be resumed"
                 )
-            code = source.code
             args = source.args
             issue_driven_json = source.issue_driven_json
-            issue_driven_preview = source.issue_driven_preview
             resumed_from_state = source.state
+
+        from purplemux_client.issue_driven import (
+            IssueDrivenValidationError,
+            generate_issue_driven_workflow,
+            issue_driven_run_preview,
+            parse_issue_driven_json,
+        )
+
+        try:
+            config = parse_issue_driven_json(issue_driven_json)
+        except IssueDrivenValidationError as exc:
+            raise RunResumeNotAllowedError(
+                f"run {run_id} saved Issue Driven settings are not valid for the current AWM"
+            ) from exc
+        code = generate_issue_driven_workflow(config)
+        issue_driven_preview = issue_driven_run_preview(config).as_json()
         return self.start(
             code,
             args=args,

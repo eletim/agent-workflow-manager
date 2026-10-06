@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import socket
@@ -396,7 +397,9 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         driver.quit()
 
 
-def test_issue_driven_story_survives_failure_recovery_and_browser_reload() -> None:
+def test_issue_driven_story_survives_failure_recovery_and_browser_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     chrome = shutil.which("google-chrome") or shutil.which("chromium")
     if chrome is None:
         pytest.skip("Chrome or Chromium is required for the HTTP browser smoke test")
@@ -427,7 +430,19 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
             }
         ],
     }
-    issue_driven_json = '{"mode":"issue-driven","one_shot_issue":322}'
+    issue_driven_json = json.dumps(
+        {
+            "mode": "issue-driven",
+            "repository": "/work/project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "one_shot_issue": 322,
+            "max_reviews": 4,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
     runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
     server = None
     thread = None
@@ -446,6 +461,10 @@ raise RuntimeError("workflow failed after the authoritative turn failure")
             time.sleep(0.02)
         assert runner.snapshot(failed_run_id).state == "failed"
 
+        monkeypatch.setattr(
+            "purplemux_client.issue_driven.generate_issue_driven_workflow",
+            lambda _config: workflow,
+        )
         recovered_run_id = runner.resume(failed_run_id)
         deadline = time.monotonic() + 5
         while (

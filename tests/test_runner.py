@@ -45,6 +45,7 @@ from purplemux_client.runner import (
     RunnerClosedError,
     RunnerSnapshot,
     RunResource,
+    RunResumeNotAllowedError,
     TopologyFinding,
 )
 from purplemux_client.web import (
@@ -680,8 +681,9 @@ def test_environment_setup_history_restores_declaration_and_result(
         restored.close()
 
 
-def test_resume_reuses_immutable_settings_and_persists_run_relationship(
+def test_resume_regenerates_current_workflow_from_saved_settings(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     history_file = tmp_path / "run-history.json"
     runner = PythonRunner(
@@ -713,14 +715,26 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
             }
         ],
     }
+    current_code = (
+        "import sys; print('current-workflow:' + sys.argv[1]); raise SystemExit(7)"
+    )
     try:
         first_id = runner.start(
-            "import sys; print(sys.argv[1]); raise SystemExit(7)",
+            "import sys; print('old-workflow:' + sys.argv[1]); raise SystemExit(7)",
             args=("same-argument",),
             issue_driven_json=source,
             issue_driven_preview=preview,
         )
         wait_for(runner, lambda item: item.state == "failed", run_id=first_id)
+        old_code = runner.snapshot(first_id).code
+
+        monkeypatch.setattr(
+            "purplemux_client.issue_driven.generate_issue_driven_workflow",
+            lambda _config: current_code,
+        )
+        current_preview = issue_driven_run_preview(
+            parse_issue_driven_json(source)
+        ).as_json()
 
         resumed_id = runner.resume(first_id)
         resumed = wait_for(
@@ -728,14 +742,15 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         )
 
         assert resumed_id == first_id + 1
-        assert resumed.code == runner.snapshot(first_id).code
+        assert resumed.code == current_code
+        assert resumed.code != old_code
         assert resumed.args == ("same-argument",)
         assert resumed.issue_driven_json == source
-        assert resumed.issue_driven_preview == preview
+        assert resumed.issue_driven_preview == current_preview
         assert resumed.resumed_from_run_id == first_id
         assert resumed.resumed_from_state == "failed"
         assert resumed.as_json()["mode"] == "issue-driven"
-        assert resumed.as_json()["runPreview"] == preview
+        assert resumed.as_json()["runPreview"] == current_preview
         assert resumed.as_json()["recoverySource"] == {
             "runId": first_id,
             "identity": runner.snapshot(first_id).identity,
@@ -768,16 +783,58 @@ def test_resume_reuses_immutable_settings_and_persists_run_relationship(
         restored.close()
 
 
-def test_legacy_resume_keeps_source_identity_when_source_history_was_deleted(
+def test_resume_rejects_saved_issue_driven_settings_invalid_for_current_awm(
     tmp_path: Path,
 ) -> None:
+    runner = PythonRunner(
+        managed_workflows=False,
+        stop_timeout=0.5,
+        run_history_file=tmp_path / "run-history.json",
+    )
+    try:
+        source_id = runner.start(
+            "raise SystemExit(7)",
+            issue_driven_json='{"mode":"issue-driven"}',
+        )
+        wait_for(runner, lambda item: item.state == "failed", run_id=source_id)
+
+        with pytest.raises(
+            RunResumeNotAllowedError,
+            match="saved Issue Driven settings are not valid for the current AWM",
+        ):
+            runner.resume(source_id)
+    finally:
+        runner.close()
+
+
+def test_legacy_resume_keeps_source_identity_when_source_history_was_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     history_file = tmp_path / "run-history.json"
+    source = json.dumps(
+        {
+            "mode": "issue-driven",
+            "repository": "/work/project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "one_shot_issue": 196,
+            "max_reviews": 4,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
     runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
     try:
         source_id = runner.start(
-            "raise SystemExit(7)", issue_driven_json='{"mode":"issue-driven"}'
+            "raise SystemExit(7)", issue_driven_json=source
         )
         wait_for(runner, lambda item: item.state == "failed", run_id=source_id)
+        monkeypatch.setattr(
+            "purplemux_client.issue_driven.generate_issue_driven_workflow",
+            lambda _config: "raise SystemExit(7)",
+        )
         resumed_id = runner.resume(source_id)
         wait_for(runner, lambda item: item.state == "failed", run_id=resumed_id)
     finally:
