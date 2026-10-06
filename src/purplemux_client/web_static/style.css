@@ -25,7 +25,7 @@ h2, label { font-size: 14px; font-weight: 650; }
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(250px, 320px) minmax(0, 1fr);
+  grid-template-columns: minmax(340px, 360px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -744,7 +744,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 #settings-message.success-message { color: #75e2a8; }
 
 @media (max-width: 900px) {
-  .app-shell { grid-template-columns: 240px minmax(0, 1fr); }
+  .app-shell { grid-template-columns: 320px minmax(0, 1fr); }
   .workspace-toolbar { align-items: stretch; flex-direction: column; }
   .workspace-toolbar .controls { flex-wrap: wrap; }
 }
