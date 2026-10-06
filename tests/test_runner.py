@@ -809,14 +809,32 @@ def test_resume_rejects_saved_issue_driven_settings_invalid_for_current_awm(
 
 def test_legacy_resume_keeps_source_identity_when_source_history_was_deleted(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     history_file = tmp_path / "run-history.json"
+    source = json.dumps(
+        {
+            "mode": "issue-driven",
+            "repository": "/work/project",
+            "integration_branch": "dev/v1",
+            "final_branch": "main",
+            "one_shot_issue": 196,
+            "max_reviews": 4,
+            "merge_to_integration": True,
+            "final_review": True,
+            "merge_final": False,
+        }
+    )
     runner = PythonRunner(managed_workflows=False, run_history_file=history_file)
     try:
         source_id = runner.start(
-            "raise SystemExit(7)", issue_driven_json='{"mode":"issue-driven"}'
+            "raise SystemExit(7)", issue_driven_json=source
         )
         wait_for(runner, lambda item: item.state == "failed", run_id=source_id)
+        monkeypatch.setattr(
+            "purplemux_client.issue_driven.generate_issue_driven_workflow",
+            lambda _config: "raise SystemExit(7)",
+        )
         resumed_id = runner.resume(source_id)
         wait_for(runner, lambda item: item.state == "failed", run_id=resumed_id)
     finally:
