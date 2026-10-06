@@ -380,6 +380,27 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         assert driver.find_element(By.ID, "stdout").is_displayed()
         assert driver.find_element(By.ID, "stderr").is_displayed()
         assert page_fits_viewport(driver)
+
+        driver.set_window_rect(width=900, height=844)
+        wait.until(page_fits_viewport)
+        running_run = wait.until(
+            lambda browser: browser.find_element(
+                By.CSS_SELECTOR, '#run-list .run-item[data-state="running"]'
+            )
+        )
+        sidebar_width = driver.execute_script(
+            "return arguments[0].getBoundingClientRect().width",
+            driver.find_element(By.CSS_SELECTOR, ".run-sidebar"),
+        )
+        running_run_width = driver.execute_script(
+            "return arguments[0].getBoundingClientRect().width",
+            running_run,
+        )
+        assert sidebar_width >= 315
+        assert running_run_width >= 285
+
+        driver.set_window_rect(width=390, height=844)
+        wait.until(page_fits_viewport)
         driver.find_element(By.ID, "stop").click()
         wait.until(lambda browser: not browser.find_element(By.ID, "stop").is_enabled())
 
@@ -392,6 +413,11 @@ def test_runner_is_usable_at_mobile_and_desktop_viewports(
         driver.set_window_rect(width=1200, height=900)
         wait.until(page_fits_viewport)
         assert driver.find_element(By.ID, "run-list").is_displayed()
+        sidebar_width = driver.execute_script(
+            "return arguments[0].getBoundingClientRect().width",
+            driver.find_element(By.CSS_SELECTOR, ".run-sidebar"),
+        )
+        assert sidebar_width >= 355
         assert driver.find_element(By.ID, "stdout").is_displayed()
     finally:
         driver.quit()
