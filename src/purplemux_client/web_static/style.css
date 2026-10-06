@@ -115,7 +115,7 @@ body:not(.runtime-view-active) #exit-code { display: none; }
   overscroll-behavior: contain;
 }
 .run-item {
-  grid-column: 1;
+  grid-column: 1 / -1;
   position: relative;
   width: 100%;
   min-width: 0;
@@ -126,6 +126,7 @@ body:not(.runtime-view-active) #exit-code { display: none; }
   overflow-wrap: anywhere;
   font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+.run-item.has-check-toggle { grid-column: 1; }
 .run-check-toggle {
   grid-column: 2;
   align-self: stretch;

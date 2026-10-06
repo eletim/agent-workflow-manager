@@ -2350,6 +2350,12 @@ test("run rows render independent decorative indicators from textual states", as
       stopped: /■ Stopped/,
     }[run.state]);
   }
+  assert.match(runItem(elements, 1).className, /full-width/);
+  assert.doesNotMatch(runItem(elements, 1).className, /has-check-toggle/);
+  for (const runId of [2, 3, 4]) {
+    assert.match(runItem(elements, runId).className, /has-check-toggle/);
+    assert.doesNotMatch(runItem(elements, runId).className, /full-width/);
+  }
 });
 
 test("structured warning state distinguishes only successful warning runs", async () => {
@@ -2424,6 +2430,8 @@ test("state changes and selection update independently", async () => {
     await waitFor(() => markerState(elements, 1) === state);
 
     assert.ok(runItem(elements, 1).className.includes("selected"));
+    assert.match(runItem(elements, 1).className, /has-check-toggle/);
+    assert.doesNotMatch(runItem(elements, 1).className, /full-width/);
     assert.equal(markerState(elements, 2), "success");
   }
 
