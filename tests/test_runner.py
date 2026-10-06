@@ -42,10 +42,10 @@ from purplemux_client.runner import (
     InvalidExecutionContextError,
     PythonRunner,
     RunCleanupNotAllowedError,
-    RunResumeNotAllowedError,
     RunnerClosedError,
     RunnerSnapshot,
     RunResource,
+    RunResumeNotAllowedError,
     TopologyFinding,
 )
 from purplemux_client.web import (
