@@ -1033,7 +1033,8 @@ function renderRunList(runs, cleanupOwnership = []) {
   for (const run of [...runs].reverse()) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `run-item ${run.runId === activeRunId ? "selected" : ""}`;
+    const checkable = ["success", "failed", "stopped"].includes(run.state);
+    button.className = `run-item ${checkable ? "has-check-toggle" : "full-width"} ${run.runId === activeRunId ? "selected" : ""}`;
     const presentation = runPresentation(run);
     button.dataset.state = presentation.visualState;
     button.dataset.runId = String(run.runId);
@@ -1079,7 +1080,7 @@ function renderRunList(runs, cleanupOwnership = []) {
     family.className = "run-family";
     family.setAttribute("aria-label", `Run #${run.runId} family`);
     renderRunFamily(family, run);
-    if (["success", "failed", "stopped"].includes(run.state)) {
+    if (checkable) {
       const toggle = document.createElement("button");
       toggle.type = "button";
       toggle.className = `run-check-toggle ${run.checked ? "checked" : "unchecked"}`;
