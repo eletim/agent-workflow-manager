@@ -588,6 +588,7 @@ class RunnerSnapshot:
     issue_driven_preview: dict[str, object] | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
+    review_fix_json: str | None = None
     review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     resumed_from_state: Literal["failed", "stopped"] | None = None
@@ -610,12 +611,15 @@ class RunnerSnapshot:
             if self.environment_setup_json is not None
             else "review"
             if self.review_json is not None
+            else "review-fix"
+            if self.review_fix_json is not None
             else "workflow"
         )
         issue_driven_json = payload.pop("issue_driven_json")
         issue_driven_preview = payload.pop("issue_driven_preview")
         environment_setup_json = payload.pop("environment_setup_json")
         review_json = payload.pop("review_json")
+        review_fix_json = payload.pop("review_fix_json")
         review_result = payload.pop("review_result")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
         resumed_from_state = payload.pop("resumed_from_state")
@@ -628,6 +632,8 @@ class RunnerSnapshot:
         if review_json is not None:
             payload["reviewJson"] = review_json
             payload["reviewResult"] = review_result
+        if review_fix_json is not None:
+            payload["reviewFixJson"] = review_fix_json
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
             payload["recoverySource"] = {
@@ -870,6 +876,8 @@ class RunnerSnapshot:
                 if self.environment_setup_json is not None
                 else "review"
                 if self.review_json is not None
+                else "review-fix"
+                if self.review_fix_json is not None
                 else "workflow"
             ),
             "state": self.state,
@@ -1000,11 +1008,13 @@ class _RunRecord:
     issue_driven_preview: dict[str, object] | None = None
     environment_setup_json: str | None = None
     review_json: str | None = None
+    review_fix_json: str | None = None
     review_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
+    stop_with_parent: bool = False
     agent_turns: list[AgentTurnTrace] = field(default_factory=list)
     agent_turn_chunks: dict[str, dict[int, str]] = field(
         default_factory=dict, repr=False
@@ -1249,6 +1259,7 @@ class PythonRunner:
             "issueDrivenPreview": run.issue_driven_preview,
             "environmentSetupJson": run.environment_setup_json,
             "reviewJson": run.review_json,
+            "reviewFixJson": run.review_fix_json,
             "reviewResult": run.review_result,
             "resumedFromRunId": run.resumed_from_run_id,
             "resumedFromState": run.resumed_from_state,
@@ -1351,6 +1362,7 @@ class PythonRunner:
         issue_driven_preview_value = value.get("issueDrivenPreview")
         environment_setup_json = value.get("environmentSetupJson")
         review_json = value.get("reviewJson")
+        review_fix_json = value.get("reviewFixJson")
         review_result = value.get("reviewResult")
         resumed_from_run_id = value.get("resumedFromRunId")
         resumed_from_state = value.get("resumedFromState")
@@ -1377,6 +1389,7 @@ class PythonRunner:
                 and not isinstance(environment_setup_json, str)
             )
             or (review_json is not None and not isinstance(review_json, str))
+            or (review_fix_json is not None and not isinstance(review_fix_json, str))
             or (review_result is not None and review_json is None)
             or (
                 resumed_from_run_id is not None
@@ -1818,6 +1831,7 @@ class PythonRunner:
             issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
+            review_fix_json=review_fix_json,
             review_result=review_result,
             resumed_from_run_id=resumed_from_run_id,
             resumed_from_state=cast(
@@ -2191,11 +2205,15 @@ class PythonRunner:
         issue_driven_preview: Mapping[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
+        review_fix_json: str | None = None,
         resumed_from_run_id: int | None = None,
         resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
+        stop_with_parent: bool = False,
     ) -> int:
+        if stop_with_parent and parent_run_id is None:
+            raise ValueError("stop_with_parent requires a local parent Run")
         if parent_identity is not None:
             self._validate_run_reference(parent_identity)
             if parent_run_id is not None:
@@ -2234,10 +2252,12 @@ class PythonRunner:
                     issue_driven_preview=stored_preview,
                     environment_setup_json=environment_setup_json,
                     review_json=review_json,
+                    review_fix_json=review_fix_json,
                     resumed_from_run_id=resumed_from_run_id,
                     resumed_from_state=resumed_from_state,
                     parent_run_id=parent_run_id,
                     parent_identity=parent_identity,
+                    stop_with_parent=stop_with_parent,
                 )
 
     def resume(self, run_id: int) -> int:
@@ -2293,10 +2313,12 @@ class PythonRunner:
         issue_driven_preview: dict[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
+        review_fix_json: str | None = None,
         resumed_from_run_id: int | None = None,
         resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
+        stop_with_parent: bool = False,
     ) -> int:
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
@@ -2316,10 +2338,12 @@ class PythonRunner:
                 issue_driven_preview=issue_driven_preview,
                 environment_setup_json=environment_setup_json,
                 review_json=review_json,
+                review_fix_json=review_fix_json,
                 resumed_from_run_id=resumed_from_run_id,
                 resumed_from_state=resumed_from_state,
                 parent_run_id=parent_run_id,
                 parent_identity=parent_identity,
+                stop_with_parent=stop_with_parent,
             )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
@@ -2342,8 +2366,10 @@ class PythonRunner:
             issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
+            review_fix_json=review_fix_json,
             resumed_from_run_id=resumed_from_run_id,
             resumed_from_state=resumed_from_state,
+            stop_with_parent=stop_with_parent,
         )
         self._runs[run_id] = run
         try:
@@ -2404,10 +2430,12 @@ class PythonRunner:
                 ),
                 None,
             )
-            if parent is None or parent.state != "running" or parent.stop_requested:
+            if parent is None or parent.state != "running":
                 raise PermissionError("invalid running Workflow credential")
             parent_id = parent.run_id
             operation = payload.get("operation")
+            if parent.stop_requested and operation != "stop":
+                raise PermissionError("invalid running Workflow credential")
             if operation == "review_result":
                 if parent.review_json is None or parent.review_result is not None:
                     raise ValueError("Review result is unavailable for this Run")
@@ -2438,9 +2466,19 @@ class PythonRunner:
                     "stdout": snapshot.stdout,
                     "stderr": snapshot.stderr,
                 }
-            if operation not in {"start", "result"}:
+            local_stop_id = None
+            if target_id is None and operation == "stop":
+                child_id = payload.get("run_id")
+                if isinstance(child_id, bool) or not isinstance(child_id, int):
+                    raise ValueError("invalid child Run ID")
+                child = self._get_run(child_id)
+                if child.parent_run != self._run_identity(parent_id):
+                    raise PermissionError("Run is not a child of this Workflow")
+                local_stop_id = child_id
+            if operation not in {"start", "result", "stop"}:
                 raise ValueError("unknown Workflow control operation")
             code, args = payload.get("code"), payload.get("args", [])
+            stop_with_parent = payload.get("stop_with_parent", False)
             if operation == "start":
                 if not isinstance(code, str) or not code.strip():
                     raise ValueError("code must be a non-empty string")
@@ -2448,10 +2486,25 @@ class PythonRunner:
                     not isinstance(arg, str) for arg in args
                 ):
                     raise ValueError("args must be strings")
+                if not isinstance(stop_with_parent, bool):
+                    raise ValueError("stop_with_parent must be a boolean")
+                if target_id is not None and stop_with_parent:
+                    raise ValueError(
+                        "stop_with_parent is supported only for local child Runs"
+                    )
         if target_id is not None:
             return self._external_child_control(parent, target_id, payload)
+        if local_stop_id is not None:
+            return {"stopped": self.stop(local_stop_id)}
         assert isinstance(code, str)
-        return {"run_id": self.start(code, args=args, parent_run_id=parent_id)}
+        return {
+            "run_id": self.start(
+                code,
+                args=args,
+                parent_run_id=parent_id,
+                stop_with_parent=stop_with_parent,
+            )
+        }
 
     def _external_child_control(
         self, parent: _RunRecord, target_id: str, payload: dict
@@ -2527,10 +2580,12 @@ class PythonRunner:
         issue_driven_preview: dict[str, object] | None = None,
         environment_setup_json: str | None = None,
         review_json: str | None = None,
+        review_fix_json: str | None = None,
         resumed_from_run_id: int | None = None,
         resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
+        stop_with_parent: bool = False,
     ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -2588,8 +2643,10 @@ class PythonRunner:
             issue_driven_preview=issue_driven_preview,
             environment_setup_json=environment_setup_json,
             review_json=review_json,
+            review_fix_json=review_fix_json,
             resumed_from_run_id=resumed_from_run_id,
             resumed_from_state=resumed_from_state,
+            stop_with_parent=stop_with_parent,
         )
         self._runs[run_id] = run
         correlation = self._run_identity(run_id)
@@ -2998,6 +3055,7 @@ class PythonRunner:
             issue_driven_preview=run.issue_driven_preview,
             environment_setup_json=run.environment_setup_json,
             review_json=run.review_json,
+            review_fix_json=run.review_fix_json,
             review_result=run.review_result if run.state == "success" else None,
             resumed_from_run_id=run.resumed_from_run_id,
             resumed_from_state=run.resumed_from_state,
@@ -4911,9 +4969,11 @@ class PythonRunner:
                     )
                 )
                 terminal_state = run.state
+                owned_child_ids = self._owned_running_child_ids_locked(run)
                 self._mark_changed()
                 self._persist_run_history_locked()
 
+            self._stop_owned_children(owned_child_ids)
             self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
         finally:
             with self._lock:
@@ -5004,14 +5064,35 @@ class PythonRunner:
                 )
             )
             terminal_state = run.state
+            owned_child_ids = self._owned_running_child_ids_locked(run)
             self._mark_changed()
             self._persist_run_history_locked()
+        self._stop_owned_children(owned_child_ids)
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
         if run.agent_turn_trace_path is not None:
             run.agent_turn_trace_path.unlink(missing_ok=True)
         self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
+
+    def _owned_running_child_ids_locked(self, parent: _RunRecord) -> tuple[int, ...]:
+        parent_identity = self._run_identity(parent.run_id)
+        return tuple(
+            child.run_id
+            for child in self._runs.values()
+            if child.parent_run == parent_identity
+            and child.stop_with_parent
+            and child.state == "running"
+        )
+
+    def _stop_owned_children(self, child_ids: tuple[int, ...]) -> None:
+        for child_id in child_ids:
+            try:
+                self.stop(child_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not stop parent-owned child Run %d: %s", child_id, exc
+                )
 
     def _read_agent_turn_trace_spool(
         self, run: _RunRecord

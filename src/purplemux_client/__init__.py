@@ -83,6 +83,7 @@ __all__ = [
     "ChildRunResult",
     "get_child_run_result",
     "start_child_run",
+    "stop_child_run",
     "wait_child_run",
     "AgentReadinessProbeResult",
     "CreateSessionRequest",
@@ -148,5 +149,6 @@ from purplemux_client.workflow import (
     ChildRunResult,
     get_child_run_result,
     start_child_run,
+    stop_child_run,
     wait_child_run,
 )

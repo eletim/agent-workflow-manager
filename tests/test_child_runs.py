@@ -143,6 +143,113 @@ time.sleep(60)
         runner.close()
 
 
+def test_stopping_parent_stops_active_child_from_signal_cleanup() -> None:
+    runner = PythonRunner(managed_workflows=False, stop_timeout=2)
+    try:
+        parent_id = runner.start("""
+import signal
+import time
+from purplemux_client import start_child_run, stop_child_run
+
+child_id = start_child_run('import time; time.sleep(60)')
+
+def stop(_signum, _frame):
+    stop_child_run(child_id)
+    raise SystemExit(143)
+
+signal.signal(signal.SIGTERM, stop)
+print(child_id, flush=True)
+while True:
+    time.sleep(1)
+""")
+        deadline = time.monotonic() + 10
+        while not runner.snapshot(parent_id).stdout:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        child_id = int(runner.snapshot(parent_id).child_runs[0].rsplit("-", 1)[1])
+
+        assert runner.stop(parent_id)
+
+        while (
+            runner.snapshot(parent_id).state == "running"
+            or runner.snapshot(child_id).state == "running"
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert runner.snapshot(parent_id).state == "stopped"
+        assert runner.snapshot(child_id).state == "stopped"
+    finally:
+        runner.close()
+
+
+def test_child_start_and_stop_apply_transport_timeout(monkeypatch) -> None:
+    from purplemux_client import workflow
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def control(operation: str, **payload: object) -> dict[str, object]:
+        calls.append((operation, payload))
+        return {"run_id": 7} if operation == "start" else {"stopped": True}
+
+    monkeypatch.setattr(workflow, "_control", control)
+
+    assert workflow.start_child_run("pass", timeout=0.25, stop_with_parent=True) == 7
+    assert workflow.stop_child_run(7, timeout=0.125)
+    assert calls[0][1]["request_timeout"] == pytest.approx(0.25)
+    assert calls[0][1]["stop_with_parent"] is True
+    assert calls[1][1]["request_timeout"] == pytest.approx(0.125)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, float("inf")])
+def test_child_control_rejects_invalid_transport_timeout(timeout) -> None:
+    from purplemux_client import workflow
+
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        workflow.start_child_run("pass", timeout=timeout)
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        workflow.stop_child_run(1, timeout=timeout)
+
+
+def test_timed_out_parent_owned_launch_stops_child_without_result_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = PythonRunner(managed_workflows=False, stop_timeout=0.5)
+    original_control = runner._workflow_control
+
+    def delayed_control(token: str, payload: dict) -> dict:
+        result = original_control(token, payload)
+        if payload.get("operation") == "start":
+            time.sleep(1)
+        return result
+
+    monkeypatch.setattr(runner, "_workflow_control", delayed_control)
+    try:
+        parent_id = runner.start("""
+from purplemux_client import start_child_run
+try:
+    start_child_run(
+        'import time; time.sleep(60)',
+        timeout=0.5,
+        stop_with_parent=True,
+    )
+except TimeoutError:
+    pass
+""")
+        deadline = time.monotonic() + 10
+        while runner.snapshot(parent_id).state == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        parent = runner.snapshot(parent_id)
+        assert parent.state == "success", parent.stderr
+        child_id = int(parent.child_runs[0].rsplit("-", 1)[1])
+        while runner.snapshot(child_id).state == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert runner.snapshot(child_id).state == "stopped"
+    finally:
+        runner.close()
+
+
 def test_child_does_not_execute_when_family_write_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
