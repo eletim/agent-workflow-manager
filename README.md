@@ -123,6 +123,8 @@ passed to a separate managed implementation-agent tab; Python then launches a
 replacement service, re-establishes readiness, launches a fresh Review, and
 repeats until `PASS`, `BLOCKED`, or `max_iterations`. Python owns every branch,
 deadline, retry, child-Run and tab cleanup, and the bounded final JSON result.
+Review child Runs are parent-owned so a lost launch response cannot orphan them,
+and their stop requests receive a bounded cleanup grace period after deadline.
 Each Review receives the readiness URL and managed service workspace/tab
 identity. Each implementation turn must produce a new clean commit whose
 co-author, agent, and `implementation` process trailers pass the canonical

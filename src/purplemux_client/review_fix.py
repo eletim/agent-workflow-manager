@@ -246,6 +246,7 @@ REVIEW_AGENT = {config.review_agent!r}
 IMPLEMENTATION_AGENT = {config.implementation_agent!r}
 COMMIT_AGENT = "claude" if IMPLEMENTATION_AGENT == "claude-code" else IMPLEMENTATION_AGENT
 TIMEOUT = {config.timeout}
+CLEANUP_GRACE_SECONDS = 5
 
 deadline = time.monotonic() + TIMEOUT
 runtime = PurpleMuxRuntime(owned_by_run=True)
@@ -293,7 +294,10 @@ def stop_active_review():
     if active_review_run is None:
         return
     run_id = active_review_run
-    stop_child_run(run_id, timeout=max(0.001, deadline - time.monotonic()))
+    stop_child_run(
+        run_id,
+        timeout=max(CLEANUP_GRACE_SECONDS, deadline - time.monotonic()),
+    )
     active_review_run = None
 
 
@@ -402,7 +406,11 @@ def review(iteration):
         signal.SIG_BLOCK, {{signal.SIGINT, signal.SIGTERM}}
     )
     try:
-        run_id = start_child_run(review_code, timeout=remaining())
+        run_id = start_child_run(
+            review_code,
+            timeout=remaining(),
+            stop_with_parent=True,
+        )
         active_review_run = run_id
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)

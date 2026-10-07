@@ -68,7 +68,7 @@ def test_review_fix_contract_generates_valid_plain_python(repository: Path) -> N
     assert 'WORKFLOW_OUTLINE = ["Start service", "Review Fix"]' in code
     assert "generate_review_workflow(ReviewInput(" in code
     assert "start=service_context" in code
-    assert "start_child_run(review_code, timeout=remaining())" in code
+    assert "stop_with_parent=True" in code
     assert 'if report["verdict"] in ("PASS", "BLOCKED"):' in code
     assert "for iteration in range(1, MAX_ITERATIONS + 1):" in code
     assert "client.close_session(tab)" in code
@@ -303,13 +303,14 @@ def test_generated_review_fix_tracks_child_before_unmasking_stop(
     _install_generated_runtime(monkeypatch, client)
     stopped: list[int] = []
 
-    def start_child(_code: str, *, timeout: float) -> int:
+    def start_child(_code: str, *, timeout: float, stop_with_parent: bool) -> int:
         assert 0 < timeout <= 30
+        assert stop_with_parent
         os.kill(os.getpid(), signal.SIGTERM)
         return 41
 
     def stop_child(run_id: int, *, timeout: float) -> bool:
-        assert timeout > 0
+        assert timeout >= 5
         stopped.append(run_id)
         return True
 
@@ -345,8 +346,9 @@ def test_generated_review_fix_propagates_stop_when_child_cleanup_fails(
     _install_generated_runtime(monkeypatch, client)
     stop_attempts: list[int] = []
 
-    def start_child(_code: str, *, timeout: float) -> int:
+    def start_child(_code: str, *, timeout: float, stop_with_parent: bool) -> int:
         assert timeout > 0
+        assert stop_with_parent
         return 42
 
     def wait_child(_run_id: int, *, timeout: float) -> ChildRunResult:
@@ -355,7 +357,7 @@ def test_generated_review_fix_propagates_stop_when_child_cleanup_fails(
         raise AssertionError("SIGTERM handler did not exit")
 
     def stop_child(run_id: int, *, timeout: float) -> bool:
-        assert timeout > 0
+        assert timeout >= 5
         stop_attempts.append(run_id)
         raise RuntimeError("cleanup unavailable")
 
@@ -561,8 +563,9 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     child_ids: list[int] = []
     review_codes: list[str] = []
 
-    def start_child(code: str, *, timeout: float) -> int:
+    def start_child(code: str, *, timeout: float, stop_with_parent: bool) -> int:
         assert 0 < timeout <= 30
+        assert stop_with_parent
         review_codes.append(code)
         run_id = len(child_ids) + 1
         child_ids.append(run_id)

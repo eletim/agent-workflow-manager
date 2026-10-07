@@ -60,6 +60,7 @@ def start_child_run(
     args: Sequence[str] = (),
     target_id: str | None = None,
     timeout: float | None = None,
+    stop_with_parent: bool = False,
 ) -> int:
     """Start a distinct local or registered external Run, persisting its parent before execution.
 
@@ -69,12 +70,17 @@ def start_child_run(
         raise ValueError("code must be a non-empty string")
     if isinstance(args, str) or any(not isinstance(arg, str) for arg in args):
         raise ValueError("args must be a sequence of strings")
+    if not isinstance(stop_with_parent, bool):
+        raise ValueError("stop_with_parent must be a boolean")
+    if target_id is not None and stop_with_parent:
+        raise ValueError("stop_with_parent is supported only for local child Runs")
     request_timeout = _request_timeout(timeout)
     return _control(
         "start",
         code=code,
         args=list(args),
         target_id=target_id,
+        stop_with_parent=stop_with_parent,
         request_timeout=request_timeout,
     )["run_id"]
 

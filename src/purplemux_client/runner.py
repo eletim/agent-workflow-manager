@@ -1014,6 +1014,7 @@ class _RunRecord:
     resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
     child_runs: tuple[str, ...] = ()
+    stop_with_parent: bool = False
     agent_turns: list[AgentTurnTrace] = field(default_factory=list)
     agent_turn_chunks: dict[str, dict[int, str]] = field(
         default_factory=dict, repr=False
@@ -2209,7 +2210,10 @@ class PythonRunner:
         resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
+        stop_with_parent: bool = False,
     ) -> int:
+        if stop_with_parent and parent_run_id is None:
+            raise ValueError("stop_with_parent requires a local parent Run")
         if parent_identity is not None:
             self._validate_run_reference(parent_identity)
             if parent_run_id is not None:
@@ -2253,6 +2257,7 @@ class PythonRunner:
                     resumed_from_state=resumed_from_state,
                     parent_run_id=parent_run_id,
                     parent_identity=parent_identity,
+                    stop_with_parent=stop_with_parent,
                 )
 
     def resume(self, run_id: int) -> int:
@@ -2313,6 +2318,7 @@ class PythonRunner:
         resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
+        stop_with_parent: bool = False,
     ) -> int:
         if prompt is None and self.managed_workflows:
             if self._event_base_url is None:
@@ -2337,6 +2343,7 @@ class PythonRunner:
                 resumed_from_state=resumed_from_state,
                 parent_run_id=parent_run_id,
                 parent_identity=parent_identity,
+                stop_with_parent=stop_with_parent,
             )
         run_environment = dict(child_env)
         run_environment[RUN_IDENTITY_ENV] = self._run_identity(run_id)
@@ -2362,6 +2369,7 @@ class PythonRunner:
             review_fix_json=review_fix_json,
             resumed_from_run_id=resumed_from_run_id,
             resumed_from_state=resumed_from_state,
+            stop_with_parent=stop_with_parent,
         )
         self._runs[run_id] = run
         try:
@@ -2470,6 +2478,7 @@ class PythonRunner:
             if operation not in {"start", "result", "stop"}:
                 raise ValueError("unknown Workflow control operation")
             code, args = payload.get("code"), payload.get("args", [])
+            stop_with_parent = payload.get("stop_with_parent", False)
             if operation == "start":
                 if not isinstance(code, str) or not code.strip():
                     raise ValueError("code must be a non-empty string")
@@ -2477,12 +2486,25 @@ class PythonRunner:
                     not isinstance(arg, str) for arg in args
                 ):
                     raise ValueError("args must be strings")
+                if not isinstance(stop_with_parent, bool):
+                    raise ValueError("stop_with_parent must be a boolean")
+                if target_id is not None and stop_with_parent:
+                    raise ValueError(
+                        "stop_with_parent is supported only for local child Runs"
+                    )
         if target_id is not None:
             return self._external_child_control(parent, target_id, payload)
         if local_stop_id is not None:
             return {"stopped": self.stop(local_stop_id)}
         assert isinstance(code, str)
-        return {"run_id": self.start(code, args=args, parent_run_id=parent_id)}
+        return {
+            "run_id": self.start(
+                code,
+                args=args,
+                parent_run_id=parent_id,
+                stop_with_parent=stop_with_parent,
+            )
+        }
 
     def _external_child_control(
         self, parent: _RunRecord, target_id: str, payload: dict
@@ -2563,6 +2585,7 @@ class PythonRunner:
         resumed_from_state: Literal["failed", "stopped"] | None = None,
         parent_run_id: int | None = None,
         parent_identity: str | None = None,
+        stop_with_parent: bool = False,
     ) -> int:
         script = tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", encoding="utf-8", delete=False
@@ -2623,6 +2646,7 @@ class PythonRunner:
             review_fix_json=review_fix_json,
             resumed_from_run_id=resumed_from_run_id,
             resumed_from_state=resumed_from_state,
+            stop_with_parent=stop_with_parent,
         )
         self._runs[run_id] = run
         correlation = self._run_identity(run_id)
@@ -4945,9 +4969,11 @@ class PythonRunner:
                     )
                 )
                 terminal_state = run.state
+                owned_child_ids = self._owned_running_child_ids_locked(run)
                 self._mark_changed()
                 self._persist_run_history_locked()
 
+            self._stop_owned_children(owned_child_ids)
             self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
         finally:
             with self._lock:
@@ -5038,14 +5064,35 @@ class PythonRunner:
                 )
             )
             terminal_state = run.state
+            owned_child_ids = self._owned_running_child_ids_locked(run)
             self._mark_changed()
             self._persist_run_history_locked()
+        self._stop_owned_children(owned_child_ids)
         run.script_path.unlink(missing_ok=True)
         if run.credential_path is not None:
             run.credential_path.unlink(missing_ok=True)
         if run.agent_turn_trace_path is not None:
             run.agent_turn_trace_path.unlink(missing_ok=True)
         self._notify_terminal(run, state=terminal_state, exit_code=exit_code)
+
+    def _owned_running_child_ids_locked(self, parent: _RunRecord) -> tuple[int, ...]:
+        parent_identity = self._run_identity(parent.run_id)
+        return tuple(
+            child.run_id
+            for child in self._runs.values()
+            if child.parent_run == parent_identity
+            and child.stop_with_parent
+            and child.state == "running"
+        )
+
+    def _stop_owned_children(self, child_ids: tuple[int, ...]) -> None:
+        for child_id in child_ids:
+            try:
+                self.stop(child_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not stop parent-owned child Run %d: %s", child_id, exc
+                )
 
     def _read_agent_turn_trace_spool(
         self, run: _RunRecord

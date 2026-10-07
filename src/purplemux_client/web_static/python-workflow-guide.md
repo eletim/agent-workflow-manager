@@ -1421,7 +1421,11 @@ from purplemux_client import (
     wait_child_run,
 )
 
-child_id = start_child_run('print("child work")', timeout=30)
+child_id = start_child_run(
+    'print("child work")',
+    timeout=30,
+    stop_with_parent=True,
+)
 try:
     result = wait_child_run(child_id, timeout=60)
 except BaseException:
@@ -1443,6 +1447,9 @@ when its optional timeout expires without stopping the child. Call
 must not outlive its parent. Stop remains scoped to the selected Run and does
 not implicitly cascade to children. The optional `timeout` on start and stop
 bounds their control request transport; use the workflow's remaining deadline.
+Set `stop_with_parent=True` when a lost or timed-out launch response must not
+orphan the child: the Runner then stops that local child when the parent ends,
+even if the parent never received its Run ID.
 
 Control uses a separate local authenticated endpoint, never progress events.
 Only the running parent may request its children's results. These helpers require
