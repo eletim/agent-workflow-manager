@@ -110,8 +110,8 @@ contract, and the meanings of `PASS`, `FAIL`, and `BLOCKED`.
 
 `POST /api/review-fix/generate` accepts `{"json": "..."}` with a
 `review-fix` declaration. Required fields are `mode`, `repository` (an existing
-local Git repository root), `start` with `command` and an HTTP(S)
-`ready_check` URL, `check`, and `max_iterations` (1–50). Optional
+local GitHub repository root with a supported `origin`), `start` with `command`
+and an HTTP(S) `ready_check` URL, `check`, and `max_iterations` (1–50). Optional
 `review_agent` and `implementation_agent` values are `codex` or `claude-code`;
 `timeout` defaults to 3600 seconds and accepts 1–86400.
 
