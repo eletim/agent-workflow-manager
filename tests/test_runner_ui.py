@@ -137,6 +137,14 @@ def test_review_editor_keeps_generated_python_read_only() -> None:
     assert 'id="review-result-panel"' in html
 
 
+def test_review_fix_editor_keeps_generated_python_read_only() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="review-fix-mode"' in html
+    assert 'id="review-fix-json"' in html
+    assert 'id="review-fix-python" spellcheck="false" readonly' in html
+    assert 'id="review-fix-result-panel"' in html
+
+
 def test_run_sidebar_is_primary_navigation_and_new_run_owns_the_editor() -> None:
     html = INDEX.read_text(encoding="utf-8")
     new_run_ancestors = _ancestors("new-run")
@@ -167,6 +175,7 @@ def test_run_sidebar_is_primary_navigation_and_new_run_owns_the_editor() -> None
         "Prompt",
         "Environment Setup",
         "Review",
+        "Review Fix",
         "Python Workflow",
         "Diagnostics",
     ):

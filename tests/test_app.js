@@ -140,6 +140,7 @@ function snapshot({
   environmentSetupJson = undefined,
   reviewJson = undefined,
   reviewResult = undefined,
+  reviewFixJson = undefined,
   resumedFromRunId = null,
   recoverySource = null,
   runPreview = null,
@@ -188,6 +189,7 @@ function snapshot({
   if (environmentSetupJson !== undefined) result.environmentSetupJson = environmentSetupJson;
   if (reviewJson !== undefined) result.reviewJson = reviewJson;
   if (reviewResult !== undefined) result.reviewResult = reviewResult;
+  if (reviewFixJson !== undefined) result.reviewFixJson = reviewFixJson;
   return result;
 }
 
@@ -256,9 +258,11 @@ async function loadApp({
 }) {
   const ids = [
     "external-target-settings", "external-targets-json", "external-target-message", "external-target-credentials", "save-external-targets",
-    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "workflow-mode", "developer-views", "runtime-view", "runtime-panel", "diagnostics-view", "prompt-fields",
+    "code", "run-arguments", "prompt-mode", "issue-driven-mode", "environment-setup-mode", "review-mode", "review-fix-mode", "workflow-mode", "developer-views", "runtime-view", "runtime-panel", "diagnostics-view", "prompt-fields",
     "review-fields", "review-json", "review-python", "review-generate", "review-success", "review-error",
     "review-result-panel", "review-result-status", "review-result-json",
+    "review-fix-fields", "review-fix-json", "review-fix-python", "review-fix-generate", "review-fix-success", "review-fix-error",
+    "review-fix-result-panel", "review-fix-result-status", "review-fix-result-json",
     "environment-setup-fields", "environment-setup-json", "environment-setup-python",
     "environment-setup-generate", "environment-setup-success", "environment-setup-error",
     "issue-driven-fields", "issue-driven-json", "issue-driven-python", "issue-driven-generate",
@@ -1441,6 +1445,26 @@ test("Review mode opens its dedicated guide", async () => {
   assert.equal(elements["guide-content"].textContent, "review guide");
   assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
     ["/review-guide.md", "GET"],
+  ]);
+});
+
+test("Review Fix mode opens its dedicated guide", async () => {
+  const {elements, calls} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/review-fix-guide.md") return response("review fix guide");
+      return undefined;
+    },
+  });
+
+  await elements["review-fix-mode"].dispatch("click");
+  assert.equal(elements["guide-open"].textContent, "Review Fix Guide");
+  await elements["guide-open"].dispatch("click");
+  assert.equal(elements["guide-title"].textContent, "Review Fix Guide");
+  assert.equal(elements["guide-raw"].href, "/review-fix-guide.md");
+  assert.equal(elements["guide-content"].textContent, "review fix guide");
+  assert.deepEqual(calls.filter(([url]) => url.includes("guide.md")), [
+    ["/review-fix-guide.md", "GET"],
   ]);
 });
 
@@ -4901,4 +4925,162 @@ test("Review generation errors clear stale code and remain visible", async () =>
   assert.equal(elements["review-python"].value, "");
   await elements["review-generate"].dispatch("click");
   assert.equal(elements["review-error"].textContent, "invalid Review JSON");
+});
+
+test("Review Fix generates, checks, submits, and restores its saved result", async () => {
+  const source = JSON.stringify({
+    mode: "review-fix",
+    repository: "/repo",
+    start: {command: "./start-dev.sh", ready_check: "http://127.0.0.1:3000/health"},
+    check: "Use the browser to verify it",
+    max_iterations: 5,
+  });
+  const generatedCode = "print('review-fix')";
+  const report = {
+    verdict: "FAIL",
+    summary: "Still failing after max_iterations",
+    repository: "/repo",
+    iterations: [{iteration: 5, review_run_id: 12, review: {verdict: "FAIL", summary: "Broken"}}],
+  };
+  const running = snapshot({
+    runId: 9, state: "running", stdout: "", mode: "review-fix",
+    code: generatedCode, reviewFixJson: source,
+    progress: [{name: "Review Fix", status: "started"}],
+  });
+  const finished = snapshot({
+    runId: 9, state: "success", stdout: JSON.stringify(report), mode: "review-fix",
+    code: generatedCode, reviewFixJson: source,
+    progress: [
+      {name: "Start service", status: "completed"},
+      {name: "Review Fix", status: "completed"},
+    ],
+  });
+  const submissions = [];
+  const {elements} = await loadApp({
+    runs: [{runId: 9, state: "success", mode: "review-fix"}],
+    details: {9: finished},
+    validation: {body: {}, status: 200},
+    fetchOverride(url, options) {
+      if (url === "/api/review-fix/generate") {
+        submissions.push([url, JSON.parse(options.body)]);
+        return response({generatedCode});
+      }
+      if (url === "/api/validate") {
+        submissions.push([url, JSON.parse(options.body)]);
+        return response({validation: [], outline: ["Start service", "Review Fix"]});
+      }
+      if (url === "/api/dry-run") {
+        submissions.push([url, JSON.parse(options.body)]);
+        return response({validation: [], outline: [], dryRun: {status: "complete", findings: [], nextMutation: null}});
+      }
+      if (url === "/api/run") {
+        submissions.push([url, JSON.parse(options.body)]);
+        return response(running, 202);
+      }
+      return undefined;
+    },
+  });
+
+  await elements["review-fix-mode"].dispatch("click");
+  elements["review-fix-json"].value = source;
+  await elements["review-fix-generate"].dispatch("click");
+  assert.equal(elements["review-fix-python"].value, generatedCode);
+  assert.equal(elements["review-fix-success"].hidden, false);
+  await elements.validate.dispatch("click");
+  await elements["dry-run"].dispatch("click");
+  await elements.run.dispatch("click");
+
+  assert.ok(submissions.some(([url, body]) => url === "/api/validate"
+    && body.code === generatedCode && body.args.length === 0));
+  assert.ok(submissions.some(([url, body]) => url === "/api/dry-run"
+    && body.code === generatedCode && body.args.length === 0));
+  assert.deepEqual(submissions.at(-1), [
+    "/api/run", {code: generatedCode, args: [], reviewFixJson: source},
+  ]);
+  assert.equal(elements["review-fix-json"].value, source);
+  assert.equal(elements["review-fix-json"].readOnly, true);
+  assert.match(selectedRun(elements).textContent, /Review Fix/);
+  assert.equal(elements.progress.children.length, 2);
+  assert.match(elements["review-fix-result-status"].textContent, /Verdict: FAIL/);
+  assert.equal(JSON.parse(elements["review-fix-result-json"].textContent).iterations.length, 1);
+});
+
+test("Review Fix keeps its draft across modes and reports generation errors", async () => {
+  let reject = false;
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url !== "/api/review-fix/generate") return undefined;
+      return reject
+        ? response({error: "invalid Review Fix JSON"}, 422)
+        : response({generatedCode: "# generated"});
+    },
+  });
+  await elements["review-fix-mode"].dispatch("click");
+  elements["review-fix-json"].value = "{\"mode\":\"review-fix\"}";
+  await elements["review-fix-generate"].dispatch("click");
+  await elements["review-mode"].dispatch("click");
+  await elements["review-fix-mode"].dispatch("click");
+  assert.equal(elements["review-fix-json"].value, "{\"mode\":\"review-fix\"}");
+  assert.equal(elements["review-fix-python"].value, "# generated");
+
+  reject = true;
+  await elements["review-fix-json"].dispatch("input");
+  assert.equal(elements["review-fix-python"].value, "");
+  await elements["review-fix-generate"].dispatch("click");
+  assert.equal(elements["review-fix-error"].textContent, "invalid Review Fix JSON");
+});
+
+test("Review Fix edits invalidate pending Validate and Dry Run renders", async () => {
+  const delayedValidation = deferred();
+  const delayedDryRun = deferred();
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/review-fix/generate") {
+        return response({generatedCode: "# generated"});
+      }
+      if (url === "/api/validate") return delayedValidation.promise;
+      if (url === "/api/dry-run") return delayedDryRun.promise;
+      return undefined;
+    },
+  });
+
+  await elements["review-fix-mode"].dispatch("click");
+  elements["review-fix-json"].value = "{\"check\":\"first\"}";
+  const pendingValidation = elements.validate.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["review-fix-json"].value = "{\"check\":\"edited\"}";
+  await elements["review-fix-json"].dispatch("input");
+  delayedValidation.resolve(response({validation: [], outline: ["stale validation"]}));
+  await pendingValidation;
+  assert.equal(elements["outline-panel"].hidden, true);
+
+  const pendingDryRun = elements["dry-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["review-fix-json"].value = "{\"check\":\"edited again\"}";
+  await elements["review-fix-json"].dispatch("input");
+  delayedDryRun.resolve(response({
+    validation: [],
+    outline: ["stale dry run"],
+    dryRun: {status: "complete", findings: [], nextMutation: null},
+  }));
+  await pendingDryRun;
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["dry-run-panel"].hidden, true);
+});
+
+test("terminal Review Fix without valid workflow JSON shows a failure state", async () => {
+  const detail = snapshot({
+    runId: 1, state: "failed", mode: "review-fix", reviewFixJson: "{}",
+    stdout: "startup diagnostics only",
+  });
+  const {elements} = await loadApp({
+    runs: [{runId: 1, state: "failed", mode: "review-fix"}],
+    details: {1: detail}, validation: {body: {}, status: 200},
+  });
+
+  assert.equal(elements["review-fix-result-status"].textContent,
+    "No structured Review Fix result was saved. See stdout and stderr.");
+  assert.equal(elements["review-fix-result-json"].textContent, "");
 });
