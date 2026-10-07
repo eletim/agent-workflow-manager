@@ -16,6 +16,7 @@ from purplemux_client.errors import WorkerFailure
 from purplemux_client.review_fix import (
     generate_review_fix_workflow,
     parse_review_fix_json,
+    serialize_review_fix_result,
 )
 from purplemux_client.runner import PythonRunner
 from purplemux_client.web import RunnerHTTPServer
@@ -105,6 +106,43 @@ def test_review_fix_rejects_invalid_declarations(
         parse_review_fix_json(declaration(repository, **changes))
 
 
+def test_review_fix_result_compacts_worst_case_history() -> None:
+    text = '\\"\n' * 2048
+    report = {
+        "verdict": "FAIL",
+        "summary": text,
+        "findings": [text] * 5,
+        "observed_facts": [text] * 5,
+        "evidence": [text] * 5,
+        "hypotheses": [text] * 5,
+        "observability_gaps": [text] * 5,
+    }
+    result = {
+        "verdict": "FAIL",
+        "summary": "maximum iterations",
+        "repository": "/repo",
+        "readiness": {"url": "http://127.0.0.1:3000", "attempts": 1},
+        "iterations": [
+            {
+                "iteration": iteration,
+                "review_run_id": iteration,
+                "review": report,
+                "implementation": text,
+                "implementation_sha": "a" * 40,
+            }
+            for iteration in range(1, 51)
+        ],
+    }
+
+    payload = serialize_review_fix_result(result)
+    restored = json.loads(payload)
+
+    assert len(payload) <= 999_999
+    assert restored["verdict"] == "FAIL"
+    assert restored["iterations"][-1]["iteration"] == 50
+    assert restored.get("iterations_omitted", 0) > 0
+
+
 def test_review_fix_generation_and_run_binding(
     repository: Path, tmp_path: Path
 ) -> None:
@@ -189,12 +227,16 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     class Client:
         def __init__(self) -> None:
             self.shells = 0
+            self.services = 0
             self.prompts: list[str] = []
             self.closed: list[str] = []
 
-        def start_shell(self, _request: object) -> str:
+        def start_shell(self, request: object) -> str:
             self.shells += 1
-            return "service" if self.shells == 1 else "readiness"
+            if "service" in request.name:
+                self.services += 1
+                return "service-" + str(self.services)
+            return "readiness-" + str(self.shells)
 
         def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
             pass
@@ -303,8 +345,13 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     assert child_ids == [1, 2]
     assert all("http://127.0.0.1:3000/api/health" in code for code in review_codes)
     assert all(
-        "managed PurpleMux workspace workspace, tab service" in code
-        for code in review_codes
+        expected in review_codes[index]
+        for index, expected in enumerate(
+            (
+                "managed PurpleMux workspace workspace, tab service-1",
+                "managed PurpleMux workspace workspace, tab service-2",
+            )
+        )
     )
     assert len(client.prompts) == 2
     assert '"verdict": "FAIL"' in client.prompts[0]
@@ -315,4 +362,6 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     assert "worktree must be clean" in client.prompts[1]
     assert result["iterations"][0]["implementation_sha"] == "b" * 40
     assert "implementation" in client.closed
-    assert "service" in client.closed
+    assert client.services == 2
+    assert "service-1" in client.closed
+    assert "service-2" in client.closed

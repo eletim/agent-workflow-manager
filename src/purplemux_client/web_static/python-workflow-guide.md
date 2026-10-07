@@ -1414,10 +1414,19 @@ A running Python Workflow can start another Workflow on the same Runner and
 sequence it using ordinary Python:
 
 ```python
-from purplemux_client import start_child_run, wait_child_run, get_child_run_result
+from purplemux_client import (
+    get_child_run_result,
+    start_child_run,
+    stop_child_run,
+    wait_child_run,
+)
 
 child_id = start_child_run('print("child work")')
-result = wait_child_run(child_id, timeout=60)
+try:
+    result = wait_child_run(child_id, timeout=60)
+except BaseException:
+    stop_child_run(child_id)
+    raise
 assert result == get_child_run_result(child_id)
 if result.state != "success":
     raise RuntimeError(f"Child {child_id} ended as {result.state}: {result.stderr}")
@@ -1429,8 +1438,10 @@ Progress, Result, Stop, and history handling. `get_child_run_result()` returns
 `None` while running; the immutable `ChildRunResult` contains `run_id`, `state`,
 `exit_code`, `stdout`, and `stderr`. Failed and stopped children return results;
 the parent decides how to handle them. `wait_child_run()` raises `TimeoutError`
-when its optional timeout expires without stopping the child. Stop remains the
-Runner's existing per-Run action; stopping a parent does not cascade to children.
+when its optional timeout expires without stopping the child. Call
+`stop_child_run()` during timeout and interruption cleanup when a local child
+must not outlive its parent. Stop remains scoped to the selected Run and does
+not implicitly cascade to children.
 
 Control uses a separate local authenticated endpoint, never progress events.
 Only the running parent may request its children's results. These helpers require

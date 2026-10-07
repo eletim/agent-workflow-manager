@@ -143,6 +143,45 @@ time.sleep(60)
         runner.close()
 
 
+def test_stopping_parent_stops_active_child_from_signal_cleanup() -> None:
+    runner = PythonRunner(managed_workflows=False, stop_timeout=2)
+    try:
+        parent_id = runner.start("""
+import signal
+import time
+from purplemux_client import start_child_run, stop_child_run
+
+child_id = start_child_run('import time; time.sleep(60)')
+
+def stop(_signum, _frame):
+    stop_child_run(child_id)
+    raise SystemExit(143)
+
+signal.signal(signal.SIGTERM, stop)
+print(child_id, flush=True)
+while True:
+    time.sleep(1)
+""")
+        deadline = time.monotonic() + 10
+        while not runner.snapshot(parent_id).stdout:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        child_id = int(runner.snapshot(parent_id).child_runs[0].rsplit("-", 1)[1])
+
+        assert runner.stop(parent_id)
+
+        while (
+            runner.snapshot(parent_id).state == "running"
+            or runner.snapshot(child_id).state == "running"
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert runner.snapshot(parent_id).state == "stopped"
+        assert runner.snapshot(child_id).state == "stopped"
+    finally:
+        runner.close()
+
+
 def test_child_does_not_execute_when_family_write_fails(
     tmp_path: Path, monkeypatch
 ) -> None:

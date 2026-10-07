@@ -111,3 +111,12 @@ def wait_child_run(
         time.sleep(
             0.05 if deadline is None else max(0, min(0.05, deadline - time.monotonic()))
         )
+
+
+def stop_child_run(run_id: int, *, target_id: str | None = None) -> bool:
+    """Stop one authorized child Run; return False if it is already terminal."""
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+        raise ValueError("run_id must be a positive integer")
+    if target_id is not None:
+        raise ValueError("stopping external child Runs is not supported")
+    return bool(_control("stop", run_id=run_id)["stopped"])

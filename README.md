@@ -119,8 +119,9 @@ The generated plain Python starts the service in a run-owned PurpleMux
 workspace, retries managed readiness probes until the shared deadline, and
 runs the public read-only Review workflow as a child Run. A `FAIL` report is
 passed to a separate managed implementation-agent tab; Python then launches a
-fresh Review and repeats until `PASS`, `BLOCKED`, or `max_iterations`. Python
-owns every branch, deadline, retry, tab cleanup, and the final JSON result.
+replacement service, re-establishes readiness, launches a fresh Review, and
+repeats until `PASS`, `BLOCKED`, or `max_iterations`. Python owns every branch,
+deadline, retry, child-Run and tab cleanup, and the bounded final JSON result.
 Each Review receives the readiness URL and managed service workspace/tab
 identity. Each implementation turn must produce a new clean commit whose
 co-author, agent, and `implementation` process trailers pass the canonical

@@ -2422,10 +2422,12 @@ class PythonRunner:
                 ),
                 None,
             )
-            if parent is None or parent.state != "running" or parent.stop_requested:
+            if parent is None or parent.state != "running":
                 raise PermissionError("invalid running Workflow credential")
             parent_id = parent.run_id
             operation = payload.get("operation")
+            if parent.stop_requested and operation != "stop":
+                raise PermissionError("invalid running Workflow credential")
             if operation == "review_result":
                 if parent.review_json is None or parent.review_result is not None:
                     raise ValueError("Review result is unavailable for this Run")
@@ -2456,7 +2458,16 @@ class PythonRunner:
                     "stdout": snapshot.stdout,
                     "stderr": snapshot.stderr,
                 }
-            if operation not in {"start", "result"}:
+            local_stop_id = None
+            if target_id is None and operation == "stop":
+                child_id = payload.get("run_id")
+                if isinstance(child_id, bool) or not isinstance(child_id, int):
+                    raise ValueError("invalid child Run ID")
+                child = self._get_run(child_id)
+                if child.parent_run != self._run_identity(parent_id):
+                    raise PermissionError("Run is not a child of this Workflow")
+                local_stop_id = child_id
+            if operation not in {"start", "result", "stop"}:
                 raise ValueError("unknown Workflow control operation")
             code, args = payload.get("code"), payload.get("args", [])
             if operation == "start":
@@ -2468,6 +2479,8 @@ class PythonRunner:
                     raise ValueError("args must be strings")
         if target_id is not None:
             return self._external_child_control(parent, target_id, payload)
+        if local_stop_id is not None:
+            return {"stopped": self.stop(local_stop_id)}
         assert isinstance(code, str)
         return {"run_id": self.start(code, args=args, parent_run_id=parent_id)}
 

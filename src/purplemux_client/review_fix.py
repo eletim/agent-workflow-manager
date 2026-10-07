@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -149,17 +150,91 @@ def parse_review_fix_json(source: str) -> ReviewFixInput:
     )
 
 
+def serialize_review_fix_result(result: dict[str, Any]) -> str:
+    """Keep the terminal Review Fix JSON value within stdout retention."""
+    max_chars = 999_999
+    payload = json.dumps(result, ensure_ascii=False)
+    if len(payload) <= max_chars:
+        return payload
+
+    iterations = result.get("iterations", [])
+    for history_limit, array_limit, text_limit in (
+        (50, 5, 2048),
+        (20, 3, 1024),
+        (8, 2, 512),
+        (1, 1, 256),
+    ):
+        candidate: dict[str, Any] = {
+            "verdict": result["verdict"],
+            "summary": str(result.get("summary", ""))[:4096],
+            "repository": result.get("repository"),
+            "iterations": [],
+        }
+        if "readiness" in result:
+            candidate["readiness"] = deepcopy(result["readiness"])
+        if "cleanup_errors" in result:
+            candidate["cleanup_errors"] = [
+                str(item)[:512] for item in result["cleanup_errors"][:20]
+            ]
+        if len(iterations) > history_limit:
+            candidate["iterations_omitted"] = len(iterations) - history_limit
+        for item in iterations[-history_limit:]:
+            compact: dict[str, Any] = {
+                key: item[key]
+                for key in ("iteration", "review_run_id", "implementation_sha")
+                if key in item
+            }
+            review = item.get("review")
+            if isinstance(review, dict):
+                compact_review: dict[str, Any] = {
+                    "verdict": review.get("verdict"),
+                    "summary": str(review.get("summary", ""))[:text_limit],
+                }
+                for name in (
+                    "findings",
+                    "observed_facts",
+                    "evidence",
+                    "hypotheses",
+                    "observability_gaps",
+                ):
+                    if isinstance(review.get(name), list):
+                        compact_review[name] = [
+                            str(value)[:text_limit]
+                            for value in review[name][:array_limit]
+                        ]
+                compact["review"] = compact_review
+            if "implementation" in item:
+                compact["implementation"] = str(item["implementation"])[-text_limit:]
+            if "readiness" in item:
+                compact["readiness"] = deepcopy(item["readiness"])
+            candidate["iterations"].append(compact)
+        payload = json.dumps(candidate, ensure_ascii=False)
+        if len(payload) <= max_chars:
+            return payload
+
+    fallback = {
+        "verdict": result["verdict"],
+        "summary": str(result.get("summary", ""))[:4096],
+        "repository": result.get("repository"),
+        "iterations": [],
+        "iterations_omitted": len(iterations),
+    }
+    return json.dumps(fallback, ensure_ascii=False)
+
+
 def generate_review_fix_workflow(config: ReviewFixInput) -> str:
     """Generate a workflow whose Python owns the complete Review Fix loop."""
     return f"""import json
 import shlex
+import signal
 import sys
 import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, GitRepository, PurpleMuxRuntime, ShellCommandRequest, agent_commit_coauthor, emit_step
 from purplemux_client.errors import MutationOutcomeUnknown, ResultNotReady, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
 from purplemux_client.review import ReviewInput, generate_review_workflow, validate_review_result
-from purplemux_client.workflow import start_child_run, wait_child_run
+from purplemux_client.review_fix import serialize_review_fix_result
+from purplemux_client.workflow import start_child_run, stop_child_run, wait_child_run
 
 WORKFLOW_OUTLINE = ["Start service", "Review Fix"]
 REPOSITORY = {config.repository!r}
@@ -181,6 +256,7 @@ readiness_tabs = []
 iterations = []
 workspace = None
 result = None
+active_review_run = None
 
 
 def remaining():
@@ -201,6 +277,34 @@ def start_service():
     service_tab = client.start_shell(ShellCommandRequest(
         START_COMMAND, REPOSITORY, "Review Fix service", deadline_check=remaining,
     ))
+
+
+def restart_service():
+    global service_tab
+    close_tab(service_tab)
+    service_tab = None
+    start_service()
+    return establish_readiness()
+
+
+def stop_active_review():
+    global active_review_run
+    if active_review_run is None:
+        return
+    run_id = active_review_run
+    stop_child_run(run_id)
+    active_review_run = None
+
+
+def stop_workflow(signum, _frame):
+    try:
+        stop_active_review()
+    except BaseException as exc:
+        raise RuntimeError("active Review child Run could not be stopped: " + str(exc)) from exc
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, stop_workflow)
 
 
 def establish_readiness():
@@ -252,6 +356,7 @@ def establish_readiness():
 
 
 def review(iteration):
+    global active_review_run
     review_timeout = max(1, min(int(remaining()), 86400))
     service_context = (
         "The declared service is already running in managed PurpleMux workspace "
@@ -264,7 +369,18 @@ def review(iteration):
         agent=REVIEW_AGENT, timeout=review_timeout,
     ))
     run_id = start_child_run(review_code)
-    child = wait_child_run(run_id, timeout=remaining())
+    active_review_run = run_id
+    try:
+        child = wait_child_run(run_id, timeout=remaining())
+    except BaseException as exc:
+        try:
+            stop_active_review()
+        except BaseException as stop_error:
+            raise RuntimeError(
+                "Review child Run could not be stopped: " + str(stop_error)
+            ) from exc
+        raise
+    active_review_run = None
     if child.state != "success" or child.exit_code != 0:
         raise RuntimeError("Review child Run failed: " + child.stderr[-4096:])
     try:
@@ -380,6 +496,8 @@ else:
                 }}
                 break
             implement(iteration, report)
+            readiness = restart_service()
+            iterations[-1]["readiness"] = readiness
         emit_step("Review Fix", "completed", workspace=workspace.id)
     except Exception as exc:
         if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
@@ -393,6 +511,11 @@ else:
         emit_step("Review Fix", "completed", workspace=workspace.id)
 finally:
     cleanup_errors = []
+    if active_review_run is not None:
+        try:
+            stop_active_review()
+        except BaseException as exc:
+            cleanup_errors.append("Review child cleanup failed: " + str(exc))
     for cleanup_tab in [implementation_tab, *readiness_tabs, service_tab]:
         if cleanup_tab is None:
             continue
@@ -407,5 +530,5 @@ finally:
             result["verdict"] = "BLOCKED"
             result["summary"] = "Review passed but managed service cleanup was not confirmed"
 
-print(json.dumps(result))
+print(serialize_review_fix_result(result))
 """
