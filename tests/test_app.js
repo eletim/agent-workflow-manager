@@ -5031,6 +5031,45 @@ test("Review Fix keeps its draft across modes and reports generation errors", as
   assert.equal(elements["review-fix-error"].textContent, "invalid Review Fix JSON");
 });
 
+test("Review Fix edits invalidate pending Validate and Dry Run renders", async () => {
+  const delayedValidation = deferred();
+  const delayedDryRun = deferred();
+  const {elements} = await loadApp({
+    runs: [], details: {}, validation: {body: {}, status: 200},
+    fetchOverride(url) {
+      if (url === "/api/review-fix/generate") {
+        return response({generatedCode: "# generated"});
+      }
+      if (url === "/api/validate") return delayedValidation.promise;
+      if (url === "/api/dry-run") return delayedDryRun.promise;
+      return undefined;
+    },
+  });
+
+  await elements["review-fix-mode"].dispatch("click");
+  elements["review-fix-json"].value = "{\"check\":\"first\"}";
+  const pendingValidation = elements.validate.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["review-fix-json"].value = "{\"check\":\"edited\"}";
+  await elements["review-fix-json"].dispatch("input");
+  delayedValidation.resolve(response({validation: [], outline: ["stale validation"]}));
+  await pendingValidation;
+  assert.equal(elements["outline-panel"].hidden, true);
+
+  const pendingDryRun = elements["dry-run"].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  elements["review-fix-json"].value = "{\"check\":\"edited again\"}";
+  await elements["review-fix-json"].dispatch("input");
+  delayedDryRun.resolve(response({
+    validation: [],
+    outline: ["stale dry run"],
+    dryRun: {status: "complete", findings: [], nextMutation: null},
+  }));
+  await pendingDryRun;
+  assert.equal(elements["outline-panel"].hidden, true);
+  assert.equal(elements["dry-run-panel"].hidden, true);
+});
+
 test("terminal Review Fix without valid workflow JSON shows a failure state", async () => {
   const detail = snapshot({
     runId: 1, state: "failed", mode: "review-fix", reviewFixJson: "{}",

@@ -2385,6 +2385,7 @@ reviewFixGenerate.addEventListener("click", async () => {
 
 reviewFixJson.addEventListener("input", () => {
   reviewFixRequestGeneration += 1;
+  validationRequestGeneration += 1;
   reviewFixPython.value = "";
   reviewFixDraft = {json: reviewFixJson.value, code: ""};
   reviewFixSuccess.hidden = true;
