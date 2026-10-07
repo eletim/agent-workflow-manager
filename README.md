@@ -106,6 +106,25 @@ The [Review Guide](src/purplemux_client/web_static/review-guide.md) gives the
 field schema, an example, the read-only browser and `ext-review` observation
 contract, and the meanings of `PASS`, `FAIL`, and `BLOCKED`.
 
+## Review Fix inputs
+
+`POST /api/review-fix/generate` accepts `{"json": "..."}` with a
+`review-fix` declaration. Required fields are `mode`, `repository` (an existing
+local Git repository root), `start` with `command` and an HTTP(S)
+`ready_check` URL, `check`, and `max_iterations` (1–50). Optional
+`review_agent` and `implementation_agent` values are `codex` or `claude-code`;
+`timeout` defaults to 3600 seconds and accepts 1–86400.
+
+The generated plain Python starts the service in a run-owned PurpleMux
+workspace, retries managed readiness probes until the shared deadline, and
+runs the public read-only Review workflow as a child Run. A `FAIL` report is
+passed to a separate managed implementation-agent tab; Python then launches a
+fresh Review and repeats until `PASS`, `BLOCKED`, or `max_iterations`. Python
+owns every branch, deadline, retry, tab cleanup, and the final JSON result.
+Submit the unchanged generated code to `/api/run` with the original declaration
+in `reviewFixJson`; AWM rejects code that does not match the declaration and
+retains the source with Run history.
+
 ## Environment Setup inputs
 
 The UI offers an Environment Setup mode. Enter the declaration, select
