@@ -307,6 +307,23 @@ def stop_workflow(signum, _frame):
 signal.signal(signal.SIGTERM, stop_workflow)
 
 
+def require_service_alive():
+    try:
+        status = client.read_status(service_tab)
+    except WorkerFailure as exc:
+        raise RuntimeError("service state became unavailable: " + str(exc)) from exc
+    if status.get("alive") is True:
+        return
+    if status.get("alive") is False:
+        try:
+            service_result = client.read_shell_result(service_tab)
+            detail = service_result.failure_message("Review Fix service")
+        except (ResultNotReady, WorkerFailure) as exc:
+            detail = str(exc)
+        raise RuntimeError("service exited before readiness: " + detail)
+    raise RuntimeError("service state did not confirm that the start command is alive")
+
+
 def establish_readiness():
     probe = (shlex.quote(sys.executable) + " -c "
              + shlex.quote("import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=5).read(1)")
@@ -324,6 +341,7 @@ def establish_readiness():
             client.wait_for_shell_completion(tab, min(remaining(), 10))
             shell_result = client.read_shell_result(tab)
             if shell_result.exit_code == 0:
+                require_service_alive()
                 close_tab(tab)
                 readiness_tabs.remove(tab)
                 return {{"url": READY_URL, "attempts": attempt}}
@@ -339,17 +357,7 @@ def establish_readiness():
                     readiness_tabs.remove(tab)
                 except BaseException:
                     pass
-        try:
-            status = client.read_status(service_tab)
-        except WorkerFailure as exc:
-            raise RuntimeError("service state became unavailable: " + str(exc)) from exc
-        if status.get("alive") is False:
-            try:
-                service_result = client.read_shell_result(service_tab)
-                detail = service_result.failure_message("Review Fix service")
-            except (ResultNotReady, WorkerFailure) as exc:
-                detail = str(exc)
-            raise RuntimeError("service exited before readiness: " + detail)
+        require_service_alive()
         if deadline - time.monotonic() <= 0:
             raise TimeoutError("service readiness timed out: " + last)
         time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
@@ -368,8 +376,14 @@ def review(iteration):
         (REPOSITORY,), CHECK, start=service_context,
         agent=REVIEW_AGENT, timeout=review_timeout,
     ))
-    run_id = start_child_run(review_code)
-    active_review_run = run_id
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {{signal.SIGINT, signal.SIGTERM}}
+    )
+    try:
+        run_id = start_child_run(review_code)
+        active_review_run = run_id
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     try:
         child = wait_child_run(run_id, timeout=remaining())
     except BaseException as exc:
@@ -466,7 +480,7 @@ try:
     client = runtime.workspace(workspace.id)
     start_service()
     readiness = establish_readiness()
-except BaseException as exc:
+except Exception as exc:
     emit_step("Start service", "failed", error=str(exc))
     if isinstance(exc, (WorkerInterrupted, MutationOutcomeUnknown)):
         raise

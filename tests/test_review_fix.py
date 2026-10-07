@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import signal
 import subprocess
 import threading
 from contextlib import redirect_stdout
@@ -143,6 +145,157 @@ def test_review_fix_result_compacts_worst_case_history() -> None:
     assert restored.get("iterations_omitted", 0) > 0
 
 
+class _GeneratedShellResult:
+    exit_code = 0
+
+    @staticmethod
+    def failure_message(_name: str) -> str:
+        return "service stopped"
+
+
+class _GeneratedClient:
+    def __init__(self, *, service_alive: bool) -> None:
+        self.service_alive = service_alive
+        self.shell_count = 0
+        self.closed: list[str] = []
+
+    def start_shell(self, request: object) -> str:
+        self.shell_count += 1
+        return "service" if "service" in request.name else "readiness"
+
+    def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
+        pass
+
+    def read_shell_result(self, _tab: str) -> _GeneratedShellResult:
+        return _GeneratedShellResult()
+
+    def read_status(self, tab: str) -> dict[str, bool]:
+        assert tab == "service"
+        return {"alive": self.service_alive}
+
+    def close_session(self, tab: str) -> None:
+        self.closed.append(tab)
+
+
+def _install_generated_runtime(
+    monkeypatch: pytest.MonkeyPatch, client: _GeneratedClient
+) -> None:
+    import purplemux_client
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="workspace")
+
+        def workspace(self, workspace_id: str) -> _GeneratedClient:
+            assert workspace_id == "workspace"
+            return client
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
+
+
+def test_generated_review_fix_rejects_stale_endpoint_readiness(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _GeneratedClient(service_alive=False)
+    _install_generated_runtime(monkeypatch, client)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    output = StringIO()
+    try:
+        with redirect_stdout(output):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "BLOCKED"
+    assert "service exited before readiness" in result["summary"]
+    assert "service" in client.closed
+
+
+def test_generated_review_fix_preserves_system_exit_during_startup(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> None:
+            raise SystemExit(143)
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit, match="143"):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+
+def test_generated_review_fix_tracks_child_before_unmasking_stop(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.workflow
+
+    client = _GeneratedClient(service_alive=True)
+    _install_generated_runtime(monkeypatch, client)
+    stopped: list[int] = []
+
+    def start_child(_code: str) -> int:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return 41
+
+    def stop_child(run_id: int) -> bool:
+        stopped.append(run_id)
+        return True
+
+    monkeypatch.setattr(purplemux_client.workflow, "start_child_run", start_child)
+    monkeypatch.setattr(purplemux_client.workflow, "stop_child_run", stop_child)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        with pytest.raises(SystemExit, match="143"):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    assert stopped == [41]
+
+
 def test_review_fix_generation_and_run_binding(
     repository: Path, tmp_path: Path
 ) -> None:
@@ -243,6 +396,9 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
 
         def read_shell_result(self, _tab: str) -> ShellResult:
             return ShellResult()
+
+        def read_status(self, _tab: str) -> dict[str, bool]:
+            return {"alive": True}
 
         def close_session(self, tab: str) -> None:
             self.closed.append(tab)
