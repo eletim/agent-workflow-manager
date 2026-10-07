@@ -283,6 +283,7 @@ def restart_service():
     global service_tab
     close_tab(service_tab)
     service_tab = None
+    require_endpoint_absent()
     start_service()
     return establish_readiness()
 
@@ -292,16 +293,15 @@ def stop_active_review():
     if active_review_run is None:
         return
     run_id = active_review_run
-    stop_child_run(run_id)
+    stop_child_run(run_id, timeout=max(0.001, deadline - time.monotonic()))
     active_review_run = None
 
 
 def stop_workflow(signum, _frame):
     try:
         stop_active_review()
-    except BaseException as exc:
-        raise RuntimeError("active Review child Run could not be stopped: " + str(exc)) from exc
-    raise SystemExit(128 + signum)
+    finally:
+        raise SystemExit(128 + signum)
 
 
 signal.signal(signal.SIGTERM, stop_workflow)
@@ -322,6 +322,28 @@ def require_service_alive():
             detail = str(exc)
         raise RuntimeError("service exited before readiness: " + detail)
     raise RuntimeError("service state did not confirm that the start command is alive")
+
+
+def require_endpoint_absent():
+    probe = (shlex.quote(sys.executable) + " -c "
+             + shlex.quote("import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=5).read(1)")
+             + " " + shlex.quote(READY_URL))
+    tab = client.start_shell(ShellCommandRequest(
+        probe, REPOSITORY, "Review Fix endpoint ownership",
+        deadline_check=remaining, max_output_chars=4096,
+    ))
+    readiness_tabs.append(tab)
+    try:
+        client.wait_for_shell_completion(tab, min(remaining(), 10))
+        shell_result = client.read_shell_result(tab)
+        if shell_result.exit_code == 0:
+            raise RuntimeError(
+                "readiness endpoint responded before the managed service was started"
+            )
+    finally:
+        if tab in readiness_tabs:
+            close_tab(tab)
+            readiness_tabs.remove(tab)
 
 
 def establish_readiness():
@@ -380,7 +402,7 @@ def review(iteration):
         signal.SIG_BLOCK, {{signal.SIGINT, signal.SIGTERM}}
     )
     try:
-        run_id = start_child_run(review_code)
+        run_id = start_child_run(review_code, timeout=remaining())
         active_review_run = run_id
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
@@ -390,6 +412,8 @@ def review(iteration):
         try:
             stop_active_review()
         except BaseException as stop_error:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise exc from stop_error
             raise RuntimeError(
                 "Review child Run could not be stopped: " + str(stop_error)
             ) from exc
@@ -478,6 +502,7 @@ try:
         cwd=REPOSITORY, name="AWM Review Fix", deadline_check=remaining,
     ))
     client = runtime.workspace(workspace.id)
+    require_endpoint_absent()
     start_service()
     readiness = establish_readiness()
 except Exception as exc:

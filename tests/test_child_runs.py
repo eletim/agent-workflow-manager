@@ -182,6 +182,33 @@ while True:
         runner.close()
 
 
+def test_child_start_and_stop_apply_transport_timeout(monkeypatch) -> None:
+    from purplemux_client import workflow
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def control(operation: str, **payload: object) -> dict[str, object]:
+        calls.append((operation, payload))
+        return {"run_id": 7} if operation == "start" else {"stopped": True}
+
+    monkeypatch.setattr(workflow, "_control", control)
+
+    assert workflow.start_child_run("pass", timeout=0.25) == 7
+    assert workflow.stop_child_run(7, timeout=0.125)
+    assert calls[0][1]["request_timeout"] == pytest.approx(0.25)
+    assert calls[1][1]["request_timeout"] == pytest.approx(0.125)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, float("inf")])
+def test_child_control_rejects_invalid_transport_timeout(timeout) -> None:
+    from purplemux_client import workflow
+
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        workflow.start_child_run("pass", timeout=timeout)
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        workflow.stop_child_run(1, timeout=timeout)
+
+
 def test_child_does_not_execute_when_family_write_fails(
     tmp_path: Path, monkeypatch
 ) -> None:

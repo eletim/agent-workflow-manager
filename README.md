@@ -116,8 +116,9 @@ local Git repository root), `start` with `command` and an HTTP(S)
 `timeout` defaults to 3600 seconds and accepts 1–86400.
 
 The generated plain Python starts the service in a run-owned PurpleMux
-workspace, retries managed readiness probes until the shared deadline, and
-runs the public read-only Review workflow as a child Run. A `FAIL` report is
+workspace, first rejects a pre-existing readiness response, retries managed
+readiness probes until the shared deadline, and runs the public read-only
+Review workflow as a child Run. A `FAIL` report is
 passed to a separate managed implementation-agent tab; Python then launches a
 replacement service, re-establishes readiness, launches a fresh Review, and
 repeats until `PASS`, `BLOCKED`, or `max_iterations`. Python owns every branch,

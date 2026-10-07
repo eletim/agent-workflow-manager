@@ -68,7 +68,7 @@ def test_review_fix_contract_generates_valid_plain_python(repository: Path) -> N
     assert 'WORKFLOW_OUTLINE = ["Start service", "Review Fix"]' in code
     assert "generate_review_workflow(ReviewInput(" in code
     assert "start=service_context" in code
-    assert "start_child_run(review_code)" in code
+    assert "start_child_run(review_code, timeout=remaining())" in code
     assert 'if report["verdict"] in ("PASS", "BLOCKED"):' in code
     assert "for iteration in range(1, MAX_ITERATIONS + 1):" in code
     assert "client.close_session(tab)" in code
@@ -146,7 +146,8 @@ def test_review_fix_result_compacts_worst_case_history() -> None:
 
 
 class _GeneratedShellResult:
-    exit_code = 0
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
 
     @staticmethod
     def failure_message(_name: str) -> str:
@@ -154,20 +155,29 @@ class _GeneratedShellResult:
 
 
 class _GeneratedClient:
-    def __init__(self, *, service_alive: bool) -> None:
+    def __init__(self, *, service_alive: bool, endpoint_present: bool = False) -> None:
         self.service_alive = service_alive
+        self.endpoint_present = endpoint_present
         self.shell_count = 0
+        self.service_starts = 0
         self.closed: list[str] = []
 
     def start_shell(self, request: object) -> str:
         self.shell_count += 1
-        return "service" if "service" in request.name else "readiness"
+        if "service" in request.name:
+            self.service_starts += 1
+            return "service"
+        if "ownership" in request.name:
+            return "ownership"
+        return "readiness"
 
     def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
         pass
 
-    def read_shell_result(self, _tab: str) -> _GeneratedShellResult:
-        return _GeneratedShellResult()
+    def read_shell_result(self, tab: str) -> _GeneratedShellResult:
+        return _GeneratedShellResult(
+            0 if tab != "ownership" or self.endpoint_present else 1
+        )
 
     def read_status(self, tab: str) -> dict[str, bool]:
         assert tab == "service"
@@ -225,6 +235,34 @@ def test_generated_review_fix_rejects_stale_endpoint_readiness(
     assert "service" in client.closed
 
 
+def test_generated_review_fix_rejects_preexisting_readiness_endpoint(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _GeneratedClient(service_alive=True, endpoint_present=True)
+    _install_generated_runtime(monkeypatch, client)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    output = StringIO()
+    try:
+        with redirect_stdout(output):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "BLOCKED"
+    assert "responded before the managed service was started" in result["summary"]
+    assert client.service_starts == 0
+
+
 def test_generated_review_fix_preserves_system_exit_during_startup(
     repository: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,11 +303,13 @@ def test_generated_review_fix_tracks_child_before_unmasking_stop(
     _install_generated_runtime(monkeypatch, client)
     stopped: list[int] = []
 
-    def start_child(_code: str) -> int:
+    def start_child(_code: str, *, timeout: float) -> int:
+        assert 0 < timeout <= 30
         os.kill(os.getpid(), signal.SIGTERM)
         return 41
 
-    def stop_child(run_id: int) -> bool:
+    def stop_child(run_id: int, *, timeout: float) -> bool:
+        assert timeout > 0
         stopped.append(run_id)
         return True
 
@@ -294,6 +334,51 @@ def test_generated_review_fix_tracks_child_before_unmasking_stop(
         signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
 
     assert stopped == [41]
+
+
+def test_generated_review_fix_propagates_stop_when_child_cleanup_fails(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.workflow
+
+    client = _GeneratedClient(service_alive=True)
+    _install_generated_runtime(monkeypatch, client)
+    stop_attempts: list[int] = []
+
+    def start_child(_code: str, *, timeout: float) -> int:
+        assert timeout > 0
+        return 42
+
+    def wait_child(_run_id: int, *, timeout: float) -> ChildRunResult:
+        assert timeout > 0
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("SIGTERM handler did not exit")
+
+    def stop_child(run_id: int, *, timeout: float) -> bool:
+        assert timeout > 0
+        stop_attempts.append(run_id)
+        raise RuntimeError("cleanup unavailable")
+
+    monkeypatch.setattr(purplemux_client.workflow, "start_child_run", start_child)
+    monkeypatch.setattr(purplemux_client.workflow, "wait_child_run", wait_child)
+    monkeypatch.setattr(purplemux_client.workflow, "stop_child_run", stop_child)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit, match="143"):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    assert stop_attempts == [42, 42, 42]
 
 
 def test_review_fix_generation_and_run_binding(
@@ -371,7 +456,8 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     import purplemux_client.workflow
 
     class ShellResult:
-        exit_code = 0
+        def __init__(self, exit_code: int = 0) -> None:
+            self.exit_code = exit_code
 
         @staticmethod
         def failure_message(_name: str) -> str:
@@ -389,13 +475,15 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
             if "service" in request.name:
                 self.services += 1
                 return "service-" + str(self.services)
+            if "ownership" in request.name:
+                return "ownership-" + str(self.shells)
             return "readiness-" + str(self.shells)
 
         def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
             pass
 
-        def read_shell_result(self, _tab: str) -> ShellResult:
-            return ShellResult()
+        def read_shell_result(self, tab: str) -> ShellResult:
+            return ShellResult(1 if tab.startswith("ownership-") else 0)
 
         def read_status(self, _tab: str) -> dict[str, bool]:
             return {"alive": True}
@@ -473,7 +561,8 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     child_ids: list[int] = []
     review_codes: list[str] = []
 
-    def start_child(code: str) -> int:
+    def start_child(code: str, *, timeout: float) -> int:
+        assert 0 < timeout <= 30
         review_codes.append(code)
         run_id = len(child_ids) + 1
         child_ids.append(run_id)
