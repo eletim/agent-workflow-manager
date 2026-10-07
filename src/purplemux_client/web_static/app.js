@@ -3,6 +3,7 @@ const runArguments = document.querySelector("#run-arguments");
 const promptModeButton = document.querySelector("#prompt-mode");
 const issueDrivenModeButton = document.querySelector("#issue-driven-mode");
 const reviewModeButton = document.querySelector("#review-mode");
+const reviewFixModeButton = document.querySelector("#review-fix-mode");
 const environmentSetupModeButton = document.querySelector("#environment-setup-mode");
 const workflowModeButton = document.querySelector("#workflow-mode");
 const developerViews = document.querySelector("#developer-views");
@@ -20,6 +21,15 @@ const reviewError = document.querySelector("#review-error");
 const reviewResultPanel = document.querySelector("#review-result-panel");
 const reviewResultStatus = document.querySelector("#review-result-status");
 const reviewResultJson = document.querySelector("#review-result-json");
+const reviewFixFields = document.querySelector("#review-fix-fields");
+const reviewFixJson = document.querySelector("#review-fix-json");
+const reviewFixPython = document.querySelector("#review-fix-python");
+const reviewFixGenerate = document.querySelector("#review-fix-generate");
+const reviewFixSuccess = document.querySelector("#review-fix-success");
+const reviewFixError = document.querySelector("#review-fix-error");
+const reviewFixResultPanel = document.querySelector("#review-fix-result-panel");
+const reviewFixResultStatus = document.querySelector("#review-fix-result-status");
+const reviewFixResultJson = document.querySelector("#review-fix-result-json");
 const environmentSetupFields = document.querySelector("#environment-setup-fields");
 const environmentSetupJson = document.querySelector("#environment-setup-json");
 const environmentSetupPython = document.querySelector("#environment-setup-python");
@@ -182,6 +192,7 @@ let promptDraft = {
 let issueDrivenDraft = {json: issueDrivenJson.value, code: "", preview: null};
 let issueDrivenRunPreview = null;
 let reviewDraft = {json: reviewJson.value, code: ""};
+let reviewFixDraft = {json: reviewFixJson.value, code: ""};
 let environmentSetupDraft = {json: environmentSetupJson.value, code: ""};
 let purpleMuxPort = null;
 let explicitNewRun = false;
@@ -200,6 +211,7 @@ let renderedRefreshGeneration = 0;
 let validationRequestGeneration = 0;
 let issueDrivenRequestGeneration = 0;
 let reviewRequestGeneration = 0;
+let reviewFixRequestGeneration = 0;
 let environmentSetupRequestGeneration = 0;
 let eventRefreshActive = false;
 let eventRefreshPending = false;
@@ -415,6 +427,8 @@ function applyFieldMode() {
   issueDrivenGenerate.disabled = !drafting;
   reviewJson.readOnly = !drafting;
   reviewGenerate.disabled = !drafting;
+  reviewFixJson.readOnly = !drafting;
+  reviewFixGenerate.disabled = !drafting;
   environmentSetupJson.readOnly = !drafting;
   environmentSetupGenerate.disabled = !drafting;
   repositoryConfigAdd.disabled = !drafting;
@@ -430,17 +444,20 @@ function applyModeVisibility() {
   const promptMode = currentMode === "prompt";
   const issueDrivenMode = currentMode === "issue-driven";
   const reviewMode = currentMode === "review";
+  const reviewFixMode = currentMode === "review-fix";
   const environmentSetupMode = currentMode === "environment-setup";
   promptFields.hidden = !promptMode;
   issueDrivenFields.hidden = !issueDrivenMode;
   reviewFields.hidden = !reviewMode;
+  reviewFixFields.hidden = !reviewFixMode;
   environmentSetupFields.hidden = !environmentSetupMode;
-  workflowFields.hidden = promptMode || issueDrivenMode || environmentSetupMode || reviewMode;
+  workflowFields.hidden = promptMode || issueDrivenMode || environmentSetupMode || reviewMode || reviewFixMode;
   validateButton.hidden = promptMode;
   dryRunButton.hidden = promptMode;
   cleanupButton.hidden = promptMode;
   guideOpen.hidden = promptMode;
-  guideOpen.textContent = reviewMode ? "Review Guide"
+  guideOpen.textContent = reviewFixMode ? "Review Fix Guide"
+    : reviewMode ? "Review Guide"
     : issueDrivenMode ? "Issue Driven Guide"
     : environmentSetupMode ? "Environment Setup Guide" : "Workflow Guide";
   validationPanel.hidden = promptMode || validationPanel.hidden;
@@ -450,11 +467,13 @@ function applyModeVisibility() {
   resourcesPanel.hidden = promptMode || resourcesPanel.hidden;
   promptModeButton.className = promptMode ? "selected" : "";
   reviewModeButton.className = reviewMode ? "selected" : "";
+  reviewFixModeButton.className = reviewFixMode ? "selected" : "";
   environmentSetupModeButton.className = environmentSetupMode ? "selected" : "";
   workflowModeButton.className = currentMode === "workflow" ? "selected" : "";
   if (!issueDrivenMode) developerViews.open = true;
   promptModeButton.setAttribute("aria-pressed", String(promptMode));
   reviewModeButton.setAttribute("aria-pressed", String(reviewMode));
+  reviewFixModeButton.setAttribute("aria-pressed", String(reviewFixMode));
   environmentSetupModeButton.setAttribute("aria-pressed", String(environmentSetupMode));
   workflowModeButton.setAttribute("aria-pressed", String(currentMode === "workflow"));
   applyPrimaryViewSelection();
@@ -483,7 +502,7 @@ function showRuntimeView(show) {
 }
 
 function showDraftLabel() {
-  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", review: "Review", workflow: "Python Workflow"}[currentMode];
+  const label = {prompt: "Prompt", "issue-driven": "Issue Driven", "environment-setup": "Environment Setup", review: "Review", "review-fix": "Review Fix", workflow: "Python Workflow"}[currentMode];
   activeContext.textContent = `New ${label} run (draft) — not yet submitted`;
 }
 
@@ -508,6 +527,8 @@ function captureDraftIfEditing() {
       };
     } else if (currentMode === "review") {
       reviewDraft = {json: reviewJson.value, code: reviewPython.value};
+    } else if (currentMode === "review-fix") {
+      reviewFixDraft = {json: reviewFixJson.value, code: reviewFixPython.value};
     } else {
       draft = {args: runArguments.value, code: code.value};
     }
@@ -593,6 +614,9 @@ function renderCleanDraftState() {
   reviewSuccess.hidden = true;
   reviewError.hidden = true;
   reviewResultPanel.hidden = true;
+  reviewFixSuccess.hidden = true;
+  reviewFixError.hidden = true;
+  reviewFixResultPanel.hidden = true;
 }
 
 function runPresentation(run) {
@@ -626,13 +650,34 @@ function renderReviewResult(result) {
   }
 }
 
+function renderReviewFixResult(result) {
+  reviewFixResultPanel.hidden = result.mode !== "review-fix" || result.runId == null;
+  if (reviewFixResultPanel.hidden) return;
+  if (result.state === "running") {
+    reviewFixResultStatus.textContent = "Review Fix in progress. Follow Progress for the current workflow step.";
+    reviewFixResultJson.textContent = "";
+    return;
+  }
+  try {
+    const report = JSON.parse((result.stdout || "").trim());
+    if (report === null || Array.isArray(report) || typeof report !== "object"
+      || !["PASS", "FAIL", "BLOCKED"].includes(report.verdict)
+      || typeof report.summary !== "string") throw new Error("invalid result");
+    reviewFixResultStatus.textContent = `Verdict: ${report.verdict} — ${report.summary}`;
+    reviewFixResultJson.textContent = JSON.stringify(report, null, 2);
+  } catch {
+    reviewFixResultStatus.textContent = "No structured Review Fix result was saved. See stdout and stderr.";
+    reviewFixResultJson.textContent = "";
+  }
+}
+
 function renderRun(result) {
   renderRunFamily(document.querySelector("#run-family"), result);
   if (Number.isInteger(result.purplemuxPort) && result.purplemuxPort > 0) {
     purpleMuxPort = result.purplemuxPort;
   }
   if (result.runId != null) {
-    currentMode = ["prompt", "issue-driven", "environment-setup", "review"].includes(result.mode)
+    currentMode = ["prompt", "issue-driven", "environment-setup", "review", "review-fix"].includes(result.mode)
       ? result.mode
       : "workflow";
   }
@@ -678,6 +723,7 @@ function renderRun(result) {
   renderRepository(result.mode === "prompt" ? result.repository || null : null);
   renderIssueDrivenSummary(result.issueDrivenSummary || null);
   renderReviewResult(result);
+  renderReviewFixResult(result);
   renderRecovery(result);
   renderResources(result);
   renderDryRun(result);
@@ -699,6 +745,9 @@ function renderRun(result) {
     } else if (currentMode === "review") {
       reviewJson.value = result.reviewJson || "";
       reviewPython.value = result.code ?? "";
+    } else if (currentMode === "review-fix") {
+      reviewFixJson.value = result.reviewFixJson || "";
+      reviewFixPython.value = result.code ?? "";
     } else {
       runArguments.value = (result.args || []).join("\n");
       code.value = result.code ?? "";
@@ -708,6 +757,7 @@ function renderRun(result) {
       "issue-driven": "Issue Driven",
       "environment-setup": "Environment Setup",
       review: "Review",
+      "review-fix": "Review Fix",
       workflow: "Workflow",
     }[currentMode];
     const resumeLabel = result.resumedFromRunId == null
@@ -931,6 +981,9 @@ async function enterDraftMode(mode = currentMode) {
     } else if (currentMode === "review") {
       reviewJson.value = reviewDraft.json;
       reviewPython.value = reviewDraft.code;
+    } else if (currentMode === "review-fix") {
+      reviewFixJson.value = reviewFixDraft.json;
+      reviewFixPython.value = reviewFixDraft.code;
     } else {
       runArguments.value = draft.args;
       code.value = draft.code;
@@ -1043,6 +1096,7 @@ function renderRunList(runs, cleanupOwnership = []) {
       "issue-driven": "Issue Driven",
       "environment-setup": "Environment Setup",
       review: "Review",
+      "review-fix": "Review Fix",
       workflow: "Workflow",
     }[run.mode] || "Workflow";
     const executionRoot = run.mode === "prompt"
@@ -1769,6 +1823,13 @@ function renderRepository(repository) {
 }
 
 function selectedGuide() {
+  if (currentMode === "review-fix") {
+    return {
+      key: "review-fix",
+      path: "/review-fix-guide.md",
+      title: "Review Fix Guide",
+    };
+  }
   if (currentMode === "review") {
     return {
       key: "review",
@@ -2251,6 +2312,12 @@ async function generateIssueDrivenCode() {
 }
 
 async function workflowSubmissionPayload(includeSourceSettings = false) {
+  if (currentMode === "review-fix") {
+    const source = reviewFixJson.value;
+    const payload = {code: await generateReviewFixCode(), args: []};
+    if (includeSourceSettings) payload.reviewFixJson = source;
+    return payload;
+  }
   if (currentMode === "review") {
     const source = reviewJson.value;
     const payload = {code: await generateReviewCode(), args: []};
@@ -2274,6 +2341,55 @@ async function workflowSubmissionPayload(includeSourceSettings = false) {
   }
   return {code: code.value, ...executionContextPayload()};
 }
+
+async function generateReviewFixCode() {
+  const requestGeneration = ++reviewFixRequestGeneration;
+  const selectionGeneration = activeRunGeneration;
+  const source = reviewFixJson.value;
+  try {
+    const result = await request("/api/review-fix/generate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({json: source}),
+    });
+    if (requestGeneration === reviewFixRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "review-fix"
+      && reviewFixJson.value === source) {
+      reviewFixPython.value = result.generatedCode;
+      reviewFixDraft = {json: source, code: result.generatedCode};
+      reviewFixSuccess.hidden = false;
+      reviewFixError.hidden = true;
+    }
+    return result.generatedCode;
+  } catch (error) {
+    if (requestGeneration === reviewFixRequestGeneration
+      && selectionGeneration === activeRunGeneration
+      && activeRunId === null && currentMode === "review-fix"
+      && reviewFixJson.value === source) {
+      reviewFixSuccess.hidden = true;
+      reviewFixError.hidden = false;
+      reviewFixError.textContent = error.result?.error || String(error);
+    }
+    throw error;
+  }
+}
+
+reviewFixGenerate.addEventListener("click", async () => {
+  if (activeRunId !== null) return;
+  await withPendingButton(reviewFixGenerate, async () => {
+    try { await generateReviewFixCode(); }
+    catch (error) { if (!error.result?.error) stderr.textContent = String(error); }
+  }, applyFieldMode);
+});
+
+reviewFixJson.addEventListener("input", () => {
+  reviewFixRequestGeneration += 1;
+  reviewFixPython.value = "";
+  reviewFixDraft = {json: reviewFixJson.value, code: ""};
+  reviewFixSuccess.hidden = true;
+  reviewFixError.hidden = true;
+});
 
 async function generateReviewCode() {
   const requestGeneration = ++reviewRequestGeneration;
@@ -2592,6 +2708,11 @@ issueDrivenModeButton.addEventListener("click", async () => {
 reviewModeButton.addEventListener("click", async () => {
   showRuntimeView(false);
   await enterDraftMode("review");
+});
+
+reviewFixModeButton.addEventListener("click", async () => {
+  showRuntimeView(false);
+  await enterDraftMode("review-fix");
 });
 
 runtimeView.addEventListener("click", () => {

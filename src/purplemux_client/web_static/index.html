@@ -66,6 +66,7 @@
               <button id="prompt-mode" type="button" aria-pressed="false">Prompt</button>
               <button id="environment-setup-mode" type="button" aria-pressed="false">Environment Setup</button>
               <button id="review-mode" type="button" aria-pressed="false">Review</button>
+              <button id="review-fix-mode" type="button" aria-pressed="false">Review Fix</button>
               <button id="workflow-mode" type="button" aria-pressed="false">Python Workflow</button>
               <a id="diagnostics-view" href="#diagnostics-panel">Diagnostics</a>
             </div>
@@ -168,6 +169,30 @@
           <textarea id="review-python" spellcheck="false" readonly aria-label="Generated Review workflow"></textarea>
         </div>
 
+        <div id="review-fix-fields" hidden>
+          <label for="review-fix-json">Review Fix JSON</label>
+          <textarea id="review-fix-json" spellcheck="false">{
+  "mode": "review-fix",
+  "repository": "~/DevEnv/project",
+  "start": {
+    "command": "./start-dev.sh",
+    "ready_check": "http://127.0.0.1:3000/api/health"
+  },
+  "check": "Use the browser to verify the feature.",
+  "max_iterations": 5,
+  "review_agent": "codex",
+  "implementation_agent": "codex",
+  "timeout": 3600
+}</textarea>
+          <div class="generated-heading">
+            <label for="review-fix-python">Generated Python (read-only)</label>
+            <button id="review-fix-generate" type="button">Validate JSON &amp; Generate</button>
+          </div>
+          <p id="review-fix-success" class="validation-success" hidden>✓ JSON/schema valid</p>
+          <p id="review-fix-error" class="repository-config-message" hidden></p>
+          <textarea id="review-fix-python" spellcheck="false" readonly aria-label="Generated Review Fix workflow"></textarea>
+        </div>
+
         <div id="workflow-fields" hidden>
           <label for="code">Python</label>
           <textarea id="code" spellcheck="false">from purplemux_client import emit_step
@@ -250,6 +275,12 @@ emit_step("workspace create", "completed")</textarea>
         <h2>Review result</h2>
         <p id="review-result-status"></p>
         <pre id="review-result-json"></pre>
+      </section>
+
+      <section id="review-fix-result-panel" class="panel" aria-live="polite" hidden>
+        <h2>Review Fix result</h2>
+        <p id="review-fix-result-status"></p>
+        <pre id="review-fix-result-json"></pre>
       </section>
 
       <section class="panel progress-panel" aria-live="polite">
