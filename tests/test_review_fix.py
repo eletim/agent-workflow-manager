@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from test_runner import request, wait_for
 
+from purplemux_client.errors import WorkerFailure
 from purplemux_client.review_fix import (
     generate_review_fix_workflow,
     parse_review_fix_json,
@@ -63,10 +64,13 @@ def test_review_fix_contract_generates_valid_plain_python(repository: Path) -> N
     ast.parse(code)
     assert 'WORKFLOW_OUTLINE = ["Start service", "Review Fix"]' in code
     assert "generate_review_workflow(ReviewInput(" in code
+    assert "start=service_context" in code
     assert "start_child_run(review_code)" in code
     assert 'if report["verdict"] in ("PASS", "BLOCKED"):' in code
     assert "for iteration in range(1, MAX_ITERATIONS + 1):" in code
     assert "client.close_session(tab)" in code
+    assert "repo.require_committed_result(" in code
+    assert 'expected_process="implementation"' in code
     runner = PythonRunner(managed_workflows=False)
     try:
         assert runner.validate(code).valid
@@ -217,6 +221,39 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
             return "implemented"
 
     client = Client()
+    validations = 0
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(current_branch="feature/review-fix", dirty=False)
+
+        def require_clean(self) -> None:
+            pass
+
+        def inspect_branch(self, branch: str) -> SimpleNamespace:
+            assert branch == "feature/review-fix"
+            return SimpleNamespace(local_sha="a" * 40)
+
+        def require_committed_result(
+            self, branch: str, **kwargs: object
+        ) -> SimpleNamespace:
+            nonlocal validations
+            assert branch == "feature/review-fix"
+            assert kwargs == {
+                "previous_sha": "a" * 40,
+                "expected_agent": "codex",
+                "expected_process": "implementation",
+            }
+            validations += 1
+            if validations == 1:
+                raise WorkerFailure("worktree must be clean")
+            return SimpleNamespace(local_sha="b" * 40)
+
+    class RepositoryType:
+        @staticmethod
+        def open(path: str) -> Repository:
+            assert path == str(repository)
+            return Repository()
 
     class Runtime:
         def __init__(self, *, owned_by_run: bool) -> None:
@@ -236,8 +273,10 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
         ]
     )
     child_ids: list[int] = []
+    review_codes: list[str] = []
 
-    def start_child(_code: str) -> int:
+    def start_child(code: str) -> int:
+        review_codes.append(code)
         run_id = len(child_ids) + 1
         child_ids.append(run_id)
         return run_id
@@ -247,6 +286,7 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
         return ChildRunResult(run_id, "success", 0, json.dumps(next(reports)), "")
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(purplemux_client, "GitRepository", RepositoryType)
     monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(purplemux_client.workflow, "start_child_run", start_child)
     monkeypatch.setattr(purplemux_client.workflow, "wait_child_run", wait_child)
@@ -261,7 +301,18 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     result = json.loads(output.getvalue())
     assert result["verdict"] == "PASS"
     assert child_ids == [1, 2]
-    assert len(client.prompts) == 1
+    assert all("http://127.0.0.1:3000/api/health" in code for code in review_codes)
+    assert all(
+        "managed PurpleMux workspace workspace, tab service" in code
+        for code in review_codes
+    )
+    assert len(client.prompts) == 2
     assert '"verdict": "FAIL"' in client.prompts[0]
+    assert "finish with a clean worktree" in client.prompts[0]
+    assert "Co-authored-by: Codex <noreply@openai.com>" in client.prompts[0]
+    assert "AWM-Agent: codex" in client.prompts[0]
+    assert "AWM-Process: implementation" in client.prompts[0]
+    assert "worktree must be clean" in client.prompts[1]
+    assert result["iterations"][0]["implementation_sha"] == "b" * 40
     assert "implementation" in client.closed
     assert "service" in client.closed

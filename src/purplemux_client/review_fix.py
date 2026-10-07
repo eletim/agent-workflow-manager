@@ -156,7 +156,7 @@ import shlex
 import sys
 import time
 
-from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, ShellCommandRequest, emit_step
+from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, GitRepository, PurpleMuxRuntime, ShellCommandRequest, agent_commit_coauthor, emit_step
 from purplemux_client.errors import MutationOutcomeUnknown, ResultNotReady, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
 from purplemux_client.review import ReviewInput, generate_review_workflow, validate_review_result
 from purplemux_client.workflow import start_child_run, wait_child_run
@@ -169,6 +169,7 @@ CHECK = {config.check!r}
 MAX_ITERATIONS = {config.max_iterations}
 REVIEW_AGENT = {config.review_agent!r}
 IMPLEMENTATION_AGENT = {config.implementation_agent!r}
+COMMIT_AGENT = "claude" if IMPLEMENTATION_AGENT == "claude-code" else IMPLEMENTATION_AGENT
 TIMEOUT = {config.timeout}
 
 deadline = time.monotonic() + TIMEOUT
@@ -252,8 +253,15 @@ def establish_readiness():
 
 def review(iteration):
     review_timeout = max(1, min(int(remaining()), 86400))
+    service_context = (
+        "The declared service is already running in managed PurpleMux workspace "
+        + workspace.id + ", tab " + service_tab + ". Its readiness probe passed at "
+        + READY_URL + ". Inspect that service and endpoint as part of the check. "
+        "Do not restart the service or send input to its managed tab."
+    )
     review_code = generate_review_workflow(ReviewInput(
-        (REPOSITORY,), CHECK, agent=REVIEW_AGENT, timeout=review_timeout,
+        (REPOSITORY,), CHECK, start=service_context,
+        agent=REVIEW_AGENT, timeout=review_timeout,
     ))
     run_id = start_child_run(review_code)
     child = wait_child_run(run_id, timeout=remaining())
@@ -273,21 +281,63 @@ def review(iteration):
 
 def implement(iteration, report):
     global implementation_tab
+    repo = GitRepository.open(REPOSITORY)
+    before = repo.inspect_worktree()
+    if before.current_branch is None:
+        raise WorkerFailure("Review Fix implementation requires a current branch")
+    repo.require_clean()
+    branch = before.current_branch
+    branch_before = repo.inspect_branch(branch)
+    if branch_before.local_sha is None:
+        raise WorkerFailure("Review Fix implementation branch has no commit")
+    previous_sha = branch_before.local_sha
     implementation_tab = client.create_session(CreateSessionRequest(
         worker=IMPLEMENTATION_AGENT, cwd=REPOSITORY, command=IMPLEMENTATION_AGENT,
         name="Review Fix implementation " + str(iteration), deadline_check=remaining,
     ))
     client.wait_until_ready(implementation_tab, min(remaining(), 60))
+    coauthor = agent_commit_coauthor(COMMIT_AGENT)
     prompt = (
         "You are the repository-modifying implementation role. Fix only the failures "
         "identified by this read-only Review report, in " + REPOSITORY + ". "
-        "Inspect and modify the repository, run focused checks, and do not merely describe a fix. "
-        "Do not start or control the Review role. Review evidence: " + json.dumps(report)
+        "Stay on branch " + branch + ". Inspect and modify the repository, run focused checks, "
+        "commit every intended source, test, and configuration change, and finish with a clean "
+        "worktree. Do not merely describe a fix. Do not reset, rebase, stash, force-push, merge, "
+        "discard ambiguous work, or start or control the Review role. Do not create, remove, or "
+        "edit agent-workflow-manager fingerprint markers. Every commit you create must end with "
+        "these exact Git trailers, preserving any additional trailers:\\n"
+        "Co-authored-by: " + coauthor + "\\nAWM-Agent: " + COMMIT_AGENT
+        + "\\nAWM-Process: implementation\\n\\nReview evidence: " + json.dumps(report)
     )
-    client.send_input(implementation_tab, prompt)
-    client.wait_for_turn_completion(implementation_tab, remaining())
-    implementation_result = client.read_result(implementation_tab)
+    implementation_result = None
+    committed = None
+    for recovery_attempt in range(3):
+        client.send_input(implementation_tab, prompt)
+        client.wait_for_turn_completion(implementation_tab, remaining())
+        implementation_result = client.read_result(implementation_tab)
+        try:
+            committed = repo.require_committed_result(
+                branch, previous_sha=previous_sha, expected_agent=COMMIT_AGENT,
+                expected_process="implementation",
+            )
+            break
+        except WorkerFailure as exc:
+            if recovery_attempt == 2:
+                raise WorkerFailure(
+                    "implementation result remained invalid after same-agent recovery: "
+                    + str(exc)
+                ) from exc
+            prompt = (
+                "AWM rejected your coding result during authoritative validation: "
+                + str(exc) + "\\nContinue in this same session and repair only that failure. "
+                "Preserve correct work and stay on branch " + branch + ". Commit all intended "
+                "changes and leave the worktree clean. Every new commit must use these trailers:\\n"
+                "Co-authored-by: " + coauthor + "\\nAWM-Agent: " + COMMIT_AGENT
+                + "\\nAWM-Process: implementation"
+            )
+    assert implementation_result is not None and committed is not None
     iterations[-1]["implementation"] = implementation_result[-4096:]
+    iterations[-1]["implementation_sha"] = committed.local_sha
     close_tab(implementation_tab)
     implementation_tab = None
 

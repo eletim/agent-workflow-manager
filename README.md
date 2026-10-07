@@ -121,6 +121,11 @@ runs the public read-only Review workflow as a child Run. A `FAIL` report is
 passed to a separate managed implementation-agent tab; Python then launches a
 fresh Review and repeats until `PASS`, `BLOCKED`, or `max_iterations`. Python
 owns every branch, deadline, retry, tab cleanup, and the final JSON result.
+Each Review receives the readiness URL and managed service workspace/tab
+identity. Each implementation turn must produce a new clean commit whose
+co-author, agent, and `implementation` process trailers pass the canonical
+CodingAgent Git postcondition; a failed postcondition is returned to the same
+agent for bounded repair before the workflow reports `BLOCKED`.
 Submit the unchanged generated code to `/api/run` with the original declaration
 in `reviewFixJson`; AWM rejects code that does not match the declaration and
 retains the source with Run history.
