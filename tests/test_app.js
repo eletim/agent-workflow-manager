@@ -141,6 +141,7 @@ function snapshot({
   reviewJson = undefined,
   reviewResult = undefined,
   reviewFixJson = undefined,
+  reviewFixResult = undefined,
   resumedFromRunId = null,
   recoverySource = null,
   runPreview = null,
@@ -190,6 +191,7 @@ function snapshot({
   if (reviewJson !== undefined) result.reviewJson = reviewJson;
   if (reviewResult !== undefined) result.reviewResult = reviewResult;
   if (reviewFixJson !== undefined) result.reviewFixJson = reviewFixJson;
+  if (reviewFixResult !== undefined) result.reviewFixResult = reviewFixResult;
   return result;
 }
 
@@ -4948,8 +4950,9 @@ test("Review Fix generates, checks, submits, and restores its saved result", asy
     progress: [{name: "Review Fix", status: "started"}],
   });
   const finished = snapshot({
-    runId: 9, state: "success", stdout: JSON.stringify(report), mode: "review-fix",
+    runId: 9, state: "success", stdout: "diagnostic output", mode: "review-fix",
     code: generatedCode, reviewFixJson: source,
+    reviewFixResult: report,
     progress: [
       {name: "Start service", status: "completed"},
       {name: "Review Fix", status: "completed"},
@@ -5073,7 +5076,7 @@ test("Review Fix edits invalidate pending Validate and Dry Run renders", async (
 test("terminal Review Fix without valid workflow JSON shows a failure state", async () => {
   const detail = snapshot({
     runId: 1, state: "failed", mode: "review-fix", reviewFixJson: "{}",
-    stdout: "startup diagnostics only",
+    stdout: JSON.stringify({verdict: "PASS", summary: "stdout is not authoritative"}),
   });
   const {elements} = await loadApp({
     runs: [{runId: 1, state: "failed", mode: "review-fix"}],

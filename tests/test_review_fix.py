@@ -20,7 +20,7 @@ from purplemux_client.review_fix import (
     parse_review_fix_json,
     serialize_review_fix_result,
 )
-from purplemux_client.runner import PythonRunner
+from purplemux_client.runner import PythonRunner, RunHistoryError
 from purplemux_client.web import RunnerHTTPServer
 from purplemux_client.workflow import ChildRunResult
 
@@ -30,6 +30,18 @@ def repository(tmp_path: Path) -> Path:
     path = tmp_path / "repository"
     path.mkdir()
     subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/repository.git",
+        ],
+        check=True,
+    )
     return path
 
 
@@ -66,7 +78,9 @@ def test_review_fix_contract_generates_valid_plain_python(repository: Path) -> N
     code = generate_review_fix_workflow(config)
     ast.parse(code)
     assert 'WORKFLOW_OUTLINE = ["Start service", "Review Fix"]' in code
-    assert "generate_review_workflow(ReviewInput(" in code
+    assert "review_config = ReviewInput(" in code
+    assert "generate_review_workflow(review_config)" in code
+    assert "review_json=json.dumps(review_config.as_json())" in code
     assert "start=service_context" in code
     assert "stop_with_parent=True" in code
     assert 'if report["verdict"] in ("PASS", "BLOCKED"):' in code
@@ -108,6 +122,15 @@ def test_review_fix_rejects_invalid_declarations(
         parse_review_fix_json(declaration(repository, **changes))
 
 
+def test_review_fix_rejects_local_only_git_repository(tmp_path: Path) -> None:
+    repository = tmp_path / "local-only"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+
+    with pytest.raises(ValueError, match="GitHub repository root"):
+        parse_review_fix_json(declaration(repository))
+
+
 def test_review_fix_result_compacts_worst_case_history() -> None:
     text = '\\"\n' * 2048
     report = {
@@ -143,6 +166,68 @@ def test_review_fix_result_compacts_worst_case_history() -> None:
     assert restored["verdict"] == "FAIL"
     assert restored["iterations"][-1]["iteration"] == 50
     assert restored.get("iterations_omitted", 0) > 0
+
+
+def test_review_fix_result_is_durable_and_independent_of_output(
+    repository: Path, tmp_path: Path
+) -> None:
+    history = tmp_path / "runs.json"
+    source = declaration(repository)
+    result = {
+        "verdict": "PASS",
+        "summary": "Fixed",
+        "repository": str(repository),
+        "iterations": [],
+    }
+    code = (
+        "import sys\n"
+        "from purplemux_client.review_fix import publish_review_fix_result\n"
+        f"publish_review_fix_result({result!r})\n"
+        "print('stdout is diagnostic')\n"
+        "print('stderr is diagnostic', file=sys.stderr)\n"
+    )
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=history, max_output_chars=16
+    )
+    try:
+        run_id = runner.start(code, review_fix_json=source)
+        snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        assert snapshot.as_json()["reviewFixResult"] == result
+        assert json.dumps(result) not in snapshot.stdout + snapshot.stderr
+    finally:
+        runner.close()
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert restored.snapshot(run_id).as_json()["reviewFixResult"] == result
+        saved = json.loads(history.read_text())
+        assert saved["runs"][snapshot.identity]["reviewFixResult"] == result
+    finally:
+        restored.close()
+
+
+def test_runner_rejects_mixed_source_modes_and_history(
+    repository: Path, tmp_path: Path
+) -> None:
+    history = tmp_path / "runs.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        with pytest.raises(ValueError, match="one Run source mode"):
+            runner.start(
+                "pass",
+                review_json='{"mode":"review"}',
+                review_fix_json=declaration(repository),
+            )
+        run_id = runner.start("pass", review_fix_json=declaration(repository))
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+
+    saved = json.loads(history.read_text())
+    next(iter(saved["runs"].values()))["reviewJson"] = '{"mode":"review"}'
+    history.write_text(json.dumps(saved))
+    with pytest.raises(RunHistoryError, match="unreadable"):
+        PythonRunner(managed_workflows=False, run_history_file=history)
 
 
 class _GeneratedShellResult:
@@ -303,9 +388,12 @@ def test_generated_review_fix_tracks_child_before_unmasking_stop(
     _install_generated_runtime(monkeypatch, client)
     stopped: list[int] = []
 
-    def start_child(_code: str, *, timeout: float, stop_with_parent: bool) -> int:
+    def start_child(
+        _code: str, *, timeout: float, stop_with_parent: bool, review_json: str
+    ) -> int:
         assert 0 < timeout <= 30
         assert stop_with_parent
+        assert json.loads(review_json)["mode"] == "review"
         os.kill(os.getpid(), signal.SIGTERM)
         return 41
 
@@ -346,9 +434,12 @@ def test_generated_review_fix_propagates_stop_when_child_cleanup_fails(
     _install_generated_runtime(monkeypatch, client)
     stop_attempts: list[int] = []
 
-    def start_child(_code: str, *, timeout: float, stop_with_parent: bool) -> int:
+    def start_child(
+        _code: str, *, timeout: float, stop_with_parent: bool, review_json: str
+    ) -> int:
         assert timeout > 0
         assert stop_with_parent
+        assert json.loads(review_json)["mode"] == "review"
         return 42
 
     def wait_child(_run_id: int, *, timeout: float) -> ChildRunResult:
@@ -563,9 +654,12 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
     child_ids: list[int] = []
     review_codes: list[str] = []
 
-    def start_child(code: str, *, timeout: float, stop_with_parent: bool) -> int:
+    def start_child(
+        code: str, *, timeout: float, stop_with_parent: bool, review_json: str
+    ) -> int:
         assert 0 < timeout <= 30
         assert stop_with_parent
+        assert json.loads(review_json)["mode"] == "review"
         review_codes.append(code)
         run_id = len(child_ids) + 1
         child_ids.append(run_id)
@@ -573,7 +667,10 @@ def test_generated_review_fix_separates_review_and_implementation_roles(
 
     def wait_child(run_id: int, *, timeout: float) -> ChildRunResult:
         assert timeout > 0
-        return ChildRunResult(run_id, "success", 0, json.dumps(next(reports)), "")
+        report = next(reports)
+        return ChildRunResult(
+            run_id, "success", 0, "diagnostic output", "", review_result=report
+        )
 
     monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
     monkeypatch.setattr(purplemux_client, "GitRepository", RepositoryType)

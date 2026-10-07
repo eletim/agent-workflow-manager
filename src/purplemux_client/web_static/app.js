@@ -658,14 +658,13 @@ function renderReviewFixResult(result) {
     reviewFixResultJson.textContent = "";
     return;
   }
-  try {
-    const report = JSON.parse((result.stdout || "").trim());
-    if (report === null || Array.isArray(report) || typeof report !== "object"
-      || !["PASS", "FAIL", "BLOCKED"].includes(report.verdict)
-      || typeof report.summary !== "string") throw new Error("invalid result");
+  const report = result.reviewFixResult;
+  if (report && typeof report === "object" && !Array.isArray(report)
+    && ["PASS", "FAIL", "BLOCKED"].includes(report.verdict)
+    && typeof report.summary === "string") {
     reviewFixResultStatus.textContent = `Verdict: ${report.verdict} — ${report.summary}`;
     reviewFixResultJson.textContent = JSON.stringify(report, null, 2);
-  } catch {
+  } else {
     reviewFixResultStatus.textContent = "No structured Review Fix result was saved. See stdout and stderr.";
     reviewFixResultJson.textContent = "";
   }

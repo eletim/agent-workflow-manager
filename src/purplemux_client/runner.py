@@ -590,6 +590,7 @@ class RunnerSnapshot:
     review_json: str | None = None
     review_fix_json: str | None = None
     review_result: dict[str, Any] | None = None
+    review_fix_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
@@ -621,6 +622,7 @@ class RunnerSnapshot:
         review_json = payload.pop("review_json")
         review_fix_json = payload.pop("review_fix_json")
         review_result = payload.pop("review_result")
+        review_fix_result = payload.pop("review_fix_result")
         resumed_from_run_id = payload.pop("resumed_from_run_id")
         resumed_from_state = payload.pop("resumed_from_state")
         if issue_driven_json is not None:
@@ -634,6 +636,7 @@ class RunnerSnapshot:
             payload["reviewResult"] = review_result
         if review_fix_json is not None:
             payload["reviewFixJson"] = review_fix_json
+            payload["reviewFixResult"] = review_fix_result
         if resumed_from_run_id is not None:
             payload["resumedFromRunId"] = resumed_from_run_id
             payload["recoverySource"] = {
@@ -1010,6 +1013,7 @@ class _RunRecord:
     review_json: str | None = None
     review_fix_json: str | None = None
     review_result: dict[str, Any] | None = None
+    review_fix_result: dict[str, Any] | None = None
     resumed_from_run_id: int | None = None
     resumed_from_state: Literal["failed", "stopped"] | None = None
     parent_run: str | None = None
@@ -1261,6 +1265,7 @@ class PythonRunner:
             "reviewJson": run.review_json,
             "reviewFixJson": run.review_fix_json,
             "reviewResult": run.review_result,
+            "reviewFixResult": run.review_fix_result,
             "resumedFromRunId": run.resumed_from_run_id,
             "resumedFromState": run.resumed_from_state,
             "agentTurns": [asdict(turn) for turn in run.agent_turns],
@@ -1364,6 +1369,7 @@ class PythonRunner:
         review_json = value.get("reviewJson")
         review_fix_json = value.get("reviewFixJson")
         review_result = value.get("reviewResult")
+        review_fix_result = value.get("reviewFixResult")
         resumed_from_run_id = value.get("resumedFromRunId")
         resumed_from_state = value.get("resumedFromState")
         if (
@@ -1391,6 +1397,18 @@ class PythonRunner:
             or (review_json is not None and not isinstance(review_json, str))
             or (review_fix_json is not None and not isinstance(review_fix_json, str))
             or (review_result is not None and review_json is None)
+            or (review_fix_result is not None and review_fix_json is None)
+            or sum(
+                source is not None
+                for source in (
+                    value.get("prompt"),
+                    issue_driven_json,
+                    environment_setup_json,
+                    review_json,
+                    review_fix_json,
+                )
+            )
+            > 1
             or (
                 resumed_from_run_id is not None
                 and (
@@ -1435,6 +1453,10 @@ class PythonRunner:
             from purplemux_client.review import validate_review_result
 
             validate_review_result(review_result)
+        if review_fix_result is not None:
+            from purplemux_client.review_fix import validate_review_fix_result
+
+            validate_review_fix_result(review_fix_result)
 
         parent_run = value.get("parentRun")
         child_runs = value.get("childRuns", [])
@@ -1833,6 +1855,7 @@ class PythonRunner:
             review_json=review_json,
             review_fix_json=review_fix_json,
             review_result=review_result,
+            review_fix_result=review_fix_result,
             resumed_from_run_id=resumed_from_run_id,
             resumed_from_state=cast(
                 Literal["failed", "stopped"] | None, resumed_from_state
@@ -2212,6 +2235,20 @@ class PythonRunner:
         parent_identity: str | None = None,
         stop_with_parent: bool = False,
     ) -> int:
+        if (
+            sum(
+                source is not None
+                for source in (
+                    prompt,
+                    issue_driven_json,
+                    environment_setup_json,
+                    review_json,
+                    review_fix_json,
+                )
+            )
+            > 1
+        ):
+            raise ValueError("provide only one Run source mode")
         if stop_with_parent and parent_run_id is None:
             raise ValueError("stop_with_parent requires a local parent Run")
         if parent_identity is not None:
@@ -2444,6 +2481,19 @@ class PythonRunner:
                 parent.review_result = validate_review_result(payload.get("result"))
                 self._mark_changed()
                 return {}
+            if operation == "review_fix_result":
+                if (
+                    parent.review_fix_json is None
+                    or parent.review_fix_result is not None
+                ):
+                    raise ValueError("Review Fix result is unavailable for this Run")
+                from purplemux_client.review_fix import validate_review_fix_result
+
+                parent.review_fix_result = validate_review_fix_result(
+                    payload.get("result")
+                )
+                self._mark_changed()
+                return {}
             target_id = payload.get("target_id")
             if target_id is not None and (
                 not isinstance(target_id, str) or not target_id
@@ -2465,6 +2515,7 @@ class PythonRunner:
                     "exit_code": snapshot.exit_code,
                     "stdout": snapshot.stdout,
                     "stderr": snapshot.stderr,
+                    "review_result": snapshot.review_result,
                 }
             local_stop_id = None
             if target_id is None and operation == "stop":
@@ -2479,6 +2530,7 @@ class PythonRunner:
                 raise ValueError("unknown Workflow control operation")
             code, args = payload.get("code"), payload.get("args", [])
             stop_with_parent = payload.get("stop_with_parent", False)
+            review_json = payload.get("review_json")
             if operation == "start":
                 if not isinstance(code, str) or not code.strip():
                     raise ValueError("code must be a non-empty string")
@@ -2492,6 +2544,14 @@ class PythonRunner:
                     raise ValueError(
                         "stop_with_parent is supported only for local child Runs"
                     )
+                if review_json is not None and (
+                    not isinstance(review_json, str) or not review_json
+                ):
+                    raise ValueError("review_json must be a non-empty string")
+                if target_id is not None and review_json is not None:
+                    raise ValueError(
+                        "Review metadata is supported only for local child Runs"
+                    )
         if target_id is not None:
             return self._external_child_control(parent, target_id, payload)
         if local_stop_id is not None:
@@ -2503,6 +2563,7 @@ class PythonRunner:
                 args=args,
                 parent_run_id=parent_id,
                 stop_with_parent=stop_with_parent,
+                review_json=review_json,
             )
         }
 
@@ -3057,6 +3118,9 @@ class PythonRunner:
             review_json=run.review_json,
             review_fix_json=run.review_fix_json,
             review_result=run.review_result if run.state == "success" else None,
+            review_fix_result=(
+                run.review_fix_result if run.state == "success" else None
+            ),
             resumed_from_run_id=run.resumed_from_run_id,
             resumed_from_state=run.resumed_from_state,
             parent_run=run.parent_run,
@@ -4959,6 +5023,7 @@ class PythonRunner:
                 )
                 if run.state != "success":
                     run.review_result = None
+                    run.review_fix_result = None
                 self._finish_active_repository(run)
                 attempt_state = run.state
                 run.attempts.append(
@@ -5053,6 +5118,7 @@ class PythonRunner:
             )
             if run.state != "success":
                 run.review_result = None
+                run.review_fix_result = None
             self._finish_active_repository(run)
             if diagnostic:
                 self._append_output(run, "stderr", diagnostic + "\n", lock_held=True)

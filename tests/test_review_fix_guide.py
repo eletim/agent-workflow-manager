@@ -15,6 +15,18 @@ def test_documented_review_fix_example_matches_the_parser(tmp_path: Path) -> Non
     repository = tmp_path / "repo"
     repository.mkdir()
     subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/repository.git",
+        ],
+        check=True,
+    )
     text = GUIDE.read_text(encoding="utf-8")
     match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
     assert match is not None

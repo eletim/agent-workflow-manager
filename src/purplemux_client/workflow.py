@@ -21,6 +21,7 @@ class ChildRunResult:
     exit_code: int | None
     stdout: str
     stderr: str
+    review_result: dict | None = None
 
 
 def _control(operation: str, *, request_timeout: float = 35, **payload: object) -> dict:
@@ -61,6 +62,7 @@ def start_child_run(
     target_id: str | None = None,
     timeout: float | None = None,
     stop_with_parent: bool = False,
+    review_json: str | None = None,
 ) -> int:
     """Start a distinct local or registered external Run, persisting its parent before execution.
 
@@ -74,6 +76,12 @@ def start_child_run(
         raise ValueError("stop_with_parent must be a boolean")
     if target_id is not None and stop_with_parent:
         raise ValueError("stop_with_parent is supported only for local child Runs")
+    if review_json is not None and (
+        not isinstance(review_json, str) or not review_json
+    ):
+        raise ValueError("review_json must be a non-empty string")
+    if target_id is not None and review_json is not None:
+        raise ValueError("Review metadata is supported only for local child Runs")
     request_timeout = _request_timeout(timeout)
     return _control(
         "start",
@@ -81,6 +89,7 @@ def start_child_run(
         args=list(args),
         target_id=target_id,
         stop_with_parent=stop_with_parent,
+        review_json=review_json,
         request_timeout=request_timeout,
     )["run_id"]
 

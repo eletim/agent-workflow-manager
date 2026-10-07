@@ -69,7 +69,8 @@ directory, or worktree identities are returned and registered.
 
 ## Child Run control contract
 
-A running Python Workflow can call `start_child_run(code, args=(), target_id=None)`,
+A running Python Workflow can call `start_child_run(code, args=(),
+target_id=None, timeout=None, stop_with_parent=False, review_json=None)`,
 `get_child_run_result(run_id, target_id=None)`, and
 `wait_child_run(run_id, timeout=None, target_id=None)`. Python owns when to start,
 wait, branch, retry after authoritative inspection, or reject a final child result.
@@ -86,7 +87,10 @@ calling server, not to workflow code or progress events.
 
 Starting creates an ordinary Run using the existing Runner lifecycle, output,
 Progress, Result, Stop, notifications, and history. Local family links are persisted
-before child execution. For external work the destination persists the supplied
+before child execution. A local child launched with `review_json` is a Review Run;
+its terminal `ChildRunResult.review_result` carries the durable structured Review
+decision independently of stdout. Review metadata is not supported for external
+children. For external work the destination persists the supplied
 full parent identity before execution, and the source records a received child
 identity even if the remaining launch response is uncertain. An unavailable launch
 identity cannot be invented; inspect the destination history. Each instance retains

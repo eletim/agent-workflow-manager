@@ -72,6 +72,36 @@ print(json.dumps({{"state": result.state, "stdout": result.stdout}}), flush=True
         restored.close()
 
 
+def test_local_review_child_returns_its_structured_result(tmp_path: Path) -> None:
+    report = {"verdict": "PASS", "summary": "saved", "repositories": []}
+    child = (
+        "from purplemux_client.review import publish_review_result\n"
+        f"publish_review_result({report!r})\n"
+        "print('diagnostic only')\n"
+    )
+    code = f"""
+from purplemux_client import start_child_run, wait_child_run
+child_id = start_child_run(
+    {child!r}, review_json='{{"mode":"review"}}', stop_with_parent=True,
+)
+result = wait_child_run(child_id, timeout=10)
+assert result.review_result == {report!r}
+assert result.stdout == "diagnostic only\\n"
+"""
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=tmp_path / "history.json"
+    )
+    try:
+        parent_id = runner.start(code)
+        deadline = time.monotonic() + 10
+        while runner.snapshot(parent_id).state == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert runner.snapshot(parent_id).state == "success"
+    finally:
+        runner.close()
+
+
 def test_family_is_persisted_before_child_execution(
     tmp_path: Path, monkeypatch
 ) -> None:

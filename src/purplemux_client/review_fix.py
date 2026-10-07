@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from purplemux_client.errors import WorkerFailure
+from purplemux_client.git import GitRepository
 
 
 @dataclass(frozen=True)
@@ -90,17 +94,9 @@ def parse_review_fix_json(source: str) -> ReviewFixInput:
     if not repository.is_dir():
         raise ValueError("repository must be a directory")
     try:
-        inspected = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ValueError(f"repository cannot be inspected: {exc}") from exc
-    if inspected.returncode or Path(inspected.stdout.strip()).resolve() != repository:
-        raise ValueError("repository must be a Git repository root")
+        GitRepository.open(repository, command_timeout_seconds=10)
+    except (OSError, RuntimeError, subprocess.SubprocessError, WorkerFailure) as exc:
+        raise ValueError(f"repository must be a GitHub repository root: {exc}") from exc
 
     start = value["start"]
     if not isinstance(start, dict):
@@ -222,6 +218,54 @@ def serialize_review_fix_result(result: dict[str, Any]) -> str:
     return json.dumps(fallback, ensure_ascii=False)
 
 
+def validate_review_fix_result(value: Any) -> dict[str, Any]:
+    """Validate a terminal Review Fix result before it enters durable history."""
+    if not isinstance(value, dict):
+        raise ValueError("Review Fix result must be an object")
+    if value.get("verdict") not in {"PASS", "FAIL", "BLOCKED"}:
+        raise ValueError("invalid Review Fix verdict")
+    if not isinstance(value.get("summary"), str) or not isinstance(
+        value.get("repository"), str
+    ):
+        raise ValueError("invalid Review Fix summary or repository")
+    iterations = value.get("iterations")
+    if not isinstance(iterations, list) or any(
+        not isinstance(item, dict) for item in iterations
+    ):
+        raise ValueError("invalid Review Fix iterations")
+    cleanup_errors = value.get("cleanup_errors", [])
+    if not isinstance(cleanup_errors, list) or any(
+        not isinstance(item, str) for item in cleanup_errors
+    ):
+        raise ValueError("invalid Review Fix cleanup errors")
+    omitted = value.get("iterations_omitted")
+    if omitted is not None and (
+        isinstance(omitted, bool) or not isinstance(omitted, int) or omitted < 1
+    ):
+        raise ValueError("invalid omitted Review Fix iteration count")
+    if value.keys() - {
+        "verdict",
+        "summary",
+        "repository",
+        "iterations",
+        "readiness",
+        "cleanup_errors",
+        "iterations_omitted",
+    }:
+        raise ValueError("unknown Review Fix result fields")
+    return value
+
+
+def publish_review_fix_result(value: dict[str, Any]) -> None:
+    """Send the Review Fix outcome to its Run independently of stdout."""
+    from purplemux_client.workflow import CONTROL_TOKEN_ENV, CONTROL_URL_ENV, _control
+
+    validate_review_fix_result(value)
+    if CONTROL_URL_ENV not in os.environ and CONTROL_TOKEN_ENV not in os.environ:
+        return
+    _control("review_fix_result", result=value)
+
+
 def generate_review_fix_workflow(config: ReviewFixInput) -> str:
     """Generate a workflow whose Python owns the complete Review Fix loop."""
     return f"""import json
@@ -233,7 +277,7 @@ import time
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, GitRepository, PurpleMuxRuntime, ShellCommandRequest, agent_commit_coauthor, emit_step
 from purplemux_client.errors import MutationOutcomeUnknown, ResultNotReady, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
 from purplemux_client.review import ReviewInput, generate_review_workflow, validate_review_result
-from purplemux_client.review_fix import serialize_review_fix_result
+from purplemux_client.review_fix import publish_review_fix_result, serialize_review_fix_result
 from purplemux_client.workflow import start_child_run, stop_child_run, wait_child_run
 
 WORKFLOW_OUTLINE = ["Start service", "Review Fix"]
@@ -398,10 +442,11 @@ def review(iteration):
         + READY_URL + ". Inspect that service and endpoint as part of the check. "
         "Do not restart the service or send input to its managed tab."
     )
-    review_code = generate_review_workflow(ReviewInput(
+    review_config = ReviewInput(
         (REPOSITORY,), CHECK, start=service_context,
         agent=REVIEW_AGENT, timeout=review_timeout,
-    ))
+    )
+    review_code = generate_review_workflow(review_config)
     previous_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK, {{signal.SIGINT, signal.SIGTERM}}
     )
@@ -410,6 +455,7 @@ def review(iteration):
             review_code,
             timeout=remaining(),
             stop_with_parent=True,
+            review_json=json.dumps(review_config.as_json()),
         )
         active_review_run = run_id
     finally:
@@ -429,10 +475,12 @@ def review(iteration):
     active_review_run = None
     if child.state != "success" or child.exit_code != 0:
         raise RuntimeError("Review child Run failed: " + child.stderr[-4096:])
+    if child.review_result is None:
+        raise RuntimeError("Review child Run did not save a structured result")
     try:
-        report = validate_review_result(json.loads(child.stdout))
+        report = validate_review_result(child.review_result)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("Review child Run returned an invalid result") from exc
+        raise RuntimeError("Review child Run saved an invalid result") from exc
     compact = {{"verdict": report["verdict"], "summary": report["summary"][:4096]}}
     for name in ("findings", "observed_facts", "evidence", "hypotheses", "observability_gaps"):
         if name in report:
@@ -577,5 +625,7 @@ finally:
             result["verdict"] = "BLOCKED"
             result["summary"] = "Review passed but managed service cleanup was not confirmed"
 
-print(serialize_review_fix_result(result))
+serialized_result = serialize_review_fix_result(result)
+publish_review_fix_result(json.loads(serialized_result))
+print(serialized_result)
 """

@@ -20,15 +20,15 @@ declaration:
 ```
 
 `mode`, `repository`, `start`, `check`, and `max_iterations` are required.
-`repository` must be an existing local Git repository root with a current
-branch. `start.command` launches the service in that repository and
+`repository` must be an existing local GitHub repository root with a current
+branch and supported `origin`. `start.command` launches the service there and
 `start.ready_check` is an HTTP(S) URL used to establish service readiness.
 `check` is the read-only Review instruction. `max_iterations` is an integer
 from 1 to 50. The optional `review_agent` and `implementation_agent` values are
 `codex` (the default) or `claude-code`. `timeout` defaults to 3600 seconds and
 must be an integer from 1 to 86400.
 
-Select **Validate JSON & Generate** to inspect the read-only plain-Python
+Select **Validate JSON & Generate** to inspect the generated plain-Python
 workflow, then use **Validate**, **Dry Run**, and **Run**. The declaration and
 generated Python are retained with Run history. Progress shows service startup
 and Review Fix execution, while the result panel shows the terminal `PASS`,
