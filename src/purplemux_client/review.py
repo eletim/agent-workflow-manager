@@ -383,6 +383,33 @@ def snapshot_review_repositories(repositories: tuple[str, ...]) -> tuple[str, ..
     return tuple(snapshots)
 
 
+def snapshot_review_tracked_state(repositories: tuple[str, ...]) -> tuple[str, ...]:
+    """Fingerprint only HEAD plus staged/unstaged tracked-file changes."""
+    snapshots: list[str] = []
+    for repository in repositories:
+        digest = hashlib.sha256()
+        for args in (
+            ("rev-parse", "HEAD"),
+            ("diff", "--no-ext-diff", "--binary", "--"),
+            ("diff", "--cached", "--no-ext-diff", "--binary", "--"),
+        ):
+            result = subprocess.run(
+                ["git", "-C", repository, *args],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode:
+                raise RuntimeError(
+                    f"Could not inspect tracked Git state in {repository}: "
+                    f"{result.stderr.decode(errors='replace')}"
+                )
+            digest.update(len(result.stdout).to_bytes(8, "big"))
+            digest.update(result.stdout)
+        snapshots.append(digest.hexdigest())
+    return tuple(snapshots)
+
+
 class ReviewWriteMonitor:
     """Record filesystem writes during a Review, except index refreshes."""
 
@@ -592,7 +619,7 @@ import time
 
 from purplemux_client import CreateSessionRequest, CreateWorkspaceRequest, PurpleMuxRuntime, emit_step
 from purplemux_client.errors import MutationOutcomeUnknown, SessionReadyTimeout, WorkerFailure, WorkerInterrupted
-from purplemux_client.review import ReviewWriteMonitor, publish_review_result, require_ext_review_contract, serialize_review_result, snapshot_review_repositories
+from purplemux_client.review import publish_review_result, require_ext_review_contract, serialize_review_result, snapshot_review_tracked_state
 
 WORKFLOW_OUTLINE = ["Review"]
 REPOSITORIES = {config.repositories!r}
@@ -617,37 +644,78 @@ def turn(message, *, finish=False, completion=None):
     seconds = max(remaining() if not finish else deadline - time.monotonic(), 0)
     if finish:
         seconds = max(seconds, 60)
+    client.send_input(tab, message)
+    client.wait_for_turn_completion(tab, seconds, on_busy_timeout=busy_timeout)
+    if completion is not None:
+        completion["confirmed"] = True
+    if not finish:
+        remaining()
+    return client.read_result(tab)
+
+
+def assess_repository_changes():
     try:
-        client.send_input(tab, message)
-        client.wait_for_turn_completion(tab, seconds, on_busy_timeout=busy_timeout)
-        if completion is not None:
-            completion["confirmed"] = True
-        if not finish:
-            remaining()
-        return client.read_result(tab)
-    finally:
-        verify_repositories()
-
-
-def verify_repositories():
-    monitor.assert_unchanged()
-    current = snapshot_review_repositories(REPOSITORIES)
-    changed = [path for path, before, after in zip(REPOSITORIES, baseline, current) if before != after]
-    if changed:
-        raise RuntimeError("Review repository change detected: " + json.dumps(changed))
+        current = snapshot_review_tracked_state(REPOSITORIES)
+    except Exception as exc:
+        return {{
+            "verdict": "BLOCKED",
+            "summary": "Tracked repository state could not be inspected after Review: " + str(exc),
+            "observability_gaps": [str(exc)],
+        }}
+    changed = [
+        path
+        for path, before, after in zip(REPOSITORIES, baseline, current)
+        if before != after
+    ]
+    if not changed:
+        return None
+    prompt = (
+        context
+        + "At the end of Review, tracked Git state changed in these repositories: "
+        + json.dumps(changed)
+        + ". Inspect the current HEAD plus staged/unstaged tracked-file diff. "
+        + "Decide whether this change is a problem for this Review's read-only requirement. "
+        + "Do not modify any repository. Return exactly one JSON object with a boolean "
+        + "field named problem and a non-empty string field named reason."
+    )
+    try:
+        judgment = json.loads(turn(prompt))
+    except (TypeError, ValueError) as exc:
+        return {{
+            "verdict": "BLOCKED",
+            "summary": "Tracked repository state changed, but Review could not classify the change.",
+            "observability_gaps": [str(exc)],
+        }}
+    if (
+        not isinstance(judgment, dict)
+        or type(judgment.get("problem")) is not bool
+        or not isinstance(judgment.get("reason"), str)
+        or not judgment["reason"].strip()
+    ):
+        return {{
+            "verdict": "BLOCKED",
+            "summary": "Tracked repository state changed, but Review returned an invalid classification.",
+            "observability_gaps": ["Repository-change classification was invalid."],
+        }}
+    if not judgment["problem"]:
+        return None
+    reason = judgment["reason"].strip()
+    return {{
+        "verdict": "BLOCKED",
+        "summary": "Review read-only requirement was violated: " + reason,
+        "observability_gaps": [reason],
+    }}
 
 
 emit_step("Review", "started")
 deadline = time.monotonic() + {config.timeout}
 baseline = None
-monitor = None
 runtime = PurpleMuxRuntime(owned_by_run=True)
 client = None
 tab = None
 try:
     ext_review_cli = require_ext_review_contract(timeout=min(10, remaining()))
-    monitor = ReviewWriteMonitor(REPOSITORIES)
-    baseline = snapshot_review_repositories(REPOSITORIES)
+    baseline = snapshot_review_tracked_state(REPOSITORIES)
     workspace = runtime.create_workspace(CreateWorkspaceRequest(
         cwd=REPOSITORIES[0], name="AWM Review", deadline_check=remaining,
     ))
@@ -726,9 +794,12 @@ try:
             result, REPOSITORIES,
             finish_failure="Finish could not run because check completion was not confirmed",
         )
+    change_result = assess_repository_changes()
+    if change_result is not None:
+        result = change_result
+        serialized_result = serialize_review_result(result, REPOSITORIES)
     client.close_session(tab)
     tab = None
-    verify_repositories()
     publish_review_result(json.loads(serialized_result))
     print(serialized_result)
 except BaseException as exc:
@@ -739,16 +810,8 @@ except BaseException as exc:
             tab = None
         except BaseException as stop_error:
             failure = RuntimeError("Review agent could not be stopped: " + str(stop_error) + "; prior failure: " + str(failure))
-    if baseline is not None:
-        try:
-            verify_repositories()
-        except BaseException as check_error:
-            failure = check_error
     emit_step("Review", "failed", error=str(failure))
     raise failure
 else:
     emit_step("Review", "completed", workspace=workspace.id)
-finally:
-    if monitor is not None:
-        monitor.close()
 """

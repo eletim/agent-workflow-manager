@@ -247,3 +247,25 @@ def test_directory_picker_contains_scrolling_to_its_list() -> None:
     assert "max-height: calc(100dvh - 32px)" in styles
     assert ".directory-picker-list" in styles
     assert "overflow-y: auto" in styles
+
+
+
+def test_run_sidebar_and_directory_picker_use_larger_desktop_surfaces() -> None:
+    styles = STYLES.read_text(encoding="utf-8")
+
+    assert "grid-template-columns: minmax(440px, 480px) minmax(0, 1fr)" in styles
+    assert "min-height: 68px" in styles
+    assert "font: 14px/1.5 ui-monospace" in styles
+    assert "width: min(1120px, calc(100% - 32px))" in styles
+    assert "height: min(760px, calc(100dvh - 32px))" in styles
+    assert ".directory-picker-dialog { width: calc(100% - 16px);" in styles
+
+
+
+def test_directory_picker_rows_are_large_enough_to_read() -> None:
+    styles = STYLES.read_text(encoding="utf-8")
+
+    assert ".directory-picker-list button" in styles
+    assert "min-height: 44px" in styles
+    assert "padding: 9px 14px" in styles
+    assert "font-size: 14px" in styles

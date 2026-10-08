@@ -22,6 +22,7 @@ from purplemux_client.review import (
     require_ext_review_contract,
     serialize_review_result,
     snapshot_review_repositories,
+    snapshot_review_tracked_state,
 )
 from purplemux_client.runner import PythonRunner
 from purplemux_client.web import RunnerHTTPServer
@@ -1556,3 +1557,65 @@ def test_generated_review_rejects_old_runtime_before_creating_workspace(
     with pytest.raises(RuntimeError, match="ext-review support required"):
         exec(compile(code, "<review>", "exec"), {})
     assert steps == [("Review", "started"), ("Review", "failed")]
+
+
+
+def test_review_tracked_snapshot_ignores_untracked_and_ignored_but_detects_tracked(
+    repositories: tuple[Path, Path],
+) -> None:
+    repository = repositories[0]
+    tracked = repository / "tracked.txt"
+    tracked.write_text("before")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Review Test",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    (repository / ".gitignore").write_text("ignored.txt\n")
+    subprocess.run(["git", "-C", str(repository), "add", ".gitignore"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Review Test",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "-qm",
+            "ignore generated file",
+        ],
+        check=True,
+    )
+
+    baseline = snapshot_review_tracked_state((str(repository),))
+    (repository / "ignored.txt").write_text("generated")
+    (repository / "untracked.txt").write_text("generated")
+    assert snapshot_review_tracked_state((str(repository),)) == baseline
+
+    tracked.write_text("after")
+    assert snapshot_review_tracked_state((str(repository),)) != baseline
+
+
+def test_generated_review_uses_end_of_review_tracked_state_classification(
+    repositories: tuple[Path, Path],
+) -> None:
+    code = generate_review_workflow(parse_review_json(declaration(repositories)))
+
+    assert "snapshot_review_tracked_state" in code
+    assert "assess_repository_changes()" in code
+    assert "ReviewWriteMonitor" not in code
+    assert "tracked Git state changed" in code
+    assert "field named problem" in code
