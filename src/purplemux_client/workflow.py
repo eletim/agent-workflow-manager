@@ -21,6 +21,7 @@ class ChildRunResult:
     exit_code: int | None
     stdout: str
     stderr: str
+    review_result: dict | None = None
 
 
 def _control(operation: str, *, request_timeout: float = 35, **payload: object) -> dict:
@@ -55,7 +56,13 @@ def _control(operation: str, *, request_timeout: float = 35, **payload: object) 
 
 
 def start_child_run(
-    code: str, *, args: Sequence[str] = (), target_id: str | None = None
+    code: str,
+    *,
+    args: Sequence[str] = (),
+    target_id: str | None = None,
+    timeout: float | None = None,
+    stop_with_parent: bool = False,
+    review_json: str | None = None,
 ) -> int:
     """Start a distinct local or registered external Run, persisting its parent before execution.
 
@@ -65,7 +72,26 @@ def start_child_run(
         raise ValueError("code must be a non-empty string")
     if isinstance(args, str) or any(not isinstance(arg, str) for arg in args):
         raise ValueError("args must be a sequence of strings")
-    return _control("start", code=code, args=list(args), target_id=target_id)["run_id"]
+    if not isinstance(stop_with_parent, bool):
+        raise ValueError("stop_with_parent must be a boolean")
+    if target_id is not None and stop_with_parent:
+        raise ValueError("stop_with_parent is supported only for local child Runs")
+    if review_json is not None and (
+        not isinstance(review_json, str) or not review_json
+    ):
+        raise ValueError("review_json must be a non-empty string")
+    if target_id is not None and review_json is not None:
+        raise ValueError("Review metadata is supported only for local child Runs")
+    request_timeout = _request_timeout(timeout)
+    return _control(
+        "start",
+        code=code,
+        args=list(args),
+        target_id=target_id,
+        stop_with_parent=stop_with_parent,
+        review_json=review_json,
+        request_timeout=request_timeout,
+    )["run_id"]
 
 
 def get_child_run_result(
@@ -111,3 +137,26 @@ def wait_child_run(
         time.sleep(
             0.05 if deadline is None else max(0, min(0.05, deadline - time.monotonic()))
         )
+
+
+def stop_child_run(
+    run_id: int, *, target_id: str | None = None, timeout: float | None = None
+) -> bool:
+    """Stop one authorized child Run; return False if it is already terminal."""
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+        raise ValueError("run_id must be a positive integer")
+    if target_id is not None:
+        raise ValueError("stopping external child Runs is not supported")
+    return bool(
+        _control("stop", run_id=run_id, request_timeout=_request_timeout(timeout))[
+            "stopped"
+        ]
+    )
+
+
+def _request_timeout(timeout: float | None) -> float:
+    if timeout is None:
+        return 35
+    if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be positive")
+    return timeout

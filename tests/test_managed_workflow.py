@@ -681,6 +681,7 @@ emit_step("parent", "completed")
             "exit_code": child.exit_code,
             "stdout": child.stdout,
             "stderr": child.stderr,
+            "review_result": None,
         }
         assert child.stdout == ""
         assert child.progress[0].name == "child"

@@ -1,0 +1,712 @@
+from __future__ import annotations
+
+import ast
+import json
+import os
+import signal
+import subprocess
+import threading
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from test_runner import request, wait_for
+
+from purplemux_client.errors import WorkerFailure
+from purplemux_client.review_fix import (
+    generate_review_fix_workflow,
+    parse_review_fix_json,
+    serialize_review_fix_result,
+)
+from purplemux_client.runner import PythonRunner, RunHistoryError
+from purplemux_client.web import RunnerHTTPServer
+from purplemux_client.workflow import ChildRunResult
+
+
+@pytest.fixture
+def repository(tmp_path: Path) -> Path:
+    path = tmp_path / "repository"
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/repository.git",
+        ],
+        check=True,
+    )
+    return path
+
+
+def declaration(path: Path, **changes: object) -> str:
+    value: dict[str, object] = {
+        "mode": "review-fix",
+        "repository": str(path),
+        "start": {
+            "command": "./start-dev.sh",
+            "ready_check": "http://127.0.0.1:3000/api/health",
+        },
+        "check": "Use the browser to verify the feature.",
+        "max_iterations": 5,
+    }
+    value.update(changes)
+    return json.dumps(value)
+
+
+def test_review_fix_contract_generates_valid_plain_python(repository: Path) -> None:
+    config = parse_review_fix_json(declaration(repository))
+    assert config.as_json() == {
+        "mode": "review-fix",
+        "repository": str(repository),
+        "start": {
+            "command": "./start-dev.sh",
+            "ready_check": "http://127.0.0.1:3000/api/health",
+        },
+        "check": "Use the browser to verify the feature.",
+        "max_iterations": 5,
+        "review_agent": "codex",
+        "implementation_agent": "codex",
+        "timeout": 3600,
+    }
+    code = generate_review_fix_workflow(config)
+    ast.parse(code)
+    assert 'WORKFLOW_OUTLINE = ["Start service", "Review Fix"]' in code
+    assert "review_config = ReviewInput(" in code
+    assert "generate_review_workflow(review_config)" in code
+    assert "review_json=json.dumps(review_config.as_json())" in code
+    assert "start=service_context" in code
+    assert "stop_with_parent=True" in code
+    assert 'if report["verdict"] in ("PASS", "BLOCKED"):' in code
+    assert "for iteration in range(1, MAX_ITERATIONS + 1):" in code
+    assert "client.close_session(tab)" in code
+    assert "repo.require_committed_result(" in code
+    assert 'expected_process="implementation"' in code
+    runner = PythonRunner(managed_workflows=False)
+    try:
+        assert runner.validate(code).valid
+    finally:
+        runner.close()
+
+
+@pytest.mark.parametrize(
+    "changes,match",
+    [
+        ({"mode": "review"}, "mode"),
+        ({"repository": "missing"}, "repository"),
+        ({"start": "run"}, "start"),
+        ({"start": {"command": "run"}}, "start"),
+        (
+            {"start": {"command": "run", "ready_check": "not-a-url"}},
+            "ready_check",
+        ),
+        ({"check": ""}, "check"),
+        ({"max_iterations": 0}, "max_iterations"),
+        ({"max_iterations": True}, "max_iterations"),
+        ({"review_agent": "shell"}, "review_agent"),
+        ({"implementation_agent": "shell"}, "implementation_agent"),
+        ({"timeout": 0}, "timeout"),
+        ({"extra": True}, "unknown fields"),
+    ],
+)
+def test_review_fix_rejects_invalid_declarations(
+    repository: Path, changes: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        parse_review_fix_json(declaration(repository, **changes))
+
+
+def test_review_fix_rejects_local_only_git_repository(tmp_path: Path) -> None:
+    repository = tmp_path / "local-only"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+
+    with pytest.raises(ValueError, match="GitHub repository root"):
+        parse_review_fix_json(declaration(repository))
+
+
+def test_review_fix_result_compacts_worst_case_history() -> None:
+    text = '\\"\n' * 2048
+    report = {
+        "verdict": "FAIL",
+        "summary": text,
+        "findings": [text] * 5,
+        "observed_facts": [text] * 5,
+        "evidence": [text] * 5,
+        "hypotheses": [text] * 5,
+        "observability_gaps": [text] * 5,
+    }
+    result = {
+        "verdict": "FAIL",
+        "summary": "maximum iterations",
+        "repository": "/repo",
+        "readiness": {"url": "http://127.0.0.1:3000", "attempts": 1},
+        "iterations": [
+            {
+                "iteration": iteration,
+                "review_run_id": iteration,
+                "review": report,
+                "implementation": text,
+                "implementation_sha": "a" * 40,
+            }
+            for iteration in range(1, 51)
+        ],
+    }
+
+    payload = serialize_review_fix_result(result)
+    restored = json.loads(payload)
+
+    assert len(payload) <= 999_999
+    assert restored["verdict"] == "FAIL"
+    assert restored["iterations"][-1]["iteration"] == 50
+    assert restored.get("iterations_omitted", 0) > 0
+
+
+def test_review_fix_result_is_durable_and_independent_of_output(
+    repository: Path, tmp_path: Path
+) -> None:
+    history = tmp_path / "runs.json"
+    source = declaration(repository)
+    result = {
+        "verdict": "PASS",
+        "summary": "Fixed",
+        "repository": str(repository),
+        "iterations": [],
+    }
+    code = (
+        "import sys\n"
+        "from purplemux_client.review_fix import publish_review_fix_result\n"
+        f"publish_review_fix_result({result!r})\n"
+        "print('stdout is diagnostic')\n"
+        "print('stderr is diagnostic', file=sys.stderr)\n"
+    )
+    runner = PythonRunner(
+        managed_workflows=False, run_history_file=history, max_output_chars=16
+    )
+    try:
+        run_id = runner.start(code, review_fix_json=source)
+        snapshot = wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+        assert snapshot.as_json()["reviewFixResult"] == result
+        assert json.dumps(result) not in snapshot.stdout + snapshot.stderr
+    finally:
+        runner.close()
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        assert restored.snapshot(run_id).as_json()["reviewFixResult"] == result
+        saved = json.loads(history.read_text())
+        assert saved["runs"][snapshot.identity]["reviewFixResult"] == result
+    finally:
+        restored.close()
+
+
+def test_runner_rejects_mixed_source_modes_and_history(
+    repository: Path, tmp_path: Path
+) -> None:
+    history = tmp_path / "runs.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        with pytest.raises(ValueError, match="one Run source mode"):
+            runner.start(
+                "pass",
+                review_json='{"mode":"review"}',
+                review_fix_json=declaration(repository),
+            )
+        run_id = runner.start("pass", review_fix_json=declaration(repository))
+        wait_for(runner, lambda item: item.state == "success", run_id=run_id)
+    finally:
+        runner.close()
+
+    saved = json.loads(history.read_text())
+    next(iter(saved["runs"].values()))["reviewJson"] = '{"mode":"review"}'
+    history.write_text(json.dumps(saved))
+    with pytest.raises(RunHistoryError, match="unreadable"):
+        PythonRunner(managed_workflows=False, run_history_file=history)
+
+
+class _GeneratedShellResult:
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+
+    @staticmethod
+    def failure_message(_name: str) -> str:
+        return "service stopped"
+
+
+class _GeneratedClient:
+    def __init__(self, *, service_alive: bool, endpoint_present: bool = False) -> None:
+        self.service_alive = service_alive
+        self.endpoint_present = endpoint_present
+        self.shell_count = 0
+        self.service_starts = 0
+        self.closed: list[str] = []
+
+    def start_shell(self, request: object) -> str:
+        self.shell_count += 1
+        if "service" in request.name:
+            self.service_starts += 1
+            return "service"
+        if "ownership" in request.name:
+            return "ownership"
+        return "readiness"
+
+    def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
+        pass
+
+    def read_shell_result(self, tab: str) -> _GeneratedShellResult:
+        return _GeneratedShellResult(
+            0 if tab != "ownership" or self.endpoint_present else 1
+        )
+
+    def read_status(self, tab: str) -> dict[str, bool]:
+        assert tab == "service"
+        return {"alive": self.service_alive}
+
+    def close_session(self, tab: str) -> None:
+        self.closed.append(tab)
+
+
+def _install_generated_runtime(
+    monkeypatch: pytest.MonkeyPatch, client: _GeneratedClient
+) -> None:
+    import purplemux_client
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="workspace")
+
+        def workspace(self, workspace_id: str) -> _GeneratedClient:
+            assert workspace_id == "workspace"
+            return client
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
+
+
+def test_generated_review_fix_rejects_stale_endpoint_readiness(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _GeneratedClient(service_alive=False)
+    _install_generated_runtime(monkeypatch, client)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    output = StringIO()
+    try:
+        with redirect_stdout(output):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "BLOCKED"
+    assert "service exited before readiness" in result["summary"]
+    assert "service" in client.closed
+
+
+def test_generated_review_fix_rejects_preexisting_readiness_endpoint(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _GeneratedClient(service_alive=True, endpoint_present=True)
+    _install_generated_runtime(monkeypatch, client)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    output = StringIO()
+    try:
+        with redirect_stdout(output):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "BLOCKED"
+    assert "responded before the managed service was started" in result["summary"]
+    assert client.service_starts == 0
+
+
+def test_generated_review_fix_preserves_system_exit_during_startup(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> None:
+            raise SystemExit(143)
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit, match="143"):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+
+def test_generated_review_fix_tracks_child_before_unmasking_stop(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.workflow
+
+    client = _GeneratedClient(service_alive=True)
+    _install_generated_runtime(monkeypatch, client)
+    stopped: list[int] = []
+
+    def start_child(
+        _code: str, *, timeout: float, stop_with_parent: bool, review_json: str
+    ) -> int:
+        assert 0 < timeout <= 30
+        assert stop_with_parent
+        assert json.loads(review_json)["mode"] == "review"
+        os.kill(os.getpid(), signal.SIGTERM)
+        return 41
+
+    def stop_child(run_id: int, *, timeout: float) -> bool:
+        assert timeout >= 5
+        stopped.append(run_id)
+        return True
+
+    monkeypatch.setattr(purplemux_client.workflow, "start_child_run", start_child)
+    monkeypatch.setattr(purplemux_client.workflow, "stop_child_run", stop_child)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        with pytest.raises(SystemExit, match="143"):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    assert stopped == [41]
+
+
+def test_generated_review_fix_propagates_stop_when_child_cleanup_fails(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client.workflow
+
+    client = _GeneratedClient(service_alive=True)
+    _install_generated_runtime(monkeypatch, client)
+    stop_attempts: list[int] = []
+
+    def start_child(
+        _code: str, *, timeout: float, stop_with_parent: bool, review_json: str
+    ) -> int:
+        assert timeout > 0
+        assert stop_with_parent
+        assert json.loads(review_json)["mode"] == "review"
+        return 42
+
+    def wait_child(_run_id: int, *, timeout: float) -> ChildRunResult:
+        assert timeout > 0
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("SIGTERM handler did not exit")
+
+    def stop_child(run_id: int, *, timeout: float) -> bool:
+        assert timeout >= 5
+        stop_attempts.append(run_id)
+        raise RuntimeError("cleanup unavailable")
+
+    monkeypatch.setattr(purplemux_client.workflow, "start_child_run", start_child)
+    monkeypatch.setattr(purplemux_client.workflow, "wait_child_run", wait_child)
+    monkeypatch.setattr(purplemux_client.workflow, "stop_child_run", stop_child)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit, match="143"):
+            exec(
+                compile(
+                    generate_review_fix_workflow(
+                        parse_review_fix_json(declaration(repository, timeout=30))
+                    ),
+                    "<review-fix>",
+                    "exec",
+                ),
+                {},
+            )
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    assert stop_attempts == [42, 42, 42]
+
+
+def test_review_fix_generation_and_run_binding(
+    repository: Path, tmp_path: Path
+) -> None:
+    source = declaration(repository)
+    history = tmp_path / "runs.json"
+    runner = PythonRunner(managed_workflows=False, run_history_file=history)
+    server = RunnerHTTPServer(("127.0.0.1", 0), runner)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = (str(server.server_address[0]), int(server.server_address[1]))
+    try:
+        status, generated = request(
+            address,
+            "POST",
+            "/api/review-fix/generate",
+            json.dumps({"json": source}),
+            token=server.request_token,
+        )
+        assert status == 200
+        assert generated["config"]["mode"] == "review-fix"
+        code = generated["generatedCode"]
+        assert runner.validate(code).valid
+
+        status, rejected = request(
+            address,
+            "POST",
+            "/api/run",
+            json.dumps({"code": code + "\n", "reviewFixJson": source}),
+            token=server.request_token,
+        )
+        assert status == 400
+
+        harmless = 'print("bound")'
+        from purplemux_client import web
+
+        original = web.generate_review_fix_workflow
+        web.generate_review_fix_workflow = lambda _config: harmless
+        try:
+            status, started = request(
+                address,
+                "POST",
+                "/api/run",
+                json.dumps({"code": harmless, "reviewFixJson": source}),
+                token=server.request_token,
+            )
+        finally:
+            web.generate_review_fix_workflow = original
+        assert status == 202
+        snapshot = wait_for(
+            runner, lambda item: item.state == "success", run_id=started["runId"]
+        )
+        assert snapshot.as_json()["mode"] == "review-fix"
+        assert snapshot.as_json()["reviewFixJson"] == source
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        runner.close()
+
+    restored = PythonRunner(managed_workflows=False, run_history_file=history)
+    try:
+        snapshot = restored.snapshot(started["runId"]).as_json()
+        assert snapshot["mode"] == "review-fix"
+        assert snapshot["reviewFixJson"] == source
+    finally:
+        restored.close()
+
+
+def test_generated_review_fix_separates_review_and_implementation_roles(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import purplemux_client
+    import purplemux_client.workflow
+
+    class ShellResult:
+        def __init__(self, exit_code: int = 0) -> None:
+            self.exit_code = exit_code
+
+        @staticmethod
+        def failure_message(_name: str) -> str:
+            return "failed"
+
+    class Client:
+        def __init__(self) -> None:
+            self.shells = 0
+            self.services = 0
+            self.prompts: list[str] = []
+            self.closed: list[str] = []
+
+        def start_shell(self, request: object) -> str:
+            self.shells += 1
+            if "service" in request.name:
+                self.services += 1
+                return "service-" + str(self.services)
+            if "ownership" in request.name:
+                return "ownership-" + str(self.shells)
+            return "readiness-" + str(self.shells)
+
+        def wait_for_shell_completion(self, _tab: str, _timeout: float) -> None:
+            pass
+
+        def read_shell_result(self, tab: str) -> ShellResult:
+            return ShellResult(1 if tab.startswith("ownership-") else 0)
+
+        def read_status(self, _tab: str) -> dict[str, bool]:
+            return {"alive": True}
+
+        def close_session(self, tab: str) -> None:
+            self.closed.append(tab)
+
+        def create_session(self, _request: object) -> str:
+            return "implementation"
+
+        def wait_until_ready(self, _tab: str, _timeout: float) -> None:
+            pass
+
+        def send_input(self, _tab: str, prompt: str) -> None:
+            self.prompts.append(prompt)
+
+        def wait_for_turn_completion(self, _tab: str, _timeout: float) -> None:
+            pass
+
+        def read_result(self, _tab: str) -> str:
+            return "implemented"
+
+    client = Client()
+    validations = 0
+
+    class Repository:
+        def inspect_worktree(self) -> SimpleNamespace:
+            return SimpleNamespace(current_branch="feature/review-fix", dirty=False)
+
+        def require_clean(self) -> None:
+            pass
+
+        def inspect_branch(self, branch: str) -> SimpleNamespace:
+            assert branch == "feature/review-fix"
+            return SimpleNamespace(local_sha="a" * 40)
+
+        def require_committed_result(
+            self, branch: str, **kwargs: object
+        ) -> SimpleNamespace:
+            nonlocal validations
+            assert branch == "feature/review-fix"
+            assert kwargs == {
+                "previous_sha": "a" * 40,
+                "expected_agent": "codex",
+                "expected_process": "implementation",
+            }
+            validations += 1
+            if validations == 1:
+                raise WorkerFailure("worktree must be clean")
+            return SimpleNamespace(local_sha="b" * 40)
+
+    class RepositoryType:
+        @staticmethod
+        def open(path: str) -> Repository:
+            assert path == str(repository)
+            return Repository()
+
+    class Runtime:
+        def __init__(self, *, owned_by_run: bool) -> None:
+            assert owned_by_run
+
+        def create_workspace(self, _request: object) -> SimpleNamespace:
+            return SimpleNamespace(id="workspace")
+
+        def workspace(self, workspace_id: str) -> Client:
+            assert workspace_id == "workspace"
+            return client
+
+    reports = iter(
+        [
+            {"verdict": "FAIL", "summary": "broken", "repositories": [str(repository)]},
+            {"verdict": "PASS", "summary": "fixed", "repositories": [str(repository)]},
+        ]
+    )
+    child_ids: list[int] = []
+    review_codes: list[str] = []
+
+    def start_child(
+        code: str, *, timeout: float, stop_with_parent: bool, review_json: str
+    ) -> int:
+        assert 0 < timeout <= 30
+        assert stop_with_parent
+        assert json.loads(review_json)["mode"] == "review"
+        review_codes.append(code)
+        run_id = len(child_ids) + 1
+        child_ids.append(run_id)
+        return run_id
+
+    def wait_child(run_id: int, *, timeout: float) -> ChildRunResult:
+        assert timeout > 0
+        report = next(reports)
+        return ChildRunResult(
+            run_id, "success", 0, "diagnostic output", "", review_result=report
+        )
+
+    monkeypatch.setattr(purplemux_client, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(purplemux_client, "GitRepository", RepositoryType)
+    monkeypatch.setattr(purplemux_client, "emit_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(purplemux_client.workflow, "start_child_run", start_child)
+    monkeypatch.setattr(purplemux_client.workflow, "wait_child_run", wait_child)
+
+    config = parse_review_fix_json(
+        declaration(repository, max_iterations=3, timeout=30)
+    )
+    output = StringIO()
+    with redirect_stdout(output):
+        exec(compile(generate_review_fix_workflow(config), "<review-fix>", "exec"), {})
+
+    result = json.loads(output.getvalue())
+    assert result["verdict"] == "PASS"
+    assert child_ids == [1, 2]
+    assert all("http://127.0.0.1:3000/api/health" in code for code in review_codes)
+    assert all(
+        expected in review_codes[index]
+        for index, expected in enumerate(
+            (
+                "managed PurpleMux workspace workspace, tab service-1",
+                "managed PurpleMux workspace workspace, tab service-2",
+            )
+        )
+    )
+    assert len(client.prompts) == 2
+    assert '"verdict": "FAIL"' in client.prompts[0]
+    assert "finish with a clean worktree" in client.prompts[0]
+    assert "Co-authored-by: Codex <noreply@openai.com>" in client.prompts[0]
+    assert "AWM-Agent: codex" in client.prompts[0]
+    assert "AWM-Process: implementation" in client.prompts[0]
+    assert "worktree must be clean" in client.prompts[1]
+    assert result["iterations"][0]["implementation_sha"] == "b" * 40
+    assert "implementation" in client.closed
+    assert client.services == 2
+    assert "service-1" in client.closed
+    assert "service-2" in client.closed

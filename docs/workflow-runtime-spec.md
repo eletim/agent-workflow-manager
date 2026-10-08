@@ -69,16 +69,22 @@ directory, or worktree identities are returned and registered.
 
 ## Child Run control contract
 
-A running Python Workflow can call `start_child_run(code, args=(), target_id=None)`,
+A running Python Workflow can call `start_child_run(code, args=(),
+target_id=None, timeout=None, stop_with_parent=False, review_json=None)`,
 `get_child_run_result(run_id, target_id=None)`, and
-`wait_child_run(run_id, timeout=None, target_id=None)`. Python owns when to start,
-wait, branch, retry after authoritative inspection, or reject a final child result.
-The Runner does not schedule a graph or infer these decisions from progress.
+`wait_child_run(run_id, timeout=None, target_id=None)`. It can also call
+`stop_child_run(run_id, target_id=None, timeout=None)` for a local child; this
+returns `True` when a stop was requested and `False` when the child was already
+terminal. Stopping external children is not supported. Python owns when to start,
+wait, stop explicitly, branch, retry after authoritative inspection, or reject a
+final child result. The Runner does not schedule a graph or infer these decisions
+from progress.
 
 The Runner supplies `AGENT_WORKFLOW_MANAGER_CONTROL_URL` and
 `AGENT_WORKFLOW_MANAGER_CONTROL_TOKEN` to each Workflow process. This dedicated
-local HTTP control receiver accepts authenticated `start` and `result` requests
-with `X-AWM-Run-Token`; it is separate from the observational event receiver.
+local HTTP control receiver accepts authenticated `start`, `result`, and `stop`
+requests, plus `review_result` and `review_fix_result` publication, with
+`X-AWM-Run-Token`; it is separate from the observational event receiver.
 Only an active, non-stopping parent may use its credential, and result access is
 limited to that parent's known children. The control credential is not an external
 AWM request token. External registrations and credential resolution belong to the
@@ -86,23 +92,33 @@ calling server, not to workflow code or progress events.
 
 Starting creates an ordinary Run using the existing Runner lifecycle, output,
 Progress, Result, Stop, notifications, and history. Local family links are persisted
-before child execution. For external work the destination persists the supplied
+before child execution. A local child launched with `review_json` is a Review Run;
+its terminal `ChildRunResult.review_result` carries the durable structured Review
+decision independently of stdout. Review metadata is not supported for external
+children. For external work the destination persists the supplied
 full parent identity before execution, and the source records a received child
 identity even if the remaining launch response is uncertain. An unavailable launch
 identity cannot be invented; inspect the destination history. Each instance retains
 its family links independently across restart. Numeric IDs alone do not establish
 cross-instance ownership; result observation checks the authorized full identity.
 
-A final `ChildRunResult` contains `run_id`, `state`, `exit_code`, `stdout`, and
-`stderr`. Failed and stopped children return final results too; they do not
-implicitly fail their parent. Only Python's own exit determines the parent outcome.
-Progress remains observational, including a child's completed step before a later
-failure. `None` means confirmed running, never an unknown result. A wait deadline
-raises `TimeoutError` without stopping the child. External communication or invalid
-results raise `ExternalRunError`; an uncertain launch raises
-`ExternalRunLaunchUnknown` and must not be blindly retried. Control transport
-failures also remain exceptions. There is no automatic child cancellation or
-restart/replay contract: inspect each ordinary Run and use its explicit Stop action.
+A final `ChildRunResult` contains `run_id`, `state`, `exit_code`, `stdout`,
+`stderr`, and optional `review_result`. The structured Review value is present
+for a successful local Review child that published one; it is not inferred from
+stdout. Failed and stopped children return final results too; they do not
+implicitly fail their parent. Only Python's own exit determines the parent
+outcome. Progress remains observational, including a child's completed step
+before a later failure. `None` means confirmed running, never an unknown result.
+A wait deadline raises `TimeoutError` without stopping the child. External
+communication or invalid results raise `ExternalRunError`; an uncertain launch
+raises `ExternalRunLaunchUnknown` and must not be blindly retried. Control
+transport failures also remain exceptions.
+
+For a local child started with `stop_with_parent=True`, the Runner automatically
+requests Stop if that child is still running when the parent becomes terminal,
+including after parent success, failure, or stop. This is best-effort cancellation,
+not restart or replay, and does not apply to external children. Other children
+remain independent and require an explicit `stop_child_run` call or Stop action.
 
 Registration setup and a runnable local/two-instance Python example are documented
 in the [README](../README.md) and [child Workflow](../examples/child-runs.py).
