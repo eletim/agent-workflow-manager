@@ -25,7 +25,7 @@ h2, label { font-size: 14px; font-weight: 650; }
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(340px, 360px) minmax(0, 1fr);
+  grid-template-columns: minmax(390px, 420px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -119,12 +119,13 @@ body:not(.runtime-view-active) #exit-code { display: none; }
   position: relative;
   width: 100%;
   min-width: 0;
-  padding: 9px 10px 9px 30px;
+  min-height: 52px;
+  padding: 11px 12px 11px 32px;
   overflow: hidden;
   text-align: left;
   white-space: pre-line;
   overflow-wrap: anywhere;
-  font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .run-item.has-check-toggle { grid-column: 1; }
 .run-check-toggle {
@@ -619,7 +620,8 @@ dialog {
 }
 dialog::backdrop { background: rgb(5 7 11 / 75%); }
 .directory-picker-dialog {
-  height: min(620px, calc(100dvh - 32px));
+  width: min(1120px, calc(100% - 32px));
+  height: min(760px, calc(100dvh - 32px));
   max-height: calc(100dvh - 32px);
   overflow: hidden;
 }
@@ -744,7 +746,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
 #settings-message.success-message { color: #75e2a8; }
 
 @media (max-width: 900px) {
-  .app-shell { grid-template-columns: 320px minmax(0, 1fr); }
+  .app-shell { grid-template-columns: 340px minmax(0, 1fr); }
   .workspace-toolbar { align-items: stretch; flex-direction: column; }
   .workspace-toolbar .controls { flex-wrap: wrap; }
 }
@@ -784,6 +786,7 @@ dialog::backdrop { background: rgb(5 7 11 / 75%); }
   .progress-time { grid-row: 2; white-space: normal; }
   .generated-heading { align-items: stretch; flex-direction: column; }
   dialog { width: calc(100% - 16px); height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); }
+  .directory-picker-dialog { width: calc(100% - 16px); height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); }
   .guide-toolbar, .directory-picker-toolbar { align-items: flex-start; }
   .guide-actions { flex-wrap: wrap; justify-content: flex-end; }
   .directory-picker-navigation { align-items: stretch; flex-direction: column; }
