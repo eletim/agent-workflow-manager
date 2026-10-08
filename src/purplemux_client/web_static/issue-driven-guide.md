@@ -32,54 +32,28 @@ decision, and Review records it needs.
 
 ## Repository semantics
 
-## Branch selection: continuing existing implementation
+### Continuing from an existing implementation branch
 
-When implementation is already committed on an existing branch (for example, by a
-Prompt run), and an Issue Driven / One-Shot run should continue from that code,
-use the **existing implementation branch as `final_branch`**. Choose a
-**new name for `integration_branch`** and set
-`make_integration_branch: true`. AWM creates the new integration branch from
-the exact remote `final_branch` HEAD. The One-Shot work items are delivered
-to that integration branch; the final PR targets the existing implementation
-branch. `merge_final: false` leaves that final delivery unmerged.
+To run One-Shot on code already committed by a Prompt run:
 
-```text
-main
-  └── feat/existing-implementation    (already committed)
-       └── feat/one-shot-followup      (new integration branch)
-            └── One-Shot work items
-```
+- `final_branch`: existing implementation branch (not necessarily `main`).
+- `integration_branch`: a new branch name for the One-Shot changes.
+- `make_integration_branch: true`: create the integration branch from
+  the remote `final_branch` HEAD.
+
+Example (other required fields omitted):
 
 ```json
 {
-  "mode": "issue-driven",
-  "repository": "~/path/to/existing/repository",
-  "integration_branch": "feat/one-shot-followup",
   "final_branch": "feat/existing-implementation",
-  "make_integration_branch": true,
-  "one_shot_issue": 97,
-  "max_reviews": 4,
-  "scope_max_reviews": 6,
-  "implementer_agent": "codex",
-  "reviewer_agent": "claude",
-  "merge_to_integration": true,
-  "final_review": true,
-  "merge_final": false
+  "integration_branch": "feat/one-shot-followup",
+  "make_integration_branch": true
 }
 ```
 
-The names are examples; choose a currently unused integration branch name.
-The existing implementation branch must exist on the remote, including the
-commits to carry forward. `final_branch` is not required to be `main`.
-
-**Do not set `make_integration_branch: false` and use a pre-existing
-Prompt-created PR branch as `integration_branch` merely to reuse its commits.**
-That flag uses the named branch as an existing integration branch; it does not
-initialize One-Shot planning/recovery state for an unrelated existing PR.
-In particular, an existing Base PR without AWM's work-item plan recovery state
-may fail with `Base PR is missing work-item plan recovery state`.
-For this continuation case, create a distinct integration branch from the
-existing implementation branch as shown above.
+Do not reuse a Prompt-created PR branch as `integration_branch` with
+`make_integration_branch: false`: its PR may lack One-Shot recovery state
+and fail with `Base PR is missing work-item plan recovery state`.
 
 `repository` is the path to the existing source repository. `integration_branch`
 is the remote/integration branch to develop on. By default, the generated Python
