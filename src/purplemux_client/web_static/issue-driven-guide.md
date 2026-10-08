@@ -32,6 +32,29 @@ decision, and Review records it needs.
 
 ## Repository semantics
 
+### Continuing from an existing implementation branch
+
+To run One-Shot on code already committed by a Prompt run:
+
+- `final_branch`: existing implementation branch (not necessarily `main`).
+- `integration_branch`: a new branch name for the One-Shot changes.
+- `make_integration_branch: true`: create the integration branch from
+  the remote `final_branch` HEAD.
+
+Example (other required fields omitted):
+
+```json
+{
+  "final_branch": "feat/existing-implementation",
+  "integration_branch": "feat/one-shot-followup",
+  "make_integration_branch": true
+}
+```
+
+Do not reuse a Prompt-created PR branch as `integration_branch` with
+`make_integration_branch: false`: its PR may lack One-Shot recovery state
+and fail with `Base PR is missing work-item plan recovery state`.
+
 `repository` is the path to the existing source repository. `integration_branch`
 is the remote/integration branch to develop on. By default, the generated Python
 calls `prepare_run_repository(repo=repository, base_branch=integration_branch)`
@@ -389,6 +412,9 @@ does not reconstruct the terminated Python process.
   manager to create and revise the mini-task plan during the run.
 - Give each mini task a stable lowercase kebab-case ID and a self-contained,
   short authoritative instruction. Do not create a GitHub Issue for it.
+- When continuing an existing Prompt implementation, put that existing remote
+  branch in `final_branch`, name a new `integration_branch`, and set
+  `make_integration_branch: true`. Do not default `final_branch` to `main`.
 - Set `make_integration_branch` to true only when the integration branch should
   be created or validated as descending from the exact `final_branch` HEAD.
 - Use `policy_issue` only for shared version design context, never for workflow
