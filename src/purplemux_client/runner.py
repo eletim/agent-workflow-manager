@@ -3536,10 +3536,9 @@ class PythonRunner:
             expected_panel = resource.metadata.get("panel_type")
             if expected_name is not None and selected.name != expected_name:
                 raise OSError("PurpleMux tab name changed; refusing cleanup")
-            if (
-                expected_panel is not None
-                and (selected.panel_type or "") != expected_panel
-            ):
+            if expected_panel is not None and self._canonical_tab_panel_type(
+                selected.panel_type
+            ) != self._canonical_tab_panel_type(expected_panel):
                 raise OSError("PurpleMux tab type changed; refusing cleanup")
             expected_provider = resource.metadata.get("provider")
             if (
@@ -3584,6 +3583,11 @@ class PythonRunner:
             self._cleanup_git_worktree(resource)
             return
         raise OSError(f"unsupported run resource kind: {resource.kind}")
+
+    @staticmethod
+    def _canonical_tab_panel_type(panel_type: str | None) -> str:
+        """Normalize PurpleMux's omitted default panel to its terminal meaning."""
+        return panel_type or "terminal"
 
     @staticmethod
     def _resource_is_absent(resource: RunResource) -> bool:

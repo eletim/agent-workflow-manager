@@ -20,7 +20,7 @@ import pytest
 
 import purplemux_client.runner as runner_module
 import purplemux_client.web as web_module
-from purplemux_client import WorkspaceState
+from purplemux_client import TabState, WorkspaceState
 from purplemux_client.errors import MutationOutcomeUnknown
 from purplemux_client.issue_driven import (
     issue_driven_run_preview,
@@ -1236,6 +1236,60 @@ register_run_resource("git_worktree", "/tmp/worktree", {"repository": "/tmp/repo
     assert all(item.cleanup_state == "cleaned" for item in after.resources)
     assert after.as_json()["resourceCleanupStatus"] == "cleaned"
     assert runner.snapshot(result.run_id).state == "success"
+
+
+def test_cleanup_treats_omitted_default_panel_as_terminal(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-owned", {
+    "name": "Owned", "directories": "/repo",
+    "initial_tab_id": "tab-initial", "initial_tab_name": "",
+    "initial_tab_panel_type": "terminal", "initial_tab_provider": "",
+})
+"""
+    )
+    result = wait_until_finished(runner)
+    workspace = WorkspaceState("ws-owned", "Owned", ("/repo",))
+    tabs = [TabState("tab-initial", "ws-owned", "", None, None)]
+    deleted: list[str] = []
+
+    class Runtime:
+        def list_workspaces(self) -> tuple[WorkspaceState, ...]:
+            return () if deleted else (workspace,)
+
+        def delete_workspace(
+            self, workspace_id: str, *, expected_state: WorkspaceState
+        ) -> None:
+            assert workspace_id == "ws-owned"
+            assert expected_state == workspace
+            assert tabs == []
+            deleted.append(workspace_id)
+
+    class Client:
+        def list_sessions(self) -> tuple[TabState, ...]:
+            return tuple(tabs)
+
+        def close_session(self, session_id: str, *, expected_state: TabState) -> None:
+            assert session_id == "tab-initial"
+            assert expected_state == tabs[0]
+            tabs.clear()
+
+    monkeypatch.setattr(runner_module, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(
+        runner_module, "PurpleMuxCLIClient", lambda _workspace: Client()
+    )
+
+    cleaned = runner.cleanup(result.run_id or 0)
+
+    assert deleted == ["ws-owned"]
+    assert [resource.cleanup_state for resource in cleaned.resources] == [
+        "cleaned",
+        "cleaned",
+    ]
+    assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
 
 
 def test_cleanup_aggregates_sibling_failures_and_blocks_parent_resources(
