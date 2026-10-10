@@ -233,10 +233,13 @@ emit_step("workspace create", "completed")</textarea>
       </section>
 
       <section id="resources-panel" class="panel recovery-panel" aria-live="polite" hidden>
-        <h2>Owned resources</h2>
+        <h2>Cleanup</h2>
         <p id="resources-summary"></p>
-        <p id="execution-context-details"></p>
-        <ol id="resources" class="attempt-history"></ol>
+        <details>
+          <summary>Details</summary>
+          <p id="execution-context-details"></p>
+          <ol id="resources" class="attempt-history"></ol>
+        </details>
       </section>
 
       <section id="validation-panel" class="panel validation-panel" aria-live="polite" hidden>

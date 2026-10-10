@@ -1002,12 +1002,15 @@ async function enterDraftMode(mode = currentMode) {
 }
 
 function renderResources(result) {
-  const resources = result.resources || [];
-  resourcesPanel.hidden = result.runId == null;
+  const resources = (result.resources || []).filter(resource => resource.cleanupState !== "cleaned");
+  resourcesPanel.hidden = result.runId == null || resources.length === 0;
   const status = result.resourceCleanupStatus || "cleaned";
-  resourcesSummary.textContent = resources.length === 0
-    ? "No run-owned resources were registered."
-    : `${resources.length} registered — ${status.replaceAll("_", " ")}.`;
+  const errors = resources.filter(resource => resource.cleanupError).length;
+  resourcesSummary.textContent = status === "cleaning"
+    ? "Cleaning up…"
+    : errors > 0
+      ? `${resources.length} remaining · ${errors} failed. Open Details for errors.`
+      : `${resources.length} remaining`;
   const context = result.executionContext;
   executionContextDetails.hidden = context == null;
   executionContextDetails.textContent = context == null
