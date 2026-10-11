@@ -3528,7 +3528,15 @@ class PythonRunner:
             if not workspace_id:
                 raise OSError("PurpleMux tab ownership lacks workspace_id")
             client = PurpleMuxCLIClient(workspace_id)
-            tabs = client.list_sessions()
+            try:
+                tabs = client.list_sessions()
+            except Exception:
+                if all(
+                    workspace.id != workspace_id
+                    for workspace in PurpleMuxRuntime().list_workspaces()
+                ):
+                    return
+                raise
             selected = next((tab for tab in tabs if tab.id == resource.identity), None)
             if selected is None:
                 return
@@ -3597,10 +3605,16 @@ class PythonRunner:
             workspace_id = resource.metadata.get("workspace_id")
             if not workspace_id:
                 raise OSError("PurpleMux tab ownership lacks workspace_id")
-            return all(
-                tab.id != resource.identity
-                for tab in PurpleMuxCLIClient(workspace_id).list_sessions()
-            )
+            try:
+                tabs = PurpleMuxCLIClient(workspace_id).list_sessions()
+            except Exception:
+                if all(
+                    workspace.id != workspace_id
+                    for workspace in PurpleMuxRuntime().list_workspaces()
+                ):
+                    return True
+                raise
+            return all(tab.id != resource.identity for tab in tabs)
         if resource.kind == "purplemux_workspace":
             return all(
                 workspace.id != resource.identity

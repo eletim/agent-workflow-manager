@@ -1594,6 +1594,56 @@ def test_managed_shell_result_cleanup_rejects_replaced_directory_without_unlinki
     assert protected_result.read_text(encoding="utf-8") == "replacement"
 
 
+def test_cleanup_completes_when_workspace_and_tabs_are_already_absent(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.start(
+        """
+from purplemux_client import register_run_resource
+register_run_resource("purplemux_workspace", "ws-gone", {})
+register_run_resource("purplemux_tab", "tab-gone", {"workspace_id": "ws-gone"})
+"""
+    )
+    result = wait_until_finished(runner)
+
+    class Runtime:
+        def list_workspaces(self) -> tuple[WorkspaceState, ...]:
+            return ()
+
+    class Client:
+        def list_sessions(self) -> tuple[TabState, ...]:
+            raise OSError("workspace was not found")
+
+    monkeypatch.setattr(runner_module, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(runner_module, "PurpleMuxCLIClient", lambda _workspace: Client())
+
+    assert runner._resource_is_absent(result.resources[1])
+    cleaned = runner.cleanup(result.run_id or 0)
+    assert all(resource.cleanup_state == "cleaned" for resource in cleaned.resources)
+    assert cleaned.as_json()["resourceCleanupStatus"] == "cleaned"
+
+
+def test_tab_cleanup_keeps_listing_failure_when_workspace_still_exists(
+    runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Runtime:
+        def list_workspaces(self) -> tuple[WorkspaceState, ...]:
+            return (WorkspaceState("ws-owned", "Owned", ("/repo",)),)
+
+    class Client:
+        def list_sessions(self) -> tuple[TabState, ...]:
+            raise OSError("could not list tabs")
+
+    monkeypatch.setattr(runner_module, "PurpleMuxRuntime", Runtime)
+    monkeypatch.setattr(runner_module, "PurpleMuxCLIClient", lambda _workspace: Client())
+    resource = RunResource("purplemux_tab", "tab-1", {"workspace_id": "ws-owned"})
+
+    with pytest.raises(OSError, match="could not list tabs"):
+        runner._cleanup_resource(resource)
+    with pytest.raises(OSError, match="could not list tabs"):
+        runner._resource_is_absent(resource)
+
+
 def test_workspace_cleanup_releases_verified_empty_workspace(
     runner: PythonRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
