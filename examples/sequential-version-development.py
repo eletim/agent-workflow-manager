@@ -153,7 +153,10 @@ REVIEWER_AUDIT_GUARD = (
     f"concise strings of at most {MAX_POLICY_CONFLICT_DETAIL_CHARS} UTF-8 bytes "
     "and must be empty unless a configured policy Issue clearly conflicts. Do "
     "not use Markdown fences or include raw logs, environment values, "
-    "credentials, tokens, secrets, or any extra keys or prose."
+    "credentials, tokens, secrets, or any extra keys or prose. "
+    "In findings and policy_conflicts, avoid control characters, <, >, {, }, "
+    "backticks, and =; describe code and values in plain text. Avoid literal "
+    "opaque values of 32 or more characters."
 )
 
 
@@ -1079,7 +1082,9 @@ def run_validated_turn(
                     f"contract: {validation_error}\n\n"
                     "Return the complete corrected response only, following the "
                     "original response contract. Correct the output in this same "
-                    "session; do not repeat the underlying task or mutate any state.",
+                    "session; do not repeat the underlying task or mutate any state. "
+                    "You may rephrase rejected text while preserving the original "
+                    "verdict and every substantive finding.",
                     repository_identity=repository_identity,
                     iteration=correction,
                     pr=pr,
@@ -1103,7 +1108,10 @@ def run_validated_turn(
                     "that existing context and repair only the response-contract "
                     "failure. Do not repeat the underlying review/task and do not "
                     "mutate files, Git, or GitHub. Return the complete corrected "
-                    "machine-readable response only.",
+                    "machine-readable response only. You may rephrase rejected "
+                    "text while preserving the original verdict and every "
+                    "substantive finding. Do not turn a rejected CHANGES_REQUESTED "
+                    "response into APPROVED or discard its findings.",
                     repository_identity=repository_identity,
                     iteration=recovery,
                     pr=pr,
@@ -1329,7 +1337,7 @@ _SENSITIVE_REVIEW_TEXT = re.compile(
     r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)"
 )
 _RAW_REVIEW_OUTPUT = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:\$\s|Traceback \(most recent call last\):|"
+    r"(?<![A-Za-z0-9_])(?:\$\s|(?i:Traceback \(most recent call last\):)|"
     r"\d{4}-\d\d-\d\d[ T]"
     r"\d\d:\d\d|FAILED(?:\s|:)|ERROR(?:\s|:)|npm ERR!\s|"
     r"\[(?:DEBUG|ERROR|FATAL|INFO|TRACE|WARN|WARNING)\])"
@@ -1342,23 +1350,33 @@ _PLANNER_LOW_LEVEL_TEXT = re.compile(
 
 
 def _safe_review_text(value: object, *, max_bytes: int) -> bool:
+    return _review_text_error(value, max_bytes=max_bytes) is None
+
+
+def _review_text_error(value: object, *, max_bytes: int) -> str | None:
+    if not isinstance(value, str):
+        return "must be a string"
     if (
-        not isinstance(value, str)
-        or not value
+        not value
         or value != value.strip()
         or "\n" in value
         or "\0" in value
         or "```" in value
         or any(0xD800 <= ord(character) <= 0xDFFF for character in value)
     ):
-        return False
-    return (
-        len(value.encode()) <= max_bytes
-        and _PERSISTENCE_SAFE_REVIEW_TEXT.fullmatch(value) is not None
-        and _RAW_REVIEW_OUTPUT.search(value) is None
-        and _SENSITIVE_REVIEW_TEXT.search(value) is None
-        and _OPAQUE_SECRET_LIKE_VALUE.search(value) is None
-    )
+        return "must be nonempty single-line text without surrounding whitespace, control characters, or surrogate characters"
+    if len(value.encode()) > max_bytes:
+        return f"exceeds {max_bytes} UTF-8 bytes"
+    if _PERSISTENCE_SAFE_REVIEW_TEXT.fullmatch(value) is None:
+        return "contains a forbidden character: control characters, <, >, {, }, backtick, or =; rephrase the text"
+    marker = _RAW_REVIEW_OUTPUT.search(value)
+    if marker is not None:
+        return f"matched log marker {marker.group()!r} at character {marker.start()}; describe the failure in prose"
+    if _SENSITIVE_REVIEW_TEXT.search(value) is not None:
+        return "matched secret-value pattern; remove the value and retain the actionable finding"
+    if _OPAQUE_SECRET_LIKE_VALUE.search(value) is not None:
+        return "matched an opaque value of 32 or more characters; describe it without the literal value"
+    return None
 
 
 def review_assessment(result: str) -> ReviewAssessment:
@@ -1385,9 +1403,11 @@ def review_assessment(result: str) -> ReviewAssessment:
         raise WorkerFailure(
             f"reviewer findings must be an array of at most {MAX_REVIEW_FINDINGS} items"
         )
-    for finding in findings:
-        if not _safe_review_text(finding, max_bytes=MAX_REVIEW_FINDING_BYTES):
+    for index, finding in enumerate(findings):
+        error = _review_text_error(finding, max_bytes=MAX_REVIEW_FINDING_BYTES)
+        if error is not None:
             raise WorkerFailure(
+                f"findings[{index}]: {error}. "
                 "reviewer findings must be concise single-line actionable text "
                 "without logs or secret-like values"
             )
@@ -1399,14 +1419,12 @@ def review_assessment(result: str) -> ReviewAssessment:
     if (
         not isinstance(policy_conflicts, list)
         or len(policy_conflicts) > MAX_PLANNER_POLICY_CONFLICTS
-        or any(
-            not _safe_review_text(
-                conflict, max_bytes=MAX_POLICY_CONFLICT_DETAIL_CHARS
-            )
-            for conflict in policy_conflicts
-        )
     ):
         raise WorkerFailure("reviewer policy_conflicts array is invalid or unsafe")
+    for index, conflict in enumerate(policy_conflicts):
+        error = _review_text_error(conflict, max_bytes=MAX_POLICY_CONFLICT_DETAIL_CHARS)
+        if error is not None:
+            raise WorkerFailure(f"policy_conflicts[{index}]: {error}")
     return ReviewAssessment(verdict, tuple(findings), tuple(policy_conflicts))
 
 

@@ -615,6 +615,8 @@ def test_decision_rejects_verdicts_inconsistent_with_findings(result: str) -> No
         "Use bearer authentication only after validating the authorization header.",
         "The password was logged without redaction.",
         "Credential validation appeared incomplete.",
+        "Surface an error when the Role cannot be derived instead of leaving the register panel stuck loading",
+        "Report failed requests in the register panel.",
     ],
 )
 def test_review_findings_allow_security_vocabulary_without_values(
@@ -650,6 +652,56 @@ def test_review_findings_reject_secret_values_and_embedded_raw_logs(
 
     with pytest.raises(WorkerFailure, match="without logs or secret-like values"):
         workflow["review_assessment"](review_result("CHANGES_REQUESTED", (finding,)))
+
+
+@pytest.mark.parametrize(
+    ("finding", "reason"),
+    [
+        ("Observed failure: ERROR loading record", "matched log marker 'ERROR '"),
+        ("Observed failure: FAILED request", "matched log marker 'FAILED '"),
+        ("Fix the `Role` lookup", "forbidden character"),
+        ("Token abc123 was logged", "secret-value pattern"),
+        ("x" * 1000, "UTF-8 bytes"),
+    ],
+)
+def test_review_validation_identifies_rejected_finding_and_rule(
+    finding: str, reason: str
+) -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    with pytest.raises(WorkerFailure) as caught:
+        workflow["review_assessment"](
+            review_result("CHANGES_REQUESTED", ("Fix the lookup.", finding))
+        )
+    assert "findings[1]:" in str(caught.value)
+    assert reason in str(caught.value)
+    assert "abc123" not in str(caught.value)
+
+
+def test_review_recovery_receives_specific_error_and_preserves_requested_changes() -> None:
+    workflow = runpy.run_path(str(EXAMPLE))
+    rejected = review_result("CHANGES_REQUESTED", ("Observed failure: ERROR loading record",))
+    corrected = review_result("CHANGES_REQUESTED", ("Show the record loading failure.",))
+    responses = iter([rejected] * 3 + [corrected])
+    turns = []
+
+    def execute_turn(_client, tab, name, prompt, **kwargs):
+        turns.append((tab, name, prompt))
+        return next(responses)
+
+    workflow["run_validated_turn"].__globals__["run_turn"] = execute_turn
+    result, verdict = workflow["run_validated_turn"](
+        object(), "reviewer-tab", "Correctness review", "Review this.",
+        workflow["decision"], repository_identity="acme/project",
+    )
+    assert result == corrected
+    assert verdict == "CHANGES_REQUESTED"
+    assert len(turns) == 4
+    assert all(tab == "reviewer-tab" for tab, _, _ in turns)
+    for _, _, prompt in turns[1:]:
+        assert "findings[0]:" in prompt
+        assert "matched log marker 'ERROR '" in prompt
+        assert "preserving the original verdict" in prompt
+    assert turns[-1][1] == "Correctness review same-agent recovery"
 
 
 @pytest.mark.parametrize(
