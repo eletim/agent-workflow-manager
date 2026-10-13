@@ -117,6 +117,11 @@ class TopologyGitHub:
         self.failure = failure
         self.comparison_calls: list[tuple[str, str]] = []
 
+    def require_branch_owner(self, *, head: str, base: str) -> None:
+        PullRequestSnapshot("acme/project", self.prs).require_branch_owner(
+            head=head, base=base
+        )
+
     def find_pr(self, *, head: str, base: str, state: str):
         if self.failure is not None:
             raise self.failure
@@ -1018,7 +1023,7 @@ def test_inline_mini_tasks_fit_the_persisted_plan_size_boundary() -> None:
         [
             {"id": "task-7", "task": "x"},
             {"id": "task-8", "task": "x"},
-            {"id": "task-9", "task": "x" * 3602},
+            {"id": "task-9", "task": "x" * 3072},
         ]
     )
 
@@ -2354,7 +2359,9 @@ def test_resume_uses_dispatched_inline_task_identity_after_planner_update(
         work_items=[{"id": "refresh-run-help", "task": original_task}]
     )
     revised_task = "Refresh the New Run help and document Resume behavior."
-    revised = workflow["planner_inline_issue"]("refresh-run-help", revised_task)
+    revised = workflow["planner_inline_issue"](
+        "refresh-run-help", revised_task, integration_branch="dev/v0.2.0"
+    )
     base_sha = "b" * 40
     feature_sha = "f" * 40
     child_pr = replace(
@@ -2971,6 +2978,8 @@ def test_repository_failure_starts_recovery_with_current_inspection() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     repo = SimpleNamespace(
+        inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="feature/work", dirty=False, status=()
         ),
@@ -3038,6 +3047,8 @@ def test_repository_recovery_rejects_unrecoverable_report(
         return BranchState(branch, "b" * 40, "b" * 40, True)
 
     repo = SimpleNamespace(
+        inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
@@ -3095,6 +3106,8 @@ def test_repository_recovery_reinspects_and_continues_with_a_fresh_plan() -> Non
         return BranchState(branch, "b" * 40, "b" * 40, True)
 
     repo = SimpleNamespace(
+        inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
@@ -3181,6 +3194,8 @@ def test_repository_recovery_fails_when_post_repair_inspection_is_uncertain() ->
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     repo = SimpleNamespace(
+        inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=True, status=(" M file",)
         ),
@@ -3292,7 +3307,8 @@ def test_retry_state_rejects_mismatched_active_and_base_pr_heads() -> None:
         "worktree": {"dirty": False, "current_branch": "feature/issue-90"},
         "remote_heads": {"dev/v1": "a" * 40, "main": "b" * 40},
         "active_branch": {"name": "feature/issue-90", "local_sha": "c" * 40,
-                          "remote_sha": "c" * 40, "current": True},
+                          "remote_sha": "c" * 40, "current": True,
+                          "checkout_branch": "feature/issue-90"},
         "active_prs": [{"number": 90, "state": "OPEN", "head_sha": "d" * 40,
                         "base_sha": "a" * 40}],
         "base_pr": None,
@@ -3316,6 +3332,8 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
         Path("/repo"), "acme/project", "dev/v1", "main", (), "true"
     )
     repo = SimpleNamespace(
+        inspect_local_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
+        inspect_remote_branch_heads=lambda: {"dev/v1": "b" * 40, "feature/work": "b" * 40},
         inspect_worktree=lambda: SimpleNamespace(
             current_branch="dev/v1", dirty=False, status=()
         ),
@@ -3337,7 +3355,7 @@ def test_repository_recovery_has_a_finite_retry_limit() -> None:
             "integration_branch": "dev/v1",
             "final_branch": "main",
             "work_item_plan": {"active": None},
-            "worktree": {"dirty": False},
+            "worktree": {"dirty": False, "current_branch": "dev/v1"},
             "remote_heads": {"dev/v1": "a" * 40, "main": "b" * 40},
             "base_pr": None,
         }
@@ -3634,6 +3652,7 @@ def test_recovery_context_includes_active_work_item_and_plan_position() -> None:
         "local_sha": "c" * 40,
         "remote_sha": "d" * 40,
         "current": True,
+        "checkout_branch": issue.branch,
     }
     assert state["active_prs"] == [
         {
@@ -3846,7 +3865,7 @@ def test_planner_rejects_oversized_plan_transactionally() -> None:
 
 def test_plan_size_boundary_reserves_multi_digit_dispatch_position() -> None:
     workflow = load_generated_workflow(issues=[90])
-    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3602]
+    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3242]
     issues = tuple(
         workflow["planner_inline_issue"](f"task-{index}", task)
         for index, task in enumerate(tasks)
@@ -4258,7 +4277,7 @@ def test_policy_conflicts_and_base_pr_body_have_aggregate_budgets() -> None:
 
 def test_near_max_plan_conflicts_and_handoff_fail_before_body_mutation() -> None:
     workflow = load_generated_workflow(issues=[90], policy_issue=200)
-    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3602]
+    tasks = ["x" * 4000 for _ in range(7)] + ["x", "x", "x" * 3242]
     issues = tuple(
         workflow["planner_inline_issue"](f"task-{index}", task)
         for index, task in enumerate(tasks)

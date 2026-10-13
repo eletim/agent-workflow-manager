@@ -10,6 +10,10 @@ class WorkerFailure(TerminalSessionError):
     """Raised when a PurpleMux-backed worker or CLI operation fails."""
 
 
+class BranchOwnershipError(WorkerFailure):
+    """A work-item branch belongs to another workflow and must not be repaired."""
+
+
 class WorkerNeedsInput(TerminalSessionError):
     """Raised when a worker cannot complete without additional input."""
 

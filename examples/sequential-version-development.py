@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal, TypeVar
 
 from purplemux_client import (
+    BranchOwnershipError,
     CreateSessionRequest,
     CreateWorkspaceRequest,
     GitHubRepository,
@@ -50,6 +51,7 @@ from purplemux_client import (
     require_inline_task_pr_fingerprint,
     run_correlation,
 )
+from purplemux_client.issue_driven import inline_task_branch
 
 WORKFLOW_PREFLIGHT = {"commands": ["git", "gh", "purplemux"]}
 WORKFLOW_DRY_RUN = 1
@@ -197,7 +199,8 @@ class Issue:
         actual = hashlib.sha256(self.task.encode()).hexdigest()
         if self.task_fingerprint != actual:
             raise ValueError("inline task fingerprint does not match its task")
-        if self.branch != f"feature/work-item-{self.task_id}":
+        legacy_branch = inline_task_branch(self.task_id)
+        if re.fullmatch(re.escape(legacy_branch) + r"(?:-[0-9a-f]{16})?", self.branch) is None:
             raise ValueError("inline task branch does not match its ID")
 
     @property
@@ -289,6 +292,11 @@ class WorkItemPlan:
     persisted_source: str | None = None
     skipped: list[PlannerSkip] = field(default_factory=list)
     active: Issue | None = field(default=None, repr=False)
+    _loaded_source: str | None = field(default=None, init=False, repr=False)
+    _loaded_version: int = field(default=2, init=False, repr=False)
+    _loaded_state: tuple[tuple[Issue, ...], int, bool] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.items = list(self.config.issues)
@@ -303,6 +311,14 @@ class WorkItemPlan:
             raise ValueError("work-item identities must be unique")
         if len(set(branches)) != len(branches):
             raise ValueError("work-item branches must be unique")
+        for issue in issues:
+            if issue.task_id is not None and issue.branch not in {
+                inline_task_branch(issue.task_id),
+                inline_task_branch(
+                    issue.task_id, integration_branch=self.config.integration_branch
+                ),
+            }:
+                raise ValueError("inline task branch does not match its integration")
         reserved = {self.config.integration_branch, self.config.main_branch}
         if len(reserved) != 2 or any(branch in reserved for branch in branches):
             raise ValueError(
@@ -1202,6 +1218,7 @@ def recover_error(
     authoritative_state: str,
     *,
     deferred_execution: list[_AgentTurnExecution] | None = None,
+    recovery_scope: str | None = None,
 ) -> RecoveryReport:
     """Start a dedicated recovery Agent for this error, never a resident agent."""
     if not isinstance(authoritative_state, str) or not authoritative_state.strip():
@@ -1236,7 +1253,13 @@ def recover_error(
                 "the affected state. If the outcome is uncertain, report retry_safe "
                 "as false. Do not reset, rebase, stash, force-push, merge a work-item "
                 "PR, create unrelated PRs, discard ambiguous work, or edit "
-                "agent-workflow-manager fingerprint markers. Return exactly one JSON "
+                "agent-workflow-manager fingerprint markers. Do not merge or "
+                "cherry-pick branch histories, create/delete branches, or modify "
+                "another work item's branch. A branch collision is not repaired "
+                "by merging the current integration base into the old branch. "
+                "Finish clean on the exact starting checkout branch. "
+                f"Allowed repair scope: {recovery_scope or 'inspect only; no branch mutations'}. "
+                "Return exactly one JSON "
                 "object with boolean repaired and retry_safe fields and concise "
                 "single-line summary and evidence strings (at most 500 UTF-8 bytes "
                 "each). Include evidence from the state after repair when "
@@ -3818,7 +3841,13 @@ workflow should proceed to whole-version delivery. Otherwise use complete=false.
 Do not use Markdown fences or add explanation outside the JSON object."""
 
 
-def planner_inline_issue(task_id: object, task: object) -> Issue:
+def planner_inline_issue(
+    task_id: object,
+    task: object,
+    *,
+    integration_branch: str | None = None,
+    branch: str | None = None,
+) -> Issue:
     if (
         not isinstance(task_id, str)
         or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", task_id) is None
@@ -3840,7 +3869,9 @@ def planner_inline_issue(task_id: object, task: object) -> Issue:
     fingerprint = hashlib.sha256(task.encode()).hexdigest()
     return Issue(
         None,
-        f"feature/work-item-{task_id}",
+        branch if branch is not None else inline_task_branch(
+            task_id, integration_branch=integration_branch
+        ),
         task_id,
         task,
         fingerprint,
@@ -3881,7 +3912,9 @@ def planner_key(value: object) -> int | str:
     return value
 
 
-def planner_added_issue(value: object) -> Issue:
+def planner_added_issue(
+    value: object, *, integration_branch: str | None = None
+) -> Issue:
     if isinstance(value, bool):
         raise WorkerFailure("planner added work item is invalid")
     if isinstance(value, int):
@@ -3890,10 +3923,12 @@ def planner_added_issue(value: object) -> Issue:
         return Issue(value, f"feature/issue-{value}")
     if not isinstance(value, dict) or set(value) != {"id", "task"}:
         raise WorkerFailure("planner added work item is invalid")
-    return planner_inline_issue(value["id"], value["task"])
+    return planner_inline_issue(
+        value["id"], value["task"], integration_branch=integration_branch
+    )
 
 
-def persisted_work_item(value: object) -> Issue:
+def persisted_work_item(value: object, *, version: int = 1) -> Issue:
     if isinstance(value, dict) and set(value) == {"issue", "branch"}:
         number = value["issue"]
         branch = value["branch"]
@@ -3908,6 +3943,14 @@ def persisted_work_item(value: object) -> Issue:
         ):
             raise WorkerFailure("persisted GitHub Issue work item is invalid")
         return Issue(number, branch)
+    if version == 2 and isinstance(value, dict) and "id" in value:
+        if set(value) != {"id", "task", "branch"} or not isinstance(
+            value["branch"], str
+        ):
+            raise WorkerFailure("persisted inline task branch is invalid")
+        return planner_inline_issue(
+            value["id"], value["task"], branch=value["branch"]
+        )
     return planner_added_issue(value)
 
 
@@ -3961,6 +4004,7 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
     candidate.items = list(plan.items)
     candidate.position = plan.position
     candidate.skipped = list(plan.skipped)
+    candidate._loaded_version = plan._loaded_version
     skipped_before = len(candidate.skipped)
     changes: list[str] = []
     try:
@@ -3971,7 +4015,9 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 raise WorkerFailure("planner action is invalid")
             kind = action["action"]
             if kind == "add" and set(action) == {"action", "item"}:
-                added = planner_added_issue(action["item"])
+                added = planner_added_issue(
+                    action["item"], integration_branch=plan.config.integration_branch
+                )
                 candidate.add(added)
                 changes.append(f"Added {added.label}.")
             elif kind == "update" and set(action) == {"action", "key", "task"}:
@@ -3980,7 +4026,9 @@ def apply_planner_decision(plan: WorkItemPlan, source: str) -> PlannerDecision:
                 current = candidate.items[index]
                 if current.task_id is None:
                     raise WorkerFailure("planner can update only an inline mini task")
-                updated = planner_inline_issue(current.task_id, action["task"])
+                updated = planner_inline_issue(
+                    current.task_id, action["task"], branch=current.branch
+                )
                 candidate.update(key, updated)
                 changes.append(f"Updated {current.label}.")
             elif kind == "skip" and set(action) == {"action", "key", "reason"}:
@@ -4090,10 +4138,29 @@ def plan_seed_fingerprint(config: Config) -> str:
 def work_item_plan_source(
     plan: WorkItemPlan, *, position: int, finalized: bool
 ) -> str:
+    # An unchanged durable plan, including a completed v1 Base PR, is a no-op.
+    # Legacy-only plans can keep v1 even after dispatch or task updates, without
+    # adding recovery-state bytes. A scoped branch requires the explicit v2 form.
+    if plan._loaded_source is not None and plan._loaded_state == (
+        tuple(plan.items), position, finalized
+    ):
+        return plan._loaded_source
+    version = plan._loaded_version
+    if any(
+        issue.task_id is not None
+        and issue.branch != inline_task_branch(issue.task_id)
+        for issue in plan.items
+    ):
+        version = 2
     payload = {
-        "version": 1,
+        "version": version,
         "seed_sha256": plan_seed_fingerprint(plan.config),
-        "items": [planner_work_item_json(issue) for issue in plan.items],
+        "items": [
+            {**planner_work_item_json(issue), "branch": issue.branch}
+            if version == 2
+            else planner_work_item_json(issue)
+            for issue in plan.items
+        ],
         "position": position,
         "finalized": finalized,
     }
@@ -4163,8 +4230,12 @@ def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
         "finalized",
     }:
         raise WorkerFailure("Base PR work-item plan recovery state has invalid fields")
-    if payload["version"] != 1 or payload["seed_sha256"] != plan_seed_fingerprint(
-        config
+    version = payload["version"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in (1, 2)
+        or payload["seed_sha256"] != plan_seed_fingerprint(config)
     ):
         raise WorkerFailure("Base PR work-item plan does not match the workflow seed")
     items = payload["items"]
@@ -4180,7 +4251,7 @@ def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
         raise WorkerFailure("Base PR work-item plan recovery values are invalid")
     plan = WorkItemPlan(config)
     try:
-        plan.items = [persisted_work_item(item) for item in items]
+        plan.items = [persisted_work_item(item, version=version) for item in items]
         plan._validate(plan.items)
     except ValueError as exc:
         raise WorkerFailure(f"Base PR work-item plan is invalid: {exc}") from exc
@@ -4188,6 +4259,9 @@ def work_item_plan_from_body(body: str, config: Config) -> WorkItemPlan:
     plan.finalized = finalized
     if finalized and position != len(plan.items):
         raise WorkerFailure("Base PR work-item plan completion state is inconsistent")
+    plan._loaded_source = source
+    plan._loaded_version = version
+    plan._loaded_state = (tuple(plan.items), position, finalized)
     plan.persisted_source = serialized_work_item_plan(plan)
     return plan
 
@@ -4217,6 +4291,9 @@ def with_work_item_plan(body: str, plan: WorkItemPlan) -> str:
     if len(indexes) > 1:
         raise WorkerFailure("Base PR has ambiguous work-item plan recovery state")
     if indexes:
+        if lines[indexes[0]].strip() == marker:
+            require_base_pr_body_size(body)
+            return body
         lines[indexes[0]] = marker
         result = "\n".join(lines)
     else:
@@ -5800,6 +5877,7 @@ def recovery_authoritative_state(
                 "local_sha": branch.local_sha,
                 "remote_sha": branch.remote_sha,
                 "current": branch.current,
+                "checkout_branch": worktree.current_branch if branch.current else None,
             }
         except Exception as exc:
             state["active_branch_inspection_error"] = short_error(exc)
@@ -5852,6 +5930,8 @@ def require_recovery_retry_state(source: str, expected_source: str | None = None
     if (
         not isinstance(worktree, dict)
         or worktree.get("dirty") is not False
+        or not isinstance(worktree.get("current_branch"), str)
+        or not worktree.get("current_branch")
         or not isinstance(remote_heads, dict)
         or not remote_heads.get(state["integration_branch"])
         or not remote_heads.get(state["final_branch"])
@@ -5868,7 +5948,10 @@ def require_recovery_retry_state(source: str, expected_source: str | None = None
         prs = state["active_prs"]
         if (
             branch.get("name") != active["branch"]
-            or branch.get("current") != (worktree.get("current_branch") == active["branch"])
+            or type(branch.get("current")) is not bool
+            or branch.get("checkout_branch") != (
+                worktree.get("current_branch") if branch.get("current") else None
+            )
             or not branch.get("local_sha")
             or branch.get("remote_sha") != branch.get("local_sha")
             or len(prs) > 1
@@ -5892,6 +5975,8 @@ def require_recovery_retry_state(source: str, expected_source: str | None = None
         raise WorkerFailure("recovery outcome is uncertain: Base PR changed")
     if expected_source is not None:
         expected = json.loads(expected_source)
+        if worktree.get("current_branch") != expected.get("worktree", {}).get("current_branch"):
+            raise WorkerFailure("recovery outcome is uncertain: checkout branch changed")
         prior_prs = expected.get("active_prs")
         if isinstance(prior_prs, list) and prior_prs:
             prior_numbers = {pr.get("number") for pr in prior_prs}
@@ -5905,6 +5990,33 @@ def require_recovery_retry_state(source: str, expected_source: str | None = None
             prior_base.get("number") != base_pr.get("number")
         ):
             raise WorkerFailure("recovery outcome is uncertain: Base PR identity changed")
+
+
+def recovery_branch_snapshot(repo: GitRepository) -> dict[str, dict[str, str]]:
+    return {
+        "local": repo.inspect_local_branch_heads(),
+        "remote": repo.inspect_remote_branch_heads(),
+    }
+
+
+def require_recovery_branch_scope(
+    before: dict[str, dict[str, str]],
+    after: dict[str, dict[str, str]],
+    *,
+    local_branch: str | None,
+    remote_branch: str | None,
+) -> None:
+    """A repair may only advance its original, workflow-owned branch."""
+    for location, allowed in (("local", local_branch), ("remote", remote_branch)):
+        prior, current = before[location], after[location]
+        for branch in prior.keys() | current.keys():
+            if prior.get(branch) == current.get(branch):
+                continue
+            if branch != allowed or (branch in prior and branch not in current):
+                raise WorkerFailure(
+                    f"recovery changed out-of-scope {location} branch {branch!r}; "
+                    "preserve the observed state and inspect it before resuming"
+                )
 
 
 def _run_repository(
@@ -5951,7 +6063,7 @@ def _run_repository(
                 config, work_items, client, repo, github, deferred_deliveries
             )
         except Exception as exc:
-            if isinstance(exc, (MutationOutcomeUnknown, WorkerInterrupted)):
+            if isinstance(exc, (BranchOwnershipError, MutationOutcomeUnknown, WorkerInterrupted)):
                 _finalize_deferred_agent_turns(_terminal_failure_outcome(exc))
                 raise
             if deferred_deliveries is not None and len(deferred_deliveries) != delivery_count:
@@ -5971,6 +6083,24 @@ def _run_repository(
                     "repository recovery requires a local branch commit"
                 ) from exc
             state = recovery_authoritative_state(config, repo, github, plan)
+            # The starting checkout must belong to this integration or its active
+            # item. Other checked-out branches are inspection-only.
+            recovery_remote_branch = None
+            for candidate in (
+                config.integration_branch,
+                plan.active.branch if plan is not None and plan.active is not None else None,
+            ):
+                if candidate is not None and repo.inspect_branch(candidate).current:
+                    recovery_remote_branch = candidate
+                    break
+            branches_before = recovery_branch_snapshot(repo)
+            scope = (
+                f"local checkout {recovery_branch!r}; remote branch "
+                f"{recovery_remote_branch!r} only. No other local or remote head "
+                "may change. Commit and push any repair to this exact branch"
+                if recovery_remote_branch is not None
+                else "inspect only; the starting checkout is not owned by this plan"
+            )
             recovery_execution: list[_AgentTurnExecution] = []
             report = recover_error(
                 client,
@@ -5978,13 +6108,23 @@ def _run_repository(
                 exc,
                 state,
                 deferred_execution=recovery_execution,
+                recovery_scope=scope,
             )
-            print(
-                f"Recovery: {report.summary} Retry safe: {report.retry_safe}. "
-                f"Evidence: {report.evidence}",
-                flush=True,
+            branches_after = recovery_branch_snapshot(repo)
+            require_recovery_branch_scope(
+                branches_before,
+                branches_after,
+                local_branch=recovery_branch if recovery_remote_branch is not None else None,
+                remote_branch=recovery_remote_branch,
             )
-            repo.require_committed_result(
+            # Only restore the checkout after proving unrelated branch heads did
+            # not change. Never hide an out-of-scope repair by switching back.
+            if repo.inspect_worktree().current_branch != recovery_branch:
+                repo.restore_checkout(
+                    recovery_branch,
+                    expected_sha=branches_after["local"][recovery_branch],
+                )
+            committed = repo.require_committed_result(
                 recovery_branch,
                 previous_sha=recovery_start.local_sha,
                 allow_unchanged=True,
@@ -5996,8 +6136,24 @@ def _run_repository(
                     recovery_execution, "stop_workflow"
                 )
                 raise
+            if recovery_remote_branch is not None:
+                repaired_branch = repo.inspect_branch(recovery_remote_branch)
+                if repaired_branch.remote_sha != committed.local_sha:
+                    raise WorkerFailure("recovery repair is not fully pushed to its allowed branch")
+                published_before = branches_before["remote"].get(recovery_remote_branch)
+                if published_before is not None and published_before != repaired_branch.remote_sha:
+                    repo.require_contains(recovery_remote_branch, published_before)
             require_recovery_retry_state(
                 recovery_authoritative_state(config, repo, github, plan), state
+            )
+            if plan is not None and plan.active is not None:
+                inspect_dynamic_work_item_topology(plan.active, config)
+            if recovery_branch_snapshot(repo) != branches_after:
+                raise WorkerFailure("recovery branch heads changed during verification")
+            print(
+                f"Recovery: {report.summary} Retry safe: True. "
+                f"Evidence: {report.evidence}",
+                flush=True,
             )
             _complete_deferred_validated_turn(
                 recovery_execution, "retry_workflow"

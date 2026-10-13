@@ -2321,7 +2321,7 @@ class PythonRunner:
         )
 
         try:
-            config = parse_issue_driven_json(issue_driven_json)
+            config = parse_issue_driven_json(issue_driven_json, allow_legacy_plan=True)
         except IssueDrivenValidationError as exc:
             raise RunResumeNotAllowedError(
                 f"run {run_id} saved Issue Driven settings are not valid for the current AWM"

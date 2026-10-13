@@ -9,7 +9,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from purplemux_client.errors import WorkerFailure
+from purplemux_client.errors import BranchOwnershipError, WorkerFailure
 from purplemux_client.execution_context import _inspect_repository_declaration
 from purplemux_client.git import BranchState, GitRepository
 from purplemux_client.github import (
@@ -97,6 +97,8 @@ class _IssueGitHubRepository(Protocol):
 
 
 class _IssuePullRequests(Protocol):
+    def require_branch_owner(self, *, head: str, base: str) -> None: ...
+
     def find_pr(
         self, *, head: str, base: str, state: Literal["OPEN", "MERGED", "CLOSED"]
     ) -> PullRequestState | None: ...
@@ -128,6 +130,8 @@ def classify_issue_topology(
 ) -> IssueTopologyState:
     """Classify one Issue from authoritative remote Git and GitHub state."""
     try:
+        if isinstance(issue, str):
+            pull_requests.require_branch_owner(head=branch, base=integration_branch)
         feature = repository.inspect_branch(branch)
         open_pr = pull_requests.find_pr(
             head=branch, base=integration_branch, state="OPEN"
@@ -243,7 +247,12 @@ def classify_issue_topology(
         label = _work_item_label(issue)
         if str(exc).startswith(f"{label}:"):
             raise
-        raise WorkerFailure(f"{label}: {exc}") from exc
+        error_type = (
+            BranchOwnershipError
+            if isinstance(exc, BranchOwnershipError)
+            else WorkerFailure
+        )
+        raise error_type(f"{label}: {exc}") from exc
 
 
 def _work_item_label(issue: int | str) -> str:
@@ -414,6 +423,11 @@ def inspect_issue_driven_topology(
             )
         integration_sha = preparation.base_sha
     pull_requests = github_inspection.inspect_pr_snapshot(branches)
+    # Ownership is authoritative before any ancestry query. A comparison API
+    # failure must not turn a known collision into an agent-repairable error.
+    for number, branch, _fingerprint in normalized:
+        if isinstance(number, str):
+            pull_requests.require_branch_owner(head=branch, base=integration_branch)
     comparison_pairs: list[tuple[str, str]] = []
     if prospective_base_branch is not None:
         comparison_pairs.append((preparation.base_sha, integration_sha))
@@ -592,11 +606,25 @@ def _pr_topology(
     )
 
 
+def inline_task_branch(task_id: str, *, integration_branch: str | None = None) -> str:
+    """Return a stable inline-task branch, scoped to its integration when known.
+
+    The unscoped form remains available for recovering durable legacy plans.
+    Never use a run ID here: a new run must find the same durable Git identity.
+    """
+    branch = f"feature/work-item-{task_id}"
+    if integration_branch is None:
+        return branch
+    scope = hashlib.sha256(integration_branch.encode()).hexdigest()[:16]
+    return f"{branch}-{scope}"
+
+
 @dataclass(frozen=True)
 class WorkItem:
     issue: int | None = None
     id: str | None = None
     task: str | None = None
+    integration_branch: str | None = None
 
     @property
     def task_fingerprint(self) -> str | None:
@@ -606,10 +634,20 @@ class WorkItem:
 
     @property
     def branch(self) -> str:
+        return self.branch_for()
+
+    def branch_for(self, integration_branch: str | None = None) -> str:
         if self.issue is not None:
             return f"feature/issue-{self.issue}"
         assert self.id is not None
-        return f"feature/work-item-{self.id}"
+        return inline_task_branch(
+            self.id,
+            integration_branch=(
+                self.integration_branch
+                if integration_branch is None
+                else integration_branch
+            ),
+        )
 
     def as_json(self) -> int | dict[str, str]:
         if self.issue is not None:
@@ -751,7 +789,12 @@ _WORK_ITEM_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def _work_item_plan_state_size(
-    work_items: list[WorkItem], policy_issue: object, one_shot_issue: object
+    work_items: list[WorkItem],
+    policy_issue: object,
+    one_shot_issue: object,
+    integration_branch: str | None = None,
+    *,
+    version: int = 2,
 ) -> int:
     items = [
         {"issue": item.issue, "branch": item.branch}
@@ -766,9 +809,20 @@ def _work_item_plan_state_size(
     }
     seed = json.dumps(seed_value, ensure_ascii=False, separators=(",", ":"))
     payload = {
-        "version": 1,
+        "version": version,
         "seed_sha256": hashlib.sha256(seed.encode()).hexdigest(),
-        "items": items,
+        "items": items
+        if version == 1
+        else [
+            {"issue": item.issue, "branch": item.branch_for(integration_branch)}
+            if item.issue is not None
+            else {
+                "id": item.id,
+                "task": item.task,
+                "branch": item.branch_for(integration_branch),
+            }
+            for item in work_items
+        ],
         "position": len(items),
         "finalized": False,
     }
@@ -800,7 +854,10 @@ def _valid_branch_name(value: str) -> bool:
         or "@{" in value
         or "//" in value
         or any(
-            character in forbidden or ord(character) < 32 or ord(character) == 127
+            character in forbidden
+            or ord(character) < 32
+            or ord(character) == 127
+            or 0xD800 <= ord(character) <= 0xDFFF
             for character in value
         )
         or any(
@@ -810,7 +867,9 @@ def _valid_branch_name(value: str) -> bool:
     )
 
 
-def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
+def _parse_single_issue_driven_json(
+    source: str, *, allow_legacy_plan: bool = False
+) -> IssueDrivenConfig:
     """Parse the intentionally small Issue Driven configuration."""
     if not isinstance(source, str):
         raise TypeError("source must be a string")
@@ -904,6 +963,11 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
             findings.append(
                 IssueDrivenFinding(f"$.{key}", "must be a valid Git branch name")
             )
+    branch_scope = (
+        integration
+        if isinstance(integration, str) and _valid_branch_name(integration)
+        else None
+    )
     if isinstance(integration, str) and integration == final:
         findings.append(
             IssueDrivenFinding("$.final_branch", "must differ from integration_branch")
@@ -1012,11 +1076,29 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
                     )
                 if id_valid and not duplicate_id and task_valid and not unknown:
                     assert isinstance(item_id, str) and isinstance(task, str)
-                    work_items.append(WorkItem(id=item_id, task=task))
+                    work_items.append(
+                        WorkItem(
+                            id=item_id,
+                            task=task,
+                            integration_branch=branch_scope,
+                        )
+                    )
         if (
             len(work_items) == len(raw_items)
-            and _work_item_plan_state_size(work_items, policy_issue, one_shot_issue)
+            and _work_item_plan_state_size(
+                work_items,
+                policy_issue,
+                one_shot_issue,
+                branch_scope,
+            )
             > _MAX_WORK_ITEM_PLAN_STATE_BYTES
+            and not (
+                allow_legacy_plan
+                and _work_item_plan_state_size(
+                    work_items, policy_issue, one_shot_issue, version=1
+                )
+                <= _MAX_WORK_ITEM_PLAN_STATE_BYTES
+            )
         ):
             findings.append(
                 IssueDrivenFinding(
@@ -1024,7 +1106,7 @@ def _parse_single_issue_driven_json(source: str) -> IssueDrivenConfig:
                     "serialized recovery state must not exceed 32000 bytes",
                 )
             )
-        generated_branches = {item.branch for item in work_items}
+        generated_branches = {item.branch_for(branch_scope) for item in work_items}
         if len(generated_branches) != len(work_items):
             findings.append(
                 IssueDrivenFinding(
@@ -1208,8 +1290,14 @@ _MULTI_ALLOWED_FIELDS = (
 ) | {"repositories"}
 
 
-def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
-    """Parse single- or multi-repository Issue Driven configuration."""
+def parse_issue_driven_json(
+    source: str, *, allow_legacy_plan: bool = False
+) -> IssueDrivenConfig:
+    """Parse Issue Driven configuration, optionally recovering a saved v1 seed.
+
+    Only Resume should opt into the legacy size allowance. The workflow still
+    validates the actual durable plan against the unchanged recovery-state cap.
+    """
     if not isinstance(source, str):
         raise TypeError("source must be a string")
 
@@ -1226,9 +1314,13 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
     try:
         value = json.loads(source, object_pairs_hook=ParsedObject)
     except json.JSONDecodeError:
-        return _parse_single_issue_driven_json(source)
+        return _parse_single_issue_driven_json(
+            source, allow_legacy_plan=allow_legacy_plan
+        )
     if not isinstance(value, dict) or "repositories" not in value:
-        return _parse_single_issue_driven_json(source)
+        return _parse_single_issue_driven_json(
+            source, allow_legacy_plan=allow_legacy_plan
+        )
 
     findings: list[IssueDrivenFinding] = []
     for key in sorted(set(value.duplicates)):
@@ -1274,7 +1366,8 @@ def parse_issue_driven_json(source: str) -> IssueDrivenConfig:
                 (
                     index,
                     _parse_single_issue_driven_json(
-                        json.dumps(candidate, ensure_ascii=False)
+                        json.dumps(candidate, ensure_ascii=False),
+                        allow_legacy_plan=allow_legacy_plan,
                     ),
                 )
             )
@@ -1364,7 +1457,8 @@ def _fixed_config_function(
             f"Issue({item.issue}, {item.branch!r})"
             if item.issue is not None
             else (
-                f"Issue(None, {item.branch!r}, {item.id!r}, {item.task!r}, "
+                f"Issue(None, {item.branch_for(config.integration_branch)!r}, "
+                f"{item.id!r}, {item.task!r}, "
                 f"{item.task_fingerprint!r})"
             )
         )
@@ -1399,7 +1493,8 @@ def _fixed_config_function(
             f"({item.issue!r}, {item.branch!r})"
             if item.issue is not None
             else (
-                f"({f'Mini task {item.id}'!r}, {item.branch!r}, "
+                f"({f'Mini task {item.id}'!r}, "
+                f"{item.branch_for(config.integration_branch)!r}, "
                 f"{item.task_fingerprint!r})"
             )
         )

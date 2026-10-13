@@ -12,6 +12,7 @@ from typing import Any, Literal, Protocol, TypeVar, cast
 from urllib.parse import quote
 
 from purplemux_client.client import WorkerFailure
+from purplemux_client.errors import BranchOwnershipError
 from purplemux_client.git import _require_slug
 from purplemux_client.operations import (
     AuthoritativeMutationRejection,
@@ -101,6 +102,30 @@ class PullRequestSnapshot:
 
     slug: str
     pull_requests: tuple[PullRequestState, ...]
+
+    def require_branch_owner(self, *, head: str, base: str) -> None:
+        """Reject foreign ownership even after its PR closed or merged."""
+        conflicts = tuple(
+            pr
+            for pr in self.pull_requests
+            if pr.head_repository.lower() == self.slug.lower()
+            and pr.head_branch == head
+            and (
+                pr.base_repository.lower() != self.slug.lower()
+                or pr.base_branch != base
+            )
+        )
+        if conflicts:
+            evidence = ", ".join(
+                f"#{pr.number} ({pr.state.lower()}) -> {pr.base_branch}"
+                for pr in conflicts
+            )
+            raise BranchOwnershipError(
+                f"work-item branch {head!r} belongs to another integration: {evidence}; "
+                f"expected {base!r}. Preserve the existing branch; do not merge the "
+                "current base into it, overwrite it, or push to it. Use a distinct "
+                "mini-task ID for a legacy plan or inspect the plan before resuming."
+            )
 
     def find_pr(
         self, *, head: str, base: str, state: PullRequestStatus

@@ -306,6 +306,50 @@ class GitRepository:
             result[branch] = fields[0]
         return result
 
+    def inspect_local_branch_heads(self) -> dict[str, str]:
+        """Snapshot local heads, including private worktree branches, read-only."""
+        self._validate_identity()
+        result: dict[str, str] = {}
+        for line in self._read(
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/"]
+        ).splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or not fields[0].startswith("refs/heads/")
+                or not _OBJECT_ID_RE.fullmatch(fields[1])
+            ):
+                raise WorkerFailure("unexpected local branch enumeration result")
+            result[fields[0].removeprefix("refs/heads/")] = fields[1]
+        return result
+
+    def restore_checkout(self, branch: str, *, expected_sha: str) -> None:
+        """Restore an existing exact checkout without synchronizing any history."""
+        self._validate_identity()
+        self._validate_branch(branch)
+        self._validate_sha(expected_sha)
+        self.require_clean()
+
+        def require_head() -> None:
+            if self._local_sha(branch) != expected_sha:
+                raise WorkerFailure(
+                    "recovery checkout branch changed before restoration"
+                )
+
+        require_head()
+        if self._current_branch() != branch:
+            self._git_mutation(
+                ["switch", branch],
+                operation="restore recovery checkout",
+                target=branch,
+                pre_state=self._current_branch(),
+                observe=self._current_branch,
+                desired=lambda: self._current_branch() == branch,
+                pre_dispatch=require_head,
+            )
+        require_head()
+        self.require_clean()
+
     def inspect_remote_note(self, ref: str, object_sha: str) -> str | None:
         """Read a note from an AWM-owned remote ref without changing branch heads."""
         self._validate_identity()
@@ -478,6 +522,10 @@ class GitRepository:
                 f"{previous_sha}"
             )
         if expected_agent is not None and expected_process is not None:
+            if expected_process == "recovery" and self._read(
+                ["rev-list", "--merges", f"{previous_sha}..{state.local_sha}"]
+            ):
+                raise WorkerFailure("recovery must not merge branch histories")
             self.require_agent_commit_provenance(
                 previous_sha,
                 state.local_sha,

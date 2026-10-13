@@ -560,6 +560,9 @@ Relevant errors all derive from `TerminalSessionError`:
 - `SessionReadyTimeout`: the session did not become ready in time.
 - `WorkerFailure`: CLI failure, invalid state/result, turn timeout, or another
   worker failure.
+- `BranchOwnershipError`: an inline work-item branch has a PR targeting another
+  integration. This `WorkerFailure` stops the workflow without starting Recovery;
+  preserve that branch instead of merging the new base into it.
 - `WorkerNeedsInput`: the agent needs additional input. This derives directly
   from `TerminalSessionError`; the current run fails and retains diagnostics so
   the operator can answer or inspect before starting a new run.
@@ -607,6 +610,7 @@ repo.inspect_worktree() -> WorktreeState
 repo.inspect_branch(branch) -> BranchState
 repo.inspect_remote_branches(branches) -> dict[str, str | None]
 repo.inspect_remote_branch_heads() -> dict[str, str]
+repo.inspect_local_branch_heads() -> dict[str, str]
 repo.inspect_feature_preparation(
     branch, *, base, expected_base_sha=None
 ) -> FeaturePreparationState
@@ -629,12 +633,15 @@ repo.inspect_remote_note(ref, object_sha) -> str | None
 `inspect_remote_branch_heads()` enumerates the remote directly and does not
 trust local tracking refs. Use it when a workflow must compare a configured
 development branch with the remote's current branch set.
+`inspect_local_branch_heads()` includes the physical private branches used by
+linked worktrees. Recovery compares both snapshots to verify its mutation scope.
 
 The inspection-aware Git operations that may mutate are:
 
 ```python
 repo.ensure_pushed(branch, *, expected_local_sha) -> BranchState
 repo.synchronize_branch(branch) -> BranchState
+repo.restore_checkout(branch, *, expected_sha) -> None
 repo.prepare_feature_branch(
     branch, *, base, expected_base_sha
 ) -> BranchState

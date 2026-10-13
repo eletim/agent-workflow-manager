@@ -16,7 +16,7 @@ from purplemux_client.client import (
     WorkspaceState,
 )
 from purplemux_client.correlation import run_correlation
-from purplemux_client.errors import TerminalSessionError
+from purplemux_client.errors import BranchOwnershipError, TerminalSessionError
 from purplemux_client.execution_context import (
     RepositoryExecutionContext,
     RepositoryPreparation,
@@ -76,6 +76,7 @@ from purplemux_client.progress import (
 )
 
 __all__ = [
+    "BranchOwnershipError",
     "ExternalRunClient",
     "ExternalRunError",
     "ExternalRunLaunchUnknown",

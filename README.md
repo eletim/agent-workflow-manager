@@ -212,6 +212,11 @@ The ordered `work_items` form may mix GitHub Issue numbers with inline mini task
 such as `{"id":"update-copy","task":"Update the empty-state copy and its test."}`.
 Inline tasks are embedded in the generated Python and do not require creating a
 GitHub Issue; the legacy Issue-only `issues` array remains supported.
+New mini-task branches include a stable hash of the integration branch, so the
+same task ID in another integration uses a different branch. Persisted plans keep
+their exact branch names, including legacy unscoped names. A mini-task branch with
+an open, closed, or merged PR targeting another integration is a collision, not
+resumable work; AWM preserves it and stops with the conflicting PR details.
 
 The immutable JSON-derived tuple seeds a separate workflow-owned `WorkItemPlan`;
 it is not frozen as the execution schedule. Before each dispatch, the generated
@@ -252,7 +257,12 @@ to use manual recovery.
 During an active Issue Driven run, a repository step failure can start a fresh
 recovery agent. After a verified repair, the workflow re-inspects persisted plan,
 Git, and PR state and retries the repository pass at most twice. An interrupted
-agent turn or uncertain mutation outcome stops the run. Each successful recovery
+agent turn, foreign branch collision, or uncertain mutation outcome stops the run.
+Recovery may change only its starting workflow-owned branch; it must not merge
+branch histories or modify other local or remote heads. A clean checkout-only
+change can be restored after those heads are verified unchanged. Retry safety is
+reported only after checkout, commit provenance, published history, and current
+topology checks pass. Each successful recovery
 records WARN findings for the original error and repair evidence; timeout and
 policy conflict warnings from earlier attempts remain in the final handoff.
 

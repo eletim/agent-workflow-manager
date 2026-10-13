@@ -1095,3 +1095,47 @@ def test_custom_runner_interruption_with_unchanged_state_is_unknown(
             desired=lambda: False,
         )
     assert calls == 1
+
+
+def test_recovery_checkout_restoration_does_not_move_branch_heads(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    git(work, "switch", "-c", "feature/foreign")
+    before_local = repo.inspect_local_branch_heads()
+    before_remote = repo.inspect_remote_branch_heads()
+    repo.restore_checkout("main", expected_sha=base)
+    assert repo.inspect_worktree().current_branch == "main"
+    assert repo.inspect_local_branch_heads() == before_local
+    assert repo.inspect_remote_branch_heads() == before_remote
+    git(work, "switch", "feature/foreign")
+    (work / "dirty.txt").write_text("uncommitted work\n")
+    with pytest.raises(WorkerFailure, match="clean"):
+        repo.restore_checkout("main", expected_sha=base)
+    assert repo.inspect_worktree().current_branch == "feature/foreign"
+
+
+def test_recovery_rejects_merging_old_branch_even_with_recovery_trailers(
+    repositories: tuple[Path, Path, Path],
+) -> None:
+    _remote, _seed, work = repositories
+    repo = open_repo(work, RecordingGitRunner())
+    base = repo.synchronize_branch("main").local_sha or ""
+    message = (
+        "Recovered.\n\nAWM-Agent: codex\nAWM-Process: recovery\n"
+        "Co-authored-by: Codex <noreply@openai.com>"
+    )
+    git(work, "switch", "-c", "feature/old")
+    git(work, "commit", "--allow-empty", "-m", message)
+    git(work, "switch", "main")
+    git(work, "commit", "--allow-empty", "-m", "New base.\n" + message)
+    git(work, "merge", "--no-ff", "feature/old", "-m", message)
+    with pytest.raises(WorkerFailure, match="must not merge branch histories"):
+        repo.require_committed_result(
+            "main",
+            previous_sha=base,
+            expected_agent="codex",
+            expected_process="recovery",
+        )

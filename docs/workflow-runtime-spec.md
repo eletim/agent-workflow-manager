@@ -148,6 +148,15 @@ uncertain outcome fails the run. The retry limit is finite, and an unknown
 mutation outcome is never retried. The Runner stores the Findings but does not
 interpret the report or schedule retries.
 
+Recovery's branch mutation scope is the starting checkout and its corresponding
+integration or active work-item remote branch. Local and authoritative remote
+head snapshots must show no changes outside that scope. Recovery cannot merge
+histories or rewrite previously published ancestry. A foreign mini-task PR
+ownership conflict bypasses the recovery agent entirely. A clean checkout can be
+restored to its original branch only after validating the branch-head scope;
+dirty or out-of-scope results remain stopped for inspection. Python verifies the
+commit result, retry state, and active task topology before reporting retry safety.
+
 For Issue Driven mode, the UI's Review & Resume action confirms the original
 immutable settings, regenerates the Workflow code from those settings using the
 current AWM implementation, and starts a distinct run. Prompt and custom Python Workflow
@@ -171,6 +180,12 @@ in an AWM-owned remote Git note anchored to the reviewed final commit. This does
 not advance either branch, and preserves planner-before-dispatch behavior for
 seeded, dynamic, and one-shot plans. Recovery validates the state against the
 immutable generated seed and re-inspects the recorded items' GitHub topology.
+New inline branches are deterministically scoped to their integration branch.
+Version 2 plan records retain each inline branch explicitly; version 1 plans keep
+their legacy branches, including when pending items are updated. An unchanged
+legacy plan remains byte-for-byte stable, and a scoped task addition upgrades the
+record without renaming existing branches. PRs targeting another integration,
+including closed and merged PRs, cannot establish ownership for an inline task.
 After an Issue merge creates a difference, the Base PR is created with the
 recovered state and resumes its normal authority. This is domain state owned and
 interpreted by the workflow, not a Runner checkpoint or progress-event state

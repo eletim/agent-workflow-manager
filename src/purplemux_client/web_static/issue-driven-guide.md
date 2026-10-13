@@ -306,8 +306,13 @@ PR and final human handoff. Numeric Issue additions are rejected, and each added
 or revised mini task receives the same authoritative remote branch, PR-state,
 SHA-containment, and fingerprint checks before its dispatch is persisted.
 
-The generated Python embeds the mini-task instruction and uses the deterministic
-branch `feature/work-item-refresh-run-help`. Across a fresh run, **Review &
+The generated Python embeds the mini-task instruction and uses an
+integration-scoped deterministic branch such as
+`feature/work-item-refresh-run-help-<integration-hash>`. Saved legacy plans retain
+their original `feature/work-item-refresh-run-help` branch. A same-head PR to a
+different integration, including a closed or merged PR, is reported as a branch
+ownership conflict; Recovery must not merge the new base into that branch.
+Across a fresh run, **Review &
 Resume**, and recovery from a timed-out marker update, the persisted
 `WorkItemPlan` supplies the authoritative task fingerprint while exact remote
 branch, PR head/base, SHA-containment, and integration topology identify the PR
