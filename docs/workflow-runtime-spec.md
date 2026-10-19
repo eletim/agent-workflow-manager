@@ -440,3 +440,22 @@ The server and topic shown above are defaults. The token is a secret and must
 never be hardcoded, copied into `config.sh`, committed, passed as a command
 argument, or printed. Credential storage and notification delivery belong to
 the notify CLI and Notify Server respectively.
+
+### Transient Agent observation outages
+
+Read-only PurpleMux CLI requests retry HTTP 502/503/504 and transient connection
+errors with bounded backoff, using the configured read retry count. Mutations
+are never retried by this mechanism. Exhausted transient reads and CLI read
+timeouts are classified as observation unavailable, separately from permanent
+API rejection or an authoritative inactive/interrupted Agent state.
+
+While waiting for an already dispatched Agent turn, exhausted transient status
+or result reads pause observation rather than ending the turn. The workflow
+records an observation-uncertain warning containing the workspace and tab IDs,
+retains its pending-turn baseline and resources, and continues read-only probes
+with backoff capped at 30 seconds. The Run stays running; this applies to Recovery
+assessment turns too. Communication recovery resumes the same turn automatically
+and records a recovery warning. Observation outage time does not consume the turn
+or result-publication deadline. No replacement Recovery Agent, repeated input,
+worktree cleanup, or Git/PR mutation is triggered by the outage. A permanent read
+error or an authoritative terminal Agent state still follows normal error handling.

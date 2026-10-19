@@ -1957,3 +1957,111 @@ def test_configuration_validation(kwargs: dict[str, object], message: str) -> No
 
     with pytest.raises(ValueError, match=message):
         PurpleMuxCLIClient(**base)
+
+
+@pytest.mark.parametrize(
+    "error", ["HTTP 502", "HTTP 503", "HTTP 504", "connection reset by peer"]
+)
+@pytest.mark.parametrize("operation", ["status", "result"])
+def test_transient_observation_read_is_retried(error: str, operation: str) -> None:
+    response = (
+        {"cliState": "busy", "alive": True}
+        if operation == "status"
+        else {"status": "completed", "text": "done"}
+    )
+    runner = FakeRunner(
+        [completed("", returncode=1, stderr=error), completed(response)]
+    )
+    cli = client(runner)
+    if operation == "status":
+        assert cli.read_status("tab-1")["cliState"] == "busy"
+    else:
+        assert cli.read_result("tab-1") == "done"
+    assert len(runner.calls) == 2
+    assert all(call[2] == operation for call in runner.calls)
+
+
+@pytest.mark.parametrize("operation", ["status", "result"])
+def test_outage_retains_pending_turn_and_recovers_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        client_module,
+        "emit_finding",
+        lambda scope, message, **kw: warnings.append(message),
+    )
+    ready = completed(
+        {
+            "cliState": "ready-for-review",
+            "alive": True,
+            "eventSeq": 3,
+            "readyForReviewAt": 200,
+            "lastEvent": {"name": "stop", "seq": 3},
+        }
+    )
+    failure = completed("", returncode=1, stderr="error: HTTP 502")
+    # Exhaust two bounded read bursts, then recover the original Agent result.
+    observations = [failure] * 4 + [ready] if operation == "status" else [ready]
+    results = [failure] * 4 if operation == "result" else []
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            *observations,
+            *results,
+            completed(
+                {"status": "completed", "text": "done", "completionTimestamp": 2}
+            ),
+        ]
+    )
+    cli = client(runner)
+    cli.send_input("tab-1", "work")
+    cli.wait_for_turn_completion("tab-1", 900)
+    assert cli.read_result("tab-1") == "done"
+    assert sum(call[2] == "send" for call in runner.calls) == 1
+    assert not any(call[2] in {"create", "close", "interrupt"} for call in runner.calls)
+    assert len(warnings) == 2
+    assert "observation uncertain" in warnings[0]
+    assert "ws-test" in warnings[0] and "tab-1" in warnings[0]
+    assert "observation recovered" in warnings[1]
+
+
+@pytest.mark.parametrize("error", ["HTTP 401", "HTTP 403", "HTTP 404", "HTTP 500"])
+def test_permanent_status_error_is_not_retried(error: str) -> None:
+    runner = FakeRunner([completed("", returncode=1, stderr=error)])
+    with pytest.raises(WorkerFailure, match=error):
+        client(runner).read_status("tab-1")
+    assert len(runner.calls) == 1
+
+
+def test_transient_mutation_failure_is_never_retried() -> None:
+    runner = FakeRunner([completed("", returncode=1, stderr="HTTP 502")])
+    with pytest.raises(WorkerFailure, match="HTTP 502"):
+        client(runner)._run(["tab", "send", "tab-1"], operation="send", read_only=False)
+    assert len(runner.calls) == 1
+
+
+def test_observation_retry_backoff_is_capped_and_does_not_close_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "emit_finding", lambda *a, **kw: None)
+    failure = completed("", returncode=1, stderr="HTTP 503")
+    runner = FakeRunner(
+        [
+            *baseline(),
+            completed({"status": "sent"}),
+            *([failure] * 16),
+            completed({"cliState": "inactive", "alive": True}),
+        ]
+    )
+    cli = client(runner)
+    delays: list[float] = []
+    cli._sleep = delays.append
+    cli.send_input("tab-1", "work")
+    with pytest.raises(WorkerFailure, match="inactive"):
+        cli.wait_for_turn_completion("tab-1", 900)
+    # Eight exhausted bursts, with bounded delays between subsequent observations.
+    assert delays[1::2] == [1, 2, 4, 8, 16, 30, 30, 30]
+    assert not any(call[2] in {"create", "close", "interrupt"} for call in runner.calls)
