@@ -28,3 +28,7 @@ class ResultNotReady(WorkerFailure):
 
 class MutationOutcomeUnknown(WorkerFailure):
     """Raised when a mutation may have been applied but cannot be confirmed."""
+
+
+class ObservationUnavailable(WorkerFailure):
+    """A transient read failure leaves the remote execution state unknown."""

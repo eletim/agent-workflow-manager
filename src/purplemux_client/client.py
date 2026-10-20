@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -17,6 +18,7 @@ from purplemux_client.codex_trust import ensure_codex_project_trust
 from purplemux_client.correlation import run_correlation
 from purplemux_client.errors import (
     MutationOutcomeUnknown,
+    ObservationUnavailable,
     ResultNotReady,
     SessionReadyTimeout,
     TerminalSessionError,
@@ -1099,8 +1101,43 @@ class PurpleMuxCLIClient:
         last_state = "unknown"
         busy_timeout_reported = False
         result_publication_deadline: float | None = None
+
+        def observe(read: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
+            nonlocal deadline, result_publication_deadline
+            outage_started: float | None = None
+            delay = 1.0
+            while True:
+                try:
+                    value = read(session_id)
+                except ObservationUnavailable as exc:
+                    if outage_started is None:
+                        outage_started = self._monotonic()
+                        emit_finding(
+                            "runtime",
+                            f"Agent observation uncertain: workspace={self.workspace_id} "
+                            f"tab={session_id}; {exc}. Retaining the pending turn and "
+                            "resources; monitoring will resume automatically when "
+                            "communication recovers. Do not redispatch this turn.",
+                            status="warning",
+                        )
+                    self._sleep(delay)
+                    delay = min(delay * 2, 30.0)
+                    continue
+                if outage_started is not None:
+                    paused = self._monotonic() - outage_started
+                    deadline += paused
+                    if result_publication_deadline is not None:
+                        result_publication_deadline += paused
+                    emit_finding(
+                        "runtime",
+                        f"Agent observation recovered: workspace={self.workspace_id} "
+                        f"tab={session_id}; continuing the same pending turn.",
+                        status="warning",
+                    )
+                return value
+
         while True:
-            status = self._status(session_id)
+            status = observe(self._status)
             state = self._state(status, session_id)
             last_state = state
             self._raise_abnormal_state(session_id, state, status)
@@ -1124,11 +1161,11 @@ class PurpleMuxCLIClient:
             ):
                 # PurpleMux can return an acknowledged ready-for-review state to
                 # idle while retaining its fresh stop event and structured result.
-                result = self._result_data(session_id)
+                result = observe(self._result_data)
                 if self._accept_fresh_result(session_id, result, baseline):
                     return
             elif state == "idle" and saw_busy:
-                result = self._result_data(session_id)
+                result = observe(self._result_data)
                 if self._result_is_interrupted(result):
                     raise WorkerInterrupted(
                         f"session {session_id} turn was interrupted"
@@ -1876,7 +1913,7 @@ class PurpleMuxCLIClient:
                 if attempt + 1 < attempts:
                     continue
                 if read_only:
-                    raise WorkerFailure(
+                    raise ObservationUnavailable(
                         f"PurpleMux {operation} timed out after {timeout_seconds}s"
                     ) from exc
                 raise MutationOutcomeUnknown(
@@ -1889,7 +1926,24 @@ class PurpleMuxCLIClient:
                 ) from exc
             if completed.returncode != 0:
                 stderr = completed.stderr.strip() or "no stderr"
-                raise WorkerFailure(
+                transient = read_only and (
+                    re.search(r"\bHTTP\s+(?:502|503|504)\b", stderr, re.IGNORECASE)
+                    or re.search(
+                        r"connection (?:reset|refused|aborted)|timed? out|"
+                        r"temporary failure in name resolution|"
+                        r"remote (?:end closed|disconnected)|unexpected EOF",
+                        stderr,
+                        re.IGNORECASE,
+                    )
+                )
+                if transient and attempt + 1 < attempts:
+                    delay = min(2.0**attempt, 8.0)
+                    if deadline_check is not None:
+                        delay = min(delay, max(0.0, deadline_check()))
+                    self._sleep(delay)
+                    continue
+                error_type = ObservationUnavailable if transient else WorkerFailure
+                raise error_type(
                     f"PurpleMux {operation} failed with exit code "
                     f"{completed.returncode}: {stderr}"
                 )
