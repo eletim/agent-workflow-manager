@@ -908,7 +908,24 @@ def test_all_review_phases_share_decision_parser() -> None:
 
     assert source.count("def decision(result: str) -> str:") == 1
     assert "decision(result)" not in source
-    assert source.count("run_validated_turn(") == 8
+    reviewer_calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_validated_turn"
+        and any(
+            keyword.arg == "role"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "reviewer"
+            for keyword in node.keywords
+        )
+    ]
+    assert reviewer_calls
+    assert all(
+        isinstance(call.args[4], ast.Name) and call.args[4].id == "decision"
+        for call in reviewer_calls
+    )
 
 
 def test_machine_output_recovery_corrects_in_the_same_session() -> None:

@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import string
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import count
@@ -51,7 +52,9 @@ from purplemux_client import (
     require_inline_task_pr_fingerprint,
     run_correlation,
 )
+from purplemux_client.agent_rate_limit import AgentRateLimited
 from purplemux_client.issue_driven import inline_task_branch
+from purplemux_client.review import snapshot_review_repositories
 
 WORKFLOW_PREFLIGHT = {"commands": ["git", "gh", "purplemux"]}
 WORKFLOW_DRY_RUN = 1
@@ -726,6 +729,188 @@ class _AgentTurnExecution:
     commit_sha: str | None = None
 
 
+RATE_LIMIT_RECOVERY_TABS: dict[tuple[str, str], str] = {}
+
+
+def rate_limit_wait(seconds: float) -> None:
+    """Wait in interruptible chunks, including long provider Retry-After delays."""
+    remaining = seconds
+    while remaining > 0:
+        chunk = min(remaining, 30.0)
+        time.sleep(chunk)
+        remaining -= chunk
+
+
+def parse_rate_limit_recovery(source: str) -> dict:
+    """A Recovery AI decides only whether to wait or resume the existing turn."""
+    try:
+        value = json.loads(source)
+    except (ValueError, TypeError) as exc:
+        raise WorkerFailure("rate-limit recovery must return one JSON object") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"action", "wait_seconds"}
+        or value["action"] not in ("wait", "resume")
+        or type(value["wait_seconds"]) is not int
+        or not 60 <= value["wait_seconds"] <= 900
+    ):
+        raise WorkerFailure(
+            "rate-limit recovery requires action wait/resume and wait_seconds 60..900"
+        )
+    return value
+
+
+def recover_agent_rate_limit(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    context: dict,
+    *,
+    repository_identity: str,
+) -> dict:
+    """Inspect using a dedicated Recovery AI, preserving the original Agent."""
+    key = (client.workspace_id, tab)
+    recovery_tab = RATE_LIMIT_RECOVERY_TABS.get(key)
+    if recovery_tab is None:
+        name = f"Rate-limit Recovery agent for {tab}"
+        recovery_tab = client.create_session(
+            CreateSessionRequest(
+                IMPLEMENTER_AGENT,
+                client.workspace_directory(),
+                IMPLEMENTER_AGENT,
+                name=name,
+                correlation_id=run_correlation(name),
+            )
+        )
+        RATE_LIMIT_RECOVERY_TABS[key] = recovery_tab
+    _, plan = run_validated_turn(
+        client,
+        recovery_tab,
+        "Agent rate-limit Recovery assessment",
+        "The original Agent encountered a provider HTTP 429 or usage limit. "
+        "Inspect its current Session, existing Git/PR work, and available review "
+        "audits before deciding whether to wait or resume that SAME Agent. "
+        "You are read-only: do not edit files, commit, change branches, mutate "
+        "PRs/reviews/comments, send input to or interrupt any Agent, close tabs, "
+        "or clean up resources. Do not switch providers. The workflow will "
+        "reconcile the same Session and verify Git/PR before executing your plan. "
+        "Choose wait if the original Agent may be progressing or the result is "
+        "uncertain. Choose resume only when its provider error has stopped "
+        "progress and continuing the same task is safe. A stale busy state may "
+        "require the workflow to confirm an interrupt before continuation. "
+        "Never treat a missing review as approved or consume a review iteration "
+        "because of a provider limit. Do not infer a quota reset time. "
+        'Return exactly {"action":"wait" or "resume","wait_seconds":60..900}. '
+        "Do not return raw logs or credentials. Current checkpoint: "
+        + json.dumps(context),
+        parse_rate_limit_recovery,
+        repository_identity=repository_identity,
+        role="rate-limit-recovery",
+        phase="rate-limit-recovery",
+    )
+    return plan
+
+
+def wait_for_agent_result(
+    client: PurpleMuxCLIClient,
+    tab: str,
+    *,
+    name: str,
+    prompt: str,
+    repository_identity: str,
+    role: str,
+    phase: str | None,
+    iteration: int | None,
+    pr: PullRequestState | None,
+    work_item_id: int | str | None,
+    verify_resume: Callable[[], object],
+    on_busy_timeout: Callable[[str], None],
+) -> str:
+    """Keep the stack/phase/review count intact during provider throttling."""
+    backoff = 60.0
+    while True:
+        try:
+            client.wait_for_turn_completion(
+                tab, TURN_TIMEOUT, on_busy_timeout=on_busy_timeout
+            )
+            return client.read_result(tab)
+        except AgentRateLimited as failure:
+            while True:
+                wait_seconds = max(backoff, failure.evidence.retry_after_seconds or 0)
+                context = {
+                    "reason": "agent_rate_limited",
+                    "repository": repository_identity,
+                    "purpose": name,
+                    "phase": phase,
+                    "role": role,
+                    "iteration": iteration,
+                    "work_item": work_item_id,
+                    "workspace": client.workspace_id,
+                    "tab": tab,
+                    "provider": failure.provider,
+                    "agent_session": failure.agent_session_id,
+                    "pr": pr.number if pr else None,
+                    "head_sha": pr.head_sha if pr else None,
+                    "base_sha": pr.base_sha if pr else None,
+                    "wait_seconds": wait_seconds,
+                    "resume": "automatic Recovery assessment after wait",
+                }
+                # This checkpoint is persisted by the normal finding/history path;
+                # raw provider output is deliberately excluded.
+                emit_finding(
+                    "runtime",
+                    "Agent側429: 待機後にRecovery AIで再開を確認します。 "
+                    + json.dumps(context),
+                    status="warning",
+                )
+                emit_step(
+                    name,
+                    "started",
+                    iteration=iteration,
+                    message=f"Agent側429: {wait_seconds:g}秒待機し自動復旧します",
+                    workspace=client.workspace_id,
+                    tab=tab,
+                    **({"pr_number": pr.number, "pr_url": pr.url} if pr else {}),
+                )
+                rate_limit_wait(wait_seconds)
+                verify_resume()
+                if role == "rate-limit-recovery":
+                    # A throttled Recovery Agent cannot recursively create another
+                    # Recovery Agent. It retries only its own reconciled Session.
+                    plan = {"action": "resume", "wait_seconds": min(backoff * 2, 900)}
+                else:
+                    before = snapshot_review_repositories(
+                        (client.workspace_directory(),)
+                    )
+                    plan = recover_agent_rate_limit(
+                        client, tab, context, repository_identity=repository_identity
+                    )
+                    after = snapshot_review_repositories(
+                        (client.workspace_directory(),)
+                    )
+                    if before != after:
+                        raise MutationOutcomeUnknown(
+                            "Git/worktree changed during read-only rate-limit Recovery; retain resources and inspect before resuming"
+                        )
+                verify_resume()
+                backoff = min(max(backoff * 2, plan["wait_seconds"]), 900.0)
+                if plan["action"] == "wait":
+                    continue
+                continuation = (
+                    "Continue the same task after the provider rate limit. First inspect "
+                    "the current Git/PR state and your previous partial work. Preserve "
+                    "existing commits and artifacts; do not duplicate branches, PRs, "
+                    "comments, reviews, or merges. Complete only unfinished work and "
+                    "return the originally requested result. Original task:\n" + prompt
+                )
+                client.resume_rate_limited_turn(tab, failure, continuation)
+                emit_finding(
+                    "runtime",
+                    f"Agent側429: 同じSessionの監視を再開します。phase={phase} tab={tab}",
+                    status="info",
+                )
+                break
+
+
 def _execute_turn(
     client: PurpleMuxCLIClient,
     tab: str,
@@ -827,10 +1012,34 @@ def _execute_turn(
             # The trace is observation-only and must never control execution.
             pass
         client.send_input(tab, prompt)
-        client.wait_for_turn_completion(
-            tab, TURN_TIMEOUT, on_busy_timeout=warn_busy_timeout
+
+        def verify_rate_limit_resume() -> None:
+            verify_turn_commits()
+            if pr is not None and role == "reviewer":
+                GitHubRepository.open(
+                    repository_identity, command_timeout_seconds=COMMAND_TIMEOUT
+                ).require_pr(
+                    number=pr.number,
+                    head=pr.head_branch,
+                    base=pr.base_branch,
+                    expected_head_sha=pr.head_sha,
+                    expected_base_sha=pr.base_sha,
+                )
+
+        result = wait_for_agent_result(
+            client,
+            tab,
+            name=name,
+            prompt=prompt,
+            repository_identity=repository_identity,
+            role=role,
+            phase=phase,
+            iteration=iteration,
+            pr=pr,
+            work_item_id=work_item_id,
+            verify_resume=verify_rate_limit_resume,
+            on_busy_timeout=warn_busy_timeout,
         )
-        result = client.read_result(tab)
         result_observed = True
         try:
             commit_sha = verify_turn_commits()
