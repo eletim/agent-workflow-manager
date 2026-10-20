@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from purplemux_client.agent_rate_limit import AgentRateLimited, detect_agent_rate_limit
 from purplemux_client.codex_trust import ensure_codex_project_trust
 from purplemux_client.correlation import run_correlation
 from purplemux_client.errors import (
@@ -1039,6 +1040,80 @@ class PurpleMuxCLIClient:
         self._completed_shell_runs[session_id] = completed
         return completed
 
+    def workspace_directory(self) -> str:
+        """Return the current authoritative workspace launch directory."""
+        return self._current_workspace_launch_directory("agent")
+
+    def inspect_agent_rate_limit(self, session_id: str) -> AgentRateLimited | None:
+        """Inspect a provider error; never claim a completed turn from pane text."""
+        status = self._status(session_id)
+        if not status.get("agentSessionId") or not status.get("agentProviderId"):
+            return None
+        evidence = detect_agent_rate_limit(status.get("error"))
+        if evidence is None:
+            evidence = detect_agent_rate_limit(self.capture_screen(session_id))
+        return AgentRateLimited(session_id, status, evidence) if evidence else None
+
+    def resume_rate_limited_turn(
+        self, session_id: str, failure: AgentRateLimited, prompt: str
+    ) -> bool:
+        """Reconcile the same provider/session before any continuation input.
+
+        Return False when the provider has progressed, so callers observe its result
+        instead of sending input. A stuck busy turn requires the same provider error
+        and event sequence plus an acknowledged interrupt before a continuation.
+        """
+        status = self._status(session_id)
+        if (
+            status.get("agentSessionId") != failure.agent_session_id
+            or status.get("agentProviderId") != failure.provider
+            or not failure.agent_session_id
+        ):
+            raise MutationOutcomeUnknown(
+                "rate-limited Agent identity changed; retain resources and inspect before resuming"
+            )
+        state = self._state(status, session_id)
+        self._raise_abnormal_state(session_id, state, status)
+        baseline = self._turn_baselines.get(session_id)
+        if baseline is not None and self._is_fresh_interrupt(status, baseline):
+            raise WorkerInterrupted(
+                f"session {session_id} was interrupted during rate-limit wait"
+            )
+        if state == "busy":
+            observed = self.inspect_agent_rate_limit(session_id)
+            if (
+                observed is None
+                or observed.evidence.fingerprint != failure.evidence.fingerprint
+                or observed.event_seq != failure.event_seq
+            ):
+                return False
+            self.interrupt(session_id)
+            self.wait_until_ready(session_id, 120)
+        elif state not in _READY_STATES:
+            return False
+        else:
+            result = self._result_data(session_id)
+            baseline = self._turn_baselines.get(session_id)
+            if (
+                baseline is not None
+                and result.get("status") == "completed"
+                and self._is_fresh_result(result, baseline)
+                and detect_agent_rate_limit(result.get("text")) is None
+            ):
+                return False
+        # Recheck identity after the interrupt/readiness wait too.
+        current = self._status(session_id)
+        if (
+            current.get("agentSessionId") != failure.agent_session_id
+            or current.get("agentProviderId") != failure.provider
+            or current.get("cliState") not in _READY_STATES
+        ):
+            raise MutationOutcomeUnknown(
+                "rate-limited Agent is not the same ready session; continuation withheld"
+            )
+        self.send_input(session_id, prompt)
+        return True
+
     def read_status(self, session_id: str) -> dict[str, Any]:
         """Read authoritative agent state from PurpleMux StatusManager output."""
         return self._status(session_id)
@@ -1101,6 +1176,7 @@ class PurpleMuxCLIClient:
         last_state = "unknown"
         busy_timeout_reported = False
         result_publication_deadline: float | None = None
+        rate_limit_poll = 0
 
         def observe(read: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
             nonlocal deadline, result_publication_deadline
@@ -1140,6 +1216,26 @@ class PurpleMuxCLIClient:
             status = observe(self._status)
             state = self._state(status, session_id)
             last_state = state
+            rate_limit_poll += 1
+            if (
+                status.get("agentSessionId")
+                and status.get("agentProviderId")
+                and state
+                in ({"busy", "idle", "ready-for-review", "inactive"} | _FAILED_STATES)
+                and (
+                    rate_limit_poll % 30 == 0
+                    or status.get("error")
+                    or state in _FAILED_STATES
+                    or state == "inactive"
+                )
+            ):
+                try:
+                    failure = self.inspect_agent_rate_limit(session_id)
+                except TerminalSessionError:
+                    # Diagnostic reads cannot override authoritative monitoring.
+                    failure = None
+                if failure is not None:
+                    raise failure
             self._raise_abnormal_state(session_id, state, status)
             if self._is_fresh_interrupt(status, baseline):
                 raise WorkerInterrupted(f"session {session_id} turn was interrupted")
@@ -1162,7 +1258,7 @@ class PurpleMuxCLIClient:
                 # PurpleMux can return an acknowledged ready-for-review state to
                 # idle while retaining its fresh stop event and structured result.
                 result = observe(self._result_data)
-                if self._accept_fresh_result(session_id, result, baseline):
+                if self._accept_fresh_result(session_id, result, baseline, status):
                     return
             elif state == "idle" and saw_busy:
                 result = observe(self._result_data)
@@ -1452,6 +1548,7 @@ class PurpleMuxCLIClient:
         session_id: str,
         result: dict[str, Any],
         baseline: _TurnBaseline,
+        status: dict[str, Any],
     ) -> bool:
         result_status = self._result_status(result, session_id)
         if self._result_is_interrupted(result):
@@ -1459,11 +1556,17 @@ class PurpleMuxCLIClient:
                 return False
             raise WorkerInterrupted(f"session {session_id} turn was interrupted")
         if result_status == "completed" and self._is_fresh_result(result, baseline):
+            evidence = detect_agent_rate_limit(result.get("text"))
+            if evidence is not None:
+                raise AgentRateLimited(session_id, status, evidence)
             self._completed_turns[session_id] = result
             self._turn_baselines.pop(session_id, None)
             return True
         if result_status in {"not-applicable", "unavailable"}:
             reason = result.get("reason")
+            evidence = detect_agent_rate_limit(reason)
+            if evidence is not None:
+                raise AgentRateLimited(session_id, status, evidence)
             raise WorkerFailure(
                 f"session {session_id} result is {result_status}: {reason}"
             )

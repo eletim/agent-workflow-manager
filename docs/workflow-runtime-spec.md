@@ -459,3 +459,37 @@ and records a recovery warning. Observation outage time does not consume the tur
 or result-publication deadline. No replacement Recovery Agent, repeated input,
 worktree cleanup, or Git/PR mutation is triggered by the outage. A permanent read
 error or an authoritative terminal Agent state still follows normal error handling.
+
+### Provider rate limits during Issue Driven turns
+
+A provider's terminal retry-limit/429 notice is distinct from a PurpleMux HTTP
+transport failure and from a structured review verdict. AWM checks fresh
+structured results and, for identified provider sessions, periodically inspects
+the terminal for a provider error notice. Terminal text can trigger a Recovery
+assessment; it cannot certify task completion or review approval.
+
+The current turn remains on the workflow stack. AWM records a sanitized waiting
+checkpoint (phase, iteration, work item, PR/head/base, provider/session/tab), waits
+60 seconds initially (exponential backoff capped at 15 minutes), then asks a
+read-only Recovery Agent to inspect the existing session, Git/PR work and review
+audits and choose wait or resume. Available numeric or HTTP-date Retry-After
+hints are respected. No reset time or limit type is inferred. The Run remains
+running while waiting and its existing progress/finding history shows the phase,
+PR and automatic recovery path. Review iteration limits are not consumed.
+
+Before continuation, AWM verifies commit provenance and the exact review PR
+head/base again. The original provider/session must still match. A progressing
+or completed Agent is observed without new input. A stuck busy Agent may receive
+a continuation only after the same error/event is reconfirmed and an interrupt
+is authoritatively acknowledged. Uncertain interrupts, changed identity or Git
+changes during the read-only assessment retain resources and block dispatch.
+The continuation explicitly preserves partial commits/artifacts and the original
+task. Existing review audit and merge verification still run after a result.
+
+A rate-limited Recovery Agent waits and reconciles its own session; it does not
+create recursive Recovery Agents or switch the original Agent's provider. This
+in-process path preserves the current phase instead of restarting implementation.
+Normal manual stop/resume behavior remains available. It is not a durable replay
+of an interrupted workflow process: after process loss, existing resume topology
+and review-audit verification apply. An unidentifiable or dead provider session is
+not automatically replaced by this handler.
